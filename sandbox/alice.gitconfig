@@ -1,0 +1,21 @@
+[user]
+	name = Alice
+	email = alice@localhost
+
+[init]
+	defaultBranch = master
+
+[pull]
+	rebase = true
+
+[push]
+	autoSetupRemote = true
+
+# gh-backed HTTPS auth for github — uses the mounted ~/.config/gh token.
+# Empty first line resets any inherited helper; second line sets ours.
+[credential "https://github.com"]
+	helper =
+	helper = !gh auth git-credential
+[credential "https://gist.github.com"]
+	helper =
+	helper = !gh auth git-credential

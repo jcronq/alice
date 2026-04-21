@@ -1,0 +1,8 @@
+#!/command/with-contenv bash
+# Runs after signal-bridge exits (crash, restart, whatever). Kills any
+# orphaned subshells/tails left behind by the bridge's `tail | while read`
+# pipeline. Without this, s6 restart leaves duplicate bridges that each
+# process every message.
+pkill -9 -f /usr/local/bin/signal-bridge 2>/dev/null || true
+pkill -9 -f "tail -F -n0 .*signal-daemon.log" 2>/dev/null || true
+exit 0

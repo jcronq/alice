@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Auto-commit + push for alice-mind. Intended to run from a systemd timer.
+# No-op if there's nothing to commit.
+
+set -euo pipefail
+
+REPO="${REPO:-$HOME/alice-mind}"
+cd "$REPO"
+
+# Quick no-op check: nothing staged, nothing unstaged, nothing untracked.
+if git diff --quiet \
+   && git diff --cached --quiet \
+   && [[ -z "$(git ls-files --others --exclude-standard)" ]]; then
+    exit 0
+fi
+
+# Pull with rebase first so we don't race a manual push from elsewhere.
+# --autostash handles the uncommitted changes we're about to commit.
+git pull --rebase --autostash 2>&1 || {
+    echo "auto-push: pull --rebase failed — leaving working tree alone" >&2
+    exit 1
+}
+
+git add -A
+
+# Staging may have produced no change (e.g. all paths are gitignored).
+if git diff --cached --quiet; then
+    exit 0
+fi
+
+count=$(git diff --cached --name-only | wc -l)
+msg="auto: $(date -Iseconds) — ${count} file(s)"
+
+git commit -m "$msg"
+git push

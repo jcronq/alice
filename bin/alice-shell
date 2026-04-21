@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Drop into a bash shell inside Alice's sandbox. Useful for debugging.
+set -euo pipefail
+
+"$(dirname "$0")/alice-up"
+
+exec docker exec -u alice -it alice bash

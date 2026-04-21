@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# alice-init — first-run setup for a fresh Alice install.
+#
+# Prompts for:
+#   1. Where Alice's mind lives (existing repo URL, existing local path,
+#      or new local scaffold).
+#   2. Signal account + allowlisted senders, to seed ~/.config/alice/alice.env.
+#
+# Does NOT:
+#   - Register the signal-cli account (interactive `signal-cli link`).
+#   - Create a GitHub repo for the mind (user runs `gh repo create` if/when).
+#   - Start the container (prints the command).
+#
+# Usage:
+#   alice-init                 # interactive, targets ~/alice-mind
+#   alice-init --target PATH   # scaffold into a different dir
+#   alice-init --yes           # accept defaults; don't prompt
+
+set -euo pipefail
+
+ALICE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCAFFOLD_SRC="$ALICE_ROOT/templates/mind-scaffold"
+TARGET="$HOME/alice-mind"
+NON_INTERACTIVE=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --target)   TARGET="$2"; shift 2 ;;
+        --target=*) TARGET="${1#--target=}"; shift ;;
+        --yes|-y)   NON_INTERACTIVE=1; shift ;;
+        -h|--help)
+            sed -n '3,19p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "alice-init: unexpected arg '$1'" >&2
+            exit 2
+            ;;
+    esac
+done
+
+ask() {
+    # ask PROMPT DEFAULT
+    local prompt="$1" default="${2:-}"
+    if [ "$NON_INTERACTIVE" -eq 1 ]; then
+        printf '%s\n' "$default"
+        return
+    fi
+    local reply
+    if [ -n "$default" ]; then
+        read -r -p "$prompt [$default]: " reply
+    else
+        read -r -p "$prompt: " reply
+    fi
+    printf '%s\n' "${reply:-$default}"
+}
+
+confirm() {
+    # confirm PROMPT DEFAULT(y|n)
+    local prompt="$1" default="${2:-y}"
+    if [ "$NON_INTERACTIVE" -eq 1 ]; then
+        [ "$default" = "y" ]
+        return
+    fi
+    local reply
+    read -r -p "$prompt [$default]: " reply
+    reply="${reply:-$default}"
+    case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+echo "=== Alice first-run setup ==="
+echo
+
+# ----- mind source -----
+echo "Where should Alice's mind live?"
+echo "  1) git clone an existing repo"
+echo "  2) use an existing local directory"
+echo "  3) create a fresh one from the default scaffold"
+choice=$(ask "Pick 1/2/3" "3")
+
+case "$choice" in
+    1)
+        url=$(ask "git URL (https or ssh)")
+        if [ -z "$url" ]; then
+            echo "no URL given, aborting" >&2
+            exit 1
+        fi
+        target=$(ask "clone target path" "$TARGET")
+        if [ -e "$target" ]; then
+            echo "$target already exists — refusing to clobber" >&2
+            exit 1
+        fi
+        git clone "$url" "$target"
+        TARGET="$target"
+        ;;
+    2)
+        path=$(ask "existing mind path" "$TARGET")
+        if [ ! -d "$path" ]; then
+            echo "$path is not a directory" >&2
+            exit 1
+        fi
+        TARGET="$path"
+        if [ ! -d "$TARGET/.git" ]; then
+            if confirm "No git repo in $TARGET. git init it?" "y"; then
+                ( cd "$TARGET" && git init -q -b master )
+            fi
+        fi
+        ;;
+    3|*)
+        target=$(ask "scaffold target path" "$TARGET")
+        if [ -e "$target" ]; then
+            if ! confirm "$target exists. overlay scaffold into it?" "n"; then
+                exit 1
+            fi
+        fi
+        mkdir -p "$target"
+        # Copy scaffold preserving hidden files (.claude/, .githooks/, etc.)
+        cp -a "$SCAFFOLD_SRC"/. "$target"/
+        TARGET="$target"
+        if [ ! -d "$TARGET/.git" ]; then
+            (
+                cd "$TARGET"
+                git init -q -b master
+                git config core.hooksPath .githooks
+                git add -A
+                git commit -q -m "Initial scaffold from alice-init"
+            )
+            echo "initialized git repo at $TARGET (no remote set)"
+        fi
+        ;;
+esac
+
+echo "mind: $TARGET"
+echo
+
+# ----- alice.env -----
+cfg_dir="$HOME/.config/alice"
+cfg_file="$cfg_dir/alice.env"
+mkdir -p "$cfg_dir"
+
+if [ -f "$cfg_file" ]; then
+    echo "$cfg_file already exists; leaving it alone."
+else
+    echo "=== Signal config (stored in $cfg_file) ==="
+    echo "You'll still need to register the account via 'signal-cli link' later."
+    echo
+    signal_account=$(ask "SIGNAL_ACCOUNT (E.164, e.g. +15555550100)")
+    allowed_senders=$(ask "ALLOWED_SENDERS (comma-separated, e.g. +15555551212:Alice)")
+
+    cp "$ALICE_ROOT/config/alice.env.example" "$cfg_file"
+    # Use python for safe sed replacement (handles metacharacters).
+    python3 - "$cfg_file" "$signal_account" "$allowed_senders" <<'PY'
+import sys, pathlib
+path, account, senders = sys.argv[1], sys.argv[2], sys.argv[3]
+txt = pathlib.Path(path).read_text()
+txt = txt.replace("SIGNAL_ACCOUNT=\n", f"SIGNAL_ACCOUNT={account}\n")
+txt = txt.replace("ALLOWED_SENDERS=\n", f"ALLOWED_SENDERS={senders}\n")
+pathlib.Path(path).write_text(txt)
+PY
+    chmod 600 "$cfg_file"
+    echo "wrote $cfg_file"
+fi
+
+# ----- wrap-up -----
+cat <<EOF
+
+=== Next steps ===
+
+1. Register Signal (once, interactive):
+      signal-cli -a "$(. "$cfg_file" && echo "\$SIGNAL_ACCOUNT")" link -n "Alice"
+   Scan the QR code with your phone's Signal app.
+
+2. Personalize Alice's mind:
+      editor $TARGET/IDENTITY.md
+      editor $TARGET/CLAUDE.md
+      editor $TARGET/USER.md
+
+3. Add $ALICE_ROOT/bin to your PATH, then:
+      alice-up        # starts the sandbox
+      alice           # talk to her
+
+4. Optional: create a private github repo for the mind:
+      cd $TARGET
+      gh repo create --private --source . --push
+
+EOF

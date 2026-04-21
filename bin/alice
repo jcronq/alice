@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Run `claude` inside Alice's sandbox. Forwards all args and stdin/stdout.
+#
+# Usage:
+#   alice                          # interactive chat
+#   alice "what's on today?"       # one-shot
+#   alice -p "summary" --resume ID # any claude CLI flags
+set -euo pipefail
+
+"$(dirname "$0")/alice-up"
+
+# -i (stdin open) + -t (tty) only if we have a terminal, else no -t for piped input.
+if [ -t 0 ] && [ -t 1 ]; then
+    exec docker exec -u alice -it alice claude "$@"
+else
+    exec docker exec -u alice -i alice claude "$@"
+fi

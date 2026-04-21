@@ -1,0 +1,6 @@
+# Large data exports (keep references, not raw data)
+data/health-export/
+
+# Local-only state
+.openclaw/
+logs/

@@ -1,0 +1,73 @@
+# Alice's sandbox. One long-lived container; commands via `docker exec`.
+# Volumes mounted at container-create time. Paths use $HOME so this works on
+# Linux and macOS without edits.
+#
+# If you have personal tools you want Alice to reach (smart-home CLIs etc.),
+# drop a docker-compose.override.yml in the same directory to add more volume
+# mounts, environment, or extra_hosts entries. Compose will merge it on top.
+
+services:
+  alice:
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+      args:
+        USER_ID: ${USER_ID:-1000}
+        GROUP_ID: ${GROUP_ID:-1000}
+    image: alice-sandbox:latest
+    container_name: alice
+    restart: unless-stopped
+    # s6-overlay (/init) is its own PID-1-capable init; don't let docker-init
+    # wrap it — it has to run as PID 1 directly.
+
+    # Outbound to host services (signal-cli daemon was host-side; kept for any
+    # host services a user wants to reach). `host.docker.internal` is provided
+    # automatically by Docker Desktop on macOS; on Linux it's wired via
+    # extra_hosts below.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    environment:
+      # Signal daemon runs IN the container; bridge reaches it locally.
+      SIGNAL_API: "http://127.0.0.1:8080"
+      # In the container there's no systemd journal; the bridge tails the
+      # daemon's log file instead.
+      SIGNAL_LOG_FILE: "/home/alice/.local/state/alice/signal-daemon.log"
+      TZ: "${ALICE_TZ:-America/New_York}"
+      # /home/alice/alice-tools/bin is first so user sidecars can shadow
+      # built-in commands if they want. Baked runtime scripts live in
+      # /usr/local/bin.
+      PATH: "/home/alice/alice-tools/bin:/home/alice/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+    volumes:
+      # Alice's brain: fully read/write, persists on host.
+      - ${HOME}/alice-mind:/home/alice/alice-mind:rw
+      # Personal sidecars (optional). If you don't have an alice-tools dir,
+      # the mount is empty — everything runtime is already baked into the image.
+      - ${HOME}/alice-tools:/home/alice/alice-tools:rw
+      # GitHub auth: read-only mount of your gh config. `gh auth git-credential`
+      # inside the container reuses the host token for git push.
+      - ${HOME}/.config/gh:/home/alice/.config/gh:ro
+      # SSH keys (for outbound ssh). Read-only; keys are not writable.
+      - ${HOME}/.ssh:/home/alice/.ssh:ro
+      # Per-host config (alice.env — SIGNAL_ACCOUNT, ALLOWED_SENDERS, etc.).
+      - ${HOME}/.config/alice:/home/alice/.config/alice:ro
+      # signal-cli registration state (account keys, attachments, avatars).
+      # Lives on host so upgrades / container recreates don't force re-registration.
+      - ${HOME}/.local/share/signal-cli:/home/alice/.local/share/signal-cli:rw
+      # Bridge runtime state — signal-to-session pointers, lock files, logs.
+      - ${HOME}/.local/state/alice:/home/alice/.local/state/alice:rw
+      # Claude Code session state (project sessions, skills cache, etc.). Kept
+      # on the host so container recreation doesn't wipe conversation history.
+      - ${HOME}/.alice-claude:/home/alice/.claude:rw
+      # Share host's Claude credentials (OAuth token) so the container is
+      # authenticated without a separate /login flow. File mount takes
+      # precedence over the dir mount above.
+      - ${HOME}/.claude/.credentials.json:/home/alice/.claude/.credentials.json:ro
+      # Share host's top-level Claude config (mcp servers, settings, etc.).
+      - ${HOME}/.claude.json:/home/alice/.claude.json:ro
+
+    working_dir: /home/alice/alice-mind
+    # s6-overlay (/init) starts signal-daemon, signal-bridge, alice-autopush,
+    # then runs this command as PID-after-init to keep the container alive.
+    command: ["sleep", "infinity"]

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Stop Alice's sandbox. Use --rm to also remove the container (wipes anything
+# that was only inside the container filesystem — volumes persist either way).
+set -euo pipefail
+
+cd "$(dirname "$0")/../sandbox"
+
+if [ "${1:-}" = "--rm" ]; then
+    docker compose down
+else
+    docker stop alice 2>/dev/null || true
+fi

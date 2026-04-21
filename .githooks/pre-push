@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Pre-push secret scanner.
+# Blocks the push if any commit in the range about to be pushed contains a
+# known secret pattern.  Designed to work without external deps (no gitleaks).
+#
+# Users are expected to extend PATTERNS in their own mind's .githooks/pre-push
+# with literals they know have leaked (rotate + blocklist — belt and braces).
+
+set -euo pipefail
+
+PATTERNS=(
+    # Hue API keys — 40-char alnum tokens in proximity to `api_key=`
+    '\b[A-Za-z0-9]{40}\b.*api_key|api_key.*\b[A-Za-z0-9]{40}\b'
+    # Home Assistant long-lived access tokens (JWT-ish, ~180+ chars of base64)
+    'eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}'
+    # AWS access key ID
+    'AKIA[0-9A-Z]{16}'
+    # Anthropic API keys — `sk-ant-...` followed by enough entropy to be real
+    'sk-ant-[a-zA-Z0-9_-]{40,}'
+    # GitHub personal access tokens
+    'gh[pousr]_[A-Za-z0-9]{36,}'
+    # Slack tokens
+    'xox[baprs]-[A-Za-z0-9-]{10,}'
+)
+
+z40="0000000000000000000000000000000000000000"
+
+while IFS= read -r line; do
+    local_ref=$(echo "$line" | awk '{print $1}')
+    local_sha=$(echo "$line" | awk '{print $2}')
+    remote_ref=$(echo "$line" | awk '{print $3}')
+    remote_sha=$(echo "$line" | awk '{print $4}')
+
+    [[ "$local_sha" == "$z40" ]] && continue  # deletion
+
+    if [[ "$remote_sha" == "$z40" ]]; then
+        range="$local_sha"
+        commits=$(git rev-list "$local_sha")
+    else
+        range="$remote_sha..$local_sha"
+        commits=$(git rev-list "$range")
+    fi
+
+    [[ -z "$commits" ]] && continue
+
+    for pattern in "${PATTERNS[@]}"; do
+        # Scan added lines in every commit in the push range.
+        # Exclude .claude/sessions/ — conversation transcripts routinely
+        # include benign mentions of secret-shaped strings and aren't a real
+        # leak surface on their own.
+        if git log -p "$range" -- . ':(exclude).claude/sessions' 2>/dev/null | grep -E "^\+" | grep -E "$pattern" -q; then
+            echo "BLOCKED: pattern '$pattern' found in commits about to be pushed."
+            echo "Review with:  git log -p $range -- . ':(exclude).claude/sessions' | grep -E '$pattern' -B3"
+            echo "Rewrite history or remove the secret before pushing."
+            exit 1
+        fi
+    done
+done
+
+exit 0

@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# event-log — append a structured event to ~/alice-mind/memory/events.jsonl
+#
+# Usage:
+#   event-log <type> <subject> <key>=<value> [<key>=<value> ...] [--source <src>]
+#
+# Example:
+#   event-log weight user lbs=215.1 scale=hume --source apple_health
+#   event-log workout user split=upper completed=true
+#   event-log meal user meal=breakfast kcal=470 protein_g=44
+#
+# See memory/EVENTS-SCHEMA.md for the schema.
+
+set -euo pipefail
+
+EVENTS_FILE="${EVENTS_FILE:-$HOME/alice-mind/memory/events.jsonl}"
+
+if [[ $# -lt 2 ]]; then
+    cat >&2 <<EOF
+usage: event-log <type> <subject> [key=value ...] [--source <src>]
+
+types:   meal | workout | weight | reminder | error | note | correction
+subject: user | system | <name> | ...
+
+see: memory/EVENTS-SCHEMA.md
+EOF
+    exit 2
+fi
+
+type="$1"; shift
+subject="$1"; shift
+source_val="manual"
+
+# Collect key=value pairs into a jq object; recognize --source as a flag
+data_args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --source)
+            source_val="$2"; shift 2 ;;
+        --source=*)
+            source_val="${1#--source=}"; shift ;;
+        *=*)
+            data_args+=("$1"); shift ;;
+        *)
+            echo "event-log: unexpected arg '$1'" >&2
+            exit 2 ;;
+    esac
+done
+
+# Build the JSON object with jq so values are escaped correctly.
+# Numeric-looking values are parsed as numbers; "true"/"false" as booleans; else strings.
+jq_program='{ts: $ts, type: $type, subject: $subject, data: ($data | fromjson), source: $source}'
+
+data_json="{}"
+if [[ ${#data_args[@]} -gt 0 ]]; then
+    # Build up a small JSON object incrementally
+    data_json=$(printf '%s\n' "${data_args[@]}" | awk -F= '
+        BEGIN { printf "{" }
+        NR > 1 { printf "," }
+        {
+            key = $1
+            # Reconstruct value in case it contained =
+            $1 = ""; sub(/^=/, "")
+            val = $0
+            # Trim any leading space awk inserted
+            sub(/^ /, "", val)
+            # Decide type
+            if (val ~ /^-?[0-9]+(\.[0-9]+)?$/)            printf "\"%s\": %s", key, val
+            else if (val == "true" || val == "false")     printf "\"%s\": %s", key, val
+            else {
+                gsub(/\\/, "\\\\", val)
+                gsub(/"/, "\\\"", val)
+                printf "\"%s\": \"%s\"", key, val
+            }
+        }
+        END { printf "}" }
+    ')
+fi
+
+ts=$(date -Iseconds)  # ISO-8601 with timezone offset
+
+mkdir -p "$(dirname "$EVENTS_FILE")"
+jq -cn \
+    --arg ts "$ts" \
+    --arg type "$type" \
+    --arg subject "$subject" \
+    --arg data "$data_json" \
+    --arg source "$source_val" \
+    "$jq_program" \
+    >> "$EVENTS_FILE"
+
+echo "logged: $type/$subject at $ts"
