@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Start Alice's sandbox (daemon + worker) if not already running. Idempotent.
-# Readiness = worker has acquired its lease (file /state/worker/lease-held
-# exists inside the container).
+# Start Alice's sandbox (daemon + one worker slot) if not already running.
+# Idempotent. Readiness = some worker holds the flock on /state/worker/lease.
 set -euo pipefail
 
 cd "$(dirname "$0")/../sandbox"
@@ -9,22 +8,43 @@ cd "$(dirname "$0")/../sandbox"
 export USER_ID="${USER_ID:-$(id -u)}"
 export GROUP_ID="${GROUP_ID:-$(id -g)}"
 
-# Are both services already up?
-daemon_state="$(docker inspect -f '{{.State.Status}}' alice-daemon 2>/dev/null || echo 'missing')"
-worker_state="$(docker inspect -f '{{.State.Status}}' alice-worker 2>/dev/null || echo 'missing')"
+# Is a worker already up and holding the lease?
+for name in alice-worker-blue alice-worker-green; do
+    state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || echo missing)"
+    if [ "$state" = "running" ]; then
+        if ! docker exec "$name" flock -n /state/worker/lease true 2>/dev/null; then
+            exit 0  # already live
+        fi
+    fi
+done
 
-if [ "$daemon_state" = "running" ] && [ "$worker_state" = "running" ]; then
-    # Already up — but wait for lease if worker just started.
-    :
-else
-    docker compose up -d
+# Bring up the daemon.
+docker compose up -d alice-daemon >/dev/null
+
+# Pick a worker slot to bring up. Prefer blue on cold start; if blue has a
+# previously-built image that isn't latest, still fine — it holds the image
+# it was tagged with at last deploy.
+if ! docker image inspect alice-worker:blue >/dev/null 2>&1 \
+   && ! docker image inspect alice-worker:green >/dev/null 2>&1; then
+    # Very first start — build + tag :blue.
+    docker compose --profile blue build alice-worker-blue >/dev/null
+    docker tag alice-worker:blue alice-worker:blue 2>/dev/null || true
 fi
 
-# Wait until some worker has acquired the lease (flock held = bridge live).
+# Start whichever slot has a built image (prefer blue).
+if docker image inspect alice-worker:blue >/dev/null 2>&1; then
+    docker compose --profile blue up -d alice-worker-blue >/dev/null
+elif docker image inspect alice-worker:green >/dev/null 2>&1; then
+    docker compose --profile green up -d alice-worker-green >/dev/null
+fi
+
+# Wait for a worker to acquire the lease.
 for _ in $(seq 1 90); do
-    for name in $(docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null); do
-        if ! docker exec "$name" flock -n /state/worker/lease true 2>/dev/null; then
-            exit 0
+    for name in alice-worker-blue alice-worker-green; do
+        if docker ps --filter "name=^${name}$" --format '{{.Names}}' | grep -q .; then
+            if ! docker exec "$name" flock -n /state/worker/lease true 2>/dev/null; then
+                exit 0
+            fi
         fi
     done
     sleep 0.5

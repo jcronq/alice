@@ -12,14 +12,16 @@ case "$target" in
         exec docker exec -u alice -it alice-daemon bash
         ;;
     worker|"")
-        # Pick the lease-holding worker.
+        # Pick the lease-holding worker (blue or green).
         for name in $(docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null); do
             if ! docker exec "$name" flock -n /state/worker/lease true 2>/dev/null; then
                 exec docker exec -u alice -it "$name" bash
             fi
         done
-        # No lease holder; fall back to canonical name.
-        exec docker exec -u alice -it alice-worker bash
+        # No lease holder; pick any running worker.
+        any=$(docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null | head -n1)
+        [ -n "$any" ] && exec docker exec -u alice -it "$any" bash
+        echo "alice-shell: no worker running" >&2; exit 1
         ;;
     *)
         echo "alice-shell: unknown target '$target' (expected 'worker' or 'daemon')" >&2

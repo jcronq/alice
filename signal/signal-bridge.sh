@@ -251,6 +251,9 @@ process_message() {
     local lock_file="$LOCK_DIR/${sender//+/}.lock"
 
     (
+        # Send immediately so the user sees typing right away, then every
+        # 10s to keep Signal's 15s typing-indicator TTL refreshed.
+        send_typing "$sender"
         while true; do
             sleep 10
             send_typing "$sender"

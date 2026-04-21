@@ -1,12 +1,15 @@
-# Alice's sandbox — split-container layout for blue/green deploys.
+# Alice's sandbox — blue/green split-container layout.
 #
 #   alice-daemon:       signal-cli only, singleton
-#   alice-worker:       bridge + claude + autopush, the live worker
-#   alice-worker-next:  used only during a blue/green deploy (profile=deploy)
+#   alice-worker-blue:  a worker slot; exactly one of blue/green is live
+#   alice-worker-green: the other worker slot
 #
-# Both workers share the `worker-base` anchor — identical volumes, env,
-# network — but use different image tags. During a deploy, -next is started
-# from :candidate, acquires the lease, then replaces the live one.
+# Only ONE of blue/green is running normally. The deploy script alternates
+# which slot takes the new image. The live one holds an exclusive flock on
+# /state/worker/lease; the other, if alive, blocks on the flock and waits.
+#
+# On first start, `compose up` brings up alice-worker-blue only (profile
+# selection via COMPOSE_PROFILES or `--profile` flag).
 #
 # Personal sidecars go in docker-compose.override.yml.
 
@@ -65,18 +68,19 @@ services:
       - ${HOME}/.local/share/signal-cli:/home/alice/.local/share/signal-cli:rw
       - ${HOME}/.local/state/alice:/state:rw
 
-  alice-worker:
+  alice-worker-blue:
     <<: *worker-base
-    image: alice-worker:latest
-    container_name: alice-worker
-    hostname: alice-worker
+    image: alice-worker:blue
+    container_name: alice-worker-blue
+    hostname: alice-worker-blue
+    profiles: ["blue"]
 
-  alice-worker-next:
+  alice-worker-green:
     <<: *worker-base
-    image: alice-worker:candidate
-    container_name: alice-worker-next
-    hostname: alice-worker-next
-    profiles: ["deploy"]
+    image: alice-worker:green
+    container_name: alice-worker-green
+    hostname: alice-worker-green
+    profiles: ["green"]
 
 networks:
   alice-net:

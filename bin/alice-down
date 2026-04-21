@@ -6,9 +6,11 @@ set -euo pipefail
 cd "$(dirname "$0")/../sandbox"
 
 if [ "${1:-}" = "--rm" ]; then
-    docker compose down
+    docker compose --profile blue --profile green down
 else
-    # Stop in reverse dependency order so the worker drains first.
-    docker stop alice-worker 2>/dev/null || true
+    # Stop worker slots first (drains in-flight claude), then daemon.
+    for name in alice-worker-blue alice-worker-green; do
+        docker stop "$name" 2>/dev/null || true
+    done
     docker stop alice-daemon 2>/dev/null || true
 fi
