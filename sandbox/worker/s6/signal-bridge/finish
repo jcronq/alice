@@ -1,0 +1,8 @@
+#!/command/with-contenv bash
+# Runs after signal-bridge exits. Cleans up orphaned subshells/tails left
+# behind by the bridge's `tail | while read` pipeline, and ensures the
+# lease-held sentinel is cleared.
+pkill -9 -f /usr/local/bin/signal-bridge 2>/dev/null || true
+pkill -9 -f "tail -F.*signal-daemon.log" 2>/dev/null || true
+rm -f /state/worker/lease-held
+exit 0

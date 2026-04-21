@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# alice-deploy — blue/green update for Alice.
+#
+#   alice-deploy worker               # build + swap the worker image
+#   alice-deploy worker --rollback    # swap back to the previous image
+#   alice-deploy daemon               # update the daemon (brief reconnect)
+#   alice-deploy all                  # daemon, then worker
+#
+# Worker flow (blue/green, zero message loss):
+#   1. docker compose build alice-worker → :latest points at new image
+#   2. Retag: alice-worker:latest → :candidate (the tag used by
+#      alice-worker-next service in compose)
+#   3. Start alice-worker-next via compose --profile deploy.
+#      It blocks on flock (the live worker holds the lease).
+#   4. SIGTERM the live worker — its bridge drains in-flight claude calls,
+#      then exits. Lease releases.
+#   5. alice-worker-next acquires lease, does catchup, starts processing.
+#   6. Stop + remove live worker; rename -next → alice-worker.
+#   7. Retag: move :latest → :previous, then retag :candidate → :latest for
+#      the next cycle (and so the canonical service re-creates cleanly).
+#
+# If drain exceeds DRAIN_TIMEOUT, the old worker is SIGKILLed — catchup +
+# dedup on the new worker ensure no duplicate processing; worst case one
+# in-flight message gets the standard retry error.
+#
+# Rollback uses the same flow with the current :previous as the new :candidate.
+
+set -euo pipefail
+
+ALICE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SANDBOX_DIR="$ALICE_ROOT/sandbox"
+DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-300}"
+READY_TIMEOUT="${READY_TIMEOUT:-90}"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-60}"
+
+export USER_ID="${USER_ID:-$(id -u)}"
+export GROUP_ID="${GROUP_ID:-$(id -g)}"
+
+die() { echo "alice-deploy: $*" >&2; exit 1; }
+log() { echo "[$(date '+%H:%M:%S')] $*"; }
+
+usage() { sed -n '3,26p' "$0"; }
+
+compose() {
+    ( cd "$SANDBOX_DIR" && USER_ID="$USER_ID" GROUP_ID="$GROUP_ID" docker compose "$@" )
+}
+
+# ---------- tag rotation ----------
+tag_image() {
+    local image="$1" src="$2" dest="$3"
+    docker tag "$image:$src" "$image:$dest"
+}
+
+has_tag() {
+    docker image inspect "$1" >/dev/null 2>&1
+}
+
+# ---------- readiness ----------
+wait_bridge_running() {
+    # Worker container alive + bridge process spawned (blocked on flock or running).
+    local name="$1" timeout="${2:-$READY_TIMEOUT}"
+    local i
+    for ((i=0; i<timeout*2; i++)); do
+        if docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null | grep -q running; then
+            if docker exec "$name" pgrep -f /usr/local/bin/signal-bridge >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+wait_lease_held() {
+    local name="$1" timeout="${2:-$READY_TIMEOUT}"
+    local i
+    for ((i=0; i<timeout*2; i++)); do
+        if docker exec "$name" test -f /state/worker/lease-held 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+wait_daemon_healthy() {
+    local timeout="${1:-$HEALTH_TIMEOUT}"
+    local i
+    for ((i=0; i<timeout*2; i++)); do
+        [ "$(docker inspect -f '{{.State.Health.Status}}' alice-daemon 2>/dev/null || echo "")" = "healthy" ] \
+            && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
+# ---------- worker deploy ----------
+deploy_worker() {
+    local mode="${1:-build}"     # 'build' or 'rollback'
+    local image="alice-worker"
+
+    # Produce the candidate image.
+    if [ "$mode" = "rollback" ]; then
+        has_tag "$image:previous" || die "no $image:previous image to roll back to"
+        log "Rolling back worker to :previous"
+        tag_image "$image" "previous" "candidate"
+    else
+        log "Building $image (new candidate) ..."
+        compose build alice-worker
+        # compose build tags as :latest. Retag to :candidate; we'll move
+        # :latest only after the swap succeeds.
+        tag_image "$image" "latest" "candidate"
+    fi
+
+    # Clean up any stale -next from a prior failed deploy.
+    docker rm -f alice-worker-next >/dev/null 2>&1 || true
+
+    log "Starting alice-worker-next from $image:candidate ..."
+    compose --profile deploy up -d --no-build alice-worker-next >/dev/null
+
+    log "Waiting for alice-worker-next bridge process to start ..."
+    if ! wait_bridge_running alice-worker-next; then
+        log "alice-worker-next failed to reach running state"
+        docker logs --tail 80 alice-worker-next 2>&1 || true
+        docker rm -f alice-worker-next >/dev/null 2>&1 || true
+        die "deploy aborted (bridge never started in the next worker)"
+    fi
+
+    log "SIGTERM → alice-worker (drain up to ${DRAIN_TIMEOUT}s) ..."
+    docker kill --signal=SIGTERM alice-worker 2>/dev/null || true
+
+    log "Waiting for alice-worker-next to acquire lease ..."
+    if ! wait_lease_held alice-worker-next "$DRAIN_TIMEOUT"; then
+        log "drain timeout — SIGKILLing alice-worker"
+        docker kill alice-worker 2>/dev/null || true
+        if ! wait_lease_held alice-worker-next 30; then
+            docker logs --tail 80 alice-worker-next 2>&1 || true
+            docker rm -f alice-worker-next >/dev/null 2>&1 || true
+            die "deploy FAILED: next worker could not acquire lease"
+        fi
+    fi
+
+    log "alice-worker-next is live. Swapping names ..."
+    docker stop alice-worker >/dev/null 2>&1 || true
+    docker rm alice-worker >/dev/null 2>&1 || true
+    docker rename alice-worker-next alice-worker
+
+    # Rotate tags.
+    has_tag "$image:latest" && tag_image "$image" "latest" "previous"
+    tag_image "$image" "candidate" "latest"
+    log "Worker now running $image:latest."
+}
+
+# ---------- daemon deploy ----------
+deploy_daemon() {
+    local image="alice-daemon"
+    log "Building $image ..."
+    compose build alice-daemon
+    tag_image "$image" "latest" "candidate"
+
+    log "Recreating alice-daemon (worker will briefly fail to reach it — messages buffer on Signal) ..."
+    compose up -d --no-build --no-deps --force-recreate alice-daemon >/dev/null
+
+    if ! wait_daemon_healthy; then
+        die "daemon did not become healthy; check 'docker logs alice-daemon'"
+    fi
+
+    has_tag "$image:latest" && tag_image "$image" "latest" "previous" 2>/dev/null || true
+    tag_image "$image" "candidate" "latest"
+    log "Daemon now running $image:latest."
+}
+
+# ---------- dispatch ----------
+case "${1:-}" in
+    worker)
+        if [ "${2:-}" = "--rollback" ]; then
+            deploy_worker "rollback"
+        else
+            deploy_worker "build"
+        fi
+        ;;
+    daemon)
+        deploy_daemon
+        ;;
+    all)
+        deploy_daemon
+        deploy_worker "build"
+        ;;
+    -h|--help|"")
+        usage
+        ;;
+    *)
+        usage; exit 2 ;;
+esac

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Start Alice's sandbox container if it isn't already running. Idempotent.
+# Start Alice's sandbox (daemon + worker) if not already running. Idempotent.
+# Readiness = worker has acquired its lease (file /state/worker/lease-held
+# exists inside the container).
 set -euo pipefail
 
 cd "$(dirname "$0")/../sandbox"
@@ -7,19 +9,27 @@ cd "$(dirname "$0")/../sandbox"
 export USER_ID="${USER_ID:-$(id -u)}"
 export GROUP_ID="${GROUP_ID:-$(id -g)}"
 
-state="$(docker inspect -f '{{.State.Status}}' alice 2>/dev/null || echo 'missing')"
+# Are both services already up?
+daemon_state="$(docker inspect -f '{{.State.Status}}' alice-daemon 2>/dev/null || echo 'missing')"
+worker_state="$(docker inspect -f '{{.State.Status}}' alice-worker 2>/dev/null || echo 'missing')"
 
-case "$state" in
-    running) exit 0 ;;
-    missing) docker compose up -d ;;
-    *)       docker start alice >/dev/null ;;
-esac
+if [ "$daemon_state" = "running" ] && [ "$worker_state" = "running" ]; then
+    # Already up — but wait for lease if worker just started.
+    :
+else
+    docker compose up -d
+fi
 
-# Wait until the container is ready (a simple exec succeeds).
-for _ in $(seq 1 30); do
-    if docker exec alice true 2>/dev/null; then exit 0; fi
-    sleep 0.2
+# Wait until the worker has acquired its lease (or some worker has —
+# during blue/green there may be multiple).
+for _ in $(seq 1 90); do
+    for name in $(docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null); do
+        if docker exec "$name" test -f /state/worker/lease-held 2>/dev/null; then
+            exit 0
+        fi
+    done
+    sleep 0.5
 done
 
-echo "alice-up: container did not become ready" >&2
+echo "alice-up: no worker acquired the lease within 45s" >&2
 exit 1

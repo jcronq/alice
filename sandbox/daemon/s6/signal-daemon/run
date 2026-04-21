@@ -1,0 +1,20 @@
+#!/command/with-contenv bash
+# signal-cli HTTP daemon. Runs as alice.
+# stdout/stderr → /state/daemon/signal-daemon.log (a shared volume the worker
+# container tails for inbound messages).
+set -e
+set -a
+# shellcheck disable=SC1091
+source /home/alice/.config/alice/alice.env
+set +a
+: "${SIGNAL_ACCOUNT:?SIGNAL_ACCOUNT must be set in alice.env}"
+
+LOG_FILE=/state/daemon/signal-daemon.log
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE"
+chown alice:alice "$LOG_FILE"
+
+# Bind 0.0.0.0:8080 so the worker container can reach via Docker network.
+exec s6-setuidgid alice bash -c \
+    'exec signal-cli -a "$1" -o json daemon --http 0.0.0.0:8080 >> "$2" 2>&1' \
+    -- "$SIGNAL_ACCOUNT" "$LOG_FILE"

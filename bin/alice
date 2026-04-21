@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Run `claude` inside Alice's sandbox. Forwards all args and stdin/stdout.
+# Run `claude` inside Alice's sandbox. Targets the worker that currently holds
+# the message-processing lease, so the call goes to the live bridge in either
+# steady state or mid-blue/green.
 #
 # Usage:
 #   alice                          # interactive chat
@@ -9,9 +11,23 @@ set -euo pipefail
 
 "$(dirname "$0")/alice-up"
 
-# -i (stdin open) + -t (tty) only if we have a terminal, else no -t for piped input.
+# Pick the worker holding the lease. If none (transient during handoff), fall
+# back to the canonical name.
+pick_worker() {
+    local name
+    for name in $(docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null); do
+        if docker exec "$name" test -f /state/worker/lease-held 2>/dev/null; then
+            printf '%s\n' "$name"
+            return 0
+        fi
+    done
+    printf 'alice-worker\n'
+}
+
+WORKER="$(pick_worker)"
+
 if [ -t 0 ] && [ -t 1 ]; then
-    exec docker exec -u alice -it alice claude "$@"
+    exec docker exec -u alice -it "$WORKER" claude "$@"
 else
-    exec docker exec -u alice -i alice claude "$@"
+    exec docker exec -u alice -i "$WORKER" claude "$@"
 fi

@@ -1,73 +1,84 @@
-# Alice's sandbox. One long-lived container; commands via `docker exec`.
-# Volumes mounted at container-create time. Paths use $HOME so this works on
-# Linux and macOS without edits.
+# Alice's sandbox — split-container layout for blue/green deploys.
 #
-# If you have personal tools you want Alice to reach (smart-home CLIs etc.),
-# drop a docker-compose.override.yml in the same directory to add more volume
-# mounts, environment, or extra_hosts entries. Compose will merge it on top.
+#   alice-daemon:       signal-cli only, singleton
+#   alice-worker:       bridge + claude + autopush, the live worker
+#   alice-worker-next:  used only during a blue/green deploy (profile=deploy)
+#
+# Both workers share the `worker-base` anchor — identical volumes, env,
+# network — but use different image tags. During a deploy, -next is started
+# from :candidate, acquires the lease, then replaces the live one.
+#
+# Personal sidecars go in docker-compose.override.yml.
+
+x-worker-base: &worker-base
+  build:
+    context: ..
+    dockerfile: sandbox/worker/Dockerfile
+    args:
+      USER_ID: ${USER_ID:-1000}
+      GROUP_ID: ${GROUP_ID:-1000}
+  restart: unless-stopped
+  depends_on:
+    alice-daemon:
+      condition: service_healthy
+  networks:
+    - alice-net
+  labels:
+    alice.role: worker
+  environment:
+    SIGNAL_API: "http://alice-daemon:8080"
+    SIGNAL_LOG_FILE: "/state/daemon/signal-daemon.log"
+    STATE_DIR: "/state/worker"
+    TZ: "${ALICE_TZ:-America/New_York}"
+    PATH: "/home/alice/alice-tools/bin:/home/alice/.local/bin:/usr/local/bin:/usr/bin:/bin"
+  volumes:
+    - ${HOME}/alice-mind:/home/alice/alice-mind:rw
+    - ${HOME}/alice-tools:/home/alice/alice-tools:rw
+    - ${HOME}/.config/gh:/home/alice/.config/gh:ro
+    - ${HOME}/.ssh:/home/alice/.ssh:ro
+    - ${HOME}/.config/alice:/home/alice/.config/alice:ro
+    - ${HOME}/.alice-claude:/home/alice/.claude:rw
+    - ${HOME}/.claude/.credentials.json:/home/alice/.claude/.credentials.json:ro
+    - ${HOME}/.claude.json:/home/alice/.claude.json:ro
+    - ${HOME}/.local/state/alice:/state:rw
+  working_dir: /home/alice/alice-mind
+  command: ["/usr/local/bin/entrypoint.sh", "sleep", "infinity"]
 
 services:
-  alice:
+  alice-daemon:
     build:
       context: ..
-      dockerfile: sandbox/Dockerfile
+      dockerfile: sandbox/daemon/Dockerfile
       args:
         USER_ID: ${USER_ID:-1000}
         GROUP_ID: ${GROUP_ID:-1000}
-    image: alice-sandbox:latest
-    container_name: alice
+    image: alice-daemon:latest
+    container_name: alice-daemon
+    hostname: alice-daemon
     restart: unless-stopped
-    # s6-overlay (/init) is its own PID-1-capable init; don't let docker-init
-    # wrap it — it has to run as PID 1 directly.
-
-    # Outbound to host services (signal-cli daemon was host-side; kept for any
-    # host services a user wants to reach). `host.docker.internal` is provided
-    # automatically by Docker Desktop on macOS; on Linux it's wired via
-    # extra_hosts below.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-
+    networks:
+      - alice-net
     environment:
-      # Signal daemon runs IN the container; bridge reaches it locally.
-      SIGNAL_API: "http://127.0.0.1:8080"
-      # In the container there's no systemd journal; the bridge tails the
-      # daemon's log file instead.
-      SIGNAL_LOG_FILE: "/home/alice/.local/state/alice/signal-daemon.log"
       TZ: "${ALICE_TZ:-America/New_York}"
-      # /home/alice/alice-tools/bin is first so user sidecars can shadow
-      # built-in commands if they want. Baked runtime scripts live in
-      # /usr/local/bin.
-      PATH: "/home/alice/alice-tools/bin:/home/alice/.local/bin:/usr/local/bin:/usr/bin:/bin"
-
     volumes:
-      # Alice's brain: fully read/write, persists on host.
-      - ${HOME}/alice-mind:/home/alice/alice-mind:rw
-      # Personal sidecars (optional). If you don't have an alice-tools dir,
-      # the mount is empty — everything runtime is already baked into the image.
-      - ${HOME}/alice-tools:/home/alice/alice-tools:rw
-      # GitHub auth: read-only mount of your gh config. `gh auth git-credential`
-      # inside the container reuses the host token for git push.
-      - ${HOME}/.config/gh:/home/alice/.config/gh:ro
-      # SSH keys (for outbound ssh). Read-only; keys are not writable.
-      - ${HOME}/.ssh:/home/alice/.ssh:ro
-      # Per-host config (alice.env — SIGNAL_ACCOUNT, ALLOWED_SENDERS, etc.).
       - ${HOME}/.config/alice:/home/alice/.config/alice:ro
-      # signal-cli registration state (account keys, attachments, avatars).
-      # Lives on host so upgrades / container recreates don't force re-registration.
       - ${HOME}/.local/share/signal-cli:/home/alice/.local/share/signal-cli:rw
-      # Bridge runtime state — signal-to-session pointers, lock files, logs.
-      - ${HOME}/.local/state/alice:/home/alice/.local/state/alice:rw
-      # Claude Code session state (project sessions, skills cache, etc.). Kept
-      # on the host so container recreation doesn't wipe conversation history.
-      - ${HOME}/.alice-claude:/home/alice/.claude:rw
-      # Share host's Claude credentials (OAuth token) so the container is
-      # authenticated without a separate /login flow. File mount takes
-      # precedence over the dir mount above.
-      - ${HOME}/.claude/.credentials.json:/home/alice/.claude/.credentials.json:ro
-      # Share host's top-level Claude config (mcp servers, settings, etc.).
-      - ${HOME}/.claude.json:/home/alice/.claude.json:ro
+      - ${HOME}/.local/state/alice:/state:rw
 
-    working_dir: /home/alice/alice-mind
-    # s6-overlay (/init) starts signal-daemon, signal-bridge, alice-autopush,
-    # then runs this command as PID-after-init to keep the container alive.
-    command: ["sleep", "infinity"]
+  alice-worker:
+    <<: *worker-base
+    image: alice-worker:latest
+    container_name: alice-worker
+    hostname: alice-worker
+
+  alice-worker-next:
+    <<: *worker-base
+    image: alice-worker:candidate
+    container_name: alice-worker-next
+    hostname: alice-worker-next
+    profiles: ["deploy"]
+
+networks:
+  alice-net:
+    name: alice-net
+    driver: bridge

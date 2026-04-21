@@ -1,7 +1,28 @@
 #!/usr/bin/env bash
-# Drop into a bash shell inside Alice's sandbox. Useful for debugging.
+# Drop into a bash shell inside Alice's sandbox (the lease-holding worker).
+# Pass "daemon" as first arg to shell into the daemon container instead.
 set -euo pipefail
 
 "$(dirname "$0")/alice-up"
 
-exec docker exec -u alice -it alice bash
+target="${1:-worker}"
+
+case "$target" in
+    daemon)
+        exec docker exec -u alice -it alice-daemon bash
+        ;;
+    worker|"")
+        # Pick the lease-holding worker.
+        for name in $(docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null); do
+            if docker exec "$name" test -f /state/worker/lease-held 2>/dev/null; then
+                exec docker exec -u alice -it "$name" bash
+            fi
+        done
+        # No lease holder; fall back to canonical name.
+        exec docker exec -u alice -it alice-worker bash
+        ;;
+    *)
+        echo "alice-shell: unknown target '$target' (expected 'worker' or 'daemon')" >&2
+        exit 2
+        ;;
+esac

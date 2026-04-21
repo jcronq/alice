@@ -1,24 +1,49 @@
 #!/bin/bash
 # Signal → Claude Code bridge.
-# Reads inbound messages from signal-cli's daemon journalctl stream,
-# runs them through `claude` with a per-sender session, and sends the reply back.
+#
+# Reads inbound messages from signal-cli's daemon log, runs them through
+# `claude` with a per-sender session, and sends the reply back via signal-cli's
+# JSON-RPC endpoint.
+#
+# Blue/green aware:
+# - Acquires an exclusive lease via flock before reading anything — only one
+#   bridge ever processes messages at a time. A second bridge starting up
+#   blocks on the lease until the first exits.
+# - Tracks byte offset into the daemon log so restarts don't miss or replay
+#   messages across bridge handoffs.
+# - Dedups on envelope timestamp as a safety net against log duplication.
+# - Drains gracefully on SIGTERM: waits for in-flight claude calls to finish,
+#   persists state, releases lease, exits cleanly.
 
 set -euo pipefail
 
-# Kill every subprocess we spawn (tail, background sends, etc.) on exit or
-# TERM/INT, so a supervisor restart doesn't leave orphan tails double-reading
-# the signal log and processing each message twice.
+# -------- traps + cleanup --------
+DRAINING=0
+TAIL_PID=""
+
 cleanup() {
     local ec=$?
     trap - EXIT
+    # Remove the readiness sentinel so the deploy script + alice wrapper
+    # immediately know we're gone.
+    rm -f "${LEASE_HELD_FILE:-}" 2>/dev/null || true
+    # Kill tail + any remaining subprocesses.
+    [ -n "$TAIL_PID" ] && kill -TERM "$TAIL_PID" 2>/dev/null || true
     jobs -p | xargs -r kill 2>/dev/null || true
-    # Also kill any descendants not tracked by jobs (grandchildren, the tail
-    # inside the `tail | while read` pipeline).
     pkill -P $$ 2>/dev/null || true
+    # Lease fd 9 closes on exit — kernel releases the flock automatically.
     exit "$ec"
 }
 trap cleanup EXIT INT TERM
 
+on_sigterm() {
+    DRAINING=1
+    log "SIGTERM received; entering drain mode"
+    # Poke the tail so the main read loop wakes up and notices DRAINING.
+    [ -n "$TAIL_PID" ] && kill -TERM "$TAIL_PID" 2>/dev/null || true
+}
+
+# -------- config --------
 ALICE_CONFIG="${ALICE_CONFIG:-$HOME/.config/alice/alice.env}"
 if [[ -r "$ALICE_CONFIG" ]]; then
     # shellcheck disable=SC1090
@@ -28,7 +53,6 @@ else
     exit 2
 fi
 
-# Validate required config
 : "${SIGNAL_API:?SIGNAL_API must be set in alice.env}"
 : "${SIGNAL_ACCOUNT:?SIGNAL_ACCOUNT must be set in alice.env}"
 : "${ALLOWED_SENDERS:?ALLOWED_SENDERS must be set in alice.env}"
@@ -36,14 +60,22 @@ fi
 CLAUDE_TIMEOUT="${CLAUDE_TIMEOUT:-240}"
 FLOCK_TIMEOUT="${FLOCK_TIMEOUT:-300}"
 CLAUDE_ALLOWED_TOOLS="${CLAUDE_ALLOWED_TOOLS:-Bash,Read,Write,Edit,Glob,Grep}"
+SIGNAL_LOG_FILE="${SIGNAL_LOG_FILE:-/state/daemon/signal-daemon.log}"
 
-LOG_FILE="${HOME}/.local/state/alice/signal-bridge.log"
-SESSION_DIR="${HOME}/.local/state/alice/signal-sessions"
-LOCK_DIR="/tmp/signal-bridge-locks"
+# Shared state dir across blue/green workers.
+STATE_DIR="${STATE_DIR:-/state/worker}"
+LOG_FILE="$STATE_DIR/signal-bridge.log"
+SESSION_DIR="$STATE_DIR/signal-sessions"
+LOCK_DIR="$STATE_DIR/locks"
+LEASE_FILE="$STATE_DIR/lease"
+LEASE_HELD_FILE="$STATE_DIR/lease-held"
+OFFSET_FILE="$STATE_DIR/offset"
+SEEN_FILE="$STATE_DIR/seen-timestamps"
+SEEN_MAX=1000
 
-mkdir -p "$(dirname "$LOG_FILE")" "$SESSION_DIR" "$LOCK_DIR"
+mkdir -p "$STATE_DIR" "$SESSION_DIR" "$LOCK_DIR"
 
-# Parse ALLOWED_SENDERS (format: "+15555550100:Name,+15555550101:Other") into NAMES map
+# -------- allowed-senders parse --------
 declare -A NAMES=()
 IFS=',' read -ra _pairs <<< "$ALLOWED_SENDERS"
 for _pair in "${_pairs[@]}"; do
@@ -53,17 +85,87 @@ for _pair in "${_pairs[@]}"; do
 done
 unset _pairs _pair _num _name
 
+# -------- log helper --------
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
 }
 
-# Send raw message via signal-cli daemon. Chunks at paragraph boundaries under 4000 chars.
+# -------- lease --------
+# fd 9 held for the lifetime of this process; closing = releasing.
+acquire_lease() {
+    log "waiting for lease at $LEASE_FILE"
+    touch "$LEASE_FILE"
+    exec 9>"$LEASE_FILE"
+    flock 9
+    log "lease acquired (pid $$)"
+    touch "$LEASE_HELD_FILE"
+}
+
+# -------- offset --------
+get_offset() {
+    if [[ -f "$OFFSET_FILE" ]]; then
+        cat "$OFFSET_FILE"
+    else
+        echo 0
+    fi
+}
+
+save_offset() {
+    local off="$1"
+    local tmp="$OFFSET_FILE.tmp.$$"
+    echo "$off" > "$tmp"
+    mv -f "$tmp" "$OFFSET_FILE"
+}
+
+# -------- dedup --------
+declare -A SEEN_TS=()
+SEEN_TS_ORDER=()
+
+load_seen() {
+    if [[ -f "$SEEN_FILE" ]]; then
+        while IFS= read -r ts; do
+            [[ -n "$ts" ]] || continue
+            SEEN_TS[$ts]=1
+            SEEN_TS_ORDER+=("$ts")
+        done < "$SEEN_FILE"
+        if [[ ${#SEEN_TS_ORDER[@]} -gt $SEEN_MAX ]]; then
+            local trimmed=( "${SEEN_TS_ORDER[@]:$(( ${#SEEN_TS_ORDER[@]} - SEEN_MAX ))}" )
+            SEEN_TS_ORDER=( "${trimmed[@]}" )
+            SEEN_TS=()
+            for ts in "${SEEN_TS_ORDER[@]}"; do SEEN_TS[$ts]=1; done
+            printf '%s\n' "${SEEN_TS_ORDER[@]}" > "$SEEN_FILE.tmp.$$"
+            mv -f "$SEEN_FILE.tmp.$$" "$SEEN_FILE"
+        fi
+    fi
+}
+
+is_duplicate() {
+    local ts="$1"
+    [[ -n "${SEEN_TS[$ts]:-}" ]]
+}
+
+mark_seen() {
+    local ts="$1"
+    [[ -z "$ts" ]] && return
+    SEEN_TS[$ts]=1
+    SEEN_TS_ORDER+=("$ts")
+    printf '%s\n' "$ts" >> "$SEEN_FILE"
+    # Periodic compaction.
+    if [[ ${#SEEN_TS_ORDER[@]} -gt $((SEEN_MAX * 2)) ]]; then
+        local trimmed=( "${SEEN_TS_ORDER[@]:$(( ${#SEEN_TS_ORDER[@]} - SEEN_MAX ))}" )
+        SEEN_TS_ORDER=( "${trimmed[@]}" )
+        SEEN_TS=()
+        for t in "${SEEN_TS_ORDER[@]}"; do SEEN_TS[$t]=1; done
+        printf '%s\n' "${SEEN_TS_ORDER[@]}" > "$SEEN_FILE.tmp.$$"
+        mv -f "$SEEN_FILE.tmp.$$" "$SEEN_FILE"
+    fi
+}
+
+# -------- Signal send --------
 send_signal() {
     local recipient="$1"
     local message="$2"
 
-    # Simple chunking: if the message fits, send whole; otherwise split on paragraph
-    # boundaries under 4000 chars per chunk.
     local chunks=()
     if [[ ${#message} -le 4000 ]]; then
         chunks=("$message")
@@ -74,7 +176,6 @@ send_signal() {
                 chunks+=("$remaining")
                 break
             fi
-            # Try to split on a paragraph break near 4000; fall back to hard cut
             local head="${remaining:0:4000}"
             local cut=${#head}
             local nl="${head##*$'\n\n'}"
@@ -91,46 +192,47 @@ send_signal() {
     for chunk in "${chunks[@]}"; do
         i=$((i + 1))
         local payload="$chunk"
-        # Prefix with (i/N) for multi-part replies so the reader knows to wait
         if [[ $total -gt 1 ]]; then
             payload="($i/$total) $chunk"
         fi
-        curl -sf -X POST "$SIGNAL_API/api/v1/rpc" \
+        local request
+        request=$(jq -cn \
+            --arg account "$SIGNAL_ACCOUNT" \
+            --arg msg "$payload" \
+            --arg recipient "$recipient" \
+            '{jsonrpc:"2.0",method:"send",id:"send",params:{account:$account,message:$msg,recipients:[$recipient]}}')
+        curl -sS -X POST "$SIGNAL_API/api/v1/rpc" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n --arg msg "$payload" --arg to "$recipient" '{
-                jsonrpc: "2.0", method: "send", id: "send",
-                params: { message: $msg, recipients: [$to] }
-            }')" >> "$LOG_FILE" 2>&1 || true
-        [[ $i -lt $total ]] && sleep 1
+            -d "$request" \
+            >> "$LOG_FILE" 2>&1
     done
 }
 
 send_typing() {
     local recipient="$1"
-    curl -sf -X POST "$SIGNAL_API/api/v1/rpc" \
+    local request
+    request=$(jq -cn \
+        --arg account "$SIGNAL_ACCOUNT" \
+        --arg recipient "$recipient" \
+        '{jsonrpc:"2.0",method:"sendTyping",id:"typing",params:{account:$account,recipients:[$recipient]}}')
+    curl -sS -X POST "$SIGNAL_API/api/v1/rpc" \
         -H "Content-Type: application/json" \
-        -d "$(jq -n --arg to "$recipient" '{
-            jsonrpc: "2.0", method: "sendTyping", id: "typing",
-            params: { recipient: $to }
-        }')" >/dev/null 2>&1 || true
+        -d "$request" > /dev/null 2>&1 || true
 }
 
+# -------- session helper --------
 get_session_file() {
     local sender="$1"
     local safe="${sender//+/}"
     echo "$SESSION_DIR/${safe}.session"
 }
 
-# Validate that the stored session ID still exists in Claude Code's project store.
-# If not, delete the session file so the next turn starts fresh instead of erroring forever.
 ensure_session_is_valid() {
     local session_file="$1"
     [[ -f "$session_file" ]] || return 0
     local sid
     sid=$(cat "$session_file" 2>/dev/null || true)
     [[ -z "$sid" ]] && { rm -f "$session_file"; return 0; }
-    # Claude Code's per-project session transcripts live at <projects_root>/<project>/<sid>.jsonl.
-    # When alice runs sandboxed, her sessions persist in ~/.alice-claude/projects/... on the host.
     local projects_root="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
     local project_slug
     project_slug=$(echo "$WORK_DIR" | tr '/' '-' | sed 's/^-//')
@@ -140,6 +242,7 @@ ensure_session_is_valid() {
     fi
 }
 
+# -------- message processing --------
 process_message() {
     local sender="$1"
     local body="$2"
@@ -148,11 +251,6 @@ process_message() {
     session_file=$(get_session_file "$sender")
     local lock_file="$LOCK_DIR/${sender//+/}.lock"
 
-    # Send typing indicator immediately (before lock) — user sees "..." right away
-    # even if the flock is held by a previous message.
-    send_typing "$sender"
-
-    # Keep the typing indicator alive with a heartbeat (Signal expires it after ~15s)
     (
         while true; do
             sleep 10
@@ -162,7 +260,6 @@ process_message() {
     local typing_pid=$!
     trap 'kill "$typing_pid" 2>/dev/null || true' RETURN
 
-    # Serialize messages per sender
     (
         flock -w "$FLOCK_TIMEOUT" 9 || {
             log "ERROR: lock timeout ($FLOCK_TIMEOUT s) for $name — notifying sender"
@@ -175,7 +272,7 @@ process_message() {
         ensure_session_is_valid "$session_file"
 
         local now
-        now=$(TZ=America/New_York date '+%A, %B %-d, %Y at %-I:%M %p %Z')
+        now=$(TZ="${TZ:-America/New_York}" date '+%A, %B %-d, %Y at %-I:%M %p %Z')
 
         local prompt="[Signal from ${name} | ${now}]
 
@@ -189,12 +286,6 @@ ${body}"
             log "Resuming session $sid"
         fi
 
-        # Bound claude with a timeout so the lock always releases before FLOCK_TIMEOUT.
-        # Capture stderr to a temp file so we can relay the actual error on failure.
-        # CLAUDE_CMD defaults to `claude` (on-host) but can be set to `alice` in
-        # alice.env to run claude inside the sandbox container.
-        # CD into WORK_DIR so claude's project slug matches the session file
-        # (claude keys sessions by CWD hash).
         local raw_output exit_code stderr_file raw_stderr
         local claude_cmd="${CLAUDE_CMD:-claude}"
         stderr_file=$(mktemp)
@@ -204,10 +295,7 @@ ${body}"
         rm -f "$stderr_file"
 
         if [[ $exit_code -ne 0 ]]; then
-            # Note: with --preserve-status, `timeout` propagates the signal-induced
-            # exit (e.g. 143 = 128 + SIGTERM from the kill) rather than returning 124.
             log "ERROR: claude exit $exit_code for $name"
-            # Session file intentionally preserved so the next turn can --resume.
             local err_msg="Hit an error (exit $exit_code). Session preserved — reply to retry."
             if [[ -n "$raw_stderr" ]]; then
                 local stderr_preview="${raw_stderr: -1500}"
@@ -236,29 +324,15 @@ ${body}"
     ) 9>"$lock_file"
 }
 
-wait_for_daemon() {
-    local i
-    for i in $(seq 1 30); do
-        if curl -sf "$SIGNAL_API/api/v1/rpc" -X POST \
-            -H "Content-Type: application/json" \
-            -d '{"jsonrpc":"2.0","method":"listAccounts","id":"ping"}' >/dev/null 2>&1; then
-            log "Daemon ready."
-            return 0
-        fi
-        sleep 2
-    done
-    log "ERROR: daemon not reachable after 60s"
-    return 1
-}
-
+# -------- envelope routing --------
 handle_envelope_line() {
     local line="$1"
-    # Skip non-JSON lines (INFO/WARN from signal-cli)
     [[ "$line" == "{"* ]] || return 0
 
-    local sender body
+    local sender body ts
     sender=$(echo "$line" | jq -r '.envelope.source // .envelope.sourceNumber // empty' 2>/dev/null) || return 0
     body=$(echo "$line" | jq -r '.envelope.dataMessage.message // empty' 2>/dev/null) || return 0
+    ts=$(echo "$line" | jq -r '.envelope.timestamp // empty' 2>/dev/null) || true
 
     [[ -z "$sender" || -z "$body" ]] && return 0
 
@@ -267,29 +341,99 @@ handle_envelope_line() {
         return 0
     fi
 
+    if [[ -n "$ts" ]] && is_duplicate "$ts"; then
+        log "skipping duplicate envelope ts=$ts"
+        return 0
+    fi
+    [[ -n "$ts" ]] && mark_seen "$ts"
+
     process_message "$sender" "$body" &
 }
 
-log "=== Signal bridge starting ==="
+# -------- wait for daemon --------
+wait_for_daemon() {
+    local i
+    for i in $(seq 1 60); do
+        if curl -sfo /dev/null -X POST "$SIGNAL_API/api/v1/rpc" \
+            -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","method":"version","id":"ping"}' 2>/dev/null; then
+            log "Daemon ready."
+            return 0
+        fi
+        sleep 1
+    done
+    log "ERROR: daemon not reachable at $SIGNAL_API after 60s"
+    return 1
+}
 
+# -------- catchup --------
+catchup() {
+    local start_off
+    start_off=$(get_offset)
+    local size
+    size=$(stat -c %s "$SIGNAL_LOG_FILE" 2>/dev/null || echo 0)
+
+    if [[ $start_off -gt $size ]]; then
+        log "catchup: saved offset $start_off > log size $size; log was truncated. resetting to 0"
+        start_off=0
+        save_offset 0
+    fi
+    if [[ $start_off -eq $size ]]; then
+        log "catchup: no backlog"
+        return
+    fi
+
+    log "catchup: reading from offset $start_off (current size $size)"
+    local cur=$start_off
+    local count=0
+    while IFS= read -r line; do
+        local bytes=${#line}
+        cur=$(( cur + bytes + 1 ))
+        save_offset "$cur"
+        handle_envelope_line "$line" || true
+        count=$((count + 1))
+    done < <(tail -c "+$((start_off + 1))" "$SIGNAL_LOG_FILE" 2>/dev/null)
+    log "catchup: processed $count lines up to offset $cur"
+}
+
+# -------- main loop --------
+main_loop() {
+    local start_off
+    start_off=$(get_offset)
+    log "main: tailing $SIGNAL_LOG_FILE from offset $start_off"
+
+    trap on_sigterm TERM
+
+    # tail -F --follow=name handles signal-daemon restart (log file rotate).
+    exec 3< <(exec tail -F --follow=name -c "+$((start_off + 1))" "$SIGNAL_LOG_FILE" 2>/dev/null)
+    # Capture the tail's PID so on_sigterm can kill it to break the read loop.
+    TAIL_PID=$(pgrep -P $$ -f 'tail -F --follow=name' | head -n1 || true)
+
+    local cur=$start_off
+    while IFS= read -r line <&3; do
+        if [[ $DRAINING -eq 1 ]]; then
+            log "main: drain flag set, exiting read loop"
+            break
+        fi
+        local bytes=${#line}
+        cur=$(( cur + bytes + 1 ))
+        save_offset "$cur"
+        handle_envelope_line "$line" || true
+    done
+
+    exec 3<&-
+    log "main: read loop exited"
+    log "drain: waiting for in-flight message handlers"
+    wait || true
+    log "drain: complete"
+}
+
+# -------- entry --------
+log "=== Signal bridge starting (pid $$) ==="
+acquire_lease
+load_seen
 wait_for_daemon || exit 1
-
+catchup
 log "Listening for messages..."
-
-# Supervising loop: if the tail exits (pipe break, log rotation, daemon
-# restart), we restart the tail rather than silently exiting.
-#
-# SIGNAL_LOG_FILE overrides the journalctl-based source — used when the
-# bridge runs in a container and signal-daemon's output is redirected to a
-# file instead of systemd's journal.
-while true; do
-    if [ -n "${SIGNAL_LOG_FILE:-}" ]; then
-        tail -F -n0 "$SIGNAL_LOG_FILE" 2>/dev/null
-    else
-        journalctl -u signal-daemon -f -o cat --no-pager 2>/dev/null
-    fi | while IFS= read -r line; do
-        handle_envelope_line "$line"
-    done || true
-    log "signal tail exited — restarting in 2s"
-    sleep 2
-done
+main_loop
+log "=== Signal bridge exiting ==="
