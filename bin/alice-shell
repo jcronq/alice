@@ -14,7 +14,7 @@ case "$target" in
     worker|"")
         # Pick the lease-holding worker.
         for name in $(docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null); do
-            if docker exec "$name" test -f /state/worker/lease-held 2>/dev/null; then
+            if ! docker exec "$name" flock -n /state/worker/lease true 2>/dev/null; then
                 exec docker exec -u alice -it "$name" bash
             fi
         done

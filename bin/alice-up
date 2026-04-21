@@ -20,11 +20,10 @@ else
     docker compose up -d
 fi
 
-# Wait until the worker has acquired its lease (or some worker has —
-# during blue/green there may be multiple).
+# Wait until some worker has acquired the lease (flock held = bridge live).
 for _ in $(seq 1 90); do
     for name in $(docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null); do
-        if docker exec "$name" test -f /state/worker/lease-held 2>/dev/null; then
+        if ! docker exec "$name" flock -n /state/worker/lease true 2>/dev/null; then
             exit 0
         fi
     done

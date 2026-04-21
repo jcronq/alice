@@ -14,9 +14,11 @@ set -euo pipefail
 # Pick the worker holding the lease. If none (transient during handoff), fall
 # back to the canonical name.
 pick_worker() {
+    # "This container's bridge holds the lease" = flock probe fails (someone
+    # already holds the exclusive lock on /state/worker/lease).
     local name
     for name in $(docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null); do
-        if docker exec "$name" test -f /state/worker/lease-held 2>/dev/null; then
+        if ! docker exec "$name" flock -n /state/worker/lease true 2>/dev/null; then
             printf '%s\n' "$name"
             return 0
         fi

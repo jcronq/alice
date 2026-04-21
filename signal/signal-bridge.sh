@@ -24,14 +24,13 @@ TAIL_PID=""
 cleanup() {
     local ec=$?
     trap - EXIT
-    # Remove the readiness sentinel so the deploy script + alice wrapper
-    # immediately know we're gone.
-    rm -f "${LEASE_HELD_FILE:-}" 2>/dev/null || true
     # Kill tail + any remaining subprocesses.
     [ -n "$TAIL_PID" ] && kill -TERM "$TAIL_PID" 2>/dev/null || true
     jobs -p | xargs -r kill 2>/dev/null || true
     pkill -P $$ 2>/dev/null || true
-    # Lease fd 9 closes on exit — kernel releases the flock automatically.
+    # Lease fd 9 closes on exit — kernel releases the flock automatically,
+    # which is the signal that "we're gone". No sentinel file to clean up;
+    # probes use `flock -n` to test the lock directly.
     exit "$ec"
 }
 trap cleanup EXIT INT TERM
@@ -68,7 +67,6 @@ LOG_FILE="$STATE_DIR/signal-bridge.log"
 SESSION_DIR="$STATE_DIR/signal-sessions"
 LOCK_DIR="$STATE_DIR/locks"
 LEASE_FILE="$STATE_DIR/lease"
-LEASE_HELD_FILE="$STATE_DIR/lease-held"
 OFFSET_FILE="$STATE_DIR/offset"
 SEEN_FILE="$STATE_DIR/seen-timestamps"
 SEEN_MAX=1000
@@ -98,7 +96,8 @@ acquire_lease() {
     exec 9>"$LEASE_FILE"
     flock 9
     log "lease acquired (pid $$)"
-    touch "$LEASE_HELD_FILE"
+    # Liveness is the flock itself — external probes check via
+    # `flock -n $LEASE_FILE true` (succeeds iff no one holds the lock).
 }
 
 # -------- offset --------
@@ -354,7 +353,8 @@ handle_envelope_line() {
 wait_for_daemon() {
     local i
     for i in $(seq 1 60); do
-        if curl -sfo /dev/null -X POST "$SIGNAL_API/api/v1/rpc" \
+        if curl -sfo /dev/null --connect-timeout 3 --max-time 5 \
+            -X POST "$SIGNAL_API/api/v1/rpc" \
             -H 'Content-Type: application/json' \
             -d '{"jsonrpc":"2.0","method":"version","id":"ping"}' 2>/dev/null; then
             log "Daemon ready."

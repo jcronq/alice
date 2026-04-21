@@ -56,9 +56,11 @@ ENV S6_KEEP_ENV=1
 
 WORKDIR /home/alice/alice-mind
 
-# Readiness = bridge has acquired lease and is processing messages.
+# Readiness = this container's bridge holds the exclusive flock on the
+# lease file (i.e., this worker is either live or actively blue/green-
+# swapping with a peer that's about to hand off).
 HEALTHCHECK --interval=10s --timeout=3s --retries=5 --start-period=30s \
-    CMD test -f /state/worker/lease-held || exit 1
+    CMD sh -c '! flock -n /state/worker/lease true' || exit 1
 
 ENTRYPOINT ["/init"]
 CMD ["/usr/local/bin/entrypoint.sh", "sleep", "infinity"]

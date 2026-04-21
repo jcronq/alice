@@ -72,10 +72,12 @@ wait_bridge_running() {
 }
 
 wait_lease_held() {
+    # "Lease held by a process inside this container" = flock probe fails
+    # (can't acquire because someone has it).
     local name="$1" timeout="${2:-$READY_TIMEOUT}"
     local i
     for ((i=0; i<timeout*2; i++)); do
-        if docker exec "$name" test -f /state/worker/lease-held 2>/dev/null; then
+        if ! docker exec "$name" flock -n /state/worker/lease true 2>/dev/null; then
             return 0
         fi
         sleep 0.5
