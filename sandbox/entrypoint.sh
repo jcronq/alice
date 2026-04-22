@@ -5,6 +5,17 @@ set -e
 # Ensure the mount points exist even before volumes attach.
 mkdir -p "$HOME/alice-mind" "$HOME/alice-tools" "$HOME/.config"
 
+# Claude auth — resolved through the host's directory mounts so token
+# refreshes on the host (via /login) become visible here without a
+# container restart. See sandbox/docker-compose.yml for rationale.
+if [ -d /host-claude ]; then
+    mkdir -p "$HOME/.claude"
+    ln -sf /host-claude/.credentials.json "$HOME/.claude/.credentials.json"
+fi
+if [ -d /host-home ]; then
+    ln -sf /host-home/.claude.json "$HOME/.claude.json"
+fi
+
 # Point git at gh for HTTPS auth. The mounted ~/.config/gh provides the token.
 if command -v gh >/dev/null 2>&1; then
     git config --global credential."https://github.com".helper '!gh auth git-credential' 2>/dev/null || true

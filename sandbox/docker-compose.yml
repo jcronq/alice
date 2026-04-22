@@ -41,8 +41,14 @@ x-worker-base: &worker-base
     - ${HOME}/.ssh:/home/alice/.ssh:ro
     - ${HOME}/.config/alice:/home/alice/.config/alice:ro
     - ${HOME}/.alice-claude:/home/alice/.claude:rw
-    - ${HOME}/.claude/.credentials.json:/home/alice/.claude/.credentials.json:ro
-    - ${HOME}/.claude.json:/home/alice/.claude.json:ro
+    # Host's Claude config — mounted as DIRECTORIES (not individual files)
+    # so that atomic file replaces (e.g. /login writing a new credentials
+    # file) become visible inside the container. Single-file bind mounts
+    # pin the inode at container-create time and go silently stale on
+    # token refresh. The entrypoint symlinks .credentials.json and
+    # .claude.json into their expected locations.
+    - ${HOME}/.claude:/host-claude:ro
+    - ${HOME}:/host-home:ro
     - ${HOME}/.local/state/alice:/state:rw
   working_dir: /home/alice/alice-mind
   command: ["/usr/local/bin/entrypoint.sh", "sleep", "infinity"]
