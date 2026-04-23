@@ -245,6 +245,7 @@ ensure_session_is_valid() {
 process_message() {
     local sender="$1"
     local body="$2"
+    local attachments="$3"   # newline-separated "path|contentType|filename" triples
     local name="${NAMES[$sender]:-$sender}"
     local session_file
     session_file=$(get_session_file "$sender")
@@ -280,6 +281,15 @@ process_message() {
 
 ${body}"
 
+        # Append attachment file references so Claude can Read them
+        if [[ -n "$attachments" ]]; then
+            while IFS='|' read -r att_path att_ct att_fname; do
+                [[ -z "$att_path" ]] && continue
+                prompt+=$'\n'"[Attachment: $att_path ($att_ct, \"$att_fname\") — use the Read tool to view]"
+                log "Attachment in prompt: $att_path"
+            done <<< "$attachments"
+        fi
+
         local -a claude_args=(-p "$prompt" --allowedTools "$CLAUDE_ALLOWED_TOOLS")
         if [[ -f "$session_file" ]]; then
             local sid
@@ -298,6 +308,10 @@ ${body}"
 
         if [[ $exit_code -ne 0 ]]; then
             log "ERROR: claude exit $exit_code for $name"
+            local kind="claude-error"
+            [[ $exit_code -eq 143 || $exit_code -eq 124 ]] && kind="claude-timeout"
+            event-log error system component=signal-bridge kind="$kind" \
+                detail="claude exit $exit_code for $name" --source signal-bridge >> "$LOG_FILE" 2>&1 || true
             local err_msg="Hit an error (exit $exit_code). Session preserved — reply to retry."
             if [[ -n "$raw_stderr" ]]; then
                 local stderr_preview="${raw_stderr: -1500}"
@@ -336,7 +350,20 @@ handle_envelope_line() {
     body=$(echo "$line" | jq -r '.envelope.dataMessage.message // empty' 2>/dev/null) || return 0
     ts=$(echo "$line" | jq -r '.envelope.timestamp // empty' 2>/dev/null) || true
 
-    [[ -z "$sender" || -z "$body" ]] && return 0
+    # Build newline-separated "path|contentType|filename" list for each attachment
+    local attachments=""
+    attachments=$(echo "$line" | jq -r '
+        .envelope.dataMessage.attachments // [] |
+        .[] |
+        ["/host-home/.local/share/signal-cli/attachments/" + .id,
+         (.contentType // "application/octet-stream"),
+         (.filename // .id)] |
+        join("|")
+    ' 2>/dev/null) || true
+
+    [[ -z "$sender" ]] && return 0
+    # Skip if no text and no attachments
+    [[ -z "$body" && -z "$attachments" ]] && return 0
 
     if [[ -z "${NAMES[$sender]+x}" ]]; then
         log "Ignoring message from unknown sender: $sender"
@@ -349,7 +376,7 @@ handle_envelope_line() {
     fi
     [[ -n "$ts" ]] && mark_seen "$ts"
 
-    process_message "$sender" "$body" &
+    process_message "$sender" "$body" "$attachments" &
 }
 
 # -------- wait for daemon --------
