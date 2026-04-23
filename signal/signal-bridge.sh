@@ -56,7 +56,15 @@ fi
 : "${SIGNAL_ACCOUNT:?SIGNAL_ACCOUNT must be set in alice.env}"
 : "${ALLOWED_SENDERS:?ALLOWED_SENDERS must be set in alice.env}"
 : "${WORK_DIR:?WORK_DIR must be set in alice.env}"
-CLAUDE_TIMEOUT="${CLAUDE_TIMEOUT:-240}"
+
+# Optional override file in alice-mind (writable from inside the container).
+BRIDGE_ENV="${BRIDGE_ENV:-$WORK_DIR/config/bridge.env}"
+if [[ -r "$BRIDGE_ENV" ]]; then
+    # shellcheck disable=SC1090
+    source "$BRIDGE_ENV"
+fi
+
+CLAUDE_TIMEOUT="${CLAUDE_TIMEOUT:-0}"
 FLOCK_TIMEOUT="${FLOCK_TIMEOUT:-300}"
 CLAUDE_ALLOWED_TOOLS="${CLAUDE_ALLOWED_TOOLS:-Bash,Read,Write,Edit,Glob,Grep}"
 SIGNAL_LOG_FILE="${SIGNAL_LOG_FILE:-/state/daemon/signal-daemon.log}"
