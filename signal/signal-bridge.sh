@@ -262,20 +262,7 @@ process_message() {
     ) </dev/null >/dev/null 2>&1 &
     local typing_pid=$!
 
-    # Status update loop: first ping after 45s, then every 60s, for long jobs
-    local status_interval="${STATUS_UPDATE_INTERVAL:-60}"
-    (
-        sleep 45
-        local elapsed=45
-        while true; do
-            send_signal "$sender" "Still working... (${elapsed}s)"
-            sleep "$status_interval"
-            elapsed=$(( elapsed + status_interval ))
-        done
-    ) </dev/null >/dev/null 2>&1 &
-    local status_pid=$!
-
-    trap 'kill "$typing_pid" "$status_pid" 2>/dev/null || true' RETURN
+    trap 'kill "$typing_pid" 2>/dev/null || true' RETURN
 
     (
         flock -w "$FLOCK_TIMEOUT" 9 || {
@@ -291,7 +278,10 @@ process_message() {
         local now
         now=$(TZ="${TZ:-America/New_York}" date '+%A, %B %-d, %Y at %-I:%M %p %Z')
 
+        local sender_name_lc
+        sender_name_lc=$(echo "$name" | tr '[:upper:]' '[:lower:]')
         local prompt="[Signal from ${name} | ${now}]
+[For long-running tasks, send interim progress updates via: notify ${sender_name_lc} \"...\"]
 
 ${body}"
 
