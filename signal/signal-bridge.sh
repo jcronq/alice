@@ -261,7 +261,21 @@ process_message() {
         done
     ) </dev/null >/dev/null 2>&1 &
     local typing_pid=$!
-    trap 'kill "$typing_pid" 2>/dev/null || true' RETURN
+
+    # Status update loop: first ping after 45s, then every 60s, for long jobs
+    local status_interval="${STATUS_UPDATE_INTERVAL:-60}"
+    (
+        sleep 45
+        local elapsed=45
+        while true; do
+            send_signal "$sender" "Still working... (${elapsed}s)"
+            sleep "$status_interval"
+            elapsed=$(( elapsed + status_interval ))
+        done
+    ) </dev/null >/dev/null 2>&1 &
+    local status_pid=$!
+
+    trap 'kill "$typing_pid" "$status_pid" 2>/dev/null || true' RETURN
 
     (
         flock -w "$FLOCK_TIMEOUT" 9 || {
@@ -301,7 +315,11 @@ ${body}"
         local raw_output exit_code stderr_file raw_stderr
         local claude_cmd="${CLAUDE_CMD:-claude}"
         stderr_file=$(mktemp)
-        raw_output=$(cd "$WORK_DIR" && timeout --preserve-status "$CLAUDE_TIMEOUT" "$claude_cmd" "${claude_args[@]}" --output-format json < /dev/null 2> "$stderr_file") && exit_code=0 || exit_code=$?
+        if [[ "${CLAUDE_TIMEOUT:-0}" -gt 0 ]]; then
+            raw_output=$(cd "$WORK_DIR" && timeout --preserve-status "$CLAUDE_TIMEOUT" "$claude_cmd" "${claude_args[@]}" --output-format json < /dev/null 2> "$stderr_file") && exit_code=0 || exit_code=$?
+        else
+            raw_output=$(cd "$WORK_DIR" && "$claude_cmd" "${claude_args[@]}" --output-format json < /dev/null 2> "$stderr_file") && exit_code=0 || exit_code=$?
+        fi
         raw_stderr=$(cat "$stderr_file")
         [[ -s "$stderr_file" ]] && cat "$stderr_file" >> "$LOG_FILE"
         rm -f "$stderr_file"
