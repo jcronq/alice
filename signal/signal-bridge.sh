@@ -56,7 +56,15 @@ fi
 : "${SIGNAL_ACCOUNT:?SIGNAL_ACCOUNT must be set in alice.env}"
 : "${ALLOWED_SENDERS:?ALLOWED_SENDERS must be set in alice.env}"
 : "${WORK_DIR:?WORK_DIR must be set in alice.env}"
-CLAUDE_TIMEOUT="${CLAUDE_TIMEOUT:-240}"
+
+# Optional override file in alice-mind (writable from inside the container).
+BRIDGE_ENV="${BRIDGE_ENV:-$WORK_DIR/config/bridge.env}"
+if [[ -r "$BRIDGE_ENV" ]]; then
+    # shellcheck disable=SC1090
+    source "$BRIDGE_ENV"
+fi
+
+CLAUDE_TIMEOUT="${CLAUDE_TIMEOUT:-0}"
 FLOCK_TIMEOUT="${FLOCK_TIMEOUT:-300}"
 CLAUDE_ALLOWED_TOOLS="${CLAUDE_ALLOWED_TOOLS:-Bash,Read,Write,Edit,Glob,Grep}"
 SIGNAL_LOG_FILE="${SIGNAL_LOG_FILE:-/state/daemon/signal-daemon.log}"
@@ -245,6 +253,7 @@ ensure_session_is_valid() {
 process_message() {
     local sender="$1"
     local body="$2"
+    local attachments="$3"   # newline-separated "path|contentType|filename" triples
     local name="${NAMES[$sender]:-$sender}"
     local session_file
     session_file=$(get_session_file "$sender")
@@ -260,6 +269,7 @@ process_message() {
         done
     ) </dev/null >/dev/null 2>&1 &
     local typing_pid=$!
+
     trap 'kill "$typing_pid" 2>/dev/null || true' RETURN
 
     (
@@ -276,9 +286,21 @@ process_message() {
         local now
         now=$(TZ="${TZ:-America/New_York}" date '+%A, %B %-d, %Y at %-I:%M %p %Z')
 
+        local sender_name_lc
+        sender_name_lc=$(echo "$name" | tr '[:upper:]' '[:lower:]')
         local prompt="[Signal from ${name} | ${now}]
+[For long-running tasks, send interim progress updates via: notify ${sender_name_lc} \"...\"]
 
 ${body}"
+
+        # Append attachment file references so Claude can Read them
+        if [[ -n "$attachments" ]]; then
+            while IFS='|' read -r att_path att_ct att_fname; do
+                [[ -z "$att_path" ]] && continue
+                prompt+=$'\n'"[Attachment: $att_path ($att_ct, \"$att_fname\") — use the Read tool to view]"
+                log "Attachment in prompt: $att_path"
+            done <<< "$attachments"
+        fi
 
         local -a claude_args=(-p "$prompt" --allowedTools "$CLAUDE_ALLOWED_TOOLS")
         if [[ -f "$session_file" ]]; then
@@ -291,13 +313,21 @@ ${body}"
         local raw_output exit_code stderr_file raw_stderr
         local claude_cmd="${CLAUDE_CMD:-claude}"
         stderr_file=$(mktemp)
-        raw_output=$(cd "$WORK_DIR" && timeout --preserve-status "$CLAUDE_TIMEOUT" "$claude_cmd" "${claude_args[@]}" --output-format json < /dev/null 2> "$stderr_file") && exit_code=0 || exit_code=$?
+        if [[ "${CLAUDE_TIMEOUT:-0}" -gt 0 ]]; then
+            raw_output=$(cd "$WORK_DIR" && timeout --preserve-status "$CLAUDE_TIMEOUT" "$claude_cmd" "${claude_args[@]}" --output-format json < /dev/null 2> "$stderr_file") && exit_code=0 || exit_code=$?
+        else
+            raw_output=$(cd "$WORK_DIR" && "$claude_cmd" "${claude_args[@]}" --output-format json < /dev/null 2> "$stderr_file") && exit_code=0 || exit_code=$?
+        fi
         raw_stderr=$(cat "$stderr_file")
         [[ -s "$stderr_file" ]] && cat "$stderr_file" >> "$LOG_FILE"
         rm -f "$stderr_file"
 
         if [[ $exit_code -ne 0 ]]; then
             log "ERROR: claude exit $exit_code for $name"
+            local kind="claude-error"
+            [[ $exit_code -eq 143 || $exit_code -eq 124 ]] && kind="claude-timeout"
+            event-log error system component=signal-bridge kind="$kind" \
+                detail="claude exit $exit_code for $name" --source signal-bridge >> "$LOG_FILE" 2>&1 || true
             local err_msg="Hit an error (exit $exit_code). Session preserved — reply to retry."
             if [[ -n "$raw_stderr" ]]; then
                 local stderr_preview="${raw_stderr: -1500}"
@@ -336,7 +366,20 @@ handle_envelope_line() {
     body=$(echo "$line" | jq -r '.envelope.dataMessage.message // empty' 2>/dev/null) || return 0
     ts=$(echo "$line" | jq -r '.envelope.timestamp // empty' 2>/dev/null) || true
 
-    [[ -z "$sender" || -z "$body" ]] && return 0
+    # Build newline-separated "path|contentType|filename" list for each attachment
+    local attachments=""
+    attachments=$(echo "$line" | jq -r '
+        .envelope.dataMessage.attachments // [] |
+        .[] |
+        ["/host-home/.local/share/signal-cli/attachments/" + .id,
+         (.contentType // "application/octet-stream"),
+         (.filename // .id)] |
+        join("|")
+    ' 2>/dev/null) || true
+
+    [[ -z "$sender" ]] && return 0
+    # Skip if no text and no attachments
+    [[ -z "$body" && -z "$attachments" ]] && return 0
 
     if [[ -z "${NAMES[$sender]+x}" ]]; then
         log "Ignoring message from unknown sender: $sender"
@@ -349,7 +392,7 @@ handle_envelope_line() {
     fi
     [[ -n "$ts" ]] && mark_seen "$ts"
 
-    process_message "$sender" "$body" &
+    process_message "$sender" "$body" "$attachments" &
 }
 
 # -------- wait for daemon --------
