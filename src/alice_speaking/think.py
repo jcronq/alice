@@ -40,7 +40,7 @@ from claude_agent_sdk import (
 DEFAULT_MIND = pathlib.Path("/home/alice/alice-mind")
 DEFAULT_BOOTSTRAP = DEFAULT_MIND / "prompts" / "thinking-bootstrap.md"
 DEFAULT_LOG = pathlib.Path("/state/worker/thinking.log")
-DEFAULT_TOOLS = "Bash,Read,Write,Edit,Glob,Grep,WebFetch"
+DEFAULT_TOOLS = "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch"
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_SECONDS = 0  # 0 == no timeout. Thinking runs as long as it needs.
 QUICK_PROMPT = "Reply exactly: QUICK-OK"
