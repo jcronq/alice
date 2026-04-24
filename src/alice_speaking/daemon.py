@@ -1,13 +1,14 @@
 """Speaking Alice's outer loop.
 
-Reads envelopes from signal-cli, drives each through the Claude Agent SDK, and
-sends the reply back through signal-cli. Serial turn processing — Alice is one
-mind juggling both senders, not a per-sender worker pool.
+Two producers feed one serial consumer:
+- signal_client.receive(): user envelopes from Signal
+- surface_watcher: files that thinking Alice drops into inner/surface/
+
+The consumer processes one event at a time — Alice is a single mind juggling
+messages and surfaced thoughts, not a parallel worker pool.
 
 One Agent SDK session per process lifetime: fresh on start, resumed across
-turns within the same run. Session ID does not persist across process restarts
-(by design — continuity is maintained by turn-log replay when we add that,
-not by resuming potentially-stale Claude sessions).
+turns within the same run.
 """
 
 from __future__ import annotations
@@ -17,8 +18,11 @@ import contextlib
 import datetime
 import logging
 import os
+import pathlib
 import signal as _signal
-from typing import Optional
+import time
+from dataclasses import dataclass
+from typing import Optional, Union
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -39,6 +43,23 @@ from .turn_log import TurnLog, new_turn
 log = logging.getLogger("alice_speaking")
 
 
+SURFACE_POLL_SECONDS = 5.0
+
+
+@dataclass
+class SignalEvent:
+    envelope: SignalEnvelope
+    sender: AllowedSender
+
+
+@dataclass
+class SurfaceEvent:
+    path: pathlib.Path
+
+
+Event = Union[SignalEvent, SurfaceEvent]
+
+
 class SpeakingDaemon:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -52,11 +73,13 @@ class SpeakingDaemon:
         self.turns = TurnLog(cfg.turn_log_path)
         self.mcp_servers, self.custom_tool_names = tools_module.build(cfg)
         self.session_id: Optional[str] = None
+        self._queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=64)
+        self._dispatched_surfaces: set[str] = set()
         self._stop = asyncio.Event()
-        self._in_flight: set[asyncio.Task[None]] = set()
+        self._surface_dir = cfg.mind_dir / "inner" / "surface"
+        self._surface_handled_dir = self._surface_dir / ".handled"
 
     async def run(self) -> None:
-        # Claude Agent SDK subprocess inherits this env var → OAuth → Max subscription.
         os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = self.cfg.oauth_token
 
         loop = asyncio.get_event_loop()
@@ -68,31 +91,32 @@ class SpeakingDaemon:
             await self.signal.wait_ready()
             log.info("daemon ready; listening")
 
-            receive_task = asyncio.create_task(self._receive_loop(), name="receive")
+            producers = [
+                asyncio.create_task(self._signal_producer(), name="sig-produce"),
+                asyncio.create_task(self._surface_producer(), name="sur-produce"),
+            ]
+            consumer = asyncio.create_task(self._consumer(), name="consumer")
             stop_task = asyncio.create_task(self._stop.wait(), name="stop")
-            done, _ = await asyncio.wait(
-                {receive_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
-            )
-            if stop_task in done:
-                log.info("stop requested; draining")
-                receive_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await receive_task
-            else:
-                log.warning("receive loop exited before stop requested")
-                stop_task.cancel()
 
-            if self._in_flight:
-                log.info("draining %d in-flight turns", len(self._in_flight))
-                await asyncio.gather(*self._in_flight, return_exceptions=True)
+            done, _ = await asyncio.wait(
+                {*producers, consumer, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            log.info("shutdown starting (triggered by %s)", [t.get_name() for t in done])
+            for task in (*producers, consumer):
+                task.cancel()
+            for task in (*producers, consumer):
+                with contextlib.suppress(BaseException):
+                    await task
         finally:
             await self.signal.aclose()
             log.info("shutdown complete")
 
-    async def _receive_loop(self) -> None:
+    # ------------------------------------------------------------------
+    # Producers
+
+    async def _signal_producer(self) -> None:
         async for env in self.signal.receive():
-            if self._stop.is_set():
-                return
             if env.source not in self.cfg.allowed_senders:
                 log.info("ignoring envelope from %s", env.source)
                 continue
@@ -100,33 +124,62 @@ class SpeakingDaemon:
                 log.debug("duplicate ts=%d; skipping", env.timestamp)
                 continue
             self.dedup.mark(env.timestamp)
-
             sender = self.cfg.allowed_senders[env.source]
-            await self._drive_turn(env, sender)
+            await self._queue.put(SignalEvent(envelope=env, sender=sender))
 
-    async def _drive_turn(self, env: SignalEnvelope, sender: AllowedSender) -> None:
-        task = asyncio.create_task(
-            self._turn(env, sender), name=f"turn-{env.timestamp}"
-        )
-        self._in_flight.add(task)
-        task.add_done_callback(self._in_flight.discard)
-        # Serialize: Alice is one mind. Owner's and Friend's messages are not
-        # processed in parallel — she reads one, responds, then the next.
-        await task
+    async def _surface_producer(self) -> None:
+        # Ensure directories exist so polling doesn't raise.
+        self._surface_dir.mkdir(parents=True, exist_ok=True)
+        self._surface_handled_dir.mkdir(parents=True, exist_ok=True)
+        while not self._stop.is_set():
+            try:
+                for path in sorted(self._surface_dir.glob("*.md")):
+                    if path.name.startswith(".") or path.name in self._dispatched_surfaces:
+                        continue
+                    self._dispatched_surfaces.add(path.name)
+                    log.info("surface detected: %s", path.name)
+                    await self._queue.put(SurfaceEvent(path=path))
+            except OSError as exc:
+                log.warning("surface poll error: %s", exc)
+            await asyncio.sleep(SURFACE_POLL_SECONDS)
 
-    async def _turn(self, env: SignalEnvelope, sender: AllowedSender) -> None:
+    # ------------------------------------------------------------------
+    # Consumer
+
+    async def _consumer(self) -> None:
+        while True:
+            event = await self._queue.get()
+            try:
+                if isinstance(event, SignalEvent):
+                    await self._handle_signal(event)
+                elif isinstance(event, SurfaceEvent):
+                    await self._handle_surface(event)
+            except Exception:
+                log.exception("consumer error handling %s", type(event).__name__)
+            finally:
+                self._queue.task_done()
+
+    # ------------------------------------------------------------------
+    # Signal turn (unchanged from phase 2)
+
+    async def _handle_signal(self, event: SignalEvent) -> None:
+        env = event.envelope
+        sender = event.sender
         await self.signal.start_typing(env.source)
         reply: Optional[str] = None
         error: Optional[str] = None
         try:
-            reply = await self._generate_reply(env, sender)
+            now = datetime.datetime.now().astimezone()
+            stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
+            prompt = f"[Signal from {sender.name} | {stamp}]\n\n{env.body}"
+            reply = await self._run_turn(prompt)
             if reply:
                 await self.signal.send(env.source, reply)
                 log.info("replied to %s (%d chars)", sender.name, len(reply))
             else:
-                log.warning("empty reply for %s; nothing sent", sender.name)
+                log.warning("empty reply for %s", sender.name)
                 error = "empty_reply"
-        except Exception as exc:  # noqa: BLE001 — user-facing error reporting
+        except Exception as exc:  # noqa: BLE001
             log.exception("turn failed for %s", sender.name)
             error = f"{type(exc).__name__}: {exc}"
             with contextlib.suppress(Exception):
@@ -146,13 +199,60 @@ class SpeakingDaemon:
                 )
             )
 
-    async def _generate_reply(
-        self, env: SignalEnvelope, sender: AllowedSender
-    ) -> str:
-        now = datetime.datetime.now().astimezone()
-        stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
-        prompt = f"[Signal from {sender.name} | {stamp}]\n\n{env.body}"
+    # ------------------------------------------------------------------
+    # Surface turn
 
+    async def _handle_surface(self, event: SurfaceEvent) -> None:
+        path = event.path
+        if not path.is_file():
+            # Already handled by someone else (race). Nothing to do.
+            self._dispatched_surfaces.discard(path.name)
+            return
+        body = path.read_text()
+        prompt = (
+            f"[Internal — a thought just surfaced from reflection: {path.name}]\n\n"
+            f"{body}\n\n"
+            "This is your own thought that just came to you. Decide what to do: "
+            "voice it to the user, file it into memory, reply to thinking via "
+            "a note (append_note), or let it pass. When you've decided, call "
+            "mcp__alice__resolve_surface with the file's `id` (its filename), "
+            "a short `verdict`, and `action_taken`. If you voice it, do that "
+            "before calling resolve_surface."
+        )
+        try:
+            await self._run_turn(prompt)
+        except Exception:
+            log.exception("surface turn failed for %s", path.name)
+        finally:
+            # If Alice didn't resolve (didn't call resolve_surface), archive it
+            # ourselves so it doesn't sit in the surface queue forever.
+            if path.is_file():
+                try:
+                    self._archive_unresolved(path)
+                except OSError as exc:
+                    log.warning("unresolved-archive failed for %s: %s", path.name, exc)
+            self._dispatched_surfaces.discard(path.name)
+
+    def _archive_unresolved(self, path: pathlib.Path) -> None:
+        today = datetime.date.today().isoformat()
+        dest_dir = self._surface_handled_dir / today
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / path.name
+        body = path.read_text()
+        trailer = (
+            "\n\n---\n"
+            + f"resolved: {datetime.datetime.now().astimezone().isoformat(timespec='seconds')}\n"
+            + "verdict: (unresolved — Alice did not call resolve_surface)\n"
+            + "action_taken: auto-archived by daemon\n"
+        )
+        dest.write_text(body + trailer)
+        path.unlink()
+        log.info("auto-archived unresolved surface: %s", path.name)
+
+    # ------------------------------------------------------------------
+    # Agent SDK invocation (shared by signal + surface turns)
+
+    async def _run_turn(self, prompt: str) -> str:
         options = self._build_options()
         parts: list[str] = []
         async for msg in query(prompt=prompt, options=options):
