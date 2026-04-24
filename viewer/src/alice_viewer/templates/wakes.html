@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}wakes{% endblock %}
+{% block body %}
+  <h1>thinking wakes · {{ wakes | length }}</h1>
+  <table>
+    <thead>
+      <tr>
+        <th>when</th><th>status</th><th>model</th><th>duration</th><th>cost</th><th>tools</th><th>events</th><th>wake id</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for w in wakes %}
+        <tr>
+          <td class="mono">{{ w.start_ts | localtime }}<br><span class="muted">{{ w.start_ts | ago }}</span></td>
+          <td>{% if w.status == 'ended' %}<span class="muted">ended</span>
+              {% elif w.status == 'timeout' %}<span style="color:var(--warn)">timeout</span>
+              {% elif w.status == 'exception' %}<span style="color:var(--err)">exception</span>
+              {% else %}<span style="color:var(--ok)">{{ w.status }}</span>{% endif %}</td>
+          <td class="mono">{{ w.model or '—' }}</td>
+          <td class="mono">{% if w.duration_ms %}{{ (w.duration_ms / 1000.0) | round(1) }}s{% else %}—{% endif %}</td>
+          <td class="mono">{% if w.total_cost_usd %}${{ w.total_cost_usd | round(4) }}{% else %}—{% endif %}</td>
+          <td class="mono">{{ w.tools | join(', ') or '—' }}</td>
+          <td class="mono">{{ w.event_count if w.event_count is defined else (w.events | length) }}</td>
+          <td><a href="/wakes/{{ w.wake_id }}">{{ w.wake_id }}</a></td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}

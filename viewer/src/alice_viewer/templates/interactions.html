@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}interactions{% endblock %}
+{% block body %}
+  <h1>interactions — cross-hemisphere flow</h1>
+  <p class="muted">
+    Files speaking and thinking pass between each other, in lifecycle order.
+    Green = resolved. Amber = pending. Red = emergency.
+  </p>
+
+  <h2>surfaces · thinking → speaking</h2>
+  <table>
+    <thead><tr><th>when</th><th>status</th><th>id</th><th>preview</th><th>trailer</th></tr></thead>
+    <tbody>
+      {% for e in surfaces %}
+        <tr>
+          <td class="mono">{{ e.ts | localtime }}<br><span class="muted">{{ e.ts | ago }}</span></td>
+          <td>
+            {% if e.kind == 'surface_pending' %}
+              <span style="color:var(--warn)">pending</span>
+            {% else %}
+              <span style="color:var(--ok)">{{ e.detail.trailer.verdict or 'resolved' }}</span>
+            {% endif %}
+          </td>
+          <td class="mono">{{ e.correlation_id }}</td>
+          <td class="wrap">{{ (e.detail.body or '')[:220] }}{% if (e.detail.body or '') | length > 220 %}…{% endif %}</td>
+          <td class="mono">
+            {% if e.detail.trailer %}
+              {% for k, v in e.detail.trailer.items() %}{{ k }}: {{ v[:80] }}<br>{% endfor %}
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5" class="muted">no surfaces yet</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>emergencies</h2>
+  <table>
+    <thead><tr><th>when</th><th>status</th><th>id</th><th>preview</th><th>trailer</th></tr></thead>
+    <tbody>
+      {% for e in emergencies %}
+        <tr>
+          <td class="mono">{{ e.ts | localtime }}<br><span class="muted">{{ e.ts | ago }}</span></td>
+          <td>
+            {% if e.kind == 'emergency_pending' %}
+              <span style="color:var(--err)">pending</span>
+            {% else %}
+              {% set verdict = e.detail.trailer.verdict or 'resolved' %}
+              <span style="color: {% if verdict == 'voiced' %}var(--err){% else %}var(--muted){% endif %}">{{ verdict }}</span>
+            {% endif %}
+          </td>
+          <td class="mono">{{ e.correlation_id }}</td>
+          <td class="wrap">{{ (e.detail.body or '')[:220] }}{% if (e.detail.body or '') | length > 220 %}…{% endif %}</td>
+          <td class="mono">
+            {% if e.detail.trailer %}
+              {% for k, v in e.detail.trailer.items() %}{{ k }}: {{ v[:80] }}<br>{% endfor %}
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5" class="muted">no emergencies</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>notes · speaking → thinking</h2>
+  <table>
+    <thead><tr><th>when</th><th>status</th><th>id</th><th>preview</th></tr></thead>
+    <tbody>
+      {% for e in notes %}
+        <tr>
+          <td class="mono">{{ e.ts | localtime }}<br><span class="muted">{{ e.ts | ago }}</span></td>
+          <td>
+            {% if e.kind == 'note_pending' %}
+              <span style="color:var(--warn)">pending</span>
+            {% else %}
+              <span style="color:var(--ok)">consumed</span>
+            {% endif %}
+          </td>
+          <td class="mono">{{ e.correlation_id }}</td>
+          <td class="wrap">{{ (e.detail.body or '')[:300] }}{% if (e.detail.body or '') | length > 300 %}…{% endif %}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="4" class="muted">no notes yet</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}

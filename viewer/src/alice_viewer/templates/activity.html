@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}activity{% endblock %}
+{% block body %}
+  <h1>activity · {{ window }}</h1>
+
+  <div class="filter-bar">
+    <a href="/activity?window=1h"  class="{% if window == '1h' %}on{% endif %}">1h</a>
+    <a href="/activity?window=6h"  class="{% if window == '6h' %}on{% endif %}">6h</a>
+    <a href="/activity?window=24h" class="{% if window == '24h' %}on{% endif %}">24h</a>
+    <a href="/activity?window=7d"  class="{% if window == '7d' %}on{% endif %}">7d</a>
+    <a href="/activity?window=30d" class="{% if window == '30d' %}on{% endif %}">30d</a>
+  </div>
+
+  <div class="legend">
+    <span><span class="sw" style="background:var(--accent-2)"></span>thinking wakes</span>
+    <span><span class="sw" style="background:var(--accent)"></span>signal turns</span>
+    <span><span class="sw" style="background:var(--accent-3)"></span>surfaces</span>
+    <span><span class="sw" style="background:var(--warn)"></span>emergencies</span>
+    <span><span class="sw" style="background:#ffd66b"></span>notes</span>
+  </div>
+
+  <div class="graph-wrap">
+    <svg id="activity-chart" class="activity-chart"></svg>
+  </div>
+
+  <h2>tool use</h2>
+  <table>
+    <thead><tr><th>hemisphere</th><th>tool</th><th>count</th></tr></thead>
+    <tbody>
+      {% for row in tool_histogram %}
+        <tr>
+          <td><span class="badge {{ row.hemisphere }}">{{ row.hemisphere }}</span></td>
+          <td class="mono">{{ row.name }}</td>
+          <td class="mono">{{ row.count }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="3" class="muted">no tool_use events yet</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <script id="buckets-data" type="application/json">{{ buckets_json | safe }}</script>
+  <script>
+    (() => {
+      const buckets = JSON.parse(document.getElementById('buckets-data').textContent);
+      if (!buckets.length) return;
+
+      const svg = d3.select('#activity-chart');
+      const bbox = svg.node().getBoundingClientRect();
+      const width = bbox.width, height = bbox.height;
+      const margin = { top: 16, right: 20, bottom: 26, left: 40 };
+      const innerW = width - margin.left - margin.right;
+      const innerH = height - margin.top - margin.bottom;
+      svg.attr('viewBox', [0, 0, width, height]);
+
+      const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
+
+      const series = ['thinking_wakes', 'signal_turns', 'surfaces', 'emergencies', 'notes'];
+      const colors = {
+        thinking_wakes: '#c39bff', signal_turns: '#8fc7ff',
+        surfaces: '#7de3c4', emergencies: '#ff9b6b', notes: '#ffd66b',
+      };
+
+      const stack = d3.stack().keys(series)(buckets);
+      const maxY = d3.max(stack[stack.length - 1], d => d[1]) || 1;
+
+      const x = d3.scaleBand().domain(buckets.map(b => b.ts)).range([0, innerW]).padding(0.1);
+      const y = d3.scaleLinear().domain([0, maxY]).range([innerH, 0]);
+
+      g.selectAll('g.series').data(stack).join('g')
+        .attr('class', 'series')
+        .attr('fill', d => colors[d.key])
+        .selectAll('rect').data(d => d).join('rect')
+          .attr('x', d => x(d.data.ts))
+          .attr('y', d => y(d[1]))
+          .attr('height', d => y(d[0]) - y(d[1]))
+          .attr('width', x.bandwidth());
+
+      // Axes.
+      const fmtTick = (ts) => {
+        const d = new Date(ts * 1000);
+        return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      };
+      const tickStep = Math.max(1, Math.floor(buckets.length / 8));
+      const tickData = buckets.filter((_, i) => i % tickStep === 0).map(b => b.ts);
+
+      g.append('g').attr('transform', `translate(0,${innerH})`)
+        .call(d3.axisBottom(x).tickValues(tickData).tickFormat(fmtTick))
+        .selectAll('text').style('fill', '#79849a');
+
+      g.append('g')
+        .call(d3.axisLeft(y).ticks(5).tickSize(-innerW))
+        .selectAll('text').style('fill', '#79849a');
+      g.selectAll('.domain, line').style('stroke', '#232d3d');
+    })();
+  </script>
+{% endblock %}

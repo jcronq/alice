@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}turn · {{ turn.turn_id if turn else 'not found' }}{% endblock %}
+{% block body %}
+  {% if not turn %}
+    <h1>turn not found</h1>
+    <p><a href="/turns">← back to turns</a></p>
+  {% else %}
+    <h1>turn · {{ turn.turn_id }} <span class="badge speaking">{{ turn.kind }}</span></h1>
+    <div class="detail-header">
+      <div class="detail-grid">
+        <span class="k">start</span><span class="v">{{ turn.start_ts | localtime }} <span class="muted">({{ turn.start_ts | ago }})</span></span>
+        <span class="k">end</span><span class="v">{% if turn.end_ts %}{{ turn.end_ts | localtime }}{% else %}—{% endif %}</span>
+        <span class="k">duration</span><span class="v">{% if turn.duration_ms %}{{ (turn.duration_ms / 1000.0) | round(1) }}s{% else %}—{% endif %}</span>
+        <span class="k">cost</span><span class="v">{% if turn.total_cost_usd %}${{ turn.total_cost_usd | round(4) }}{% else %}—{% endif %}</span>
+        <span class="k">sender</span><span class="v">{{ turn.sender_name or '—' }}</span>
+        {% if turn.surface_id %}<span class="k">surface</span><span class="v">{{ turn.surface_id }}</span>{% endif %}
+        {% if turn.emergency_id %}<span class="k">emergency</span><span class="v">{{ turn.emergency_id }}</span>{% endif %}
+        <span class="k">tools</span><span class="v">{{ turn.tools | join(', ') or '—' }}</span>
+        {% if turn.error %}<span class="k">error</span><span class="v" style="color:var(--err)">{{ turn.error }}</span>{% endif %}
+      </div>
+    </div>
+
+    {% if turn.inbound %}
+      <h2>inbound</h2>
+      <pre class="small">{{ turn.inbound }}</pre>
+    {% endif %}
+    {% if turn.outbound %}
+      <h2>outbound</h2>
+      <pre class="small">{{ turn.outbound }}</pre>
+    {% endif %}
+
+    <h2>trace</h2>
+    <div class="trace">
+      {% for ev in turn.events %}
+        <div class="trace-row kind-{{ ev.kind }}">
+          <span class="ts">{{ ev.ts | localtime }}</span>
+          <span class="kind">{{ ev.kind }}</span>
+          <span class="body">
+            <div>{{ ev.summary }}</div>
+            {% if ev.kind in ('tool_use', 'result', 'exception') %}
+              <pre>{{ ev.detail | pretty_json }}</pre>
+            {% endif %}
+          </span>
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+{% endblock %}

@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block title %}narrative · {{ window }}{% endblock %}
+{% block body %}
+  <h1>narrative · what's been happening</h1>
+  <p class="muted">
+    Claude (sonnet-4-6) reads a digest of recent wakes, turns, surfaces, notes, emergencies,
+    and thoughts and writes a short story about what Alice has been up to. Cached for 5 minutes.
+  </p>
+
+  <div class="filter-bar">
+    {% for w in windows %}
+      <a href="/narrative?window={{ w }}" class="{% if window == w %}on{% endif %}">{{ w }}</a>
+    {% endfor %}
+    <button id="regen" class="filter-btn" style="margin-left:auto">↻ regenerate</button>
+  </div>
+
+  <div id="meta" class="live-banner">
+    <span class="dot" id="meta-dot"></span>
+    <span id="meta-text">loading digest…</span>
+  </div>
+
+  <div id="narrative" class="narrative-body"></div>
+
+  <style>
+    .narrative-body {
+      background: var(--panel); border-radius: 6px; padding: 20px 24px;
+      line-height: 1.6; font-size: 14px; font-family: "Georgia", "Charter", serif;
+      max-width: 820px; min-height: 200px;
+    }
+    .narrative-body p { margin: 0 0 1em; }
+    .narrative-body code { background: var(--panel-2); padding: 1px 5px; border-radius: 3px; font-size: 13px; }
+    .narrative-body em { color: var(--muted); }
+    .narrative-body strong { color: var(--accent); }
+    .filter-btn {
+      background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+      padding: 4px 12px; border-radius: 4px; cursor: pointer; font-family: var(--mono);
+      font-size: 12px;
+    }
+    .filter-btn:hover { border-color: var(--accent); color: var(--accent); }
+    #meta-dot.err { background: var(--err); }
+    #meta-dot.done { background: var(--ok); animation: none; opacity: 1; }
+    .narrative-body .cursor {
+      display: inline-block; width: 7px; height: 1em; background: var(--accent);
+      vertical-align: text-bottom; margin-left: 2px;
+      animation: blink 1s step-end infinite;
+    }
+    @keyframes blink { 50% { opacity: 0; } }
+  </style>
+
+  <script>
+    (function () {
+      const narrativeEl = document.getElementById('narrative');
+      const metaText = document.getElementById('meta-text');
+      const metaDot = document.getElementById('meta-dot');
+      const regen = document.getElementById('regen');
+      const window_ = '{{ window }}';
+
+      let buf = '';
+      let es = null;
+
+      function render() {
+        // Tiny inline markdown: **bold**, *italic*/_italic_, `code`, paragraphs.
+        const escaped = buf.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        let html = escaped
+          .replace(/`([^`]+)`/g, '<code>$1</code>')
+          .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+          .replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+          .replace(/(^|[\s(])_([^_\n]+)_/g, '$1<em>$2</em>');
+        html = '<p>' + html.split(/\n\s*\n/).join('</p><p>') + '</p>';
+        html = html.replace(/\n/g, '<br>');
+        narrativeEl.innerHTML = html + '<span class="cursor"></span>';
+      }
+
+      function finalize() {
+        const cur = narrativeEl.querySelector('.cursor');
+        if (cur) cur.remove();
+      }
+
+      function start(bust) {
+        buf = '';
+        narrativeEl.innerHTML = '<span class="cursor"></span>';
+        metaText.textContent = 'asking claude…';
+        metaDot.classList.remove('done', 'err');
+        if (es) es.close();
+
+        const url = '/api/narrative/stream?window=' + encodeURIComponent(window_) + (bust ? '&nocache=1' : '');
+        es = new EventSource(url);
+
+        es.addEventListener('meta', (m) => {
+          const d = JSON.parse(m.data);
+          const parts = [];
+          parts.push(`${d.event_count} events`);
+          if (d.bucket_total) {
+            const mins = Math.round((d.bucket_seconds || 3600) / 60);
+            parts.push(`${d.bucket_total} buckets (${mins}m each)`);
+          }
+          metaText.textContent = parts.join(' · ') + (d.cached_final ? ' · cached, instant' : ' · warming buckets…');
+        });
+        es.addEventListener('bucket_progress', (m) => {
+          const d = JSON.parse(m.data);
+          metaText.textContent = `buckets: ${d.cached}/${d.total} ready (${d.pending} generating)…`;
+        });
+        es.addEventListener('chunk', (m) => {
+          const d = JSON.parse(m.data);
+          buf += d.text;
+          render();
+        });
+        es.addEventListener('result', (m) => {
+          const d = JSON.parse(m.data);
+          const dur = d.duration_ms ? Math.round(d.duration_ms / 100) / 10 : null;
+          const cost = d.cost_usd;
+          metaText.textContent = metaText.textContent.replace(' · generating…', '') +
+            (dur ? ` · ${dur}s` : '') + (cost ? ` · $${cost}` : '');
+        });
+        es.addEventListener('done', () => {
+          finalize();
+          metaDot.classList.add('done');
+          es.close();
+        });
+        es.addEventListener('error', (m) => {
+          let msg = 'stream error';
+          try { msg = JSON.parse(m.data).message; } catch (e) {}
+          metaText.textContent = 'error: ' + msg;
+          metaDot.classList.add('err');
+          finalize();
+          es.close();
+        });
+      }
+
+      regen.addEventListener('click', () => start(true));
+      start(false);
+    })();
+  </script>
+{% endblock %}

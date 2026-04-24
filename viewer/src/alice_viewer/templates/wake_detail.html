@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}wake · {{ wake.wake_id if wake else 'not found' }}{% endblock %}
+{% block body %}
+  {% if not wake %}
+    <h1>wake not found</h1>
+    <p><a href="/wakes">← back to wakes</a></p>
+  {% else %}
+    <h1>wake · {{ wake.wake_id }}</h1>
+    <div class="detail-header">
+      <div class="detail-grid">
+        <span class="k">start</span><span class="v">{{ wake.start_ts | localtime }} <span class="muted">({{ wake.start_ts | ago }})</span></span>
+        <span class="k">end</span><span class="v">{% if wake.end_ts %}{{ wake.end_ts | localtime }}{% else %}—{% endif %}</span>
+        <span class="k">status</span><span class="v">{{ wake.status }}</span>
+        <span class="k">model</span><span class="v">{{ wake.model or '—' }}</span>
+        <span class="k">duration</span><span class="v">{% if wake.duration_ms %}{{ (wake.duration_ms / 1000.0) | round(1) }}s{% else %}—{% endif %}</span>
+        <span class="k">cost</span><span class="v">{% if wake.total_cost_usd %}${{ wake.total_cost_usd | round(4) }}{% else %}—{% endif %}</span>
+        <span class="k">tools</span><span class="v">{{ wake.tools | join(', ') or '—' }}</span>
+        <span class="k">events</span><span class="v">{{ wake.events | length }}</span>
+      </div>
+    </div>
+
+    <h2>trace</h2>
+    <div class="trace">
+      {% for ev in wake.events %}
+        <div class="trace-row kind-{{ ev.kind }}">
+          <span class="ts">{{ ev.ts | localtime }}</span>
+          <span class="kind">{{ ev.kind }}</span>
+          <span class="body">
+            <div>{{ ev.summary }}</div>
+            {% if ev.kind in ('tool_use', 'result', 'user_message', 'exception') or ev.detail.text %}
+              <pre>{{ ev.detail | pretty_json }}</pre>
+            {% endif %}
+          </span>
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+{% endblock %}
