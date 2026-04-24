@@ -36,6 +36,15 @@ SPEAKING_DEFAULTS: dict[str, Any] = {
         "end": "07:00",
         "timezone": "America/New_York",
     },
+    # How many recent turns from speaking-turns.jsonl to inject as the Layer 2
+    # bootstrap preamble when Layer 1 (session_id resume) fails or is missing.
+    # See design-unified-context-compaction.md.
+    "context_bootstrap_turns": 20,
+    # When ResultMessage.usage.input_tokens exceeds this value, flag the
+    # session for compaction. On the next event, run a summary turn, roll the
+    # session, and inject the summary + tail(5) turns as preamble. 150K ~= 75%
+    # of a 200K window — leaves runway for the compaction turn itself.
+    "context_compaction_threshold": 150_000,
 }
 
 
@@ -61,6 +70,7 @@ class Config:
     offset_path: pathlib.Path
     seen_path: pathlib.Path
     turn_log_path: pathlib.Path
+    event_log_path: pathlib.Path
 
     # Behavior (from alice.config.json, falls back to SPEAKING_DEFAULTS)
     speaking: dict[str, Any] = field(default_factory=lambda: dict(SPEAKING_DEFAULTS))
@@ -144,5 +154,8 @@ def load() -> Config:
         offset_path=state_dir / "offset",
         seen_path=state_dir / "seen-timestamps",
         turn_log_path=mind_dir / "inner" / "state" / "speaking-turns.jsonl",
+        event_log_path=pathlib.Path(
+            from_any("SPEAKING_EVENT_LOG") or str(state_dir / "speaking.log")
+        ),
         speaking=speaking,
     )
