@@ -68,11 +68,17 @@ other_slot() {
 
 # ---------- readiness probes ----------
 wait_bridge_running() {
+    # Wait for the container to be running AND for either the legacy bash bridge
+    # or the new alice-speaking daemon process to exist (even if it's still
+    # blocked on the flock — the process being alive is what we care about here).
     local name="$1" timeout="${2:-$READY_TIMEOUT}"
     local i
     for ((i=0; i<timeout*2; i++)); do
         if docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null | grep -q running; then
-            if docker exec "$name" pgrep -f /usr/local/bin/signal-bridge >/dev/null 2>&1; then
+            if docker exec "$name" sh -c '
+                pgrep -f /usr/local/bin/signal-bridge >/dev/null 2>&1 ||
+                pgrep -f alice_speaking >/dev/null 2>&1
+            ' >/dev/null 2>&1; then
                 return 0
             fi
         fi

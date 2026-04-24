@@ -37,6 +37,7 @@ x-worker-base: &worker-base
   volumes:
     - ${HOME}/alice-mind:/home/alice/alice-mind:rw
     - ${HOME}/alice-tools:/home/alice/alice-tools:rw
+    - ${HOME}/alice-speaking:/home/alice/alice-speaking:ro
     - ${HOME}/.config/gh:/home/alice/.config/gh:ro
     - ${HOME}/.ssh:/home/alice/.ssh:ro
     - ${HOME}/.config/alice:/home/alice/.config/alice:ro

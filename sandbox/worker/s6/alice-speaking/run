@@ -1,0 +1,27 @@
+#!/command/with-contenv bash
+# Speaking Alice — Python daemon (Claude Agent SDK) that replaces the legacy
+# signal-bridge.sh. Runs as alice.
+#
+# Holds the flock on /state/worker/lease for the process lifetime so the
+# existing blue/green deploy mechanism (alice-deploy worker) still coordinates
+# handoff correctly. When blue/green is retired the flock wrapper can go.
+set -e
+
+# Wait for signal-cli's HTTP endpoint. depends_on's service_healthy normally
+# handles this but belt-and-braces.
+for _ in $(seq 1 60); do
+    if curl -sfo /dev/null -X POST "${SIGNAL_API:-http://alice-daemon:8080}/api/v1/rpc" \
+        -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","method":"version","id":"ping"}' 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+
+export ALICE_CONFIG=/home/alice/.config/alice/alice.env
+export PYTHONPATH=/home/alice/alice-speaking/src
+# Unbuffered stdout so s6 can see logs in real time.
+export PYTHONUNBUFFERED=1
+
+exec s6-setuidgid alice flock -x /state/worker/lease \
+    /opt/alice-speaking-venv/bin/python -m alice_speaking

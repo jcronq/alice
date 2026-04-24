@@ -22,6 +22,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN npm install -g @anthropic-ai/claude-code@latest
 
+# Dedicated venv for alice-speaking (the speaking hemisphere daemon). Debian
+# marks system pip as externally-managed so this isolates our deps cleanly.
+RUN python3 -m venv /opt/alice-speaking-venv \
+    && /opt/alice-speaking-venv/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/alice-speaking-venv/bin/pip install --no-cache-dir \
+        'claude-agent-sdk>=0.1.66' 'httpx>=0.28.1'
+
 # s6-overlay for process supervision (bridge + autopush)
 ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz /tmp/
 ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-x86_64.tar.xz /tmp/

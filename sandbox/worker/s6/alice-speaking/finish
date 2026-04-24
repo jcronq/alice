@@ -1,0 +1,7 @@
+#!/command/with-contenv bash
+# Cleanup after alice-speaking exits. The Python daemon already drains
+# cleanly on SIGTERM; this is just a belt-and-suspenders kill for any
+# stray subprocesses the Agent SDK might have spawned (claude CLI).
+pkill -9 -f 'python -m alice_speaking' 2>/dev/null || true
+pkill -9 -f '/opt/alice-speaking-venv/bin/python' 2>/dev/null || true
+exit 0
