@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # alice-think — one wake of Alice's thinking hemisphere.
 #
-# Thin shim over python -m alice_speaking.think (uses the speaking venv so we
-# get the Claude Agent SDK — direct `claude -p` hangs on TTY detection in
-# non-interactive contexts per Issue #9026). The Python entry is where config
-# overrides, prompt assembly, timeout, and structured event logging live.
+# Thin shim over `python -m alice_thinking` (the Agent SDK avoids the
+# `claude -p` TTY-detection hang per Issue #9026). The Python entry is
+# where config overrides, prompt assembly, and the kernel.run() call live.
 #
 # Usage:
 #   alice-think                  # full wake, reads prompts/thinking-bootstrap.md
 #   alice-think --quick          # 30s plumbing smoke test
 #   alice-think --echo           # also emit events to stderr
+#   alice-think --max-seconds 0  # unbounded (default — no timeout)
 #   alice-think --max-seconds 90 # cap wake at 90s for faster iteration
 #
 # Singleton enforcement is external — alice-thinker's supervisor wraps each
@@ -26,4 +26,4 @@ fi
 
 export PYTHONPATH="$ALICE_SPEAKING_SRC"
 export PYTHONUNBUFFERED=1
-exec "$VENV_PY" -m alice_speaking.think "$@"
+exec "$VENV_PY" -m alice_thinking "$@"

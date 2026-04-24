@@ -37,7 +37,12 @@ x-worker-base: &worker-base
   volumes:
     - ${HOME}/alice-mind:/home/alice/alice-mind:rw
     - ${HOME}/alice-tools:/home/alice/alice-tools:rw
-    - ${HOME}/alice-speaking:/home/alice/alice-speaking:ro
+    # alice-speaking mounted rw so speaking Alice can self-improve via worker
+    # subagents (v3-unified-context was the first pass; future iterations
+    # commit directly from inside the container). Policy: thinking MUST NOT
+    # write here (per the hemisphere boundary); enforcement is documentation.
+    - ${HOME}/alice-speaking:/home/alice/alice-speaking:rw
+    - ${HOME}/alice-viewer:/home/alice/alice-viewer:rw
     - ${HOME}/.config/gh:/home/alice/.config/gh:ro
     - ${HOME}/.ssh:/home/alice/.ssh:ro
     - ${HOME}/.config/alice:/home/alice/.config/alice:ro
