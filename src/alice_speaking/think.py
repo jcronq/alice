@@ -48,21 +48,14 @@ QUICK_MAX_SECONDS = 30
 
 
 def _load_token() -> None:
-    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
-        return
-    env_file = pathlib.Path(
-        os.environ.get("ALICE_CONFIG")
-        or pathlib.Path.home() / ".config" / "alice" / "alice.env"
-    )
-    if not env_file.is_file():
-        return
-    for raw in env_file.read_text().splitlines():
-        line = raw.strip()
-        if line.startswith("CLAUDE_CODE_OAUTH_TOKEN="):
-            os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = (
-                line.split("=", 1)[1].strip().strip('"').strip("'")
-            )
-            return
+    """Populate ``CLAUDE_CODE_OAUTH_TOKEN`` in os.environ (no-op if already set).
+
+    Delegates to :func:`alice_core.auth.ensure_token` — see that module for
+    the resolution order.
+    """
+    from alice_core.auth import ensure_token
+
+    ensure_token()
 
 
 def _apply_config_overrides(args: argparse.Namespace) -> None:
