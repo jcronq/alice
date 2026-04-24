@@ -98,22 +98,29 @@ def load() -> Config:
     env_path = pathlib.Path(os.environ.get("ALICE_CONFIG", DEFAULT_ALICE_ENV))
     env = _load_env_file(env_path)
 
+    # alice.env holds secrets + long-lived identity; compose injects
+    # container-level wiring (SIGNAL_API, STATE_DIR, SIGNAL_LOG_FILE) as
+    # environment vars. Prefer the env file for secrets, env vars for wiring.
+    def from_any(key: str, default: str | None = None) -> str | None:
+        return env.get(key) or os.environ.get(key) or default
+
     def required(key: str) -> str:
-        value = env.get(key) or os.environ.get(key)
+        value = from_any(key)
         if not value:
-            raise KeyError(f"{key} missing from {env_path}")
+            raise KeyError(f"{key} missing from {env_path} and process env")
         return value
 
-    signal_api = env.get("SIGNAL_API", "http://127.0.0.1:8080")
+    signal_api = from_any("SIGNAL_API", "http://127.0.0.1:8080") or ""
     signal_account = required("SIGNAL_ACCOUNT")
     oauth_token = required("CLAUDE_CODE_OAUTH_TOKEN")
     allowed = _parse_allowed_senders(required("ALLOWED_SENDERS"))
-    work_dir = pathlib.Path(env.get("WORK_DIR") or DEFAULT_MIND_DIR)
+    work_dir = pathlib.Path(from_any("WORK_DIR", str(DEFAULT_MIND_DIR)) or str(DEFAULT_MIND_DIR))
 
-    mind_dir = pathlib.Path(env.get("ALICE_MIND_DIR") or work_dir)
-    state_dir = pathlib.Path(env.get("STATE_DIR") or DEFAULT_STATE_DIR)
+    mind_dir = pathlib.Path(from_any("ALICE_MIND_DIR", str(work_dir)) or str(work_dir))
+    state_dir = pathlib.Path(from_any("STATE_DIR", str(DEFAULT_STATE_DIR)) or str(DEFAULT_STATE_DIR))
     signal_log = pathlib.Path(
-        env.get("SIGNAL_LOG_FILE") or state_dir.parent / "daemon" / "signal-daemon.log"
+        from_any("SIGNAL_LOG_FILE")
+        or str(state_dir.parent / "daemon" / "signal-daemon.log")
     )
 
     speaking = dict(SPEAKING_DEFAULTS)
