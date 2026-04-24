@@ -16,14 +16,16 @@
 # invocation in `flock -n /state/worker/thinking.lock`.
 set -u
 
-VENV_PY="/opt/alice-speaking-venv/bin/python"
-ALICE_SPEAKING_SRC="${ALICE_SPEAKING_SRC:-/home/alice/alice-speaking/src}"
+VENV_PY="/opt/alice-venv/bin/python"
+# Monorepo root is bind-mounted at /home/alice/alice; src/ holds all four
+# packages (alice_core, alice_speaking, alice_thinking, alice_viewer).
+ALICE_SRC="${ALICE_SRC:-/home/alice/alice/src}"
 
 if [ ! -x "$VENV_PY" ]; then
     echo "[alice-think] venv python missing at $VENV_PY" >&2
     exit 1
 fi
 
-export PYTHONPATH="$ALICE_SPEAKING_SRC"
+export PYTHONPATH="$ALICE_SRC"
 export PYTHONUNBUFFERED=1
 exec "$VENV_PY" -m alice_thinking "$@"

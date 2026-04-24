@@ -1,6 +1,15 @@
 node_modules/
 dist/
+build/
 __pycache__/
 *.pyc
 .env
 sandbox/docker-compose.override.yml
+
+# Python tooling
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# uv / hatch build artifacts
+/uv.lock.tmp

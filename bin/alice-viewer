@@ -1,23 +1,24 @@
 #!/usr/bin/env bash
-# Run the alice-viewer on :7777 (binds 0.0.0.0 by default — LAN-reachable).
+# alice-viewer — observability UI, runs on host (not in the container).
 #
+# Binds 0.0.0.0:7777 so the dashboard is reachable from Owner's LAN.
 # Reads Alice's logs directly from their host bind-mount locations:
 #   thinking  → ~/.local/state/alice/worker/thinking.log
 #   speaking  → ~/.local/state/alice/worker/speaking.log
 #   mind      → ~/alice-mind
 # Override via env: ALICE_THINKING_LOG, ALICE_SPEAKING_LOG, ALICE_MIND.
-# To restrict to loopback: ALICE_VIEWER_HOST=127.0.0.1 ./run.sh
+# Restrict to loopback with ALICE_VIEWER_HOST=127.0.0.1 alice-viewer.
 set -eu
 
-cd "$(dirname "$0")"
+# Run from the monorepo root so uv picks up the alice pyproject.
+cd "$(dirname "$0")/.."
 
 if ! command -v uv >/dev/null 2>&1; then
     echo "alice-viewer: uv not found on PATH" >&2
     exit 1
 fi
 
-# Sync deps into a uv-managed venv on first run.
-uv sync >/dev/null
+uv sync --quiet
 
 export ALICE_VIEWER_HOST="${ALICE_VIEWER_HOST:-0.0.0.0}"
 export ALICE_VIEWER_PORT="${ALICE_VIEWER_PORT:-7777}"

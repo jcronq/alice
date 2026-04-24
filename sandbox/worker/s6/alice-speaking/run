@@ -19,9 +19,11 @@ for _ in $(seq 1 60); do
 done
 
 export ALICE_CONFIG=/home/alice/.config/alice/alice.env
-export PYTHONPATH=/home/alice/alice-speaking/src
+# Monorepo root bind-mounted at /home/alice/alice — src/ holds all Python
+# packages (alice_core, alice_speaking, alice_thinking, alice_viewer).
+export PYTHONPATH=/home/alice/alice/src
 # Unbuffered stdout so s6 can see logs in real time.
 export PYTHONUNBUFFERED=1
 
 exec s6-setuidgid alice flock -x /state/worker/lease \
-    /opt/alice-speaking-venv/bin/python -m alice_speaking
+    /opt/alice-venv/bin/python -m alice_speaking

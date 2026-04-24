@@ -22,11 +22,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN npm install -g @anthropic-ai/claude-code@latest
 
-# Dedicated venv for alice-speaking (the speaking hemisphere daemon). Debian
-# marks system pip as externally-managed so this isolates our deps cleanly.
-RUN python3 -m venv /opt/alice-speaking-venv \
-    && /opt/alice-speaking-venv/bin/pip install --no-cache-dir --upgrade pip \
-    && /opt/alice-speaking-venv/bin/pip install --no-cache-dir \
+# Dedicated venv for alice (agent kernel + speaking daemon + thinking wake).
+# The monorepo src/ tree is bind-mounted at /home/alice/alice/src and added
+# to PYTHONPATH by the s6 services and /usr/local/bin/alice-think — so this
+# venv only needs the upstream deps, not the alice_* packages themselves.
+# Debian marks system pip as externally-managed; a venv isolates cleanly.
+RUN python3 -m venv /opt/alice-venv \
+    && /opt/alice-venv/bin/pip install --no-cache-dir --upgrade pip \
+    && /opt/alice-venv/bin/pip install --no-cache-dir \
         'claude-agent-sdk>=0.1.66' 'httpx>=0.28.1'
 
 # s6-overlay for process supervision (bridge + autopush)
