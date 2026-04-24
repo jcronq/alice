@@ -20,7 +20,7 @@ build-backend = "hatchling.build"
 # alice_speaking is the Signal daemon that composes the kernel with producers,
 # handlers, and an outbox.
 [tool.hatch.build.targets.wheel]
-packages = ["src/alice_core", "src/alice_speaking"]
+packages = ["src/alice_core", "src/alice_speaking", "src/alice_thinking"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
