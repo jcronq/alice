@@ -89,6 +89,10 @@ class SpeakingDaemon:
         self._emergency_dir = cfg.mind_dir / "inner" / "emergency"
         self._emergency_handled_dir = self._emergency_dir / ".handled"
         self._dispatched_emergencies: set[str] = set()
+        self._config_path = cfg.mind_dir / "config" / "alice.config.json"
+        self._config_mtime: float = (
+            self._config_path.stat().st_mtime if self._config_path.is_file() else 0.0
+        )
 
     async def run(self) -> None:
         os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = self.cfg.oauth_token
@@ -182,6 +186,7 @@ class SpeakingDaemon:
         while True:
             event = await self._queue.get()
             try:
+                self._maybe_reload_config()
                 if isinstance(event, SignalEvent):
                     await self._handle_signal(event)
                 elif isinstance(event, SurfaceEvent):
@@ -192,6 +197,37 @@ class SpeakingDaemon:
                 log.exception("consumer error handling %s", type(event).__name__)
             finally:
                 self._queue.task_done()
+
+    def _maybe_reload_config(self) -> None:
+        """Reload alice.config.json if it has changed on disk.
+
+        Hot-reload happens at event boundaries — each signal / surface /
+        emergency turn begins with the freshest config. Alice's `write_config`
+        tool therefore takes effect on her next turn, no daemon restart needed.
+        Hot-reloadable: model, quiet_hours, working_context_token_budget.
+        """
+        if not self._config_path.is_file():
+            return
+        try:
+            mtime = self._config_path.stat().st_mtime
+        except OSError:
+            return
+        if mtime == self._config_mtime:
+            return
+        try:
+            new_cfg = config_module.load()
+        except Exception:  # noqa: BLE001
+            log.exception("config reload failed; keeping current cfg")
+            return
+        old_speaking = self.cfg.speaking
+        self.cfg = new_cfg
+        self._config_mtime = mtime
+        changes = {
+            k: v
+            for k, v in new_cfg.speaking.items()
+            if old_speaking.get(k) != v
+        }
+        log.info("config reloaded (changes: %s)", list(changes.keys()) or "none observed")
 
     # ------------------------------------------------------------------
     # Signal turn (unchanged from phase 2)
