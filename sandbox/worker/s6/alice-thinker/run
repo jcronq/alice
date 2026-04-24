@@ -1,0 +1,38 @@
+#!/command/with-contenv bash
+# alice-thinker — timer loop that fires alice-think on a configurable cadence.
+# Singleton enforced by `flock -n` on a shared lock; a second firing skips
+# rather than queues, matching the REM-cycle design where overlap is bad.
+#
+# Reads cadence_minutes from alice.config.json at each iteration, so live
+# config changes take effect on the next cycle boundary.
+set -e
+
+LOCK=/state/worker/thinking.lock
+CONFIG_JSON=/home/alice/alice-mind/config/alice.config.json
+DEFAULT_CADENCE_MIN=30
+
+# Ensure the state dir + lock file exist so flock can open them.
+mkdir -p "$(dirname "$LOCK")"
+touch "$LOCK"
+chown alice:alice "$LOCK" || true
+
+# Wait a bit on startup so Alice's speaking hemisphere has a chance to settle
+# before thinking starts burning tokens.
+sleep 60
+
+while true; do
+    cadence_min="$DEFAULT_CADENCE_MIN"
+    if [ -f "$CONFIG_JSON" ] && command -v jq >/dev/null 2>&1; then
+        v=$(jq -r '.thinking.cadence_minutes // empty' "$CONFIG_JSON" 2>/dev/null || true)
+        case "$v" in
+            ''|*[!0-9]*) ;;  # invalid / empty — keep default
+            *) cadence_min="$v" ;;
+        esac
+    fi
+    cadence=$(( cadence_min * 60 ))
+
+    # `flock -n` → non-blocking; if already held, skip this wake entirely.
+    flock -n "$LOCK" s6-setuidgid alice /usr/local/bin/alice-think || true
+
+    sleep "$cadence"
+done
