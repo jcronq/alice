@@ -300,7 +300,11 @@ def test_post_compaction_preamble_uses_summary(cfg, monkeypatch) -> None:
     assert "Context summary" in d._pending_preamble
 
 
-def test_resume_failure_clears_session_and_primes_layer2(cfg, monkeypatch) -> None:
+def test_resume_failure_clears_and_retries(cfg, monkeypatch) -> None:
+    """Design §Problem 1: resume= failure clears session_id, primes
+    Layer 2 preamble, and transparently retries the same prompt once
+    with a fresh session. Test drives a query mock that fails on the
+    first call (with resume=) and succeeds on the retry (fresh)."""
     d = _make_daemon(cfg, monkeypatch)
     d.session_id = "stale"
     session_state.write(d._session_path, "stale")
@@ -311,25 +315,70 @@ def test_resume_failure_clears_session_and_primes_layer2(cfg, monkeypatch) -> No
     class SessionNotFoundError(RuntimeError):
         pass
 
-    async def boom(**kwargs):
-        raise SessionNotFoundError("Session not found: stale")
-        yield  # pragma: no cover  # makes this an async-gen syntactically
+    calls: list[dict] = []
 
-    monkeypatch.setattr(daemon_module, "query", lambda **kw: boom(**kw))
+    async def first_call_fails_then_succeeds(*, prompt: str, options: Any):
+        calls.append({"prompt": prompt, "resume": getattr(options, "resume", None)})
+        # First call (resume=stale) raises. Second call (no resume) succeeds.
+        if len(calls) == 1:
+            raise SessionNotFoundError("Session not found: stale")
+        # Success path: yield one assistant + one result.
+        yield _assistant("ok")
+        yield _result("fresh")
+
+    monkeypatch.setattr(
+        daemon_module,
+        "query",
+        lambda **kw: first_call_fails_then_succeeds(**kw),
+    )
+
+    asyncio.run(
+        d._run_turn("hi", turn_id="t1", outbound_recipient="+15555550100")
+    )
+
+    # Retry happened; fresh session persisted.
+    assert len(calls) == 2
+    assert calls[0]["resume"] == "stale"
+    assert calls[1]["resume"] is None
+    assert d.session_id == "fresh"
+    persisted = session_state.read(d._session_path)
+    assert persisted is not None and persisted.session_id == "fresh"
+    # Layer 2 preamble was primed before retry and then consumed.
+    assert d._pending_preamble is None
+    assert "Recent conversation" in calls[1]["prompt"]
+    # Event log should have session_resume_failed.
+    lines = d.cfg.event_log_path.read_text().splitlines()
+    events = [json.loads(line)["event"] for line in lines]
+    assert "session_resume_failed" in events
+
+
+def test_resume_failure_does_not_loop_on_retry(cfg, monkeypatch) -> None:
+    """If the retry ALSO blows up session-style, we don't recurse a
+    second time — the exception propagates to the caller."""
+    d = _make_daemon(cfg, monkeypatch)
+    d.session_id = "stale"
+    session_state.write(d._session_path, "stale")
+
+    class SessionNotFoundError(RuntimeError):
+        pass
+
+    calls: list[int] = []
+
+    async def always_fails(*, prompt: str, options: Any):
+        calls.append(1)
+        raise SessionNotFoundError("Session not found")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(daemon_module, "query", lambda **kw: always_fails(**kw))
 
     with pytest.raises(SessionNotFoundError):
         asyncio.run(
             d._run_turn("hi", turn_id="t1", outbound_recipient="+15555550100")
         )
 
+    # Exactly two calls — one initial + one retry.
+    assert len(calls) == 2
     assert d.session_id is None
-    assert not d._session_path.is_file()
-    # Layer 2 primed from turn_log.
-    assert d._pending_preamble is not None
-    # Event log should have session_resume_failed.
-    lines = d.cfg.event_log_path.read_text().splitlines()
-    events = [json.loads(line)["event"] for line in lines]
-    assert "session_resume_failed" in events
 
 
 def test_preamble_consumed_on_next_turn(cfg, monkeypatch) -> None:

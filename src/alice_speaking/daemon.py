@@ -732,6 +732,12 @@ class SpeakingDaemon:
         ``outbound_recipient`` is informational for the missed_reply
         event.
 
+        On Layer 1 failure (resume= points at a session the SDK no
+        longer has) we clear self.session_id, prime the Layer 2
+        bootstrap preamble, and transparently retry the same prompt
+        with a fresh session — per design §Problem 1, layer-1-failure
+        handling.
+
         Returns the concatenated assistant text (useful for compaction
         turns which consume the summary). Returns empty string on early
         abort.
@@ -745,13 +751,19 @@ class SpeakingDaemon:
             final_prompt = f"{self._pending_preamble}\n\n{prompt}"
             self._pending_preamble = None
 
-        options = self._build_options()
         parts: list[str] = []
-        result_usage: Optional[dict] = None
-        result_session_id: Optional[str] = None
+        # Mutable box for usage + final session_id so the inner loop
+        # closure can update them without nonlocal bookkeeping.
+        accum: dict[str, Any] = {"usage": None, "session_id": None}
 
-        try:
-            async for msg in query(prompt=final_prompt, options=options):
+        async def _drive(query_prompt: str) -> None:
+            """Drive one query() generator, dispatching each message
+            into part accumulation, observability, and session persist."""
+            parts.clear()
+            accum["usage"] = None
+            accum["session_id"] = None
+            options = self._build_options()
+            async for msg in query(prompt=query_prompt, options=options):
                 if isinstance(msg, AssistantMessage):
                     if getattr(msg, "error", None) == "rate_limit":
                         raise RuntimeError("claude rate_limit")
@@ -783,8 +795,8 @@ class SpeakingDaemon:
                                     text=_short(block.thinking),
                                 )
                 elif isinstance(msg, ResultMessage):
-                    result_usage = msg.usage
-                    result_session_id = msg.session_id
+                    accum["usage"] = msg.usage
+                    accum["session_id"] = msg.session_id
                     if msg.session_id:
                         self.session_id = msg.session_id
                         # Persist Layer 1 immediately. Skip when silent so
@@ -814,9 +826,13 @@ class SpeakingDaemon:
                     if msg.is_error:
                         detail = getattr(msg, "result", None) or "unknown"
                         raise RuntimeError(f"claude result error: {detail}")
+
+        try:
+            await _drive(final_prompt)
         except Exception as exc:  # noqa: BLE001
             # Layer 1 failure recovery: if resume= points at a stale
-            # session, drop session state and let the next turn rebuild.
+            # session, drop session state, prime Layer 2, and retry the
+            # same prompt once with a fresh session.
             if self.session_id and _looks_like_missing_session(exc):
                 self.events.emit(
                     "session_resume_failed",
@@ -825,19 +841,23 @@ class SpeakingDaemon:
                     error=f"{type(exc).__name__}: {exc}",
                 )
                 log.warning(
-                    "resume=%s failed (%s); clearing and falling back to Layer 2",
+                    "resume=%s failed (%s); retrying with fresh session",
                     self.session_id,
                     type(exc).__name__,
                 )
                 self.session_id = None
                 session_state.clear(self._session_path)
-                # Prime Layer 2 so the NEXT turn starts warm.
                 self._prime_bootstrap_preamble()
-                # Let the caller handle the surface error — they'll log
-                # the turn and ideally retry. We don't recurse here
-                # because the current prompt is already consumed from the
-                # consumer's perspective.
-            raise
+                retry_prompt = prompt
+                if self._pending_preamble:
+                    retry_prompt = f"{self._pending_preamble}\n\n{prompt}"
+                    self._pending_preamble = None
+                await _drive(retry_prompt)
+            else:
+                raise
+
+        result_usage = accum["usage"]
+        result_session_id = accum["session_id"]
 
         # Compaction threshold check — only on non-silent turns.
         if not silent and result_usage:
