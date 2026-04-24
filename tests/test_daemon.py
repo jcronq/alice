@@ -86,7 +86,11 @@ def _make_daemon(cfg, monkeypatch: pytest.MonkeyPatch) -> SpeakingDaemon:
 
 
 def _patch_query(monkeypatch: pytest.MonkeyPatch, messages_fn: Callable[[], list[Any]]):
-    """Replace daemon_module.query with a factory producing the given messages.
+    """Replace the SDK's query() with a factory producing the given messages.
+
+    As of the kernel refactor (step 7), query() is invoked from inside
+    :mod:`alice_core.kernel`, not from daemon.py. We patch it there so the
+    daemon's kernel-driven turns see our fakes.
 
     ``messages_fn`` is a zero-arg callable so each turn can return a fresh
     list — closing over mutable state from the test."""
@@ -95,11 +99,11 @@ def _patch_query(monkeypatch: pytest.MonkeyPatch, messages_fn: Callable[[], list
         for m in messages_fn():
             yield m
 
-    # Need to preserve the "call twice" behavior (generator factory).
+    # Preserve generator-factory semantics (each call makes a new generator).
     def outer(**kwargs):
         return fake_query(**kwargs)
 
-    monkeypatch.setattr(daemon_module, "query", outer)
+    monkeypatch.setattr("alice_core.kernel.query", outer)
 
 
 # --------------------------------------------------------------------- tests
@@ -327,8 +331,7 @@ def test_resume_failure_clears_and_retries(cfg, monkeypatch) -> None:
         yield _result("fresh")
 
     monkeypatch.setattr(
-        daemon_module,
-        "query",
+        "alice_core.kernel.query",
         lambda **kw: first_call_fails_then_succeeds(**kw),
     )
 
@@ -369,7 +372,7 @@ def test_resume_failure_does_not_loop_on_retry(cfg, monkeypatch) -> None:
         raise SessionNotFoundError("Session not found")
         yield  # pragma: no cover
 
-    monkeypatch.setattr(daemon_module, "query", lambda **kw: always_fails(**kw))
+    monkeypatch.setattr("alice_core.kernel.query", lambda **kw: always_fails(**kw))
 
     with pytest.raises(SessionNotFoundError):
         asyncio.run(
@@ -397,7 +400,7 @@ def test_preamble_consumed_on_next_turn(cfg, monkeypatch) -> None:
         for m in msgs():
             yield m
 
-    monkeypatch.setattr(daemon_module, "query", lambda **kw: fake_query(**kw))
+    monkeypatch.setattr("alice_core.kernel.query", lambda **kw: fake_query(**kw))
 
     asyncio.run(
         d._run_turn("real body", turn_id="t1", outbound_recipient="+15555550100")

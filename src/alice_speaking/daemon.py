@@ -46,15 +46,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    ResultMessage,
-    TextBlock,
-    ThinkingBlock,
-    ToolUseBlock,
-    query,
-)
+from alice_core.kernel import AgentKernel, KernelSpec
+from alice_core.sdk_compat import _short, looks_like_missing_session as _looks_like_missing_session
 
 from . import compaction as compaction_module
 from . import config as config_module
@@ -62,8 +55,8 @@ from . import session_state
 from . import tools as tools_module
 from .config import AllowedSender, Config
 from .dedup import DedupStore
-from alice_core.sdk_compat import _short, looks_like_missing_session as _looks_like_missing_session
 from .events import EventLogger
+from .handlers import CompactionArmer, SessionHandler
 from .quiet_hours import QueuedMessage, QuietQueue, is_quiet_hours
 from .signal_client import SignalClient, SignalEnvelope
 from .turn_log import TurnLog, new_turn
@@ -704,110 +697,36 @@ class SpeakingDaemon:
         outbound_recipient: Optional[str],
         silent: bool = False,
     ) -> str:
-        """Execute one SDK turn.
+        """Execute one SDK turn through the agent kernel.
 
         ``silent=True`` marks the turn as internal (bootstrap or
-        compaction) — no missed_reply event, no usage-threshold check.
-        ``outbound_recipient`` is informational for the missed_reply
-        event.
+        compaction) — no missed_reply event, no usage-threshold check,
+        no session.json flap. ``outbound_recipient`` is informational
+        for the missed_reply event.
 
         On Layer 1 failure (resume= points at a session the SDK no
         longer has) we clear self.session_id, prime the Layer 2
         bootstrap preamble, and transparently retry the same prompt
-        with a fresh session — per design §Problem 1, layer-1-failure
-        handling.
+        with a fresh session.
 
         Returns the concatenated assistant text (useful for compaction
-        turns which consume the summary). Returns empty string on early
-        abort.
+        turns which consume the summary).
         """
         self._turn_did_send = False
 
-        # Compose the prompt with any pending preamble. The preamble is
-        # one-shot: it's consumed as the current turn's first context.
-        final_prompt = prompt
-        if self._pending_preamble:
-            final_prompt = f"{self._pending_preamble}\n\n{prompt}"
-            self._pending_preamble = None
+        final_prompt = self._compose_prompt(prompt)
+        spec = self._build_spec()
+        handlers = self._build_handlers(silent=silent)
 
-        parts: list[str] = []
-        # Mutable box for usage + final session_id so the inner loop
-        # closure can update them without nonlocal bookkeeping.
-        accum: dict[str, Any] = {"usage": None, "session_id": None}
-
-        async def _drive(query_prompt: str) -> None:
-            """Drive one query() generator, dispatching each message
-            into part accumulation, observability, and session persist."""
-            parts.clear()
-            accum["usage"] = None
-            accum["session_id"] = None
-            options = self._build_options()
-            async for msg in query(prompt=query_prompt, options=options):
-                if isinstance(msg, AssistantMessage):
-                    if getattr(msg, "error", None) == "rate_limit":
-                        raise RuntimeError("claude rate_limit")
-                    if getattr(msg, "error", None):
-                        raise RuntimeError(f"claude error: {msg.error}")
-                    for block in msg.content:
-                        if isinstance(block, TextBlock):
-                            parts.append(block.text)
-                            if not silent:
-                                self.events.emit(
-                                    "assistant_text",
-                                    turn_id=turn_id,
-                                    text=_short(block.text),
-                                )
-                        elif isinstance(block, ToolUseBlock):
-                            if not silent:
-                                self.events.emit(
-                                    "tool_use",
-                                    turn_id=turn_id,
-                                    name=block.name,
-                                    input=_short(block.input),
-                                    id=block.id,
-                                )
-                        elif isinstance(block, ThinkingBlock):
-                            if not silent:
-                                self.events.emit(
-                                    "thinking",
-                                    turn_id=turn_id,
-                                    text=_short(block.thinking),
-                                )
-                elif isinstance(msg, ResultMessage):
-                    accum["usage"] = msg.usage
-                    accum["session_id"] = msg.session_id
-                    if msg.session_id:
-                        self.session_id = msg.session_id
-                        # Persist Layer 1 immediately. Skip when silent so
-                        # a compaction turn mid-flight doesn't flap the
-                        # session file across the roll.
-                        if not silent:
-                            try:
-                                session_state.write(
-                                    self._session_path, msg.session_id
-                                )
-                            except OSError:
-                                log.exception(
-                                    "failed to persist session_id to %s",
-                                    self._session_path,
-                                )
-                    if not silent:
-                        self.events.emit(
-                            "result",
-                            turn_id=turn_id,
-                            session_id=msg.session_id,
-                            num_turns=getattr(msg, "num_turns", None),
-                            duration_ms=getattr(msg, "duration_ms", None),
-                            total_cost_usd=getattr(msg, "total_cost_usd", None),
-                            is_error=msg.is_error,
-                            usage=msg.usage,
-                        )
-                    if msg.is_error:
-                        detail = getattr(msg, "result", None) or "unknown"
-                        raise RuntimeError(f"claude result error: {detail}")
+        kernel = AgentKernel(
+            self.events,
+            correlation_id=turn_id,
+            silent=silent,
+            short_cap=2000,
+        )
 
         try:
-            await _drive(final_prompt)
+            result = await kernel.run(final_prompt, spec, handlers=handlers)
         except Exception as exc:  # noqa: BLE001
             # Layer 1 failure recovery: if resume= points at a stale
             # session, drop session state, prime Layer 2, and retry the
@@ -827,32 +746,20 @@ class SpeakingDaemon:
                 self.session_id = None
                 session_state.clear(self._session_path)
                 self._prime_bootstrap_preamble()
-                retry_prompt = prompt
-                if self._pending_preamble:
-                    retry_prompt = f"{self._pending_preamble}\n\n{prompt}"
-                    self._pending_preamble = None
-                await _drive(retry_prompt)
+                retry_prompt = self._compose_prompt(prompt)
+                retry_spec = self._build_spec()
+                retry_handlers = self._build_handlers(silent=silent)
+                result = await kernel.run(
+                    retry_prompt, retry_spec, handlers=retry_handlers
+                )
             else:
                 raise
 
-        result_usage = accum["usage"]
-        result_session_id = accum["session_id"]
-
-        # Compaction threshold check — only on non-silent turns.
-        if not silent and result_usage:
-            threshold = int(
-                self.cfg.speaking.get(
-                    "context_compaction_threshold",
-                    compaction_module.DEFAULT_THRESHOLD,
-                )
-            )
-            if compaction_module.should_compact(result_usage, threshold):
-                self._compaction_pending = True
-                log.info(
-                    "compaction armed (input_tokens=%s > threshold=%d)",
-                    result_usage.get("input_tokens"),
-                    threshold,
-                )
+        if result.is_error or result.error:
+            # Kernel returned an error result (timeout, etc.). Callers
+            # see an empty / partial text; the kernel already emitted
+            # the specific error event. We just flow through.
+            pass
 
         # Missed-reply observability: only meaningful when the turn was
         # supposed to be able to reach a user and Alice skipped it.
@@ -861,22 +768,61 @@ class SpeakingDaemon:
                 "missed_reply",
                 turn_id=turn_id,
                 outbound_recipient=outbound_recipient,
-                session_id=result_session_id,
+                session_id=result.session_id,
             )
 
-        return "".join(parts).strip()
+        return result.text
 
-    def _build_options(self) -> ClaudeAgentOptions:
+    def _compose_prompt(self, prompt: str) -> str:
+        """Prepend the one-shot bootstrap preamble if one is pending."""
+        if not self._pending_preamble:
+            return prompt
+        composed = f"{self._pending_preamble}\n\n{prompt}"
+        self._pending_preamble = None
+        return composed
+
+    def _build_spec(self) -> KernelSpec:
         builtin_tools = ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
-        kwargs: dict = {
-            "model": self.cfg.speaking.get("model"),
-            "allowed_tools": builtin_tools + self.custom_tool_names,
-            "mcp_servers": self.mcp_servers,
-            "cwd": str(self.cfg.work_dir),
-        }
-        if self.session_id:
-            kwargs["resume"] = self.session_id
-        return ClaudeAgentOptions(**kwargs)
+        return KernelSpec(
+            model=self.cfg.speaking.get("model"),
+            allowed_tools=builtin_tools + self.custom_tool_names,
+            mcp_servers=self.mcp_servers,
+            cwd=self.cfg.work_dir,
+            resume=self.session_id,
+        )
+
+    def _build_handlers(self, *, silent: bool) -> list:
+        """Compose the per-turn kernel handlers.
+
+        Silent turns still need their session_id tracked (so the next
+        turn passes ``resume=``) but skip the session.json write and the
+        compaction arming — those are production-turn concerns only.
+        """
+
+        def _set_session_id(sid: str) -> None:
+            self.session_id = sid
+
+        def _arm_compaction() -> None:
+            self._compaction_pending = True
+
+        handlers: list = [
+            SessionHandler(
+                session_path=self._session_path,
+                set_session_id=_set_session_id,
+                persist=not silent,
+            ),
+        ]
+        if not silent:
+            threshold = int(
+                self.cfg.speaking.get(
+                    "context_compaction_threshold",
+                    compaction_module.DEFAULT_THRESHOLD,
+                )
+            )
+            handlers.append(
+                CompactionArmer(threshold=threshold, arm=_arm_compaction)
+            )
+        return handlers
 
     # ------------------------------------------------------------------
     # Layer 2 bootstrap + compaction
