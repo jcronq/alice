@@ -36,6 +36,7 @@ from . import config as config_module
 from . import tools as tools_module
 from .config import AllowedSender, Config
 from .dedup import DedupStore
+from .quiet_hours import QueuedMessage, QuietQueue, is_quiet_hours
 from .signal_client import SignalClient, SignalEnvelope
 from .turn_log import TurnLog, new_turn
 
@@ -44,6 +45,7 @@ log = logging.getLogger("alice_speaking")
 
 
 SURFACE_POLL_SECONDS = 5.0
+QUIET_CHECK_SECONDS = 30.0
 
 
 @dataclass
@@ -72,6 +74,7 @@ class SpeakingDaemon:
         self.dedup = DedupStore(cfg.seen_path)
         self.turns = TurnLog(cfg.turn_log_path)
         self.mcp_servers, self.custom_tool_names = tools_module.build(cfg)
+        self.quiet_queue = QuietQueue(cfg.mind_dir / "inner" / "state" / "quiet-queue.jsonl")
         self.session_id: Optional[str] = None
         self._queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=64)
         self._dispatched_surfaces: set[str] = set()
@@ -91,9 +94,14 @@ class SpeakingDaemon:
             await self.signal.wait_ready()
             log.info("daemon ready; listening")
 
+            # If quiet hours ended while we were down, drain the queue first.
+            if not is_quiet_hours(self.cfg.speaking) and self.quiet_queue.size() > 0:
+                await self._drain_quiet_queue(reason="startup")
+
             producers = [
                 asyncio.create_task(self._signal_producer(), name="sig-produce"),
                 asyncio.create_task(self._surface_producer(), name="sur-produce"),
+                asyncio.create_task(self._quiet_watcher(), name="quiet-watch"),
             ]
             consumer = asyncio.create_task(self._consumer(), name="consumer")
             stop_task = asyncio.create_task(self._stop.wait(), name="stop")
@@ -165,7 +173,11 @@ class SpeakingDaemon:
     async def _handle_signal(self, event: SignalEvent) -> None:
         env = event.envelope
         sender = event.sender
-        await self.signal.start_typing(env.source)
+        quiet = is_quiet_hours(self.cfg.speaking)
+
+        # Typing indicator is visible outbound → suppressed during quiet hours.
+        if not quiet:
+            await self.signal.start_typing(env.source)
         reply: Optional[str] = None
         error: Optional[str] = None
         try:
@@ -174,8 +186,7 @@ class SpeakingDaemon:
             prompt = f"[Signal from {sender.name} | {stamp}]\n\n{env.body}"
             reply = await self._run_turn(prompt)
             if reply:
-                await self.signal.send(env.source, reply)
-                log.info("replied to %s (%d chars)", sender.name, len(reply))
+                await self._send_or_queue(env.source, reply, sender.name)
             else:
                 log.warning("empty reply for %s", sender.name)
                 error = "empty_reply"
@@ -183,12 +194,14 @@ class SpeakingDaemon:
             log.exception("turn failed for %s", sender.name)
             error = f"{type(exc).__name__}: {exc}"
             with contextlib.suppress(Exception):
-                await self.signal.send(
+                await self._send_or_queue(
                     env.source,
                     f"Hit an error ({type(exc).__name__}). Session preserved — reply to retry.",
+                    sender.name,
                 )
         finally:
-            await self.signal.stop_typing(env.source)
+            if not quiet:
+                await self.signal.stop_typing(env.source)
             self.turns.append(
                 new_turn(
                     sender_number=env.source,
@@ -198,6 +211,49 @@ class SpeakingDaemon:
                     error=error,
                 )
             )
+
+    async def _send_or_queue(self, recipient: str, text: str, sender_name: str) -> None:
+        if is_quiet_hours(self.cfg.speaking):
+            self.quiet_queue.append(
+                QueuedMessage(
+                    recipient=recipient,
+                    text=text,
+                    queued_at=time.time(),
+                )
+            )
+            log.info(
+                "quiet hours: queued reply for %s (%d chars); queue size=%d",
+                sender_name,
+                len(text),
+                self.quiet_queue.size(),
+            )
+            return
+        await self.signal.send(recipient, text)
+        log.info("replied to %s (%d chars)", sender_name, len(text))
+
+    async def _quiet_watcher(self) -> None:
+        """Poll quiet-hours state; drain the queue on transition out."""
+        was_quiet = is_quiet_hours(self.cfg.speaking)
+        while not self._stop.is_set():
+            await asyncio.sleep(QUIET_CHECK_SECONDS)
+            now_quiet = is_quiet_hours(self.cfg.speaking)
+            if was_quiet and not now_quiet:
+                await self._drain_quiet_queue(reason="quiet-hours-ended")
+            was_quiet = now_quiet
+
+    async def _drain_quiet_queue(self, *, reason: str) -> None:
+        messages = self.quiet_queue.drain()
+        if not messages:
+            return
+        log.info("draining quiet queue (%d msgs) — %s", len(messages), reason)
+        for msg in messages:
+            try:
+                await self.signal.send(msg.recipient, msg.text)
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "failed to send queued message to %s; re-queueing", msg.recipient
+                )
+                self.quiet_queue.append(msg)
 
     # ------------------------------------------------------------------
     # Surface turn
