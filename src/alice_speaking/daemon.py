@@ -29,6 +29,7 @@ from claude_agent_sdk import (
 )
 
 from . import config as config_module
+from . import tools as tools_module
 from .config import AllowedSender, Config
 from .dedup import DedupStore
 from .signal_client import SignalClient, SignalEnvelope
@@ -49,6 +50,7 @@ class SpeakingDaemon:
         )
         self.dedup = DedupStore(cfg.seen_path)
         self.turns = TurnLog(cfg.turn_log_path)
+        self.mcp_servers, self.custom_tool_names = tools_module.build(cfg)
         self.session_id: Optional[str] = None
         self._stop = asyncio.Event()
         self._in_flight: set[asyncio.Task[None]] = set()
@@ -171,9 +173,11 @@ class SpeakingDaemon:
         return "".join(parts).strip()
 
     def _build_options(self) -> ClaudeAgentOptions:
+        builtin_tools = ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
         kwargs: dict = {
             "model": self.cfg.speaking.get("model"),
-            "allowed_tools": ["Bash", "Read", "Write", "Edit", "Glob", "Grep"],
+            "allowed_tools": builtin_tools + self.custom_tool_names,
+            "mcp_servers": self.mcp_servers,
             "cwd": str(self.cfg.work_dir),
         }
         if self.session_id:
