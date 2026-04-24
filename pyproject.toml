@@ -1,0 +1,15 @@
+[project]
+name = "alice-speaking"
+version = "0.1.0"
+description = "Alice's speaking hemisphere — the Python daemon that holds the conversation."
+authors = [
+    { name = "jcronq", email = "jcronq@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "claude-agent-sdk>=0.1.66",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.17,<0.10.0"]
+build-backend = "uv_build"
