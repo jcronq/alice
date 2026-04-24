@@ -42,7 +42,7 @@ DEFAULT_BOOTSTRAP = DEFAULT_MIND / "prompts" / "thinking-bootstrap.md"
 DEFAULT_LOG = pathlib.Path("/state/worker/thinking.log")
 DEFAULT_TOOLS = "Bash,Read,Write,Edit,Glob,Grep,WebFetch"
 DEFAULT_MODEL = "claude-sonnet-4-6"
-DEFAULT_MAX_SECONDS = 300
+DEFAULT_MAX_SECONDS = 0  # 0 == no timeout. Thinking runs as long as it needs.
 QUICK_PROMPT = "Reply exactly: QUICK-OK"
 QUICK_MAX_SECONDS = 30
 
@@ -126,44 +126,52 @@ async def _run_once(
         cwd=str(cwd),
         prompt_chars=len(prompt_text),
     )
+
+    async def _drive() -> None:
+        async for msg in query(prompt=prompt_text, options=options):
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, TextBlock):
+                        logger.emit("assistant_text", text=_short(block.text))
+                    elif isinstance(block, ToolUseBlock):
+                        logger.emit(
+                            "tool_use",
+                            name=block.name,
+                            input=_short(block.input),
+                            id=block.id,
+                        )
+                    elif isinstance(block, ThinkingBlock):
+                        logger.emit("thinking", text=_short(block.thinking))
+                if msg.error:
+                    logger.emit("assistant_error", error=msg.error)
+            elif isinstance(msg, UserMessage):
+                # UserMessage comes back when tool results arrive; log for
+                # completeness so the trace is faithful.
+                logger.emit("user_message", content=_short(msg.content))
+            elif isinstance(msg, ResultMessage):
+                logger.emit(
+                    "result",
+                    num_turns=msg.num_turns,
+                    duration_ms=msg.duration_ms,
+                    total_cost_usd=msg.total_cost_usd,
+                    is_error=msg.is_error,
+                    usage=msg.usage,
+                    result=_short(msg.result) if msg.result else None,
+                )
+            elif isinstance(msg, SystemMessage):
+                logger.emit(
+                    "system",
+                    subtype=msg.subtype,
+                    data_keys=list((msg.data or {}).keys()),
+                )
+
     try:
-        async with asyncio.timeout(max_seconds):
-            async for msg in query(prompt=prompt_text, options=options):
-                if isinstance(msg, AssistantMessage):
-                    for block in msg.content:
-                        if isinstance(block, TextBlock):
-                            logger.emit("assistant_text", text=_short(block.text))
-                        elif isinstance(block, ToolUseBlock):
-                            logger.emit(
-                                "tool_use",
-                                name=block.name,
-                                input=_short(block.input),
-                                id=block.id,
-                            )
-                        elif isinstance(block, ThinkingBlock):
-                            logger.emit("thinking", text=_short(block.thinking))
-                    if msg.error:
-                        logger.emit("assistant_error", error=msg.error)
-                elif isinstance(msg, UserMessage):
-                    # UserMessage comes back when tool results arrive; log for
-                    # completeness so the trace is faithful.
-                    logger.emit("user_message", content=_short(msg.content))
-                elif isinstance(msg, ResultMessage):
-                    logger.emit(
-                        "result",
-                        num_turns=msg.num_turns,
-                        duration_ms=msg.duration_ms,
-                        total_cost_usd=msg.total_cost_usd,
-                        is_error=msg.is_error,
-                        usage=msg.usage,
-                        result=_short(msg.result) if msg.result else None,
-                    )
-                elif isinstance(msg, SystemMessage):
-                    logger.emit(
-                        "system",
-                        subtype=msg.subtype,
-                        data_keys=list((msg.data or {}).keys()),
-                    )
+        if max_seconds and max_seconds > 0:
+            async with asyncio.timeout(max_seconds):
+                await _drive()
+        else:
+            # max_seconds <= 0 → unbounded. Thinking finishes on its own terms.
+            await _drive()
     except asyncio.TimeoutError:
         logger.emit("timeout", max_seconds=max_seconds)
         return 124
@@ -183,7 +191,12 @@ def main() -> int:
     parser.add_argument("--prompt", default=None, help="inline prompt (overrides --bootstrap)")
     parser.add_argument("--log", default=str(DEFAULT_LOG), help="event log path")
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--max-seconds", type=int, default=DEFAULT_MAX_SECONDS)
+    parser.add_argument(
+        "--max-seconds",
+        type=int,
+        default=DEFAULT_MAX_SECONDS,
+        help="Wake budget in seconds. 0 or negative = no timeout (default).",
+    )
     parser.add_argument("--tools", default=DEFAULT_TOOLS)
     parser.add_argument("--echo", action="store_true", help="also echo events to stderr")
     parser.add_argument(

@@ -1,13 +1,21 @@
-"""Memory tools — read/write into Alice's permanent knowledge at memory/.
+"""Memory tools — READ-ONLY for speaking Alice.
 
-Phase-6 MVP: glob-based read + quick write. Graph traversal via [[wikilinks]]
-is sketched in HEMISPHERES.md but deferred — thinking Alice can use Read/Grep
-meanwhile, and we'll add a dedicated `read_memory_link` once it's clear what
-shape works in practice.
+Speaking does not write memory directly. When she learns something durable,
+she writes a note to `inner/notes/` via the `append_note` tool and thinking
+Alice processes the note into memory on her next wake. This includes dated
+daily logs, meal logs, workout logs, feedback, and all structured facts.
+
+This module exposes ``read_memory`` that glob-searches across both
+``memory/`` (legacy stream) and ``cortex-memory/`` (groomed wiki) and bumps
+``last_accessed`` + ``access_count`` frontmatter fields whenever it returns
+a single file — so thinking Alice has signal about which notes are actively
+load-bearing vs drifting toward irrelevance.
 """
 
 from __future__ import annotations
 
+import datetime
+import re
 from pathlib import Path
 from typing import Any
 
@@ -24,17 +32,22 @@ def _err(text: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": f"error: {text}"}], "isError": True}
 
 
+_ROOTS = ("cortex-memory", "memory")
+
+
 def build(cfg: Config) -> list[SdkMcpTool[Any]]:
-    memory_dir = cfg.mind_dir / "memory"
+    mind_dir = cfg.mind_dir
     PREVIEW_CAP = 4000
 
     @tool(
         name="read_memory",
         description=(
-            "Read from Alice's permanent memory/ by path or glob. `pattern` is "
-            "relative to memory/ (e.g., 'fitness/CURRENT-WEIGHTS.md' or "
-            "'*/user_jason.md' or 'cozyhem/**/*.md'). Returns the content of a "
-            "single match verbatim, or a listing of first lines for multi-match."
+            "Read Alice's memory. Pattern is glob-style, searched across both "
+            "`cortex-memory/` (groomed wiki) and `memory/` (legacy stream). "
+            "Examples: 'people/jason.md', 'projects/cozyhem.md', "
+            "'2026-04-24.md', '*/jason*', 'fitness/CURRENT-WEIGHTS.md'. "
+            "Single-match returns verbatim content and bumps last_accessed + "
+            "access_count. Multi-match returns a listing of first lines."
         ),
         input_schema={"pattern": str},
     )
@@ -42,48 +55,46 @@ def build(cfg: Config) -> list[SdkMcpTool[Any]]:
         pattern = (args.get("pattern") or "").strip()
         if not pattern:
             return _err("pattern required")
-        if not memory_dir.is_dir():
-            return _err("memory/ does not exist")
-        matches = sorted(memory_dir.glob(pattern))
+
+        matches: list[Path] = []
+        for root_name in _ROOTS:
+            root = mind_dir / root_name
+            if not root.is_dir():
+                continue
+            matches.extend(sorted(root.glob(pattern)))
+            # Also allow the pattern to be prefixed with the root name itself.
+            if pattern.startswith(f"{root_name}/"):
+                matches.extend(sorted(mind_dir.glob(pattern)))
+
+        # Dedup while preserving order.
+        seen: set[str] = set()
+        unique: list[Path] = []
+        for p in matches:
+            key = str(p.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(p)
+        matches = unique
+
         if not matches:
-            return _ok(f"(no match for {pattern} under memory/)")
+            return _ok(f"(no match for {pattern} under cortex-memory/ or memory/)")
+
         if len(matches) == 1 and matches[0].is_file():
             body = matches[0].read_text()
+            _bump_access(matches[0])
             return _ok(_truncate(body, PREVIEW_CAP, matches[0]))
+
         lines: list[str] = []
         for p in matches[:40]:
             if p.is_dir():
-                lines.append(f"{p.relative_to(memory_dir)}/  (dir)")
+                lines.append(f"{p.relative_to(mind_dir)}/  (dir)")
             else:
-                lines.append(f"{p.relative_to(memory_dir)}: {_first_nonempty(p)}")
+                lines.append(f"{p.relative_to(mind_dir)}: {_first_nonempty(p)}")
         more = "" if len(matches) <= 40 else f"\n…and {len(matches) - 40} more"
         return _ok("\n".join(lines) + more)
 
-    @tool(
-        name="write_memory",
-        description=(
-            "Write a file under memory/. Path is relative to memory/. Creates "
-            "parent directories. Overwrites if present — use read_memory first "
-            "if you care about prior content. For quick facts; consolidation/"
-            "grooming is thinking Alice's job."
-        ),
-        input_schema={"path": str, "content": str},
-    )
-    async def write_memory(args: dict) -> dict:
-        rel = (args.get("path") or "").strip().strip("/")
-        content = args.get("content")
-        if not rel:
-            return _err("path required")
-        if not isinstance(content, str):
-            return _err("content must be a string")
-        if ".." in Path(rel).parts:
-            return _err("path cannot contain ..")
-        dest = memory_dir / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(content)
-        return _ok(f"memory written: {dest.relative_to(cfg.mind_dir)} ({len(content)} chars)")
-
-    return [read_memory, write_memory]
+    return [read_memory]
 
 
 def _first_nonempty(path: Path, cap: int = 120) -> str:
@@ -101,6 +112,55 @@ def _truncate(body: str, cap: int, path: Path) -> str:
     if len(body) <= cap:
         return body
     return body[:cap] + f"\n\n…[truncated at {cap}; file is {len(body)} chars; read {path} directly for full]"
+
+
+_FRONTMATTER_RE = re.compile(r"^(---\n)(.*?)(\n---\n)", re.DOTALL)
+
+
+def _bump_access(path: Path) -> None:
+    """Best-effort update of last_accessed + access_count in frontmatter.
+
+    No-op if:
+    - The file has no YAML frontmatter (e.g., legacy memory files).
+    - We can't write back (permissions). Reading is not meant to fail.
+    """
+    try:
+        text = path.read_text()
+    except OSError:
+        return
+    m = _FRONTMATTER_RE.match(text)
+    if not m:
+        return
+    body_fm = m.group(2)
+    today = datetime.date.today().isoformat()
+    new_fm = _update_fm_field(body_fm, "last_accessed", today)
+    # Increment access_count.
+    cur_count = 0
+    for line in new_fm.splitlines():
+        if line.strip().startswith("access_count:"):
+            try:
+                cur_count = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                cur_count = 0
+            break
+    new_fm = _update_fm_field(new_fm, "access_count", str(cur_count + 1))
+    new_text = m.group(1) + new_fm + m.group(3) + text[m.end():]
+    try:
+        path.write_text(new_text)
+    except OSError:
+        pass
+
+
+def _update_fm_field(fm: str, key: str, value: str) -> str:
+    lines = fm.splitlines()
+    new_line = f"{key}: {value}"
+    for i, line in enumerate(lines):
+        if line.strip().startswith(f"{key}:"):
+            lines[i] = new_line
+            return "\n".join(lines)
+    # Not present — append.
+    lines.append(new_line)
+    return "\n".join(lines)
 
 
 __all__ = ["build"]
