@@ -44,7 +44,7 @@ import signal as _signal
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from claude_agent_sdk import (
     AssistantMessage,
