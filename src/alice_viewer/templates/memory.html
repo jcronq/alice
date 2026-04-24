@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block title %}memory graph{% endblock %}
+{% block body %}
+  <h1>memory graph · [[wikilinks]]</h1>
+  <p class="muted">
+    Every <code>*.md</code> under <code>alice-mind/memory/</code> is a node.
+    Edges are wikilinks. Node size grows with in-degree (how often the note is referenced).
+    Click a node to view its file path.
+  </p>
+
+  <div class="flex" style="margin: 8px 0;">
+    <label class="muted"><input type="checkbox" id="show-ghosts" checked> show unresolved links</label>
+    <span class="muted" id="node-count">—</span>
+  </div>
+
+  <div class="graph-wrap" id="graph-wrap">
+    <svg class="graph" id="memgraph"></svg>
+  </div>
+  <div class="tooltip" id="tooltip"></div>
+
+  <script>
+    (async () => {
+      const res = await fetch('/api/memory-graph');
+      const data = await res.json();
+      const wrap = document.getElementById('graph-wrap');
+      document.getElementById('node-count').textContent =
+        `${data.nodes.length} nodes · ${data.edges.length} edges`;
+
+      if (!data.nodes.length) {
+        wrap.innerHTML = '<p class="muted" style="padding:20px">No memory notes yet. Alice\'s thinking hemisphere will populate <code>alice-mind/memory/</code> as she grooms.</p>';
+        return;
+      }
+
+      const folderColor = (folder) => {
+        if (folder === 'unresolved') return '#ff6b81';
+        if (folder.startsWith('memory/sources')) return '#7de3c4';
+        if (folder.startsWith('memory/projects')) return '#8fc7ff';
+        return '#c39bff';
+      };
+
+      const svg = d3.select('#memgraph');
+      const width = wrap.clientWidth;
+      const height = wrap.clientHeight;
+      svg.attr('viewBox', [0, 0, width, height]);
+
+      const tooltip = d3.select('#tooltip');
+
+      const zoomG = svg.append('g');
+      svg.call(d3.zoom().scaleExtent([0.2, 5]).on('zoom', (e) => zoomG.attr('transform', e.transform)));
+
+      let nodes = data.nodes.slice();
+      let edges = data.edges.slice();
+
+      const render = () => {
+        zoomG.selectAll('*').remove();
+
+        const showGhosts = document.getElementById('show-ghosts').checked;
+        const activeNodes = nodes.filter(n => showGhosts || n.folder !== 'unresolved');
+        const activeIds = new Set(activeNodes.map(n => n.id));
+        const activeEdges = edges.filter(e => activeIds.has(e.source.id || e.source) && activeIds.has(e.target.id || e.target));
+
+        const sim = d3.forceSimulation(activeNodes)
+          .force('link', d3.forceLink(activeEdges).id(d => d.id).distance(60).strength(0.3))
+          .force('charge', d3.forceManyBody().strength(-180))
+          .force('center', d3.forceCenter(width / 2, height / 2))
+          .force('collide', d3.forceCollide(14));
+
+        const link = zoomG.append('g').attr('stroke', '#2f3a4e').attr('stroke-opacity', 0.6)
+          .selectAll('line').data(activeEdges).join('line').attr('stroke-width', 1);
+
+        const nodeSel = zoomG.append('g').selectAll('g').data(activeNodes).join('g')
+          .call(d3.drag()
+            .on('start', (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+            .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; })
+            .on('end', (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; }));
+
+        const maxIn = Math.max(1, d3.max(activeNodes, n => n.in_degree) || 1);
+        nodeSel.append('circle')
+          .attr('r', d => 4 + 8 * (d.in_degree / maxIn))
+          .attr('fill', d => folderColor(d.folder))
+          .attr('stroke', '#0d1015').attr('stroke-width', 1.4);
+
+        nodeSel.append('text').attr('class', 'node-label').attr('dx', 10).attr('dy', 3)
+          .text(d => d.label);
+
+        nodeSel.on('mouseenter', (e, d) => {
+          tooltip.style('display', 'block')
+            .html(`<b>${d.label}</b><br><span style="color:#79849a">${d.id}</span><br>in-degree: ${d.in_degree}<br>size: ${d.size} bytes<br><span style="color:#79849a">click for detail</span>`)
+            .style('left', (e.pageX + 12) + 'px').style('top', (e.pageY + 12) + 'px');
+        }).on('mousemove', (e) => tooltip.style('left', (e.pageX + 12) + 'px').style('top', (e.pageY + 12) + 'px'))
+          .on('mouseleave', () => tooltip.style('display', 'none'))
+          .on('click', (e, d) => {
+            tooltip.style('display', 'none');
+            window.openMemoryNodeModal(d);
+          });
+        nodeSel.style('cursor', 'pointer');
+
+        sim.on('tick', () => {
+          link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+              .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+          nodeSel.attr('transform', d => `translate(${d.x},${d.y})`);
+        });
+      };
+
+      render();
+      document.getElementById('show-ghosts').addEventListener('change', render);
+    })();
+  </script>
+{% endblock %}

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Alice Viewer · {% block title %}{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <script src="https://unpkg.com/htmx.org@1.9.12/dist/ext/sse.js"></script>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+  <script src="/static/events.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">◑</span>
+      <span>Alice Viewer</span>
+    </div>
+    <nav>
+      <a href="/"           class="{% if active == 'timeline' %}on{% endif %}">timeline</a>
+      <a href="/narrative"  class="{% if active == 'narrative' %}on{% endif %}">narrative</a>
+      <a href="/wakes"      class="{% if active == 'wakes' %}on{% endif %}">wakes</a>
+      <a href="/turns"      class="{% if active == 'turns' %}on{% endif %}">turns</a>
+      <a href="/interactions" class="{% if active == 'interactions' %}on{% endif %}">interactions</a>
+      <a href="/graph"      class="{% if active == 'graph' %}on{% endif %}">flow graph</a>
+      <a href="/memory"     class="{% if active == 'memory' %}on{% endif %}">memory graph</a>
+      <a href="/activity"   class="{% if active == 'activity' %}on{% endif %}">activity</a>
+    </nav>
+  </header>
+  <div class="layout">
+    <aside class="sidebar">
+      <section>
+        <h3>state</h3>
+        <div class="metric"><span class="k">pending surfaces</span><span class="v">{{ state.pending_surfaces }}</span></div>
+        <div class="metric"><span class="k">pending emergencies</span><span class="v{% if state.pending_emergencies %} warn{% endif %}">{{ state.pending_emergencies }}</span></div>
+        <div class="metric"><span class="k">total wakes</span><span class="v">{{ state.total_wakes }}</span></div>
+        <div class="metric"><span class="k">total turns</span><span class="v">{{ state.total_turns }}</span></div>
+        <div class="metric"><span class="k">last wake</span><span class="v">{{ state.last_wake_ts | ago }}</span></div>
+        <div class="metric"><span class="k">last turn</span><span class="v">{{ state.last_turn_ts | ago }}</span></div>
+        <div class="metric"><span class="k">events loaded</span><span class="v">{{ state.event_count }}</span></div>
+      </section>
+      <section>
+        <h3>directive.md</h3>
+        <pre class="directive">{{ state.directive }}</pre>
+      </section>
+      <section>
+        <h3>paths</h3>
+        <div class="path-item"><span>thinking</span><code>{{ state.paths.thinking_log }}</code></div>
+        <div class="path-item"><span>speaking</span><code>{{ state.paths.speaking_log }}</code></div>
+        <div class="path-item"><span>mind</span><code>{{ state.paths.mind_dir }}</code></div>
+      </section>
+    </aside>
+    <main>
+      {% block body %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>
