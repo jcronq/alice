@@ -62,7 +62,8 @@ from . import session_state
 from . import tools as tools_module
 from .config import AllowedSender, Config
 from .dedup import DedupStore
-from .events import EventLogger, _short
+from alice_core.sdk_compat import _short, looks_like_missing_session as _looks_like_missing_session
+from .events import EventLogger
 from .quiet_hours import QueuedMessage, QuietQueue, is_quiet_hours
 from .signal_client import SignalClient, SignalEnvelope
 from .turn_log import TurnLog, new_turn
@@ -78,28 +79,6 @@ QUIET_CHECK_SECONDS = 30.0
 # Matches the design: 5 verbatim turns bridge the gap between summary
 # cutoff and now.
 SUMMARY_TAIL_TURNS = 5
-
-
-# Exceptions the SDK may raise when resume= points at a session that no
-# longer exists on disk. We match loosely by name because the SDK module
-# layout has shifted between minor versions; looking up the class at
-# import time would couple us to one layout.
-_SESSION_MISSING_EXC_NAMES = {
-    "SessionNotFoundError",
-    "NoSuchSessionError",
-    "SessionNotFound",
-}
-
-
-def _looks_like_missing_session(exc: BaseException) -> bool:
-    name = type(exc).__name__
-    if name in _SESSION_MISSING_EXC_NAMES:
-        return True
-    msg = str(exc).lower()
-    return (
-        "session" in msg
-        and ("not found" in msg or "no such" in msg or "does not exist" in msg)
-    )
 
 
 @dataclass
