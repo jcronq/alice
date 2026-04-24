@@ -8,6 +8,7 @@ authors = [
 requires-python = ">=3.10"
 dependencies = [
     "claude-agent-sdk>=0.1.66",
+    "httpx>=0.28.1",
 ]
 
 [build-system]
