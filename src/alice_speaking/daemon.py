@@ -59,7 +59,12 @@ class SurfaceEvent:
     path: pathlib.Path
 
 
-Event = Union[SignalEvent, SurfaceEvent]
+@dataclass
+class EmergencyEvent:
+    path: pathlib.Path
+
+
+Event = Union[SignalEvent, SurfaceEvent, EmergencyEvent]
 
 
 class SpeakingDaemon:
@@ -81,6 +86,9 @@ class SpeakingDaemon:
         self._stop = asyncio.Event()
         self._surface_dir = cfg.mind_dir / "inner" / "surface"
         self._surface_handled_dir = self._surface_dir / ".handled"
+        self._emergency_dir = cfg.mind_dir / "inner" / "emergency"
+        self._emergency_handled_dir = self._emergency_dir / ".handled"
+        self._dispatched_emergencies: set[str] = set()
 
     async def run(self) -> None:
         os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = self.cfg.oauth_token
@@ -101,6 +109,7 @@ class SpeakingDaemon:
             producers = [
                 asyncio.create_task(self._signal_producer(), name="sig-produce"),
                 asyncio.create_task(self._surface_producer(), name="sur-produce"),
+                asyncio.create_task(self._emergency_producer(), name="emg-produce"),
                 asyncio.create_task(self._quiet_watcher(), name="quiet-watch"),
             ]
             consumer = asyncio.create_task(self._consumer(), name="consumer")
@@ -151,6 +160,21 @@ class SpeakingDaemon:
                 log.warning("surface poll error: %s", exc)
             await asyncio.sleep(SURFACE_POLL_SECONDS)
 
+    async def _emergency_producer(self) -> None:
+        self._emergency_dir.mkdir(parents=True, exist_ok=True)
+        self._emergency_handled_dir.mkdir(parents=True, exist_ok=True)
+        while not self._stop.is_set():
+            try:
+                for path in sorted(self._emergency_dir.glob("*.md")):
+                    if path.name.startswith(".") or path.name in self._dispatched_emergencies:
+                        continue
+                    self._dispatched_emergencies.add(path.name)
+                    log.warning("EMERGENCY detected: %s", path.name)
+                    await self._queue.put(EmergencyEvent(path=path))
+            except OSError as exc:
+                log.warning("emergency poll error: %s", exc)
+            await asyncio.sleep(SURFACE_POLL_SECONDS)
+
     # ------------------------------------------------------------------
     # Consumer
 
@@ -162,6 +186,8 @@ class SpeakingDaemon:
                     await self._handle_signal(event)
                 elif isinstance(event, SurfaceEvent):
                     await self._handle_surface(event)
+                elif isinstance(event, EmergencyEvent):
+                    await self._handle_emergency(event)
             except Exception:
                 log.exception("consumer error handling %s", type(event).__name__)
             finally:
@@ -304,6 +330,98 @@ class SpeakingDaemon:
         dest.write_text(body + trailer)
         path.unlink()
         log.info("auto-archived unresolved surface: %s", path.name)
+
+    # ------------------------------------------------------------------
+    # Emergency turn
+    #
+    # External monitors drop files into inner/emergency/. Unlike surfaces,
+    # emergency-derived outbound BYPASSES quiet hours (that's the whole point).
+    # The speaking turn composes the message; the handler sends it directly
+    # via the signal client rather than going through _send_or_queue.
+
+    async def _handle_emergency(self, event: EmergencyEvent) -> None:
+        path = event.path
+        if not path.is_file():
+            self._dispatched_emergencies.discard(path.name)
+            return
+        body = path.read_text()
+
+        # Pick a primary recipient. Emergency monitors should set an explicit
+        # target via frontmatter eventually; until then, first allowed sender
+        # (typically Owner) gets it.
+        recipient = next(iter(self.cfg.allowed_senders), None)
+        if recipient is None:
+            log.error("emergency %s: no allowed_senders configured", path.name)
+            self._archive_emergency(path, verdict="no-recipient", action="daemon-archived")
+            return
+
+        prompt = (
+            f"[EMERGENCY — signal from an external monitor: {path.name}]\n\n"
+            f"{body}\n\n"
+            "Review this emergency. Verify the frontmatter contains "
+            "`evidence_paths` with at least one verifiable source. If the "
+            "evidence is insufficient, reply empty — the daemon will archive "
+            "without voicing.\n\n"
+            "If the emergency is real, your reply text will be sent "
+            "IMMEDIATELY to the user over Signal, bypassing quiet hours. Be "
+            "concise and direct — name the emergency, the evidence, and the "
+            "recommended action in one short message. This is the ONE case "
+            "where you initiate voice contact without prior conversation."
+        )
+
+        voiced_text: Optional[str] = None
+        verdict = "unknown"
+        action = "none"
+        try:
+            reply = await self._run_turn(prompt)
+            if reply:
+                await self.signal.send(recipient, reply)
+                voiced_text = reply
+                verdict = "voiced"
+                action = f"sent to {recipient} (bypassed quiet hours)"
+                log.warning(
+                    "emergency voiced to %s (%d chars): %s",
+                    recipient,
+                    len(reply),
+                    path.name,
+                )
+            else:
+                verdict = "downgraded"
+                action = "alice returned empty reply — no evidence or false positive"
+                log.info("emergency downgraded: %s", path.name)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("emergency turn failed for %s", path.name)
+            verdict = "error"
+            action = f"{type(exc).__name__}: {exc}"
+        finally:
+            if path.is_file():
+                self._archive_emergency(path, verdict=verdict, action=action, voiced=voiced_text)
+            self._dispatched_emergencies.discard(path.name)
+
+    def _archive_emergency(
+        self,
+        path: pathlib.Path,
+        *,
+        verdict: str,
+        action: str,
+        voiced: Optional[str] = None,
+    ) -> None:
+        today = datetime.date.today().isoformat()
+        dest_dir = self._emergency_handled_dir / today
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / path.name
+        body = path.read_text()
+        trailer = (
+            "\n\n---\n"
+            + f"resolved: {datetime.datetime.now().astimezone().isoformat(timespec='seconds')}\n"
+            + f"verdict: {verdict}\n"
+            + f"action_taken: {action}\n"
+        )
+        if voiced:
+            trailer += f"voiced_text: {voiced[:500]}\n"
+        dest.write_text(body + trailer)
+        path.unlink()
+        log.info("emergency archived: %s (%s)", path.name, verdict)
 
     # ------------------------------------------------------------------
     # Agent SDK invocation (shared by signal + surface turns)
