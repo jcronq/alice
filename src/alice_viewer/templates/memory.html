@@ -107,6 +107,18 @@
 
         try { window.attachGraphFocus({ nodeSel, linkSel: link, edges: activeEdges }); }
         catch (err) { console.error('attachGraphFocus failed', err); }
+
+        try {
+          window.attachGraphTuning({
+            key: 'memory',
+            container: wrap,
+            simulation: sim,
+            linkSel: link,
+            nodeSel,
+            circleSel: nodeSel.select('circle'),
+            defaults: { linkDistance: 140, linkStrength: 0.08, chargeStrength: -650, collideRadius: 14 },
+          });
+        } catch (err) { console.error('attachGraphTuning failed', err); }
       };
 
       render();

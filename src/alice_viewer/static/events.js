@@ -659,3 +659,164 @@ window.attachGraphFocus = function ({ nodeSel, linkSel, edges, idAccessor }) {
     .on('mouseenter.focus', (e, d) => apply(id(d)))
     .on('mouseleave.focus', clear);
 };
+
+// Tuning panel for d3 force graphs — Obsidian-style sliders for the layout
+// + visual knobs. Values persist per-`key` in localStorage so they survive
+// re-renders (memory graph's ghost toggle) and page reloads.
+//
+// Caller passes live d3 selections + the simulation. Re-call after a
+// re-render with the fresh references — the panel itself is preserved
+// (we replace the DOM but read existing values back out of localStorage).
+window.attachGraphTuning = function ({ key, container, simulation, linkSel, nodeSel, circleSel, defaults }) {
+  if (!container || !simulation) return;
+
+  // Inject panel CSS once per page.
+  if (!document.getElementById('graph-tuning-style')) {
+    const s = document.createElement('style');
+    s.id = 'graph-tuning-style';
+    s.textContent = `
+      .graph-tuning {
+        position: absolute; top: 14px; right: 14px; z-index: 5;
+        background: var(--panel-2); border: 1px solid var(--border);
+        border-radius: 6px; padding: 6px 10px; font-size: 11px;
+        min-width: 220px; color: var(--text);
+      }
+      .graph-tuning > summary {
+        cursor: pointer; user-select: none; color: var(--muted);
+        list-style: none;
+      }
+      .graph-tuning > summary::-webkit-details-marker { display: none; }
+      .graph-tuning[open] > summary { color: var(--text); margin-bottom: 6px; }
+      .graph-tuning .row { display: block; margin-top: 8px; }
+      .graph-tuning .row .lbl { color: var(--text); }
+      .graph-tuning .row .v {
+        color: var(--muted); float: right; font-family: var(--mono);
+        font-size: 10px;
+      }
+      .graph-tuning .row input[type="range"] {
+        width: 100%; margin: 2px 0 0; display: block;
+      }
+      .graph-tuning .reset {
+        margin-top: 10px; background: transparent; border: 1px solid var(--border);
+        color: var(--muted); padding: 3px 8px; border-radius: 4px;
+        font-size: 10px; cursor: pointer;
+      }
+      .graph-tuning .reset:hover { color: var(--text); border-color: var(--text); }
+    `;
+    document.head.appendChild(s);
+  }
+
+  // Cache each circle's pre-scaling radius so the size multiplier is
+  // composable with the per-graph radius logic (kind-based, in-degree, etc.).
+  circleSel.each(function () {
+    const c = d3.select(this);
+    if (c.property('__baseR') == null) c.property('__baseR', +c.attr('r') || 6);
+  });
+
+  // Cache base link width for the multiplier.
+  linkSel.each(function () {
+    const l = d3.select(this);
+    if (l.property('__baseW') == null) {
+      l.property('__baseW', +l.attr('stroke-width') || 1);
+    }
+  });
+
+  const storageKey = 'graph-tuning:' + key;
+  const baseDefaults = {
+    linkDistance: 80,
+    linkStrength: 0.4,
+    chargeStrength: -220,
+    collideRadius: 18,
+    nodeRadius: 1,
+    linkWidth: 1,
+  };
+  const merged = { ...baseDefaults, ...(defaults || {}) };
+  let values = { ...merged };
+  try {
+    const saved = JSON.parse(localStorage.getItem(storageKey) || 'null');
+    if (saved && typeof saved === 'object') values = { ...values, ...saved };
+  } catch (_) { /* ignore */ }
+
+  // Spec for the sliders. step=0 means integer-format display.
+  const knobs = [
+    { name: 'linkDistance',   label: 'link distance',  min: 10,    max: 400, step: 1,    fmt: v => v.toFixed(0) },
+    { name: 'linkStrength',   label: 'link strength',  min: 0,     max: 1,   step: 0.01, fmt: v => v.toFixed(2) },
+    { name: 'chargeStrength', label: 'repel force',    min: -2000, max: 0,   step: 10,   fmt: v => v.toFixed(0) },
+    { name: 'collideRadius',  label: 'collide radius', min: 0,     max: 60,  step: 1,    fmt: v => v.toFixed(0) },
+    { name: 'nodeRadius',     label: 'node size ×',    min: 0.3,   max: 3,   step: 0.1,  fmt: v => v.toFixed(1) },
+    { name: 'linkWidth',      label: 'link width ×',   min: 0.3,   max: 4,   step: 0.1,  fmt: v => v.toFixed(1) },
+  ];
+
+  // If a panel already exists in this container (re-render path), keep
+  // it open/closed state and replace the body; otherwise build fresh.
+  let panel = container.querySelector('.graph-tuning');
+  const wasOpen = panel ? panel.open : false;
+  if (panel) panel.remove();
+  panel = document.createElement('details');
+  panel.className = 'graph-tuning';
+  panel.open = wasOpen;
+  panel.innerHTML =
+    '<summary>⚙ tuning</summary>' +
+    knobs.map(k => `
+      <label class="row">
+        <span class="lbl">${k.label}</span>
+        <span class="v" data-for="${k.name}">${k.fmt(values[k.name])}</span>
+        <input type="range" data-tune="${k.name}"
+               min="${k.min}" max="${k.max}" step="${k.step}"
+               value="${values[k.name]}" />
+      </label>
+    `).join('') +
+    '<button type="button" class="reset">reset to defaults</button>';
+  container.appendChild(panel);
+
+  const apply = () => {
+    const linkF = simulation.force('link');
+    if (linkF) linkF.distance(values.linkDistance).strength(values.linkStrength);
+    const chargeF = simulation.force('charge');
+    if (chargeF) chargeF.strength(values.chargeStrength);
+    const collideF = simulation.force('collide');
+    if (collideF) collideF.radius(values.collideRadius);
+    circleSel.attr('r', function () {
+      const base = d3.select(this).property('__baseR') || 6;
+      return base * values.nodeRadius;
+    });
+    linkSel.attr('stroke-width', function () {
+      const base = d3.select(this).property('__baseW') || 1;
+      return base * values.linkWidth;
+    });
+    simulation.alpha(0.4).restart();
+  };
+
+  const persist = () => {
+    try { localStorage.setItem(storageKey, JSON.stringify(values)); }
+    catch (_) { /* quota / private mode — non-fatal */ }
+  };
+
+  panel.querySelectorAll('input[type="range"]').forEach(input => {
+    const name = input.dataset.tune;
+    const display = panel.querySelector(`.v[data-for="${name}"]`);
+    const knob = knobs.find(k => k.name === name);
+    input.addEventListener('input', () => {
+      values[name] = +input.value;
+      display.textContent = knob.fmt(values[name]);
+      apply();
+    });
+    input.addEventListener('change', persist);
+  });
+
+  panel.querySelector('.reset').addEventListener('click', () => {
+    values = { ...merged };
+    panel.querySelectorAll('input[type="range"]').forEach(input => {
+      const name = input.dataset.tune;
+      input.value = values[name];
+      const display = panel.querySelector(`.v[data-for="${name}"]`);
+      const knob = knobs.find(k => k.name === name);
+      display.textContent = knob.fmt(values[name]);
+    });
+    apply();
+    try { localStorage.removeItem(storageKey); } catch (_) {}
+  });
+
+  // Apply once on attach so persisted values take effect immediately.
+  apply();
+};
