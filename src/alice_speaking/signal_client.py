@@ -14,8 +14,9 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import pathlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import AsyncIterator, Optional
 
 import httpx
@@ -27,12 +28,41 @@ log = logging.getLogger(__name__)
 _CHUNK_LIMIT = 4000
 _TYPING_REFRESH_SECONDS = 10
 
+# Where signal-cli stores attachment files. Inside the worker container
+# the host's signal-cli data dir is bind-mounted at /host-home/.local/share/...
+# Override via SIGNAL_ATTACHMENTS_DIR for non-default deployments.
+DEFAULT_ATTACHMENTS_DIR = pathlib.Path(
+    os.environ.get(
+        "SIGNAL_ATTACHMENTS_DIR",
+        "/host-home/.local/share/signal-cli/attachments",
+    )
+)
+
+
+@dataclass
+class Attachment:
+    """One inbound media attachment from a Signal message.
+
+    ``path`` is a filesystem path Alice's tools can ``Read`` (image PDF,
+    audio, etc. — Claude Code's Read tool handles common formats). The
+    file is the raw blob signal-cli stored on disk; signal-cli generates
+    the ``id`` filename and (sometimes) preserves the original
+    ``filename`` and ``content_type`` from the sender.
+    """
+
+    id: str
+    path: pathlib.Path
+    content_type: str = "application/octet-stream"
+    filename: Optional[str] = None
+    size: Optional[int] = None
+
 
 @dataclass
 class SignalEnvelope:
     timestamp: int
     source: str
     body: str
+    attachments: list[Attachment] = field(default_factory=list)
 
 
 class SignalClient:
@@ -226,6 +256,14 @@ def _chunk(text: str, limit: int) -> list[str]:
 
 
 def _parse_envelope(line: str) -> Optional[SignalEnvelope]:
+    """Parse one signal-cli log line into an envelope.
+
+    Returns ``None`` for non-message lines (typing receipts, sync messages
+    with no dataMessage, etc.) or malformed JSON. A message qualifies if
+    it has a source, a timestamp, and EITHER text body OR at least one
+    attachment — image-only messages are valid inbound; we don't drop
+    them just because the body is empty.
+    """
     if not line.startswith("{"):
         return None
     try:
@@ -234,9 +272,48 @@ def _parse_envelope(line: str) -> Optional[SignalEnvelope]:
         return None
     env = data.get("envelope") or {}
     data_msg = env.get("dataMessage") or {}
-    body = data_msg.get("message")
+    body = data_msg.get("message") or ""
     source = env.get("source") or env.get("sourceNumber")
     ts = env.get("timestamp")
-    if not source or not body or ts is None:
+    attachments = _parse_attachments(data_msg.get("attachments") or [])
+    if not source or ts is None:
         return None
-    return SignalEnvelope(timestamp=int(ts), source=str(source), body=str(body))
+    if not body and not attachments:
+        # Nothing to act on — ignore the envelope.
+        return None
+    return SignalEnvelope(
+        timestamp=int(ts),
+        source=str(source),
+        body=str(body),
+        attachments=attachments,
+    )
+
+
+def _parse_attachments(raw: list) -> list[Attachment]:
+    """Convert signal-cli's dataMessage.attachments list into Attachment objects.
+
+    signal-cli writes each attachment to ``<attachments_dir>/<id>``. The
+    JSON entry carries the id, content type, and (sometimes) the original
+    filename. Missing fields fall back to safe defaults.
+    """
+    out: list[Attachment] = []
+    if not isinstance(raw, list):
+        return out
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        attachment_id = entry.get("id")
+        if not attachment_id:
+            continue
+        out.append(
+            Attachment(
+                id=str(attachment_id),
+                path=DEFAULT_ATTACHMENTS_DIR / str(attachment_id),
+                content_type=str(
+                    entry.get("contentType") or "application/octet-stream"
+                ),
+                filename=entry.get("filename") or None,
+                size=entry.get("size") if isinstance(entry.get("size"), int) else None,
+            )
+        )
+    return out

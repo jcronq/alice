@@ -341,6 +341,15 @@ class SpeakingDaemon:
             sender_number=env.source,
             inbound_chars=len(env.body),
             inbound=_short(env.body),
+            attachments=[
+                {
+                    "id": a.id,
+                    "path": str(a.path),
+                    "content_type": a.content_type,
+                    "filename": a.filename,
+                }
+                for a in env.attachments
+            ],
             quiet=quiet,
         )
 
@@ -350,14 +359,7 @@ class SpeakingDaemon:
         try:
             now = datetime.datetime.now().astimezone()
             stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
-            prompt = (
-                f"[Signal from {sender.name} | {stamp}]\n\n"
-                f"{env.body}\n\n"
-                "To reply, call the `send_message` tool "
-                "(recipient='jason' or 'katie' or an E.164 number, "
-                "message=your reply text). Returning text alone will NOT "
-                "send. If there's nothing to say, let the turn close silently."
-            )
+            prompt = self._build_signal_prompt(sender_name=sender.name, stamp=stamp, env=env)
             await self._run_turn(prompt, turn_id=turn_id, outbound_recipient=env.source)
         except Exception as exc:  # noqa: BLE001
             log.exception("turn failed for %s", sender.name)
@@ -395,6 +397,47 @@ class SpeakingDaemon:
                 error=error,
                 duration_ms=int((time.time() - started) * 1000),
             )
+
+    def _build_signal_prompt(
+        self,
+        *,
+        sender_name: str,
+        stamp: str,
+        env: SignalEnvelope,
+    ) -> str:
+        """Compose the per-turn prompt for a signal envelope.
+
+        Body comes first; any inbound attachments are listed after with
+        the absolute path Alice's Read tool can open. Attachments are
+        listed even when the body is empty (image-only messages from
+        Owner/Friend are common).
+        """
+        body = env.body or "(no text — see attachments below)"
+        lines: list[str] = [
+            f"[Signal from {sender_name} | {stamp}]",
+            "",
+            body,
+        ]
+        if env.attachments:
+            lines.append("")
+            lines.append(
+                f"--- {len(env.attachments)} attachment"
+                f"{'s' if len(env.attachments) != 1 else ''} ---"
+            )
+            for att in env.attachments:
+                fn = f' "{att.filename}"' if att.filename else ""
+                lines.append(
+                    f"- {att.path} ({att.content_type}{fn}) — "
+                    f"use the Read tool to view."
+                )
+        lines.append("")
+        lines.append(
+            "To reply, call the `send_message` tool "
+            "(recipient='jason' or 'katie' or an E.164 number, "
+            "message=your reply text). Returning text alone will NOT "
+            "send. If there's nothing to say, let the turn close silently."
+        )
+        return "\n".join(lines)
 
     async def _send_or_queue(
         self,
