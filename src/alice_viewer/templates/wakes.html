@@ -5,13 +5,14 @@
   <table>
     <thead>
       <tr>
-        <th>when</th><th>status</th><th>model</th><th>duration</th><th>cost</th><th>tools</th><th>events</th><th>wake id</th>
+        <th>when</th><th>summary</th><th>status</th><th>model</th><th>duration</th><th>cost</th><th>tools</th><th>events</th><th>wake id</th>
       </tr>
     </thead>
     <tbody>
       {% for w in wakes %}
         <tr>
           <td class="mono">{{ w.start_ts | localtime }}<br><span class="muted">{{ w.start_ts | ago }}</span></td>
+          <td>{{ summaries.get(w.wake_id, '') }}</td>
           <td>{% if w.status == 'ended' %}<span class="muted">ended</span>
               {% elif w.status == 'timeout' %}<span style="color:var(--warn)">timeout</span>
               {% elif w.status == 'exception' %}<span style="color:var(--err)">exception</span>
