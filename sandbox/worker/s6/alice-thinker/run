@@ -31,8 +31,18 @@ while true; do
     fi
     cadence=$(( cadence_min * 60 ))
 
+    # Target a fixed gap between wake STARTS (not between end-and-next-start).
+    # A 3-minute wake on a 5-minute cadence sleeps 2 minutes; an 8-minute wake
+    # fires immediately. Cadence is the floor, not the floor-plus-wake-time.
+    start_ts=$(date +%s)
+
     # `flock -n` → non-blocking; if already held, skip this wake entirely.
     flock -n "$LOCK" s6-setuidgid alice /usr/local/bin/alice-think || true
 
-    sleep "$cadence"
+    end_ts=$(date +%s)
+    elapsed=$(( end_ts - start_ts ))
+    remainder=$(( cadence - elapsed ))
+    if [ "$remainder" -gt 0 ]; then
+        sleep "$remainder"
+    fi
 done
