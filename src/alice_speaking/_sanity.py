@@ -35,7 +35,7 @@ def load_oauth_token() -> None:
 async def main() -> int:
     load_oauth_token()
     opts = ClaudeAgentOptions(
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-4-6",
         allowed_tools=[],
         system_prompt="Reply verbatim to anything the user says. No preamble.",
     )

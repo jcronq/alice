@@ -22,6 +22,7 @@ from .settings import Paths
 
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
+BUCKET_MODEL = "claude-haiku-4-5"  # one-shot bucket summaries — Haiku is plenty
 DEFAULT_MAX_SECONDS = 90
 CACHE_TTL_SECONDS = 300  # 5 min — refresh if window content changed recently
 
@@ -409,7 +410,7 @@ async def _run_once(prompt: str, *, max_output_tokens_hint: int = 500) -> tuple[
         query,
     )
     options = ClaudeAgentOptions(
-        model=DEFAULT_MODEL,
+        model=BUCKET_MODEL,
         allowed_tools=[],
         cwd="/tmp",
     )

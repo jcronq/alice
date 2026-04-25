@@ -37,12 +37,32 @@ from alice_core.kernel import AgentKernel, KernelSpec
 
 DEFAULT_MIND = pathlib.Path("/home/alice/alice-mind")
 DEFAULT_BOOTSTRAP = DEFAULT_MIND / "prompts" / "thinking-bootstrap.md"
+DEFAULT_DIRECTIVE = DEFAULT_MIND / "inner" / "directive.md"
 DEFAULT_LOG = pathlib.Path("/state/worker/thinking.log")
 DEFAULT_TOOLS = "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch"
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_SECONDS = 0  # 0 == no timeout. Thinking runs as long as it needs.
 QUICK_PROMPT = "Reply exactly: QUICK-OK"
 QUICK_MAX_SECONDS = 30
+
+
+def _build_prompt(bootstrap_path: pathlib.Path, directive_path: pathlib.Path) -> str:
+    """Compose the wake prompt: directive contents + bootstrap.
+
+    Inlining directive.md saves the agent one Read tool round-trip per
+    wake. The directive is small (~30 lines, well under the 1024-token
+    cache threshold) — the win is the saved round-trip, not caching.
+    """
+    bootstrap = bootstrap_path.read_text()
+    if not directive_path.is_file():
+        return bootstrap
+    directive = directive_path.read_text()
+    return (
+        "## Directive (current standing orders — read this first)\n\n"
+        f"{directive.strip()}\n\n"
+        "---\n\n"
+        f"{bootstrap}"
+    )
 
 
 def _load_token() -> None:
@@ -190,13 +210,13 @@ def main() -> int:
         max_seconds = QUICK_MAX_SECONDS
     else:
         mind = pathlib.Path(args.mind)
-        prompt_text = (
-            args.prompt
-            if args.prompt
-            else pathlib.Path(
+        if args.prompt:
+            prompt_text = args.prompt
+        else:
+            bootstrap_path = pathlib.Path(
                 args.bootstrap or (mind / "prompts" / "thinking-bootstrap.md")
-            ).read_text()
-        )
+            )
+            prompt_text = _build_prompt(bootstrap_path, mind / "inner" / "directive.md")
         tools = [t.strip() for t in args.tools.split(",") if t.strip()]
         cwd = mind
         max_seconds = args.max_seconds
