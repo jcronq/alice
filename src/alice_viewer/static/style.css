@@ -215,6 +215,36 @@ pre.small { max-height: 260px; overflow-y: auto; }
 .trace-row .kind { color: var(--muted); font-size: 11px; }
 .trace-row .body pre { margin: 4px 0 0; background: var(--panel-2); padding: 6px; font-size: 11px; }
 
+/* System events — formatted by subtype rather than raw JSON.
+   `init`: pill row of model/session/tools/cwd.
+   `task_*`: sub-agent lifecycle row, color-coded by phase. */
+.sys-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.sys-pill {
+  font-size: 11px; color: var(--muted);
+  background: var(--panel-2); padding: 2px 8px; border-radius: 10px;
+}
+.sys-pill code { color: var(--text); }
+.sys-pill.muted code { color: var(--muted); }
+.sys-task {
+  margin-top: 4px; padding: 6px 10px; background: var(--panel-2);
+  border-left: 2px solid var(--accent-3); border-radius: 0 4px 4px 0;
+}
+.sys-task-started      { border-left-color: var(--accent-2); }
+.sys-task-progress     { border-left-color: var(--muted); }
+.sys-task-notification { border-left-color: var(--ok); }
+.sys-task-head {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  font-size: 11px; color: var(--muted);
+}
+.sys-task-tag { font-weight: 500; color: var(--text); }
+.sys-task-id { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+.sys-task-status { padding: 0 6px; border-radius: 8px; font-size: 10px; }
+.sys-status-completed { color: var(--ok); }
+.sys-status-failed, .sys-status-error { color: var(--err); }
+.sys-task-desc    { color: var(--text);  margin-top: 4px; font-size: 12px; }
+.sys-task-summary { color: var(--text);  margin-top: 4px; font-style: italic; font-size: 12px; }
+.sys-task-tool    { margin-top: 2px; font-size: 11px; }
+
 /* Graph canvases */
 .graph-wrap { background: var(--panel); border-radius: 6px; padding: 6px; margin-bottom: 12px; position: relative; }
 svg.graph { width: 100%; height: 70vh; background: var(--bg); border-radius: 4px; }

@@ -1,0 +1,39 @@
+{# Body of a `system` trace event, formatted by subtype:
+     - init                : model · session · tool count · cwd · cc version
+     - task_started/progress/notification : sub-agent row with task id, status
+     - anything else       : raw JSON
+     - legacy `data_keys`  : muted "(keys-only log)" hint #}
+{% set sub = ev.detail.subtype or 'unknown' %}
+{% set d = ev.detail.data %}
+{% if d %}
+  {% if sub == 'init' %}
+    <div class="sys-row">
+      {% if d.model %}<span class="sys-pill">model <code>{{ d.model }}</code></span>{% endif %}
+      {% if d.session_id %}<span class="sys-pill">session <code>{{ d.session_id[:8] }}</code></span>{% endif %}
+      {% if d.tools %}<span class="sys-pill">{{ d.tools | length }} tools</span>{% endif %}
+      {% if d.mcp_servers %}<span class="sys-pill">mcp <code>{{ d.mcp_servers }}</code></span>{% endif %}
+      {% if d.cwd %}<span class="sys-pill">cwd <code>{{ d.cwd }}</code></span>{% endif %}
+      {% if d.claude_code_version %}<span class="sys-pill muted">cc {{ d.claude_code_version }}</span>{% endif %}
+    </div>
+  {% elif sub in ('task_started', 'task_progress', 'task_notification') %}
+    {% set phase = sub | replace('task_', '') %}
+    <div class="sys-task sys-task-{{ phase }}">
+      <div class="sys-task-head">
+        <span class="sys-task-tag">↳ {{ phase }}</span>
+        {% if d.task_id %}<code class="sys-task-id">{{ d.task_id[:10] }}</code>{% endif %}
+        {% if d.task_type %}<span class="muted">[{{ d.task_type }}]</span>{% endif %}
+        {% if d.status %}<span class="sys-task-status sys-status-{{ d.status }}">{{ d.status }}</span>{% endif %}
+      </div>
+      {% if d.description %}<div class="sys-task-desc">{{ d.description }}</div>{% endif %}
+      {% if d.last_tool_name %}<div class="muted sys-task-tool">↳ using <code>{{ d.last_tool_name }}</code></div>{% endif %}
+      {% if d.summary and d.summary != d.description %}<div class="sys-task-summary">{{ d.summary }}</div>{% endif %}
+      {% if d.output_file %}<div class="muted">→ <code>{{ d.output_file }}</code></div>{% endif %}
+    </div>
+  {% else %}
+    <pre>{{ d | pretty_json }}</pre>
+  {% endif %}
+{% elif ev.detail.data_keys %}
+  <div class="muted">keys-only log (older format) · {{ ev.detail.data_keys | join(', ') }}</div>
+{% else %}
+  <pre>{{ ev.detail | pretty_json }}</pre>
+{% endif %}
