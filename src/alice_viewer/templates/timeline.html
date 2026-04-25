@@ -100,41 +100,55 @@
     .run.running { background: linear-gradient(90deg, var(--panel), color-mix(in srgb, var(--ok) 6%, var(--panel))); }
 
     /* Modal trace formatting */
-    .modal-body .trace { display: flex; flex-direction: column; gap: 4px; margin-top: 14px; }
+    .modal-body .trace { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
+
+    /* Two layouts:
+         .trace-row.compact = single-line rows (result, lifecycle, etc.)
+                              ts + kind + summary in three columns.
+         .trace-row.rich    = content rows (thinking, reply, tool call).
+                              header line above + full-width body below. */
     .modal-body .trace-row {
-      display: grid; grid-template-columns: 80px 130px 1fr; gap: 12px;
-      padding: 6px 10px; background: var(--panel-2); border-radius: 0 4px 4px 0;
+      padding: 8px 12px; background: var(--panel-2); border-radius: 0 4px 4px 0;
       border-left: 3px solid var(--border);
-      font-size: 11px;
+      font-size: 12px;
     }
+    .modal-body .trace-row.compact {
+      display: grid; grid-template-columns: 80px 130px 1fr; gap: 12px; align-items: baseline;
+    }
+    .modal-body .trace-row.rich .trace-head {
+      display: flex; gap: 12px; align-items: baseline;
+      font-size: 11px; color: var(--muted);
+      margin-bottom: 6px; padding-bottom: 4px;
+      border-bottom: 1px solid var(--border);
+    }
+    .modal-body .trace-row.rich .trace-head .kind { font-weight: 500; }
+
     .modal-body .trace-row.fam-tool { border-left-color: #ff9b6b; }
     .modal-body .trace-row.fam-text { border-left-color: var(--accent); }
     .modal-body .trace-row.fam-thought { border-left-color: var(--accent-2); }
     .modal-body .trace-row.fam-result { border-left-color: var(--ok); }
     .modal-body .trace-row.fam-boundary { border-left-color: var(--muted); }
     .modal-body .trace-row.fam-error { border-left-color: var(--err); }
+
     .modal-body .trace-row .summary { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .modal-body .trace-row .ts { color: var(--muted); }
     .modal-body .trace-row .kind { color: var(--muted); }
     .modal-body .trace-row .trace-text {
       color: var(--text); white-space: pre-wrap; word-break: break-word;
-      font-size: 11px; line-height: 1.5;
+      font-size: 13px; line-height: 1.55;
     }
-    .modal-body .trace-row .trace-text.muted { color: var(--muted); font-style: italic; }
+    .modal-body .trace-row .trace-text.muted { color: var(--muted); font-style: italic; font-size: 11px; }
     .modal-body .trace-tool-header {
-      font-size: 10px; margin-bottom: 4px;
+      font-size: 11px; margin-bottom: 6px;
     }
     .modal-body .trace-tool-header code {
-      background: transparent; padding: 0; color: #ffb38f; font-weight: 500;
+      background: transparent; padding: 0; color: #ffb38f; font-weight: 500; font-size: 12px;
     }
     .modal-body .trace-tool-secondary {
-      font-size: 10px; color: var(--muted); margin-top: 4px;
+      font-size: 11px; color: var(--muted); margin-top: 6px;
       white-space: pre-wrap; word-break: break-word;
     }
     .modal-body .trace-empty { color: var(--muted); padding: 30px; text-align: center; }
-    /* When the body is a multi-line block, allow the row to grow past
-       the default ellipsis truncation. */
-    .modal-body .trace-row:has(.trace-text) { align-items: flex-start; }
   </style>
 
   <script>
@@ -230,26 +244,37 @@
         const ts = fmtTs(ev.ts).replace(/^.* /, ''); // just the time
         const detail = ev.detail || {};
 
-        let bodyHtml;
-        if (ev.kind === 'thinking' || ev.kind === 'assistant_text') {
-          // Full reasoning / reply text as a multi-line block.
-          const text = (detail.text || '').trim();
-          bodyHtml = text
-            ? '<div class="trace-text">' + escapeHtml(text) + '</div>'
-            : '<div class="trace-text muted">(empty)</div>';
-        } else if (ev.kind === 'tool_use') {
-          // Show the tool's primary args inline so 'send_message jason' is
-          // actually informative — message text, command, file path, etc.
-          bodyHtml = renderTraceToolUse(detail);
-        } else {
-          bodyHtml = '<span class="summary">' + escapeHtml(ev.summary || '') + '</span>';
+        // Content-rich rows (thinking / reply / tool call) get full width
+        // with a header line above. Everything else stays as a one-line
+        // compact grid row.
+        const isRich =
+          ev.kind === 'thinking' ||
+          ev.kind === 'assistant_text' ||
+          ev.kind === 'tool_use';
+
+        if (!isRich) {
+          return '<div class="trace-row compact fam-' + fam + '">' +
+                 '<span class="ts">' + escapeHtml(ts) + '</span>' +
+                 '<span class="kind">' + escapeHtml(label) + '</span>' +
+                 '<span class="summary">' + escapeHtml(ev.summary || '') + '</span>' +
+                 '</div>';
         }
 
-        return '<div class="trace-row fam-' + fam + '">' +
-               '<span class="ts">' + escapeHtml(ts) + '</span>' +
-               '<span class="kind">' + escapeHtml(label) + '</span>' +
-               bodyHtml +
-               '</div>';
+        let body;
+        if (ev.kind === 'thinking' || ev.kind === 'assistant_text') {
+          const text = (detail.text || '').trim();
+          body = text
+            ? '<div class="trace-text">' + escapeHtml(text) + '</div>'
+            : '<div class="trace-text muted">(empty)</div>';
+        } else {
+          body = renderTraceToolUse(detail);
+        }
+
+        const head = '<div class="trace-head">' +
+                     '<span class="ts">' + escapeHtml(ts) + '</span>' +
+                     '<span class="kind">' + escapeHtml(label) + '</span>' +
+                     '</div>';
+        return '<div class="trace-row rich fam-' + fam + '">' + head + body + '</div>';
       }
 
       // Render a tool_use event's args as a compact body block.
