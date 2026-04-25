@@ -166,15 +166,19 @@ def create_app(paths: Paths | None = None) -> FastAPI:
 
     @app.get("/wakes/{wake_id}", response_class=HTMLResponse)
     async def wake_detail(request: Request, wake_id: str):
+        from . import run_summary
+
         p: Paths = app.state.paths
         events = sources.load_all(p)
         wakes = aggregators.group_wakes(events)
         wake = next((w for w in wakes if w.wake_id == wake_id), None)
+        summary = aggregators.summarize_wake(wake, run_summary) if wake else None
         return templates.TemplateResponse(
             request,
             "wake_detail.html",
             {
                 "wake": wake,
+                "summary": summary,
                 "state": _state_context(),
                 "active": "wakes",
             },

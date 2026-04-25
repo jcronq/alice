@@ -142,7 +142,7 @@ def group_runs(events: list[UnifiedEvent]) -> list[Run]:
 
     runs: list[Run] = []
     for w in group_wakes(events):
-        summary = _summarize_wake(w, run_summary)
+        summary = summarize_wake(w, run_summary)
         runs.append(
             Run(
                 run_id=w.wake_id,
@@ -192,7 +192,7 @@ def group_runs(events: list[UnifiedEvent]) -> list[Run]:
     return runs
 
 
-def _summarize_wake(w: Wake, run_summary_module=None) -> str:
+def summarize_wake(w: Wake, run_summary_module=None) -> str:
     """Compact one-line label for a thinking wake row.
 
     Running wakes get ``running…`` (no point summarizing a moving

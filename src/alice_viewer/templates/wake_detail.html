@@ -6,6 +6,7 @@
     <p><a href="/wakes">← back to wakes</a></p>
   {% else %}
     <h1>wake · {{ wake.wake_id }}</h1>
+    {% if summary %}<div class="summary-full">{{ summary }}</div>{% endif %}
     <div class="detail-header">
       <div class="detail-grid">
         <span class="k">start</span><span class="v">{{ wake.start_ts | localtime }} <span class="muted">({{ wake.start_ts | ago }})</span></span>
