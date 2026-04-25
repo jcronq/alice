@@ -46,7 +46,6 @@
           {% else %}
             {% if r.duration_ms %}<span class="muted">{{ (r.duration_ms / 1000.0) | round(1) }}s</span>{% endif %}
             {% if r.cost_usd %}<br><span class="muted">${{ r.cost_usd | round(4) }}</span>{% endif %}
-            {% if r.events %}<br><span class="muted">{{ r.events | length }} ev</span>{% endif %}
             {% if r.error %}<br><span style="color:var(--err)">{{ r.error[:60] }}</span>{% endif %}
           {% endif %}
         </span>
@@ -61,7 +60,7 @@
     .run {
       display: grid;
       /* timestamp · kind · who-or-model · summary (2-line) · metrics */
-      grid-template-columns: 130px 130px 130px 1fr 110px;
+      grid-template-columns: 130px 130px 90px 1fr 90px;
       gap: 12px;
       padding: 8px 12px;
       background: var(--panel);
