@@ -71,6 +71,154 @@ class Turn:
         }
 
 
+@dataclass
+class Run:
+    """A unified span of agentic work — one thinking wake or one speaking turn.
+
+    Wraps the existing Wake / Turn models behind one shape so the timeline
+    UI can render them in a single chronological list. The detail_url
+    points at the existing per-wake / per-turn detail page.
+    """
+
+    run_id: str
+    kind: str           # thinking-wake | signal-turn | surface-turn | emergency-turn
+    hemisphere: str     # thinking | speaking
+    start_ts: float
+    end_ts: float | None
+    status: str         # running | ended | errored | timeout | exception
+    summary: str        # one-line label for the row
+    duration_ms: int | None
+    cost_usd: float | None
+    model: str | None
+    tools: list[str]
+    sender_name: str | None
+    inbound: str | None
+    outbound: str | None
+    error: str | None
+    detail_url: str
+    events: list[UnifiedEvent] = field(default_factory=list)
+
+    @property
+    def is_running(self) -> bool:
+        return self.end_ts is None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "kind": self.kind,
+            "hemisphere": self.hemisphere,
+            "start_ts": self.start_ts,
+            "end_ts": self.end_ts,
+            "status": self.status,
+            "summary": self.summary,
+            "duration_ms": self.duration_ms,
+            "cost_usd": self.cost_usd,
+            "model": self.model,
+            "tools": self.tools,
+            "sender_name": self.sender_name,
+            "inbound": self.inbound,
+            "outbound": self.outbound,
+            "error": self.error,
+            "detail_url": self.detail_url,
+            "is_running": self.is_running,
+            "event_count": len(self.events),
+        }
+
+
+def group_runs(events: list[UnifiedEvent]) -> list[Run]:
+    """Build a unified, newest-first list of Runs.
+
+    Each thinking Wake and each speaking Turn becomes one Run. Click-
+    through goes to the existing detail pages (``/wakes/<id>``,
+    ``/turns/<id>``) — the Run is just a row + summary in the timeline.
+    """
+    runs: list[Run] = []
+    for w in group_wakes(events):
+        summary = _summarize_wake(w)
+        runs.append(
+            Run(
+                run_id=w.wake_id,
+                kind="thinking-wake",
+                hemisphere="thinking",
+                start_ts=w.start_ts,
+                end_ts=w.end_ts,
+                status=w.status,
+                summary=summary,
+                duration_ms=w.duration_ms,
+                cost_usd=w.total_cost_usd,
+                model=w.model,
+                tools=list(w.tools),
+                sender_name=None,
+                inbound=None,
+                outbound=None,
+                error=None,
+                detail_url=f"/wakes/{w.wake_id}",
+                events=list(w.events),
+            )
+        )
+    for t in group_turns(events):
+        summary = _summarize_turn(t)
+        status = "errored" if t.error else ("ended" if t.end_ts else "running")
+        runs.append(
+            Run(
+                run_id=t.turn_id,
+                kind=f"{t.kind}-turn",
+                hemisphere="speaking",
+                start_ts=t.start_ts,
+                end_ts=t.end_ts,
+                status=status,
+                summary=summary,
+                duration_ms=t.duration_ms,
+                cost_usd=t.total_cost_usd,
+                model=None,
+                tools=list(t.tools),
+                sender_name=t.sender_name,
+                inbound=t.inbound,
+                outbound=t.outbound,
+                error=t.error,
+                detail_url=f"/turns/{t.turn_id}",
+                events=list(t.events),
+            )
+        )
+    runs.sort(key=lambda r: r.start_ts, reverse=True)
+    return runs
+
+
+def _summarize_wake(w: Wake) -> str:
+    """Compact one-line label for a thinking wake row.
+
+    Tries to read the assistant_text or wake-thought to give a sense of
+    what the wake actually did; falls back to tool counts when nothing
+    textual is available.
+    """
+    # Prefer the first non-empty assistant_text or thinking block — that
+    # usually carries the wake's stated intent.
+    for ev in w.events:
+        if ev.kind in ("assistant_text", "thinking"):
+            text = (ev.detail.get("text") or "").strip()
+            if text:
+                return text.replace("\n", " ")[:160]
+    # Otherwise: tools used.
+    if w.tools:
+        return f"used {', '.join(w.tools[:6])}"
+    return "(no activity captured)"
+
+
+def _summarize_turn(t: Turn) -> str:
+    """Compact one-line label for a speaking turn row."""
+    if t.kind == "signal":
+        sender = t.sender_name or "?"
+        inbound = (t.inbound or "").replace("\n", " ").strip()
+        if not inbound:
+            return f"{sender} → (image / attachment)"
+        return f"{sender} → {inbound[:160]}"
+    if t.kind == "surface":
+        return f"surface · {t.surface_id or '?'}"
+    if t.kind == "emergency":
+        return f"EMERGENCY · {t.emergency_id or '?'}"
+    return t.kind
+
+
 def group_wakes(events: list[UnifiedEvent]) -> list[Wake]:
     thinking = [e for e in events if e.hemisphere == "thinking"]
     by_id: dict[str, Wake] = {}

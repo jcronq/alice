@@ -1,155 +1,232 @@
 {% extends "base.html" %}
 {% block title %}timeline{% endblock %}
 {% block body %}
-  <h1>timeline · {{ state.event_count }} events</h1>
-
-  <div class="live-banner">
-    <span class="dot"></span>
-    <span id="live-status">live-tail connecting…</span>
-  </div>
+  <h1>timeline · {{ runs | length }} runs</h1>
 
   <div class="filter-bar">
     <a href="/?limit={{ limit }}" class="{% if not hemisphere %}on{% endif %}">all</a>
     <a href="/?hemisphere=thinking&limit={{ limit }}" class="{% if hemisphere == 'thinking' %}on{% endif %}">thinking</a>
     <a href="/?hemisphere=speaking&limit={{ limit }}" class="{% if hemisphere == 'speaking' %}on{% endif %}">speaking</a>
-    <a href="/?hemisphere=inner&limit={{ limit }}" class="{% if hemisphere == 'inner' %}on{% endif %}">inner</a>
-    <span class="muted" style="margin-left:auto">showing last {{ events | length }}</span>
+    <span class="muted" style="margin-left:auto">click a run to see its trace</span>
   </div>
 
   <div class="legend">
-    <span><span class="sw" style="background:var(--accent-2)"></span>thinking</span>
-    <span><span class="sw" style="background:var(--accent)"></span>speaking</span>
-    <span><span class="sw" style="background:var(--accent-3)"></span>inner</span>
+    <span><span class="sw" style="background:var(--accent-2)"></span>thinking-wake</span>
+    <span><span class="sw" style="background:var(--accent)"></span>signal-turn</span>
+    <span><span class="sw" style="background:var(--accent-3)"></span>surface-turn</span>
+    <span><span class="sw" style="background:var(--warn)"></span>emergency-turn</span>
+    <span><span class="sw" style="background:var(--err)"></span>error / timeout</span>
   </div>
 
-  <div class="events" id="events">
-    {% for e in events %}
-      {% set fam = e.kind | kind_family %}
-      <div class="event hemi-{{ e.hemisphere }} kind-{{ e.kind }} fam-{{ fam }}"
-           data-record='{{ e.to_dict() | tojson }}'>
-        <span class="ts">{{ e.ts | localtime }}</span>
+  <div class="runs" id="runs">
+    {% for r in runs %}
+      {% set fam = 'tool' if r.kind == 'thinking-wake' else
+                    ('emergency' if r.kind == 'emergency-turn' else
+                    ('artifact' if r.kind == 'surface-turn' else 'turn')) %}
+      {% set status_class = 'status-' + r.status %}
+      <div class="run hemi-{{ r.hemisphere }} kind-{{ r.kind }} {{ status_class }}{% if r.is_running %} running{% endif %}"
+           data-run-id="{{ r.run_id }}">
+        <span class="ts">
+          {{ r.start_ts | localtime }}
+          {% if r.end_ts %}<br><span class="muted">{{ r.start_ts | ago }}</span>{% endif %}
+        </span>
         <span class="kind">
-          <span class="badge {{ e.hemisphere }}">{{ e.hemisphere }}</span>
-          <span class="kind-chip fam-{{ fam }}">{{ e.kind | humanize_kind }}</span>
+          <span class="badge {{ r.hemisphere }}">{{ r.hemisphere }}</span>
+          <span class="kind-chip fam-{{ fam }}">{{ r.kind }}</span>
         </span>
-        <span class="cid">
-          {% if e.correlation_id %}{{ e.correlation_id }}{% else %}—{% endif %}
+        <span class="who">
+          {% if r.sender_name %}{{ r.sender_name }}
+          {% elif r.kind == 'thinking-wake' %}<span class="muted">{{ r.model or '—' }}</span>
+          {% else %}<span class="muted">—</span>{% endif %}
         </span>
-        <span class="summary">{{ e.summary }}</span>
+        <span class="summary">{{ r.summary }}</span>
+        <span class="metrics">
+          {% if r.is_running %}
+            <span class="live-dot"></span><span class="muted">running</span>
+          {% else %}
+            {% if r.duration_ms %}<span class="muted">{{ (r.duration_ms / 1000.0) | round(1) }}s</span>{% endif %}
+            {% if r.cost_usd %} · <span class="muted">${{ r.cost_usd | round(4) }}</span>{% endif %}
+            {% if r.events %} · <span class="muted">{{ r.events | length }} events</span>{% endif %}
+            {% if r.error %}<br><span style="color:var(--err)">{{ r.error[:60] }}</span>{% endif %}
+          {% endif %}
+        </span>
+        <span class="tools">
+          {% for t in r.tools[:6] %}<span class="chip tool">{{ t }}</span>{% endfor %}
+          {% if r.tools | length > 6 %}<span class="muted">+{{ r.tools | length - 6 }}</span>{% endif %}
+        </span>
       </div>
+    {% else %}
+      <div class="muted" style="padding:30px">No runs yet — wait for thinking to wake or for a signal message.</div>
     {% endfor %}
   </div>
 
+  <style>
+    .runs { display: flex; flex-direction: column; gap: 4px; }
+    .run {
+      display: grid;
+      grid-template-columns: 130px 220px 110px 1fr 130px 1fr;
+      gap: 12px;
+      padding: 8px 12px;
+      background: var(--panel);
+      border-left: 3px solid transparent;
+      border-radius: 0 4px 4px 0;
+      font-size: 12px;
+      cursor: pointer;
+      align-items: start;
+    }
+    .run > * { min-width: 0; }
+    .run:hover { background: var(--panel-2); }
+    .run:hover .summary { color: var(--accent); }
+    .run.hemi-thinking { border-left-color: var(--accent-2); }
+    .run.hemi-speaking { border-left-color: var(--accent); }
+    .run.kind-emergency-turn { background: #2f1414; border-left-color: var(--warn); }
+    .run.status-errored { border-left-color: var(--err); }
+    .run.status-timeout { border-left-color: var(--err); }
+    .run.status-exception { border-left-color: var(--err); }
+
+    .run .ts { color: var(--muted); font-size: 11px; line-height: 1.5; }
+    .run .kind { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+    .run .kind .kind-chip { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .run .who { font-family: var(--mono); color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .run .summary { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .run .metrics { font-size: 11px; line-height: 1.5; text-align: right; }
+    .run .tools { display: flex; flex-wrap: wrap; gap: 3px; align-items: flex-start; }
+
+    .live-dot {
+      display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+      background: var(--ok); margin-right: 4px; vertical-align: middle;
+      animation: pulse 1.5s infinite ease-in-out;
+    }
+    .run.running { background: linear-gradient(90deg, var(--panel), color-mix(in srgb, var(--ok) 6%, var(--panel))); }
+
+    /* Modal trace formatting */
+    .modal-body .trace { display: flex; flex-direction: column; gap: 4px; margin-top: 14px; }
+    .modal-body .trace-row {
+      display: grid; grid-template-columns: 80px 130px 1fr; gap: 12px;
+      padding: 6px 10px; background: var(--panel-2); border-radius: 0 4px 4px 0;
+      border-left: 3px solid var(--border);
+      font-size: 11px;
+    }
+    .modal-body .trace-row.fam-tool { border-left-color: #ff9b6b; }
+    .modal-body .trace-row.fam-text { border-left-color: var(--accent); }
+    .modal-body .trace-row.fam-thought { border-left-color: var(--accent-2); }
+    .modal-body .trace-row.fam-result { border-left-color: var(--ok); }
+    .modal-body .trace-row.fam-boundary { border-left-color: var(--muted); }
+    .modal-body .trace-row.fam-error { border-left-color: var(--err); }
+    .modal-body .trace-row .summary { color: var(--text); }
+    .modal-body .trace-row .ts { color: var(--muted); }
+    .modal-body .trace-row .kind { color: var(--muted); }
+    .modal-body .trace-empty { color: var(--muted); padding: 30px; text-align: center; }
+  </style>
+
   <script>
-    // Live-tail via SSE. New events get prepended.
     (function () {
-      const container = document.getElementById('events');
-      const status = document.getElementById('live-status');
-      const es = new EventSource('/stream');
-      es.addEventListener('open', () => { status.textContent = 'live-tail connected'; });
-      es.addEventListener('error', () => { status.textContent = 'live-tail disconnected — retrying…'; });
-      es.addEventListener('event', (msg) => {
-        try {
-          const rec = JSON.parse(msg.data);
-          const row = renderRow(rec);
-          container.prepend(row);
-          // Keep DOM bounded.
-          while (container.children.length > 800) container.removeChild(container.lastChild);
-        } catch (e) {}
-      });
-
-      function renderRow(rec) {
-        const hemi = rec._hemisphere || 'unknown';
-        const kind = rec.event || 'unknown';
-        const ts = new Date((rec.ts || 0) * 1000);
-        const tsStr = ts.toISOString().replace('T', ' ').substring(0, 19);
-        const cid = rec.turn_id || '';
-        const summary = summarize(rec);
-        const fam = window.kindFamily(kind);
-        const label = window.humanizeKind(kind);
-
-        // Build a UnifiedEvent-shaped record so the modal handler sees the same thing as server-rendered rows.
-        const unified = {
-          ts: rec.ts || 0, hemisphere: hemi, kind: kind,
-          correlation_id: cid || null, summary: summary, detail: rec,
-        };
-
-        const d = document.createElement('div');
-        d.className = `event hemi-${hemi} kind-${kind} fam-${fam}`;
-        d.setAttribute('data-record', JSON.stringify(unified));
-        d.innerHTML = `
-          <span class="ts">${tsStr}</span>
-          <span class="kind">
-            <span class="badge ${hemi}">${hemi}</span>
-            <span class="kind-chip fam-${fam}">${label}</span>
-          </span>
-          <span class="cid">${cid || '—'}</span>
-          <span class="summary"></span>
-        `;
-        d.querySelector('.summary').textContent = summary;
-        return d;
-      }
-
-      function summarize(rec) {
-        const k = rec.event;
-        if (k === 'assistant_text') return trim(rec.text || '', 140);
-        if (k === 'tool_use') return toolSummary(rec.name || '?', rec.input);
-        if (k === 'thinking') return `(thought) ${trim(rec.text || '', 120)}`;
-        if (k === 'result') return `result · ${rec.duration_ms}ms · $${rec.total_cost_usd}`;
-        if (k === 'signal_turn_start') return `signal · ${rec.sender_name} → ${trim(rec.inbound || '', 100)}`;
-        if (k === 'signal_turn_end') return `turn end · ${rec.outbound_chars || 0} chars${rec.error ? ' · err=' + rec.error : ''}`;
-        if (k === 'wake_start') return `wake start · model=${rec.model}`;
-        if (k === 'wake_end') return 'wake end';
-        if (k === 'surface_dispatch') return `surface dispatch · ${rec.surface_id}`;
-        if (k === 'emergency_voiced') return `EMERGENCY voiced → ${rec.recipient}`;
-        return k;
-      }
-      function trim(s, cap) { s = (s || '').replace(/\n/g, ' '); return s.length > cap ? s.substr(0, cap - 1) + '…' : s; }
-      function toolSummary(name, input) {
-        let parsed = input;
-        if (typeof input === 'string') {
-          try { parsed = JSON.parse(input); }
-          catch (e) {
-            // Truncated JSON — pluck known fields by regex.
-            for (const f of ['file_path', 'command', 'pattern', 'url', 'query', 'notebook_path', 'description']) {
-              const re = new RegExp('"' + f + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"');
-              const m = input.match(re);
-              if (m) return `${name} ${trim(m[1], 140)}`;
-            }
-            return `${name} ${trim(input, 140)}`;
-          }
-        }
-        if (!parsed || typeof parsed !== 'object') return name;
-        let primary = null;
-        if (name === 'Bash') primary = parsed.command;
-        else if (['Read', 'Write', 'Edit', 'NotebookEdit'].includes(name)) primary = parsed.file_path || parsed.notebook_path;
-        else if (name === 'Grep' || name === 'Glob') {
-          primary = parsed.pattern;
-          if (parsed.path) primary = `${primary}  in ${parsed.path}`;
-        }
-        else if (name === 'WebFetch') primary = parsed.url;
-        else if (name === 'WebSearch') primary = parsed.query;
-        else if (name === 'Task') primary = parsed.description || parsed.subagent_type;
-        else if (name === 'TaskCreate' || name === 'TaskUpdate') primary = parsed.subject || parsed.taskId;
-        else if (name.startsWith('mcp__')) {
-          for (const v of Object.values(parsed)) { if (typeof v === 'string' && v) { primary = v; break; } }
-        }
-        if (primary == null) return `${name} ${trim(JSON.stringify(parsed), 140)}`;
-        return `${name} ${trim(String(primary), 140)}`;
-      }
-    })();
-
-    // Modal — click any event card to open the shared rich-modal.
-    (function () {
-      const events = document.getElementById('events');
-      events.addEventListener('click', (e) => {
+      const container = document.getElementById('runs');
+      container.addEventListener('click', async (e) => {
         if (e.target.tagName === 'A') return;
-        const card = e.target.closest('.event');
-        if (!card) return;
-        const raw = card.getAttribute('data-record');
-        if (!raw) return;
-        try { window.openEventModal(JSON.parse(raw)); } catch (err) { console.error(err); }
+        const row = e.target.closest('.run');
+        if (!row) return;
+        const id = row.getAttribute('data-run-id');
+        if (!id) return;
+        await openRunModal(id);
       });
+
+      async function openRunModal(runId) {
+        // Show a loading shell first, then fetch + render.
+        window.openModal({
+          titleHtml: '<span class="muted">loading…</span>',
+          bodyHtml: '<div class="trace-empty">fetching trace…</div>',
+        });
+        try {
+          const res = await fetch('/api/runs/' + encodeURIComponent(runId));
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            renderError(err.error || 'not found');
+            return;
+          }
+          const data = await res.json();
+          renderRun(data.run, data.events);
+        } catch (err) {
+          renderError(String(err));
+        }
+      }
+
+      function renderError(msg) {
+        document.querySelector('#app-modal .modal-title').innerHTML =
+          '<span style="color:var(--err)">error</span>';
+        document.querySelector('#app-modal .modal-body').innerHTML =
+          '<div class="trace-empty">' + escapeHtml(msg) + '</div>';
+      }
+
+      function renderRun(run, events) {
+        const fam = run.kind === 'thinking-wake' ? 'tool'
+                  : run.kind === 'emergency-turn' ? 'emergency'
+                  : run.kind === 'surface-turn' ? 'artifact' : 'turn';
+        const startStr = fmtTs(run.start_ts);
+        const endStr = run.end_ts ? fmtTs(run.end_ts) : 'still running';
+        const durStr = run.duration_ms != null ? (run.duration_ms / 1000).toFixed(1) + 's' : '—';
+        const costStr = run.cost_usd != null ? '$' + Number(run.cost_usd).toFixed(4) : '—';
+
+        document.querySelector('#app-modal .modal-title').innerHTML =
+          '<span class="badge ' + escapeHtml(run.hemisphere) + '">' + escapeHtml(run.hemisphere) + '</span> ' +
+          '<span class="kind-chip fam-' + fam + '">' + escapeHtml(run.kind) + '</span>';
+
+        const detailRows = [
+          ['run id', '<code>' + escapeHtml(run.run_id) + '</code>'],
+          ['started', escapeHtml(startStr)],
+          ['ended', escapeHtml(endStr)],
+          ['duration', escapeHtml(durStr)],
+          ['cost', escapeHtml(costStr)],
+        ];
+        if (run.model) detailRows.push(['model', '<code>' + escapeHtml(run.model) + '</code>']);
+        if (run.sender_name) detailRows.push(['sender', escapeHtml(run.sender_name)]);
+        if (run.tools && run.tools.length) {
+          detailRows.push(['tools', run.tools.map(t => '<span class="chip tool">' + escapeHtml(t) + '</span>').join(' ')]);
+        }
+        if (run.error) {
+          detailRows.push(['error', '<span style="color:var(--err)">' + escapeHtml(run.error) + '</span>']);
+        }
+        const detailHtml = '<div class="detail-grid">' +
+          detailRows.map(([k, v]) => '<span class="k">' + k + '</span><span class="v">' + v + '</span>').join('') +
+          '</div>';
+
+        const summaryHtml = run.summary
+          ? '<div class="summary-full">' + escapeHtml(run.summary) + '</div>'
+          : '';
+
+        const ctaHtml = '<p style="margin-top:14px"><a href="' + run.detail_url +
+          '">open full detail page →</a></p>';
+
+        const traceHtml = events && events.length
+          ? '<h2>trace · ' + events.length + ' events</h2><div class="trace">' +
+            events.map(renderTraceRow).join('') + '</div>'
+          : '<div class="trace-empty">No events captured for this run.</div>';
+
+        document.querySelector('#app-modal .modal-body').innerHTML =
+          summaryHtml + detailHtml + ctaHtml + traceHtml;
+      }
+
+      function renderTraceRow(ev) {
+        const fam = window.kindFamily(ev.kind);
+        const label = window.humanizeKind(ev.kind);
+        const ts = fmtTs(ev.ts).replace(/^.* /, ''); // just the time
+        const summary = ev.summary || '';
+        return '<div class="trace-row fam-' + fam + '">' +
+               '<span class="ts">' + escapeHtml(ts) + '</span>' +
+               '<span class="kind">' + escapeHtml(label) + '</span>' +
+               '<span class="summary">' + escapeHtml(summary) + '</span>' +
+               '</div>';
+      }
+
+      function fmtTs(ts) {
+        try { return new Date(ts * 1000).toLocaleString(); }
+        catch (e) { return String(ts); }
+      }
+
+      function escapeHtml(s) {
+        return String(s == null ? '' : s)
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      }
     })();
   </script>
 {% endblock %}

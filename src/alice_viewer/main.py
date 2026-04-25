@@ -61,25 +61,59 @@ def create_app(paths: Paths | None = None) -> FastAPI:
     # Views
 
     @app.get("/", response_class=HTMLResponse)
-    async def timeline(request: Request, limit: int = 400, hemisphere: str | None = None):
+    async def timeline(request: Request, limit: int = 200, hemisphere: str | None = None):
+        """Timeline of *runs* — one row per thinking wake or speaking turn.
+
+        A run is a contiguous span of work. Thinking runs go from
+        ``wake_start`` to ``wake_end``/``timeout``/``exception``;
+        speaking runs go from ``signal_turn_start`` (or
+        surface_dispatch / emergency_dispatch) to the matching turn_end.
+        Click a row to drill into the per-event trace through that span.
+        """
         p: Paths = app.state.paths
         events = sources.load_all(p)
+        runs = aggregators.group_runs(events)
         if hemisphere:
-            events = [e for e in events if e.hemisphere == hemisphere]
-        # Show newest-first for display but keep the newest `limit`.
-        events = events[-limit:]
-        events.reverse()
+            runs = [r for r in runs if r.hemisphere == hemisphere]
+        runs = runs[:limit]
         return templates.TemplateResponse(
             request,
             "timeline.html",
             {
-                "events": events,
+                "runs": runs,
                 "hemisphere": hemisphere,
                 "limit": limit,
                 "state": _state_context(),
                 "active": "timeline",
             },
         )
+
+    @app.get("/api/runs/{run_id}")
+    async def api_run_detail(run_id: str) -> JSONResponse:
+        """Return one run + its event trace as JSON for the timeline modal."""
+        p: Paths = app.state.paths
+        events = sources.load_all(p)
+        runs = aggregators.group_runs(events)
+        match = next((r for r in runs if r.run_id == run_id), None)
+        if match is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return JSONResponse(
+            {
+                "run": match.to_dict(),
+                "events": [e.to_dict() for e in match.events],
+            }
+        )
+
+    @app.get("/api/runs")
+    async def api_runs(limit: int = 200, hemisphere: str | None = None) -> JSONResponse:
+        """Newest-first list of runs as JSON. Used by the timeline's
+        live refresh; also handy for ad-hoc inspection via curl."""
+        p: Paths = app.state.paths
+        events = sources.load_all(p)
+        runs = aggregators.group_runs(events)
+        if hemisphere:
+            runs = [r for r in runs if r.hemisphere == hemisphere]
+        return JSONResponse([r.to_dict() for r in runs[:limit]])
 
     @app.get("/wakes", response_class=HTMLResponse)
     async def wakes_index(request: Request):
