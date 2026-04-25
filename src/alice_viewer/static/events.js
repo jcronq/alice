@@ -720,16 +720,13 @@ window.openInteractionNodeModal = function (node) {
   if (node.kind === 'wake' && node.id) {
     return openRunModal(node.id.replace('wake::', ''));
   }
+  if (node.kind === 'turn' && node.id) {
+    return openRunModal(node.id.replace('turn::', ''));
+  }
 
   const fam = node.kind;
   const titleHtml = `<span class="kind-chip fam-${escapeHtml(fam)}">${escapeHtml(fam)}</span> ${escapeHtml(node.label || '')}`;
   const meta = node.meta || {};
-
-  // For turn nodes, the real data lives on a dedicated page — give a CTA.
-  let cta = '';
-  if (node.kind === 'turn' && node.id) {
-    cta = `<p><a href="/turns/${encodeURIComponent(node.id.replace('turn::', ''))}">open full turn trace →</a></p>`;
-  }
 
   const rows = [
     ['node id', `<code>${escapeHtml(node.id || '')}</code>`],
@@ -738,7 +735,7 @@ window.openInteractionNodeModal = function (node) {
   ];
   if (node.ts) rows.push(['ts', escapeHtml(fmtTs(node.ts))]);
 
-  let body = cta + kvTable(rows);
+  let body = kvTable(rows);
 
   // Artifact kinds carry meta.body etc.; render rich content.
   if (meta.body) body += '<h2>body</h2>' + renderMarkdown(meta.body);
