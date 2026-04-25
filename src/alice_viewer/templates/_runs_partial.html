@@ -1,0 +1,44 @@
+{# One page of timeline rows + (optionally) an HTMX sentinel that fetches
+   the next page when scrolled into view. Included by timeline.html for
+   the first page; rendered standalone by /timeline/page for subsequent
+   pages (replaces the previous sentinel via hx-swap=outerHTML). #}
+{% for r in runs %}
+  {% set fam = 'tool' if r.kind == 'thinking-wake' else
+                ('emergency' if r.kind == 'emergency-turn' else
+                ('artifact' if r.kind == 'surface-turn' else 'turn')) %}
+  {% set status_class = 'status-' + r.status %}
+  {% set short_model = r.model | replace('claude-', '') | replace('-', '.') if r.model else '' %}
+  <div class="run hemi-{{ r.hemisphere }} kind-{{ r.kind }} {{ status_class }}{% if r.is_running %} running{% endif %}"
+       data-run-id="{{ r.run_id }}">
+    <span class="ts">
+      {{ r.start_ts | localtime }}
+      {% if r.end_ts %}<br><span class="muted">{{ r.start_ts | ago }}</span>{% endif %}
+    </span>
+    <span class="kind">
+      <span class="kind-chip fam-{{ fam }}">{{ r.kind }}</span>
+    </span>
+    <span class="who">
+      {% if r.sender_name %}{{ r.sender_name }}
+      {% elif short_model %}<span class="muted">{{ short_model }}</span>
+      {% else %}<span class="muted">—</span>{% endif %}
+    </span>
+    <span class="summary">{{ r.summary }}</span>
+    <span class="metrics">
+      {% if r.is_running %}
+        <span class="live-dot"></span><span class="muted">running</span>
+      {% else %}
+        {% if r.duration_ms %}<span class="muted">{{ (r.duration_ms / 1000.0) | round(1) }}s</span>{% endif %}
+        {% if r.cost_usd %}<br><span class="muted">${{ r.cost_usd | round(4) }}</span>{% endif %}
+        {% if r.error %}<br><span style="color:var(--err)">{{ r.error[:60] }}</span>{% endif %}
+      {% endif %}
+    </span>
+  </div>
+{% endfor %}
+{% if has_more %}
+  <div class="runs-sentinel"
+       hx-get="/timeline/page?offset={{ next_offset }}&limit={{ limit }}{% if hemisphere %}&hemisphere={{ hemisphere }}{% endif %}"
+       hx-trigger="revealed"
+       hx-swap="outerHTML">
+    <span class="muted">loading more…</span>
+  </div>
+{% endif %}

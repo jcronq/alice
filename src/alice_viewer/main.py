@@ -61,7 +61,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
     # Views
 
     @app.get("/", response_class=HTMLResponse)
-    async def timeline(request: Request, limit: int = 200, hemisphere: str | None = None):
+    async def timeline(request: Request, limit: int = 50, hemisphere: str | None = None):
         """Timeline of *runs* — one row per thinking wake or speaking turn.
 
         A run is a contiguous span of work. Thinking runs go from
@@ -75,16 +75,49 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         runs = aggregators.group_runs(events)
         if hemisphere:
             runs = [r for r in runs if r.hemisphere == hemisphere]
-        runs = runs[:limit]
+        total = len(runs)
+        page = runs[:limit]
         return templates.TemplateResponse(
             request,
             "timeline.html",
             {
-                "runs": runs,
+                "runs": page,
+                "total_runs": total,
                 "hemisphere": hemisphere,
                 "limit": limit,
+                "next_offset": limit,
+                "has_more": total > limit,
                 "state": _state_context(),
                 "active": "timeline",
+            },
+        )
+
+    @app.get("/timeline/page", response_class=HTMLResponse)
+    async def timeline_page(
+        request: Request,
+        offset: int = 0,
+        limit: int = 50,
+        hemisphere: str | None = None,
+    ):
+        """HTML partial for one page of timeline rows + (optionally) a
+        new infinite-scroll sentinel. Called by HTMX when the previous
+        sentinel scrolls into view."""
+        p: Paths = app.state.paths
+        events = sources.load_all(p)
+        runs = aggregators.group_runs(events)
+        if hemisphere:
+            runs = [r for r in runs if r.hemisphere == hemisphere]
+        page = runs[offset : offset + limit]
+        next_offset = offset + limit
+        return templates.TemplateResponse(
+            request,
+            "_runs_partial.html",
+            {
+                "runs": page,
+                "hemisphere": hemisphere,
+                "limit": limit,
+                "next_offset": next_offset,
+                "has_more": next_offset < len(runs),
             },
         )
 

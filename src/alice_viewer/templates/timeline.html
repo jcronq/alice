@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}timeline{% endblock %}
 {% block body %}
-  <h1>timeline · {{ runs | length }} runs</h1>
+  <h1>timeline · {{ total_runs }} runs</h1>
 
   <div class="filter-bar">
     <a href="/?limit={{ limit }}" class="{% if not hemisphere %}on{% endif %}">all</a>
@@ -19,44 +19,22 @@
   </div>
 
   <div class="runs" id="runs">
-    {% for r in runs %}
-      {% set fam = 'tool' if r.kind == 'thinking-wake' else
-                    ('emergency' if r.kind == 'emergency-turn' else
-                    ('artifact' if r.kind == 'surface-turn' else 'turn')) %}
-      {% set status_class = 'status-' + r.status %}
-      {% set short_model = r.model | replace('claude-', '') | replace('-', '.') if r.model else '' %}
-      <div class="run hemi-{{ r.hemisphere }} kind-{{ r.kind }} {{ status_class }}{% if r.is_running %} running{% endif %}"
-           data-run-id="{{ r.run_id }}">
-        <span class="ts">
-          {{ r.start_ts | localtime }}
-          {% if r.end_ts %}<br><span class="muted">{{ r.start_ts | ago }}</span>{% endif %}
-        </span>
-        <span class="kind">
-          <span class="kind-chip fam-{{ fam }}">{{ r.kind }}</span>
-        </span>
-        <span class="who">
-          {% if r.sender_name %}{{ r.sender_name }}
-          {% elif short_model %}<span class="muted">{{ short_model }}</span>
-          {% else %}<span class="muted">—</span>{% endif %}
-        </span>
-        <span class="summary">{{ r.summary }}</span>
-        <span class="metrics">
-          {% if r.is_running %}
-            <span class="live-dot"></span><span class="muted">running</span>
-          {% else %}
-            {% if r.duration_ms %}<span class="muted">{{ (r.duration_ms / 1000.0) | round(1) }}s</span>{% endif %}
-            {% if r.cost_usd %}<br><span class="muted">${{ r.cost_usd | round(4) }}</span>{% endif %}
-            {% if r.error %}<br><span style="color:var(--err)">{{ r.error[:60] }}</span>{% endif %}
-          {% endif %}
-        </span>
-      </div>
+    {% if runs %}
+      {% include "_runs_partial.html" %}
     {% else %}
       <div class="muted" style="padding:30px">No runs yet — wait for thinking to wake or for a signal message.</div>
-    {% endfor %}
+    {% endif %}
   </div>
 
   <style>
     .runs { display: flex; flex-direction: column; gap: 4px; }
+    .runs-sentinel {
+      padding: 14px 12px;
+      text-align: center;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .runs-sentinel.htmx-request::after { content: ''; }
     .run {
       display: grid;
       /* timestamp · kind · who-or-model · summary (2-line) · metrics */
