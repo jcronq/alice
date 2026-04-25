@@ -95,13 +95,14 @@
           window.openInteractionNodeModal(d);
         });
 
-      window.attachGraphFocus({ nodeSel: node, linkSel: link, edges: data.edges });
-
       simulation.on('tick', () => {
         link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
             .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
         node.attr('transform', d => `translate(${d.x},${d.y})`);
       });
+
+      try { window.attachGraphFocus({ nodeSel: node, linkSel: link, edges: data.edges }); }
+      catch (err) { console.error('attachGraphFocus failed', err); }
     })();
   </script>
 {% endblock %}

@@ -99,13 +99,14 @@
           });
         nodeSel.style('cursor', 'pointer');
 
-        window.attachGraphFocus({ nodeSel, linkSel: link, edges: activeEdges });
-
         sim.on('tick', () => {
           link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
               .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
           nodeSel.attr('transform', d => `translate(${d.x},${d.y})`);
         });
+
+        try { window.attachGraphFocus({ nodeSel, linkSel: link, edges: activeEdges }); }
+        catch (err) { console.error('attachGraphFocus failed', err); }
       };
 
       render();
