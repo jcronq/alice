@@ -6,6 +6,7 @@
     <p><a href="/turns">← back to turns</a></p>
   {% else %}
     <h1>turn · {{ turn.turn_id }} <span class="badge speaking">{{ turn.kind }}</span></h1>
+    {% if summary %}<div class="summary-full">{{ summary }}</div>{% endif %}
     <div class="detail-header">
       <div class="detail-grid">
         <span class="k">start</span><span class="v">{{ turn.start_ts | localtime }} <span class="muted">({{ turn.start_ts | ago }})</span></span>

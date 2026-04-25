@@ -165,7 +165,7 @@ def group_runs(events: list[UnifiedEvent]) -> list[Run]:
             )
         )
     for t in group_turns(events):
-        summary = _summarize_turn(t)
+        summary = summarize_turn(t)
         status = "errored" if t.error else ("ended" if t.end_ts else "running")
         runs.append(
             Run(
@@ -223,7 +223,7 @@ def summarize_wake(w: Wake, run_summary_module=None) -> str:
     return "(no activity captured)"
 
 
-def _summarize_turn(t: Turn) -> str:
+def summarize_turn(t: Turn) -> str:
     """Compact one-line label for a speaking turn row."""
     if t.kind == "signal":
         sender = t.sender_name or "?"

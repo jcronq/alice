@@ -206,11 +206,13 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         events = sources.load_all(p)
         turns = aggregators.group_turns(events)
         turn = next((t for t in turns if t.turn_id == turn_id), None)
+        summary = aggregators.summarize_turn(turn) if turn else None
         return templates.TemplateResponse(
             request,
             "turn_detail.html",
             {
                 "turn": turn,
+                "summary": summary,
                 "state": _state_context(),
                 "active": "turns",
             },
