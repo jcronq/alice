@@ -861,7 +861,10 @@ class SpeakingDaemon:
             self.events,
             correlation_id=turn_id,
             silent=silent,
-            short_cap=2000,
+            # Generous so Opus's reasoning + replies aren't sliced mid-
+            # sentence in the modal trace. Logs grow ~2x on busy days
+            # but disk is cheap and the viewer's value depends on this.
+            short_cap=4000,
         )
 
         try:
@@ -928,6 +931,11 @@ class SpeakingDaemon:
             mcp_servers=self.mcp_servers,
             cwd=self.cfg.work_dir,
             resume=self.session_id,
+            # Adaptive thinking with summarized display so ThinkingBlocks
+            # come back with non-empty text. Without display='summarized'
+            # the SDK omits thinking text entirely (signature only) and
+            # the viewer's trace shows empty (thought) rows.
+            thinking={"type": "adaptive", "display": "summarized"},
         )
 
     def _build_handlers(self, *, silent: bool) -> list:

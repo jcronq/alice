@@ -70,6 +70,12 @@ class KernelSpec:
     All fields map directly to SDK ``ClaudeAgentOptions`` arguments or
     wrapper-level behavior. The kernel builds the SDK options from this
     spec — callers never touch ``ClaudeAgentOptions`` directly.
+
+    ``thinking`` controls extended-thinking emission. When ``None``, the
+    SDK uses its own default (which omits thinking text entirely). To
+    actually see what the model is reasoning about, pass
+    ``{"type": "adaptive", "display": "summarized"}`` — that makes
+    ThinkingBlocks come back with non-empty text the viewer can render.
     """
 
     model: str
@@ -78,6 +84,7 @@ class KernelSpec:
     mcp_servers: Optional[dict] = None
     resume: Optional[str] = None
     max_seconds: int = 0  # 0 or negative = unbounded
+    thinking: Optional[dict] = None  # ThinkingConfig dict from claude_agent_sdk.types
 
 
 @dataclass
@@ -288,6 +295,8 @@ class AgentKernel:
             kwargs["mcp_servers"] = spec.mcp_servers
         if spec.resume:
             kwargs["resume"] = spec.resume
+        if spec.thinking is not None:
+            kwargs["thinking"] = spec.thinking
         return ClaudeAgentOptions(**kwargs)
 
 

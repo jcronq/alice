@@ -106,13 +106,19 @@ async def _run_wake(
     kernel = AgentKernel(
         emitter,
         correlation_id=wake_id,
-        short_cap=400,  # tight cap — thinking traces stay compact
+        # Cap is generous — Sonnet's reasoning blocks are often >1k chars
+        # and a wake's whole value is the trace (Owner browses thoughts
+        # in the viewer, not just the resulting wiki edits).
+        short_cap=4000,
     )
     spec = KernelSpec(
         model=model,
         allowed_tools=tools,
         cwd=cwd,
         max_seconds=max_seconds,
+        # Adaptive thinking with summarized display so ThinkingBlocks
+        # come back with non-empty text.
+        thinking={"type": "adaptive", "display": "summarized"},
     )
 
     try:
