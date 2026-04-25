@@ -456,18 +456,278 @@ function openEventModal(rec) {
 window.openEventModal = openEventModal;
 
 /* ------------------------------------------------------------------ */
+/* Run modal — fetches /api/runs/{id} and renders the trace.            */
+/* Used by the timeline row click handler and by the flow graph for    */
+/* wake/turn nodes.                                                      */
+
+async function openRunModal(runId) {
+  openModal({
+    titleHtml: '<span class="muted">loading…</span>',
+    bodyHtml: '<div class="trace-empty">fetching trace…</div>',
+  });
+  try {
+    const res = await fetch('/api/runs/' + encodeURIComponent(runId));
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      _renderRunError(err.error || 'not found');
+      return;
+    }
+    const data = await res.json();
+    _renderRun(data.run, data.events);
+  } catch (err) {
+    _renderRunError(String(err));
+  }
+}
+
+function _renderRunError(msg) {
+  document.querySelector('#app-modal .modal-title').innerHTML =
+    '<span style="color:var(--err)">error</span>';
+  document.querySelector('#app-modal .modal-body').innerHTML =
+    '<div class="trace-empty">' + escapeHtml(msg) + '</div>';
+}
+
+function _renderRun(run, events) {
+  const fam = run.kind === 'thinking-wake' ? 'tool'
+            : run.kind === 'emergency-turn' ? 'emergency'
+            : run.kind === 'surface-turn' ? 'artifact' : 'turn';
+  const startStr = fmtTs(run.start_ts);
+  const endStr = run.end_ts ? fmtTs(run.end_ts) : 'still running';
+  const durStr = run.duration_ms != null ? (run.duration_ms / 1000).toFixed(1) + 's' : '—';
+  const costStr = run.cost_usd != null ? '$' + Number(run.cost_usd).toFixed(4) : '—';
+
+  document.querySelector('#app-modal .modal-title').innerHTML =
+    '<span class="badge ' + escapeHtml(run.hemisphere) + '">' + escapeHtml(run.hemisphere) + '</span> ' +
+    '<span class="kind-chip fam-' + fam + '">' + escapeHtml(run.kind) + '</span>';
+
+  const detailRows = [
+    ['run id', '<code>' + escapeHtml(run.run_id) + '</code>'],
+    ['started', escapeHtml(startStr)],
+    ['ended', escapeHtml(endStr)],
+    ['duration', escapeHtml(durStr)],
+    ['cost', escapeHtml(costStr)],
+  ];
+  if (run.model) detailRows.push(['model', '<code>' + escapeHtml(run.model) + '</code>']);
+  if (run.sender_name) detailRows.push(['sender', escapeHtml(run.sender_name)]);
+  if (run.tools && run.tools.length) {
+    detailRows.push(['tools', run.tools.map(t => '<span class="chip tool">' + escapeHtml(t) + '</span>').join(' ')]);
+  }
+  if (run.error) {
+    detailRows.push(['error', '<span style="color:var(--err)">' + escapeHtml(run.error) + '</span>']);
+  }
+  const detailHtml = '<div class="detail-grid">' +
+    detailRows.map(([k, v]) => '<span class="k">' + k + '</span><span class="v">' + v + '</span>').join('') +
+    '</div>';
+
+  const summaryHtml = run.summary
+    ? '<div class="summary-full">' + escapeHtml(run.summary) + '</div>'
+    : '';
+
+  const ctaHtml = '<p style="margin-top:14px"><a href="' + run.detail_url +
+    '">open full detail page →</a></p>';
+
+  const traceHtml = events && events.length
+    ? '<h2>trace · ' + events.length + ' events</h2><div class="trace">' +
+      events.map(_renderTraceRow).join('') + '</div>'
+    : '<div class="trace-empty">No events captured for this run.</div>';
+
+  document.querySelector('#app-modal .modal-body').innerHTML =
+    summaryHtml + detailHtml + ctaHtml + traceHtml;
+}
+
+function _renderTraceRow(ev) {
+  const fam = window.kindFamily(ev.kind);
+  const label = window.humanizeKind(ev.kind);
+  const ts = fmtTs(ev.ts).replace(/^.* /, '');
+  const detail = ev.detail || {};
+
+  const isRich =
+    ev.kind === 'thinking' ||
+    ev.kind === 'assistant_text' ||
+    ev.kind === 'tool_use' ||
+    ev.kind === 'system';
+
+  if (!isRich) {
+    return '<div class="trace-row compact fam-' + fam + '">' +
+           '<span class="ts">' + escapeHtml(ts) + '</span>' +
+           '<span class="kind">' + escapeHtml(label) + '</span>' +
+           '<span class="summary">' + escapeHtml(ev.summary || '') + '</span>' +
+           '</div>';
+  }
+
+  let body;
+  if (ev.kind === 'thinking' || ev.kind === 'assistant_text') {
+    const text = (detail.text || '').trim();
+    body = text
+      ? '<div class="trace-text">' + escapeHtml(text) + '</div>'
+      : '<div class="trace-text muted">(empty)</div>';
+  } else if (ev.kind === 'tool_use') {
+    body = _renderTraceToolUse(detail);
+  } else {
+    body = _renderTraceSystem(detail);
+  }
+
+  const head = '<div class="trace-head">' +
+               '<span class="ts">' + escapeHtml(ts) + '</span>' +
+               '<span class="kind">' + escapeHtml(label) + '</span>' +
+               (ev.kind === 'system' && detail.subtype
+                 ? ' <span class="muted">· ' + escapeHtml(detail.subtype) + '</span>'
+                 : '') +
+               '</div>';
+  return '<div class="trace-row rich fam-' + fam + '">' + head + body + '</div>';
+}
+
+function _renderTraceToolUse(detail) {
+  const name = detail.name || '?';
+  let input = detail.input;
+  if (typeof input === 'string') {
+    try { input = JSON.parse(input); }
+    catch (e) {
+      return '<div class="trace-text"><strong>' + escapeHtml(name) + '</strong>\n' +
+             escapeHtml(String(input)) + '</div>';
+    }
+  }
+  if (!input || typeof input !== 'object') {
+    return '<div class="trace-text"><strong>' + escapeHtml(name) + '</strong></div>';
+  }
+
+  let primary = null;
+  let primaryLabel = null;
+  const secondaries = [];
+
+  if (name === 'Bash') {
+    primary = input.command;
+    primaryLabel = 'command';
+    if (input.description) secondaries.push(['', input.description]);
+    if (input.timeout) secondaries.push(['timeout', input.timeout + 'ms']);
+  } else if (['Read', 'Write', 'Edit', 'NotebookEdit'].includes(name)) {
+    primary = input.file_path || input.notebook_path;
+    primaryLabel = 'file';
+    if (input.offset != null) secondaries.push(['offset', input.offset]);
+    if (input.limit != null) secondaries.push(['limit', input.limit]);
+    if (name === 'Edit') {
+      if (input.old_string) secondaries.push(['old', _truncate(input.old_string, 200)]);
+      if (input.new_string) secondaries.push(['new', _truncate(input.new_string, 200)]);
+    }
+    if (name === 'Write' && input.content) {
+      secondaries.push(['content', _truncate(input.content, 400)]);
+    }
+  } else if (name === 'Grep') {
+    primary = input.pattern;
+    primaryLabel = 'pattern';
+    if (input.path) secondaries.push(['path', input.path]);
+    if (input.glob) secondaries.push(['glob', input.glob]);
+    if (input.output_mode) secondaries.push(['mode', input.output_mode]);
+  } else if (name === 'Glob') {
+    primary = input.pattern;
+    primaryLabel = 'pattern';
+    if (input.path) secondaries.push(['path', input.path]);
+  } else if (name === 'WebFetch') {
+    primary = input.url;
+    primaryLabel = 'url';
+    if (input.prompt) secondaries.push(['prompt', _truncate(input.prompt, 300)]);
+  } else if (name === 'WebSearch') {
+    primary = input.query;
+    primaryLabel = 'query';
+  } else if (name.endsWith('__send_message') || name === 'send_message') {
+    primary = input.message;
+    primaryLabel = 'message';
+    if (input.recipient) secondaries.push(['→', input.recipient]);
+  } else if (name.endsWith('__append_note') || name === 'append_note') {
+    primary = input.content || input.body || input.text;
+    primaryLabel = 'note';
+    if (input.tag) secondaries.push(['tag', input.tag]);
+    if (input.title) secondaries.push(['title', input.title]);
+  } else if (name.endsWith('__resolve_surface') || name === 'resolve_surface') {
+    primary = input.action_taken;
+    primaryLabel = 'action';
+    if (input.id) secondaries.push(['surface', input.id]);
+    if (input.verdict) secondaries.push(['verdict', input.verdict]);
+  } else if (name.endsWith('__write_memory') || name === 'write_memory') {
+    primary = input.content;
+    primaryLabel = 'memory';
+    if (input.path) secondaries.push(['path', input.path]);
+  } else if (name.endsWith('__read_memory') || name === 'read_memory') {
+    primary = input.pattern;
+    primaryLabel = 'pattern';
+  } else if (name.startsWith('mcp__')) {
+    for (const [k, v] of Object.entries(input)) {
+      if (typeof v === 'string' && v) {
+        primary = v;
+        primaryLabel = k;
+        break;
+      }
+    }
+    for (const [k, v] of Object.entries(input)) {
+      if (k !== primaryLabel) {
+        secondaries.push([k, typeof v === 'string' ? v : JSON.stringify(v)]);
+      }
+    }
+  }
+
+  if (primary == null) {
+    return '<div class="trace-text"><strong>' + escapeHtml(name) + '</strong>\n' +
+           escapeHtml(JSON.stringify(input, null, 2)) + '</div>';
+  }
+
+  const header = '<div class="trace-tool-header">' +
+                 '<code>' + escapeHtml(name) + '</code>' +
+                 (primaryLabel ? ' <span class="muted">' + escapeHtml(primaryLabel) + ':</span>' : '') +
+                 '</div>';
+  const primaryBlock = '<div class="trace-text">' + escapeHtml(String(primary)) + '</div>';
+  const secondaryHtml = secondaries.length
+    ? '<div class="trace-tool-secondary">' +
+      secondaries.map(([k, v]) =>
+        (k ? '<span class="muted">' + escapeHtml(k) + ':</span> ' : '') +
+        escapeHtml(String(v))
+      ).join(' · ') +
+      '</div>'
+    : '';
+  return header + primaryBlock + secondaryHtml;
+}
+
+function _truncate(s, cap) {
+  s = String(s || '');
+  return s.length > cap ? s.substring(0, cap - 1) + '…' : s;
+}
+
+function _renderTraceSystem(detail) {
+  const data = detail.data || {};
+  const keys = Object.keys(data);
+  if (!keys.length) {
+    return '<div class="trace-text muted">(no data)</div>';
+  }
+  const rows = keys.map(k => {
+    let v = data[k];
+    if (Array.isArray(v)) {
+      v = v.length === 0 ? '(none)' :
+          v.length <= 8 ? v.join(', ') : v.slice(0, 8).join(', ') + ` …+${v.length - 8}`;
+    } else if (v && typeof v === 'object') {
+      v = JSON.stringify(v);
+    }
+    return '<span class="k">' + escapeHtml(k) + '</span>' +
+           '<span class="v">' + escapeHtml(String(v == null ? '' : v)) + '</span>';
+  }).join('');
+  return '<div class="detail-grid trace-system-grid">' + rows + '</div>';
+}
+
+window.openRunModal = openRunModal;
+
+/* ------------------------------------------------------------------ */
 /* Helpers for graph pages.                                              */
 
 window.openInteractionNodeModal = function (node) {
+  // Wake/turn nodes get the same trace modal as the timeline rows.
+  if (node.kind === 'wake' && node.id) {
+    return openRunModal(node.id.replace('wake::', ''));
+  }
+
   const fam = node.kind;
   const titleHtml = `<span class="kind-chip fam-${escapeHtml(fam)}">${escapeHtml(fam)}</span> ${escapeHtml(node.label || '')}`;
   const meta = node.meta || {};
 
-  // For wake/turn nodes, the real data lives on dedicated pages — give a CTA.
+  // For turn nodes, the real data lives on a dedicated page — give a CTA.
   let cta = '';
-  if (node.kind === 'wake' && node.id) {
-    cta = `<p><a href="/wakes/${encodeURIComponent(node.id.replace('wake::', ''))}">open full wake trace →</a></p>`;
-  } else if (node.kind === 'turn' && node.id) {
+  if (node.kind === 'turn' && node.id) {
     cta = `<p><a href="/turns/${encodeURIComponent(node.id.replace('turn::', ''))}">open full turn trace →</a></p>`;
   }
 
