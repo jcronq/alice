@@ -132,7 +132,8 @@ def _build_prompt(events: list) -> str:
 
     parts = [
         "Summarize this thinking wake in ONE sentence (max ~140 chars).",
-        "Write in plain past tense — what Alice actually did, not what she planned.",
+        "Write in FIRST PERSON past tense — 'I groomed X' not 'Alice groomed X'.",
+        "You ARE Alice; the wake is yours; speak as yourself.",
         "No quotes, no preamble like 'In this wake', just the sentence.",
         "",
     ]
