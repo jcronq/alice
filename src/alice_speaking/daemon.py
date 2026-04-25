@@ -158,6 +158,12 @@ class SpeakingDaemon:
         # call to _run_turn(); flipped to True by _send_message when Alice
         # explicitly sends. Used to flag missed_reply events.
         self._turn_did_send: bool = False
+        # Current turn kind — set by _handle_signal/_handle_surface/
+        # _handle_emergency at entry, reset in finally. _send_message
+        # uses this to decide whether to honor quiet hours: signal +
+        # emergency turns bypass (Owner gets a reply when he asks);
+        # surface turns honor (Alice-initiated thoughts wait for morning).
+        self._current_turn_kind: Optional[str] = None
         # When set, the very next turn will prepend this text as a
         # bootstrap preamble (Layer 2 restart OR post-compaction summary
         # injection).
@@ -423,9 +429,13 @@ class SpeakingDaemon:
                 sender.name,
             )
 
-        if not quiet:
-            await self.signal.start_typing(source)
+        # Replies to inbound bypass quiet hours — Owner expects an answer
+        # when he asks something, regardless of the clock. Typing indicator
+        # fires too so he sees Alice working.
+        await self.signal.start_typing(source)
         error: Optional[str] = None
+        prev_kind = self._current_turn_kind
+        self._current_turn_kind = "signal"
         try:
             now = datetime.datetime.now().astimezone()
             stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
@@ -437,17 +447,15 @@ class SpeakingDaemon:
             log.exception("turn failed for %s", sender.name)
             error = f"{type(exc).__name__}: {exc}"
             with contextlib.suppress(Exception):
-                # Errors still go through send_or_queue directly because
-                # the failing turn couldn't complete a send_message call.
-                await self._send_or_queue(
+                # Direct send: signal turn errors bypass the quiet queue
+                # too — same rule applies to error notices as to replies.
+                await self.signal.send(
                     source,
                     f"Hit an error ({type(exc).__name__}). Session preserved — reply to retry.",
-                    sender.name,
-                    turn_id=turn_id,
                 )
         finally:
-            if not quiet:
-                await self.signal.stop_typing(source)
+            self._current_turn_kind = prev_kind
+            await self.signal.stop_typing(source)
             # One turn_log entry per envelope so the inbound audit trail
             # is preserved regardless of batch size.
             for ev in batch:
@@ -632,14 +640,18 @@ class SpeakingDaemon:
             "resolve_surface."
         )
         error: Optional[str] = None
+        prev_kind = self._current_turn_kind
+        self._current_turn_kind = "surface"
         try:
             # Surface turns don't have a single inbound recipient; the
-            # ``outbound_recipient`` is informational only.
+            # ``outbound_recipient`` is informational only. Quiet hours
+            # apply here — Alice's own thoughts wait for morning.
             await self._run_turn(prompt, turn_id=turn_id, outbound_recipient=None)
         except Exception as exc:  # noqa: BLE001
             log.exception("surface turn failed for %s", path.name)
             error = f"{type(exc).__name__}: {exc}"
         finally:
+            self._current_turn_kind = prev_kind
             if path.is_file():
                 try:
                     self._archive_unresolved(path)
@@ -720,9 +732,12 @@ class SpeakingDaemon:
         )
 
         # For this turn only, flip the emergency bypass so _send_message
-        # sends directly even during quiet hours.
+        # sends directly even during quiet hours, and label the turn
+        # kind so other guards know we're in emergency.
         was_emergency = getattr(self, "_emergency_bypass", False)
+        prev_kind = self._current_turn_kind
         self._emergency_bypass = True
+        self._current_turn_kind = "emergency"
         verdict = "unknown"
         action = "none"
         try:
@@ -758,6 +773,7 @@ class SpeakingDaemon:
             )
         finally:
             self._emergency_bypass = was_emergency
+            self._current_turn_kind = prev_kind
             if path.is_file():
                 self._archive_emergency(path, verdict=verdict, action=action)
             self._dispatched_emergencies.discard(path.name)
@@ -799,21 +815,34 @@ class SpeakingDaemon:
 
         This is the closure passed to the send_message MCP tool. The tool
         handles name-to-number resolution; by the time we land here the
-        recipient is already an E.164 number. During emergency turns the
-        daemon flips ``_emergency_bypass`` True so quiet-hours queuing is
-        skipped — everything else flows through ``_send_or_queue``.
+        recipient is already an E.164 number.
+
+        Quiet-hours policy: replies to inbound (signal turns) and
+        emergencies bypass the quiet queue — Owner expects an answer
+        when he asks something, regardless of the clock. Only
+        Alice-initiated thoughts (surface turns) honor quiet hours by
+        going through ``_send_or_queue``.
         """
-        if getattr(self, "_emergency_bypass", False):
+        emergency = getattr(self, "_emergency_bypass", False)
+        bypass_quiet = emergency or self._current_turn_kind == "signal"
+        if bypass_quiet:
             await self.signal.send(recipient, text)
-            log.info("emergency send to %s (%d chars)", recipient, len(text))
+            log.info(
+                "%s send to %s (%d chars)",
+                "emergency" if emergency else "reply",
+                recipient,
+                len(text),
+            )
             self.events.emit(
                 "signal_send",
                 recipient=recipient,
                 sender_name=self._sender_name_for(recipient),
                 text_len=len(text),
-                emergency=True,
+                emergency=emergency,
+                bypassed_quiet=is_quiet_hours(self.cfg.speaking),
             )
         else:
+            # Surface-triggered (Alice's own thought) — honors quiet hours.
             await self._send_or_queue(
                 recipient,
                 text,

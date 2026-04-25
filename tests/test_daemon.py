@@ -208,8 +208,14 @@ def test_send_message_suppresses_missed_reply(cfg, monkeypatch) -> None:
     # We can't easily assert the flag after _run_turn because _run_turn
     # resets it at the top of each call. Instead, verify that invoking
     # _send_message directly flips the flag AND writes to signal.
+    #
+    # NB: ``_current_turn_kind = 'signal'`` is set so the send bypasses
+    # quiet hours — that's the policy for replies to inbound. Without
+    # this the test would be flaky (only pass when wall-clock is outside
+    # 22-07 ET).
     async def go2():
         d._turn_did_send = False
+        d._current_turn_kind = "signal"
         await d._send_message("+15555550100", "hi")
         return d._turn_did_send, d.signal.sent
 
