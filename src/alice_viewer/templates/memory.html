@@ -60,8 +60,12 @@
         const activeEdges = edges.filter(e => activeIds.has(e.source.id || e.source) && activeIds.has(e.target.id || e.target));
 
         const sim = d3.forceSimulation(activeNodes)
-          .force('link', d3.forceLink(activeEdges).id(d => d.id).distance(60).strength(0.3))
-          .force('charge', d3.forceManyBody().strength(-180))
+          // Loosened so dense clusters spread out and read well at zoom 1.
+          // distance: how far links want to be (was 60). strength: how
+          // hard they pull (was 0.3). charge: pairwise repulsion (was
+          // -180, more negative = stronger push).
+          .force('link', d3.forceLink(activeEdges).id(d => d.id).distance(140).strength(0.08))
+          .force('charge', d3.forceManyBody().strength(-650))
           .force('center', d3.forceCenter(width / 2, height / 2))
           .force('collide', d3.forceCollide(14));
 
