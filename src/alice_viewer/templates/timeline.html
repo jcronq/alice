@@ -106,14 +106,18 @@
          .trace-row.compact = single-line rows (result, lifecycle, etc.)
                               ts + kind + summary in three columns.
          .trace-row.rich    = content rows (thinking, reply, tool call).
-                              header line above + full-width body below. */
+                              header line above + full-width body below.
+       Explicit display:block on the base .trace-row beats the legacy
+       global grid rule used by the per-wake / per-turn detail pages. */
     .modal-body .trace-row {
+      display: block !important;
       padding: 8px 12px; background: var(--panel-2); border-radius: 0 4px 4px 0;
       border-left: 3px solid var(--border);
       font-size: 12px;
     }
     .modal-body .trace-row.compact {
-      display: grid; grid-template-columns: 80px 130px 1fr; gap: 12px; align-items: baseline;
+      display: grid !important;
+      grid-template-columns: 80px 130px 1fr; gap: 12px; align-items: baseline;
     }
     .modal-body .trace-row.rich .trace-head {
       display: flex; gap: 12px; align-items: baseline;
