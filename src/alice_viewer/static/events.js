@@ -530,3 +530,88 @@ window.openMemoryNodeModal = async function (node) {
       '<div class="callout err">failed to load note: ' + escapeHtml(e.message) + '</div>';
   }
 };
+
+// Hover-focus for d3 force graphs: keep hovered node colored, desaturate
+// 1-hop neighbors slightly, 2-hop more, fade everything else. Treats edges
+// as undirected for BFS — the goal is investigating structure, not flow
+// direction. Uses a `.focus` event namespace so existing tooltip/click
+// handlers on the same selection still fire.
+window.attachGraphFocus = function ({ nodeSel, linkSel, edges, idAccessor }) {
+  const id = idAccessor || (n => n.id);
+  const endId = (e, side) => {
+    const v = e[side];
+    return (v && typeof v === 'object') ? id(v) : v;
+  };
+
+  const adj = new Map();
+  const ensure = k => {
+    let s = adj.get(k);
+    if (!s) { s = new Set(); adj.set(k, s); }
+    return s;
+  };
+  edges.forEach(e => {
+    const s = endId(e, 'source');
+    const t = endId(e, 'target');
+    ensure(s).add(t);
+    ensure(t).add(s);
+  });
+
+  const bfs = (startId) => {
+    const dist = new Map([[startId, 0]]);
+    const queue = [startId];
+    while (queue.length) {
+      const cur = queue.shift();
+      const d = dist.get(cur);
+      const neighbors = adj.get(cur);
+      if (!neighbors) continue;
+      neighbors.forEach(n => {
+        if (!dist.has(n)) {
+          dist.set(n, d + 1);
+          queue.push(n);
+        }
+      });
+    }
+    return dist;
+  };
+
+  // distance 0: hovered. 1: direct neighbor. 2: neighbor's neighbor.
+  // >=3 or unreachable: fully faded.
+  const styleFor = (d) => {
+    if (d === 0)   return { gray: 0,    opacity: 1.0  };
+    if (d === 1)   return { gray: 0.55, opacity: 0.85 };
+    if (d === 2)   return { gray: 0.85, opacity: 0.5  };
+    return            { gray: 1.0,  opacity: 0.15 };
+  };
+
+  const apply = (startId) => {
+    const dist = bfs(startId);
+    nodeSel
+      .style('filter', n => {
+        const d = dist.has(id(n)) ? dist.get(id(n)) : Infinity;
+        return `grayscale(${styleFor(d).gray})`;
+      })
+      .style('opacity', n => {
+        const d = dist.has(id(n)) ? dist.get(id(n)) : Infinity;
+        return styleFor(d).opacity;
+      });
+    if (linkSel) {
+      linkSel.style('stroke-opacity', e => {
+        const ds = dist.has(endId(e, 'source')) ? dist.get(endId(e, 'source')) : Infinity;
+        const dt = dist.has(endId(e, 'target')) ? dist.get(endId(e, 'target')) : Infinity;
+        const m = Math.min(ds, dt);
+        if (m === 0) return 0.95;
+        if (m === 1) return 0.45;
+        return 0.04;
+      });
+    }
+  };
+
+  const clear = () => {
+    nodeSel.style('filter', null).style('opacity', null);
+    if (linkSel) linkSel.style('stroke-opacity', null);
+  };
+
+  nodeSel
+    .on('mouseenter.focus', (e, d) => apply(id(d)))
+    .on('mouseleave.focus', clear);
+};
