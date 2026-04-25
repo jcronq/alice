@@ -28,7 +28,7 @@
           <span class="kind">{{ ev.kind }}</span>
           <span class="body">
             <div>{{ ev.summary }}</div>
-            {% if ev.kind in ('tool_use', 'result', 'user_message', 'exception') or ev.detail.text %}
+            {% if ev.kind in ('tool_use', 'result', 'user_message', 'exception', 'system') or ev.detail.text %}
               <pre>{{ ev.detail | pretty_json }}</pre>
             {% endif %}
           </span>

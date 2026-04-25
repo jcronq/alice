@@ -38,7 +38,7 @@
           <span class="kind">{{ ev.kind }}</span>
           <span class="body">
             <div>{{ ev.summary }}</div>
-            {% if ev.kind in ('tool_use', 'result', 'exception') %}
+            {% if ev.kind in ('tool_use', 'result', 'exception', 'system') %}
               <pre>{{ ev.detail | pretty_json }}</pre>
             {% endif %}
           </span>
