@@ -121,6 +121,16 @@
       font-size: 11px; line-height: 1.5;
     }
     .modal-body .trace-row .trace-text.muted { color: var(--muted); font-style: italic; }
+    .modal-body .trace-tool-header {
+      font-size: 10px; margin-bottom: 4px;
+    }
+    .modal-body .trace-tool-header code {
+      background: transparent; padding: 0; color: #ffb38f; font-weight: 500;
+    }
+    .modal-body .trace-tool-secondary {
+      font-size: 10px; color: var(--muted); margin-top: 4px;
+      white-space: pre-wrap; word-break: break-word;
+    }
     .modal-body .trace-empty { color: var(--muted); padding: 30px; text-align: center; }
     /* When the body is a multi-line block, allow the row to grow past
        the default ellipsis truncation. */
@@ -220,20 +230,17 @@
         const ts = fmtTs(ev.ts).replace(/^.* /, ''); // just the time
         const detail = ev.detail || {};
 
-        // For text-bearing kinds (thinking + assistant_text), render the
-        // FULL detail.text as a body block, not the truncated summary.
-        // The summary is fine for tool_use / result / lifecycle rows.
         let bodyHtml;
         if (ev.kind === 'thinking' || ev.kind === 'assistant_text') {
+          // Full reasoning / reply text as a multi-line block.
           const text = (detail.text || '').trim();
-          if (text) {
-            bodyHtml = '<div class="trace-text">' + escapeHtml(text) + '</div>';
-          } else {
-            bodyHtml = '<div class="trace-text muted">(empty)</div>';
-          }
+          bodyHtml = text
+            ? '<div class="trace-text">' + escapeHtml(text) + '</div>'
+            : '<div class="trace-text muted">(empty)</div>';
         } else if (ev.kind === 'tool_use') {
-          // Tool use already gets a tight one-line summary like "Bash ls -la".
-          bodyHtml = '<span class="summary">' + escapeHtml(ev.summary || '') + '</span>';
+          // Show the tool's primary args inline so 'send_message jason' is
+          // actually informative — message text, command, file path, etc.
+          bodyHtml = renderTraceToolUse(detail);
         } else {
           bodyHtml = '<span class="summary">' + escapeHtml(ev.summary || '') + '</span>';
         }
@@ -243,6 +250,129 @@
                '<span class="kind">' + escapeHtml(label) + '</span>' +
                bodyHtml +
                '</div>';
+      }
+
+      // Render a tool_use event's args as a compact body block.
+      // For known tools, surfaces the primary argument prominently with
+      // any secondary args as muted captions. Unknown tools fall back
+      // to a JSON dump.
+      function renderTraceToolUse(detail) {
+        const name = detail.name || '?';
+        let input = detail.input;
+        if (typeof input === 'string') {
+          try { input = JSON.parse(input); }
+          catch (e) {
+            return '<div class="trace-text"><strong>' + escapeHtml(name) + '</strong>\n' +
+                   escapeHtml(String(input)) + '</div>';
+          }
+        }
+        if (!input || typeof input !== 'object') {
+          return '<div class="trace-text"><strong>' + escapeHtml(name) + '</strong></div>';
+        }
+
+        // Per-tool primary/secondary arg picking — mirrors what
+        // events.js does for the standalone event modal but compact
+        // enough to live in a trace row.
+        let primary = null;
+        let primaryLabel = null;
+        const secondaries = [];
+
+        if (name === 'Bash') {
+          primary = input.command;
+          primaryLabel = 'command';
+          if (input.description) secondaries.push(['', input.description]);
+          if (input.timeout) secondaries.push(['timeout', input.timeout + 'ms']);
+        } else if (['Read', 'Write', 'Edit', 'NotebookEdit'].includes(name)) {
+          primary = input.file_path || input.notebook_path;
+          primaryLabel = 'file';
+          if (input.offset != null) secondaries.push(['offset', input.offset]);
+          if (input.limit != null) secondaries.push(['limit', input.limit]);
+          if (name === 'Edit') {
+            if (input.old_string) secondaries.push(['old', truncate(input.old_string, 200)]);
+            if (input.new_string) secondaries.push(['new', truncate(input.new_string, 200)]);
+          }
+          if (name === 'Write' && input.content) {
+            secondaries.push(['content', truncate(input.content, 400)]);
+          }
+        } else if (name === 'Grep') {
+          primary = input.pattern;
+          primaryLabel = 'pattern';
+          if (input.path) secondaries.push(['path', input.path]);
+          if (input.glob) secondaries.push(['glob', input.glob]);
+          if (input.output_mode) secondaries.push(['mode', input.output_mode]);
+        } else if (name === 'Glob') {
+          primary = input.pattern;
+          primaryLabel = 'pattern';
+          if (input.path) secondaries.push(['path', input.path]);
+        } else if (name === 'WebFetch') {
+          primary = input.url;
+          primaryLabel = 'url';
+          if (input.prompt) secondaries.push(['prompt', truncate(input.prompt, 300)]);
+        } else if (name === 'WebSearch') {
+          primary = input.query;
+          primaryLabel = 'query';
+        } else if (name.endsWith('__send_message') || name === 'send_message') {
+          primary = input.message;
+          primaryLabel = 'message';
+          if (input.recipient) secondaries.push(['→', input.recipient]);
+        } else if (name.endsWith('__append_note') || name === 'append_note') {
+          primary = input.content || input.body || input.text;
+          primaryLabel = 'note';
+          if (input.tag) secondaries.push(['tag', input.tag]);
+          if (input.title) secondaries.push(['title', input.title]);
+        } else if (name.endsWith('__resolve_surface') || name === 'resolve_surface') {
+          primary = input.action_taken;
+          primaryLabel = 'action';
+          if (input.id) secondaries.push(['surface', input.id]);
+          if (input.verdict) secondaries.push(['verdict', input.verdict]);
+        } else if (name.endsWith('__write_memory') || name === 'write_memory') {
+          primary = input.content;
+          primaryLabel = 'memory';
+          if (input.path) secondaries.push(['path', input.path]);
+        } else if (name.endsWith('__read_memory') || name === 'read_memory') {
+          primary = input.pattern;
+          primaryLabel = 'pattern';
+        } else if (name.startsWith('mcp__')) {
+          // Generic MCP fallback — find the first string value.
+          for (const [k, v] of Object.entries(input)) {
+            if (typeof v === 'string' && v) {
+              primary = v;
+              primaryLabel = k;
+              break;
+            }
+          }
+          for (const [k, v] of Object.entries(input)) {
+            if (k !== primaryLabel) {
+              secondaries.push([k, typeof v === 'string' ? v : JSON.stringify(v)]);
+            }
+          }
+        }
+
+        if (primary == null) {
+          // No known primary — dump the JSON.
+          return '<div class="trace-text"><strong>' + escapeHtml(name) + '</strong>\n' +
+                 escapeHtml(JSON.stringify(input, null, 2)) + '</div>';
+        }
+
+        const header = '<div class="trace-tool-header">' +
+                       '<code>' + escapeHtml(name) + '</code>' +
+                       (primaryLabel ? ' <span class="muted">' + escapeHtml(primaryLabel) + ':</span>' : '') +
+                       '</div>';
+        const primaryBlock = '<div class="trace-text">' + escapeHtml(String(primary)) + '</div>';
+        const secondaryHtml = secondaries.length
+          ? '<div class="trace-tool-secondary">' +
+            secondaries.map(([k, v]) =>
+              (k ? '<span class="muted">' + escapeHtml(k) + ':</span> ' : '') +
+              escapeHtml(String(v))
+            ).join(' · ') +
+            '</div>'
+          : '';
+        return header + primaryBlock + secondaryHtml;
+      }
+
+      function truncate(s, cap) {
+        s = String(s || '');
+        return s.length > cap ? s.substring(0, cap - 1) + '…' : s;
       }
 
       function fmtTs(ts) {
