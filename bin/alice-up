@@ -18,8 +18,8 @@ for name in alice-worker-blue alice-worker-green; do
     fi
 done
 
-# Bring up the daemon.
-docker compose up -d alice-daemon >/dev/null
+# Bring up the daemon + observability viewer (always-on, host-side UI).
+docker compose up -d alice-daemon alice-viewer >/dev/null
 
 # Pick a worker slot to bring up. Prefer blue on cold start; if blue has a
 # previously-built image that isn't latest, still fine — it holds the image

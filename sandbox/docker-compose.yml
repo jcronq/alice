@@ -94,6 +94,33 @@ services:
     hostname: alice-worker-green
     profiles: ["green"]
 
+  alice-viewer:
+    build:
+      context: ..
+      dockerfile: sandbox/viewer/Dockerfile
+      args:
+        USER_ID: ${USER_ID:-1000}
+        GROUP_ID: ${GROUP_ID:-1000}
+    image: alice-viewer:latest
+    container_name: alice-viewer
+    hostname: alice-viewer
+    restart: unless-stopped
+    networks:
+      - alice-net
+    ports:
+      - "7777:7777"
+    environment:
+      ALICE_VIEWER_HOST: "0.0.0.0"
+      ALICE_VIEWER_PORT: "7777"
+      ALICE_STATE: "/state/worker"
+      ALICE_MIND: "/home/alice/alice-mind"
+      ALICE_VIEWER_CACHE_DIR: "/state/viewer-cache"
+      TZ: "${ALICE_TZ:-America/New_York}"
+    volumes:
+      - ${HOME}/alice:/home/alice/alice:ro
+      - ${HOME}/alice-mind:/home/alice/alice-mind:ro
+      - ${HOME}/.local/state/alice:/state:rw
+
 networks:
   alice-net:
     name: alice-net
