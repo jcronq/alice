@@ -1,0 +1,7 @@
+{# Body of a `thinking` or `assistant_text` event: full prose, not JSON. #}
+{% set text = (ev.detail.text or '') | trim %}
+{% if text %}
+  <div class="trace-text">{{ text }}</div>
+{% else %}
+  <div class="trace-text muted">(empty)</div>
+{% endif %}

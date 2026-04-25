@@ -214,6 +214,15 @@ pre.small { max-height: 260px; overflow-y: auto; }
 .trace-row .ts { color: var(--muted); font-size: 11px; }
 .trace-row .kind { color: var(--muted); font-size: 11px; }
 .trace-row .body pre { margin: 4px 0 0; background: var(--panel-2); padding: 6px; font-size: 11px; }
+.trace-row .body .trace-text {
+  margin: 6px 0 0;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.trace-row .body .trace-text.muted { color: var(--muted); font-style: italic; font-size: 11px; }
 
 /* System events — formatted by subtype rather than raw JSON.
    `init`: pill row of model/session/tools/cwd.

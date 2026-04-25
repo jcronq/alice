@@ -32,7 +32,9 @@
               {% include "_system_event.html" %}
             {% elif ev.kind == 'user_message' %}
               {% include "_user_message.html" %}
-            {% elif ev.kind in ('tool_use', 'result', 'exception') or ev.detail.text %}
+            {% elif ev.kind in ('thinking', 'assistant_text') %}
+              {% include "_text_event.html" %}
+            {% elif ev.kind in ('tool_use', 'result', 'exception') %}
               <pre>{{ ev.detail | pretty_json }}</pre>
             {% endif %}
           </span>
