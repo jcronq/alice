@@ -74,6 +74,19 @@ QUIET_CHECK_SECONDS = 30.0
 SUMMARY_TAIL_TURNS = 5
 
 
+def _format_envelope_time(timestamp_ms: int) -> str:
+    """Render an envelope's millisecond Unix timestamp as a local time string.
+
+    Used by the multi-message prompt format so Alice can see when each
+    queued message arrived relative to the others.
+    """
+    try:
+        dt = datetime.datetime.fromtimestamp(int(timestamp_ms) / 1000).astimezone()
+    except (OSError, ValueError, OverflowError):
+        return str(timestamp_ms)
+    return dt.strftime("%-I:%M:%S %p %Z")
+
+
 @dataclass
 class SignalEvent:
     envelope: SignalEnvelope
@@ -280,7 +293,12 @@ class SpeakingDaemon:
                     await self._run_compaction()
 
                 if isinstance(event, SignalEvent):
-                    await self._handle_signal(event)
+                    # Coalesce any other queued signals from the same
+                    # sender so Alice handles a burst in one turn instead
+                    # of N back-to-back ones — same UX as Claude Code's
+                    # input queue while a turn is mid-flight.
+                    batch = self._drain_signal_batch(event)
+                    await self._handle_signal(batch)
                 elif isinstance(event, SurfaceEvent):
                     await self._handle_surface(event)
                 elif isinstance(event, EmergencyEvent):
@@ -289,6 +307,35 @@ class SpeakingDaemon:
                 log.exception("consumer error handling %s", type(event).__name__)
             finally:
                 self._queue.task_done()
+
+    def _drain_signal_batch(self, head: SignalEvent) -> list["SignalEvent"]:
+        """Pull all currently-queued SignalEvents from head's source into a
+        batch. Non-matching events (from a different sender, or surfaces /
+        emergencies) get put back on the queue in their original order — so
+        the next consumer iteration sees them unchanged.
+
+        Best-effort coalescing: anything that arrives during the turn this
+        batch produces will hit the next consumer iteration. Like Claude
+        Code, queued input applies to the NEXT turn, not the current one.
+        """
+        batch: list[SignalEvent] = [head]
+        held: list = []
+        while True:
+            try:
+                ev = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._queue.task_done()
+            if (
+                isinstance(ev, SignalEvent)
+                and ev.envelope.source == head.envelope.source
+            ):
+                batch.append(ev)
+            else:
+                held.append(ev)
+        for ev in held:
+            self._queue.put_nowait(ev)
+        return batch
 
     def _maybe_reload_config(self) -> None:
         """Reload alice.config.json if it has changed on disk.
@@ -327,20 +374,37 @@ class SpeakingDaemon:
     # ------------------------------------------------------------------
     # Signal turn — no auto-capture; Alice replies via send_message.
 
-    async def _handle_signal(self, event: SignalEvent) -> None:
-        env = event.envelope
-        sender = event.sender
+    async def _handle_signal(self, batch: list[SignalEvent]) -> None:
+        """Process a batch of one or more SignalEvents from the same sender.
+
+        All events in the batch share the same source + sender (caller
+        guarantees, via :meth:`_drain_signal_batch`). One kernel turn
+        handles the whole batch; the prompt enumerates each message in
+        arrival order, with timestamps + attachments.
+        """
+        if not batch:
+            return
+        head = batch[0]
+        sender = head.sender
+        source = head.envelope.source
         quiet = is_quiet_hours(self.cfg.speaking)
         turn_id = uuid.uuid4().hex[:12]
         started = time.time()
+
+        all_attachments = [a for ev in batch for a in ev.envelope.attachments]
+        total_chars = sum(len(ev.envelope.body) for ev in batch)
+        inbound_preview = " ┃ ".join(
+            _short(ev.envelope.body, 200) for ev in batch if ev.envelope.body
+        ) or f"({len(all_attachments)} attachment(s), no text)"
 
         self.events.emit(
             "signal_turn_start",
             turn_id=turn_id,
             sender_name=sender.name,
-            sender_number=env.source,
-            inbound_chars=len(env.body),
-            inbound=_short(env.body),
+            sender_number=source,
+            message_count=len(batch),
+            inbound_chars=total_chars,
+            inbound=_short(inbound_preview, 600),
             attachments=[
                 {
                     "id": a.id,
@@ -348,19 +412,27 @@ class SpeakingDaemon:
                     "content_type": a.content_type,
                     "filename": a.filename,
                 }
-                for a in env.attachments
+                for a in all_attachments
             ],
             quiet=quiet,
         )
+        if len(batch) > 1:
+            log.info(
+                "batched %d signal messages from %s into one turn",
+                len(batch),
+                sender.name,
+            )
 
         if not quiet:
-            await self.signal.start_typing(env.source)
+            await self.signal.start_typing(source)
         error: Optional[str] = None
         try:
             now = datetime.datetime.now().astimezone()
             stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
-            prompt = self._build_signal_prompt(sender_name=sender.name, stamp=stamp, env=env)
-            await self._run_turn(prompt, turn_id=turn_id, outbound_recipient=env.source)
+            prompt = self._build_signal_prompt(
+                sender_name=sender.name, stamp=stamp, batch=batch
+            )
+            await self._run_turn(prompt, turn_id=turn_id, outbound_recipient=source)
         except Exception as exc:  # noqa: BLE001
             log.exception("turn failed for %s", sender.name)
             error = f"{type(exc).__name__}: {exc}"
@@ -368,32 +440,31 @@ class SpeakingDaemon:
                 # Errors still go through send_or_queue directly because
                 # the failing turn couldn't complete a send_message call.
                 await self._send_or_queue(
-                    env.source,
+                    source,
                     f"Hit an error ({type(exc).__name__}). Session preserved — reply to retry.",
                     sender.name,
                     turn_id=turn_id,
                 )
         finally:
             if not quiet:
-                await self.signal.stop_typing(env.source)
-            self.turns.append(
-                new_turn(
-                    sender_number=env.source,
-                    sender_name=sender.name,
-                    inbound=env.body,
-                    # outbound is no longer captured at this layer — Alice
-                    # invokes send_message herself. We leave outbound=None
-                    # here; the turn_log becomes a record of inbound +
-                    # error only. (Rich outbound observability lives in
-                    # the event log via signal_send events.)
-                    outbound=None,
-                    error=error,
+                await self.signal.stop_typing(source)
+            # One turn_log entry per envelope so the inbound audit trail
+            # is preserved regardless of batch size.
+            for ev in batch:
+                self.turns.append(
+                    new_turn(
+                        sender_number=ev.envelope.source,
+                        sender_name=sender.name,
+                        inbound=ev.envelope.body,
+                        outbound=None,
+                        error=error,
+                    )
                 )
-            )
             self.events.emit(
                 "signal_turn_end",
                 turn_id=turn_id,
                 sender_name=sender.name,
+                message_count=len(batch),
                 error=error,
                 duration_ms=int((time.time() - started) * 1000),
             )
@@ -403,34 +474,59 @@ class SpeakingDaemon:
         *,
         sender_name: str,
         stamp: str,
-        env: SignalEnvelope,
+        batch: list[SignalEvent],
     ) -> str:
-        """Compose the per-turn prompt for a signal envelope.
+        """Compose the per-turn prompt for one or more signal envelopes.
 
-        Body comes first; any inbound attachments are listed after with
-        the absolute path Alice's Read tool can open. Attachments are
-        listed even when the body is empty (image-only messages from
-        Owner/Friend are common).
+        Single-envelope batches use the simple original layout. Multi-
+        envelope batches enumerate each message in arrival order with a
+        per-message timestamp; attachments are listed inline under the
+        message they came in with. Either way, the closing instruction
+        block tells Alice how to reply via send_message.
         """
-        body = env.body or "(no text — see attachments below)"
-        lines: list[str] = [
-            f"[Signal from {sender_name} | {stamp}]",
-            "",
-            body,
-        ]
-        if env.attachments:
-            lines.append("")
-            lines.append(
-                f"--- {len(env.attachments)} attachment"
-                f"{'s' if len(env.attachments) != 1 else ''} ---"
-            )
-            for att in env.attachments:
-                fn = f' "{att.filename}"' if att.filename else ""
+        lines: list[str] = []
+        if len(batch) == 1:
+            env = batch[0].envelope
+            body = env.body or "(no text — see attachments below)"
+            lines.extend([
+                f"[Signal from {sender_name} | {stamp}]",
+                "",
+                body,
+            ])
+            if env.attachments:
+                lines.append("")
                 lines.append(
-                    f"- {att.path} ({att.content_type}{fn}) — "
-                    f"use the Read tool to view."
+                    f"--- {len(env.attachments)} attachment"
+                    f"{'s' if len(env.attachments) != 1 else ''} ---"
                 )
-        lines.append("")
+                for att in env.attachments:
+                    fn = f' "{att.filename}"' if att.filename else ""
+                    lines.append(
+                        f"- {att.path} ({att.content_type}{fn}) — "
+                        f"use the Read tool to view."
+                    )
+        else:
+            lines.extend([
+                f"[Signal from {sender_name} | {stamp}]",
+                f"{len(batch)} messages came in while you were busy — "
+                "handle them together as one reply (or several, your call). "
+                "Each is shown in arrival order:",
+                "",
+            ])
+            for i, ev in enumerate(batch, start=1):
+                env = ev.envelope
+                ts_str = _format_envelope_time(env.timestamp)
+                body = env.body or "(no text — see attachments below)"
+                lines.append(f"--- message {i} of {len(batch)} (sent {ts_str}) ---")
+                lines.append(body)
+                if env.attachments:
+                    for att in env.attachments:
+                        fn = f' "{att.filename}"' if att.filename else ""
+                        lines.append(
+                            f"  attachment: {att.path} "
+                            f"({att.content_type}{fn}) — Read it."
+                        )
+                lines.append("")
         lines.append(
             "To reply, call the `send_message` tool "
             "(recipient='jason' or 'katie' or an E.164 number, "

@@ -124,10 +124,23 @@ def daemon(cfg, monkeypatch):
     return daemon_module.SpeakingDaemon(cfg)
 
 
+def _signal_event(env: SignalEnvelope, name: str = "Owner"):
+    """Wrap an envelope in a SignalEvent for the prompt builder."""
+    from alice_speaking.config import AllowedSender
+    from alice_speaking.daemon import SignalEvent
+
+    return SignalEvent(
+        envelope=env,
+        sender=AllowedSender(number=env.source, name=name),
+    )
+
+
 def test_prompt_with_no_attachments(daemon) -> None:
     env = SignalEnvelope(timestamp=1, source="+15555550100", body="hi alice")
     prompt = daemon._build_signal_prompt(
-        sender_name="Owner", stamp="Friday, April 25, 2026 at 9:00 AM EDT", env=env
+        sender_name="Owner",
+        stamp="Friday, April 25, 2026 at 9:00 AM EDT",
+        batch=[_signal_event(env)],
     )
     assert "[Signal from Owner | Friday" in prompt
     assert "hi alice" in prompt
@@ -147,7 +160,7 @@ def test_prompt_with_attachments_lists_paths(daemon, tmp_path) -> None:
         ],
     )
     prompt = daemon._build_signal_prompt(
-        sender_name="Owner", stamp="t", env=env
+        sender_name="Owner", stamp="t", batch=[_signal_event(env)]
     )
     assert "see attached" in prompt
     assert "--- 2 attachments ---" in prompt
@@ -168,7 +181,37 @@ def test_prompt_with_image_only_message(daemon, tmp_path) -> None:
         body="",
         attachments=[Attachment(id="selfie.jpg", path=p, content_type="image/jpeg")],
     )
-    prompt = daemon._build_signal_prompt(sender_name="Owner", stamp="t", env=env)
+    prompt = daemon._build_signal_prompt(
+        sender_name="Owner", stamp="t", batch=[_signal_event(env)]
+    )
     assert "(no text" in prompt
     assert str(p) in prompt
     assert "--- 1 attachment ---" in prompt
+
+
+def test_prompt_with_batched_messages(daemon) -> None:
+    envs = [
+        SignalEnvelope(
+            timestamp=1735131600000, source="+15555550100", body="hi alice"
+        ),
+        SignalEnvelope(
+            timestamp=1735131605000, source="+15555550100", body="quick question"
+        ),
+        SignalEnvelope(
+            timestamp=1735131610000, source="+15555550100", body="what's the time"
+        ),
+    ]
+    prompt = daemon._build_signal_prompt(
+        sender_name="Owner",
+        stamp="t",
+        batch=[_signal_event(e) for e in envs],
+    )
+    assert "3 messages came in while you were busy" in prompt
+    assert "--- message 1 of 3" in prompt
+    assert "--- message 2 of 3" in prompt
+    assert "--- message 3 of 3" in prompt
+    assert "hi alice" in prompt
+    assert "quick question" in prompt
+    assert "what's the time" in prompt
+    # Closing instruction still present
+    assert "send_message" in prompt
