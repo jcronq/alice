@@ -222,10 +222,15 @@ class AgentKernel:
                         detail = getattr(msg, "result", None) or "unknown"
                         raise RuntimeError(f"claude result error: {detail}")
                 elif isinstance(msg, SystemMessage):
+                    # Capture filtered data so the viewer can show what's
+                    # going on (init: session_id, model, tools list;
+                    # task_progress: task_id, description, usage). Drop
+                    # noise fields that aren't useful for the trace.
+                    raw_data = msg.data or {}
                     self._emit(
                         "system",
                         subtype=msg.subtype,
-                        data_keys=list((msg.data or {}).keys()),
+                        data=_filter_system_data(raw_data, cap=self._cap),
                     )
                     for h in handlers:
                         await h.on_system(msg)
@@ -298,6 +303,45 @@ class AgentKernel:
         if spec.thinking is not None:
             kwargs["thinking"] = spec.thinking
         return ClaudeAgentOptions(**kwargs)
+
+
+# Fields we don't surface in system events — random uuids, ambient
+# settings the trace doesn't need to repeat per turn, version strings,
+# etc. Everything else flows through (and gets _short-truncated).
+_SYSTEM_DATA_NOISE = {
+    "type",                 # redundant with event="system"
+    "uuid",                 # per-event random
+    "analytics_disabled",
+    "fast_mode_state",
+    "apiKeySource",
+    "output_style",
+    "permissionMode",       # we control this
+    "agents",               # long preset list
+    "plugins",              # long preset list
+    "memory_paths",         # private filesystem paths
+}
+
+
+def _filter_system_data(data: dict, *, cap: int) -> dict:
+    """Drop noise + truncate large values so system events stay readable."""
+    out: dict = {}
+    for key, value in data.items():
+        if key in _SYSTEM_DATA_NOISE:
+            continue
+        if isinstance(value, (list, dict)):
+            # Compact summary — full lists/dicts blow up log size.
+            if isinstance(value, list):
+                out[key] = (
+                    value[:20] if all(isinstance(v, (str, int, float, bool)) for v in value)
+                    else f"[{len(value)} items]"
+                )
+            else:
+                out[key] = list(value.keys())[:30]
+        elif isinstance(value, str):
+            out[key] = _short(value, cap)
+        else:
+            out[key] = value
+    return out
 
 
 __all__ = [

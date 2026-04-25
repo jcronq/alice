@@ -152,6 +152,14 @@
       font-size: 11px; color: var(--muted); margin-top: 6px;
       white-space: pre-wrap; word-break: break-word;
     }
+    .modal-body .trace-system-grid {
+      grid-template-columns: 160px 1fr; font-size: 11px;
+      gap: 4px 12px; margin: 0;
+    }
+    .modal-body .trace-system-grid .k { color: var(--muted); }
+    .modal-body .trace-system-grid .v {
+      color: var(--text); word-break: break-word; white-space: pre-wrap;
+    }
     .modal-body .trace-empty { color: var(--muted); padding: 30px; text-align: center; }
   </style>
 
@@ -248,13 +256,13 @@
         const ts = fmtTs(ev.ts).replace(/^.* /, ''); // just the time
         const detail = ev.detail || {};
 
-        // Content-rich rows (thinking / reply / tool call) get full width
-        // with a header line above. Everything else stays as a one-line
-        // compact grid row.
+        // Content-rich rows get full width with a header line above.
+        // Everything else stays as a one-line compact grid row.
         const isRich =
           ev.kind === 'thinking' ||
           ev.kind === 'assistant_text' ||
-          ev.kind === 'tool_use';
+          ev.kind === 'tool_use' ||
+          ev.kind === 'system';
 
         if (!isRich) {
           return '<div class="trace-row compact fam-' + fam + '">' +
@@ -270,13 +278,18 @@
           body = text
             ? '<div class="trace-text">' + escapeHtml(text) + '</div>'
             : '<div class="trace-text muted">(empty)</div>';
-        } else {
+        } else if (ev.kind === 'tool_use') {
           body = renderTraceToolUse(detail);
+        } else {
+          body = renderTraceSystem(detail);
         }
 
         const head = '<div class="trace-head">' +
                      '<span class="ts">' + escapeHtml(ts) + '</span>' +
                      '<span class="kind">' + escapeHtml(label) + '</span>' +
+                     (ev.kind === 'system' && detail.subtype
+                       ? ' <span class="muted">· ' + escapeHtml(detail.subtype) + '</span>'
+                       : '') +
                      '</div>';
         return '<div class="trace-row rich fam-' + fam + '">' + head + body + '</div>';
       }
@@ -402,6 +415,28 @@
       function truncate(s, cap) {
         s = String(s || '');
         return s.length > cap ? s.substring(0, cap - 1) + '…' : s;
+      }
+
+      // System events carry a filtered data dict — render the meaningful
+      // fields as a compact key-value list. Skip fields with no value.
+      function renderTraceSystem(detail) {
+        const data = detail.data || {};
+        const keys = Object.keys(data);
+        if (!keys.length) {
+          return '<div class="trace-text muted">(no data)</div>';
+        }
+        const rows = keys.map(k => {
+          let v = data[k];
+          if (Array.isArray(v)) {
+            v = v.length === 0 ? '(none)' :
+                v.length <= 8 ? v.join(', ') : v.slice(0, 8).join(', ') + ` …+${v.length - 8}`;
+          } else if (v && typeof v === 'object') {
+            v = JSON.stringify(v);
+          }
+          return '<span class="k">' + escapeHtml(k) + '</span>' +
+                 '<span class="v">' + escapeHtml(String(v == null ? '' : v)) + '</span>';
+        }).join('');
+        return '<div class="detail-grid trace-system-grid">' + rows + '</div>';
       }
 
       function fmtTs(ts) {

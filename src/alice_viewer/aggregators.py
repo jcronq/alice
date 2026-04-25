@@ -131,10 +131,18 @@ def group_runs(events: list[UnifiedEvent]) -> list[Run]:
     Each thinking Wake and each speaking Turn becomes one Run. Click-
     through goes to the existing detail pages (``/wakes/<id>``,
     ``/turns/<id>``) — the Run is just a row + summary in the timeline.
+
+    For ended thinking wakes, prefers the cached Haiku-generated single-
+    sentence summary; on cache miss, kicks off background generation
+    and returns a fallback this iteration.
     """
+    # Lazy import — keeps the aggregator pure (testable without the
+    # viewer's run_summary side effects).
+    from . import run_summary
+
     runs: list[Run] = []
     for w in group_wakes(events):
-        summary = _summarize_wake(w)
+        summary = _summarize_wake(w, run_summary)
         runs.append(
             Run(
                 run_id=w.wake_id,
@@ -184,21 +192,32 @@ def group_runs(events: list[UnifiedEvent]) -> list[Run]:
     return runs
 
 
-def _summarize_wake(w: Wake) -> str:
+def _summarize_wake(w: Wake, run_summary_module=None) -> str:
     """Compact one-line label for a thinking wake row.
 
-    Tries to read the assistant_text or wake-thought to give a sense of
-    what the wake actually did; falls back to tool counts when nothing
-    textual is available.
+    Running wakes get ``running…`` (no point summarizing a moving
+    target). Ended wakes prefer the Haiku-generated cached summary; on
+    cache miss, schedule one and return a fallback for this render.
     """
-    # Prefer the first non-empty assistant_text or thinking block — that
-    # usually carries the wake's stated intent.
+    if w.end_ts is None:
+        return "running…"
+
+    if run_summary_module is not None:
+        cached = run_summary_module.read(w.wake_id)
+        if cached:
+            return cached
+        # Fire-and-forget — fills cache for the next render.
+        try:
+            run_summary_module.schedule(w.wake_id, w.events)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Fallback: first non-empty assistant_text or thinking block.
     for ev in w.events:
         if ev.kind in ("assistant_text", "thinking"):
             text = (ev.detail.get("text") or "").strip()
             if text:
                 return text.replace("\n", " ")[:160]
-    # Otherwise: tools used.
     if w.tools:
         return f"used {', '.join(w.tools[:6])}"
     return "(no activity captured)"
