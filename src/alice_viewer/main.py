@@ -33,6 +33,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
     templates.env.filters["pretty_json"] = _pretty_json
     templates.env.filters["humanize_kind"] = kind_labels.humanize
     templates.env.filters["kind_family"] = kind_labels.family
+    templates.env.filters["tool_results"] = sources.parse_tool_results
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 

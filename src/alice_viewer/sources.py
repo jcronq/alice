@@ -150,6 +150,87 @@ def _trim(s: str, cap: int) -> str:
     return s if len(s) <= cap else s[: cap - 1] + "…"
 
 
+# `user_message` events store the SDK's tool-result blocks as the
+# *str()* of a list, e.g. ``["ToolResultBlock(tool_use_id='X', content='Y',
+# is_error=False)"]``. Because each list element is already a string, the
+# outer ``str(list)`` re-escapes its contents — so quotes around content
+# come through as ``\"`` (backslash + quote) and inner ``\t`` / ``\n``
+# come through as ``\\t`` / ``\\n``. We accept an optional leading
+# backslash on each quote and decode escapes twice on readout.
+_TOOL_RESULT_RE = re.compile(
+    r"ToolResultBlock\(\s*"
+    r"tool_use_id=\\?(?P<idq>['\"])(?P<tid>[^'\"\\]+)\\?(?P=idq)"
+    r"\s*,\s*content=\\?(?P<cq>['\"])(?P<content>(?:[^\\]|\\.)*?)\\?(?P=cq)"
+    r"\s*,\s*is_error=(?P<err>True|False|None)\s*\)",
+    re.DOTALL,
+)
+# Lenient match for truncated entries (kernel applies a length cap) —
+# pulls tool_use_id and whatever opening content we have.
+_TOOL_RESULT_TRUNC_RE = re.compile(
+    r"ToolResultBlock\(\s*"
+    r"tool_use_id=\\?(?P<idq>['\"])(?P<tid>[^'\"\\]+)\\?(?P=idq)"
+    r"(?:\s*,\s*content=\\?(?P<cq>['\"])(?P<content>.*))?",
+    re.DOTALL,
+)
+
+
+def parse_tool_results(text: Any) -> list[dict[str, Any]]:
+    """Best-effort parse of a `user_message` event's `content` field into
+    a list of ``{tool_use_id, content, is_error, truncated}`` dicts.
+
+    Returns ``[]`` when the input doesn't look like a tool-result list — the
+    caller should fall back to displaying the raw string.
+    """
+    if not isinstance(text, str) or "ToolResultBlock(" not in text:
+        return []
+
+    out: list[dict[str, Any]] = []
+    consumed_until = 0
+    for m in _TOOL_RESULT_RE.finditer(text):
+        out.append(_decode_block(m, truncated=False))
+        consumed_until = m.end()
+
+    # If a `ToolResultBlock(` appears past where the strict regex stopped,
+    # it's a truncated tail. Try to pull what we can.
+    tail = text[consumed_until:]
+    tail_start = tail.find("ToolResultBlock(")
+    if tail_start != -1:
+        tm = _TOOL_RESULT_TRUNC_RE.search(tail, tail_start)
+        if tm:
+            out.append(_decode_block(tm, truncated=True))
+    return out
+
+
+def _unescape(s: str) -> str:
+    """Decode Python repr-style escapes. Tries twice because the outer
+    `str(list)` of pre-stringified blocks introduces a second layer of
+    escaping (``\\\\t`` → ``\\t`` → tab)."""
+    for _ in range(2):
+        try:
+            decoded = s.encode("latin-1", "backslashreplace").decode(
+                "unicode_escape"
+            )
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            return s
+        if decoded == s:
+            break
+        s = decoded
+    return s
+
+
+def _decode_block(m: re.Match, *, truncated: bool) -> dict[str, Any]:
+    content = m.groupdict().get("content")
+    if content is not None:
+        content = _unescape(content)
+    err = m.groupdict().get("err")
+    return {
+        "tool_use_id": m.group("tid"),
+        "content": content,
+        "is_error": err == "True" if err else False,
+        "truncated": truncated or err is None,
+    }
+
+
 def _thinking_summary(event: str, rec: dict[str, Any]) -> str:
     if event == "wake_start":
         return f"wake start · model={rec.get('model')} budget={rec.get('max_seconds')}s"

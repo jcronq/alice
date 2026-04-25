@@ -1,0 +1,23 @@
+{# Render a `user_message` event as a stack of tool-result cards.
+   Falls back to the raw content if parse fails. #}
+{% set blocks = ev.detail.content | tool_results %}
+{% if blocks %}
+  <div class="tool-results">
+    {% for b in blocks %}
+      <div class="tool-result {% if b.is_error %}is-error{% endif %}">
+        <div class="tool-result-head">
+          <code class="tool-result-id" title="{{ b.tool_use_id }}">…{{ b.tool_use_id[-10:] }}</code>
+          {% if b.is_error %}<span class="tool-result-tag err">error</span>{% endif %}
+          {% if b.truncated %}<span class="tool-result-tag muted">truncated by log cap</span>{% endif %}
+        </div>
+        {% if b.content %}
+          <pre class="tool-result-content">{{ b.content }}</pre>
+        {% else %}
+          <div class="muted">(no content)</div>
+        {% endif %}
+      </div>
+    {% endfor %}
+  </div>
+{% else %}
+  <pre>{{ ev.detail.content }}</pre>
+{% endif %}
