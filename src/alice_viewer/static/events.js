@@ -577,8 +577,8 @@ window.attachGraphFocus = function ({ nodeSel, linkSel, edges, idAccessor }) {
     return dist;
   };
 
-  // Cache the per-circle base fill once so we can interpolate from it
-  // and restore it cleanly on mouseleave.
+  // Cache per-circle base fill so we can interpolate from it and restore
+  // it cleanly on mouseleave.
   const circleSel = nodeSel.select('circle');
   circleSel.each(function () {
     const c = d3.select(this);
@@ -588,13 +588,18 @@ window.attachGraphFocus = function ({ nodeSel, linkSel, edges, idAccessor }) {
   });
 
   // distance 0: hovered. 1: direct neighbor. 2: neighbor's neighbor.
-  // >=3 or unreachable: fully faded into the background.
-  const FADE = '#2f3744';
+  // >=3 or unreachable: faded almost to background.
+  //
+  // Sharp cliffs > smooth gradient: at-a-glance "is this connected?" reads
+  // better when 1-hop stays nearly full color and 2-hop drops hard. The
+  // hovered node gets a white stroke halo so the focal point is unambiguous.
+  const FADE = '#2a3140';
+  const HALO = '#ffffff';
   const styleFor = (d) => {
     if (d === 0)   return { mix: 0.0,  opacity: 1.0  };
-    if (d === 1)   return { mix: 0.55, opacity: 0.9  };
-    if (d === 2)   return { mix: 0.85, opacity: 0.55 };
-    return            { mix: 1.0,  opacity: 0.18 };
+    if (d === 1)   return { mix: 0.15, opacity: 1.0  };
+    if (d === 2)   return { mix: 0.75, opacity: 0.4  };
+    return            { mix: 1.0,  opacity: 0.07 };
   };
 
   const apply = (startId) => {
@@ -603,29 +608,51 @@ window.attachGraphFocus = function ({ nodeSel, linkSel, edges, idAccessor }) {
       const d = dist.has(id(n)) ? dist.get(id(n)) : Infinity;
       return styleFor(d).opacity;
     });
-    circleSel.style('fill', function (n) {
-      const d = dist.has(id(n)) ? dist.get(id(n)) : Infinity;
-      const s = styleFor(d);
-      if (s.mix === 0) return null;
-      const orig = d3.select(this).property('__origFill') || '#79849a';
-      return d3.interpolateRgb(orig, FADE)(s.mix);
-    });
+    circleSel
+      .style('fill', function (n) {
+        const d = dist.has(id(n)) ? dist.get(id(n)) : Infinity;
+        const s = styleFor(d);
+        if (s.mix === 0) return null;
+        const orig = d3.select(this).property('__origFill') || '#79849a';
+        return d3.interpolateRgb(orig, FADE)(s.mix);
+      })
+      .style('stroke', n => (dist.get(id(n)) === 0 ? HALO : null))
+      .style('stroke-width', n => (dist.get(id(n)) === 0 ? 3 : null));
     if (linkSel) {
-      linkSel.style('stroke-opacity', e => {
-        const ds = dist.has(endId(e, 'source')) ? dist.get(endId(e, 'source')) : Infinity;
-        const dt = dist.has(endId(e, 'target')) ? dist.get(endId(e, 'target')) : Infinity;
-        const m = Math.min(ds, dt);
-        if (m === 0) return 0.95;
-        if (m === 1) return 0.5;
-        return 0.05;
-      });
+      linkSel
+        .style('stroke', e => {
+          const ds = dist.has(endId(e, 'source')) ? dist.get(endId(e, 'source')) : Infinity;
+          const dt = dist.has(endId(e, 'target')) ? dist.get(endId(e, 'target')) : Infinity;
+          return Math.min(ds, dt) === 0 ? HALO : null;
+        })
+        .style('stroke-width', e => {
+          const ds = dist.has(endId(e, 'source')) ? dist.get(endId(e, 'source')) : Infinity;
+          const dt = dist.has(endId(e, 'target')) ? dist.get(endId(e, 'target')) : Infinity;
+          return Math.min(ds, dt) === 0 ? 2 : null;
+        })
+        .style('stroke-opacity', e => {
+          const ds = dist.has(endId(e, 'source')) ? dist.get(endId(e, 'source')) : Infinity;
+          const dt = dist.has(endId(e, 'target')) ? dist.get(endId(e, 'target')) : Infinity;
+          const m = Math.min(ds, dt);
+          if (m === 0) return 1.0;
+          if (m === 1) return 0.4;
+          return 0.03;
+        });
     }
   };
 
   const clear = () => {
     nodeSel.style('opacity', null);
-    circleSel.style('fill', null);
-    if (linkSel) linkSel.style('stroke-opacity', null);
+    circleSel
+      .style('fill', null)
+      .style('stroke', null)
+      .style('stroke-width', null);
+    if (linkSel) {
+      linkSel
+        .style('stroke', null)
+        .style('stroke-width', null)
+        .style('stroke-opacity', null);
+    }
   };
 
   nodeSel
