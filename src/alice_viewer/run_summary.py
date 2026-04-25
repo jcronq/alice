@@ -28,6 +28,10 @@ from typing import Any
 
 HAIKU_MODEL = "claude-haiku-4-5"
 
+# Bump when the prompt or output shape changes — cached entries with a
+# lower schema are treated as missing so summaries regenerate lazily.
+CACHE_SCHEMA = 2
+
 
 def cache_dir() -> pathlib.Path:
     override = os.environ.get("ALICE_VIEWER_CACHE_DIR")
@@ -45,13 +49,19 @@ def _cache_path(run_id: str) -> pathlib.Path:
 
 
 def read(run_id: str) -> str | None:
-    """Return the cached one-line summary for ``run_id``, or None."""
+    """Return the cached summary for ``run_id``, or None.
+
+    Returns None for entries written under an older CACHE_SCHEMA so that
+    a prompt/format change naturally re-summarizes wakes on next view.
+    """
     path = _cache_path(run_id)
     if not path.is_file():
         return None
     try:
         data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
+        return None
+    if data.get("schema", 1) < CACHE_SCHEMA:
         return None
     summary = data.get("summary")
     return summary if isinstance(summary, str) and summary else None
@@ -65,6 +75,7 @@ def write(run_id: str, summary: str, *, cost_usd: float | None = None) -> None:
         "summary": summary,
         "generated_at": time.time(),
         "model": HAIKU_MODEL,
+        "schema": CACHE_SCHEMA,
     }
     if cost_usd is not None:
         payload["cost_usd"] = cost_usd
@@ -105,19 +116,21 @@ def schedule(run_id: str, events: list) -> None:
 def _build_prompt(events: list) -> str:
     """Compact narrative of a wake's events as a Haiku prompt.
 
-    Picks the most informative subset:
-    - first thinking block (Alice's stated intent)
-    - tool calls (what she actually did, by primary arg)
-    - last assistant_text (close-out summary if present)
+    Samples the wake's thinking across its full arc — first thought, a
+    middle thought, and the last two — plus all tool calls and the final
+    assistant_text. The previous version only fed the FIRST thinking
+    block as "Initial intent", which biased Haiku toward describing what
+    the wake set out to do rather than what it actually accomplished
+    end-to-end.
     """
-    intent = None
+    thoughts: list[str] = []
     final_text = None
     tool_lines: list[str] = []
     for ev in events:
-        if ev.kind == "thinking" and intent is None:
+        if ev.kind == "thinking":
             t = (ev.detail.get("text") or "").strip()
             if t:
-                intent = t[:600]
+                thoughts.append(t[:500])
         elif ev.kind == "assistant_text":
             t = (ev.detail.get("text") or "").strip()
             if t:
@@ -130,26 +143,42 @@ def _build_prompt(events: list) -> str:
                 f"- {name}" + (f": {primary[:200]}" if primary else "")
             )
 
+    sampled_thoughts = _sample_thoughts(thoughts)
+
     parts = [
-        "Summarize this thinking wake in ONE sentence (max ~140 chars).",
-        "Write in FIRST PERSON past tense — 'I groomed X' not 'Alice groomed X'.",
-        "You ARE Alice; the wake is yours; speak as yourself.",
-        "No quotes, no preamble like 'In this wake', just the sentence.",
+        "Summarize the FULL ARC of this thinking wake — what I actually",
+        "accomplished from start to finish, not just what I set out to do.",
+        "1–3 short sentences, ~240 characters max. Cover distinct phases",
+        "if there were several (e.g. groom + fix + verify), in order.",
+        "FIRST PERSON past tense — 'I groomed X, then fixed Y' not",
+        "'Alice groomed X'. You ARE Alice; the wake is yours.",
+        "No quotes, no preamble like 'In this wake', just the summary.",
         "",
     ]
-    if intent:
-        parts.append(f"Initial intent: {intent}")
+    if sampled_thoughts:
+        parts.append(f"Thinking samples (across the wake, in order):")
+        for i, t in enumerate(sampled_thoughts, 1):
+            parts.append(f"[{i}] {t}")
         parts.append("")
     if tool_lines:
-        parts.append(f"Tool calls ({len(tool_lines)}):")
-        parts.extend(tool_lines[:30])
-        if len(tool_lines) > 30:
-            parts.append(f"…and {len(tool_lines) - 30} more")
+        parts.append(f"Tool calls in order ({len(tool_lines)}):")
+        parts.extend(tool_lines[:40])
+        if len(tool_lines) > 40:
+            parts.append(f"…and {len(tool_lines) - 40} more")
         parts.append("")
     if final_text:
         parts.append(f"Closing text: {final_text}")
 
     return "\n".join(parts)
+
+
+def _sample_thoughts(thoughts: list[str]) -> list[str]:
+    """Pick first, middle, and last two thoughts so the prompt covers the
+    full arc rather than only the opening intent."""
+    n = len(thoughts)
+    if n <= 4:
+        return thoughts
+    return [thoughts[0], thoughts[n // 2], thoughts[-2], thoughts[-1]]
 
 
 def _tool_primary(name: str, raw_input: Any) -> str:
@@ -201,7 +230,7 @@ async def _generate(run_id: str, events: list) -> None:
         summary.startswith("'") and summary.endswith("'")
     ):
         summary = summary[1:-1]
-    summary = summary.replace("\n", " ").strip()[:200]
+    summary = summary.replace("\n", " ").strip()[:280]
     write(run_id, summary, cost_usd=result.cost_usd)
 
 

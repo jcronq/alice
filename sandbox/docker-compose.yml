@@ -120,6 +120,9 @@ services:
       - ${HOME}/alice:/home/alice/alice:ro
       - ${HOME}/alice-mind:/home/alice/alice-mind:ro
       - ${HOME}/.local/state/alice:/state:rw
+      # alice.env carries CLAUDE_CODE_OAUTH_TOKEN for run_summary's
+      # Haiku call; alice_core.auth reads it from this default path.
+      - ${HOME}/.config/alice:/home/alice/.config/alice:ro
 
 networks:
   alice-net:
