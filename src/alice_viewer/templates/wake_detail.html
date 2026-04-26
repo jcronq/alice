@@ -7,6 +7,25 @@
   {% else %}
     <h1>wake · {{ wake.wake_id }}</h1>
     {% if summary %}<div class="summary-full">{{ summary }}</div>{% endif %}
+
+    {% if thought %}
+    <section class="wake-thought">
+      <h2>wake.md <span class="muted">· {{ thought.filename }}</span></h2>
+      <div class="wake-thought-body" id="wake-thought-body"></div>
+      <script>
+        (function () {
+          const body = {{ thought.body | tojson }};
+          const el = document.getElementById('wake-thought-body');
+          if (el && window.renderMarkdown) {
+            el.innerHTML = window.renderMarkdown(body);
+          } else if (el) {
+            el.textContent = body;
+          }
+        })();
+      </script>
+    </section>
+    {% endif %}
+
     <div class="detail-header">
       <div class="detail-grid">
         <span class="k">start</span><span class="v">{{ wake.start_ts | localtime }} <span class="muted">({{ wake.start_ts | ago }})</span></span>
