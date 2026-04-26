@@ -18,6 +18,27 @@
     <span class="muted" id="node-count">—</span>
   </div>
 
+  <div class="flex" id="type-filter-row" style="margin: 4px 0 8px; align-items: center; gap: 6px; flex-wrap: wrap;">
+    <span class="muted" style="margin-right: 4px;">types:</span>
+  </div>
+
+  <style>
+    .type-pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 2px 10px; border: 1px solid var(--border); border-radius: 999px;
+      background: var(--panel-2); color: var(--text); cursor: pointer;
+      font-size: 0.85em; user-select: none; transition: opacity 0.12s;
+    }
+    .type-pill .pill-dot {
+      display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+      flex: 0 0 auto;
+    }
+    .type-pill .pill-count { color: var(--muted); }
+    .type-pill.filtered {
+      opacity: 0.35; filter: grayscale(0.6);
+    }
+  </style>
+
   <div class="graph-wrap" id="graph-wrap">
     <svg class="graph" id="memgraph"></svg>
   </div>
@@ -38,9 +59,19 @@
 
       const folderColor = (folder) => {
         if (folder === 'unresolved') return '#ff6b81';
-        if (folder.startsWith('memory/sources')) return '#7de3c4';
+        // cortex-memory folders
+        if (folder === 'cortex-memory/people')    return '#f9c96d';  // amber — people/entities
+        if (folder === 'cortex-memory/projects')  return '#8fc7ff';  // light blue — projects
+        if (folder === 'cortex-memory/reference') return '#b8d4ff';  // blue-gray — reference docs
+        if (folder === 'cortex-memory/feedback')  return '#ffa07a';  // salmon — Owner's feedback/preferences
+        if (folder === 'cortex-memory/sources')   return '#7de3c4';  // teal — external sources
+        if (folder === 'cortex-memory/conflicts') return '#ff6b81';  // red — contradictions
+        if (folder === 'cortex-memory/dailies')   return '#d4d4d4';  // light gray — chronological logs
+        if (folder === 'cortex-memory/research')  return '#a8e6cf';  // light green — investigations
+        // legacy memory/ paths (kept for backward compat)
+        if (folder.startsWith('memory/sources'))  return '#7de3c4';
         if (folder.startsWith('memory/projects')) return '#8fc7ff';
-        return '#c39bff';
+        return '#c39bff';  // default purple for anything else
       };
 
       const svg = d3.select('#memgraph');
@@ -65,6 +96,75 @@
       // each render and after focus-mouseleave clears.
       let nodeSelRef = null;
       let linkSelRef = null;
+
+      // ---- Type-filter state ------------------------------------------
+      // Each cortex-memory folder + 'unresolved' becomes a "type" pill.
+      // hiddenTypes is the set of folder-keys that are currently filtered out.
+      // Folder keys match the node.folder string (e.g. 'cortex-memory/people'
+      // or 'unresolved' or a legacy 'memory/...' path).
+      const TYPE_DEFS = [
+        { key: 'cortex-memory/people',    label: 'people' },
+        { key: 'cortex-memory/projects',  label: 'projects' },
+        { key: 'cortex-memory/reference', label: 'reference' },
+        { key: 'cortex-memory/feedback',  label: 'feedback' },
+        { key: 'cortex-memory/sources',   label: 'sources' },
+        { key: 'cortex-memory/conflicts', label: 'conflicts' },
+        { key: 'cortex-memory/dailies',   label: 'dailies' },
+        { key: 'cortex-memory/research',  label: 'research' },
+        { key: 'unresolved',              label: 'unresolved' },
+      ];
+      // Map pill-label -> folder-key for URL parsing.
+      const LABEL_TO_KEY = Object.fromEntries(TYPE_DEFS.map(t => [t.label, t.key]));
+      const KEY_TO_LABEL = Object.fromEntries(TYPE_DEFS.map(t => [t.key, t.label]));
+
+      const hiddenTypes = new Set();
+      // Parse ?hidden=feedback,dailies on load.
+      const initialHidden = new URLSearchParams(window.location.search).get('hidden');
+      if (initialHidden) {
+        for (const lab of initialHidden.split(',').map(s => s.trim()).filter(Boolean)) {
+          const key = LABEL_TO_KEY[lab];
+          if (key) hiddenTypes.add(key);
+        }
+      }
+
+      const updateHiddenURL = () => {
+        const labels = [...hiddenTypes].map(k => KEY_TO_LABEL[k]).filter(Boolean).sort();
+        const params = new URLSearchParams(window.location.search);
+        if (labels.length) params.set('hidden', labels.join(','));
+        else params.delete('hidden');
+        const qs = params.toString();
+        const newURL = window.location.pathname + (qs ? '?' + qs : '') + window.location.hash;
+        history.replaceState(null, '', newURL);
+      };
+
+      // Build pills from node data. Counts are computed over ALL nodes
+      // (not currently-rendered ones) so toggling pills doesn't shift counts.
+      const buildPills = () => {
+        const row = document.getElementById('type-filter-row');
+        // Strip everything after the leading "types:" label.
+        while (row.children.length > 1) row.removeChild(row.lastChild);
+        const counts = {};
+        for (const n of nodes) counts[n.folder] = (counts[n.folder] || 0) + 1;
+        for (const def of TYPE_DEFS) {
+          const c = counts[def.key] || 0;
+          if (c === 0 && def.key !== 'unresolved') continue;  // skip empty cortex types
+          const pill = document.createElement('span');
+          pill.className = 'type-pill' + (hiddenTypes.has(def.key) ? ' filtered' : '');
+          pill.dataset.typeKey = def.key;
+          pill.innerHTML =
+            `<span class="pill-dot" style="background:${folderColor(def.key)}"></span>` +
+            `<span class="pill-label">${def.label}</span>` +
+            `<span class="pill-count">(${c})</span>`;
+          pill.addEventListener('click', () => {
+            if (hiddenTypes.has(def.key)) hiddenTypes.delete(def.key);
+            else hiddenTypes.add(def.key);
+            pill.classList.toggle('filtered');
+            updateHiddenURL();
+            render();
+          });
+          row.appendChild(pill);
+        }
+      };
 
       const applySearch = () => {
         if (!nodeSelRef) return;
@@ -92,7 +192,11 @@
         zoomG.selectAll('*').remove();
 
         const showGhosts = document.getElementById('show-ghosts').checked;
-        const activeNodes = nodes.filter(n => showGhosts || n.folder !== 'unresolved');
+        const activeNodes = nodes.filter(n => {
+          if (!showGhosts && n.folder === 'unresolved') return false;
+          if (hiddenTypes.has(n.folder)) return false;
+          return true;
+        });
         const activeIds = new Set(activeNodes.map(n => n.id));
         const activeEdges = edges.filter(e => activeIds.has(e.source.id || e.source) && activeIds.has(e.target.id || e.target));
 
@@ -166,6 +270,7 @@
         } catch (err) { console.error('attachGraphTuning failed', err); }
       };
 
+      buildPills();
       render();
       document.getElementById('show-ghosts').addEventListener('change', render);
 

@@ -448,12 +448,34 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         )
 
     @app.get("/api/interaction-graph")
-    async def api_interaction_graph() -> JSONResponse:
+    async def api_interaction_graph(window_seconds: int | None = None) -> JSONResponse:
+        """Interaction graph nodes + edges.
+
+        ``window_seconds`` (optional): if given, drop nodes whose ts is
+        older than ``now - window_seconds``. Nodes with ts==0 (e.g. the
+        ``directive`` cluster anchor) are always kept. Edges referencing
+        dropped nodes are also dropped. We filter at the route boundary
+        because ``aggregators.build_interaction_graph`` is shared with
+        in-flight work and we want to avoid touching its signature.
+        """
         p: Paths = app.state.paths
         events = sources.load_all(p)
         wakes = aggregators.group_wakes(events)
         turns = aggregators.group_turns(events)
         nodes, edges = aggregators.build_interaction_graph(events, wakes, turns)
+
+        if window_seconds is not None and window_seconds > 0:
+            cutoff = time.time() - window_seconds
+            kept_ids: set[str] = set()
+            kept_nodes = []
+            for n in nodes:
+                # ts==0 sentinels (directive anchor) are always kept.
+                if n.ts == 0 or n.ts >= cutoff:
+                    kept_nodes.append(n)
+                    kept_ids.add(n.id)
+            kept_edges = [e for e in edges if e.source in kept_ids and e.target in kept_ids]
+            nodes, edges = kept_nodes, kept_edges
+
         return JSONResponse(
             {
                 "nodes": [

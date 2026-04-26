@@ -10,6 +10,20 @@
     Edges: reads · writes · surfaces · consumes · voices. Drag to rearrange.
   </p>
 
+  <div class="flex" style="margin: 8px 0; align-items: center; gap: 12px; flex-wrap: wrap;">
+    <label class="muted" for="window-select">window:</label>
+    <select id="window-select"
+            style="padding: 3px 8px; background: var(--panel-2); color: var(--text);
+                   border: 1px solid var(--border); border-radius: 4px; font: inherit;">
+      <option value="1h">1h</option>
+      <option value="4h" selected>4h</option>
+      <option value="24h">24h</option>
+      <option value="7d">7d</option>
+      <option value="all">all-time</option>
+    </select>
+    <span class="muted" id="graph-info">—</span>
+  </div>
+
   <div class="legend">
     <span><span class="sw" style="background:var(--accent-2)"></span>wake</span>
     <span><span class="sw" style="background:var(--accent)"></span>turn</span>
@@ -27,13 +41,38 @@
 
   <script>
     (async () => {
-      const res = await fetch('/api/interaction-graph');
-      const data = await res.json();
+      // Time-window options: label -> seconds (null = all-time, no filter).
+      const WINDOW_SECONDS = {
+        '1h': 3600,
+        '4h': 4 * 3600,
+        '24h': 24 * 3600,
+        '7d': 7 * 86400,
+        'all': null,
+      };
 
-      if (!data.nodes.length) {
-        document.getElementById('graph-wrap').innerHTML = '<p class="muted" style="padding:20px">No interactions yet — once wakes + turns accumulate, they\'ll show up here.</p>';
-        return;
-      }
+      const select = document.getElementById('window-select');
+      const info = document.getElementById('graph-info');
+
+      // Initialize from URL ?window=4h, default 4h.
+      const urlWindow = new URLSearchParams(window.location.search).get('window');
+      if (urlWindow && urlWindow in WINDOW_SECONDS) select.value = urlWindow;
+
+      const updateWindowURL = (w) => {
+        const params = new URLSearchParams(window.location.search);
+        params.set('window', w);
+        const qs = params.toString();
+        const newURL = window.location.pathname + (qs ? '?' + qs : '') + window.location.hash;
+        history.replaceState(null, '', newURL);
+      };
+
+      const fetchGraph = async (windowLabel) => {
+        const secs = WINDOW_SECONDS[windowLabel];
+        const url = secs == null
+          ? '/api/interaction-graph'
+          : '/api/interaction-graph?window_seconds=' + secs;
+        const r = await fetch(url);
+        return r.json();
+      };
 
       const kindColor = {
         directive: '#79849a', wake: '#c39bff', turn: '#8fc7ff',
@@ -42,79 +81,116 @@
 
       const svg = d3.select('#graph');
       const wrap = document.getElementById('graph-wrap');
+      const tooltip = d3.select('#tooltip');
+
+      // One-time setup: viewBox + defs (arrow marker). Cleared/re-built
+      // contents (zoomG) live inside the SVG and get torn down on each
+      // window-change re-render.
       const width = wrap.clientWidth;
       const height = wrap.clientHeight;
       svg.attr('viewBox', [0, 0, width, height]);
-
-      const tooltip = d3.select('#tooltip');
-
       const defs = svg.append('defs');
       defs.append('marker')
           .attr('id', 'arrow').attr('viewBox', '0 -5 10 10').attr('refX', 14).attr('refY', 0)
           .attr('markerWidth', 6).attr('markerHeight', 6).attr('orient', 'auto')
           .append('path').attr('d', 'M0,-5L10,0L0,5').attr('fill', '#444d60');
 
-      const zoomG = svg.append('g');
-      svg.call(d3.zoom().scaleExtent([0.2, 4]).on('zoom', (e) => zoomG.attr('transform', e.transform)));
+      let currentSim = null;
 
-      const simulation = d3.forceSimulation(data.nodes)
-        .force('link', d3.forceLink(data.edges).id(d => d.id).distance(80).strength(0.4))
-        .force('charge', d3.forceManyBody().strength(-220))
-        .force('center', d3.forceCenter(width / 2, height / 2))
-        .force('collide', d3.forceCollide(18));
+      const renderGraph = (data) => {
+        // Tear down the previous render: stop any running sim, clear svg children.
+        if (currentSim) { try { currentSim.stop(); } catch (e) {} currentSim = null; }
+        svg.selectAll('g').remove();  // clears all top-level <g> incl. zoomG
+        // Empty-state handling: replace svg's parent contents only if no nodes.
+        if (!data.nodes.length) {
+          svg.append('g').append('text')
+            .attr('x', width / 2).attr('y', height / 2)
+            .attr('text-anchor', 'middle').attr('fill', '#79849a')
+            .text('No interactions in this window.');
+          return;
+        }
 
-      const link = zoomG.append('g').attr('stroke', '#444d60').attr('stroke-opacity', 0.6)
-        .selectAll('line').data(data.edges).join('line')
-          .attr('stroke-width', 1.2)
-          .attr('marker-end', 'url(#arrow)');
+        const zoomG = svg.append('g');
+        svg.call(d3.zoom().scaleExtent([0.2, 4]).on('zoom', (e) => zoomG.attr('transform', e.transform)));
 
-      const node = zoomG.append('g').selectAll('g').data(data.nodes).join('g')
-        .call(d3.drag()
-          .on('start', (e, d) => { if (!e.active) simulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
-          .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; })
-          .on('end', (e, d) => { if (!e.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; }));
+        const simulation = d3.forceSimulation(data.nodes)
+          .force('link', d3.forceLink(data.edges).id(d => d.id).distance(80).strength(0.4))
+          .force('charge', d3.forceManyBody().strength(-220))
+          .force('center', d3.forceCenter(width / 2, height / 2))
+          .force('collide', d3.forceCollide(18));
+        currentSim = simulation;
 
-      node.append('circle')
-          .attr('r', d => d.kind === 'wake' || d.kind === 'turn' ? 9 : 6)
-          .attr('fill', d => kindColor[d.kind] || '#79849a')
-          .attr('stroke', '#0d1015').attr('stroke-width', 1.5);
+        const link = zoomG.append('g').attr('stroke', '#444d60').attr('stroke-opacity', 0.6)
+          .selectAll('line').data(data.edges).join('line')
+            .attr('stroke-width', 1.2)
+            .attr('marker-end', 'url(#arrow)');
 
-      node.append('text')
-          .attr('class', 'node-label')
-          .attr('dx', 11).attr('dy', 3)
-          .text(d => d.label);
+        const node = zoomG.append('g').selectAll('g').data(data.nodes).join('g')
+          .call(d3.drag()
+            .on('start', (e, d) => { if (!e.active) simulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+            .on('drag', (e, d) => { d.fx = e.x; d.fy = e.y; })
+            .on('end', (e, d) => { if (!e.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; }));
 
-      node.on('mouseenter', (e, d) => {
-        tooltip.style('display', 'block')
-               .html(`<b>${d.kind}</b> · ${d.label}<br><span style="color:#79849a">${d.id}</span><br><span style="color:#79849a">click for detail</span>`)
-               .style('left', (e.pageX + 12) + 'px').style('top', (e.pageY + 12) + 'px');
-      }).on('mousemove', (e) => tooltip.style('left', (e.pageX + 12) + 'px').style('top', (e.pageY + 12) + 'px'))
-        .on('mouseleave', () => tooltip.style('display', 'none'))
-        .on('click', (e, d) => {
-          tooltip.style('display', 'none');
-          window.openInteractionNodeModal(d);
+        node.append('circle')
+            .attr('r', d => d.kind === 'wake' || d.kind === 'turn' ? 9 : 6)
+            .attr('fill', d => kindColor[d.kind] || '#79849a')
+            .attr('stroke', '#0d1015').attr('stroke-width', 1.5);
+
+        node.append('text')
+            .attr('class', 'node-label')
+            .attr('dx', 11).attr('dy', 3)
+            .text(d => d.label);
+
+        node.on('mouseenter', (e, d) => {
+          tooltip.style('display', 'block')
+                 .html(`<b>${d.kind}</b> · ${d.label}<br><span style="color:#79849a">${d.id}</span><br><span style="color:#79849a">click for detail</span>`)
+                 .style('left', (e.pageX + 12) + 'px').style('top', (e.pageY + 12) + 'px');
+        }).on('mousemove', (e) => tooltip.style('left', (e.pageX + 12) + 'px').style('top', (e.pageY + 12) + 'px'))
+          .on('mouseleave', () => tooltip.style('display', 'none'))
+          .on('click', (e, d) => {
+            tooltip.style('display', 'none');
+            window.openInteractionNodeModal(d);
+          });
+
+        simulation.on('tick', () => {
+          link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+              .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+          node.attr('transform', d => `translate(${d.x},${d.y})`);
         });
 
-      simulation.on('tick', () => {
-        link.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
-            .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
-        node.attr('transform', d => `translate(${d.x},${d.y})`);
+        try { window.attachGraphFocus({ nodeSel: node, linkSel: link, edges: data.edges }); }
+        catch (err) { console.error('attachGraphFocus failed', err); }
+
+        try {
+          window.attachGraphTuning({
+            key: 'flow',
+            container: wrap,
+            simulation,
+            linkSel: link,
+            nodeSel: node,
+            circleSel: node.select('circle'),
+            defaults: { linkDistance: 80, linkStrength: 0.4, chargeStrength: -220, collideRadius: 18 },
+          });
+        } catch (err) { console.error('attachGraphTuning failed', err); }
+      };
+
+      let data = await fetchGraph(select.value);
+      info.textContent = `${data.nodes.length} nodes · ${data.edges.length} edges`;
+      renderGraph(data);
+
+      select.addEventListener('change', async () => {
+        const w = select.value;
+        updateWindowURL(w);
+        info.textContent = 'loading…';
+        try {
+          data = await fetchGraph(w);
+          info.textContent = `${data.nodes.length} nodes · ${data.edges.length} edges`;
+          renderGraph(data);
+        } catch (err) {
+          console.error('window change failed', err);
+          info.textContent = 'error';
+        }
       });
-
-      try { window.attachGraphFocus({ nodeSel: node, linkSel: link, edges: data.edges }); }
-      catch (err) { console.error('attachGraphFocus failed', err); }
-
-      try {
-        window.attachGraphTuning({
-          key: 'flow',
-          container: wrap,
-          simulation,
-          linkSel: link,
-          nodeSel: node,
-          circleSel: node.select('circle'),
-          defaults: { linkDistance: 80, linkStrength: 0.4, chargeStrength: -220, collideRadius: 18 },
-        });
-      } catch (err) { console.error('attachGraphTuning failed', err); }
     })();
   </script>
 {% endblock %}
