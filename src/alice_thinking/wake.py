@@ -28,11 +28,16 @@ import json
 import pathlib
 import sys
 import time
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from alice_core.auth import ensure_token
 from alice_core.events import EventLogger
 from alice_core.kernel import AgentKernel, KernelSpec
+
+
+WAKE_TZ = ZoneInfo("America/New_York")
 
 
 DEFAULT_MIND = pathlib.Path("/home/alice/alice-mind")
@@ -46,18 +51,41 @@ QUICK_PROMPT = "Reply exactly: QUICK-OK"
 QUICK_MAX_SECONDS = 30
 
 
+def _wake_timestamp_header(now: datetime | None = None) -> str:
+    """Return a single-line wake-time header for the prompt.
+
+    Injected at the very top of Thinking's prompt so she never has to
+    compute the local hour herself — that path was brittle (the bootstrap
+    instruction can drift out of sync with mode/stage logic, as it did
+    during the sleep-arch v2 rollout). Format:
+    ``Current local time: 2026-04-26 14:32 EDT (Sunday)``.
+    DST is handled by zoneinfo; we don't hardcode the abbreviation.
+    """
+    moment = (now or datetime.now(WAKE_TZ)).astimezone(WAKE_TZ)
+    return (
+        "Current local time: "
+        f"{moment.strftime('%Y-%m-%d %H:%M %Z')} ({moment.strftime('%A')})"
+    )
+
+
 def _build_prompt(bootstrap_path: pathlib.Path, directive_path: pathlib.Path) -> str:
-    """Compose the wake prompt: directive contents + bootstrap.
+    """Compose the wake prompt: timestamp + directive contents + bootstrap.
 
     Inlining directive.md saves the agent one Read tool round-trip per
     wake. The directive is small (~30 lines, well under the 1024-token
     cache threshold) — the win is the saved round-trip, not caching.
+
+    The wake timestamp is prepended so Thinking sees current local time
+    before any other prompt content. Mode/stage selection should read
+    this line rather than computing the hour themselves.
     """
     bootstrap = bootstrap_path.read_text()
+    header = _wake_timestamp_header()
     if not directive_path.is_file():
-        return bootstrap
+        return f"{header}\n\n{bootstrap}"
     directive = directive_path.read_text()
     return (
+        f"{header}\n\n"
         "## Directive (current standing orders — read this first)\n\n"
         f"{directive.strip()}\n\n"
         "---\n\n"
