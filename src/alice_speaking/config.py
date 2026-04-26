@@ -19,6 +19,10 @@ from typing import Any
 DEFAULT_ALICE_ENV = pathlib.Path.home() / ".config" / "alice" / "alice.env"
 DEFAULT_MIND_DIR = pathlib.Path.home() / "alice-mind"
 DEFAULT_STATE_DIR = pathlib.Path("/state/worker")
+# CLI transport socket. Lives under /state (shared between worker and
+# daemon containers, but only the worker process binds it). Override with
+# ALICE_CLI_SOCKET in alice.env or the environment.
+DEFAULT_CLI_SOCKET = pathlib.Path("/state/alice.sock")
 
 # Fallback speaking-hemisphere config, applied when alice.config.json is absent
 # or omits fields. Matches the defaults in HEMISPHERES.md.
@@ -71,6 +75,10 @@ class Config:
     seen_path: pathlib.Path
     turn_log_path: pathlib.Path
     event_log_path: pathlib.Path
+
+    # CLI transport
+    cli_enabled: bool = True
+    cli_socket_path: pathlib.Path = field(default_factory=lambda: DEFAULT_CLI_SOCKET)
 
     # Behavior (from alice.config.json, falls back to SPEAKING_DEFAULTS)
     speaking: dict[str, Any] = field(default_factory=lambda: dict(SPEAKING_DEFAULTS))
@@ -142,6 +150,13 @@ def load() -> Config:
         except json.JSONDecodeError as exc:
             raise ValueError(f"{config_json} is not valid JSON: {exc}") from exc
 
+    cli_enabled_raw = (from_any("ALICE_CLI_ENABLED", "1") or "1").strip().lower()
+    cli_enabled = cli_enabled_raw not in {"0", "false", "no", "off", ""}
+    cli_socket_path = pathlib.Path(
+        from_any("ALICE_CLI_SOCKET", str(DEFAULT_CLI_SOCKET))
+        or str(DEFAULT_CLI_SOCKET)
+    )
+
     return Config(
         signal_api=signal_api,
         signal_account=signal_account,
@@ -158,4 +173,6 @@ def load() -> Config:
             from_any("SPEAKING_EVENT_LOG") or str(state_dir / "speaking.log")
         ),
         speaking=speaking,
+        cli_enabled=cli_enabled,
+        cli_socket_path=cli_socket_path,
     )

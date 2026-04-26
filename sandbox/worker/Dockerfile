@@ -30,7 +30,7 @@ RUN npm install -g @anthropic-ai/claude-code@latest
 RUN python3 -m venv /opt/alice-venv \
     && /opt/alice-venv/bin/pip install --no-cache-dir --upgrade pip \
     && /opt/alice-venv/bin/pip install --no-cache-dir \
-        'claude-agent-sdk>=0.1.66' 'httpx>=0.28.1'
+        'claude-agent-sdk>=0.1.66' 'httpx>=0.28.1' 'mistune>=3.0'
 
 # s6-overlay for process supervision (bridge + autopush)
 ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz /tmp/
@@ -52,12 +52,14 @@ COPY sandbox/worker/s6/ /etc/s6-overlay/s6-rc.d/
 COPY --chown=alice:alice bin/alice-mind-autopush /usr/local/bin/alice-mind-autopush
 COPY --chown=alice:alice bin/event-log           /usr/local/bin/event-log
 COPY --chown=alice:alice bin/alice-think         /usr/local/bin/alice-think
+COPY --chown=alice:alice bin/alice-client        /usr/local/bin/alice-client
 COPY --chown=alice:alice signal/signal-bridge.sh /usr/local/bin/signal-bridge
 
 RUN chmod +x /usr/local/bin/entrypoint.sh \
         /usr/local/bin/alice-mind-autopush \
         /usr/local/bin/event-log \
         /usr/local/bin/alice-think \
+        /usr/local/bin/alice-client \
         /usr/local/bin/signal-bridge \
     && find /etc/s6-overlay/s6-rc.d \( -name 'run' -o -name 'up' -o -name 'finish' \) | xargs -r chmod +x
 

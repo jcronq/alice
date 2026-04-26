@@ -14,6 +14,8 @@ dependencies = [
     # Agent kernel + hemispheres.
     "claude-agent-sdk>=0.1.66",
     "httpx>=0.28.1",
+    # Per-transport markdown rendering (alice_speaking.render).
+    "mistune>=3.0",
     # Viewer.
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",

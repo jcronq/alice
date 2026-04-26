@@ -79,14 +79,27 @@ def _err(text: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": f"error: {text}"}], "isError": True}
 
 
+# Sentinel that means "reply to whoever just messaged you, on the same
+# transport they used." The daemon's _send_message closure recognises this
+# and dispatches via the current turn's reply channel — works for Signal,
+# CLI, and any future transport without changing this tool.
+SELF_RECIPIENT = "__SELF__"
+
+# Aliases for SELF_RECIPIENT that Alice can spell naturally.
+_SELF_ALIASES = frozenset({"self", "reply", "user", "sender"})
+
+
 def _resolve_recipient(raw: str, cfg: Config) -> Optional[str]:
-    """Map a name / number string to an E.164 phone number.
+    """Map a name / number / alias string to either an E.164 phone number
+    or :data:`SELF_RECIPIENT`.
 
     Returns None if the recipient can't be resolved.
     """
     value = (raw or "").strip()
     if not value:
         return None
+    if value.lower() in _SELF_ALIASES:
+        return SELF_RECIPIENT
     if value.startswith("+"):
         # Already in E.164 form — trust it.
         return value
@@ -163,7 +176,12 @@ _SEND_MESSAGE_SCHEMA: dict[str, Any] = {
         "recipient": {
             "type": "string",
             "description": (
-                "'jason', 'katie', or an E.164 number (e.g. '+15555550100')."
+                "Who to send to. Options: "
+                "'self' / 'reply' — reply on the same transport the inbound "
+                "came from (works for Signal, the local CLI, and future "
+                "channels); "
+                "'jason' / 'katie' — Signal recipient by name; "
+                "an E.164 number like '+15555550100' — Signal recipient by number."
             ),
         },
         "message": {
@@ -227,14 +245,13 @@ def build(
     @tool(
         name="send_message",
         description=(
-            "Send a Signal message. This is how you reply to the user — "
-            "returning text alone does NOT send. Recipient can be "
-            "'jason', 'katie', or an E.164 number (e.g. '+15555550100'). "
-            "Message is the text body as you want it delivered. "
-            "`attachments` is an optional list of filesystem paths "
-            "(images, PDFs, etc.) that ride along with the message. "
-            "Use this for both inbound replies AND surface-triggered "
-            "voicings."
+            "Send a message. This is how you reply to the user — returning "
+            "text alone does NOT send. Recipient: 'self' or 'reply' replies "
+            "on the same transport the inbound came from (Signal, the local "
+            "CLI, etc.). 'jason' / 'katie' / E.164 number sends via Signal "
+            "specifically. `attachments` is an optional list of filesystem "
+            "paths (images, PDFs) — Signal-only today. Use this for both "
+            "inbound replies AND surface-triggered voicings."
         ),
         input_schema=_SEND_MESSAGE_SCHEMA,
     )
@@ -287,9 +304,17 @@ def build(
             if attachment_paths
             else ""
         )
-        return _ok(f"sent to {number} ({len(message)} chars){suffix}")
+        target_desc = (
+            "via current channel" if number == SELF_RECIPIENT else f"to {number}"
+        )
+        return _ok(f"sent {target_desc} ({len(message)} chars){suffix}")
 
     return [send_message]
 
 
-__all__ = ["build", "_resolve_recipient", "_stage_attachments"]
+__all__ = [
+    "build",
+    "SELF_RECIPIENT",
+    "_resolve_recipient",
+    "_stage_attachments",
+]

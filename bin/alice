@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
-# Run `claude` inside Alice's sandbox. Targets the worker that currently holds
-# the message-processing lease, so the call goes to the live bridge in either
-# steady state or mid-blue/green.
+# Talk to Alice over the local CLI transport socket inside her sandbox.
+#
+# Targets the worker that currently holds the message-processing lease,
+# so the call goes to the live bridge in either steady state or
+# mid-blue/green.
 #
 # Usage:
-#   alice                          # interactive chat
-#   alice "what's on today?"       # one-shot
-#   alice -p "summary" --resume ID # any claude CLI flags
+#   alice                           # interactive REPL
+#   alice "what's on today?"        # one-shot prompt
+#   alice -p "what's on today?"     # one-shot prompt (explicit -p)
+#   alice --json -p "..."           # raw JSON event stream (for agents)
+#
+# Phase 1 talks to /state/alice.sock via /usr/local/bin/alice-client
+# baked into the worker image. The legacy `claude`-based path used to
+# spawn a fresh agent with no Alice context — this path goes through
+# the running speaking daemon, so the CLI gets real Alice (mind repo,
+# session continuity, MCP tools).
 set -euo pipefail
 
 "$(dirname "$0")/alice-up"
 
-# Pick the worker holding the lease. If none (transient during handoff), fall
-# back to the canonical name.
+# Pick the worker holding the lease. If none (transient during handoff),
+# fall back to the canonical name.
 pick_worker() {
-    # Find the worker container that holds the lease. Blue/green slots:
-    # at most one is live at a time. flock probe fails = someone holds it.
     local name
     for name in $(docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null); do
         if ! docker exec "$name" flock -n /state/worker/lease true 2>/dev/null; then
@@ -23,14 +30,31 @@ pick_worker() {
             return 0
         fi
     done
-    # Fallback — pick any running worker, even if not lease-holder.
     docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null | head -n1
 }
 
 WORKER="$(pick_worker)"
 
-if [ -t 0 ] && [ -t 1 ]; then
-    exec docker exec -u alice -it "$WORKER" claude "$@"
+if [ -z "$WORKER" ]; then
+    echo "alice: no worker container running. did alice-up succeed?" >&2
+    exit 1
+fi
+
+# Build the args we'll pass to alice-client. Bare `alice "prompt"` is
+# friendlier than requiring -p; we promote a non-flag first arg into a
+# -p prompt. Everything starting with - or -- passes through unchanged.
+client_args=()
+if [ "$#" -ge 1 ] && [[ "$1" != -* ]]; then
+    client_args=(-p "$*")
 else
-    exec docker exec -u alice -i "$WORKER" claude "$@"
+    client_args=("$@")
+fi
+
+# Interactive vs one-shot decided by alice-client based on -p presence.
+# We just need the right docker-exec shape: -t when stdin+stdout are
+# both terminals (interactive REPL), -i otherwise (pipe-friendly).
+if [ -t 0 ] && [ -t 1 ] && [ "$#" -eq 0 ]; then
+    exec docker exec -u alice -it "$WORKER" /usr/local/bin/alice-client "${client_args[@]}"
+else
+    exec docker exec -u alice -i "$WORKER" /usr/local/bin/alice-client "${client_args[@]}"
 fi

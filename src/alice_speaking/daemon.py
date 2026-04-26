@@ -52,6 +52,7 @@ from alice_core.sdk_compat import _short, looks_like_missing_session as _looks_l
 
 from . import compaction as compaction_module
 from . import config as config_module
+from . import render as render_module
 from . import session_state
 from . import tools as tools_module
 from .config import AllowedSender, Config
@@ -60,6 +61,8 @@ from .events import EventLogger
 from .handlers import CompactionArmer, SessionHandler
 from .quiet_hours import QueuedMessage, QuietQueue, is_quiet_hours
 from .signal_client import SignalClient, SignalEnvelope
+from .tools.messaging import SELF_RECIPIENT
+from .transports import CLITransport, ChannelRef, InboundMessage, OutboundMessage
 from .turn_log import TurnLog, new_turn
 
 
@@ -104,7 +107,19 @@ class EmergencyEvent:
     path: pathlib.Path
 
 
-Event = Union[SignalEvent, SurfaceEvent, EmergencyEvent]
+@dataclass
+class CLIEvent:
+    """A message that came in over the CLI transport (Unix socket).
+
+    Mirrors :class:`SignalEvent` but for the local CLI transport.
+    Carries the full :class:`InboundMessage` so the handler can find the
+    reply channel without extra plumbing.
+    """
+
+    message: InboundMessage
+
+
+Event = Union[SignalEvent, SurfaceEvent, EmergencyEvent, CLIEvent]
 
 
 class SpeakingDaemon:
@@ -164,17 +179,33 @@ class SpeakingDaemon:
         # turn_log entry can attach it (Layer 2 bootstrap relies on this).
         self._turn_last_outbound: Optional[str] = None
         # Current turn kind — set by _handle_signal/_handle_surface/
-        # _handle_emergency at entry, reset in finally. _send_message
-        # uses this to decide whether to honor quiet hours: signal +
-        # emergency turns bypass (Owner gets a reply when he asks);
-        # surface turns honor (Alice-initiated thoughts wait for morning).
+        # _handle_emergency/_handle_cli at entry, reset in finally.
+        # _send_message uses this to decide whether to honor quiet hours:
+        # signal + cli + emergency turns bypass (the user is waiting on
+        # an answer); surface turns honor (Alice-initiated thoughts wait
+        # for morning).
         self._current_turn_kind: Optional[str] = None
+        # Reply channel for the current turn — set by handlers at entry,
+        # cleared in finally. _send_message uses this when Alice picks
+        # recipient='self' to dispatch back over the originating
+        # transport. None outside of a turn or for surface/emergency
+        # turns where there's no inbound channel.
+        self._current_reply_channel: Optional[ChannelRef] = None
         # When set, the very next turn will prepend this text as a
         # bootstrap preamble (Layer 2 restart OR post-compaction summary
         # injection).
         self._pending_preamble: Optional[str] = None
         # One-shot consumer startup guard.
         self._consumer_started: bool = False
+
+        # CLI transport — optional, falls back to no-op if disabled.
+        # Constructed here so it shares the daemon's lifecycle and can
+        # see _current_reply_channel via _send_message.
+        self.cli_transport: Optional[CLITransport] = (
+            CLITransport(socket_path=cfg.cli_socket_path)
+            if cfg.cli_enabled
+            else None
+        )
 
         self._queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=64)
         self._dispatched_surfaces: set[str] = set()
@@ -226,6 +257,11 @@ class SpeakingDaemon:
                 asyncio.create_task(self._emergency_producer(), name="emg-produce"),
                 asyncio.create_task(self._quiet_watcher(), name="quiet-watch"),
             ]
+            if self.cli_transport is not None:
+                await self.cli_transport.start()
+                producers.append(
+                    asyncio.create_task(self._cli_producer(), name="cli-produce")
+                )
             consumer = asyncio.create_task(self._consumer(), name="consumer")
             stop_task = asyncio.create_task(self._stop.wait(), name="stop")
 
@@ -241,6 +277,9 @@ class SpeakingDaemon:
                     await task
         finally:
             await self.signal.aclose()
+            if self.cli_transport is not None:
+                with contextlib.suppress(Exception):
+                    await self.cli_transport.stop()
             self.events.emit("shutdown")
             log.info("shutdown complete")
 
@@ -307,6 +346,12 @@ class SpeakingDaemon:
                 log.warning("emergency poll error: %s", exc)
             await asyncio.sleep(SURFACE_POLL_SECONDS)
 
+    async def _cli_producer(self) -> None:
+        """Pump InboundMessages from the CLI transport onto the consumer queue."""
+        assert self.cli_transport is not None
+        async for msg in self.cli_transport.messages():
+            await self._queue.put(CLIEvent(message=msg))
+
     # ------------------------------------------------------------------
     # Consumer
 
@@ -328,6 +373,8 @@ class SpeakingDaemon:
                     # input queue while a turn is mid-flight.
                     batch = self._drain_signal_batch(event)
                     await self._handle_signal(batch)
+                elif isinstance(event, CLIEvent):
+                    await self._handle_cli(event)
                 elif isinstance(event, SurfaceEvent):
                     await self._handle_surface(event)
                 elif isinstance(event, EmergencyEvent):
@@ -458,7 +505,15 @@ class SpeakingDaemon:
         await self.signal.start_typing(source)
         error: Optional[str] = None
         prev_kind = self._current_turn_kind
+        prev_channel = self._current_reply_channel
         self._current_turn_kind = "signal"
+        # ChannelRef so Alice can use recipient='self' on signal turns
+        # too. Phase 1 just stuffs the phone number into address; Phase 2
+        # routes via SignalTransport.send instead of direct signal_client
+        # access.
+        self._current_reply_channel = ChannelRef(
+            transport="signal", address=source, durable=True
+        )
         try:
             now = datetime.datetime.now().astimezone()
             stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
@@ -478,6 +533,7 @@ class SpeakingDaemon:
                 )
         finally:
             self._current_turn_kind = prev_kind
+            self._current_reply_channel = prev_channel
             await self.signal.stop_typing(source)
             # One turn_log entry per envelope so the inbound audit trail
             # is preserved regardless of batch size. Only the LAST envelope
@@ -506,6 +562,108 @@ class SpeakingDaemon:
                 error=error,
                 duration_ms=int((time.time() - started) * 1000),
             )
+
+    # ------------------------------------------------------------------
+    # CLI turn — local-socket transport for terminal users + agents.
+
+    async def _handle_cli(self, event: CLIEvent) -> None:
+        """Run one turn for a CLI message and signal completion to the
+        client when done.
+
+        CLI is conversational like Signal but ephemeral — the client
+        connection may have closed by the time the turn finishes. The
+        :class:`CLITransport` handles missing-writer cases by logging
+        and dropping; we don't need to detect them here.
+        """
+        assert self.cli_transport is not None
+        msg = event.message
+        turn_id = uuid.uuid4().hex[:12]
+        started = time.time()
+
+        self.events.emit(
+            "cli_turn_start",
+            turn_id=turn_id,
+            principal_id=msg.principal.native_id,
+            display_name=msg.principal.display_name,
+            inbound_chars=len(msg.text),
+            inbound=_short(msg.text, 600),
+        )
+
+        prev_kind = self._current_turn_kind
+        prev_channel = self._current_reply_channel
+        self._current_turn_kind = "cli"
+        self._current_reply_channel = msg.origin
+        error: Optional[str] = None
+        try:
+            now = datetime.datetime.now().astimezone()
+            stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
+            prompt = self._build_cli_prompt(
+                principal_name=msg.principal.display_name,
+                stamp=stamp,
+                text=msg.text,
+            )
+            await self._run_turn(
+                prompt,
+                turn_id=turn_id,
+                outbound_recipient=f"cli:{msg.principal.native_id}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("cli turn failed for %s", msg.principal.display_name)
+            error = f"{type(exc).__name__}: {exc}"
+            with contextlib.suppress(Exception):
+                await self.cli_transport.signal_error(msg.origin, error)
+        finally:
+            # Always tell the client the turn ended, even if Alice never
+            # called send_message — they need {"type":"done"} to know to
+            # prompt the user again. Errors are sent above, so we only
+            # send "done" on the success path.
+            if error is None:
+                with contextlib.suppress(Exception):
+                    await self.cli_transport.signal_done(msg.origin)
+            self._current_turn_kind = prev_kind
+            self._current_reply_channel = prev_channel
+            self.events.emit(
+                "cli_turn_end",
+                turn_id=turn_id,
+                principal_id=msg.principal.native_id,
+                error=error,
+                duration_ms=int((time.time() - started) * 1000),
+            )
+
+    def _build_cli_prompt(
+        self,
+        *,
+        principal_name: str,
+        stamp: str,
+        text: str,
+    ) -> str:
+        """Compose the prompt for a single CLI message.
+
+        Mirrors the Signal prompt's structure but tells Alice the channel
+        is local + interactive + markdown-capable, and instructs her to
+        reply via send_message(recipient='self').
+        """
+        cli_caps = self.cli_transport.caps if self.cli_transport else None
+        cap_fragment = (
+            render_module.capability_prompt_fragment("cli", cli_caps)
+            if cli_caps is not None
+            else ""
+        )
+        lines: list[str] = [
+            f"[CLI from {principal_name} | {stamp}]",
+            "",
+            text,
+            "",
+            "---",
+            cap_fragment,
+            "",
+            "To reply, call the `send_message` tool with "
+            "recipient='self' (replies on the same CLI socket the "
+            "message came from). Returning text alone will NOT reach "
+            "the user. If there's nothing useful to say, let the turn "
+            "close silently — the client will see an empty response.",
+        ]
+        return "\n".join(lines)
 
     def _build_signal_prompt(
         self,
@@ -766,8 +924,14 @@ class SpeakingDaemon:
         # kind so other guards know we're in emergency.
         was_emergency = getattr(self, "_emergency_bypass", False)
         prev_kind = self._current_turn_kind
+        prev_channel = self._current_reply_channel
         self._emergency_bypass = True
         self._current_turn_kind = "emergency"
+        # Emergency reply channel = the (sole) allowed sender's signal
+        # number. recipient='self' on an emergency turn routes here.
+        self._current_reply_channel = ChannelRef(
+            transport="signal", address=recipient, durable=True
+        )
         verdict = "unknown"
         action = "none"
         try:
@@ -804,6 +968,7 @@ class SpeakingDaemon:
         finally:
             self._emergency_bypass = was_emergency
             self._current_turn_kind = prev_kind
+            self._current_reply_channel = prev_channel
             if path.is_file():
                 self._archive_emergency(path, verdict=verdict, action=action)
             self._dispatched_emergencies.discard(path.name)
@@ -846,27 +1011,76 @@ class SpeakingDaemon:
         text: str,
         attachments: Optional[list[str]] = None,
     ) -> None:
-        """Send Signal text and update the daemon's did-send tracker.
+        """Dispatch send_message to the right transport and track did-send.
 
-        This is the closure passed to the send_message MCP tool. The tool
-        handles name-to-number resolution; by the time we land here the
-        recipient is already an E.164 number. ``attachments`` (if any)
-        have already been copied into the worker/daemon-shared spool
-        dir by the tool, so the paths are valid from inside the daemon
-        container.
+        Two recipient modes:
 
-        Quiet-hours policy: replies to inbound (signal turns) and
+        - ``recipient == SELF_RECIPIENT`` — Alice asked to reply on the
+          inbound channel. We look at ``self._current_reply_channel`` and
+          dispatch by transport (cli → CLITransport.send, signal → the
+          existing signal path with the current turn's source number).
+        - anything else — an explicit Signal recipient (E.164 number, by
+          the time the tool resolved it). Goes to the existing signal
+          path with the existing quiet-hours policy.
+
+        Quiet-hours policy (signal): replies to inbound (signal turns) and
         emergencies bypass the quiet queue — Owner expects an answer
-        when he asks something, regardless of the clock. Only
-        Alice-initiated thoughts (surface turns) honor quiet hours by
-        going through ``_send_or_queue``. Attachments only flow on the
-        bypass paths today; the quiet-queue stores text-only payloads
-        and dropping the attachments there would silently ditch media,
-        so surface turns with attachments are routed through the
-        immediate send path even during quiet hours when text would
-        normally queue. (Surface turns rarely have attachments; this
-        keeps the simple cases simple while not eating media.)
+        when he asks. Surface-triggered sends (Alice's own thoughts)
+        honor quiet hours via ``_send_or_queue``. Attachments always
+        bypass — the quiet queue stores text-only payloads and dropping
+        attachments there would silently ditch media.
+
+        CLI sends never queue: the user is at a terminal waiting; quiet
+        hours don't apply.
         """
+        # ---- Self-reply path: route by current reply channel's transport.
+        if recipient == SELF_RECIPIENT:
+            channel = self._current_reply_channel
+            if channel is None:
+                raise RuntimeError(
+                    "send_message(recipient='self') has no inbound channel "
+                    "to reply on (only valid during a signal/cli turn)"
+                )
+            if channel.transport == "cli":
+                if self.cli_transport is None:
+                    raise RuntimeError("cli transport disabled but reply requested")
+                if attachments:
+                    log.warning(
+                        "ignoring %d attachment(s) for cli reply; cli does "
+                        "not support outbound files yet",
+                        len(attachments),
+                    )
+                # Render Alice's text per the CLI capability profile.
+                # Today CLI is markdown=full so render is a near-no-op,
+                # but going through render keeps the wiring consistent
+                # with future Signal/Discord paths.
+                chunks = render_module.render(text, self.cli_transport.caps)
+                for chunk in chunks:
+                    await self.cli_transport.send(
+                        OutboundMessage(destination=channel, text=chunk)
+                    )
+                self.events.emit(
+                    "cli_send",
+                    principal_id=channel.address,
+                    text_len=len(text),
+                    chunk_count=len(chunks),
+                )
+                self._turn_last_outbound = text
+                self._turn_did_send = True
+                return
+            if channel.transport == "signal":
+                # Convert ChannelRef back to phone number — for Phase 1
+                # the address IS the phone number when the inbound came
+                # over signal. (Phase 2 will normalize this through the
+                # transport.)
+                recipient = channel.address
+                # fall through to signal path below
+            else:
+                raise RuntimeError(
+                    f"don't know how to send to transport '{channel.transport}'"
+                )
+
+        # ---- Signal path (unchanged behavior).
         emergency = getattr(self, "_emergency_bypass", False)
         bypass_quiet = (
             emergency

@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""alice-client — speaks the CLITransport socket protocol.
+
+Runs *inside* the worker container (the host wrapper at bin/alice does
+the docker-exec dance). Connects to ``/state/alice.sock`` (override with
+``ALICE_CLI_SOCKET``), sends a message, and prints Alice's reply chunks
+to stdout until she signals ``done``.
+
+Two modes:
+
+    alice-client -p "what's on today?"   # one-shot — print and exit
+    alice-client                          # interactive — REPL over the
+                                          # same socket; one connection,
+                                          # many turns
+
+A ``--json`` flag emits the raw event stream (one JSON event per line)
+to stdout instead of human-friendly chunks. Useful for agents driving
+Alice programmatically.
+
+Exit codes:
+    0   one or more turns completed (or interactive mode exited cleanly)
+    1   protocol or transport error (socket missing, malformed event)
+    2   Alice replied with type=error
+    3   client error (bad arguments, can't reach socket)
+
+Stays small on purpose — no third-party deps, just stdlib.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import socket
+import sys
+from typing import Iterator, Optional
+
+
+DEFAULT_SOCKET = "/state/alice.sock"
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="alice-client",
+        description="Talk to Alice over the local CLI transport socket.",
+    )
+    p.add_argument(
+        "-p",
+        "--prompt",
+        help="One-shot prompt. If absent, run an interactive REPL.",
+    )
+    p.add_argument(
+        "--socket",
+        default=os.environ.get("ALICE_CLI_SOCKET", DEFAULT_SOCKET),
+        help=f"Path to alice's socket (default: {DEFAULT_SOCKET})",
+    )
+    p.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_mode",
+        help="Emit raw JSON events to stdout (one per line). For agents.",
+    )
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="Per-turn timeout in seconds (default: no timeout).",
+    )
+    return p.parse_args(argv)
+
+
+def connect(path: str) -> socket.socket:
+    if not pathlib.Path(path).exists():
+        sys.stderr.write(
+            f"alice-client: socket not found at {path}\n"
+            "is the alice-speaking service running?\n"
+        )
+        sys.exit(3)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(path)
+    except (PermissionError, ConnectionRefusedError, FileNotFoundError) as exc:
+        sys.stderr.write(f"alice-client: cannot connect to {path}: {exc}\n")
+        sys.exit(3)
+    return sock
+
+
+def send_message(sock: socket.socket, text: str) -> None:
+    payload = json.dumps({"type": "message", "text": text}) + "\n"
+    sock.sendall(payload.encode("utf-8"))
+
+
+def event_stream(sock: socket.socket) -> Iterator[dict]:
+    """Read newline-delimited JSON events from the socket."""
+    buf = b""
+    while True:
+        try:
+            chunk = sock.recv(65536)
+        except (ConnectionError, OSError):
+            return
+        if not chunk:
+            return
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            if not line.strip():
+                continue
+            try:
+                yield json.loads(line.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                sys.stderr.write(f"alice-client: malformed event: {exc}\n")
+
+
+def drain_one_turn(
+    sock: socket.socket,
+    *,
+    json_mode: bool,
+    timeout: Optional[float],
+) -> int:
+    """Read events until ``done`` or ``error``. Returns an exit hint:
+    0 on success, 2 on Alice-reported error.
+    """
+    if timeout is not None:
+        sock.settimeout(timeout)
+    error_seen = False
+    for event in event_stream(sock):
+        if json_mode:
+            sys.stdout.write(json.dumps(event) + "\n")
+            sys.stdout.flush()
+        etype = event.get("type")
+        if etype == "chunk":
+            if not json_mode:
+                sys.stdout.write(event.get("text", ""))
+                sys.stdout.flush()
+        elif etype == "error":
+            error_seen = True
+            if not json_mode:
+                sys.stderr.write(
+                    "alice-client: error from alice: "
+                    f"{event.get('message', 'unspecified')}\n"
+                )
+        elif etype == "done":
+            if not json_mode:
+                # Trailing newline so the prompt sits on its own line.
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+            return 2 if error_seen else 0
+        # ack / tool_use / unknown — pass through (json mode only).
+    # Stream ended without "done" — connection died.
+    if not json_mode:
+        sys.stderr.write("\nalice-client: connection closed before turn ended\n")
+    return 1
+
+
+def run_one_shot(sock: socket.socket, args: argparse.Namespace) -> int:
+    send_message(sock, args.prompt)
+    return drain_one_turn(sock, json_mode=args.json_mode, timeout=args.timeout)
+
+
+def run_interactive(sock: socket.socket, args: argparse.Namespace) -> int:
+    if not args.json_mode:
+        sys.stderr.write(
+            "alice-client: interactive mode (Ctrl-D to exit). Type a message and press Enter.\n"
+        )
+    while True:
+        if not args.json_mode:
+            sys.stderr.write("> ")
+            sys.stderr.flush()
+        try:
+            line = sys.stdin.readline()
+        except KeyboardInterrupt:
+            sys.stderr.write("\n")
+            return 0
+        if not line:
+            # EOF
+            if not args.json_mode:
+                sys.stderr.write("\n")
+            return 0
+        text = line.rstrip("\n")
+        if not text.strip():
+            continue
+        send_message(sock, text)
+        rc = drain_one_turn(
+            sock, json_mode=args.json_mode, timeout=args.timeout
+        )
+        if rc != 0:
+            # Connection problem — exit. (Alice-reported errors continue.)
+            if rc == 1:
+                return 1
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    sock = connect(args.socket)
+    try:
+        if args.prompt is not None:
+            return run_one_shot(sock, args)
+        return run_interactive(sock, args)
+    finally:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        sock.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
