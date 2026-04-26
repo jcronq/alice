@@ -1,44 +1,53 @@
 #!/command/with-contenv bash
-# alice-thinker — timer loop that fires alice-think on a configurable cadence.
+# alice-thinker — timer loop that fires alice-think on a mode-aware cadence.
 # Singleton enforced by `flock -n` on a shared lock; a second firing skips
 # rather than queues, matching the REM-cycle design where overlap is bad.
 #
-# Reads cadence_minutes from alice.config.json at each iteration, so live
-# config changes take effect on the next cycle boundary.
+# Mode-aware cadence per Alice's active/sleep design:
+#   sleep mode (23:00–07:00): vault grooming, fast cadence (default 5 min)
+#   active mode (07:00–23:00): generative learning, slower cadence (default 30 min)
+#
+# Reads `thinking.rem_cadence_minutes` and `thinking.active_cadence_minutes`
+# from alice.config.json at each iteration, so live config changes take
+# effect on the next cycle boundary. See cortex-memory/reference/design-day-night-modes.md.
 set -e
 
 LOCK=/state/worker/thinking.lock
 CONFIG_JSON=/home/alice/alice-mind/config/alice.config.json
-DEFAULT_CADENCE_MIN=30
+DEFAULT_REM_CADENCE_MIN=5
+DEFAULT_ACTIVE_CADENCE_MIN=30
 
-# Ensure the state dir + lock file exist so flock can open them.
 mkdir -p "$(dirname "$LOCK")"
 touch "$LOCK"
 chown alice:alice "$LOCK" || true
 
-# Wait a bit on startup so Alice's speaking hemisphere has a chance to settle
-# before thinking starts burning tokens.
 sleep 60
 
 while true; do
-    cadence_min="$DEFAULT_CADENCE_MIN"
+    hour=$(date +%H)
+    hour=${hour#0}
+    if [ "$hour" -lt 7 ] || [ "$hour" -ge 23 ]; then
+        mode=sleep
+        default_min="$DEFAULT_REM_CADENCE_MIN"
+        config_key=rem_cadence_minutes
+    else
+        mode=active
+        default_min="$DEFAULT_ACTIVE_CADENCE_MIN"
+        config_key=active_cadence_minutes
+    fi
+
+    cadence_min="$default_min"
     if [ -f "$CONFIG_JSON" ] && command -v jq >/dev/null 2>&1; then
-        v=$(jq -r '.thinking.cadence_minutes // empty' "$CONFIG_JSON" 2>/dev/null || true)
+        v=$(jq -r ".thinking.$config_key // empty" "$CONFIG_JSON" 2>/dev/null || true)
         case "$v" in
-            ''|*[!0-9]*) ;;  # invalid / empty — keep default
+            ''|*[!0-9]*) ;;
             *) cadence_min="$v" ;;
         esac
     fi
     cadence=$(( cadence_min * 60 ))
 
-    # Target a fixed gap between wake STARTS (not between end-and-next-start).
-    # A 3-minute wake on a 5-minute cadence sleeps 2 minutes; an 8-minute wake
-    # fires immediately. Cadence is the floor, not the floor-plus-wake-time.
     start_ts=$(date +%s)
-
-    # `flock -n` → non-blocking; if already held, skip this wake entirely.
     flock -n "$LOCK" s6-setuidgid alice /usr/local/bin/alice-think || true
-
     end_ts=$(date +%s)
     elapsed=$(( end_ts - start_ts ))
     remainder=$(( cadence - elapsed ))
