@@ -810,34 +810,54 @@ class SpeakingDaemon:
     # ------------------------------------------------------------------
     # send_message router (closure given to tools.messaging)
 
-    async def _send_message(self, recipient: str, text: str) -> None:
+    async def _send_message(
+        self,
+        recipient: str,
+        text: str,
+        attachments: Optional[list[str]] = None,
+    ) -> None:
         """Send Signal text and update the daemon's did-send tracker.
 
         This is the closure passed to the send_message MCP tool. The tool
         handles name-to-number resolution; by the time we land here the
-        recipient is already an E.164 number.
+        recipient is already an E.164 number. ``attachments`` (if any)
+        have already been copied into the worker/daemon-shared spool
+        dir by the tool, so the paths are valid from inside the daemon
+        container.
 
         Quiet-hours policy: replies to inbound (signal turns) and
         emergencies bypass the quiet queue — Owner expects an answer
         when he asks something, regardless of the clock. Only
         Alice-initiated thoughts (surface turns) honor quiet hours by
-        going through ``_send_or_queue``.
+        going through ``_send_or_queue``. Attachments only flow on the
+        bypass paths today; the quiet-queue stores text-only payloads
+        and dropping the attachments there would silently ditch media,
+        so surface turns with attachments are routed through the
+        immediate send path even during quiet hours when text would
+        normally queue. (Surface turns rarely have attachments; this
+        keeps the simple cases simple while not eating media.)
         """
         emergency = getattr(self, "_emergency_bypass", False)
-        bypass_quiet = emergency or self._current_turn_kind == "signal"
+        bypass_quiet = (
+            emergency
+            or self._current_turn_kind == "signal"
+            or bool(attachments)  # see docstring
+        )
         if bypass_quiet:
-            await self.signal.send(recipient, text)
+            await self.signal.send(recipient, text, attachments=attachments)
             log.info(
-                "%s send to %s (%d chars)",
+                "%s send to %s (%d chars%s)",
                 "emergency" if emergency else "reply",
                 recipient,
                 len(text),
+                f", {len(attachments)} attachment(s)" if attachments else "",
             )
             self.events.emit(
                 "signal_send",
                 recipient=recipient,
                 sender_name=self._sender_name_for(recipient),
                 text_len=len(text),
+                attachment_count=len(attachments) if attachments else 0,
                 emergency=emergency,
                 bypassed_quiet=is_quiet_hours(self.cfg.speaking),
             )

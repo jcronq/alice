@@ -17,7 +17,7 @@ import logging
 import os
 import pathlib
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Optional
+from typing import Any, AsyncIterator, Optional
 
 import httpx
 
@@ -107,18 +107,37 @@ class SignalClient:
             f"signal-cli daemon not reachable at {self.api} after {timeout_seconds}s: {last_error}"
         )
 
-    async def send(self, recipient: str, text: str) -> None:
+    async def send(
+        self,
+        recipient: str,
+        text: str,
+        attachments: Optional[list[str]] = None,
+    ) -> None:
+        """Send a Signal message, optionally with one or more attachments.
+
+        ``attachments`` is a list of filesystem paths visible **inside the
+        signal-cli daemon's container**. Cross-container path resolution
+        is the caller's responsibility — see ``tools/messaging.py`` for
+        the spool-dir copy strategy that the MCP tool uses.
+
+        Attachments only ride along on the FIRST chunk when the message
+        is split — sending them on every chunk would multiply the upload
+        and look like duplicate media to the recipient.
+        """
         chunks = _chunk(text, _CHUNK_LIMIT)
         total = len(chunks)
         for i, chunk in enumerate(chunks, start=1):
             payload = f"({i}/{total}) {chunk}" if total > 1 else chunk
+            params: dict[str, Any] = {
+                "account": self.account,
+                "message": payload,
+                "recipients": [recipient],
+            }
+            if attachments and i == 1:
+                params["attachments"] = list(attachments)
             await self._rpc(
                 "send",
-                {
-                    "account": self.account,
-                    "message": payload,
-                    "recipients": [recipient],
-                },
+                params,
                 request_id=f"send-{i}",
             )
 

@@ -55,9 +55,16 @@ def _result(
 class FakeSignal:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
+        self.sent_with_attachments: list[tuple[str, str, list[str] | None]] = []
 
-    async def send(self, recipient: str, text: str) -> None:
+    async def send(
+        self,
+        recipient: str,
+        text: str,
+        attachments: list[str] | None = None,
+    ) -> None:
         self.sent.append((recipient, text))
+        self.sent_with_attachments.append((recipient, text, attachments))
 
     async def start_typing(self, recipient: str) -> None:
         pass
