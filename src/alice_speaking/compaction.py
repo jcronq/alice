@@ -50,18 +50,30 @@ COMPACTION_PROMPT = (
 def should_compact(
     usage: Optional[dict[str, Any]], threshold: int
 ) -> bool:
-    """Return True when input_tokens from the last turn exceeds the
-    threshold. Tolerates missing / non-integer fields — a missing usage
-    dict is treated as "no token pressure" (better to skip than to
-    compact on phantom data)."""
+    """Return True when the effective context size from the last turn
+    exceeds the threshold.
+
+    "Effective" = input_tokens + cache_read_input_tokens +
+    cache_creation_input_tokens. For Signal turns the SDK accumulates
+    cache_read_input_tokens across all API calls in a single query()
+    invocation; input_tokens alone is always tiny (7-23) and would
+    never cross the threshold.
+
+    Tolerates missing / non-integer fields — a missing usage dict is
+    treated as "no token pressure" (better to skip than compact on
+    phantom data).
+    """
     if not usage or not isinstance(usage, dict):
         return False
-    raw = usage.get("input_tokens")
     try:
-        input_tokens = int(raw) if raw is not None else 0
+        effective = (
+            int(usage.get("input_tokens") or 0)
+            + int(usage.get("cache_read_input_tokens") or 0)
+            + int(usage.get("cache_creation_input_tokens") or 0)
+        )
     except (TypeError, ValueError):
         return False
-    return input_tokens > threshold
+    return effective > threshold
 
 
 def build_summary_preamble(

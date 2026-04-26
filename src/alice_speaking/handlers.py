@@ -89,10 +89,19 @@ class CompactionArmer(NullHandler):
             return
         if compaction_module.should_compact(msg.usage, self._threshold):
             self._arm()
+            effective = (
+                (msg.usage.get("input_tokens") or 0)
+                + (msg.usage.get("cache_read_input_tokens") or 0)
+                + (msg.usage.get("cache_creation_input_tokens") or 0)
+            )
             log.info(
-                "compaction armed (input_tokens=%s > threshold=%d)",
-                msg.usage.get("input_tokens"),
+                "compaction armed (effective_tokens=%d > threshold=%d; "
+                "input=%s cache_read=%s cache_create=%s)",
+                effective,
                 self._threshold,
+                msg.usage.get("input_tokens"),
+                msg.usage.get("cache_read_input_tokens"),
+                msg.usage.get("cache_creation_input_tokens"),
             )
 
 

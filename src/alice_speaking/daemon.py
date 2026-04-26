@@ -19,7 +19,8 @@ cortex-memory/reference/design-unified-context-compaction.md):
   JSONL has been deleted, or resume= fails at runtime, the daemon falls
   back to a silent bootstrap turn that injects render_for_prompt of the
   recent turn_log. That turn's session_id becomes the active session.
-- Compaction: after each turn, if usage.input_tokens exceeds
+- Compaction: after each turn, if effective context tokens (input +
+  cache_read + cache_creation) exceed
   ``cfg.speaking["context_compaction_threshold"]``, a flag is set. The
   consumer runs a silent compaction turn before the next event, writes
   a 4-part summary to ``inner/state/context-summary.md``, rolls the
@@ -158,6 +159,10 @@ class SpeakingDaemon:
         # call to _run_turn(); flipped to True by _send_message when Alice
         # explicitly sends. Used to flag missed_reply events.
         self._turn_did_send: bool = False
+        # Per-turn outbound text capture. Set to None at start of each turn;
+        # _send_message records the most recent outbound text here so the
+        # turn_log entry can attach it (Layer 2 bootstrap relies on this).
+        self._turn_last_outbound: Optional[str] = None
         # Current turn kind — set by _handle_signal/_handle_surface/
         # _handle_emergency at entry, reset in finally. _send_message
         # uses this to decide whether to honor quiet hours: signal +
@@ -255,8 +260,26 @@ class SpeakingDaemon:
             await self._queue.put(SignalEvent(envelope=env, sender=sender))
 
     async def _surface_producer(self) -> None:
+        """Watch ``inner/surface/`` for new .md surfaces and queue them.
+
+        Flat-file only. Files in subdirs of ``inner/surface/`` (other than
+        ``.handled/``) will not be picked up — the glob is non-recursive.
+        Producers of surfaces (thinking Alice, manual injects) must drop
+        files at the top level of the surface directory.
+        """
         self._surface_dir.mkdir(parents=True, exist_ok=True)
         self._surface_handled_dir.mkdir(parents=True, exist_ok=True)
+        # One-shot drift check — warn if surfaces are stranded in subdirs
+        for entry in self._surface_dir.iterdir():
+            if entry.is_dir() and entry.name not in (".handled",):
+                md_count = len(list(entry.glob("*.md")))
+                if md_count:
+                    log.warning(
+                        "surface drift: %d .md file(s) in subdir %s — "
+                        "_surface_producer is non-recursive; these will not dispatch. "
+                        "Move them to flat inner/surface/ format.",
+                        md_count, entry.name,
+                    )
         while not self._stop.is_set():
             try:
                 for path in sorted(self._surface_dir.glob("*.md")):
@@ -457,14 +480,21 @@ class SpeakingDaemon:
             self._current_turn_kind = prev_kind
             await self.signal.stop_typing(source)
             # One turn_log entry per envelope so the inbound audit trail
-            # is preserved regardless of batch size.
-            for ev in batch:
+            # is preserved regardless of batch size. Only the LAST envelope
+            # in the batch carries the outbound text — earlier envelopes
+            # get None so render_for_prompt() doesn't emit duplicate
+            # `[alice]` lines for what was a single reply.
+            for i, ev in enumerate(batch):
                 self.turns.append(
                     new_turn(
                         sender_number=ev.envelope.source,
                         sender_name=sender.name,
                         inbound=ev.envelope.body,
-                        outbound=None,
+                        outbound=(
+                            self._turn_last_outbound
+                            if i == len(batch) - 1
+                            else None
+                        ),
                         error=error,
                     )
                 )
@@ -868,6 +898,7 @@ class SpeakingDaemon:
                 text,
                 self._sender_name_for(recipient),
             )
+        self._turn_last_outbound = text
         self._turn_did_send = True
 
     def _sender_name_for(self, recipient: str) -> str:
@@ -901,6 +932,7 @@ class SpeakingDaemon:
         turns which consume the summary).
         """
         self._turn_did_send = False
+        self._turn_last_outbound = None   # reset per turn
 
         final_prompt = self._compose_prompt(prompt)
         spec = self._build_spec()

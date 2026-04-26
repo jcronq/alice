@@ -45,6 +45,34 @@ def test_should_compact_malformed_usage() -> None:
     assert compaction.should_compact("not a dict", 150_000) is False
 
 
+def test_should_compact_uses_effective_total() -> None:
+    """Real Signal-turn failure mode: input_tokens is tiny (7-23) but
+    cache_read_input_tokens accumulates across all API calls in the
+    query() invocation and can exceed 800K. Compaction must fire on
+    the effective total, not input_tokens alone."""
+    # cache_read alone pushes past threshold
+    assert compaction.should_compact(
+        {"input_tokens": 10, "cache_read_input_tokens": 800_000}, 150_000
+    ) is True
+    # cache_creation alone pushes past threshold
+    assert compaction.should_compact(
+        {"input_tokens": 10, "cache_creation_input_tokens": 200_000}, 150_000
+    ) is True
+    # Combined still below threshold → False
+    assert compaction.should_compact(
+        {"input_tokens": 10, "cache_read_input_tokens": 50_000}, 150_000
+    ) is False
+    # All three fields summed push past threshold
+    assert compaction.should_compact(
+        {
+            "input_tokens": 10,
+            "cache_read_input_tokens": 100_000,
+            "cache_creation_input_tokens": 60_000,
+        },
+        150_000,
+    ) is True
+
+
 # -------------------------------------------------------- preamble builders
 
 
