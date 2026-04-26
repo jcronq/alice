@@ -8,8 +8,13 @@
     Click a node to view its file path.
   </p>
 
-  <div class="flex" style="margin: 8px 0;">
+  <div class="flex" style="margin: 8px 0; align-items: center; gap: 12px; flex-wrap: wrap;">
+    <input type="search" id="memsearch" placeholder="search… (e.g. day night thinking)"
+           style="flex: 1 1 280px; min-width: 220px; padding: 4px 8px; background: var(--panel-2);
+                  color: var(--text); border: 1px solid var(--border); border-radius: 4px;
+                  font: inherit;" />
     <label class="muted"><input type="checkbox" id="show-ghosts" checked> show unresolved links</label>
+    <span class="muted" id="search-info"></span>
     <span class="muted" id="node-count">—</span>
   </div>
 
@@ -50,6 +55,38 @@
 
       let nodes = data.nodes.slice();
       let edges = data.edges.slice();
+
+      // Search state lives outside render() so it survives ghost-toggle
+      // re-renders. matchIds = null means "no active search" (everything
+      // shown at full strength). topId = the highest-scoring match.
+      let matchIds = null;
+      let topId = null;
+      // Refs to the live d3 selections so applySearch() can re-style after
+      // each render and after focus-mouseleave clears.
+      let nodeSelRef = null;
+      let linkSelRef = null;
+
+      const applySearch = () => {
+        if (!nodeSelRef) return;
+        const circles = nodeSelRef.select('circle');
+        if (!matchIds) {
+          nodeSelRef.style('opacity', null);
+          circles.style('stroke', null).style('stroke-width', null);
+          if (linkSelRef) linkSelRef.style('opacity', null);
+          return;
+        }
+        nodeSelRef.style('opacity', n => matchIds.has(n.id) ? 1 : 0.08);
+        circles
+          .style('stroke', n => n.id === topId ? '#ffffff' : null)
+          .style('stroke-width', n => n.id === topId ? 3 : null);
+        if (linkSelRef) {
+          linkSelRef.style('opacity', e => {
+            const s = (e.source && e.source.id) || e.source;
+            const t = (e.target && e.target.id) || e.target;
+            return (matchIds.has(s) && matchIds.has(t)) ? 0.6 : 0.05;
+          });
+        }
+      };
 
       const render = () => {
         zoomG.selectAll('*').remove();
@@ -108,6 +145,14 @@
         try { window.attachGraphFocus({ nodeSel, linkSel: link, edges: activeEdges }); }
         catch (err) { console.error('attachGraphFocus failed', err); }
 
+        // Expose live selections for the search overlay, then re-apply
+        // current search state after this render. The .search namespace
+        // re-applies search-dim after focus's mouseleave clears styles.
+        nodeSelRef = nodeSel;
+        linkSelRef = link;
+        nodeSel.on('mouseleave.search', applySearch);
+        applySearch();
+
         try {
           window.attachGraphTuning({
             key: 'memory',
@@ -123,6 +168,57 @@
 
       render();
       document.getElementById('show-ghosts').addEventListener('change', render);
+
+      // ---- Search wiring -----------------------------------------------
+      const searchInput = document.getElementById('memsearch');
+      const searchInfo = document.getElementById('search-info');
+      let searchTimer = null;
+      let lastResults = [];
+
+      const runSearch = async (q) => {
+        const trimmed = q.trim();
+        if (!trimmed) {
+          matchIds = null;
+          topId = null;
+          lastResults = [];
+          searchInfo.textContent = '';
+          applySearch();
+          return;
+        }
+        try {
+          const res = await fetch('/api/memory/search?q=' + encodeURIComponent(trimmed));
+          const data = await res.json();
+          lastResults = data.results || [];
+          matchIds = new Set(lastResults.map(r => r.id));
+          topId = lastResults.length ? lastResults[0].id : null;
+          searchInfo.textContent = lastResults.length
+            ? `${lastResults.length} match${lastResults.length === 1 ? '' : 'es'} · top: ${lastResults[0].label}`
+            : 'no matches';
+          applySearch();
+        } catch (e) {
+          console.error('search failed', e);
+          searchInfo.textContent = 'search error';
+        }
+      };
+
+      searchInput.addEventListener('input', () => {
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(() => runSearch(searchInput.value), 150);
+      });
+
+      searchInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          searchInput.value = '';
+          clearTimeout(searchTimer);
+          runSearch('');
+        } else if (e.key === 'Enter' && lastResults.length) {
+          e.preventDefault();
+          const top = lastResults[0];
+          const node = nodes.find(n => n.id === top.id);
+          if (node) window.openMemoryNodeModal(node);
+        }
+      });
     })();
   </script>
 {% endblock %}

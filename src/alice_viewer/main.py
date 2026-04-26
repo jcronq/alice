@@ -30,6 +30,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     templates.env.filters["localtime"] = _localtime
     templates.env.filters["ago"] = _ago
+    templates.env.filters["tokens"] = _tokens
     templates.env.filters["pretty_json"] = _pretty_json
     templates.env.filters["humanize_kind"] = kind_labels.humanize
     templates.env.filters["kind_family"] = kind_labels.family
@@ -56,6 +57,8 @@ def create_app(paths: Paths | None = None) -> FastAPI:
             "total_wakes": len(wakes),
             "total_turns": len(turns),
             "event_count": len(events),
+            "speaking_usage": aggregators.latest_speaking_usage(events),
+            "thinking_avg": aggregators.thinking_usage_average(events),
         }
 
     # ------------------------------------------------------------------
@@ -178,12 +181,16 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         wakes = aggregators.group_wakes(events)
         wake = next((w for w in wakes if w.wake_id == wake_id), None)
         summary = aggregators.summarize_wake(wake, run_summary) if wake else None
+        thought = (
+            sources.find_wake_thought(events, wake.start_ts, wake.end_ts) if wake else None
+        )
         return templates.TemplateResponse(
             request,
             "wake_detail.html",
             {
                 "wake": wake,
                 "summary": summary,
+                "thought": thought,
                 "state": _state_context(),
                 "active": "wakes",
             },
@@ -465,6 +472,13 @@ def create_app(paths: Paths | None = None) -> FastAPI:
             }
         )
 
+    @app.get("/api/memory/search")
+    async def api_memory_search(q: str = "", limit: int = 25) -> JSONResponse:
+        """Rank memory notes by token-AND match across label/frontmatter/body."""
+        p: Paths = app.state.paths
+        results = sources.search_memory(p.mind_dir, q, limit=limit)
+        return JSONResponse({"query": q, "results": results})
+
     @app.get("/api/memory/note")
     async def api_memory_note(id: str) -> JSONResponse:
         """Return a memory note's body + frontmatter for the graph modal."""
@@ -589,6 +603,17 @@ def _ago(ts: float | None) -> str:
     if delta < 86400:
         return f"{int(delta // 3600)}h ago"
     return f"{int(delta // 86400)}d ago"
+
+
+def _tokens(n: int | float | None) -> str:
+    if not n:
+        return "0"
+    n = int(n)
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1000:.1f}K"
+    return f"{n / 1_000_000:.2f}M"
 
 
 def _pretty_json(obj: Any) -> str:

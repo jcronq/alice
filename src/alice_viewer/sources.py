@@ -531,6 +531,44 @@ def read_directive(inner: pathlib.Path) -> str:
     return _read_text(inner / "directive.md")
 
 
+def find_wake_thought(
+    events: list[UnifiedEvent],
+    wake_start_ts: float,
+    wake_end_ts: float | None,
+) -> dict[str, Any] | None:
+    """Locate the `*-wake.md` thought file written during this wake.
+
+    Matches by file mtime (the `thought_written` event ts) rather than
+    parsing the filename, since filename HHMMSS reflects the writer's
+    local TZ which may differ from the viewer process's TZ. Picks the
+    closest `*-wake.md` whose mtime falls between wake start and end
+    (or start + 2h if the wake never closed cleanly).
+    """
+    upper = (wake_end_ts if wake_end_ts is not None else wake_start_ts + 7200) + 60
+    best: UnifiedEvent | None = None
+    best_delta: float | None = None
+    for ev in events:
+        if ev.kind != "thought_written":
+            continue
+        filename = (ev.detail or {}).get("filename") or ""
+        if not filename.endswith("-wake.md"):
+            continue
+        if ev.ts < wake_start_ts - 5 or ev.ts > upper:
+            continue
+        delta = abs(ev.ts - wake_start_ts)
+        if best_delta is None or delta < best_delta:
+            best = ev
+            best_delta = delta
+    if best is None:
+        return None
+    d = best.detail or {}
+    return {
+        "filename": d.get("filename") or best.correlation_id or "wake.md",
+        "body": d.get("body") or "",
+        "path": d.get("path") or "",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Memory graph source
 
@@ -628,6 +666,92 @@ def read_memory_graph(mind: pathlib.Path) -> tuple[list[MemoryNode], list[Memory
             edges.append(MemoryEdge(source=src_id, target=target_id))
 
     return list(nodes.values()), edges
+
+
+def search_memory(
+    mind: pathlib.Path, query: str, limit: int = 25
+) -> list[dict[str, Any]]:
+    """Token-AND search across cortex-memory + legacy memory/.
+
+    A note matches when *every* whitespace-separated token in the query
+    appears (case-insensitive substring) somewhere in its label, frontmatter
+    title/aliases/tags, or body. Hits in the strong haystack score 10×
+    body hits; an all-strong match gets a +20 bonus so labelled hits float
+    to the top. Returns ranked records `{id, label, title, score,
+    matched_in}`. Body of the note is not returned — fetch via
+    /api/memory/note for that.
+    """
+    tokens = [t.lower() for t in query.split() if t]
+    if not tokens:
+        return []
+
+    results: list[dict[str, Any]] = []
+    for root_name in ("cortex-memory", "memory"):
+        root = mind / root_name
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*.md"):
+            try:
+                rel = path.relative_to(mind).with_suffix("")
+            except ValueError:
+                continue
+            body = _read_text(path)
+            if not body:
+                continue
+
+            fm_match = FRONTMATTER_RE.match(body)
+            if fm_match:
+                fm_text = fm_match.group(1)
+                body_text = body[fm_match.end():]
+            else:
+                fm_text = ""
+                body_text = body
+
+            label = path.stem
+            strong = (label + " " + fm_text).lower()
+            weak = body_text.lower()
+
+            score = 0
+            strong_hits = 0
+            weak_hits = 0
+            for tok in tokens:
+                if tok in strong:
+                    strong_hits += 1
+                    score += 10
+                elif tok in weak:
+                    weak_hits += 1
+                    score += 1
+                else:
+                    score = 0
+                    break
+
+            if score == 0:
+                continue
+            if strong_hits == len(tokens):
+                score += 20
+                matched_in = "label/title/aliases"
+            elif weak_hits == len(tokens):
+                matched_in = "body"
+            else:
+                matched_in = "mixed"
+
+            # Title from frontmatter, if any — used for display.
+            title = ""
+            for line in fm_text.splitlines():
+                if line.startswith("title:"):
+                    title = line.partition(":")[2].strip()
+                    break
+
+            results.append({
+                "id": str(rel),
+                "label": label,
+                "title": title,
+                "score": score,
+                "matched_in": matched_in,
+            })
+
+    results.sort(key=lambda r: (-r["score"], r["label"]))
+    return results[:limit]
 
 
 # ---------------------------------------------------------------------------
