@@ -343,6 +343,83 @@ def group_turns(events: list[UnifiedEvent]) -> list[Turn]:
 
 
 # ---------------------------------------------------------------------------
+# Token-usage stats — sidebar metrics
+
+
+def _usage_breakdown(usage: dict[str, Any]) -> dict[str, int]:
+    """Pull the four headline token counts off an SDK `result.usage` payload."""
+    return {
+        "input": int(usage.get("input_tokens") or 0),
+        "cache_creation": int(usage.get("cache_creation_input_tokens") or 0),
+        "cache_read": int(usage.get("cache_read_input_tokens") or 0),
+        "output": int(usage.get("output_tokens") or 0),
+    }
+
+
+def _last_iteration(usage: dict[str, Any]) -> dict[str, int] | None:
+    """The trailing iteration's tokens — closest analog to `/context` after the run."""
+    iters = usage.get("iterations") or []
+    if not iters:
+        return None
+    last = iters[-1]
+    return {
+        "input": int(last.get("input_tokens") or 0),
+        "cache_creation": int(last.get("cache_creation_input_tokens") or 0),
+        "cache_read": int(last.get("cache_read_input_tokens") or 0),
+        "output": int(last.get("output_tokens") or 0),
+    }
+
+
+def latest_speaking_usage(events: list[UnifiedEvent]) -> dict[str, Any] | None:
+    """Token snapshot from the most recent speaking `result` event."""
+    latest: UnifiedEvent | None = None
+    for ev in events:
+        if ev.hemisphere != "speaking" or ev.kind != "result":
+            continue
+        if latest is None or ev.ts > latest.ts:
+            latest = ev
+    if latest is None:
+        return None
+    usage = latest.detail.get("usage") or {}
+    totals = _usage_breakdown(usage)
+    last_iter = _last_iteration(usage)
+    iters = usage.get("iterations") or []
+    return {
+        "ts": latest.ts,
+        "turn_id": latest.correlation_id,
+        "totals": totals,
+        "context": last_iter,           # snapshot at end of run (≈ /context output)
+        "iterations": len(iters),
+        "model": (latest.detail or {}).get("model"),
+    }
+
+
+def thinking_usage_average(
+    events: list[UnifiedEvent], *, window_seconds: float = 86400, now_ts: float | None = None
+) -> dict[str, Any] | None:
+    """Average the four token counts over thinking results in the last window."""
+    import time as _time
+    cutoff = (now_ts if now_ts is not None else _time.time()) - window_seconds
+    results = [
+        e for e in events
+        if e.hemisphere == "thinking" and e.kind == "result" and e.ts >= cutoff
+    ]
+    if not results:
+        return None
+    totals = {"input": 0, "cache_creation": 0, "cache_read": 0, "output": 0}
+    for ev in results:
+        b = _usage_breakdown(ev.detail.get("usage") or {})
+        for k in totals:
+            totals[k] += b[k]
+    n = len(results)
+    return {
+        "samples": n,
+        "window_hours": int(window_seconds // 3600),
+        "avg": {k: totals[k] // n for k in totals},
+    }
+
+
+# ---------------------------------------------------------------------------
 # Interaction DAG
 
 

@@ -32,14 +32,35 @@
   <div class="layout">
     <aside class="sidebar">
       <section>
-        <h3>state</h3>
+        <h3>speaking · last turn{% if state.speaking_usage %} <span class="muted">({{ state.speaking_usage.ts | ago }})</span>{% endif %}</h3>
+        {% if state.speaking_usage and state.speaking_usage.context %}
+          {% set ctx = state.speaking_usage.context %}
+          <div class="metric"><span class="k">context</span><span class="v">{{ (ctx.input + ctx.cache_creation + ctx.cache_read) | tokens }}</span></div>
+          <div class="metric"><span class="k">input</span><span class="v">{{ ctx.input | tokens }}</span></div>
+          <div class="metric"><span class="k">cache write</span><span class="v">{{ ctx.cache_creation | tokens }}</span></div>
+          <div class="metric"><span class="k">cache read</span><span class="v">{{ ctx.cache_read | tokens }}</span></div>
+          <div class="metric"><span class="k">output</span><span class="v">{{ ctx.output | tokens }}</span></div>
+          <div class="metric"><span class="k">iterations</span><span class="v">{{ state.speaking_usage.iterations }}</span></div>
+        {% else %}
+          <div class="metric muted">no result yet</div>
+        {% endif %}
+      </section>
+      <section>
+        <h3>thinking · {{ state.thinking_avg.window_hours if state.thinking_avg else 24 }}h avg{% if state.thinking_avg %} <span class="muted">(n={{ state.thinking_avg.samples }})</span>{% endif %}</h3>
+        {% if state.thinking_avg %}
+          {% set a = state.thinking_avg.avg %}
+          <div class="metric"><span class="k">input</span><span class="v">{{ a.input | tokens }}</span></div>
+          <div class="metric"><span class="k">cache write</span><span class="v">{{ a.cache_creation | tokens }}</span></div>
+          <div class="metric"><span class="k">cache read</span><span class="v">{{ a.cache_read | tokens }}</span></div>
+          <div class="metric"><span class="k">output</span><span class="v">{{ a.output | tokens }}</span></div>
+        {% else %}
+          <div class="metric muted">no result yet</div>
+        {% endif %}
+      </section>
+      <section>
+        <h3>queues</h3>
         <div class="metric"><span class="k">pending surfaces</span><span class="v">{{ state.pending_surfaces }}</span></div>
         <div class="metric"><span class="k">pending emergencies</span><span class="v{% if state.pending_emergencies %} warn{% endif %}">{{ state.pending_emergencies }}</span></div>
-        <div class="metric"><span class="k">total wakes</span><span class="v">{{ state.total_wakes }}</span></div>
-        <div class="metric"><span class="k">total turns</span><span class="v">{{ state.total_turns }}</span></div>
-        <div class="metric"><span class="k">last wake</span><span class="v">{{ state.last_wake_ts | ago }}</span></div>
-        <div class="metric"><span class="k">last turn</span><span class="v">{{ state.last_turn_ts | ago }}</span></div>
-        <div class="metric"><span class="k">events loaded</span><span class="v">{{ state.event_count }}</span></div>
       </section>
       <section>
         <h3>directive.md</h3>
