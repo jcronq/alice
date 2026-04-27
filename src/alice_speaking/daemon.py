@@ -228,6 +228,11 @@ class SpeakingDaemon:
         # transport. None outside of a turn or for surface/emergency
         # turns where there's no inbound channel.
         self._current_reply_channel: Optional[ChannelRef] = None
+        # Display name for the principal whose turn we're inside. Used
+        # by ``_emit_send_event`` so e.g. cli_send's sender_name reads
+        # "Owner" rather than the opaque conn_id from the ChannelRef.
+        # None outside of an inbound conversational turn.
+        self._current_principal_display_name: Optional[str] = None
         # When set, the very next turn will prepend this text as a
         # bootstrap preamble (Layer 2 restart OR post-compaction summary
         # injection).
@@ -591,9 +596,11 @@ class SpeakingDaemon:
         error: Optional[str] = None
         prev_kind = self._current_turn_kind
         prev_channel = self._current_reply_channel
+        prev_display_name = self._current_principal_display_name
         self._current_turn_kind = "signal"
         channel = ChannelRef(transport="signal", address=source, durable=True)
         self._current_reply_channel = channel
+        self._current_principal_display_name = sender_name
         # Replies to inbound bypass quiet hours — Owner expects an answer
         # when he asks something, regardless of the clock. Typing indicator
         # fires too so he sees Alice working.
@@ -620,6 +627,7 @@ class SpeakingDaemon:
         finally:
             self._current_turn_kind = prev_kind
             self._current_reply_channel = prev_channel
+            self._current_principal_display_name = prev_display_name
             await self.signal_transport.typing(channel, False)
             # One turn_log entry per envelope so the inbound audit trail
             # is preserved regardless of batch size. Only the LAST envelope
@@ -677,8 +685,10 @@ class SpeakingDaemon:
 
         prev_kind = self._current_turn_kind
         prev_channel = self._current_reply_channel
+        prev_display_name = self._current_principal_display_name
         self._current_turn_kind = "cli"
         self._current_reply_channel = msg.origin
+        self._current_principal_display_name = msg.principal.display_name
         error: Optional[str] = None
         try:
             now = datetime.datetime.now().astimezone()
@@ -708,6 +718,7 @@ class SpeakingDaemon:
                     await self.cli_transport.signal_done(msg.origin)
             self._current_turn_kind = prev_kind
             self._current_reply_channel = prev_channel
+            self._current_principal_display_name = prev_display_name
             self.events.emit(
                 "cli_turn_end",
                 turn_id=turn_id,
@@ -741,8 +752,10 @@ class SpeakingDaemon:
 
         prev_kind = self._current_turn_kind
         prev_channel = self._current_reply_channel
+        prev_display_name = self._current_principal_display_name
         self._current_turn_kind = "discord"
         self._current_reply_channel = msg.origin
+        self._current_principal_display_name = msg.principal.display_name
         await self.discord_transport.typing(msg.origin, True)
         error: Optional[str] = None
         try:
@@ -774,6 +787,7 @@ class SpeakingDaemon:
         finally:
             self._current_turn_kind = prev_kind
             self._current_reply_channel = prev_channel
+            self._current_principal_display_name = prev_display_name
             self.events.emit(
                 "discord_turn_end",
                 turn_id=turn_id,
@@ -1351,10 +1365,19 @@ class SpeakingDaemon:
         """Single canonical ``<transport>_send`` event shape across all
         transports. ``bypassed_quiet`` is ``True`` only when delivery
         happened despite the wall-clock being inside the quiet window
-        (i.e. a real bypass took effect, not just "we sent at 3pm")."""
+        (i.e. a real bypass took effect, not just "we sent at 3pm").
+
+        ``sender_name`` resolution: prefer the address book; fall back
+        to the in-flight turn's principal display name (set by handlers
+        on entry); finally fall back to the channel address. The middle
+        case matters for CLI replies — the channel.address is an
+        ephemeral conn_id with no address-book entry.
+        """
         sender_name = self.address_book.display_name_for(
             channel.transport, channel.address
         )
+        if sender_name == channel.address and self._current_principal_display_name:
+            sender_name = self._current_principal_display_name
         self.events.emit(
             f"{channel.transport}_send",
             turn_id=turn_id,
