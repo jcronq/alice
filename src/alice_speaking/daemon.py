@@ -69,6 +69,7 @@ from .transports import (
     OutboundMessage,
     SignalTransport,
 )
+from .transports.base import SIGNAL_CAPS
 from .turn_log import TurnLog, new_turn
 
 
@@ -512,21 +513,16 @@ class SpeakingDaemon:
                 sender.name,
             )
 
-        # Replies to inbound bypass quiet hours — Owner expects an answer
-        # when he asks something, regardless of the clock. Typing indicator
-        # fires too so he sees Alice working.
-        await self.signal.start_typing(source)
         error: Optional[str] = None
         prev_kind = self._current_turn_kind
         prev_channel = self._current_reply_channel
         self._current_turn_kind = "signal"
-        # ChannelRef so Alice can use recipient='self' on signal turns
-        # too. Phase 1 just stuffs the phone number into address; Phase 2
-        # routes via SignalTransport.send instead of direct signal_client
-        # access.
-        self._current_reply_channel = ChannelRef(
-            transport="signal", address=source, durable=True
-        )
+        channel = ChannelRef(transport="signal", address=source, durable=True)
+        self._current_reply_channel = channel
+        # Replies to inbound bypass quiet hours — Owner expects an answer
+        # when he asks something, regardless of the clock. Typing indicator
+        # fires too so he sees Alice working.
+        await self.signal_transport.typing(channel, True)
         try:
             now = datetime.datetime.now().astimezone()
             stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
@@ -538,16 +534,18 @@ class SpeakingDaemon:
             log.exception("turn failed for %s", sender.name)
             error = f"{type(exc).__name__}: {exc}"
             with contextlib.suppress(Exception):
-                # Direct send: signal turn errors bypass the quiet queue
-                # too — same rule applies to error notices as to replies.
-                await self.signal.send(
-                    source,
-                    f"Hit an error ({type(exc).__name__}). Session preserved — reply to retry.",
+                # Signal turn errors bypass the quiet queue too — same rule
+                # applies to error notices as to replies.
+                await self.signal_transport.send(
+                    OutboundMessage(
+                        destination=channel,
+                        text=f"Hit an error ({type(exc).__name__}). Session preserved — reply to retry.",
+                    )
                 )
         finally:
             self._current_turn_kind = prev_kind
             self._current_reply_channel = prev_channel
-            await self.signal.stop_typing(source)
+            await self.signal_transport.typing(channel, False)
             # One turn_log entry per envelope so the inbound audit trail
             # is preserved regardless of batch size. Only the LAST envelope
             # in the batch carries the outbound text — earlier envelopes
@@ -736,12 +734,16 @@ class SpeakingDaemon:
                             f"({att.content_type}{fn}) — Read it."
                         )
                 lines.append("")
-        lines.append(
+        lines.extend([
+            "",
+            "---",
+            render_module.capability_prompt_fragment("signal", SIGNAL_CAPS),
+            "",
             "To reply, call the `send_message` tool "
             "(recipient='jason' or 'katie' or an E.164 number, "
             "message=your reply text). Returning text alone will NOT "
-            "send. If there's nothing to say, let the turn close silently."
-        )
+            "send. If there's nothing to say, let the turn close silently.",
+        ])
         return "\n".join(lines)
 
     async def _send_or_queue(
@@ -775,7 +777,14 @@ class SpeakingDaemon:
                 queue_size=self.quiet_queue.size(),
             )
             return
-        await self.signal.send(recipient, text)
+        await self.signal_transport.send(
+            OutboundMessage(
+                destination=ChannelRef(
+                    transport="signal", address=recipient, durable=True
+                ),
+                text=text,
+            )
+        )
         log.info("replied to %s (%d chars)", sender_name, len(text))
         self.events.emit(
             "signal_send",
@@ -803,7 +812,16 @@ class SpeakingDaemon:
         self.events.emit("quiet_queue_drain", count=len(messages), reason=reason)
         for msg in messages:
             try:
-                await self.signal.send(msg.recipient, msg.text)
+                await self.signal_transport.send(
+                    OutboundMessage(
+                        destination=ChannelRef(
+                            transport="signal",
+                            address=msg.recipient,
+                            durable=True,
+                        ),
+                        text=msg.text,
+                    )
+                )
             except Exception:  # noqa: BLE001
                 log.exception(
                     "failed to send queued message to %s; re-queueing", msg.recipient
@@ -1029,12 +1047,11 @@ class SpeakingDaemon:
         Two recipient modes:
 
         - ``recipient == SELF_RECIPIENT`` — Alice asked to reply on the
-          inbound channel. We look at ``self._current_reply_channel`` and
-          dispatch by transport (cli → CLITransport.send, signal → the
-          existing signal path with the current turn's source number).
+          inbound channel. We use ``self._current_reply_channel`` directly
+          and dispatch via the transport that owns it.
         - anything else — an explicit Signal recipient (E.164 number, by
-          the time the tool resolved it). Goes to the existing signal
-          path with the existing quiet-hours policy.
+          the time the tool resolved it). Wrapped in a signal ChannelRef
+          and routed through ``signal_transport``.
 
         Quiet-hours policy (signal): replies to inbound (signal turns) and
         emergencies bypass the quiet queue — Owner expects an answer
@@ -1052,7 +1069,7 @@ class SpeakingDaemon:
             if channel is None:
                 raise RuntimeError(
                     "send_message(recipient='self') has no inbound channel "
-                    "to reply on (only valid during a signal/cli turn)"
+                    "to reply on (only valid during a signal/cli/emergency turn)"
                 )
             if channel.transport == "cli":
                 if self.cli_transport is None:
@@ -1063,10 +1080,6 @@ class SpeakingDaemon:
                         "not support outbound files yet",
                         len(attachments),
                     )
-                # Render Alice's text per the CLI capability profile.
-                # Today CLI is markdown=full so render is a near-no-op,
-                # but going through render keeps the wiring consistent
-                # with future Signal/Discord paths.
                 chunks = render_module.render(text, self.cli_transport.caps)
                 for chunk in chunks:
                     await self.cli_transport.send(
@@ -1081,19 +1094,18 @@ class SpeakingDaemon:
                 self._turn_last_outbound = text
                 self._turn_did_send = True
                 return
-            if channel.transport == "signal":
-                # Convert ChannelRef back to phone number — for Phase 1
-                # the address IS the phone number when the inbound came
-                # over signal. (Phase 2 will normalize this through the
-                # transport.)
-                recipient = channel.address
-                # fall through to signal path below
-            else:
+            if channel.transport != "signal":
                 raise RuntimeError(
                     f"don't know how to send to transport '{channel.transport}'"
                 )
+            signal_channel = channel
+        else:
+            # Explicit recipient — build the channel here.
+            signal_channel = ChannelRef(
+                transport="signal", address=recipient, durable=True
+            )
 
-        # ---- Signal path (unchanged behavior).
+        # ---- Signal path (transport-routed).
         emergency = getattr(self, "_emergency_bypass", False)
         bypass_quiet = (
             emergency
@@ -1101,18 +1113,24 @@ class SpeakingDaemon:
             or bool(attachments)  # see docstring
         )
         if bypass_quiet:
-            await self.signal.send(recipient, text, attachments=attachments)
+            await self.signal_transport.send(
+                OutboundMessage(
+                    destination=signal_channel,
+                    text=text,
+                    attachments=list(attachments) if attachments else [],
+                )
+            )
             log.info(
                 "%s send to %s (%d chars%s)",
                 "emergency" if emergency else "reply",
-                recipient,
+                signal_channel.address,
                 len(text),
                 f", {len(attachments)} attachment(s)" if attachments else "",
             )
             self.events.emit(
                 "signal_send",
-                recipient=recipient,
-                sender_name=self._sender_name_for(recipient),
+                recipient=signal_channel.address,
+                sender_name=self._sender_name_for(signal_channel.address),
                 text_len=len(text),
                 attachment_count=len(attachments) if attachments else 0,
                 emergency=emergency,
@@ -1121,9 +1139,9 @@ class SpeakingDaemon:
         else:
             # Surface-triggered (Alice's own thought) — honors quiet hours.
             await self._send_or_queue(
-                recipient,
+                signal_channel.address,
                 text,
-                self._sender_name_for(recipient),
+                self._sender_name_for(signal_channel.address),
             )
         self._turn_last_outbound = text
         self._turn_did_send = True

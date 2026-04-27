@@ -28,7 +28,6 @@ from __future__ import annotations
 import logging
 from typing import AsyncIterator
 
-from ..render import render
 from .base import (
     SIGNAL_CAPS,
     Capabilities,
@@ -99,6 +98,11 @@ class SignalTransport:
         attachment alongside the message; sending it on every chunk
         would multiply the upload and look like duplicate media.
         """
+        # Lazy import: alice_speaking.render imports transports.base, so
+        # importing it at module scope would cycle through this module
+        # back to render before render finishes initializing.
+        from ..render import render
+
         chunks = render(out.text, self.caps)
         if not chunks:
             log.debug("signal send: render produced no chunks; nothing to do")
