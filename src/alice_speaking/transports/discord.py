@@ -1,19 +1,38 @@
 """DiscordTransport: Discord under the Transport interface.
 
-Phase 3b scope is intentionally narrow: **DMs only**. Guild channels are a
-future expansion (capability advertisement is the same; routing is the
-only difference). The bot must:
+Supports both **DMs** and **guild text channels** (Phase 4c). The bot
+must:
 
 - be granted the **Message Content Intent** in the Discord developer
-  portal (it is privileged — disabled by default).
+  portal (privileged — disabled by default).
 - be DM-able by the principal (defaults to "friends only" on a personal
   account; if the bot is in a shared guild with the principal, DMs
   open up automatically).
+- be a member of any guild whose text channels Alice should reach.
 
-ACL: same address-book rule as every other transport. The daemon's
-``_discord_producer`` filters via
-``address_book.is_allowed("discord", str(user.id))``. Inbound from
-unknown discord users is dropped silently — same as Signal.
+Address scheme
+==============
+
+Discord channel addresses use a two-letter prefix so the transport can
+distinguish "send a DM to user X" from "post in channel Y":
+
+- ``user:<discord-user-id>`` — opens (or reuses) a DM with that user.
+- ``channel:<discord-channel-id>`` — posts in that text channel.
+
+For back-compat with Phase 3b principals.yaml entries, a bare numeric
+id (no prefix) is treated as ``user:<id>``.
+
+ACL
+===
+
+For DMs: the user's principal must exist in the address book and be
+``allowed=True`` — same shape as Signal/CLI.
+
+For guild messages: the user's principal must exist AND the principal
+must list the originating channel id (``channel:<channel-id>``) in
+their channels. This lets the address book gate at channel granularity
+(Owner can talk in ``#alice-room`` but not ``#general``) without a
+separate top-level channel allowlist.
 
 Outbound rendering uses :data:`DISCORD_CAPS` (markdown="limited" — Discord
 supports headers, bold, italics, code blocks, but not tables; max 1900
@@ -49,17 +68,43 @@ log = logging.getLogger(__name__)
 
 
 def _default_intents() -> discord.Intents:
-    """Minimum intents to receive DM text content.
+    """Minimum intents to receive DM and guild text content.
 
     ``message_content`` is privileged (must be toggled on in the Discord
-    developer portal). ``dm_messages`` is non-privileged and on by default
-    in ``Intents.default()``, but we set it explicitly so the requirement
-    is visible at the call site.
+    developer portal). ``dm_messages`` and ``guild_messages`` are
+    non-privileged and on by default in ``Intents.default()``, but we
+    set them explicitly so the requirements are visible at the call
+    site.
     """
     intents = discord.Intents.default()
     intents.dm_messages = True
+    intents.guild_messages = True
     intents.message_content = True
     return intents
+
+
+def _parse_address(address: str) -> tuple[str, int]:
+    """Split a Discord channel address into ``(kind, id)``.
+
+    ``kind`` is ``"user"`` or ``"channel"``. Bare numeric ids are
+    treated as ``"user"`` for back-compat with Phase 3b address-book
+    entries (which used the discord user id directly, no prefix).
+    """
+    if ":" in address:
+        kind, _, raw = address.partition(":")
+        kind = kind.strip().lower()
+    else:
+        kind, raw = "user", address
+    if kind not in {"user", "channel"}:
+        raise ValueError(
+            f"discord address kind must be 'user' or 'channel', got {kind!r}"
+        )
+    try:
+        return kind, int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"discord address id must be numeric, got {raw!r}"
+        ) from exc
 
 
 class DiscordTransport:
@@ -148,11 +193,6 @@ class DiscordTransport:
         client = self._client
         if client is None or msg.author.id == getattr(client.user, "id", None):
             return
-        # Phase 3b: DMs only. Guild messages are dropped silently. When
-        # we add guild support the discriminator will be the channel kind,
-        # not the message origin.
-        if not isinstance(msg.channel, discord.DMChannel):
-            return
         if not msg.content.strip() and not msg.attachments:
             return
         author = msg.author
@@ -162,22 +202,38 @@ class DiscordTransport:
         display_name = (
             getattr(author, "global_name", None) or author.name
         )
+        # Principal native_id always uses the user prefix — it's the
+        # *who*, not the *where*. Origin uses user: for DMs, channel:
+        # for guild messages — that's how the daemon's _send_message
+        # decides whether `recipient='self'` opens a DM or posts back
+        # in the same channel.
+        principal_address = f"user:{author.id}"
+        is_dm = isinstance(msg.channel, discord.DMChannel)
+        if is_dm:
+            origin_address = principal_address
+        else:
+            origin_address = f"channel:{msg.channel.id}"
         principal = Principal(
             transport="discord",
-            native_id=str(author.id),
+            native_id=principal_address,
             display_name=display_name,
         )
-        # ``address`` for outbound DMs is the user-id (we can ``fetch_user``
-        # to recover the User object).
         origin = ChannelRef(
-            transport="discord", address=str(author.id), durable=True
+            transport="discord", address=origin_address, durable=True
         )
         inbound = InboundMessage(
             principal=principal,
             origin=origin,
             text=msg.content,
             timestamp=msg.created_at.timestamp(),
-            metadata={"discord_message_id": str(msg.id)},
+            metadata={
+                "discord_message_id": str(msg.id),
+                "discord_channel_kind": "dm" if is_dm else "guild",
+                "discord_channel_id": str(msg.channel.id),
+                "discord_guild_id": (
+                    str(msg.guild.id) if msg.guild is not None else None
+                ),
+            },
         )
         self._user_cache[str(author.id)] = author
         try:
@@ -192,12 +248,13 @@ class DiscordTransport:
     # Outbound
 
     async def send(self, out: OutboundMessage) -> int:
-        """Render Alice's text per :data:`DISCORD_CAPS` and DM each chunk.
+        """Render Alice's text per :data:`DISCORD_CAPS` and post each
+        chunk. Routes by address prefix: ``user:<id>`` opens/uses a DM
+        with that user, ``channel:<id>`` posts in that text channel.
 
-        Multi-chunk messages get an ``(i/N)`` prefix to mirror the Signal
-        convention. Attachments are accepted but logged-and-dropped for
-        now. Returns the chunk count delivered (0 when render produces
-        nothing).
+        Multi-chunk messages get an ``(i/N)`` prefix to mirror the
+        Signal convention. Attachments are accepted but logged-and-
+        dropped for now. Returns the chunk count delivered.
         """
         from ..render import render
 
@@ -215,26 +272,57 @@ class DiscordTransport:
                 len(out.attachments),
             )
 
-        user = await self._resolve_user(out.destination.address)
+        target = await self._resolve_destination(out.destination.address)
         total = len(chunks)
         for i, chunk in enumerate(chunks, start=1):
             payload = f"({i}/{total}) {chunk}" if total > 1 else chunk
-            await user.send(payload)
+            await target.send(payload)
         return total
 
-    async def _resolve_user(self, native_id: str) -> discord.abc.User:
-        cached = self._user_cache.get(native_id)
+    async def _resolve_destination(
+        self, address: str
+    ) -> discord.abc.Messageable:
+        """Map an address (``user:<id>`` or ``channel:<id>``) to the
+        discord.py object whose ``.send(text)`` delivers there."""
+        kind, snowflake = _parse_address(address)
+        if kind == "user":
+            return await self._resolve_user(str(snowflake))
+        return await self._resolve_channel(snowflake)
+
+    async def _resolve_user(self, user_id: str) -> discord.abc.User:
+        cached = self._user_cache.get(user_id)
         if cached is not None:
             return cached
         assert self._client is not None
         try:
-            user = await self._client.fetch_user(int(native_id))
+            user = await self._client.fetch_user(int(user_id))
         except (ValueError, discord.HTTPException) as exc:
             raise RuntimeError(
-                f"discord: cannot resolve user id {native_id!r}: {exc}"
+                f"discord: cannot resolve user id {user_id!r}: {exc}"
             ) from exc
-        self._user_cache[native_id] = user
+        self._user_cache[user_id] = user
         return user
+
+    async def _resolve_channel(self, channel_id: int) -> discord.abc.Messageable:
+        assert self._client is not None
+        ch = self._client.get_channel(channel_id)
+        if ch is None:
+            try:
+                ch = await self._client.fetch_channel(channel_id)
+            except discord.HTTPException as exc:
+                raise RuntimeError(
+                    f"discord: cannot resolve channel id {channel_id}: {exc}"
+                ) from exc
+        # Duck-type rather than isinstance(Messageable) — Messageable is
+        # a Protocol that some channel subclasses register against in
+        # ways that fail isinstance at runtime; ``.send`` callable is the
+        # actual contract we need.
+        if not callable(getattr(ch, "send", None)):
+            raise RuntimeError(
+                f"discord: channel {channel_id} is not messageable "
+                f"(got {type(ch).__name__})"
+            )
+        return ch
 
     async def typing(self, channel: ChannelRef, on: bool) -> None:
         """Best-effort typing indicator.
@@ -248,8 +336,11 @@ class DiscordTransport:
         if not on or self._client is None:
             return
         try:
-            user = await self._resolve_user(channel.address)
-            dm = user.dm_channel or await user.create_dm()
-            await dm.trigger_typing()
+            target = await self._resolve_destination(channel.address)
+            # For DMs, ``target`` is the discord.User; we want the underlying
+            # DMChannel for trigger_typing.
+            if isinstance(target, discord.User):
+                target = target.dm_channel or await target.create_dm()
+            await target.trigger_typing()
         except Exception as exc:  # noqa: BLE001
             log.debug("discord typing indicator failed: %s", exc)

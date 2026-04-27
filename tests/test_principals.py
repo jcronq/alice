@@ -182,8 +182,9 @@ def test_load_from_yaml(tmp_path: pathlib.Path):
     assert book.lookup_by_id("jcronq").display_name == "Owner"
     assert book.is_allowed("signal", "+15555550100") is True
     assert book.is_allowed("signal", "+15555550101") is False  # explicitly disallowed
+    # Bare discord ids are auto-prefixed with user: at load time (Phase 4c).
     assert book.preferred_channel("jcronq", "discord") == ChannelRef(
-        transport="discord", address="284000000000000000", durable=True
+        transport="discord", address="user:284000000000000000", durable=True
     )
 
 
@@ -204,3 +205,26 @@ def test_load_rejects_bad_yaml_shape(tmp_path: pathlib.Path):
     p.write_text("principals: not-a-mapping\n")
     with pytest.raises(ValueError):
         load(yaml_path=p)
+
+
+def test_load_normalizes_bare_discord_ids_to_user_prefix(tmp_path: pathlib.Path):
+    """Phase 4c added user:/channel: prefixes for Discord. Phase 3b
+    YAMLs used bare numeric ids (DM-only); the loader auto-prefixes
+    them with ``user:`` so back-compat lookups keep working."""
+    p = tmp_path / "principals.yaml"
+    p.write_text(textwrap.dedent("""\
+        principals:
+          jcronq:
+            display_name: Owner
+            channels:
+              - {transport: discord, address: "123"}              # bare → user:123
+              - {transport: discord, address: "user:456"}         # already prefixed
+              - {transport: discord, address: "channel:789"}      # guild
+    """))
+    book = load(yaml_path=p)
+    addresses = {ch.address for ch in book.lookup_by_id("jcronq").channels}
+    assert addresses == {"user:123", "user:456", "channel:789"}
+    # Native-id lookups use the prefixed form.
+    assert book.is_allowed("discord", "user:123") is True
+    assert book.is_allowed("discord", "channel:789") is True
+    assert book.is_allowed("discord", "123") is False  # not bare anymore

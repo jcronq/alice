@@ -19,6 +19,7 @@ from alice_speaking.transports.base import (
     ChannelRef,
     OutboundMessage,
 )
+from alice_speaking.transports.discord import _parse_address
 
 
 def test_construction_requires_token():
@@ -82,6 +83,52 @@ def test_send_renders_and_chunks(monkeypatch):
     assert len(sent) == 1
     assert "**hello**" in sent[0]
     assert "_world_" in sent[0]
+
+
+def test_parse_address_handles_user_and_channel_prefixes():
+    assert _parse_address("user:123") == ("user", 123)
+    assert _parse_address("channel:456") == ("channel", 456)
+    # Bare numeric id is back-compat-treated as user.
+    assert _parse_address("789") == ("user", 789)
+
+
+def test_parse_address_rejects_unknown_kind():
+    with pytest.raises(ValueError):
+        _parse_address("guild:123")
+
+
+def test_parse_address_rejects_non_numeric_id():
+    with pytest.raises(ValueError):
+        _parse_address("user:abc")
+
+
+def test_send_routes_channel_address_to_channel_send():
+    """Address ``channel:<id>`` → fetch_channel + channel.send (not DM)."""
+    t = DiscordTransport(token="xxx")
+    sent_via: list[str] = []
+
+    class _StubChannel:
+        async def send(self, payload: str) -> None:
+            sent_via.append(payload)
+
+    class _StubClient:
+        def get_channel(self, _id: int):
+            return _StubChannel()
+
+    t._client = _StubClient()
+
+    async def go():
+        await t.send(
+            OutboundMessage(
+                destination=ChannelRef(
+                    transport="discord", address="channel:42", durable=True
+                ),
+                text="hello channel",
+            )
+        )
+
+    asyncio.run(go())
+    assert sent_via == ["hello channel"]
 
 
 def test_send_attachments_logged_and_dropped(monkeypatch, caplog):

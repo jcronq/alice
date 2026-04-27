@@ -276,7 +276,7 @@ def _from_dict(data: dict, *, source: str) -> AddressBook:
             channels.append(
                 PrincipalChannel(
                     transport=str(transport),
-                    address=str(address),
+                    address=_normalize_address(str(transport), str(address)),
                     durable=bool(ch.get("durable", True)),
                     preferred=bool(ch.get("preferred", False)),
                 )
@@ -290,6 +290,19 @@ def _from_dict(data: dict, *, source: str) -> AddressBook:
             )
         )
     return AddressBook(records)
+
+
+def _normalize_address(transport: str, address: str) -> str:
+    """Apply transport-specific address normalization at load time so
+    later lookups have a stable form.
+
+    Discord (Phase 4c): bare numeric ids are auto-prefixed with
+    ``user:`` for back-compat with Phase 3b YAMLs (which used the bare
+    discord user-id directly).
+    """
+    if transport == "discord" and ":" not in address:
+        return f"user:{address}"
+    return address
 
 
 def _synth(

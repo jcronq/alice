@@ -428,17 +428,41 @@ class SpeakingDaemon:
     async def _discord_producer(self) -> None:
         """Pump InboundMessages from the Discord transport, ACL-gated.
 
-        Inbound from a Discord user not in the address book is dropped
-        silently — same rule as the Signal producer.
+        Two-level ACL:
+        1. The user (``msg.principal.native_id`` = ``user:<id>``) must
+           be a known, allowed principal.
+        2. For guild messages (Phase 4c), the originating channel
+           (``msg.origin.address`` = ``channel:<id>``) must be listed
+           in that principal's channels — letting the address book gate
+           guild access at channel granularity.
+        DMs satisfy (2) trivially since their origin matches the
+        principal's own ``user:`` entry.
         """
         assert self.discord_transport is not None
         async for msg in self.discord_transport.messages():
-            if not self.address_book.is_allowed("discord", msg.principal.native_id):
+            principal = self.address_book.lookup_by_native(
+                "discord", msg.principal.native_id
+            )
+            if principal is None or not principal.allowed:
                 log.info(
                     "ignoring discord message from unknown user %s",
                     msg.principal.native_id,
                 )
                 continue
+            channel_kind = msg.metadata.get("discord_channel_kind")
+            if channel_kind == "guild":
+                channel_addr = msg.origin.address
+                if not any(
+                    ch.transport == "discord" and ch.address == channel_addr
+                    for ch in principal.channels
+                ):
+                    log.info(
+                        "ignoring guild discord message from %s in %s "
+                        "(channel not in principal's address-book entries)",
+                        msg.principal.native_id,
+                        channel_addr,
+                    )
+                    continue
             # Refresh display name in the address book if the inbound
             # carried a richer one (Discord users can change global_name).
             self.address_book.learn(msg)
