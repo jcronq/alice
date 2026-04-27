@@ -23,12 +23,14 @@ from .base import (
     Transport,
 )
 from .cli import CLITransport
+from .discord import DiscordTransport
 from .signal import SignalTransport
 
 __all__ = [
     "Capabilities",
     "ChannelRef",
     "CLITransport",
+    "DiscordTransport",
     "InboundMessage",
     "OutboundMessage",
     "Principal",

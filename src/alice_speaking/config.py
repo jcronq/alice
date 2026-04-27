@@ -86,6 +86,11 @@ class Config:
     cli_enabled: bool = True
     cli_socket_path: pathlib.Path = field(default_factory=lambda: DEFAULT_CLI_SOCKET)
 
+    # Discord transport — optional. When ``discord_bot_token`` is empty
+    # the daemon skips construction; existing deploys without Discord
+    # configured keep working.
+    discord_bot_token: str = ""
+
     # Behavior (from alice.config.json, falls back to SPEAKING_DEFAULTS)
     speaking: dict[str, Any] = field(default_factory=lambda: dict(SPEAKING_DEFAULTS))
 
@@ -173,6 +178,8 @@ def load() -> Config:
         or str(mind_dir / "config" / "principals.yaml")
     )
 
+    discord_bot_token = (from_any("DISCORD_BOT_TOKEN", "") or "").strip()
+
     return Config(
         signal_api=signal_api,
         signal_account=signal_account,
@@ -192,4 +199,5 @@ def load() -> Config:
         speaking=speaking,
         cli_enabled=cli_enabled,
         cli_socket_path=cli_socket_path,
+        discord_bot_token=discord_bot_token,
     )

@@ -67,6 +67,7 @@ from .tools.messaging import SELF_RECIPIENT, ResolvedRecipient
 from .transports import (
     CLITransport,
     ChannelRef,
+    DiscordTransport,
     InboundMessage,
     OutboundMessage,
     SignalTransport,
@@ -128,7 +129,19 @@ class CLIEvent:
     message: InboundMessage
 
 
-Event = Union[SignalEvent, SurfaceEvent, EmergencyEvent, CLIEvent]
+@dataclass
+class DiscordEvent:
+    """A message that came in over the Discord transport.
+
+    Same shape as :class:`CLIEvent` — the inbound :class:`InboundMessage`
+    carries everything the handler needs. Discord channels are durable
+    (DM history persists), unlike CLI's ephemeral sockets.
+    """
+
+    message: InboundMessage
+
+
+Event = Union[SignalEvent, SurfaceEvent, EmergencyEvent, CLIEvent, DiscordEvent]
 
 
 class SpeakingDaemon:
@@ -238,6 +251,15 @@ class SpeakingDaemon:
             else None
         )
 
+        # Discord transport — optional. Constructed only when a bot token
+        # is configured; absent token = transport stays None and existing
+        # deploys keep working unchanged.
+        self.discord_transport: Optional[DiscordTransport] = (
+            DiscordTransport(token=cfg.discord_bot_token)
+            if cfg.discord_bot_token
+            else None
+        )
+
         self._queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=64)
         self._dispatched_surfaces: set[str] = set()
         self._stop = asyncio.Event()
@@ -294,6 +316,13 @@ class SpeakingDaemon:
                 producers.append(
                     asyncio.create_task(self._cli_producer(), name="cli-produce")
                 )
+            if self.discord_transport is not None:
+                await self.discord_transport.start()
+                producers.append(
+                    asyncio.create_task(
+                        self._discord_producer(), name="discord-produce"
+                    )
+                )
             consumer = asyncio.create_task(self._consumer(), name="consumer")
             stop_task = asyncio.create_task(self._stop.wait(), name="stop")
 
@@ -314,6 +343,9 @@ class SpeakingDaemon:
             if self.cli_transport is not None:
                 with contextlib.suppress(Exception):
                     await self.cli_transport.stop()
+            if self.discord_transport is not None:
+                with contextlib.suppress(Exception):
+                    await self.discord_transport.stop()
             self.events.emit("shutdown")
             log.info("shutdown complete")
 
@@ -388,6 +420,25 @@ class SpeakingDaemon:
         async for msg in self.cli_transport.messages():
             await self._queue.put(CLIEvent(message=msg))
 
+    async def _discord_producer(self) -> None:
+        """Pump InboundMessages from the Discord transport, ACL-gated.
+
+        Inbound from a Discord user not in the address book is dropped
+        silently — same rule as the Signal producer.
+        """
+        assert self.discord_transport is not None
+        async for msg in self.discord_transport.messages():
+            if not self.address_book.is_allowed("discord", msg.principal.native_id):
+                log.info(
+                    "ignoring discord message from unknown user %s",
+                    msg.principal.native_id,
+                )
+                continue
+            # Refresh display name in the address book if the inbound
+            # carried a richer one (Discord users can change global_name).
+            self.address_book.learn(msg)
+            await self._queue.put(DiscordEvent(message=msg))
+
     # ------------------------------------------------------------------
     # Consumer
 
@@ -411,6 +462,8 @@ class SpeakingDaemon:
                     await self._handle_signal(batch)
                 elif isinstance(event, CLIEvent):
                     await self._handle_cli(event)
+                elif isinstance(event, DiscordEvent):
+                    await self._handle_discord(event)
                 elif isinstance(event, SurfaceEvent):
                     await self._handle_surface(event)
                 elif isinstance(event, EmergencyEvent):
@@ -662,6 +715,103 @@ class SpeakingDaemon:
                 error=error,
                 duration_ms=int((time.time() - started) * 1000),
             )
+
+    # ------------------------------------------------------------------
+    # Discord turn — DMs only in Phase 3b.
+
+    async def _handle_discord(self, event: DiscordEvent) -> None:
+        """Run one turn for a Discord DM. Same shape as
+        :meth:`_handle_cli` but the channel is durable, so a missed
+        send_message just shows up as silence to the user (no
+        ``signal_done`` analog — Discord clients don't have a pending
+        prompt to clear)."""
+        assert self.discord_transport is not None
+        msg = event.message
+        turn_id = uuid.uuid4().hex[:12]
+        started = time.time()
+
+        self.events.emit(
+            "discord_turn_start",
+            turn_id=turn_id,
+            principal_id=msg.principal.native_id,
+            display_name=msg.principal.display_name,
+            inbound_chars=len(msg.text),
+            inbound=_short(msg.text, 600),
+        )
+
+        prev_kind = self._current_turn_kind
+        prev_channel = self._current_reply_channel
+        self._current_turn_kind = "discord"
+        self._current_reply_channel = msg.origin
+        await self.discord_transport.typing(msg.origin, True)
+        error: Optional[str] = None
+        try:
+            now = datetime.datetime.now().astimezone()
+            stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
+            prompt = self._build_discord_prompt(
+                principal_name=msg.principal.display_name,
+                stamp=stamp,
+                text=msg.text,
+            )
+            await self._run_turn(
+                prompt,
+                turn_id=turn_id,
+                outbound_recipient=f"discord:{msg.principal.native_id}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("discord turn failed for %s", msg.principal.display_name)
+            error = f"{type(exc).__name__}: {exc}"
+            with contextlib.suppress(Exception):
+                await self.discord_transport.send(
+                    OutboundMessage(
+                        destination=msg.origin,
+                        text=(
+                            f"Hit an error ({type(exc).__name__}). "
+                            "Session preserved — reply to retry."
+                        ),
+                    )
+                )
+        finally:
+            self._current_turn_kind = prev_kind
+            self._current_reply_channel = prev_channel
+            self.events.emit(
+                "discord_turn_end",
+                turn_id=turn_id,
+                principal_id=msg.principal.native_id,
+                error=error,
+                duration_ms=int((time.time() - started) * 1000),
+            )
+
+    def _build_discord_prompt(
+        self,
+        *,
+        principal_name: str,
+        stamp: str,
+        text: str,
+    ) -> str:
+        """Compose the prompt for a single Discord DM. Mirrors the CLI/Signal
+        prompts but advertises Discord's caps (limited markdown, 1900-byte
+        chunks) so Alice writes in the right shape."""
+        caps = self.discord_transport.caps if self.discord_transport else None
+        cap_fragment = (
+            render_module.capability_prompt_fragment("discord", caps)
+            if caps is not None
+            else ""
+        )
+        lines: list[str] = [
+            f"[Discord DM from {principal_name} | {stamp}]",
+            "",
+            text,
+            "",
+            "---",
+            cap_fragment,
+            "",
+            "To reply, call the `send_message` tool with "
+            "recipient='self' (replies on the same Discord DM the "
+            "message came from). Returning text alone will NOT reach "
+            "the user.",
+        ]
+        return "\n".join(lines)
 
     def _build_cli_prompt(
         self,
@@ -1126,6 +1276,27 @@ class SpeakingDaemon:
                 principal_id=channel.address,
                 text_len=len(text),
                 chunk_count=len(chunks),
+            )
+            self._turn_last_outbound = text
+            self._turn_did_send = True
+            return
+
+        if channel.transport == "discord":
+            if self.discord_transport is None:
+                raise RuntimeError("discord transport disabled but reply requested")
+            if attachments:
+                log.warning(
+                    "ignoring %d attachment(s) for discord reply; not yet "
+                    "implemented",
+                    len(attachments),
+                )
+            await self.discord_transport.send(
+                OutboundMessage(destination=channel, text=text)
+            )
+            self.events.emit(
+                "discord_send",
+                principal_id=channel.address,
+                text_len=len(text),
             )
             self._turn_last_outbound = text
             self._turn_did_send = True
