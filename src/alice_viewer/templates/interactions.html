@@ -1,89 +1,153 @@
 {% extends "base.html" %}
 {% block title %}interactions{% endblock %}
 {% block body %}
-  <h1>interactions — cross-hemisphere flow</h1>
+  <h1>interactions</h1>
   <p class="muted">
-    Files speaking and thinking pass between each other, in lifecycle order.
-    Green = resolved. Amber = pending. Red = emergency.
+    Each card is one Speaking turn presented start to finish:
+    the <strong>stimulus</strong> (what triggered the turn),
+    the <strong>thinking</strong> (Speaking's reasoning), and
+    the <strong>response</strong> (what got sent).
   </p>
 
-  <h2>surfaces · thinking → speaking</h2>
-  <table>
-    <thead><tr><th>when</th><th>status</th><th>id</th><th>preview</th><th>trailer</th></tr></thead>
-    <tbody>
-      {% for e in surfaces %}
-        <tr>
-          <td class="mono">{{ e.ts | localtime }}<br><span class="muted">{{ e.ts | ago }}</span></td>
-          <td>
-            {% if e.kind == 'surface_pending' %}
-              <span style="color:var(--warn)">pending</span>
-            {% else %}
-              <span style="color:var(--ok)">{{ e.detail.trailer.verdict or 'resolved' }}</span>
-            {% endif %}
-          </td>
-          <td class="mono">{{ e.correlation_id }}</td>
-          <td class="wrap">{{ (e.detail.body or '')[:220] }}{% if (e.detail.body or '') | length > 220 %}…{% endif %}</td>
-          <td class="mono">
-            {% if e.detail.trailer %}
-              {% for k, v in e.detail.trailer.items() %}{{ k }}: {{ v[:80] }}<br>{% endfor %}
-            {% else %}—{% endif %}
-          </td>
-        </tr>
-      {% else %}
-        <tr><td colspan="5" class="muted">no surfaces yet</td></tr>
+  <div class="arc-filters">
+    <span class="arc-filter-group">
+      <span class="muted">kind:</span>
+      <a class="pill {% if not filter_kind %}pill-active{% endif %}"
+         href="/interactions?limit={{ limit }}{% if filter_sender %}&sender={{ filter_sender }}{% endif %}">
+        all <span class="muted">({{ total_arcs }})</span>
+      </a>
+      {% for k in ['signal', 'surface', 'emergency'] %}
+        <a class="pill {% if filter_kind == k %}pill-active{% endif %}"
+           href="/interactions?kind={{ k }}&limit={{ limit }}{% if filter_sender %}&sender={{ filter_sender }}{% endif %}">
+          {{ k }} <span class="muted">({{ kind_counts[k] }})</span>
+        </a>
       {% endfor %}
-    </tbody>
-  </table>
+    </span>
+    {% if senders %}
+      <span class="arc-filter-group">
+        <span class="muted">sender:</span>
+        <a class="pill {% if not filter_sender %}pill-active{% endif %}"
+           href="/interactions?limit={{ limit }}{% if filter_kind %}&kind={{ filter_kind }}{% endif %}">all</a>
+        {% for s in senders %}
+          <a class="pill {% if filter_sender == s %}pill-active{% endif %}"
+             href="/interactions?sender={{ s }}&limit={{ limit }}{% if filter_kind %}&kind={{ filter_kind }}{% endif %}">{{ s }}</a>
+        {% endfor %}
+      </span>
+    {% endif %}
+  </div>
 
-  <h2>emergencies</h2>
-  <table>
-    <thead><tr><th>when</th><th>status</th><th>id</th><th>preview</th><th>trailer</th></tr></thead>
-    <tbody>
-      {% for e in emergencies %}
-        <tr>
-          <td class="mono">{{ e.ts | localtime }}<br><span class="muted">{{ e.ts | ago }}</span></td>
-          <td>
-            {% if e.kind == 'emergency_pending' %}
-              <span style="color:var(--err)">pending</span>
-            {% else %}
-              {% set verdict = e.detail.trailer.verdict or 'resolved' %}
-              <span style="color: {% if verdict == 'voiced' %}var(--err){% else %}var(--muted){% endif %}">{{ verdict }}</span>
-            {% endif %}
-          </td>
-          <td class="mono">{{ e.correlation_id }}</td>
-          <td class="wrap">{{ (e.detail.body or '')[:220] }}{% if (e.detail.body or '') | length > 220 %}…{% endif %}</td>
-          <td class="mono">
-            {% if e.detail.trailer %}
-              {% for k, v in e.detail.trailer.items() %}{{ k }}: {{ v[:80] }}<br>{% endfor %}
-            {% else %}—{% endif %}
-          </td>
-        </tr>
-      {% else %}
-        <tr><td colspan="5" class="muted">no emergencies</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <p class="muted arc-counts">
+    showing {{ arcs | length }} of {{ total_arcs }}
+    · pending:
+    {{ pending_surfaces }} surface{{ '' if pending_surfaces == 1 else 's' }},
+    {{ pending_emergencies }} emergenc{{ 'y' if pending_emergencies == 1 else 'ies' }},
+    {{ pending_notes }} note{{ '' if pending_notes == 1 else 's' }}
+  </p>
 
-  <h2>notes · speaking → thinking</h2>
-  <table>
-    <thead><tr><th>when</th><th>status</th><th>id</th><th>preview</th></tr></thead>
-    <tbody>
-      {% for e in notes %}
-        <tr>
-          <td class="mono">{{ e.ts | localtime }}<br><span class="muted">{{ e.ts | ago }}</span></td>
-          <td>
-            {% if e.kind == 'note_pending' %}
-              <span style="color:var(--warn)">pending</span>
-            {% else %}
-              <span style="color:var(--ok)">consumed</span>
-            {% endif %}
-          </td>
-          <td class="mono">{{ e.correlation_id }}</td>
-          <td class="wrap">{{ (e.detail.body or '')[:300] }}{% if (e.detail.body or '') | length > 300 %}…{% endif %}</td>
-        </tr>
-      {% else %}
-        <tr><td colspan="4" class="muted">no notes yet</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  {% if not arcs %}
+    <p class="muted">no arcs match the current filter.</p>
+  {% endif %}
+
+  {% for arc in arcs %}
+    <article class="arc kind-{{ arc.kind }}">
+      <header class="arc-head">
+        <div class="arc-headline">
+          <span class="arc-kind-badge kind-{{ arc.kind }}">{{ arc.kind }}</span>
+          {% if arc.sender %}
+            <span class="arc-sender">{{ arc.sender }}</span>
+            {% if arc.kind == 'signal' %}<span class="muted">→ alice</span>{% endif %}
+          {% endif %}
+          {% if arc.kind == 'surface' and arc.surface_id %}
+            <code class="arc-surface-id">{{ arc.surface_id }}</code>
+          {% endif %}
+        </div>
+        <div class="arc-meta">
+          <span class="arc-when mono">{{ arc.ts | localtime }}</span>
+          <span class="muted">· {{ arc.ts | ago }}</span>
+          {% if arc.duration_ms %}
+            <span class="muted">· {{ (arc.duration_ms / 1000) | round(1) }}s</span>
+          {% endif %}
+          <a class="arc-detail-link" href="{{ arc.detail_url }}">open turn ↗</a>
+        </div>
+      </header>
+
+      <ol class="arc-timeline">
+        <li class="arc-step kind-stimulus">
+          <div class="arc-step-row">
+            <div class="arc-step-marker">
+              <span class="arc-dot"></span>
+              <span class="arc-step-label">stimulus</span>
+            </div>
+            <div class="arc-step-body">
+              {% if arc.stimulus %}
+                <div class="arc-bubble inbound">
+                  <div class="arc-bubble-text">{{ arc.stimulus }}</div>
+                </div>
+              {% else %}
+                <div class="arc-step-empty muted">(no inbound text — image / attachment / dispatch only)</div>
+              {% endif %}
+            </div>
+          </div>
+        </li>
+
+        <li class="arc-step kind-thinking">
+          <div class="arc-step-row">
+            <div class="arc-step-marker">
+              <span class="arc-dot"></span>
+              <span class="arc-step-label">thinking</span>
+            </div>
+            <div class="arc-step-body">
+              {% if arc.thinking_excerpt %}
+                <div class="arc-bubble thinking">
+                  <div class="arc-bubble-text">{{ arc.thinking_excerpt }}</div>
+                </div>
+                {% if arc.thinking_count > 1 %}
+                  <div class="arc-thinking-more muted">
+                    + {{ arc.thinking_count - 1 }} more thinking block{{ '' if arc.thinking_count == 2 else 's' }}
+                    — see <a href="{{ arc.detail_url }}">turn detail</a>
+                  </div>
+                {% endif %}
+              {% else %}
+                <div class="arc-step-empty muted">(no thinking captured)</div>
+              {% endif %}
+              {% if arc.tools %}
+                <div class="arc-tools muted">
+                  tools: {% for t in arc.tools %}<code>{{ t }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+                </div>
+              {% endif %}
+            </div>
+          </div>
+        </li>
+
+        <li class="arc-step kind-response">
+          <div class="arc-step-row">
+            <div class="arc-step-marker">
+              <span class="arc-dot"></span>
+              <span class="arc-step-label">response</span>
+            </div>
+            <div class="arc-step-body">
+              {% if arc.response %}
+                <div class="arc-bubble outbound">
+                  <div class="arc-bubble-text">{{ arc.response }}</div>
+                </div>
+              {% elif arc.error %}
+                <div class="arc-bubble error">
+                  <span class="arc-bubble-tag">error</span>
+                  <div class="arc-bubble-text">{{ arc.error }}</div>
+                </div>
+              {% else %}
+                <div class="arc-step-empty muted">
+                  {% if arc.end_ts %}
+                    (no outbound captured)
+                  {% else %}
+                    (still running…)
+                  {% endif %}
+                </div>
+              {% endif %}
+            </div>
+          </div>
+        </li>
+      </ol>
+    </article>
+  {% endfor %}
 {% endblock %}

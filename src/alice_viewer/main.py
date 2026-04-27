@@ -231,26 +231,78 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         )
 
     @app.get("/interactions", response_class=HTMLResponse)
-    async def interactions(request: Request):
+    async def interactions(
+        request: Request,
+        limit: int = 100,
+        kind: str | None = None,   # "signal" | "surface" | "emergency" | None
+        sender: str | None = None,  # filter by sender name (signal turns)
+    ):
         p: Paths = app.state.paths
         events = sources.load_all(p)
-        wakes = aggregators.group_wakes(events)
+        # Enrich turns with outbound text from speaking-turns.jsonl —
+        # speaking.log's signal_turn_end events don't carry the actual
+        # message text Speaking sent, but the turn-log does. We patch the
+        # relevant Turn objects via group_turns() before building arcs.
         turns = aggregators.group_turns(events)
-        surfaces = [e for e in events if e.kind in ("surface_pending", "surface_resolved")]
-        emergencies = [e for e in events if e.kind in ("emergency_pending", "emergency_resolved")]
-        notes = [e for e in events if e.kind in ("note_pending", "note_consumed")]
-        surfaces.sort(key=lambda e: e.ts, reverse=True)
-        emergencies.sort(key=lambda e: e.ts, reverse=True)
-        notes.sort(key=lambda e: e.ts, reverse=True)
+        turn_log_events = sources.read_turn_log(p.turn_log)
+        for tev in turn_log_events:
+            rec = tev.detail or {}
+            outbound = rec.get("outbound")
+            sender_name = rec.get("sender_name")
+            if not outbound:
+                continue
+            for t in turns:
+                if t.outbound:
+                    continue
+                if t.kind != "signal" or t.sender_name != sender_name:
+                    continue
+                anchor = t.end_ts if t.end_ts else t.start_ts
+                if abs(tev.ts - anchor) <= 10.0:
+                    t.outbound = outbound
+                    break
+
+        # group_arcs reads turn.outbound off the Turn objects we just
+        # patched, so the enrichment carries through.
+        arcs = aggregators.group_arcs(events, turns=turns)
+
+        total_arcs = len(arcs)
+        # Per-kind counts (pre-filter)
+        kind_counts = {
+            "signal": sum(1 for a in arcs if a.kind == "signal"),
+            "surface": sum(1 for a in arcs if a.kind == "surface"),
+            "emergency": sum(1 for a in arcs if a.kind == "emergency"),
+        }
+        # Distinct senders for the filter pill row (signal arcs only)
+        senders = sorted({a.sender for a in arcs if a.kind == "signal" and a.sender})
+
+        # Apply filters
+        filtered = arcs
+        if kind in ("signal", "surface", "emergency"):
+            filtered = [a for a in filtered if a.kind == kind]
+        if sender:
+            filtered = [a for a in filtered if a.sender == sender]
+
+        # Newest-first cap
+        filtered = filtered[: max(1, min(limit, 500))]
+
+        pending_surfaces = sum(1 for e in events if e.kind == "surface_pending")
+        pending_emergencies = sum(1 for e in events if e.kind == "emergency_pending")
+        pending_notes = sum(1 for e in events if e.kind == "note_pending")
+
         return templates.TemplateResponse(
             request,
             "interactions.html",
             {
-                "surfaces": surfaces,
-                "emergencies": emergencies,
-                "notes": notes,
-                "wakes": wakes,
-                "turns": turns,
+                "arcs": filtered,
+                "total_arcs": total_arcs,
+                "kind_counts": kind_counts,
+                "senders": senders,
+                "filter_kind": kind,
+                "filter_sender": sender,
+                "limit": limit,
+                "pending_surfaces": pending_surfaces,
+                "pending_emergencies": pending_emergencies,
+                "pending_notes": pending_notes,
                 "state": _state_context(),
                 "active": "interactions",
             },
