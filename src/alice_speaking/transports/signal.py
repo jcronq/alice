@@ -85,7 +85,7 @@ class SignalTransport:
     # ------------------------------------------------------------------
     # Outbound
 
-    async def send(self, out: OutboundMessage) -> None:
+    async def send(self, out: OutboundMessage) -> int:
         """Render Alice's text per :data:`SIGNAL_CAPS`, then send chunk-by-chunk.
 
         ``render()`` strips markdown (Signal renders none) and chunks to
@@ -97,6 +97,9 @@ class SignalTransport:
         Attachments ride on the FIRST chunk only. signal-cli stores the
         attachment alongside the message; sending it on every chunk
         would multiply the upload and look like duplicate media.
+
+        Returns the number of chunks delivered (0 when ``render`` produces
+        an empty list — e.g. text was whitespace).
         """
         # Lazy import: alice_speaking.render imports transports.base, so
         # importing it at module scope would cycle through this module
@@ -106,7 +109,7 @@ class SignalTransport:
         chunks = render(out.text, self.caps)
         if not chunks:
             log.debug("signal send: render produced no chunks; nothing to do")
-            return
+            return 0
 
         recipient = out.destination.address
         attachments = list(out.attachments) if out.attachments else None
@@ -121,6 +124,7 @@ class SignalTransport:
                 payload,
                 attachments=attachments if i == 1 else None,
             )
+        return total
 
     async def typing(self, channel: ChannelRef, on: bool) -> None:
         """Drive the typing-indicator heartbeat for a recipient."""

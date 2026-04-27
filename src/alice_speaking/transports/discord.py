@@ -191,12 +191,13 @@ class DiscordTransport:
     # ------------------------------------------------------------------
     # Outbound
 
-    async def send(self, out: OutboundMessage) -> None:
+    async def send(self, out: OutboundMessage) -> int:
         """Render Alice's text per :data:`DISCORD_CAPS` and DM each chunk.
 
         Multi-chunk messages get an ``(i/N)`` prefix to mirror the Signal
         convention. Attachments are accepted but logged-and-dropped for
-        now — Phase 4 cleanup territory.
+        now. Returns the chunk count delivered (0 when render produces
+        nothing).
         """
         from ..render import render
 
@@ -206,7 +207,7 @@ class DiscordTransport:
         chunks = render(out.text, self.caps)
         if not chunks:
             log.debug("discord send: render produced no chunks; nothing to do")
-            return
+            return 0
 
         if out.attachments:
             log.warning(
@@ -219,6 +220,7 @@ class DiscordTransport:
         for i, chunk in enumerate(chunks, start=1):
             payload = f"({i}/{total}) {chunk}" if total > 1 else chunk
             await user.send(payload)
+        return total
 
     async def _resolve_user(self, native_id: str) -> discord.abc.User:
         cached = self._user_cache.get(native_id)

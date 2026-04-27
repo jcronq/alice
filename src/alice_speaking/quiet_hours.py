@@ -1,8 +1,9 @@
 """Quiet hours policy + queued-outbound persistence.
 
 During quiet hours the daemon still processes turns and runs surface
-reviews — Alice is present but silent. Signal outbound is held until the
-window closes, then drained in-order.
+reviews — Alice is present but silent. Outbound on durable transports
+(signal, discord) is held until the window closes, then drained
+in-order. CLI bypasses (interactive — the user is at a terminal waiting).
 """
 
 from __future__ import annotations
@@ -17,9 +18,14 @@ from zoneinfo import ZoneInfo
 
 @dataclass
 class QueuedMessage:
+    """A queued outbound. ``transport`` is required to know which
+    transport to dispatch on at drain time. Defaults to ``"signal"`` for
+    back-compat with pre-Phase-4 on-disk records (signal-only)."""
+
     recipient: str
     text: str
     queued_at: float
+    transport: str = "signal"
 
 
 def is_quiet_hours(cfg_speaking: dict[str, Any], now: dt.datetime | None = None) -> bool:

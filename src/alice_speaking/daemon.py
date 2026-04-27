@@ -918,54 +918,6 @@ class SpeakingDaemon:
         ])
         return "\n".join(lines)
 
-    async def _send_or_queue(
-        self,
-        recipient: str,
-        text: str,
-        sender_name: str,
-        *,
-        turn_id: Optional[str] = None,
-    ) -> None:
-        if is_quiet_hours(self.cfg.speaking):
-            self.quiet_queue.append(
-                QueuedMessage(
-                    recipient=recipient,
-                    text=text,
-                    queued_at=time.time(),
-                )
-            )
-            log.info(
-                "quiet hours: queued reply for %s (%d chars); queue size=%d",
-                sender_name,
-                len(text),
-                self.quiet_queue.size(),
-            )
-            self.events.emit(
-                "quiet_queue_enter",
-                turn_id=turn_id,
-                recipient=recipient,
-                sender_name=sender_name,
-                text_len=len(text),
-                queue_size=self.quiet_queue.size(),
-            )
-            return
-        await self.signal_transport.send(
-            OutboundMessage(
-                destination=ChannelRef(
-                    transport="signal", address=recipient, durable=True
-                ),
-                text=text,
-            )
-        )
-        log.info("replied to %s (%d chars)", sender_name, len(text))
-        self.events.emit(
-            "signal_send",
-            turn_id=turn_id,
-            recipient=recipient,
-            sender_name=sender_name,
-            text_len=len(text),
-        )
-
     async def _quiet_watcher(self) -> None:
         """Poll quiet-hours state; drain the queue on transition out."""
         was_quiet = is_quiet_hours(self.cfg.speaking)
@@ -983,20 +935,22 @@ class SpeakingDaemon:
         log.info("draining quiet queue (%d msgs) — %s", len(messages), reason)
         self.events.emit("quiet_queue_drain", count=len(messages), reason=reason)
         for msg in messages:
+            channel = ChannelRef(
+                transport=msg.transport,
+                address=msg.recipient,
+                durable=True,
+            )
             try:
-                await self.signal_transport.send(
-                    OutboundMessage(
-                        destination=ChannelRef(
-                            transport="signal",
-                            address=msg.recipient,
-                            durable=True,
-                        ),
-                        text=msg.text,
-                    )
+                await self._dispatch_outbound(
+                    channel,
+                    msg.text,
+                    bypass_quiet=True,  # we're past the window already
                 )
             except Exception:  # noqa: BLE001
                 log.exception(
-                    "failed to send queued message to %s; re-queueing", msg.recipient
+                    "failed to send queued %s message to %s; re-queueing",
+                    msg.transport,
+                    msg.recipient,
                 )
                 self.quiet_queue.append(msg)
 
@@ -1227,127 +1181,191 @@ class SpeakingDaemon:
           messaging tool (via the address book or a raw E.164 number).
           Routed through the transport identified by ``channel.transport``.
 
-        Quiet-hours policy (signal): replies to inbound (signal turns) and
-        emergencies bypass the quiet queue — Owner expects an answer
-        when he asks. Surface-triggered sends (Alice's own thoughts)
-        honor quiet hours via ``_send_or_queue``. Attachments always
-        bypass — the quiet queue stores text-only payloads and dropping
+        Quiet-hours policy (signal + discord): replies to inbound turns
+        and emergencies bypass the queue — the user is waiting on an
+        answer. Surface-triggered sends (Alice's own thoughts) honor
+        quiet hours and route through :class:`QuietQueue`. Attachments
+        always bypass — the queue stores text-only payloads and dropping
         attachments there would silently ditch media.
 
         CLI sends never queue: the user is at a terminal waiting; quiet
         hours don't apply.
         """
-        # ---- Self-reply path: route by current reply channel's transport.
         if recipient == SELF_RECIPIENT:
             channel = self._current_reply_channel
             if channel is None:
                 raise RuntimeError(
                     "send_message(recipient='self') has no inbound channel "
-                    "to reply on (only valid during a signal/cli/emergency turn)"
+                    "to reply on (only valid during a signal/cli/discord/"
+                    "emergency turn)"
                 )
         else:
             assert isinstance(recipient, ChannelRef)
             channel = recipient
 
-        if channel.transport == "cli":
-            if self.cli_transport is None:
-                raise RuntimeError("cli transport disabled but reply requested")
-            if not channel.durable and recipient != SELF_RECIPIENT:
-                # Explicit cli sends from outside the originating turn
-                # have no live socket to deliver on — refuse cleanly.
-                raise RuntimeError(
-                    "cannot send to ephemeral cli channel outside its "
-                    "originating turn — use recipient='self' during the "
-                    "inbound CLI turn instead"
-                )
-            if attachments:
-                log.warning(
-                    "ignoring %d attachment(s) for cli reply; cli does "
-                    "not support outbound files yet",
-                    len(attachments),
-                )
-            chunks = render_module.render(text, self.cli_transport.caps)
-            for chunk in chunks:
-                await self.cli_transport.send(
-                    OutboundMessage(destination=channel, text=chunk)
-                )
-            self.events.emit(
-                "cli_send",
-                principal_id=channel.address,
-                text_len=len(text),
-                chunk_count=len(chunks),
-            )
-            self._turn_last_outbound = text
-            self._turn_did_send = True
-            return
-
-        if channel.transport == "discord":
-            if self.discord_transport is None:
-                raise RuntimeError("discord transport disabled but reply requested")
-            if attachments:
-                log.warning(
-                    "ignoring %d attachment(s) for discord reply; not yet "
-                    "implemented",
-                    len(attachments),
-                )
-            await self.discord_transport.send(
-                OutboundMessage(destination=channel, text=text)
-            )
-            self.events.emit(
-                "discord_send",
-                principal_id=channel.address,
-                text_len=len(text),
-            )
-            self._turn_last_outbound = text
-            self._turn_did_send = True
-            return
-
-        if channel.transport != "signal":
+        # CLI deliverability — refuse explicit sends to dead ephemeral
+        # channels rather than dropping them silently.
+        if (
+            channel.transport == "cli"
+            and not channel.durable
+            and recipient != SELF_RECIPIENT
+        ):
             raise RuntimeError(
-                f"don't know how to send to transport '{channel.transport}'"
+                "cannot send to ephemeral cli channel outside its "
+                "originating turn — use recipient='self' during the "
+                "inbound CLI turn instead"
             )
-        signal_channel = channel
 
-        # ---- Signal path (transport-routed).
         emergency = getattr(self, "_emergency_bypass", False)
+        # Bypass triggers: emergency-flavored turn, or we're inside an
+        # inbound conversational turn whose user is waiting, or we'd have
+        # to drop attachments to queue. CLI is always-bypass (interactive).
         bypass_quiet = (
-            emergency
-            or self._current_turn_kind == "signal"
-            or bool(attachments)  # see docstring
+            channel.transport == "cli"
+            or emergency
+            or self._current_turn_kind in ("signal", "discord", "cli")
+            or bool(attachments)
         )
-        if bypass_quiet:
-            await self.signal_transport.send(
-                OutboundMessage(
-                    destination=signal_channel,
-                    text=text,
-                    attachments=list(attachments) if attachments else [],
-                )
-            )
-            log.info(
-                "%s send to %s (%d chars%s)",
-                "emergency" if emergency else "reply",
-                signal_channel.address,
-                len(text),
-                f", {len(attachments)} attachment(s)" if attachments else "",
-            )
-            self.events.emit(
-                "signal_send",
-                recipient=signal_channel.address,
-                sender_name=self._sender_name_for(signal_channel.address),
-                text_len=len(text),
-                attachment_count=len(attachments) if attachments else 0,
-                emergency=emergency,
-                bypassed_quiet=is_quiet_hours(self.cfg.speaking),
-            )
-        else:
-            # Surface-triggered (Alice's own thought) — honors quiet hours.
-            await self._send_or_queue(
-                signal_channel.address,
-                text,
-                self._sender_name_for(signal_channel.address),
-            )
+
+        await self._dispatch_outbound(
+            channel,
+            text,
+            attachments,
+            emergency=emergency,
+            bypass_quiet=bypass_quiet,
+        )
         self._turn_last_outbound = text
         self._turn_did_send = True
+
+    # ------------------------------------------------------------------
+    # Unified outbound dispatch
+    #
+    # One function = one path = one event emission. Replaces the old
+    # branched-by-transport routing in ``_send_message`` (which had two
+    # ``signal_send`` emit sites with subtly different field shapes) and
+    # the signal-only ``_send_or_queue``.
+
+    def _transport_for(self, name: str):
+        return {
+            "signal": self.signal_transport,
+            "cli": self.cli_transport,
+            "discord": self.discord_transport,
+        }.get(name)
+
+    async def _dispatch_outbound(
+        self,
+        channel: ChannelRef,
+        text: str,
+        attachments: Optional[list[str]] = None,
+        *,
+        turn_id: Optional[str] = None,
+        emergency: bool = False,
+        bypass_quiet: bool = False,
+    ) -> None:
+        """Deliver ``text`` to ``channel``. Honors quiet hours (when not
+        bypassed) for durable transports; emits the canonical
+        ``<transport>_send`` event after delivery."""
+        transport = self._transport_for(channel.transport)
+        if transport is None:
+            raise RuntimeError(
+                f"transport {channel.transport!r} is not available "
+                "(disabled or not configured)"
+            )
+
+        # Queueable transports: signal, discord. CLI never queues.
+        queueable = channel.transport in ("signal", "discord")
+        if queueable and not bypass_quiet and is_quiet_hours(self.cfg.speaking):
+            self.quiet_queue.append(
+                QueuedMessage(
+                    transport=channel.transport,
+                    recipient=channel.address,
+                    text=text,
+                    queued_at=time.time(),
+                )
+            )
+            sender_name = self.address_book.display_name_for(
+                channel.transport, channel.address
+            )
+            log.info(
+                "quiet hours: queued %s reply for %s (%d chars); queue size=%d",
+                channel.transport,
+                sender_name,
+                len(text),
+                self.quiet_queue.size(),
+            )
+            self.events.emit(
+                "quiet_queue_enter",
+                turn_id=turn_id,
+                transport=channel.transport,
+                recipient=channel.address,
+                sender_name=sender_name,
+                text_len=len(text),
+                queue_size=self.quiet_queue.size(),
+            )
+            return
+
+        if attachments and channel.transport != "signal":
+            log.warning(
+                "ignoring %d attachment(s) for %s reply; transport doesn't "
+                "support outbound files yet",
+                len(attachments),
+                channel.transport,
+            )
+            attachments = None
+
+        chunk_count = await transport.send(
+            OutboundMessage(
+                destination=channel,
+                text=text,
+                attachments=list(attachments) if attachments else [],
+            )
+        )
+        log.info(
+            "%s send to %s (%d chars%s)",
+            "emergency" if emergency else "reply",
+            channel.address,
+            len(text),
+            f", {len(attachments)} attachment(s)" if attachments else "",
+        )
+        self._emit_send_event(
+            channel=channel,
+            text_len=len(text),
+            chunk_count=chunk_count,
+            attachment_count=len(attachments) if attachments else 0,
+            emergency=emergency,
+            bypassed_quiet=is_quiet_hours(self.cfg.speaking),
+            turn_id=turn_id,
+        )
+
+    def _emit_send_event(
+        self,
+        *,
+        channel: ChannelRef,
+        text_len: int,
+        chunk_count: int,
+        attachment_count: int,
+        emergency: bool,
+        bypassed_quiet: bool,
+        turn_id: Optional[str],
+    ) -> None:
+        """Single canonical ``<transport>_send`` event shape across all
+        transports. ``bypassed_quiet`` is ``True`` only when delivery
+        happened despite the wall-clock being inside the quiet window
+        (i.e. a real bypass took effect, not just "we sent at 3pm")."""
+        sender_name = self.address_book.display_name_for(
+            channel.transport, channel.address
+        )
+        self.events.emit(
+            f"{channel.transport}_send",
+            turn_id=turn_id,
+            recipient=channel.address,
+            sender_name=sender_name,
+            text_len=text_len,
+            chunk_count=chunk_count,
+            attachment_count=attachment_count,
+            emergency=emergency,
+            bypassed_quiet=bypassed_quiet,
+        )
 
     def _sender_name_for(self, recipient: str) -> str:
         return self.address_book.display_name_for("signal", recipient)

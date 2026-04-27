@@ -236,6 +236,69 @@ def test_send_message_suppresses_missed_reply(cfg, monkeypatch) -> None:
     assert sent == [("+15555550100", "hi")]
 
 
+def _read_events(path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def test_signal_send_event_has_unified_shape(cfg, monkeypatch) -> None:
+    """After Phase 4a, signal_send carries the canonical
+    {recipient, sender_name, text_len, chunk_count, attachment_count,
+    emergency, bypassed_quiet} shape — same as cli_send / discord_send."""
+    d = _make_daemon(cfg, monkeypatch)
+    from alice_speaking.transports import ChannelRef
+
+    jason = ChannelRef(transport="signal", address="+15555550100", durable=True)
+
+    async def go():
+        d._turn_did_send = False
+        d._current_turn_kind = "signal"  # bypass quiet so test is wall-clock-stable
+        await d._send_message(jason, "hi")
+
+    asyncio.run(go())
+    events = [e for e in _read_events(cfg.event_log_path) if e["event"] == "signal_send"]
+    assert len(events) == 1
+    e = events[0]
+    for key in (
+        "recipient",
+        "sender_name",
+        "text_len",
+        "chunk_count",
+        "attachment_count",
+        "emergency",
+        "bypassed_quiet",
+    ):
+        assert key in e, f"missing {key!r} on signal_send: {e}"
+    assert e["recipient"] == "+15555550100"
+    assert e["sender_name"] == "Owner"
+    assert e["text_len"] == 2
+    assert e["chunk_count"] == 1
+    assert e["attachment_count"] == 0
+
+
+def test_discord_surface_send_routes_through_quiet_queue(cfg, monkeypatch) -> None:
+    """Discord surface-triggered sends honor quiet hours — Phase 4b
+    closes the gap where 3b always-bypassed."""
+    d = _make_daemon(cfg, monkeypatch)
+    # Force quiet hours regardless of wall clock.
+    monkeypatch.setattr(daemon_module, "is_quiet_hours", lambda *_a, **_k: True)
+    d.discord_transport = object()  # truthy stand-in; we won't reach .send()
+
+    from alice_speaking.transports import ChannelRef
+
+    discord_user = ChannelRef(transport="discord", address="111", durable=True)
+
+    async def go():
+        d._turn_did_send = False
+        d._current_turn_kind = "surface"  # surface, not inbound — should queue
+        await d._dispatch_outbound(discord_user, "hello")
+
+    asyncio.run(go())
+    assert d.quiet_queue.size() == 1
+    queued = d.quiet_queue.drain()[0]
+    assert queued.transport == "discord"
+    assert queued.recipient == "111"
+
+
 def test_token_threshold_arms_compaction(cfg, monkeypatch) -> None:
     d = _make_daemon(cfg, monkeypatch)
     # Lower the threshold so the fake usage trips it.

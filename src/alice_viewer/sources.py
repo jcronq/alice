@@ -286,8 +286,16 @@ def _speaking_summary(event: str, rec: dict[str, Any]) -> str:
         chars = rec.get("outbound_chars") or 0
         err = rec.get("error")
         return f"turn end · {chars} chars" + (f" · error={err}" if err else "")
-    if event == "signal_send":
-        return f"signal-send · {rec.get('sender_name')} ({rec.get('text_len')} chars)"
+    if event in ("signal_send", "cli_send", "discord_send"):
+        transport = event.removesuffix("_send")
+        chunks = rec.get("chunk_count")
+        chunk_suffix = (
+            f", {chunks} chunks" if chunks is not None and chunks != 1 else ""
+        )
+        return (
+            f"{transport}-send · {rec.get('sender_name')} "
+            f"({rec.get('text_len')} chars{chunk_suffix})"
+        )
     if event == "surface_dispatch":
         return f"surface dispatch · {rec.get('surface_id')}"
     if event == "surface_turn_end":

@@ -13,6 +13,12 @@ const KIND_LABELS = {
   signal_turn_start: 'signal in',
   signal_turn_end: 'signal done',
   signal_send: 'signal sent',
+  cli_turn_start: 'cli in',
+  cli_turn_end: 'cli done',
+  cli_send: 'cli sent',
+  discord_turn_start: 'discord in',
+  discord_turn_end: 'discord done',
+  discord_send: 'discord sent',
   surface_dispatch: 'surface in',
   surface_turn_end: 'surface done',
   emergency_dispatch: 'emergency in',
@@ -51,7 +57,10 @@ const KIND_FAMILIES = {
   wake_start: 'boundary', wake_end: 'boundary',
   daemon_start: 'boundary', daemon_ready: 'boundary', shutdown: 'boundary',
   surface_turn_end: 'boundary', emergency_turn_end: 'boundary',
-  signal_turn_start: 'turn', signal_turn_end: 'turn', signal_send: 'turn', turn_log: 'turn',
+  signal_turn_start: 'turn', signal_turn_end: 'turn', signal_send: 'turn',
+  cli_turn_start: 'turn', cli_turn_end: 'turn', cli_send: 'turn',
+  discord_turn_start: 'turn', discord_turn_end: 'turn', discord_send: 'turn',
+  turn_log: 'turn',
   surface_dispatch: 'artifact', surface_pending: 'artifact', surface_resolved: 'artifact',
   thought_written: 'thought',
   note_pending: 'note', note_consumed: 'note',
@@ -120,6 +129,19 @@ function kvTable(pairs) {
     .map(([k, v]) => `<span class="k">${escapeHtml(k)}</span><span class="v">${v}</span>`)
     .join('');
   return `<div class="detail-grid">${rows}</div>`;
+}
+
+function sendEventDetail(rec) {
+  const d = rec.detail;
+  return kvTable([
+    ['recipient', escapeHtml(d.recipient || '—')],
+    ['sender label', escapeHtml(d.sender_name || '—')],
+    ['text length', d.text_len],
+    ['chunks', d.chunk_count],
+    ['attachments', d.attachment_count],
+    ['emergency', d.emergency ? 'yes' : ''],
+    ['bypassed quiet hours', d.bypassed_quiet ? 'yes' : ''],
+  ]);
 }
 
 /* ------------------------------------------------------------------ */
@@ -261,11 +283,9 @@ const KIND_RENDERERS = {
       ['error', d.error ? `<span style="color:var(--err)">${escapeHtml(d.error)}</span>` : '—'],
     ]) + (d.outbound ? '<h2>outbound</h2>' + renderMarkdown(d.outbound) : '');
   },
-  signal_send: (rec) => kvTable([
-    ['recipient', escapeHtml(rec.detail.recipient || '—')],
-    ['sender label', escapeHtml(rec.detail.sender_name || '—')],
-    ['text length', rec.detail.text_len],
-  ]),
+  signal_send: (rec) => sendEventDetail(rec),
+  cli_send: (rec) => sendEventDetail(rec),
+  discord_send: (rec) => sendEventDetail(rec),
 
   surface_dispatch: (rec) => {
     const d = rec.detail;

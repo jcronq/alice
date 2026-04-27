@@ -150,14 +150,20 @@ class CLITransport:
     # ------------------------------------------------------------------
     # Outbound
 
-    async def send(self, out: OutboundMessage) -> None:
+    async def send(self, out: OutboundMessage) -> int:
         """Deliver an OutboundMessage to the correct connection.
 
         ``out.destination.address`` is the connection_id assigned at
         accept time. If that connection has gone away (client
         disconnected mid-turn), the send is logged and dropped — there's
         no recovery for an ephemeral channel.
+
+        Renders + chunks per :data:`CLI_CAPS` (full markdown, 1MB
+        chunks — practically a single chunk for any reasonable reply).
+        Returns the chunk count.
         """
+        from ..render import render
+
         conn_id = out.destination.address
         writer = self._writers.get(conn_id)
         if writer is None:
@@ -166,8 +172,13 @@ class CLITransport:
                 conn_id,
                 len(out.text),
             )
-            return
-        await self._write_event(writer, {"type": "chunk", "text": out.text})
+            return 0
+        chunks = render(out.text, self.caps)
+        if not chunks:
+            return 0
+        for chunk in chunks:
+            await self._write_event(writer, {"type": "chunk", "text": chunk})
+        return len(chunks)
 
     async def typing(self, channel: ChannelRef, on: bool) -> None:
         """No-op for CLI — terminals don't have typing indicators."""
