@@ -9,9 +9,9 @@ Surface and emergency events are NOT transports — they're internal triggers
 and stay on their own producers. The Transport interface is for human-facing
 channels only.
 
-Phase 1 ships the base types and one transport (:class:`CLITransport`).
-SignalClient is left on its current path; Phase 2 will refactor it under
-this interface.
+Phase 1 shipped the base types and :class:`CLITransport`. Phase 2 adds
+:class:`SignalTransport` for outbound dispatch (inbound still flows
+through the daemon's ``_signal_producer`` until Phase 3).
 """
 
 from .base import (
@@ -23,6 +23,7 @@ from .base import (
     Transport,
 )
 from .cli import CLITransport
+from .signal import SignalTransport
 
 __all__ = [
     "Capabilities",
@@ -31,5 +32,6 @@ __all__ = [
     "InboundMessage",
     "OutboundMessage",
     "Principal",
+    "SignalTransport",
     "Transport",
 ]

@@ -62,7 +62,13 @@ from .handlers import CompactionArmer, SessionHandler
 from .quiet_hours import QueuedMessage, QuietQueue, is_quiet_hours
 from .signal_client import SignalClient, SignalEnvelope
 from .tools.messaging import SELF_RECIPIENT
-from .transports import CLITransport, ChannelRef, InboundMessage, OutboundMessage
+from .transports import (
+    CLITransport,
+    ChannelRef,
+    InboundMessage,
+    OutboundMessage,
+    SignalTransport,
+)
 from .turn_log import TurnLog, new_turn
 
 
@@ -131,6 +137,10 @@ class SpeakingDaemon:
             log_path=cfg.signal_log_path,
             offset_path=cfg.offset_path,
         )
+        # Phase 2: SignalTransport wraps the SignalClient under the
+        # Transport interface. Phase 2a constructs it; Phase 2b cuts
+        # outbound dispatch over to it.
+        self.signal_transport = SignalTransport(signal_client=self.signal)
         self.dedup = DedupStore(cfg.seen_path)
         self.turns = TurnLog(cfg.turn_log_path)
         self.events = EventLogger(cfg.event_log_path)
@@ -240,6 +250,7 @@ class SpeakingDaemon:
         try:
             log.info("waiting for signal-cli at %s", self.cfg.signal_api)
             await self.signal.wait_ready()
+            await self.signal_transport.start()
             log.info("daemon ready; listening")
             self.events.emit("daemon_ready", signal_api=self.cfg.signal_api)
 
@@ -276,6 +287,8 @@ class SpeakingDaemon:
                 with contextlib.suppress(BaseException):
                     await task
         finally:
+            with contextlib.suppress(Exception):
+                await self.signal_transport.stop()
             await self.signal.aclose()
             if self.cli_transport is not None:
                 with contextlib.suppress(Exception):

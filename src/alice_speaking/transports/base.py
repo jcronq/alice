@@ -149,11 +149,18 @@ class InboundMessage:
 
 @dataclass
 class OutboundMessage:
-    """An outbound message handed by the router back to a transport."""
+    """An outbound message handed by the router back to a transport.
+
+    ``attachments`` is a list of filesystem paths the transport can read.
+    Paths must be visible to the transport's underlying delivery process
+    (e.g. for Signal, paths must be visible to signal-cli's container).
+    Transports that don't support attachments may log + drop them.
+    """
 
     destination: ChannelRef
     text: str
     in_reply_to: Optional[InboundMessage] = None
+    attachments: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
