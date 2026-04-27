@@ -293,6 +293,10 @@ class AgentKernel:
         kwargs: dict[str, Any] = {
             "model": spec.model,
             "allowed_tools": spec.allowed_tools,
+            # SDK default is 1MB, which dense tool-use turns blow through
+            # (observed CLIJSONDecodeError 2026-04-26). 10MB is a generous
+            # margin without unbounded memory exposure.
+            "max_buffer_size": 10 * 1024 * 1024,
         }
         if spec.cwd is not None:
             kwargs["cwd"] = str(spec.cwd)
