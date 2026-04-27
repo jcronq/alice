@@ -7,10 +7,17 @@ design-unified-context-compaction.md) is to make the outbox explicit:
 Alice calls ``send_message(recipient, message)`` whenever she wants text
 to reach Signal. Returning text alone no longer sends it.
 
-Recipient resolution:
-- ``"jason"`` / ``"katie"`` — resolved against cfg.allowed_senders by
-  case-insensitive name match.
-- anything starting with ``+`` — treated as an E.164 phone number.
+Recipient resolution (Phase 3 — address-book backed):
+- ``"self"`` / ``"reply"`` etc. — reply on the same transport the
+  inbound came from. The daemon's :meth:`_send_message` honors the
+  current turn's reply channel.
+- A principal id or display name (``"jcronq"``, ``"jason"``, ``"katie"``)
+  — looked up in the :class:`AddressBook`. Resolves to that principal's
+  preferred channel (signal by default, but transports/phase-3-onwards
+  can pick e.g. discord per-principal).
+- An E.164 phone number (anything starting with ``+``) — treated as a
+  Signal address. No address-book lookup; Alice may message numbers
+  not in the book.
 - anything else — error.
 
 Attachment path strategy (cross-container)
@@ -52,12 +59,14 @@ import os
 import pathlib
 import shutil
 import uuid
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, Union
 
 from claude_agent_sdk import SdkMcpTool, tool
 
 from ..config import Config
+from ..principals import AddressBook
 from ..signal_client import SignalClient
+from ..transports.base import ChannelRef
 
 
 log = logging.getLogger(__name__)
@@ -89,11 +98,23 @@ SELF_RECIPIENT = "__SELF__"
 _SELF_ALIASES = frozenset({"self", "reply", "user", "sender"})
 
 
-def _resolve_recipient(raw: str, cfg: Config) -> Optional[str]:
-    """Map a name / number / alias string to either an E.164 phone number
-    or :data:`SELF_RECIPIENT`.
+# Resolved recipient — either the SELF_RECIPIENT sentinel or a concrete
+# :class:`ChannelRef` produced by the address book / E.164 parser.
+ResolvedRecipient = Union[str, ChannelRef]
 
-    Returns None if the recipient can't be resolved.
+
+def _resolve_recipient(
+    raw: str, address_book: AddressBook
+) -> Optional[ResolvedRecipient]:
+    """Map a name / number / alias string to a recipient the daemon can
+    dispatch on.
+
+    Returns:
+        - ``SELF_RECIPIENT`` for self-aliases.
+        - A signal :class:`ChannelRef` for E.164 phone numbers.
+        - The address book's preferred :class:`ChannelRef` for known
+          principal ids / display names.
+        - ``None`` for anything unresolvable.
     """
     value = (raw or "").strip()
     if not value:
@@ -101,13 +122,8 @@ def _resolve_recipient(raw: str, cfg: Config) -> Optional[str]:
     if value.lower() in _SELF_ALIASES:
         return SELF_RECIPIENT
     if value.startswith("+"):
-        # Already in E.164 form — trust it.
-        return value
-    lowered = value.lower()
-    for number, sender in cfg.allowed_senders.items():
-        if sender.name.lower() == lowered:
-            return number
-    return None
+        return ChannelRef(transport="signal", address=value, durable=True)
+    return address_book.preferred_channel(value)
 
 
 def _stage_attachments(
@@ -160,10 +176,13 @@ def _cleanup(paths: list[str]) -> None:
 
 # Type alias for the coroutine that actually sends a message. The daemon
 # passes a closure that updates its internal "did-send" tracking so
-# missed_reply detection works. ``attachments`` is None when no media
-# rides along — callers MAY pass an empty list and we treat that the
-# same as None.
-SendCallable = Callable[[str, str, Optional[list[str]]], Awaitable[None]]
+# missed_reply detection works. The first argument is either the
+# :data:`SELF_RECIPIENT` sentinel (str) or a resolved :class:`ChannelRef`.
+# ``attachments`` is None when no media rides along — callers MAY pass an
+# empty list and we treat that the same as None.
+SendCallable = Callable[
+    [ResolvedRecipient, str, Optional[list[str]]], Awaitable[None]
+]
 
 
 # JSON Schema for the send_message tool. We use the explicit JSON-Schema
@@ -207,6 +226,7 @@ _SEND_MESSAGE_SCHEMA: dict[str, Any] = {
 def build(
     cfg: Config,
     *,
+    address_book: AddressBook,
     signal: Optional[SignalClient] = None,
     sender: Optional[SendCallable] = None,
     outbox_dir: Optional[pathlib.Path] = None,
@@ -214,9 +234,10 @@ def build(
     """Build the messaging tool list.
 
     One of ``sender`` or ``signal`` must be provided. ``sender`` wins when
-    both are present — this lets the daemon wrap SignalClient.send with
+    both are present — this lets the daemon wrap transport.send with
     bookkeeping (did-send tracking, event emission, quiet-hours routing).
 
+    ``address_book`` is used for principal-name → channel resolution.
     ``outbox_dir`` overrides the spool location used to stage attachments.
     Defaults to ``/state/outbox`` (shared between worker and daemon
     containers).
@@ -232,11 +253,24 @@ def build(
         _signal = signal
 
         async def _direct(
-            recipient: str,
+            recipient: ResolvedRecipient,
             message: str,
             attachments: Optional[list[str]] = None,
         ) -> None:
-            await _signal.send(recipient, message, attachments=attachments)
+            # Direct (no-daemon) path is signal-only: the bare SignalClient
+            # has no concept of CLI / Discord / SELF_RECIPIENT. Reject
+            # anything we can't translate to a Signal address.
+            if isinstance(recipient, str):
+                raise RuntimeError(
+                    "direct sender cannot route SELF_RECIPIENT — wrap with "
+                    "the daemon's _send_message closure to use 'self'"
+                )
+            if recipient.transport != "signal":
+                raise RuntimeError(
+                    f"direct sender is signal-only; got transport "
+                    f"{recipient.transport!r}"
+                )
+            await _signal.send(recipient.address, message, attachments=attachments)
 
         actual_sender = _direct
 
@@ -260,11 +294,12 @@ def build(
         message = args.get("message") or ""
         if not isinstance(message, str) or not message.strip():
             return _err("message must be a non-empty string")
-        number = _resolve_recipient(raw_recipient, cfg)
-        if number is None:
+        resolved = _resolve_recipient(raw_recipient, address_book)
+        if resolved is None:
             return _err(
                 f"could not resolve recipient {raw_recipient!r}; "
-                "use 'jason', 'katie', or an E.164 number (+...)."
+                "use 'self', a known principal id / display name, or an "
+                "E.164 number (+...)."
             )
 
         # Validate + normalize attachments. Empty list is treated as None
@@ -289,7 +324,7 @@ def build(
             cleanups = []
 
         try:
-            await actual_sender(number, message, attachment_paths)
+            await actual_sender(resolved, message, attachment_paths)
         except Exception as exc:  # noqa: BLE001
             _cleanup(cleanups)
             return _err(f"{type(exc).__name__}: {exc}")
@@ -304,9 +339,11 @@ def build(
             if attachment_paths
             else ""
         )
-        target_desc = (
-            "via current channel" if number == SELF_RECIPIENT else f"to {number}"
-        )
+        if resolved == SELF_RECIPIENT:
+            target_desc = "via current channel"
+        else:
+            assert isinstance(resolved, ChannelRef)
+            target_desc = f"to {resolved.transport}:{resolved.address}"
         return _ok(f"sent {target_desc} ({len(message)} chars){suffix}")
 
     return [send_message]

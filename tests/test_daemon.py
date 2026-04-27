@@ -201,11 +201,16 @@ def test_send_message_suppresses_missed_reply(cfg, monkeypatch) -> None:
     _patch_query(monkeypatch, msgs)
 
     # Simulate what the send_message tool does: call the daemon's sender.
+    # The tool resolves the recipient to a ChannelRef before calling.
+    from alice_speaking.transports import ChannelRef
+
+    jason = ChannelRef(transport="signal", address="+15555550100", durable=True)
+
     async def go():
         # Reset did_send like _run_turn would.
         d._turn_did_send = False
         # Manually invoke the sender as the tool handler would.
-        await d._send_message("+15555550100", "hello jason")
+        await d._send_message(jason, "hello jason")
         # Then run the "turn" which checks the flag.
         await d._run_turn(
             "unused", turn_id="t-sent", outbound_recipient="+15555550100"
@@ -223,7 +228,7 @@ def test_send_message_suppresses_missed_reply(cfg, monkeypatch) -> None:
     async def go2():
         d._turn_did_send = False
         d._current_turn_kind = "signal"
-        await d._send_message("+15555550100", "hi")
+        await d._send_message(jason, "hi")
         return d._turn_did_send, d.signal.sent
 
     flag, sent = asyncio.run(go2())

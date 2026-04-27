@@ -52,16 +52,18 @@ from alice_core.sdk_compat import _short, looks_like_missing_session as _looks_l
 
 from . import compaction as compaction_module
 from . import config as config_module
+from . import principals as principals_module
 from . import render as render_module
 from . import session_state
 from . import tools as tools_module
-from .config import AllowedSender, Config
+from .config import Config
 from .dedup import DedupStore
 from .events import EventLogger
 from .handlers import CompactionArmer, SessionHandler
+from .principals import AddressBook
 from .quiet_hours import QueuedMessage, QuietQueue, is_quiet_hours
 from .signal_client import SignalClient, SignalEnvelope
-from .tools.messaging import SELF_RECIPIENT
+from .tools.messaging import SELF_RECIPIENT, ResolvedRecipient
 from .transports import (
     CLITransport,
     ChannelRef,
@@ -101,7 +103,7 @@ def _format_envelope_time(timestamp_ms: int) -> str:
 @dataclass
 class SignalEvent:
     envelope: SignalEnvelope
-    sender: AllowedSender
+    sender_name: str
 
 
 @dataclass
@@ -132,6 +134,15 @@ Event = Union[SignalEvent, SurfaceEvent, EmergencyEvent, CLIEvent]
 class SpeakingDaemon:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
+        # Phase 3: AddressBook is the unified ACL + display-name + recipient
+        # resolution surface. Loaded from principals.yaml when present;
+        # synthesized from ALLOWED_SENDERS + the daemon's own uid as a
+        # migration shim when it isn't.
+        self.address_book: AddressBook = principals_module.load(
+            yaml_path=cfg.principals_path,
+            fallback_signal_senders=cfg.allowed_senders_fallback,
+            fallback_cli_uid=os.getuid(),
+        )
         self.signal = SignalClient(
             api=cfg.signal_api,
             account=cfg.signal_account,
@@ -176,7 +187,9 @@ class SpeakingDaemon:
         # send_message sender closure needs self.signal plus the did-send
         # tracker below.
         self.mcp_servers, self.custom_tool_names = tools_module.build(
-            cfg, sender=self._send_message
+            cfg,
+            address_book=self.address_book,
+            sender=self._send_message,
         )
 
         # Compaction bookkeeping.
@@ -211,9 +224,16 @@ class SpeakingDaemon:
 
         # CLI transport — optional, falls back to no-op if disabled.
         # Constructed here so it shares the daemon's lifecycle and can
-        # see _current_reply_channel via _send_message.
+        # see _current_reply_channel via _send_message. ACL + display
+        # name come from the address book.
         self.cli_transport: Optional[CLITransport] = (
-            CLITransport(socket_path=cfg.cli_socket_path)
+            CLITransport(
+                socket_path=cfg.cli_socket_path,
+                is_allowed=lambda uid: self.address_book.is_allowed("cli", uid),
+                principal_name_for=lambda uid: self.address_book.display_name_for(
+                    "cli", uid
+                ),
+            )
             if cfg.cli_enabled
             else None
         )
@@ -302,15 +322,17 @@ class SpeakingDaemon:
 
     async def _signal_producer(self) -> None:
         async for env in self.signal.receive():
-            if env.source not in self.cfg.allowed_senders:
+            if not self.address_book.is_allowed("signal", env.source):
                 log.info("ignoring envelope from %s", env.source)
                 continue
             if self.dedup.seen(env.timestamp):
                 log.debug("duplicate ts=%d; skipping", env.timestamp)
                 continue
             self.dedup.mark(env.timestamp)
-            sender = self.cfg.allowed_senders[env.source]
-            await self._queue.put(SignalEvent(envelope=env, sender=sender))
+            sender_name = self.address_book.display_name_for("signal", env.source)
+            await self._queue.put(
+                SignalEvent(envelope=env, sender_name=sender_name)
+            )
 
     async def _surface_producer(self) -> None:
         """Watch ``inner/surface/`` for new .md surfaces and queue them.
@@ -475,7 +497,7 @@ class SpeakingDaemon:
         if not batch:
             return
         head = batch[0]
-        sender = head.sender
+        sender_name = head.sender_name
         source = head.envelope.source
         quiet = is_quiet_hours(self.cfg.speaking)
         turn_id = uuid.uuid4().hex[:12]
@@ -490,7 +512,7 @@ class SpeakingDaemon:
         self.events.emit(
             "signal_turn_start",
             turn_id=turn_id,
-            sender_name=sender.name,
+            sender_name=sender_name,
             sender_number=source,
             message_count=len(batch),
             inbound_chars=total_chars,
@@ -510,7 +532,7 @@ class SpeakingDaemon:
             log.info(
                 "batched %d signal messages from %s into one turn",
                 len(batch),
-                sender.name,
+                sender_name,
             )
 
         error: Optional[str] = None
@@ -527,11 +549,11 @@ class SpeakingDaemon:
             now = datetime.datetime.now().astimezone()
             stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
             prompt = self._build_signal_prompt(
-                sender_name=sender.name, stamp=stamp, batch=batch
+                sender_name=sender_name, stamp=stamp, batch=batch
             )
             await self._run_turn(prompt, turn_id=turn_id, outbound_recipient=source)
         except Exception as exc:  # noqa: BLE001
-            log.exception("turn failed for %s", sender.name)
+            log.exception("turn failed for %s", sender_name)
             error = f"{type(exc).__name__}: {exc}"
             with contextlib.suppress(Exception):
                 # Signal turn errors bypass the quiet queue too — same rule
@@ -555,7 +577,7 @@ class SpeakingDaemon:
                 self.turns.append(
                     new_turn(
                         sender_number=ev.envelope.source,
-                        sender_name=sender.name,
+                        sender_name=sender_name,
                         inbound=ev.envelope.body,
                         outbound=(
                             self._turn_last_outbound
@@ -568,7 +590,7 @@ class SpeakingDaemon:
             self.events.emit(
                 "signal_turn_end",
                 turn_id=turn_id,
-                sender_name=sender.name,
+                sender_name=sender_name,
                 message_count=len(batch),
                 error=error,
                 duration_ms=int((time.time() - started) * 1000),
@@ -925,9 +947,12 @@ class SpeakingDaemon:
             body=_short(body),
         )
 
-        recipient = next(iter(self.cfg.allowed_senders), None)
-        if recipient is None:
-            log.error("emergency %s: no allowed_senders configured", path.name)
+        emergency_channel = self.address_book.emergency_recipient()
+        if emergency_channel is None:
+            log.error(
+                "emergency %s: no signal-capable principal in address book",
+                path.name,
+            )
             self.events.emit(
                 "emergency_no_recipient",
                 turn_id=turn_id,
@@ -935,6 +960,7 @@ class SpeakingDaemon:
             )
             self._archive_emergency(path, verdict="no-recipient", action="daemon-archived")
             return
+        recipient = emergency_channel.address
 
         prompt = (
             f"[EMERGENCY — signal from an external monitor: {path.name}]\n\n"
@@ -958,11 +984,9 @@ class SpeakingDaemon:
         prev_channel = self._current_reply_channel
         self._emergency_bypass = True
         self._current_turn_kind = "emergency"
-        # Emergency reply channel = the (sole) allowed sender's signal
-        # number. recipient='self' on an emergency turn routes here.
-        self._current_reply_channel = ChannelRef(
-            transport="signal", address=recipient, durable=True
-        )
+        # Emergency reply channel = the address book's emergency
+        # recipient. recipient='self' on an emergency turn routes here.
+        self._current_reply_channel = emergency_channel
         verdict = "unknown"
         action = "none"
         try:
@@ -1038,7 +1062,7 @@ class SpeakingDaemon:
 
     async def _send_message(
         self,
-        recipient: str,
+        recipient: ResolvedRecipient,
         text: str,
         attachments: Optional[list[str]] = None,
     ) -> None:
@@ -1049,9 +1073,9 @@ class SpeakingDaemon:
         - ``recipient == SELF_RECIPIENT`` — Alice asked to reply on the
           inbound channel. We use ``self._current_reply_channel`` directly
           and dispatch via the transport that owns it.
-        - anything else — an explicit Signal recipient (E.164 number, by
-          the time the tool resolved it). Wrapped in a signal ChannelRef
-          and routed through ``signal_transport``.
+        - a :class:`ChannelRef` — an explicit channel resolved by the
+          messaging tool (via the address book or a raw E.164 number).
+          Routed through the transport identified by ``channel.transport``.
 
         Quiet-hours policy (signal): replies to inbound (signal turns) and
         emergencies bypass the quiet queue — Owner expects an answer
@@ -1071,39 +1095,47 @@ class SpeakingDaemon:
                     "send_message(recipient='self') has no inbound channel "
                     "to reply on (only valid during a signal/cli/emergency turn)"
                 )
-            if channel.transport == "cli":
-                if self.cli_transport is None:
-                    raise RuntimeError("cli transport disabled but reply requested")
-                if attachments:
-                    log.warning(
-                        "ignoring %d attachment(s) for cli reply; cli does "
-                        "not support outbound files yet",
-                        len(attachments),
-                    )
-                chunks = render_module.render(text, self.cli_transport.caps)
-                for chunk in chunks:
-                    await self.cli_transport.send(
-                        OutboundMessage(destination=channel, text=chunk)
-                    )
-                self.events.emit(
-                    "cli_send",
-                    principal_id=channel.address,
-                    text_len=len(text),
-                    chunk_count=len(chunks),
-                )
-                self._turn_last_outbound = text
-                self._turn_did_send = True
-                return
-            if channel.transport != "signal":
-                raise RuntimeError(
-                    f"don't know how to send to transport '{channel.transport}'"
-                )
-            signal_channel = channel
         else:
-            # Explicit recipient — build the channel here.
-            signal_channel = ChannelRef(
-                transport="signal", address=recipient, durable=True
+            assert isinstance(recipient, ChannelRef)
+            channel = recipient
+
+        if channel.transport == "cli":
+            if self.cli_transport is None:
+                raise RuntimeError("cli transport disabled but reply requested")
+            if not channel.durable and recipient != SELF_RECIPIENT:
+                # Explicit cli sends from outside the originating turn
+                # have no live socket to deliver on — refuse cleanly.
+                raise RuntimeError(
+                    "cannot send to ephemeral cli channel outside its "
+                    "originating turn — use recipient='self' during the "
+                    "inbound CLI turn instead"
+                )
+            if attachments:
+                log.warning(
+                    "ignoring %d attachment(s) for cli reply; cli does "
+                    "not support outbound files yet",
+                    len(attachments),
+                )
+            chunks = render_module.render(text, self.cli_transport.caps)
+            for chunk in chunks:
+                await self.cli_transport.send(
+                    OutboundMessage(destination=channel, text=chunk)
+                )
+            self.events.emit(
+                "cli_send",
+                principal_id=channel.address,
+                text_len=len(text),
+                chunk_count=len(chunks),
             )
+            self._turn_last_outbound = text
+            self._turn_did_send = True
+            return
+
+        if channel.transport != "signal":
+            raise RuntimeError(
+                f"don't know how to send to transport '{channel.transport}'"
+            )
+        signal_channel = channel
 
         # ---- Signal path (transport-routed).
         emergency = getattr(self, "_emergency_bypass", False)
@@ -1147,8 +1179,7 @@ class SpeakingDaemon:
         self._turn_did_send = True
 
     def _sender_name_for(self, recipient: str) -> str:
-        sender = self.cfg.allowed_senders.get(recipient)
-        return sender.name if sender else recipient
+        return self.address_book.display_name_for("signal", recipient)
 
     # ------------------------------------------------------------------
     # Agent SDK invocation (shared by signal + surface + emergency + compaction)

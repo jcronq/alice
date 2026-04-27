@@ -6,7 +6,12 @@ import pathlib
 
 import pytest
 
-from alice_speaking.config import AllowedSender, Config, SPEAKING_DEFAULTS
+from alice_speaking.config import Config, SPEAKING_DEFAULTS
+from alice_speaking.principals import (
+    AddressBook,
+    PrincipalChannel,
+    PrincipalRecord,
+)
 
 
 @pytest.fixture
@@ -21,10 +26,6 @@ def cfg(tmp_path: pathlib.Path) -> Config:
         signal_api="http://127.0.0.1:8080",
         signal_account="+15550000000",
         oauth_token="dummy",
-        allowed_senders={
-            "+15555550100": AllowedSender(number="+15555550100", name="Owner"),
-            "+15555550101": AllowedSender(number="+15555550101", name="Friend"),
-        },
         work_dir=mind_dir,
         mind_dir=mind_dir,
         state_dir=state_dir,
@@ -33,5 +34,45 @@ def cfg(tmp_path: pathlib.Path) -> Config:
         seen_path=state_dir / "seen",
         turn_log_path=mind_dir / "inner" / "state" / "speaking-turns.jsonl",
         event_log_path=state_dir / "speaking.log",
+        principals_path=mind_dir / "config" / "principals.yaml",
+        allowed_senders_fallback={
+            "+15555550100": "Owner",
+            "+15555550101": "Friend",
+        },
         speaking=dict(SPEAKING_DEFAULTS),
     )
+
+
+@pytest.fixture
+def address_book() -> AddressBook:
+    """Standard two-principal address book matching the legacy
+    ALLOWED_SENDERS fixture: Owner on signal+cli, Friend on signal only."""
+    return AddressBook([
+        PrincipalRecord(
+            id="jason",
+            display_name="Owner",
+            channels=[
+                PrincipalChannel(
+                    transport="signal",
+                    address="+15555550100",
+                    durable=True,
+                    preferred=True,
+                ),
+                PrincipalChannel(
+                    transport="cli", address="1000", durable=False
+                ),
+            ],
+        ),
+        PrincipalRecord(
+            id="katie",
+            display_name="Friend",
+            channels=[
+                PrincipalChannel(
+                    transport="signal",
+                    address="+15555550101",
+                    durable=True,
+                    preferred=True,
+                ),
+            ],
+        ),
+    ])

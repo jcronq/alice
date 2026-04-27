@@ -11,11 +11,12 @@ no module-level state.
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Optional
 
 from claude_agent_sdk import McpSdkServerConfig, create_sdk_mcp_server
 
 from ..config import Config
+from ..principals import AddressBook
 from ..signal_client import SignalClient
 from . import config_tools, inner, memory, messaging
 
@@ -26,8 +27,9 @@ SERVER_NAME = "alice"
 def build(
     cfg: Config,
     *,
+    address_book: AddressBook,
     signal: Optional[SignalClient] = None,
-    sender: Optional[Callable[[str, str], Awaitable[None]]] = None,
+    sender: Optional[messaging.SendCallable] = None,
 ) -> tuple[dict[str, McpSdkServerConfig], list[str]]:
     """Return the mcp_servers dict and the fully-qualified allowed_tools list
     for ClaudeAgentOptions.
@@ -44,7 +46,11 @@ def build(
         *config_tools.build(cfg),
     ]
     if sender is not None or signal is not None:
-        tool_list.extend(messaging.build(cfg, signal=signal, sender=sender))
+        tool_list.extend(
+            messaging.build(
+                cfg, address_book=address_book, signal=signal, sender=sender
+            )
+        )
     server = create_sdk_mcp_server(name=SERVER_NAME, version="0.1.0", tools=tool_list)
     # Agent SDK scopes MCP tools as `mcp__<server>__<tool>` in allowed_tools.
     allowed = [f"mcp__{SERVER_NAME}__{t.name}" for t in tool_list]

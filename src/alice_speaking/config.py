@@ -5,6 +5,10 @@ Two sources, by design:
   OAuth token, paths). Already exists; shared with the legacy bash bridge.
 - ``alice.config.json`` (in alice-mind): behavioral knobs Alice can self-tune.
   Optional in phase 1 — defaults kick in when absent.
+
+A third source is loaded by the daemon directly (not the Config object):
+``principals.yaml`` (in alice-mind/config/) — the address book / ACL.
+See :mod:`alice_speaking.principals`.
 """
 
 from __future__ import annotations
@@ -53,18 +57,11 @@ SPEAKING_DEFAULTS: dict[str, Any] = {
 
 
 @dataclass
-class AllowedSender:
-    number: str
-    name: str
-
-
-@dataclass
 class Config:
     # From alice.env
     signal_api: str
     signal_account: str
     oauth_token: str
-    allowed_senders: dict[str, AllowedSender]
     work_dir: pathlib.Path
 
     # Paths (derived, overridable)
@@ -75,6 +72,15 @@ class Config:
     seen_path: pathlib.Path
     turn_log_path: pathlib.Path
     event_log_path: pathlib.Path
+
+    # Address book / ACL — path to principals.yaml plus the parsed
+    # ALLOWED_SENDERS env var, kept around as the synth-fallback input
+    # when the YAML doesn't exist yet. Once a deploy authors
+    # principals.yaml, ``allowed_senders_fallback`` becomes irrelevant.
+    principals_path: pathlib.Path = field(
+        default_factory=lambda: DEFAULT_MIND_DIR / "config" / "principals.yaml"
+    )
+    allowed_senders_fallback: dict[str, str] = field(default_factory=dict)
 
     # CLI transport
     cli_enabled: bool = True
@@ -97,9 +103,14 @@ def _load_env_file(path: pathlib.Path) -> dict[str, str]:
     return result
 
 
-def _parse_allowed_senders(raw: str) -> dict[str, AllowedSender]:
-    # Format: "+15555550100:Owner,+15555550101:Friend"
-    senders: dict[str, AllowedSender] = {}
+def _parse_allowed_senders(raw: str) -> dict[str, str]:
+    """Parse the legacy ``ALLOWED_SENDERS`` env var into a ``{number: name}``
+    mapping. Used as the synth-fallback input for the address book when
+    ``principals.yaml`` is absent.
+
+    Format: ``"+15555550100:Owner,+15555550101:Friend"``.
+    """
+    senders: dict[str, str] = {}
     for pair in raw.split(","):
         pair = pair.strip()
         if not pair or ":" not in pair:
@@ -108,7 +119,7 @@ def _parse_allowed_senders(raw: str) -> dict[str, AllowedSender]:
         number = number.strip()
         name = name.strip()
         if number and name:
-            senders[number] = AllowedSender(number=number, name=name)
+            senders[number] = name
     return senders
 
 
@@ -157,11 +168,15 @@ def load() -> Config:
         or str(DEFAULT_CLI_SOCKET)
     )
 
+    principals_path = pathlib.Path(
+        from_any("ALICE_PRINCIPALS_FILE", str(mind_dir / "config" / "principals.yaml"))
+        or str(mind_dir / "config" / "principals.yaml")
+    )
+
     return Config(
         signal_api=signal_api,
         signal_account=signal_account,
         oauth_token=oauth_token,
-        allowed_senders=allowed,
         work_dir=work_dir,
         mind_dir=mind_dir,
         state_dir=state_dir,
@@ -172,6 +187,8 @@ def load() -> Config:
         event_log_path=pathlib.Path(
             from_any("SPEAKING_EVENT_LOG") or str(state_dir / "speaking.log")
         ),
+        principals_path=principals_path,
+        allowed_senders_fallback=allowed,
         speaking=speaking,
         cli_enabled=cli_enabled,
         cli_socket_path=cli_socket_path,

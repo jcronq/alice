@@ -15,7 +15,6 @@ from typing import Any
 import pytest
 
 from alice_speaking import daemon as daemon_module
-from alice_speaking.config import AllowedSender
 from alice_speaking.daemon import EmergencyEvent, SignalEvent, SurfaceEvent
 from alice_speaking.signal_client import SignalEnvelope
 
@@ -32,7 +31,7 @@ def _make_daemon(cfg, monkeypatch):
 def _sig(source: str, ts: int, body: str = "", name: str = "Owner") -> SignalEvent:
     return SignalEvent(
         envelope=SignalEnvelope(timestamp=ts, source=source, body=body),
-        sender=AllowedSender(number=source, name=name),
+        sender_name=name,
     )
 
 

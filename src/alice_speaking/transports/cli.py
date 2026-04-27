@@ -25,8 +25,10 @@ the principal's ``native_id``. Multiple simultaneous connections from
 the same uid share the same Principal but get distinct ChannelRefs (so
 two terminals can hold separate conversations).
 
-Phase 1 ACL: only the alice user inside the container is allowed. Any
-other uid is rejected with a polite error and the connection closed.
+ACL (Phase 3+): the daemon supplies an ``is_allowed`` callback that
+consults the :class:`AddressBook`. The transport falls back to
+"only-the-running-uid" when no callback is supplied — useful for tests
+and standalone harnesses where there's no address book.
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ import socket
 import struct
 import time
 import uuid
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Callable, Optional
 
 from .base import (
     CLI_CAPS,
@@ -51,6 +53,12 @@ from .base import (
     OutboundMessage,
     Principal,
 )
+
+
+# Callback the transport invokes during connection accept to decide
+# whether ``str(peer_uid)`` is allowed in. The daemon binds this to
+# ``address_book.is_allowed("cli", uid)``; tests can pass a stub.
+ACLCallable = Callable[[str], bool]
 
 
 log = logging.getLogger(__name__)
@@ -77,14 +85,20 @@ class CLITransport:
         self,
         *,
         socket_path: pathlib.Path,
-        allowed_uid: Optional[int] = None,
+        is_allowed: Optional[ACLCallable] = None,
+        principal_name_for: Optional[Callable[[str], str]] = None,
     ) -> None:
         self._socket_path = socket_path
-        # Default: only allow the running process's uid (alice inside the
-        # worker container). Override for tests or ops scenarios.
-        self._allowed_uid = (
-            allowed_uid if allowed_uid is not None else os.getuid()
-        )
+        # ACL: defer to the address book when wired by the daemon. When no
+        # callback is supplied (tests, standalone harnesses) accept the
+        # current process's own uid only — a sensible local-dev default.
+        if is_allowed is None:
+            own_uid = str(os.getuid())
+            is_allowed = lambda uid: uid == own_uid  # noqa: E731
+        self._is_allowed = is_allowed
+        # Optional display-name lookup (address-book backed). Falls back to
+        # the legacy ``"local (uid=N)"`` rendering when not supplied.
+        self._principal_name_for = principal_name_for
         self._server: Optional[asyncio.AbstractServer] = None
         self._inbox: asyncio.Queue[InboundMessage] = asyncio.Queue(maxsize=64)
         # connection_id → StreamWriter, so :meth:`send` can find the right
@@ -109,11 +123,7 @@ class CLITransport:
             os.chmod(self._socket_path, 0o600)
         except OSError as exc:
             log.warning("could not chmod %s: %s", self._socket_path, exc)
-        log.info(
-            "CLI transport listening at %s (allowed_uid=%d)",
-            self._socket_path,
-            self._allowed_uid,
-        )
+        log.info("CLI transport listening at %s", self._socket_path)
 
     async def stop(self) -> None:
         if self._server is not None:
@@ -190,20 +200,17 @@ class CLITransport:
         writer: asyncio.StreamWriter,
     ) -> None:
         peer_uid = _peer_uid(writer)
-        if peer_uid is None or peer_uid != self._allowed_uid:
-            log.info(
-                "cli connection rejected: peer_uid=%s (allowed=%d)",
-                peer_uid,
-                self._allowed_uid,
-            )
+        peer_uid_str = str(peer_uid) if peer_uid is not None else ""
+        if peer_uid is None or not self._is_allowed(peer_uid_str):
+            log.info("cli connection rejected: peer_uid=%s", peer_uid)
             with contextlib.suppress(Exception):
                 await self._write_event(
                     writer,
                     {
                         "type": "error",
                         "message": (
-                            f"unauthorized: uid {peer_uid} is not allowed "
-                            f"(only uid {self._allowed_uid} can connect)"
+                            f"unauthorized: uid {peer_uid} is not in the "
+                            f"address book"
                         ),
                     },
                 )
@@ -212,10 +219,14 @@ class CLITransport:
             return
 
         conn_id = uuid.uuid4().hex[:12]
+        if self._principal_name_for is not None:
+            display_name = self._principal_name_for(peer_uid_str)
+        else:
+            display_name = f"local (uid={peer_uid})"
         principal = Principal(
             transport="cli",
-            native_id=str(peer_uid),
-            display_name=f"local (uid={peer_uid})",
+            native_id=peer_uid_str,
+            display_name=display_name,
         )
         channel = ChannelRef(transport="cli", address=conn_id, durable=False)
         self._writers[conn_id] = writer

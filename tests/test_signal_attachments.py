@@ -126,13 +126,9 @@ def daemon(cfg, monkeypatch):
 
 def _signal_event(env: SignalEnvelope, name: str = "Owner"):
     """Wrap an envelope in a SignalEvent for the prompt builder."""
-    from alice_speaking.config import AllowedSender
     from alice_speaking.daemon import SignalEvent
 
-    return SignalEvent(
-        envelope=env,
-        sender=AllowedSender(number=env.source, name=name),
-    )
+    return SignalEvent(envelope=env, sender_name=name)
 
 
 def test_prompt_with_no_attachments(daemon) -> None:
