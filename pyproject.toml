@@ -9,6 +9,8 @@ authors = [
 # Speaking's packages target 3.10+ but python 3.13 in the container covers both.
 requires-python = ">=3.11"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 
 dependencies = [
     # Agent kernel + hemispheres.
