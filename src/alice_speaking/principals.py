@@ -209,7 +209,7 @@ def load(
     yaml_path: Optional[pathlib.Path] = None,
     fallback_signal_senders: Optional[dict[str, str]] = None,
     fallback_cli_uid: Optional[int] = None,
-    fallback_cli_principal_id: str = "jcronq",
+    fallback_cli_principal_id: str = "owner",
     fallback_cli_display_name: str = "Owner (local CLI)",
 ) -> AddressBook:
     """Load an :class:`AddressBook`.

@@ -31,7 +31,7 @@ For DMs: the user's principal must exist in the address book and be
 For guild messages: the user's principal must exist AND the principal
 must list the originating channel id (``channel:<channel-id>``) in
 their channels. This lets the address book gate at channel granularity
-(Owner can talk in ``#alice-room`` but not ``#general``) without a
+(the owner can talk in ``#alice-room`` but not ``#general``) without a
 separate top-level channel allowlist.
 
 Outbound rendering uses :data:`DISCORD_CAPS` (markdown="limited" — Discord

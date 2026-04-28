@@ -2,7 +2,7 @@
 
 Three concepts kept independent:
 
-- :class:`Principal` — *who*. A stable identity: jcronq, friend_alice, an
+- :class:`Principal` — *who*. A stable identity: owner, friend_carol, an
   agent with a known token. Transport-independent.
 - :class:`ChannelRef` — *where*. A delivery address: a Signal phone number,
   a CLI socket connection, a Discord channel id. Transport-private payload

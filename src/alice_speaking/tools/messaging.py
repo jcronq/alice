@@ -11,7 +11,7 @@ Recipient resolution (Phase 3 — address-book backed):
 - ``"self"`` / ``"reply"`` etc. — reply on the same transport the
   inbound came from. The daemon's :meth:`_send_message` honors the
   current turn's reply channel.
-- A principal id or display name (``"jcronq"``, ``"jason"``, ``"katie"``)
+- A principal id or display name (``"owner"``, ``"friend_carol"``)
   — looked up in the :class:`AddressBook`. Resolves to that principal's
   preferred channel (signal by default, but transports/phase-3-onwards
   can pick e.g. discord per-principal).

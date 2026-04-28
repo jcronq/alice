@@ -577,7 +577,7 @@ def build_interaction_graph(
 #
 # This is intentionally simpler than the connected-component approach below
 # (which lives in `build_interaction_arcs` for the graph view). One turn ==
-# one card. Per Owner 2026-04-26: he wants to track each interaction start to
+# one card. Per the owner 2026-04-26: track each interaction start to
 # finish, with the originating note, the thinking, and the response visible
 # at a glance. Implementation follows the design at
 # `cortex-memory/research/2026-04-26-interactions-tab-arc-design.md`.
@@ -590,7 +590,7 @@ class ConversationArc:
     ts: float            # turn start
     end_ts: float | None
     duration_ms: int | None
-    sender: str | None   # "Owner" / "Friend" for signal; "Thinking Alice" for surface
+    sender: str | None   # principal display name for signal; "Thinking Alice" for surface
     stimulus: str | None  # inbound text or surface body (full)
     stimulus_kind: str    # "signal" | "surface" | "emergency"
     surface_id: str | None  # originating surface filename, if any
@@ -650,7 +650,7 @@ def group_arcs(
 
     # Surface map: correlation_id (filename) → surface event. Prefer the
     # resolved (.handled) version when both exist; that's the one with the
-    # trailer Owner cares about.
+    # trailer the owner cares about.
     surface_map: dict[str, UnifiedEvent] = {}
     for ev in events:
         if ev.kind not in ("surface_pending", "surface_resolved"):
@@ -738,7 +738,7 @@ def group_arcs(
 # component). Each Arc threads together what was actually a single
 # end-to-end exchange across the two hemispheres: an inbound signal turn
 # that wrote a note → the thinking wake that consumed it → the surface that
-# wake produced → the speaking surface-turn that voiced it back to Owner.
+# wake produced → the speaking surface-turn that voiced it back to the owner.
 #
 # We render each Arc as a card with a vertical timeline of ArcSteps. The
 # step's ``hemisphere`` and ``incoming_edge`` are what give the UI its
@@ -974,7 +974,7 @@ def build_interaction_arcs(
     arcs: list[Arc] = []
     for comp_ids in components:
         # Skip lone wakes / lone turns / lone thoughts — those have their
-        # own dedicated tabs and aren't "interactions" in Owner's sense.
+        # own dedicated tabs and aren't "interactions" in the owner's sense.
         if len(comp_ids) == 1:
             n0 = node_by_id[comp_ids[0]]
             if n0.kind in ("wake", "turn", "thought"):

@@ -204,13 +204,13 @@ def test_send_message_suppresses_missed_reply(cfg, monkeypatch) -> None:
     # The tool resolves the recipient to a ChannelRef before calling.
     from alice_speaking.transports import ChannelRef
 
-    jason = ChannelRef(transport="signal", address="+15555550100", durable=True)
+    owner = ChannelRef(transport="signal", address="+15555550100", durable=True)
 
     async def go():
         # Reset did_send like _run_turn would.
         d._turn_did_send = False
         # Manually invoke the sender as the tool handler would.
-        await d._send_message(jason, "hello jason")
+        await d._send_message(owner, "hello owner")
         # Then run the "turn" which checks the flag.
         await d._run_turn(
             "unused", turn_id="t-sent", outbound_recipient="+15555550100"
@@ -228,7 +228,7 @@ def test_send_message_suppresses_missed_reply(cfg, monkeypatch) -> None:
     async def go2():
         d._turn_did_send = False
         d._current_turn_kind = "signal"
-        await d._send_message(jason, "hi")
+        await d._send_message(owner, "hi")
         return d._turn_did_send, d.signal.sent
 
     flag, sent = asyncio.run(go2())
@@ -247,12 +247,12 @@ def test_signal_send_event_has_unified_shape(cfg, monkeypatch) -> None:
     d = _make_daemon(cfg, monkeypatch)
     from alice_speaking.transports import ChannelRef
 
-    jason = ChannelRef(transport="signal", address="+15555550100", durable=True)
+    owner = ChannelRef(transport="signal", address="+15555550100", durable=True)
 
     async def go():
         d._turn_did_send = False
         d._current_turn_kind = "signal"  # bypass quiet so test is wall-clock-stable
-        await d._send_message(jason, "hi")
+        await d._send_message(owner, "hi")
 
     asyncio.run(go())
     events = [e for e in _read_events(cfg.event_log_path) if e["event"] == "signal_send"]
@@ -351,7 +351,7 @@ def test_layer2_bootstrap_preamble_primed_from_turn_log(cfg, monkeypatch) -> Non
     d = _make_daemon(cfg, monkeypatch)
     from alice_speaking.turn_log import new_turn
 
-    d.turns.append(new_turn("+15555550100", "Owner", "morning", "hey jason"))
+    d.turns.append(new_turn("+15555550100", "Owner", "morning", "hey owner"))
     d.turns.append(
         new_turn("+15555550100", "Owner", "how you doing", "doing fine")
     )

@@ -17,16 +17,16 @@ from alice_speaking.transports import ChannelRef
 
 
 def test_resolve_recipient_name_lookup(address_book):
-    jason = ChannelRef(
+    owner = ChannelRef(
         transport="signal", address="+15555550100", durable=True
     )
-    katie = ChannelRef(
+    friend = ChannelRef(
         transport="signal", address="+15555550101", durable=True
     )
-    assert messaging._resolve_recipient("jason", address_book) == jason
+    assert messaging._resolve_recipient("owner", address_book) == owner
     # case-insensitive on display name + id
-    assert messaging._resolve_recipient("Owner", address_book) == jason
-    assert messaging._resolve_recipient("KATIE", address_book) == katie
+    assert messaging._resolve_recipient("Owner", address_book) == owner
+    assert messaging._resolve_recipient("FRIEND", address_book) == friend
 
 
 def test_resolve_recipient_e164_passthrough(address_book):
@@ -80,7 +80,7 @@ def test_send_message_happy_path(cfg, address_book, tmp_path):
     assert send_tool.name == "send_message"
 
     result = asyncio.run(
-        send_tool.handler({"recipient": "jason", "message": "hello"})
+        send_tool.handler({"recipient": "owner", "message": "hello"})
     )
     assert result.get("isError") is not True
     assert sent == [
@@ -120,7 +120,7 @@ def test_send_message_empty_message(cfg, address_book, tmp_path):
     send_tool = tools[0]
 
     result = asyncio.run(
-        send_tool.handler({"recipient": "jason", "message": "   "})
+        send_tool.handler({"recipient": "owner", "message": "   "})
     )
     assert result["isError"] is True
     assert "message must be a non-empty string" in result["content"][0]["text"]
@@ -137,7 +137,7 @@ def test_send_message_propagates_send_failure(cfg, address_book, tmp_path):
     send_tool = tools[0]
 
     result = asyncio.run(
-        send_tool.handler({"recipient": "jason", "message": "ping"})
+        send_tool.handler({"recipient": "owner", "message": "ping"})
     )
     assert result["isError"] is True
     assert "signal offline" in result["content"][0]["text"]
@@ -160,7 +160,7 @@ def test_send_message_via_signal_client(cfg, address_book):
     tools = messaging.build(cfg, address_book=address_book, signal=FakeSignal())
     send_tool = tools[0]
     result = asyncio.run(
-        send_tool.handler({"recipient": "katie", "message": "hi k"})
+        send_tool.handler({"recipient": "friend", "message": "hi k"})
     )
     assert result.get("isError") is not True
     assert sent == [("+15555550101", "hi k", None)]
@@ -194,7 +194,7 @@ def test_send_message_with_attachment_passes_path(cfg, address_book, tmp_path):
     result = asyncio.run(
         send_tool.handler(
             {
-                "recipient": "jason",
+                "recipient": "owner",
                 "message": "look at this",
                 "attachments": [str(src)],
             }
@@ -237,7 +237,7 @@ def test_send_message_no_attachments_field(cfg, address_book, tmp_path):
     send_tool = tools[0]
 
     result = asyncio.run(
-        send_tool.handler({"recipient": "jason", "message": "no media"})
+        send_tool.handler({"recipient": "owner", "message": "no media"})
     )
     assert result.get("isError") is not True
     assert sent == [
@@ -269,7 +269,7 @@ def test_send_message_empty_attachments_treated_as_none(cfg, address_book, tmp_p
 
     result = asyncio.run(
         send_tool.handler(
-            {"recipient": "jason", "message": "still nothing", "attachments": []}
+            {"recipient": "owner", "message": "still nothing", "attachments": []}
         )
     )
     assert result.get("isError") is not True
@@ -298,7 +298,7 @@ def test_send_message_non_list_attachments_errors(cfg, address_book, tmp_path):
     result = asyncio.run(
         send_tool.handler(
             {
-                "recipient": "jason",
+                "recipient": "owner",
                 "message": "hi",
                 "attachments": "/path/to/file.png",
             }
@@ -324,7 +324,7 @@ def test_send_message_attachments_with_non_string_entry_errors(
     result = asyncio.run(
         send_tool.handler(
             {
-                "recipient": "jason",
+                "recipient": "owner",
                 "message": "hi",
                 "attachments": ["/ok.png", 42],
             }
@@ -355,7 +355,7 @@ def test_send_message_missing_attachment_path_errors(cfg, address_book, tmp_path
     result = asyncio.run(
         send_tool.handler(
             {
-                "recipient": "jason",
+                "recipient": "owner",
                 "message": "hi",
                 "attachments": [str(tmp_path / "nope.png")],
             }
@@ -392,7 +392,7 @@ def test_send_message_send_failure_cleans_up_staged_files(cfg, address_book, tmp
     result = asyncio.run(
         send_tool.handler(
             {
-                "recipient": "jason",
+                "recipient": "owner",
                 "message": "boom",
                 "attachments": [str(src)],
             }

@@ -230,8 +230,8 @@ class SpeakingDaemon:
         self._current_reply_channel: Optional[ChannelRef] = None
         # Display name for the principal whose turn we're inside. Used
         # by ``_emit_send_event`` so e.g. cli_send's sender_name reads
-        # "Owner" rather than the opaque conn_id from the ChannelRef.
-        # None outside of an inbound conversational turn.
+        # the principal's display name rather than the opaque conn_id
+        # from the ChannelRef. None outside of an inbound conversational turn.
         self._current_principal_display_name: Optional[str] = None
         # When set, the very next turn will prepend this text as a
         # bootstrap preamble (Layer 2 restart OR post-compaction summary
@@ -625,9 +625,9 @@ class SpeakingDaemon:
         channel = ChannelRef(transport="signal", address=source, durable=True)
         self._current_reply_channel = channel
         self._current_principal_display_name = sender_name
-        # Replies to inbound bypass quiet hours — Owner expects an answer
-        # when he asks something, regardless of the clock. Typing indicator
-        # fires too so he sees Alice working.
+        # Replies to inbound bypass quiet hours — the user expects an
+        # answer when they ask something, regardless of the clock. Typing
+        # indicator fires too so they see Alice working.
         await self.signal_transport.typing(channel, True)
         # State machine: every inbound moves received -> replied | abandoned.
         # "received" fires immediately (per envelope) so the sender sees

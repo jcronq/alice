@@ -49,7 +49,7 @@ def address_book() -> AddressBook:
     ALLOWED_SENDERS fixture: Owner on signal+cli, Friend on signal only."""
     return AddressBook([
         PrincipalRecord(
-            id="jason",
+            id="owner",
             display_name="Owner",
             channels=[
                 PrincipalChannel(
@@ -64,7 +64,7 @@ def address_book() -> AddressBook:
             ],
         ),
         PrincipalRecord(
-            id="katie",
+            id="friend",
             display_name="Friend",
             channels=[
                 PrincipalChannel(

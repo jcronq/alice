@@ -56,21 +56,21 @@ def test_drain_signal_batch_collects_same_sender(cfg, monkeypatch):
 
 def test_drain_signal_batch_preserves_other_sender(cfg, monkeypatch):
     d = _make_daemon(cfg, monkeypatch)
-    head = _sig("+15555550100", 1, "from jason")
-    d._queue.put_nowait(_sig("+15555550100", 2, "also jason"))
-    d._queue.put_nowait(_sig("+15555550101", 3, "from katie", name="Friend"))
-    d._queue.put_nowait(_sig("+15555550100", 4, "more jason"))
+    head = _sig("+15555550100", 1, "from owner")
+    d._queue.put_nowait(_sig("+15555550100", 2, "also owner"))
+    d._queue.put_nowait(_sig("+15555550101", 3, "from friend", name="Friend"))
+    d._queue.put_nowait(_sig("+15555550100", 4, "more owner"))
     batch = d._drain_signal_batch(head)
 
     # Owner's three messages batch together; Friend's stays in the queue.
     assert [ev.envelope.body for ev in batch] == [
-        "from jason",
-        "also jason",
-        "more jason",
+        "from owner",
+        "also owner",
+        "more owner",
     ]
     assert d._queue.qsize() == 1
     held = d._queue.get_nowait()
-    assert held.envelope.body == "from katie"
+    assert held.envelope.body == "from friend"
     assert held.envelope.source == "+15555550101"
 
 

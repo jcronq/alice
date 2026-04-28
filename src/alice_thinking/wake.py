@@ -155,7 +155,7 @@ async def _run_wake(
         emitter,
         correlation_id=wake_id,
         # Cap is generous — Sonnet's reasoning blocks are often >1k chars
-        # and a wake's whole value is the trace (Owner browses thoughts
+        # and a wake's whole value is the trace (the owner browses thoughts
         # in the viewer, not just the resulting wiki edits).
         short_cap=4000,
     )

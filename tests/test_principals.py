@@ -19,7 +19,7 @@ from alice_speaking.transports.base import ChannelRef, InboundMessage, Principal
 def _book() -> AddressBook:
     return AddressBook([
         PrincipalRecord(
-            id="jcronq",
+            id="owner",
             display_name="Owner",
             channels=[
                 PrincipalChannel(
@@ -32,7 +32,7 @@ def _book() -> AddressBook:
             ],
         ),
         PrincipalRecord(
-            id="katie",
+            id="friend",
             display_name="Friend",
             channels=[
                 PrincipalChannel(
@@ -48,22 +48,27 @@ def test_lookup_by_native_signal():
     book = _book()
     record = book.lookup_by_native("signal", "+15555550100")
     assert record is not None
-    assert record.id == "jcronq"
+    assert record.id == "owner"
 
 
 def test_lookup_by_native_cli():
     book = _book()
     record = book.lookup_by_native("cli", "1000")
     assert record is not None
-    assert record.id == "jcronq"
+    assert record.id == "owner"
 
 
 def test_lookup_by_id_case_insensitive_on_id_and_display_name():
-    book = _book()
-    assert book.lookup_by_id("jcronq").id == "jcronq"
-    assert book.lookup_by_id("JCRONQ").id == "jcronq"
-    assert book.lookup_by_id("jason").id == "jcronq"
-    assert book.lookup_by_id("JASON").id == "jcronq"
+    # Use distinct id vs display_name so each branch of the lookup is exercised.
+    book = AddressBook([PrincipalRecord(
+        id="alpha",
+        display_name="Owner",
+        channels=[PrincipalChannel(transport="signal", address="+15555550100")],
+    )])
+    assert book.lookup_by_id("alpha").id == "alpha"
+    assert book.lookup_by_id("ALPHA").id == "alpha"
+    assert book.lookup_by_id("Owner").id == "alpha"
+    assert book.lookup_by_id("OWNER").id == "alpha"
 
 
 def test_is_allowed_respects_flag():
@@ -83,14 +88,14 @@ def test_is_allowed_unknown_returns_false():
 
 def test_preferred_channel_picks_preferred_then_first():
     book = _book()
-    assert book.preferred_channel("jcronq") == ChannelRef(
+    assert book.preferred_channel("owner") == ChannelRef(
         transport="signal", address="+15555550100", durable=True
     )
     # Narrowed by transport
-    assert book.preferred_channel("jcronq", "cli") == ChannelRef(
+    assert book.preferred_channel("owner", "cli") == ChannelRef(
         transport="cli", address="1000", durable=False
     )
-    assert book.preferred_channel("jcronq", "discord") is None
+    assert book.preferred_channel("owner", "discord") is None
 
 
 def test_emergency_recipient_picks_first_allowed_signal_durable():
@@ -138,7 +143,7 @@ def test_learn_refreshes_display_name():
         text="hi",
         timestamp=0.0,
     ))
-    assert book.lookup_by_id("jcronq").display_name == "Owner (work phone)"
+    assert book.lookup_by_id("owner").display_name == "Owner (work phone)"
 
 
 def test_learn_skips_unknown_principals():
@@ -166,24 +171,24 @@ def test_load_from_yaml(tmp_path: pathlib.Path):
     p = tmp_path / "principals.yaml"
     p.write_text(textwrap.dedent("""\
         principals:
-          jcronq:
+          owner:
             display_name: Owner
             channels:
               - {transport: signal, address: "+15555550100", preferred: true}
               - {transport: cli, address: "1000", durable: false}
               - {transport: discord, address: "284000000000000000"}
-          katie:
+          friend:
             display_name: Friend
             channels:
               - {transport: signal, address: "+15555550101"}
             allowed: false
     """))
     book = load(yaml_path=p)
-    assert book.lookup_by_id("jcronq").display_name == "Owner"
+    assert book.lookup_by_id("owner").display_name == "Owner"
     assert book.is_allowed("signal", "+15555550100") is True
     assert book.is_allowed("signal", "+15555550101") is False  # explicitly disallowed
     # Bare discord ids are auto-prefixed with user: at load time (Phase 4c).
-    assert book.preferred_channel("jcronq", "discord") == ChannelRef(
+    assert book.preferred_channel("owner", "discord") == ChannelRef(
         transport="discord", address="user:284000000000000000", durable=True
     )
 
@@ -197,7 +202,7 @@ def test_load_synth_fallback_when_yaml_missing(tmp_path: pathlib.Path, caplog):
     assert book.is_allowed("signal", "+15555550100") is True
     assert book.is_allowed("cli", "1000") is True
     # Synth merges signal + cli into the same principal id.
-    assert book.lookup_by_native("signal", "+15555550100").id == "jason"
+    assert book.lookup_by_native("signal", "+15555550100").id == "owner"
 
 
 def test_load_rejects_bad_yaml_shape(tmp_path: pathlib.Path):
@@ -214,7 +219,7 @@ def test_load_normalizes_bare_discord_ids_to_user_prefix(tmp_path: pathlib.Path)
     p = tmp_path / "principals.yaml"
     p.write_text(textwrap.dedent("""\
         principals:
-          jcronq:
+          owner:
             display_name: Owner
             channels:
               - {transport: discord, address: "123"}              # bare → user:123
@@ -222,7 +227,7 @@ def test_load_normalizes_bare_discord_ids_to_user_prefix(tmp_path: pathlib.Path)
               - {transport: discord, address: "channel:789"}      # guild
     """))
     book = load(yaml_path=p)
-    addresses = {ch.address for ch in book.lookup_by_id("jcronq").channels}
+    addresses = {ch.address for ch in book.lookup_by_id("owner").channels}
     assert addresses == {"user:123", "user:456", "channel:789"}
     # Native-id lookups use the prefixed form.
     assert book.is_allowed("discord", "user:123") is True
