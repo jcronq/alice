@@ -2,14 +2,33 @@ node_modules/
 dist/
 build/
 __pycache__/
-*.pyc
+*.py[cod]
 .env
+.envrc
+.direnv/
 sandbox/docker-compose.override.yml
 
 # Python tooling
 .venv/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
 *.egg-info/
 
 # uv / hatch build artifacts
 /uv.lock.tmp
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Backups / scratch — frequent leak vector for stale local copies.
+*.bak
+*.bak.*
+*.orig

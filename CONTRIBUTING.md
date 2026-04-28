@@ -3,6 +3,20 @@
 Thanks for your interest in alice. **The project is not currently accepting
 external contributions.**
 
+## After cloning — wire the pre-push secret scanner
+
+This repo ships a pre-push hook at `.githooks/pre-push` that scans pushes
+for known secret patterns (Anthropic / GitHub / Slack / AWS keys, etc.).
+Git won't auto-enable hooks from a tracked path (security feature), so
+each clone has to opt in:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Run it once after cloning. It's cheap insurance against pasting a key
+into a commit by accident.
+
 ## What helps right now
 
 - **Bug reports** — open a GitHub issue with reproduction steps.
