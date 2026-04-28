@@ -136,7 +136,7 @@ def render_prompt(digest: dict, window_label: str) -> str:
     return f"""You are writing a short narrative summary of what Alice has been doing.
 
 Alice has two hemispheres:
-- **Speaking Alice** (Opus, the voice that talks to the owner and their contacts over Signal).
+- **Speaking Alice** (Opus, the voice that talks to the owner and their trusted contacts over Signal).
 - **Thinking Alice** (Sonnet, a quieter background process that wakes on a timer to groom her own memory and knowledge base in `alice-mind/`).
 
 They pass files between each other: *surfaces* (thinking → speaking: an insight sharp enough to voice), *notes* (speaking → thinking: fleeting thoughts filed for later grooming), *emergencies* (external monitors → speaking, bypassing quiet hours), *thoughts* (thinking's own wake journal).
@@ -145,7 +145,7 @@ Below is a machine-generated digest of what happened over the last {window_label
 
 1. Tells the story of what Alice did, in natural prose. Weave thinking wakes, signal turns, and cross-hemisphere artifacts into one thread — don't list them.
 2. Calls out anything notable: errors, timeouts, emergencies voiced or downgraded, repeated themes, unusual tool patterns, gaps of silence, the latest direction of Alice's grooming.
-3. Refers to Alice in third person. The owner and their contacts are the people she talks to. Be specific — use actual topic keywords you see in the digest rather than generic words like "conversation" or "tasks."
+3. Refers to Alice in third person. The owner and their trusted contacts are the people she talks to — but use the actual names from the digest whenever they're present rather than these generic labels. Be specific — use actual topic keywords you see in the digest rather than generic words like "conversation" or "tasks."
 4. If almost nothing happened, say so plainly in one or two sentences.
 
 Write only the narrative, nothing else. No preamble. No conclusion section. No bullet points unless the digest is genuinely a list of discrete items.
@@ -490,7 +490,7 @@ def render_merge_prompt(
     body = "\n".join(lines) if lines else "(no activity in window)"
     return f"""Weave the following per-time-period summaries of Alice's activity into one narrative (~250-400 words, markdown, no headers, no bullet walls). Keep proper nouns and specifics. Third person. If nothing happened, say so in one or two sentences.
 
-Alice has two hemispheres: Speaking (Opus, voices Signal to the owner and their contacts) and Thinking (Sonnet, background grooming of alice-mind). They pass artifacts between each other — surfaces, notes, emergencies, thoughts.
+Alice has two hemispheres: Speaking (Opus, voices Signal to the owner and their trusted contacts) and Thinking (Sonnet, background grooming of alice-mind). They pass artifacts between each other — surfaces, notes, emergencies, thoughts.
 
 Window: last {window_label}
 
