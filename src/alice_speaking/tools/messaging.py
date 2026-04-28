@@ -199,8 +199,9 @@ _SEND_MESSAGE_SCHEMA: dict[str, Any] = {
                 "'self' / 'reply' — reply on the same transport the inbound "
                 "came from (works for Signal, the local CLI, and future "
                 "channels); "
-                "'jason' / 'katie' — Signal recipient by name; "
-                "an E.164 number like '+15555550100' — Signal recipient by number."
+                "a principal id or display name from the address book; "
+                "an E.164 phone number (anything starting with '+') — "
+                "Signal recipient by number."
             ),
         },
         "message": {
@@ -282,10 +283,11 @@ def build(
             "Send a message. This is how you reply to the user — returning "
             "text alone does NOT send. Recipient: 'self' or 'reply' replies "
             "on the same transport the inbound came from (Signal, the local "
-            "CLI, etc.). 'jason' / 'katie' / E.164 number sends via Signal "
-            "specifically. `attachments` is an optional list of filesystem "
-            "paths (images, PDFs) — Signal-only today. Use this for both "
-            "inbound replies AND surface-triggered voicings."
+            "CLI, etc.); a principal id from the address book or an E.164 "
+            "phone number sends via Signal specifically. `attachments` is "
+            "an optional list of filesystem paths (images, PDFs) — Signal-"
+            "only today. Use this for both inbound replies AND surface-"
+            "triggered voicings."
         ),
         input_schema=_SEND_MESSAGE_SCHEMA,
     )

@@ -44,10 +44,11 @@ def build(cfg: Config) -> list[SdkMcpTool[Any]]:
         description=(
             "Read Alice's memory. Pattern is glob-style, searched across both "
             "`cortex-memory/` (groomed wiki) and `memory/` (legacy stream). "
-            "Examples: 'people/jason.md', 'projects/cozyhem.md', "
-            "'2026-04-24.md', '*/jason*', 'fitness/CURRENT-WEIGHTS.md'. "
-            "Single-match returns verbatim content and bumps last_accessed + "
-            "access_count. Multi-match returns a listing of first lines."
+            "Patterns can be plain filenames, dated entries like "
+            "'2026-04-24.md', folder-scoped ('people/*'), or globs across "
+            "subtrees ('*/<keyword>*'). Single-match returns verbatim "
+            "content and bumps last_accessed + access_count. Multi-match "
+            "returns a listing of first lines."
         ),
         input_schema={"pattern": str},
     )
