@@ -967,9 +967,11 @@ class SpeakingDaemon:
             render_module.capability_prompt_fragment("signal", SIGNAL_CAPS),
             "",
             "To reply, call the `send_message` tool "
-            "(recipient='jason' or 'katie' or an E.164 number, "
-            "message=your reply text). Returning text alone will NOT "
-            "send. If there's nothing to say, let the turn close silently.",
+            "(recipient='self' to reply to the sender, a principal id "
+            "from the address book to reach someone else, or an E.164 "
+            "number; message=your reply text). Returning text alone "
+            "will NOT send. If there's nothing to say, let the turn "
+            "close silently.",
         ])
         return "\n".join(lines)
 
