@@ -22,6 +22,17 @@
     <span class="muted" style="margin-right: 4px;">types:</span>
   </div>
 
+  <div id="cluster-metrics" class="muted" style="margin: 4px 0 10px; font-size: 0.85em; display: none;">
+    <span class="cm-strip"></span>
+    <details style="display: inline-block; margin-left: 10px;">
+      <summary style="cursor: pointer;" id="cm-hubs-summary">top hubs</summary>
+      <ol class="cm-hubs" style="margin: 4px 0 0 18px; padding: 0; line-height: 1.5;"></ol>
+    </details>
+    <span class="muted" style="margin-left: 10px; font-size: 0.92em;">
+      topical subgraph: dailies, instructions, and index notes excluded
+    </span>
+  </div>
+
   <style>
     .type-pill {
       display: inline-flex; align-items: center; gap: 6px;
@@ -37,6 +48,13 @@
     .type-pill.filtered {
       opacity: 0.35; filter: grayscale(0.6);
     }
+    #cluster-metrics .cm-stat { color: var(--text); margin-right: 14px; }
+    #cluster-metrics .cm-stat b { font-weight: 600; }
+    #cluster-metrics .cm-good { color: #7de3c4; }
+    #cluster-metrics .cm-warn { color: #f9c96d; }
+    #cluster-metrics .cm-bad  { color: #ff6b81; }
+    #cluster-metrics .cm-hubs li { color: var(--text); }
+    #cluster-metrics .cm-hubs li .cm-hub-folder { color: var(--muted); margin-left: 6px; font-size: 0.92em; }
   </style>
 
   <div class="graph-wrap" id="graph-wrap">
@@ -63,7 +81,7 @@
         if (folder === 'cortex-memory/people')    return '#f9c96d';  // amber — people/entities
         if (folder === 'cortex-memory/projects')  return '#8fc7ff';  // light blue — projects
         if (folder === 'cortex-memory/reference') return '#b8d4ff';  // blue-gray — reference docs
-        if (folder === 'cortex-memory/feedback')  return '#ffa07a';  // salmon — Owner's feedback/preferences
+        if (folder === 'cortex-memory/feedback')  return '#ffa07a';  // salmon — owner's feedback/preferences
         if (folder === 'cortex-memory/sources')   return '#7de3c4';  // teal — external sources
         if (folder === 'cortex-memory/conflicts') return '#ff6b81';  // red — contradictions
         if (folder === 'cortex-memory/dailies')   return '#d4d4d4';  // light gray — chronological logs
@@ -71,7 +89,34 @@
         // legacy memory/ paths (kept for backward compat)
         if (folder.startsWith('memory/sources'))  return '#7de3c4';
         if (folder.startsWith('memory/projects')) return '#8fc7ff';
-        return '#c39bff';  // default purple for anything else
+        return '#c39bff';  // default purple — operational instructions / directives
+      };
+
+      // Map a raw node.folder to a filter-category key. The memory/*
+      // operational dirs (root-level files and per-domain how-to-operate
+      // directories) collapse to a single 'instructions' category so the
+      // type-filter row can hide them as one. They aren't legacy — they're
+      // how-to-operate directives for Alice. Anything matching a known
+      // cortex-memory subfolder keeps its own key.
+      const RECOGNIZED_CORTEX = new Set([
+        'cortex-memory/people',
+        'cortex-memory/projects',
+        'cortex-memory/reference',
+        'cortex-memory/feedback',
+        'cortex-memory/sources',
+        'cortex-memory/conflicts',
+        'cortex-memory/dailies',
+        'cortex-memory/research',
+      ]);
+      const folderCategory = (folder) => {
+        if (folder === 'unresolved') return 'unresolved';
+        if (RECOGNIZED_CORTEX.has(folder)) return folder;
+        // Legacy memory/sources and memory/projects fold into their cortex
+        // equivalents (already colored that way in folderColor) so the
+        // filter pill matches the visible color.
+        if (folder.startsWith('memory/sources'))  return 'cortex-memory/sources';
+        if (folder.startsWith('memory/projects')) return 'cortex-memory/projects';
+        return 'instructions';
       };
 
       const svg = d3.select('#memgraph');
@@ -111,6 +156,7 @@
         { key: 'cortex-memory/conflicts', label: 'conflicts' },
         { key: 'cortex-memory/dailies',   label: 'dailies' },
         { key: 'cortex-memory/research',  label: 'research' },
+        { key: 'instructions',            label: 'instructions' },
         { key: 'unresolved',              label: 'unresolved' },
       ];
       // Map pill-label -> folder-key for URL parsing.
@@ -144,7 +190,10 @@
         // Strip everything after the leading "types:" label.
         while (row.children.length > 1) row.removeChild(row.lastChild);
         const counts = {};
-        for (const n of nodes) counts[n.folder] = (counts[n.folder] || 0) + 1;
+        for (const n of nodes) {
+          const cat = folderCategory(n.folder);
+          counts[cat] = (counts[cat] || 0) + 1;
+        }
         for (const def of TYPE_DEFS) {
           const c = counts[def.key] || 0;
           if (c === 0 && def.key !== 'unresolved') continue;  // skip empty cortex types
@@ -194,7 +243,7 @@
         const showGhosts = document.getElementById('show-ghosts').checked;
         const activeNodes = nodes.filter(n => {
           if (!showGhosts && n.folder === 'unresolved') return false;
-          if (hiddenTypes.has(n.folder)) return false;
+          if (hiddenTypes.has(folderCategory(n.folder))) return false;
           return true;
         });
         const activeIds = new Set(activeNodes.map(n => n.id));
@@ -269,6 +318,50 @@
           });
         } catch (err) { console.error('attachGraphTuning failed', err); }
       };
+
+      // ---- Cluster metrics readout ------------------------------------
+      // Populated once per page load from the /api/memory-graph response.
+      // Computed server-side over the topical subgraph (dailies + instructions
+      // + unresolved excluded — they bridge across domains and would mask
+      // real lobe formation).
+      const renderClusterMetrics = (cm) => {
+        if (!cm) return;
+        const wrap = document.getElementById('cluster-metrics');
+        const strip = wrap.querySelector('.cm-strip');
+        const hubsList = wrap.querySelector('.cm-hubs');
+        const summary = document.getElementById('cm-hubs-summary');
+        // Modularity bands: >0.3 healthy lobes, 0.1–0.3 weak structure,
+        // <0.1 hairball. Lobe coverage bands: >=0.7 most nodes in real
+        // lobes, 0.4–0.7 partial, <0.4 mostly singletons.
+        const modCls = cm.modularity >= 0.3 ? 'cm-good'
+                     : cm.modularity >= 0.1 ? 'cm-warn' : 'cm-bad';
+        const covCls = cm.lobe_coverage >= 0.7 ? 'cm-good'
+                     : cm.lobe_coverage >= 0.4 ? 'cm-warn' : 'cm-bad';
+        strip.innerHTML =
+          `<span class="cm-stat">modularity: <b class="${modCls}">${cm.modularity.toFixed(3)}</b></span>` +
+          `<span class="cm-stat">clusters: <b>${cm.cluster_count}</b></span>` +
+          `<span class="cm-stat">lobe coverage: <b class="${covCls}">${(cm.lobe_coverage * 100).toFixed(0)}%</b></span>` +
+          `<span class="cm-stat">topical: <b>${cm.topical_node_count}</b> nodes / <b>${cm.topical_edge_count}</b> edges</span>`;
+        summary.textContent = `top hubs (${(cm.top_hubs || []).length})`;
+        hubsList.innerHTML = '';
+        for (const hub of (cm.top_hubs || [])) {
+          const li = document.createElement('li');
+          li.innerHTML =
+            `<a href="#" class="cm-hub-link" data-id="${hub.id}">${hub.label}</a>` +
+            ` · in-degree <b>${hub.in_degree}</b>` +
+            `<span class="cm-hub-folder">${hub.folder}</span>`;
+          hubsList.appendChild(li);
+        }
+        hubsList.querySelectorAll('.cm-hub-link').forEach(a => {
+          a.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            const node = nodes.find(n => n.id === a.dataset.id);
+            if (node) window.openMemoryNodeModal(node);
+          });
+        });
+        wrap.style.display = '';
+      };
+      renderClusterMetrics(data.cluster_metrics);
 
       buildPills();
       render();

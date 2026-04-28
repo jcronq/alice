@@ -618,7 +618,7 @@ def read_memory_graph(mind: pathlib.Path) -> tuple[list[MemoryNode], list[Memory
                 rel = path.relative_to(mind).with_suffix("")
             except ValueError:
                 continue
-            node_id = str(rel)  # e.g. "cortex-memory/people/jason" or "memory/2026-04-24"
+            node_id = str(rel)  # e.g. "cortex-memory/people/friend" or "memory/2026-04-24"
             label = path.stem
             folder = "/".join(rel.parts[:-1]) or rel.parts[0]
             try:
@@ -674,6 +674,183 @@ def read_memory_graph(mind: pathlib.Path) -> tuple[list[MemoryNode], list[Memory
             edges.append(MemoryEdge(source=src_id, target=target_id))
 
     return list(nodes.values()), edges
+
+
+# Folders whose notes count as the "topical subgraph" for cluster
+# diagnostics. Dailies are excluded — they bridge every domain by design and
+# would force a hairball verdict regardless of topical linking discipline.
+# Index/README notes at the cortex root, the legacy operational-instruction
+# folders under memory/ (how-to-operate directives, one folder per domain),
+# and unresolved ghosts are also excluded — none belong to a single
+# topical lobe.
+_TOPICAL_CORTEX = frozenset({
+    "cortex-memory/people",
+    "cortex-memory/projects",
+    "cortex-memory/reference",
+    "cortex-memory/feedback",
+    "cortex-memory/sources",
+    "cortex-memory/conflicts",
+    "cortex-memory/research",
+})
+
+
+def _is_topical(folder: str) -> bool:
+    if folder in _TOPICAL_CORTEX:
+        return True
+    # Legacy memory/sources and memory/projects fold into cortex-memory's
+    # sources/projects categories — keep them topical.
+    if folder.startswith("memory/sources") or folder.startswith("memory/projects"):
+        return True
+    return False
+
+
+def compute_cluster_metrics(
+    nodes: list[MemoryNode],
+    edges: list[MemoryEdge],
+    *,
+    top_hub_count: int = 10,
+    min_lobe_size: int = 3,
+    max_iterations: int = 30,
+) -> dict[str, Any]:
+    """Compute cluster-quality metrics over the topical subgraph.
+
+    A "healthy" graph has visible domain lobes (fitness, infra, projects,
+    people…) linked sparingly through bridge notes. A hairball — one
+    undifferentiated nebula — looks fine to vault_health (zero broken, zero
+    orphans) because over-linking satisfies that signal trivially. These
+    metrics give an actual cluster-quality reading.
+
+    Returned keys:
+
+    - ``modularity`` — Newman's Q on the label-propagation partition
+      (range -0.5..1, in practice 0..1 for connected graphs). Above ~0.3
+      means recognizable lobes; ~0.1 or below is a hairball.
+    - ``cluster_count`` — number of distinct communities label-propagation
+      settled on.
+    - ``top_hubs`` — ten highest in-degree topical nodes. The bridge notes;
+      candidates for a Stage C hub audit.
+    - ``lobe_coverage`` — fraction of topical nodes that live in a cluster
+      of size ``>= min_lobe_size``. Low coverage = lots of singletons /
+      tiny pairs; high coverage = real lobes formed.
+    - ``topical_node_count`` / ``topical_edge_count`` — sanity counters
+      for the subgraph the rest of the metrics were computed over.
+
+    Dailies, root-level index/README notes, operational-instruction
+    folders under memory/, and unresolved ghosts are excluded.
+    """
+    topical_ids = {n.id for n in nodes if _is_topical(n.folder)}
+    if not topical_ids:
+        return {
+            "modularity": 0.0,
+            "cluster_count": 0,
+            "top_hubs": [],
+            "lobe_coverage": 0.0,
+            "topical_node_count": 0,
+            "topical_edge_count": 0,
+        }
+
+    topical_edges = [
+        (e.source, e.target)
+        for e in edges
+        if e.source in topical_ids and e.target in topical_ids and e.source != e.target
+    ]
+
+    # Undirected adjacency. Directed edge dedup happens upstream in
+    # read_memory_graph; here we collapse (a,b)/(b,a) pairs.
+    neighbors: dict[str, set[str]] = {nid: set() for nid in topical_ids}
+    for s, t in topical_edges:
+        neighbors[s].add(t)
+        neighbors[t].add(s)
+
+    und_edges: set[tuple[str, str]] = set()
+    for nid, ns in neighbors.items():
+        for other in ns:
+            und_edges.add((nid, other) if nid < other else (other, nid))
+    m = len(und_edges)
+
+    # Synchronous label propagation. Each node starts in its own community;
+    # each sweep we read every node's current label simultaneously, then for
+    # each node compute the most-common label among its neighbors. Ties
+    # break by "stay if currently tied for top" first, otherwise lex-min on
+    # the label string. Synchronous + stay-if-tied is deterministic and
+    # avoids the iteration-order collapse that ruins the asynchronous
+    # variant on small symmetric graphs (where a single bridge edge can
+    # cascade two lobes into one cluster).
+    labels: dict[str, str] = {nid: nid for nid in topical_ids}
+    sorted_ids = sorted(topical_ids)
+    for _ in range(max_iterations):
+        new_labels: dict[str, str] = {}
+        for nid in sorted_ids:
+            ns = neighbors[nid]
+            if not ns:
+                new_labels[nid] = labels[nid]
+                continue
+            counts: dict[str, int] = {}
+            for other in ns:
+                lbl = labels[other]
+                counts[lbl] = counts.get(lbl, 0) + 1
+            top_count = max(counts.values())
+            candidates = [lbl for lbl, c in counts.items() if c == top_count]
+            current = labels[nid]
+            if current in candidates:
+                new_labels[nid] = current
+            else:
+                new_labels[nid] = min(candidates)
+        if new_labels == labels:
+            break
+        labels = new_labels
+
+    cluster_sizes: dict[str, int] = {}
+    for lbl in labels.values():
+        cluster_sizes[lbl] = cluster_sizes.get(lbl, 0) + 1
+    cluster_count = len(cluster_sizes)
+    nodes_in_lobes = sum(c for c in cluster_sizes.values() if c >= min_lobe_size)
+    lobe_coverage = nodes_in_lobes / len(topical_ids)
+
+    # Newman modularity on the label-propagation partition.
+    if m == 0:
+        modularity = 0.0
+    else:
+        degrees = {nid: len(ns) for nid, ns in neighbors.items()}
+        L: dict[str, int] = {}
+        K: dict[str, int] = {}
+        for nid in topical_ids:
+            K[labels[nid]] = K.get(labels[nid], 0) + degrees[nid]
+        for s, t in und_edges:
+            if labels[s] == labels[t]:
+                L[labels[s]] = L.get(labels[s], 0) + 1
+        two_m = 2 * m
+        Q = 0.0
+        for lbl, k_c in K.items():
+            l_c = L.get(lbl, 0)
+            Q += (l_c / m) - (k_c / two_m) ** 2
+        modularity = Q
+
+    # Top hubs = highest in-degree nodes restricted to the topical subgraph.
+    in_deg: dict[str, int] = {}
+    for _src, tgt in topical_edges:
+        in_deg[tgt] = in_deg.get(tgt, 0) + 1
+    label_by_id = {n.id: n.label for n in nodes}
+    folder_by_id = {n.id: n.folder for n in nodes}
+    hub_ids = sorted(in_deg, key=lambda nid: (-in_deg[nid], nid))[:top_hub_count]
+    top_hubs = [
+        {
+            "id": nid,
+            "label": label_by_id.get(nid, nid),
+            "folder": folder_by_id.get(nid, ""),
+            "in_degree": in_deg[nid],
+        }
+        for nid in hub_ids
+    ]
+
+    return {
+        "modularity": round(modularity, 4),
+        "cluster_count": cluster_count,
+        "top_hubs": top_hubs,
+        "lobe_coverage": round(lobe_coverage, 4),
+        "topical_node_count": len(topical_ids),
+        "topical_edge_count": m,
+    }
 
 
 def search_memory(

@@ -482,6 +482,11 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         in_deg: dict[str, int] = {}
         for e in edges:
             in_deg[e.target] = in_deg.get(e.target, 0) + 1
+        # Cluster diagnostics over the topical subgraph (dailies, instructions,
+        # index notes, and unresolved ghosts excluded — they bridge across
+        # domains and would mask real lobe formation). See
+        # sources.compute_cluster_metrics.
+        cluster_metrics = sources.compute_cluster_metrics(nodes, edges)
         return JSONResponse(
             {
                 "nodes": [
@@ -496,6 +501,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
                     for n in nodes
                 ],
                 "edges": [{"source": e.source, "target": e.target} for e in edges],
+                "cluster_metrics": cluster_metrics,
             }
         )
 
