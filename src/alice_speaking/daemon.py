@@ -629,6 +629,16 @@ class SpeakingDaemon:
         # when he asks something, regardless of the clock. Typing indicator
         # fires too so he sees Alice working.
         await self.signal_transport.typing(channel, True)
+        # State machine: every inbound moves received -> replied | abandoned.
+        # "received" fires immediately (per envelope) so the sender sees
+        # acknowledgement before the turn starts. Default state is
+        # "abandoned" — only flipped to "replied" when we actually send.
+        for ev in batch:
+            with contextlib.suppress(Exception):
+                await self.signal_transport.set_message_state(
+                    channel, ev.envelope.timestamp, "received"
+                )
+        terminal_state = "abandoned"
         try:
             now = datetime.datetime.now().astimezone()
             stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
@@ -636,6 +646,8 @@ class SpeakingDaemon:
                 sender_name=sender_name, stamp=stamp, batch=batch
             )
             await self._run_turn(prompt, turn_id=turn_id, outbound_recipient=source)
+            if self._turn_did_send:
+                terminal_state = "replied"
         except Exception as exc:  # noqa: BLE001
             log.exception("turn failed for %s", sender_name)
             error = f"{type(exc).__name__}: {exc}"
@@ -652,6 +664,11 @@ class SpeakingDaemon:
             self._current_turn_kind = prev_kind
             self._current_reply_channel = prev_channel
             self._current_principal_display_name = prev_display_name
+            for ev in batch:
+                with contextlib.suppress(Exception):
+                    await self.signal_transport.set_message_state(
+                        channel, ev.envelope.timestamp, terminal_state
+                    )
             await self.signal_transport.typing(channel, False)
             # One turn_log entry per envelope so the inbound audit trail
             # is preserved regardless of batch size. Only the LAST envelope

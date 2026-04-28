@@ -40,6 +40,17 @@ from .base import (
 log = logging.getLogger(__name__)
 
 
+# Per-message state -> emoji. The daemon transitions an inbound through
+# received -> replied | abandoned and the transport renders the state as
+# a reaction on the originating message. Cosmetic feedback only — never
+# load-bearing.
+_STATE_EMOJI: dict[str, str] = {
+    "received": "👀",
+    "replied": "✅",
+    "abandoned": "❌",
+}
+
+
 class SignalTransport:
     """Transport adapter for Signal. Wraps an existing :class:`SignalClient`."""
 
@@ -132,3 +143,35 @@ class SignalTransport:
             await self._signal.start_typing(channel.address)
         else:
             await self._signal.stop_typing(channel.address)
+
+    async def set_message_state(
+        self,
+        channel: ChannelRef,
+        target_timestamp: int,
+        state: str,
+    ) -> None:
+        """React to a prior inbound message with the emoji for ``state``.
+
+        Known states: ``received`` (we accepted it), ``replied`` (we sent
+        a response), ``abandoned`` (we gave up — error or no reply).
+        Unknown states are logged and skipped. Reactions are cosmetic;
+        any RPC failure is swallowed rather than failing the turn.
+        """
+        emoji = _STATE_EMOJI.get(state)
+        if not emoji:
+            log.warning("unknown signal message state %r; skipping", state)
+            return
+        try:
+            await self._signal.send_reaction(
+                recipient=channel.address,
+                target_author=channel.address,
+                target_timestamp=target_timestamp,
+                emoji=emoji,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "send_reaction failed (ts=%d state=%s): %s",
+                target_timestamp,
+                state,
+                exc,
+            )

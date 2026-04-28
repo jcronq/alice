@@ -152,6 +152,32 @@ class SignalClient:
             # Typing is best-effort; don't fail the turn because Signal is sulking.
             pass
 
+    async def send_reaction(
+        self,
+        recipient: str,
+        target_author: str,
+        target_timestamp: int,
+        emoji: str,
+    ) -> None:
+        """Send an emoji reaction to a prior message.
+
+        ``target_author`` + ``target_timestamp`` together identify the
+        message being reacted to. For 1:1 inbound, the author is the
+        sender themselves and the recipient (where the reaction is
+        delivered) is the same number.
+        """
+        await self._rpc(
+            "sendReaction",
+            {
+                "account": self.account,
+                "emoji": emoji,
+                "targetAuthor": target_author,
+                "targetTimestamp": int(target_timestamp),
+                "recipient": [recipient],
+            },
+            request_id="react",
+        )
+
     async def start_typing(self, recipient: str) -> None:
         """Kick off a 10s typing heartbeat for the recipient."""
         await self.stop_typing(recipient)
