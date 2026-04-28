@@ -53,14 +53,12 @@ COPY --chown=alice:alice bin/alice-mind-autopush /usr/local/bin/alice-mind-autop
 COPY --chown=alice:alice bin/event-log           /usr/local/bin/event-log
 COPY --chown=alice:alice bin/alice-think         /usr/local/bin/alice-think
 COPY --chown=alice:alice bin/alice-client        /usr/local/bin/alice-client
-COPY --chown=alice:alice signal/signal-bridge.sh /usr/local/bin/signal-bridge
 
 RUN chmod +x /usr/local/bin/entrypoint.sh \
         /usr/local/bin/alice-mind-autopush \
         /usr/local/bin/event-log \
         /usr/local/bin/alice-think \
         /usr/local/bin/alice-client \
-        /usr/local/bin/signal-bridge \
     && find /etc/s6-overlay/s6-rc.d \( -name 'run' -o -name 'up' -o -name 'finish' \) | xargs -r chmod +x
 
 ENV HOME=/home/alice

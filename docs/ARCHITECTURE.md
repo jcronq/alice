@@ -39,12 +39,13 @@ poke at outside herself" lives in the optional tools repo.
 
 ## Runtime processes (inside the container)
 
-s6-overlay supervises three long-run services:
+s6-overlay supervises these long-run services:
 
 | Service          | What it does                                               |
 |------------------|------------------------------------------------------------|
 | `signal-daemon`  | `signal-cli --http 127.0.0.1:8080` — the phone line        |
-| `signal-bridge`  | Tails the daemon's log, routes inbound messages to claude  |
+| `alice-speaking` | Python daemon that routes inbound messages to claude       |
+| `alice-thinker`  | Wake-driven proactive turns                                |
 | `alice-autopush` | Every 15 min, commits + pushes any changes in `alice-mind` |
 
 Each has `run` and `finish` scripts under `sandbox/s6/<service>/`.
@@ -58,15 +59,15 @@ User's phone
 signal-cli daemon (in container, :8080)
    │ logs JSON envelope to signal-daemon.log
    ▼
-signal-bridge.sh (in container)
+alice-speaking daemon (in container)
    │ tails log, parses envelope
    │ looks up per-sender session pointer
    ▼
-claude -p "…" --resume <session-id>
+claude (Agent SDK, --resume <session-id>)
    │ reads alice-mind/ (CLAUDE.md + skills + memory)
    │ generates response
    ▼
-signal-bridge.sh
+alice-speaking daemon
    │ POSTs to signal daemon's JSON-RPC
    ▼
 signal-cli daemon

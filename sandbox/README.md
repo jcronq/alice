@@ -12,7 +12,7 @@ Alice should feel like a separate entity. The sandbox gives her:
 - Her own filesystem view — she sees `/home/alice/alice-mind` and nothing
   else from your host except what's mounted
 - Her own installed tools (node, claude, gh, git, ssh, curl, jq, signal-cli)
-  supervised by s6-overlay (signal-daemon, signal-bridge, alice-autopush)
+  supervised by s6-overlay (signal-daemon, alice-speaking, alice-thinker, alice-autopush)
 
 Everything Alice writes to the mounted volumes persists on the host.
 
@@ -34,8 +34,6 @@ alice/
 │   ├── alice-init            # first-run: scaffold a mind + alice.env
 │   ├── alice-mind-autopush   # baked into image; auto-commit mind
 │   └── event-log             # baked; append structured event
-├── signal/
-│   └── signal-bridge.sh      # baked as /usr/local/bin/signal-bridge
 ├── templates/mind-scaffold/  # starter files for `alice-init`
 └── config/alice.env.example
 ```
@@ -89,7 +87,7 @@ alice-up           # start fresh on new image
 - `docker logs alice` — s6 + service startup output
 - `alice-shell` → poke around as Alice
 - `docker inspect alice` → see mounts, env, network
-- Bridge log: `~/.local/state/alice/signal-bridge.log`
+- Speaking daemon log: `docker logs alice-worker-blue` (or `-green`)
 - Signal daemon log: `~/.local/state/alice/signal-daemon.log`
 
 ## Extending (adding personal sidecars)
