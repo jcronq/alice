@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""Build cortex-index.db from the cortex-memory vault.
+"""Build cortex-index.db from a markdown vault.
 
-Walks ~/alice-mind/cortex-memory/, parses YAML frontmatter and wikilinks,
-populates a SQLite + FTS5 index at ~/alice-mind/inner/state/cortex-index.db.
+Walks the vault root (default: ~/alice-mind/cortex-memory/), parses YAML
+frontmatter and wikilinks, populates a SQLite + FTS5 index at the DB path
+(default: ~/alice-mind/inner/state/cortex-index.db).
 
-Design constraints (from 2026-04-28-cortex-signal-architecture §8):
+Design constraints:
   - Vault is canonical. DB is a derived index. Wipe DB → rebuild from vault →
     identical state. No round-trip writes from DB to vault.
   - Class A (canonical, projected from frontmatter): notes table.
   - Class B (operational telemetry): note_metrics table; resets on rebuild.
-  - Atomic rebuild: write to .tmp → fsync → os.rename to final path. Never
-    modify the live DB in place.
+  - Atomic rebuild: write to .tmp → os.replace to final path. Never modify
+    the live DB in place.
   - FTS5 external-content over notes table for full-text search.
   - Structural folders: projects/, reference/, people/, decisions/, plus
     index.md at vault root. Links into these folders mark is_structural=1.
   - Wikilink resolution: (1) exact slug match, (2) alias from frontmatter,
-    (3) display-title match. Unresolved → resolved=0 (Stage B repair queue).
+    (3) display-title match. Unresolved → resolved=0 (repair queue).
 
 Usage:
     python3 build_index.py                  # rebuild against default paths
@@ -145,7 +146,7 @@ def needs_rebuild(vault: Path, db_path: Path, max_stale_seconds: int = 86400) ->
 def slug_for(path: Path, vault: Path, colliding_stems: frozenset[str] = frozenset()) -> str:
     """Slug = filename stem; qualified by folder when stems collide.
 
-    Filenames are unique in this vault by convention, so the bare stem suffices
+    Filenames are typically unique across a vault, so the bare stem suffices
     for the common case. When two notes share a stem (e.g., decisions/_index.md
     and findings/_index.md), the slug becomes "<folder>/<stem>" so the UNIQUE
     constraint on notes.slug holds. Wikilinks usually reference by basename;
@@ -250,8 +251,8 @@ def resolve_link(
 ) -> dict | None:
     """Resolve a wikilink target. Order: slug → alias → title.
 
-    `raw` may include a folder prefix (e.g., 'inner/notes/foo'); we strip to the
-    basename for slug lookup since the vault uses unique filenames.
+    `raw` may include a folder prefix (e.g., 'subdir/foo'); we try the full
+    path first, then the basename, since vaults often address by basename.
     """
     candidate = raw.strip()
     if not candidate:

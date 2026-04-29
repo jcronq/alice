@@ -1,4 +1,4 @@
-"""Minimal YAML frontmatter parser for Alice's cortex-memory vault.
+"""Minimal YAML frontmatter parser for Obsidian-style markdown vaults.
 
 Handles the subset of YAML actually used in vault frontmatter:
   - scalar strings (quoted or unquoted)
