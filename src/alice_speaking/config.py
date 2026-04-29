@@ -71,13 +71,6 @@ class Config:
     # Code SDK falls back to ~/.claude/.credentials.json (the entrypoint
     # symlinks it from the host), so this isn't strictly required.
     oauth_token: str
-    # API-key auth mode. When ``anthropic_base_url`` or ``anthropic_api_key``
-    # is set, alice_core.auth picks "api" mode and routes the CLI through
-    # this endpoint instead of the default Claude subscription flow. Used
-    # for LiteLLM proxies (or direct Anthropic API).
-    anthropic_base_url: str
-    anthropic_api_key: str
-    anthropic_auth_token: str
     work_dir: pathlib.Path
 
     # Paths (derived, overridable)
@@ -106,6 +99,14 @@ class Config:
     # the daemon skips construction; existing deploys without Discord
     # configured keep working.
     discord_bot_token: str = ""
+
+    # API-key auth mode. When ``anthropic_base_url`` or ``anthropic_api_key``
+    # is set, alice_core.auth picks "api" mode and routes the CLI through
+    # this endpoint instead of the default Claude subscription flow. Used
+    # for LiteLLM proxies (or direct Anthropic API).
+    anthropic_base_url: str = ""
+    anthropic_api_key: str = ""
+    anthropic_auth_token: str = ""
 
     # A2A transport — optional. When ``a2a_enabled`` is False the daemon
     # skips construction. A2A lets external (Google A2A protocol)
