@@ -362,15 +362,25 @@ if [ $rc -ne 0 ]; then
         info "    docker restart alice-worker-blue"
         info "    alice -p 'ping'"
     fi
-    info "Speaking-daemon stderr is at:"
-    info "    ~/.local/state/alice/worker/speaking-stderr.log"
+    # Two diagnostic surfaces, in priority order:
+    # - docker logs catches import-time crashes BEFORE the supervisor
+    #   redirects stderr to a file (e.g. ModuleNotFoundError on a stale
+    #   worker image). This is the *first* place to look on a fresh
+    #   install failure.
+    # - speaking.log is the structured app log; useful once the daemon
+    #   has actually started but is misbehaving.
+    info "First places to look:"
+    info "    docker logs --tail 80 alice-worker-blue"
+    info "    tail -F ~/.local/state/alice/worker/speaking.log"
     fail "Smoke test failed."
 elif printf '%s' "$reply" | grep -qiE "error|authentication_failed"; then
     warn "Alice replied with an error response:"
     printf '%s\n' "$reply" | sed 's/^/        /'
     info ""
     info "Most likely: token in alice.env is invalid or expired."
-    info "Logs: ~/.local/state/alice/worker/speaking-stderr.log"
+    info "Logs:"
+    info "    docker logs --tail 80 alice-worker-blue"
+    info "    tail -F ~/.local/state/alice/worker/speaking.log"
     fail "Smoke test failed."
 else
     ok "Alice replied:"
