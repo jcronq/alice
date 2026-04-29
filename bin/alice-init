@@ -13,7 +13,7 @@
 #   - Start the container (prints the command).
 #
 # Usage:
-#   alice-init                 # interactive, targets ~/alice-mind
+#   alice-init                 # interactive, targets <repo>/data/alice-mind
 #   alice-init --target PATH   # scaffold into a different dir
 #   alice-init --yes           # accept defaults (skips Signal prompt)
 
@@ -21,7 +21,11 @@ set -euo pipefail
 
 ALICE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCAFFOLD_SRC="$ALICE_ROOT/templates/mind-scaffold"
-TARGET="$HOME/alice-mind"
+# Mind + tools live under <repo>/data/ by default — that whole directory
+# is gitignored in this (runtime) repo. The mind is itself a separate
+# git repo created by the scaffold step below; tools is just a directory.
+TARGET="$ALICE_ROOT/data/alice-mind"
+TOOLS_DIR="$ALICE_ROOT/data/alice-tools"
 NON_INTERACTIVE=0
 
 # ----- prerequisite check -----
@@ -81,6 +85,10 @@ confirm() {
 
 echo "=== Alice first-run setup ==="
 echo
+
+# Ensure <repo>/data/ exists so all three mind-source paths below have a
+# stable parent (git clone won't create intermediate parents).
+mkdir -p "$(dirname "$TARGET")"
 
 # ----- mind source -----
 echo "Where should Alice's mind live?"
@@ -182,7 +190,7 @@ fi
 # them root-owned on first start. alice-up does this too — running here
 # means a user who edits files between init and up sees the right paths.
 mkdir -p \
-    "$HOME/alice-tools" \
+    "$TOOLS_DIR" \
     "$HOME/.config/gh" \
     "$HOME/.alice-claude" \
     "$HOME/.local/state/alice" \

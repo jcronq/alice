@@ -124,8 +124,11 @@ text alone does NOT send.
 
 **Volumes (host → container):**
 
-- `~/alice-mind` rw — her mind (memory, skills, identity).
-- `~/alice-tools` rw — your sidecars (smart home, AV, repo helpers, …).
+- `<repo>/data/alice-mind` rw — her mind (memory, skills, identity).
+  Its own git repo; the parent `data/` is gitignored from this repo.
+  Override with `ALICE_MIND=…` if you want it elsewhere.
+- `<repo>/data/alice-tools` rw — your sidecars (smart home, AV, repo
+  helpers, …). Override with `ALICE_TOOLS=…`.
 - `~/alice` rw — this repo, mounted live so subagents can self-improve.
   Hemisphere boundary: thinking MUST NOT write here.
 - `~/.claude` ro — host Claude config (directory-mounted so atomic
@@ -136,7 +139,8 @@ text alone does NOT send.
 ## Mind repo
 
 Every Alice has her own mind. By default `alice-init` scaffolds one at
-`~/alice-mind`. You can instead:
+`<repo>/data/alice-mind/` (the parent `data/` directory is gitignored
+from this runtime repo). You can instead:
 
 - Clone an existing mind: `alice-init` → option 1 → paste the URL
 - Point at an existing directory: `alice-init` → option 2 → enter the path
@@ -178,9 +182,10 @@ event-log          # tail / query memory/events.jsonl
 ## Sidecars
 
 If you want Alice to control your smart home, your AV stack, your repos,
-whatever — drop those scripts in `~/alice-tools/`. They're mounted at
-`/home/alice/alice-tools/` inside the worker and on PATH. Or extend the
-container further via a `docker-compose.override.yml` in `sandbox/`.
+whatever — drop those scripts in `<repo>/data/alice-tools/`. They're
+mounted at `/home/alice/alice-tools/` inside the worker and on PATH. Or
+extend the container further via a `docker-compose.override.yml` in
+`sandbox/`.
 
 ## License
 

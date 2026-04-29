@@ -32,8 +32,9 @@ This interactive tool will:
    `~/.config/alice/alice.env`.
 3. Print next-step commands.
 
-If you picked the scaffold, `~/alice-mind` is now a local git repo. Edit
-`IDENTITY.md`, `CLAUDE.md`, `USER.md` to taste.
+If you picked the scaffold, `<repo>/data/alice-mind/` is now a local git
+repo (and the parent `data/` directory is gitignored from the runtime
+repo). Edit `IDENTITY.md`, `CLAUDE.md`, `USER.md` to taste.
 
 ## Register Signal
 
@@ -70,14 +71,14 @@ alice-down --rm       # stop and remove container (volumes persist)
 
 ## Versioning her mind
 
-`~/alice-mind` is just a git repo. If you pointed it at a remote during
-`alice-init`, the in-container `alice-autopush` service commits and
-pushes every 15 minutes.
+`<repo>/data/alice-mind/` is just a git repo. If you pointed it at a
+remote during `alice-init`, the in-container `alice-autopush` service
+commits and pushes every 15 minutes.
 
 To configure a remote on an existing local scaffold:
 
 ```bash
-cd ~/alice-mind
+cd <repo>/data/alice-mind
 gh repo create --private --source . --push
 ```
 

@@ -42,8 +42,8 @@ alice/
 
 | Host path                 | Inside container               | Mode | Purpose                                           |
 |---------------------------|--------------------------------|------|---------------------------------------------------|
-| `~/alice-mind`            | `/home/alice/alice-mind`       | rw   | Alice's brain — memories, skills, identity        |
-| `~/alice-tools`           | `/home/alice/alice-tools`      | rw   | Optional personal sidecars (can be empty)         |
+| `<repo>/data/alice-mind`  | `/home/alice/alice-mind`       | rw   | Alice's brain — memories, skills, identity        |
+| `<repo>/data/alice-tools` | `/home/alice/alice-tools`      | rw   | Optional personal sidecars (can be empty)         |
 | `~/.config/gh`            | `/home/alice/.config/gh`       | ro   | GitHub token (via `gh auth git-credential`)       |
 | `~/.ssh`                  | `/home/alice/.ssh`             | ro   | SSH keys for outbound ssh                         |
 | `~/.config/alice`         | `/home/alice/.config/alice`    | ro   | `alice.env` — per-host runtime config             |

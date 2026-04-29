@@ -8,6 +8,10 @@ __pycache__/
 .direnv/
 sandbox/docker-compose.override.yml
 
+# Alice's mind repo — its own git repo, scaffolded by alice-init.
+# Keep out of this (runtime) repo's history.
+/data/
+
 # Python tooling
 .venv/
 .pytest_cache/

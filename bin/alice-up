@@ -21,13 +21,18 @@ export GROUP_ID="${GROUP_ID:-$(id -g)}"
 # /home/alice/alice mount points at *this* checkout — no matter if it's
 # ~/alice, ~/dev/alice, or somewhere else entirely.
 export ALICE_REPO="${ALICE_REPO:-$ALICE_ROOT}"
+# Mind + tools live under <repo>/data/ by default (gitignored as a whole).
+# Mind is its own git repo; tools is just a directory of scripts.
+# Override either env var to put them elsewhere.
+export ALICE_MIND="${ALICE_MIND:-$ALICE_ROOT/data/alice-mind}"
+export ALICE_TOOLS="${ALICE_TOOLS:-$ALICE_ROOT/data/alice-tools}"
 
 # Pre-create host directories that compose binds. If we don't, the docker
 # daemon creates them as root:root on first run and Alice (uid 1000) can't
 # write. Idempotent.
 mkdir -p \
-    "$HOME/alice-mind" \
-    "$HOME/alice-tools" \
+    "$ALICE_MIND" \
+    "$ALICE_TOOLS" \
     "$HOME/.config/alice" \
     "$HOME/.config/gh" \
     "$HOME/.alice-claude" \

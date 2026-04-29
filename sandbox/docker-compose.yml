@@ -35,8 +35,11 @@ x-worker-base: &worker-base
     TZ: "${ALICE_TZ:-America/New_York}"
     PATH: "/home/alice/alice-tools/bin:/home/alice/.local/bin:/usr/local/bin:/usr/bin:/bin"
   volumes:
-    - ${HOME}/alice-mind:/home/alice/alice-mind:rw
-    - ${HOME}/alice-tools:/home/alice/alice-tools:rw
+    # Mind + tools default to <repo>/data/{alice-mind,alice-tools}; alice-up
+    # exports ALICE_MIND / ALICE_TOOLS pointing there. Fall back to the
+    # legacy ~/alice-{mind,tools} paths if compose is invoked directly.
+    - ${ALICE_MIND:-${HOME}/alice-mind}:/home/alice/alice-mind:rw
+    - ${ALICE_TOOLS:-${HOME}/alice-tools}:/home/alice/alice-tools:rw
     # Monorepo bind-mounted rw so Alice can self-improve in place (her
     # subagents can commit + push from inside the container). The host
     # path holds everything that runs her — agent kernel, speaking
@@ -120,7 +123,7 @@ services:
       TZ: "${ALICE_TZ:-America/New_York}"
     volumes:
       - ${ALICE_REPO:-${HOME}/alice}:/home/alice/alice:ro
-      - ${HOME}/alice-mind:/home/alice/alice-mind:ro
+      - ${ALICE_MIND:-${HOME}/alice-mind}:/home/alice/alice-mind:ro
       - ${HOME}/.local/state/alice:/state:rw
       # alice.env carries CLAUDE_CODE_OAUTH_TOKEN for run_summary's
       # Haiku call; alice_core.auth reads it from this default path.
