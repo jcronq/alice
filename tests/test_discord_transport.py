@@ -13,13 +13,12 @@ import asyncio
 
 import pytest
 
-from alice_speaking.transports import DiscordTransport
 from alice_speaking.transports.base import (
     DISCORD_CAPS,
     ChannelRef,
     OutboundMessage,
 )
-from alice_speaking.transports.discord import _parse_address
+from alice_speaking.transports.discord import DiscordTransport, _parse_address
 
 
 def test_construction_requires_token():
