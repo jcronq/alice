@@ -54,7 +54,7 @@ fi
 # We just need the right docker-exec shape: -t when stdin+stdout are
 # both terminals (interactive REPL), -i otherwise (pipe-friendly).
 if [ -t 0 ] && [ -t 1 ] && [ "$#" -eq 0 ]; then
-    exec docker exec -u alice -it "$WORKER" /usr/local/bin/alice-client "${client_args[@]}"
+    exec docker exec -u alice -it "$WORKER" /usr/local/bin/alice-client ${client_args[@]+"${client_args[@]}"}
 else
-    exec docker exec -u alice -i "$WORKER" /usr/local/bin/alice-client "${client_args[@]}"
+    exec docker exec -u alice -i "$WORKER" /usr/local/bin/alice-client ${client_args[@]+"${client_args[@]}"}
 fi

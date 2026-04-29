@@ -314,6 +314,24 @@ def group_turns(events: list[UnifiedEvent]) -> list[Turn]:
             turn.outbound = d.get("outbound")
             turn.error = d.get("error")
             turn.duration_ms = d.get("duration_ms")
+        elif ev.kind == "cli_turn_start":
+            turn.kind = "cli"
+            turn.start_ts = ev.ts
+            turn.sender_name = d.get("display_name")
+            turn.inbound = d.get("inbound")
+        elif ev.kind == "cli_turn_end":
+            turn.end_ts = ev.ts
+            turn.error = d.get("error")
+            turn.duration_ms = d.get("duration_ms")
+        elif ev.kind == "discord_turn_start":
+            turn.kind = "discord"
+            turn.start_ts = ev.ts
+            turn.sender_name = d.get("display_name")
+            turn.inbound = d.get("inbound")
+        elif ev.kind == "discord_turn_end":
+            turn.end_ts = ev.ts
+            turn.error = d.get("error")
+            turn.duration_ms = d.get("duration_ms")
         elif ev.kind == "surface_dispatch":
             turn.kind = "surface"
             turn.start_ts = ev.ts

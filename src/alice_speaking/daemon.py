@@ -760,6 +760,15 @@ class SpeakingDaemon:
             self._current_turn_kind = prev_kind
             self._current_reply_channel = prev_channel
             self._current_principal_display_name = prev_display_name
+            self.turns.append(
+                new_turn(
+                    sender_number=msg.principal.native_id,
+                    sender_name=msg.principal.display_name,
+                    inbound=msg.text,
+                    outbound=self._turn_last_outbound,
+                    error=error,
+                )
+            )
             self.events.emit(
                 "cli_turn_end",
                 turn_id=turn_id,
@@ -829,6 +838,15 @@ class SpeakingDaemon:
             self._current_turn_kind = prev_kind
             self._current_reply_channel = prev_channel
             self._current_principal_display_name = prev_display_name
+            self.turns.append(
+                new_turn(
+                    sender_number=msg.principal.native_id,
+                    sender_name=msg.principal.display_name,
+                    inbound=msg.text,
+                    outbound=self._turn_last_outbound,
+                    error=error,
+                )
+            )
             self.events.emit(
                 "discord_turn_end",
                 turn_id=turn_id,

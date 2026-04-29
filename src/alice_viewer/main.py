@@ -196,11 +196,34 @@ def create_app(paths: Paths | None = None) -> FastAPI:
             },
         )
 
+    def _enrich_turns_with_outbound(turns, p: Paths) -> None:
+        # *_turn_end events don't carry the actual message text Speaking
+        # sent, but speaking-turns.jsonl does. Patch matching turns
+        # in-place. Applies to any turn kind that writes a turn-log
+        # entry (signal, cli, discord).
+        turn_log_events = sources.read_turn_log(p.turn_log)
+        for tev in turn_log_events:
+            rec = tev.detail or {}
+            outbound = rec.get("outbound")
+            sender_name = rec.get("sender_name")
+            if not outbound:
+                continue
+            for t in turns:
+                if t.outbound:
+                    continue
+                if t.sender_name != sender_name:
+                    continue
+                anchor = t.end_ts if t.end_ts else t.start_ts
+                if abs(tev.ts - anchor) <= 10.0:
+                    t.outbound = outbound
+                    break
+
     @app.get("/turns", response_class=HTMLResponse)
     async def turns_index(request: Request):
         p: Paths = app.state.paths
         events = sources.load_all(p)
         turns = aggregators.group_turns(events)
+        _enrich_turns_with_outbound(turns, p)
         turns.reverse()
         return templates.TemplateResponse(
             request,
@@ -217,6 +240,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         p: Paths = app.state.paths
         events = sources.load_all(p)
         turns = aggregators.group_turns(events)
+        _enrich_turns_with_outbound(turns, p)
         turn = next((t for t in turns if t.turn_id == turn_id), None)
         summary = aggregators.summarize_turn(turn) if turn else None
         return templates.TemplateResponse(
@@ -239,28 +263,8 @@ def create_app(paths: Paths | None = None) -> FastAPI:
     ):
         p: Paths = app.state.paths
         events = sources.load_all(p)
-        # Enrich turns with outbound text from speaking-turns.jsonl —
-        # speaking.log's signal_turn_end events don't carry the actual
-        # message text Speaking sent, but the turn-log does. We patch the
-        # relevant Turn objects via group_turns() before building arcs.
         turns = aggregators.group_turns(events)
-        turn_log_events = sources.read_turn_log(p.turn_log)
-        for tev in turn_log_events:
-            rec = tev.detail or {}
-            outbound = rec.get("outbound")
-            sender_name = rec.get("sender_name")
-            if not outbound:
-                continue
-            for t in turns:
-                if t.outbound:
-                    continue
-                if t.kind != "signal" or t.sender_name != sender_name:
-                    continue
-                anchor = t.end_ts if t.end_ts else t.start_ts
-                if abs(tev.ts - anchor) <= 10.0:
-                    t.outbound = outbound
-                    break
-
+        _enrich_turns_with_outbound(turns, p)
         # group_arcs reads turn.outbound off the Turn objects we just
         # patched, so the enrichment carries through.
         arcs = aggregators.group_arcs(events, turns=turns)
