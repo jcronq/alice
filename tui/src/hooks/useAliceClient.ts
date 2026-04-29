@@ -127,18 +127,37 @@ export function useAliceClient(opts: UseAliceClientOpts): UseAliceClient {
         break;
       }
 
-      case "tool_use":
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: nextId(),
-            role: "tool",
-            text: "",
-            toolName: ev.name,
-            toolInput: (ev.input ?? undefined) as Record<string, unknown> | undefined,
-          },
-        ]);
+      case "tool_use": {
+        // Settle the in-flight alice message *before* appending the tool, so
+        // tools land chronologically between text segments instead of after
+        // them. The next chunk (if any) creates a fresh alice message.
+        //
+        // This is also load-bearing for Conversation.tsx's <Static> region:
+        // Ink diffs <Static> by index (not by key), so the `settled` array
+        // must stay append-only. If we left m1 streaming while pushing the
+        // tool, m1 would later migrate from `live` into `settled` at index N,
+        // but Ink would have already consumed index N with the tool — so m1
+        // would never be rendered to static and would visibly disappear when
+        // it stopped streaming.
+        const aliceId = currentAliceId.current;
+        currentAliceId.current = null;
+        setMessages((prev) => {
+          const settled = aliceId
+            ? prev.map((m) => (m.id === aliceId ? { ...m, streaming: false } : m))
+            : prev;
+          return [
+            ...settled,
+            {
+              id: nextId(),
+              role: "tool",
+              text: "",
+              toolName: ev.name,
+              toolInput: (ev.input ?? undefined) as Record<string, unknown> | undefined,
+            },
+          ];
+        });
         break;
+      }
 
       case "result": {
         // Decorate the in-flight alice message with cost/duration AND
@@ -163,14 +182,22 @@ export function useAliceClient(opts: UseAliceClientOpts): UseAliceClient {
         break;
       }
 
-      case "error":
-        setMessages((prev) => [
-          ...prev,
-          { id: nextId(), role: "error", text: ev.message },
-        ]);
+      case "error": {
+        // Same settle-before-append pattern as tool_use — an in-flight alice
+        // message must leave `streaming` so it migrates into <Static> in
+        // chronological order, otherwise it gets stranded in `live` and
+        // disappears.
+        const aliceId = currentAliceId.current;
         currentAliceId.current = null;
+        setMessages((prev) => {
+          const settled = aliceId
+            ? prev.map((m) => (m.id === aliceId ? { ...m, streaming: false } : m))
+            : prev;
+          return [...settled, { id: nextId(), role: "error", text: ev.message }];
+        });
         setStatus({ kind: "idle" });
         break;
+      }
 
       case "done":
         // Mark the in-flight alice message complete.
