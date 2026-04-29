@@ -333,6 +333,32 @@ PY
     fi
 fi
 
+# ---- 4b. optional A2A ------------------------------------------------------
+
+step "A2A transport (optional)"
+
+if [ "${ALICE_A2A_ENABLED:-}" = "true" ] || [ "${ALICE_A2A_ENABLED:-}" = "1" ]; then
+    ok "A2A already enabled (port ${ALICE_A2A_PORT:-7878})"
+else
+    info "Lets external Google A2A-compliant agents submit tasks to Alice"
+    info "over JSON-RPC + SSE. Skip if Alice is humans-only via Signal/Discord/CLI."
+    info "Default port 7878 is internal-only — to expose to the host, add a"
+    info "docker-compose.override.yml entry per the alice.env.example notes."
+    if confirm "Enable A2A?" "n"; then
+        a2a_port="$(ask "ALICE_A2A_PORT" "7878")"
+        a2a_principal="$(ask "ALICE_A2A_PRINCIPAL (display name for A2A callers)" "a2a")"
+        write_var_to_env "ALICE_A2A_ENABLED" "true"
+        write_var_to_env "ALICE_A2A_PORT" "$a2a_port"
+        write_var_to_env "ALICE_A2A_PRINCIPAL" "$a2a_principal"
+        ok "A2A config written. Endpoint inside container: http://0.0.0.0:$a2a_port/"
+        info "Re-source alice.env so the rest of this script sees the new vars."
+        set -a
+        # shellcheck disable=SC1090
+        source "$ENV_FILE"
+        set +a
+    fi
+fi
+
 # ---- 5. bring up the sandbox ----------------------------------------------
 
 step "Bringing up Alice's sandbox"

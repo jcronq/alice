@@ -34,7 +34,8 @@ RUN python3 -m venv /opt/alice-venv \
         'httpx>=0.28.1' \
         'mistune>=3.0' \
         'pyyaml>=6.0' \
-        'discord.py>=2.4'
+        'discord.py>=2.4' \
+        'a2a-sdk[http-server]>=1.0.2'
 
 # s6-overlay for process supervision (bridge + autopush)
 ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz /tmp/
@@ -59,12 +60,14 @@ COPY --chown=alice:alice bin/alice-mind-autopush /usr/local/bin/alice-mind-autop
 COPY --chown=alice:alice bin/event-log           /usr/local/bin/event-log
 COPY --chown=alice:alice bin/alice-think         /usr/local/bin/alice-think
 COPY --chown=alice:alice bin/alice-client        /usr/local/bin/alice-client
+COPY --chown=alice:alice bin/alice-gh-watcher    /usr/local/bin/alice-gh-watcher
 
 RUN chmod +x /usr/local/bin/entrypoint.sh \
         /usr/local/bin/alice-mind-autopush \
         /usr/local/bin/event-log \
         /usr/local/bin/alice-think \
         /usr/local/bin/alice-client \
+        /usr/local/bin/alice-gh-watcher \
     && find /etc/s6-overlay/s6-rc.d \( -name 'run' -o -name 'up' -o -name 'finish' \) | xargs -r chmod +x
 
 ENV HOME=/home/alice

@@ -41,6 +41,21 @@ x-worker-base: &worker-base
     # mounted ~/.config/gh OAuth credentials instead — existing host
     # auth setups keep working.
     GH_TOKEN: "${GH_TOKEN:-}"
+    # A2A (Google Agent2Agent protocol) — opt-in via alice.env. The
+    # speaking daemon spins up a uvicorn server on this port inside the
+    # worker container when ALICE_A2A_ENABLED=true. The port is
+    # intentionally NOT published to the host by default: blue and green
+    # slots share the same x-worker-base, and a static publish would
+    # conflict during alice-deploy's swap (both containers briefly run).
+    # To expose A2A to the host or wider network, add a docker-compose
+    # .override.yml entry that publishes ALICE_A2A_PORT only on the slot
+    # you actually want live, or front the workers with an external
+    # load balancer that targets the lease-holder.
+    ALICE_A2A_ENABLED: "${ALICE_A2A_ENABLED:-}"
+    ALICE_A2A_PORT: "${ALICE_A2A_PORT:-}"
+    ALICE_A2A_HOST: "${ALICE_A2A_HOST:-}"
+    ALICE_A2A_PRINCIPAL: "${ALICE_A2A_PRINCIPAL:-}"
+    ALICE_A2A_EXTERNAL_URL: "${ALICE_A2A_EXTERNAL_URL:-}"
   volumes:
     # Mind + tools default to <repo>/data/{alice-mind,alice-tools}; alice-up
     # exports ALICE_MIND / ALICE_TOOLS pointing there. Fall back to the
