@@ -1580,7 +1580,7 @@ class SpeakingDaemon:
         return composed
 
     def _build_spec(self) -> KernelSpec:
-        builtin_tools = ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
+        builtin_tools = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch"]
         return KernelSpec(
             model=self.cfg.speaking.get("model"),
             allowed_tools=builtin_tools + self.custom_tool_names,
