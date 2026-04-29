@@ -31,8 +31,8 @@ DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-300}"
 READY_TIMEOUT="${READY_TIMEOUT:-90}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-60}"
 
-export USER_ID="${USER_ID:-$(id -u)}"
-export GROUP_ID="${GROUP_ID:-$(id -g)}"
+# shellcheck source=./_alice-env.sh
+. "$ALICE_ROOT/bin/_alice-env.sh"
 
 die() { echo "alice-deploy: $*" >&2; exit 1; }
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -40,7 +40,13 @@ log() { echo "[$(date '+%H:%M:%S')] $*"; }
 usage() { sed -n '3,26p' "$0"; }
 
 compose() {
-    ( cd "$SANDBOX_DIR" && USER_ID="$USER_ID" GROUP_ID="$GROUP_ID" docker compose "$@" )
+    # All ALICE_* / USER_ID / GROUP_ID env vars are exported by
+    # _alice-env.sh, so the subshell inherits them and docker compose
+    # resolves the bind-mount paths consistently with alice-up. Without
+    # this, the compose file's defaults (e.g. ${HOME}/alice-mind) take
+    # effect and a deploy silently remounts the worker onto stub dirs
+    # — disconnected from live state. See issue #2.
+    ( cd "$SANDBOX_DIR" && docker compose "$@" )
 }
 
 # ---------- slot detection ----------

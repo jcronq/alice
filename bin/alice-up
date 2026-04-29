@@ -15,17 +15,8 @@ if ! docker info >/dev/null 2>&1; then
     exit 1
 fi
 
-export USER_ID="${USER_ID:-$(id -u)}"
-export GROUP_ID="${GROUP_ID:-$(id -g)}"
-# Bind the alice repo from wherever this script lives, so the worker's
-# /home/alice/alice mount points at *this* checkout — no matter if it's
-# ~/alice, ~/dev/alice, or somewhere else entirely.
-export ALICE_REPO="${ALICE_REPO:-$ALICE_ROOT}"
-# Mind + tools live under <repo>/data/ by default (gitignored as a whole).
-# Mind is its own git repo; tools is just a directory of scripts.
-# Override either env var to put them elsewhere.
-export ALICE_MIND="${ALICE_MIND:-$ALICE_ROOT/data/alice-mind}"
-export ALICE_TOOLS="${ALICE_TOOLS:-$ALICE_ROOT/data/alice-tools}"
+# shellcheck source=./_alice-env.sh
+. "$ALICE_ROOT/bin/_alice-env.sh"
 
 # Pre-create host directories that compose binds. If we don't, the docker
 # daemon creates them as root:root on first run and Alice (uid 1000) can't
