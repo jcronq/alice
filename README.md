@@ -23,7 +23,8 @@ alice/
 │   ├── alice_core/        # auth, paths, config helpers
 │   ├── alice_speaking/    # inbound turn pipeline (per transport)
 │   ├── alice_thinking/    # wake-cycle pipeline (active + sleep modes)
-│   └── alice_viewer/      # introspection UI
+│   ├── alice_viewer/      # introspection UI
+│   └── alice_watchers/    # background pollers feeding inner/notes/ (github)
 ├── speaking/              # transport implementations (signal, cli, discord)
 ├── viewer/                # viewer static assets
 ├── bin/                   # CLI wrappers (alice, alice-up, alice-init, …)
@@ -176,8 +177,49 @@ alice-shell        # docker exec into the live worker
 alice-think        # manually trigger a thinking wake
 alice-init         # first-run scaffold (creates / clones mind, writes env)
 alice-mind-autopush  # autopush daemon (runs inside the worker)
+alice-gh-watcher   # one pass of the GitHub repo watcher (runs inside the worker)
 event-log          # tail / query memory/events.jsonl
 ```
+
+## Watching GitHub repos
+
+To have Alice notice PR/review/comment activity between turns, list the
+repos in your mind's `config/alice.config.json`:
+
+```json
+{
+  "github_watcher": {
+    "enabled": true,
+    "repos": ["owner/repo", "owner/other-repo"],
+    "poll_interval_seconds": 300
+  }
+}
+```
+
+The `alice-gh-watcher` s6 service inside the worker polls each repo on
+the configured cadence (default 5 min, floor 60 s) and drops one note
+per unseen event into `inner/notes/` for thinking to drain. Captured
+events: PR reviews (approved / changes_requested / dismissed), inline
+review comments, PR conversation comments, new PRs, open → merged /
+closed transitions, check-run failures, plus standalone-issue activity
+(new issue, state change, comment).
+
+**Rando filter.** Issue activity, PR conversation comments, and
+standalone-issue comments are trust-gated by GitHub's `author_association`
+field. By default only `OWNER` / `COLLABORATOR` / `MEMBER` produce notes
+— i.e. people deliberately added to the repo or the owning org. Randos
+on the internet stay silent. PR reviews, inline review comments, and CI
+failures always fire regardless of association (rare and high-signal).
+Override the trust set with `trusted_associations` in the config block,
+e.g. `["OWNER", "COLLABORATOR", "MEMBER", "CONTRIBUTOR"]` to also trust
+anyone whose patch has been merged.
+
+The watcher is a no-op when `repos` is empty, so it's safe to leave
+running. Auth uses the worker's `GH_TOKEN` (or mounted `~/.config/gh/`
+OAuth, same as `gh` on the host); a 401/403 emits a single loud note
+tagged `github-watcher-error` and backs off until the next poll. Per-repo
+"already seen" markers persist at `~/.local/state/alice/worker/gh-watcher-state.json`,
+so a restart doesn't re-flood the inbox.
 
 ## Sidecars
 

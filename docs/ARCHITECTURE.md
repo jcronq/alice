@@ -43,10 +43,11 @@ s6-overlay supervises these long-run services:
 
 | Service          | What it does                                               |
 |------------------|------------------------------------------------------------|
-| `signal-daemon`  | `signal-cli --http 127.0.0.1:8080` — the phone line        |
-| `alice-speaking` | Python daemon that routes inbound messages to claude       |
-| `alice-thinker`  | Wake-driven proactive turns                                |
-| `alice-autopush` | Every 15 min, commits + pushes any changes in `alice-mind` |
+| `signal-daemon`    | `signal-cli --http 127.0.0.1:8080` — the phone line        |
+| `alice-speaking`   | Python daemon that routes inbound messages to claude       |
+| `alice-thinker`    | Wake-driven proactive turns                                |
+| `alice-autopush`   | Every 15 min, commits + pushes any changes in `alice-mind` |
+| `alice-gh-watcher` | Polls watched GitHub repos, drops PR activity into `inner/notes/` |
 
 Each has `run` and `finish` scripts under `sandbox/s6/<service>/`.
 

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# alice-gh-watcher — one pass of the GitHub repo watcher.
+#
+# Polls the repos listed in alice.config.json's `github_watcher.repos`,
+# diffs against /state/worker/gh-watcher-state.json, and writes one note
+# per unseen event into ~/alice-mind/inner/notes/ for thinking to drain.
+#
+# Singleton enforcement is external — the s6 supervisor wraps each
+# invocation in `flock -n /state/worker/gh-watcher.lock` so a slow poll
+# can't double-fire.
+#
+# Exit codes:
+#   0  poll OK (zero or more notes written)
+#   1  auth failure — loud note written, supervisor retries next cadence
+#   2  unexpected internal error
+set -u
+
+VENV_PY="/opt/alice-venv/bin/python"
+ALICE_SRC="${ALICE_SRC:-/home/alice/alice/src}"
+
+if [ ! -x "$VENV_PY" ]; then
+    echo "[alice-gh-watcher] venv python missing at $VENV_PY" >&2
+    exit 2
+fi
+
+export PYTHONPATH="$ALICE_SRC"
+export PYTHONUNBUFFERED=1
+exec "$VENV_PY" -m alice_watchers.github "$@"
