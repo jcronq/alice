@@ -353,7 +353,10 @@ class A2ATransport:
             supported_interfaces=[
                 AgentInterface(
                     protocol_binding="JSONRPC",
-                    protocol_version="0.3.0",
+                    # Match the version the SDK's DefaultRequestHandler enforces
+                    # on incoming A2A-Version headers. Advertising 0.3 here
+                    # would have clients default to that and get rejected.
+                    protocol_version="1.0",
                     url=self._external_url,
                 ),
             ],
