@@ -4,18 +4,20 @@
 # rather than queues, matching the REM-cycle design where overlap is bad.
 #
 # Mode-aware cadence per Alice's active/sleep design:
-#   sleep mode (23:00–07:00): vault grooming, fast cadence (default 5 min)
-#   active mode (07:00–23:00): generative learning, slower cadence (default 30 min)
+#   sleep mode (23:00–07:00): vault grooming, 5-min cadence
+#   active mode (07:00–23:00): generative learning, 5-min cadence
 #
-# Reads `thinking.rem_cadence_minutes` and `thinking.active_cadence_minutes`
-# from alice.config.json at each iteration, so live config changes take
-# effect on the next cycle boundary. See cortex-memory/reference/design-day-night-modes.md.
+# Both default to 5 min — matches the directive's stated cadence and
+# keeps Alice responsive to surfaces during the day. Override either via
+# `thinking.rem_cadence_minutes` / `thinking.active_cadence_minutes` in
+# alice.config.json; live config changes take effect on the next cycle
+# boundary. See cortex-memory/reference/design-day-night-modes.md.
 set -e
 
 LOCK=/state/worker/thinking.lock
 CONFIG_JSON=/home/alice/alice-mind/config/alice.config.json
 DEFAULT_REM_CADENCE_MIN=5
-DEFAULT_ACTIVE_CADENCE_MIN=30
+DEFAULT_ACTIVE_CADENCE_MIN=5
 
 mkdir -p "$(dirname "$LOCK")"
 touch "$LOCK"
