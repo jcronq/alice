@@ -107,6 +107,23 @@ class Config:
     # configured keep working.
     discord_bot_token: str = ""
 
+    # A2A transport — optional. When ``a2a_enabled`` is False the daemon
+    # skips construction. A2A lets external (Google A2A protocol)
+    # agents submit tasks to Alice over HTTP/JSON-RPC; the worker
+    # exposes a port that compose maps to the host.
+    a2a_enabled: bool = False
+    a2a_port: int = 7878
+    a2a_host: str = "0.0.0.0"
+    # Single shared principal for all A2A traffic in v1. Operator points
+    # an upstream proxy (oauth2-proxy / Caddy / etc.) at the worker port
+    # and fronts it with whatever auth their org uses; per-caller
+    # principal lookup is a follow-up.
+    a2a_principal: str = "a2a"
+    # URL advertised on the agent card at /.well-known/agent-card.json.
+    # Empty defaults to ``http://<a2a_host>:<a2a_port>/`` — fine for
+    # local dev. Set to the public URL when fronted by a reverse proxy.
+    a2a_external_url: str = ""
+
     # Behavior (from alice.config.json, falls back to SPEAKING_DEFAULTS)
     speaking: dict[str, Any] = field(default_factory=lambda: dict(SPEAKING_DEFAULTS))
 
@@ -200,6 +217,16 @@ def load() -> Config:
 
     discord_bot_token = (from_any("DISCORD_BOT_TOKEN", "") or "").strip()
 
+    a2a_enabled_raw = (from_any("ALICE_A2A_ENABLED", "0") or "0").strip().lower()
+    a2a_enabled = a2a_enabled_raw in {"1", "true", "yes", "on"}
+    try:
+        a2a_port = int(from_any("ALICE_A2A_PORT", "7878") or "7878")
+    except ValueError:
+        a2a_port = 7878
+    a2a_host = (from_any("ALICE_A2A_HOST", "0.0.0.0") or "0.0.0.0").strip()
+    a2a_principal = (from_any("ALICE_A2A_PRINCIPAL", "a2a") or "a2a").strip()
+    a2a_external_url = (from_any("ALICE_A2A_EXTERNAL_URL", "") or "").strip()
+
     return Config(
         signal_api=signal_api,
         signal_account=signal_account,
@@ -223,4 +250,9 @@ def load() -> Config:
         cli_enabled=cli_enabled,
         cli_socket_path=cli_socket_path,
         discord_bot_token=discord_bot_token,
+        a2a_enabled=a2a_enabled,
+        a2a_port=a2a_port,
+        a2a_host=a2a_host,
+        a2a_principal=a2a_principal,
+        a2a_external_url=a2a_external_url,
     )

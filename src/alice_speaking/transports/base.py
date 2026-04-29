@@ -128,6 +128,24 @@ DISCORD_CAPS = Capabilities(
     interactive=False,
 )
 
+# A2A: agents talking to Alice over Google's A2A protocol. Other agents
+# generally consume the structured event stream rather than rendered
+# text-message chunks, so we leave markdown unrestricted and pick a
+# generous max_message_bytes — splitting only kicks in for genuinely
+# huge replies (which the SDK will package as multiple text artifacts).
+# No typing indicator (A2A's status updates fill that role); no reactions.
+A2A_CAPS = Capabilities(
+    markdown="full",
+    code_blocks=True,
+    images_outbound=False,
+    files_outbound=False,
+    max_message_bytes=200_000,
+    long_message_strategy="split",
+    typing_indicator=False,
+    reactions=False,
+    interactive=False,
+)
+
 
 # ---------------------------------------------------------------------------
 # Messages

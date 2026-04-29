@@ -48,6 +48,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 if TYPE_CHECKING:
+    from .transports.a2a import A2ATransport
     from .transports.discord import DiscordTransport
 
 from alice_core.auth import ensure_auth_env
@@ -148,7 +149,21 @@ class DiscordEvent:
     message: InboundMessage
 
 
-Event = Union[SignalEvent, SurfaceEvent, EmergencyEvent, CLIEvent, DiscordEvent]
+@dataclass
+class A2AEvent:
+    """A message that came in over the A2A transport (Google A2A protocol).
+
+    Each event corresponds to one A2A task; the channel is ephemeral
+    (lives for the duration of the SSE stream). Like :class:`CLIEvent`,
+    but the daemon must explicitly call ``signal_done`` / ``signal_error``
+    on the transport at end-of-turn so the SDK can close the SSE stream
+    with a terminal status update.
+    """
+
+    message: InboundMessage
+
+
+Event = Union[SignalEvent, SurfaceEvent, EmergencyEvent, CLIEvent, DiscordEvent, A2AEvent]
 
 
 class SpeakingDaemon:
@@ -279,6 +294,19 @@ class SpeakingDaemon:
             from .transports.discord import DiscordTransport
             self.discord_transport = DiscordTransport(token=cfg.discord_bot_token)
 
+        # A2A transport — optional. Constructed only when explicitly
+        # enabled in alice.env. Import is lazy so worker images that
+        # don't ship a2a-sdk (e.g. minimal builds) start fine.
+        self.a2a_transport: Optional["A2ATransport"] = None
+        if cfg.a2a_enabled:
+            from .transports.a2a import A2ATransport
+            self.a2a_transport = A2ATransport(
+                port=cfg.a2a_port,
+                host=cfg.a2a_host,
+                principal_name=cfg.a2a_principal,
+                external_url=cfg.a2a_external_url or None,
+            )
+
         self._queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=64)
         self._dispatched_surfaces: set[str] = set()
         self._stop = asyncio.Event()
@@ -352,6 +380,11 @@ class SpeakingDaemon:
                         self._discord_producer(), name="discord-produce"
                     )
                 )
+            if self.a2a_transport is not None:
+                await self.a2a_transport.start()
+                producers.append(
+                    asyncio.create_task(self._a2a_producer(), name="a2a-produce")
+                )
             consumer = asyncio.create_task(self._consumer(), name="consumer")
             stop_task = asyncio.create_task(self._stop.wait(), name="stop")
 
@@ -377,6 +410,9 @@ class SpeakingDaemon:
             if self.discord_transport is not None:
                 with contextlib.suppress(Exception):
                     await self.discord_transport.stop()
+            if self.a2a_transport is not None:
+                with contextlib.suppress(Exception):
+                    await self.a2a_transport.stop()
             self.events.emit("shutdown")
             log.info("shutdown complete")
 
@@ -452,6 +488,18 @@ class SpeakingDaemon:
         async for msg in self.cli_transport.messages():
             await self._queue.put(CLIEvent(message=msg))
 
+    async def _a2a_producer(self) -> None:
+        """Pump InboundMessages from the A2A transport onto the consumer queue.
+
+        v1: all A2A traffic shares a single configured principal
+        (``cfg.a2a_principal``), so there's no per-caller ACL gate
+        here — the transport already attaches the configured principal
+        when it builds the InboundMessage. Auth, when needed, lives
+        upstream of the worker (proxy / ingress)."""
+        assert self.a2a_transport is not None
+        async for msg in self.a2a_transport.messages():
+            await self._queue.put(A2AEvent(message=msg))
+
     async def _discord_producer(self) -> None:
         """Pump InboundMessages from the Discord transport, ACL-gated.
 
@@ -520,6 +568,8 @@ class SpeakingDaemon:
                     await self._handle_cli(event)
                 elif isinstance(event, DiscordEvent):
                     await self._handle_discord(event)
+                elif isinstance(event, A2AEvent):
+                    await self._handle_a2a(event)
                 elif isinstance(event, SurfaceEvent):
                     await self._handle_surface(event)
                 elif isinstance(event, EmergencyEvent):
@@ -914,6 +964,115 @@ class SpeakingDaemon:
             "recipient='self' (replies on the same Discord DM the "
             "message came from). Returning text alone will NOT reach "
             "the user.",
+        ]
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # A2A turn — Google Agent2Agent protocol over HTTP/JSON-RPC.
+
+    async def _handle_a2a(self, event: A2AEvent) -> None:
+        """Run one turn for an A2A task and signal completion to the SDK
+        so the SSE stream gets a terminal status update. Same shape as
+        :meth:`_handle_cli`: ephemeral channel (the per-task outbox lives
+        only for the duration of the request), the daemon must always
+        signal_done so the client's stream closes cleanly."""
+        assert self.a2a_transport is not None
+        msg = event.message
+        turn_id = uuid.uuid4().hex[:12]
+        started = time.time()
+
+        self.events.emit(
+            "a2a_turn_start",
+            turn_id=turn_id,
+            principal_id=msg.principal.native_id,
+            display_name=msg.principal.display_name,
+            task_id=msg.origin.address,
+            inbound_chars=len(msg.text),
+            inbound=_short(msg.text, 600),
+        )
+
+        prev_kind = self._current_turn_kind
+        prev_channel = self._current_reply_channel
+        prev_display_name = self._current_principal_display_name
+        self._current_turn_kind = "a2a"
+        self._current_reply_channel = msg.origin
+        self._current_principal_display_name = msg.principal.display_name
+        error: Optional[str] = None
+        try:
+            now = datetime.datetime.now().astimezone()
+            stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
+            prompt = self._build_a2a_prompt(
+                principal_name=msg.principal.display_name,
+                stamp=stamp,
+                text=msg.text,
+            )
+            await self._run_turn(
+                prompt,
+                turn_id=turn_id,
+                outbound_recipient=f"a2a:{msg.origin.address}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("a2a turn failed for %s", msg.principal.display_name)
+            error = f"{type(exc).__name__}: {exc}"
+            with contextlib.suppress(Exception):
+                await self.a2a_transport.signal_error(msg.origin, error)
+        finally:
+            # Always close the SSE stream by emitting a terminal status —
+            # the SDK won't return from execute() until we do, and a hung
+            # task ties up a connection. Errors close above; the success
+            # path closes here.
+            if error is None:
+                with contextlib.suppress(Exception):
+                    await self.a2a_transport.signal_done(msg.origin)
+            self._current_turn_kind = prev_kind
+            self._current_reply_channel = prev_channel
+            self._current_principal_display_name = prev_display_name
+            self.turns.append(
+                new_turn(
+                    sender_number=msg.principal.native_id,
+                    sender_name=msg.principal.display_name,
+                    inbound=msg.text,
+                    outbound=self._turn_last_outbound,
+                    error=error,
+                )
+            )
+            self.events.emit(
+                "a2a_turn_end",
+                turn_id=turn_id,
+                principal_id=msg.principal.native_id,
+                task_id=msg.origin.address,
+                error=error,
+                duration_ms=int((time.time() - started) * 1000),
+            )
+
+    def _build_a2a_prompt(
+        self,
+        *,
+        principal_name: str,
+        stamp: str,
+        text: str,
+    ) -> str:
+        """Compose the prompt for a single A2A task. Reuses the CLI prompt
+        capabilities (full markdown, large message size) — A2A consumers
+        are typically other agents that handle structured output well."""
+        caps = self.a2a_transport.caps if self.a2a_transport else None
+        cap_fragment = (
+            render_module.capability_prompt_fragment("a2a", caps)
+            if caps is not None
+            else ""
+        )
+        lines: list[str] = [
+            f"[A2A task from {principal_name} | {stamp}]",
+            "",
+            text,
+            "",
+            "---",
+            cap_fragment,
+            "",
+            "To reply, call the `send_message` tool with "
+            "recipient='self' (the reply streams back over the same A2A "
+            "task as text artifacts). Returning text alone will NOT reach "
+            "the caller.",
         ]
         return "\n".join(lines)
 
@@ -1322,9 +1481,9 @@ class SpeakingDaemon:
         # inbound conversational turn whose user is waiting, or we'd have
         # to drop attachments to queue. CLI is always-bypass (interactive).
         bypass_quiet = (
-            channel.transport == "cli"
+            channel.transport in ("cli", "a2a")
             or emergency
-            or self._current_turn_kind in ("signal", "discord", "cli")
+            or self._current_turn_kind in ("signal", "discord", "cli", "a2a")
             or bool(attachments)
         )
 
@@ -1351,6 +1510,7 @@ class SpeakingDaemon:
             "signal": self.signal_transport,
             "cli": self.cli_transport,
             "discord": self.discord_transport,
+            "a2a": self.a2a_transport,
         }.get(name)
 
     async def _dispatch_outbound(
