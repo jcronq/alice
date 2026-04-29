@@ -1,13 +1,15 @@
-"""One-shot verification that the Agent SDK reaches Claude via Alice's OAuth token.
+"""One-shot verification that the Agent SDK reaches Claude.
+
+Works for either auth mode — subscription (CLAUDE_CODE_OAUTH_TOKEN)
+or api / LiteLLM (ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY).
 
 Run as: `uv run python -m alice_speaking._sanity`
 """
 
 import asyncio
-import os
-import pathlib
 import sys
 
+from alice_core.auth import ensure_auth_env
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -15,25 +17,14 @@ from claude_agent_sdk import (
     query,
 )
 
-ALICE_ENV = pathlib.Path.home() / ".config" / "alice" / "alice.env"
-MARKER = "SDK-OAUTH-OK"
-
-
-def load_oauth_token() -> None:
-    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
-        return
-    if not ALICE_ENV.is_file():
-        sys.exit(f"CLAUDE_CODE_OAUTH_TOKEN not set and {ALICE_ENV} not found")
-    for raw in ALICE_ENV.read_text().splitlines():
-        line = raw.strip()
-        if line.startswith("CLAUDE_CODE_OAUTH_TOKEN="):
-            os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = line.split("=", 1)[1].strip()
-            return
-    sys.exit(f"CLAUDE_CODE_OAUTH_TOKEN not found in {ALICE_ENV}")
+MARKER = "SDK-AUTH-OK"
 
 
 async def main() -> int:
-    load_oauth_token()
+    auth = ensure_auth_env()
+    if auth.mode == "none":
+        sys.exit("no Claude credentials in env or alice.env (set CLAUDE_CODE_OAUTH_TOKEN, or ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY)")
+    print(f"auth mode: {auth.mode}")
     opts = ClaudeAgentOptions(
         model="claude-sonnet-4-6",
         allowed_tools=[],
@@ -49,7 +40,7 @@ async def main() -> int:
     reply = reply.strip()
     print(f"reply: {reply!r}")
     if MARKER in reply:
-        print("OK — Agent SDK + OAuth verified")
+        print("OK — Agent SDK auth verified")
         return 0
     print("FAIL — unexpected response")
     return 1

@@ -11,8 +11,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
-import pathlib
 import time
 from dataclasses import dataclass
 from typing import AsyncIterator
@@ -33,21 +31,15 @@ class NarrativeRequest:
     max_events: int = 500
 
 
-def load_oauth_token() -> str | None:
-    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-    if token:
-        return token
-    env_file = pathlib.Path(
-        os.environ.get("ALICE_CONFIG")
-        or pathlib.Path.home() / ".config" / "alice" / "alice.env"
-    )
-    if not env_file.is_file():
-        return None
-    for raw in env_file.read_text().splitlines():
-        line = raw.strip()
-        if line.startswith("CLAUDE_CODE_OAUTH_TOKEN="):
-            return line.split("=", 1)[1].strip().strip('"').strip("'")
-    return None
+def _ensure_auth():
+    """Resolve auth from env + alice.env into os.environ for the SDK subprocess.
+
+    Returns the resolved ``AuthEnv``; ``mode == "none"`` means no
+    credentials were found and the caller should surface an error.
+    """
+    from alice_core.auth import ensure_auth_env
+
+    return ensure_auth_env()
 
 
 def build_digest(paths: Paths, window_seconds: int, max_events: int) -> dict:
@@ -198,11 +190,10 @@ async def stream_narrative(
 ) -> AsyncIterator[dict]:
     """Yield events: {"type": "chunk", "text": "..."} and finally {"type": "done"}
     or {"type": "error", "message": "..."}."""
-    token = load_oauth_token()
-    if not token:
-        yield {"type": "error", "message": "CLAUDE_CODE_OAUTH_TOKEN missing from env and alice.env"}
+    auth = _ensure_auth()
+    if auth.mode == "none":
+        yield {"type": "error", "message": "no Claude credentials in env or alice.env (set CLAUDE_CODE_OAUTH_TOKEN, or ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY)"}
         return
-    os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = token
 
     try:
         # Import lazily so startup doesn't require the SDK/claude CLI to exist.
@@ -398,10 +389,9 @@ async def _summarize_bucket(slot: BucketSlot) -> bucket_cache.BucketSummary:
 
 async def _run_once(prompt: str, *, max_output_tokens_hint: int = 500) -> tuple[str, float]:
     """Non-streaming LLM call — used for per-bucket summaries."""
-    token = load_oauth_token()
-    if not token:
-        raise RuntimeError("CLAUDE_CODE_OAUTH_TOKEN missing")
-    os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    auth = _ensure_auth()
+    if auth.mode == "none":
+        raise RuntimeError("no Claude credentials (set CLAUDE_CODE_OAUTH_TOKEN, or ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY)")
     from claude_agent_sdk import (
         AssistantMessage,
         ClaudeAgentOptions,

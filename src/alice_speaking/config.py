@@ -71,6 +71,13 @@ class Config:
     # Code SDK falls back to ~/.claude/.credentials.json (the entrypoint
     # symlinks it from the host), so this isn't strictly required.
     oauth_token: str
+    # API-key auth mode. When ``anthropic_base_url`` or ``anthropic_api_key``
+    # is set, alice_core.auth picks "api" mode and routes the CLI through
+    # this endpoint instead of the default Claude subscription flow. Used
+    # for LiteLLM proxies (or direct Anthropic API).
+    anthropic_base_url: str
+    anthropic_api_key: str
+    anthropic_auth_token: str
     work_dir: pathlib.Path
 
     # Paths (derived, overridable)
@@ -155,6 +162,11 @@ def load() -> Config:
     # ~/.claude/.credentials.json that the entrypoint maintains. Empty
     # here means "let the SDK find it on disk."
     oauth_token = from_any("CLAUDE_CODE_OAUTH_TOKEN", "") or ""
+    # API-key mode (LiteLLM or direct Anthropic API). All three optional;
+    # presence of base_url or api_key flips alice_core.auth into "api" mode.
+    anthropic_base_url = from_any("ANTHROPIC_BASE_URL", "") or ""
+    anthropic_api_key = from_any("ANTHROPIC_API_KEY", "") or ""
+    anthropic_auth_token = from_any("ANTHROPIC_AUTH_TOKEN", "") or ""
     allowed = _parse_allowed_senders(from_any("ALLOWED_SENDERS", "") or "")
     work_dir = pathlib.Path(from_any("WORK_DIR", str(DEFAULT_MIND_DIR)) or str(DEFAULT_MIND_DIR))
 
@@ -192,6 +204,9 @@ def load() -> Config:
         signal_api=signal_api,
         signal_account=signal_account,
         oauth_token=oauth_token,
+        anthropic_base_url=anthropic_base_url,
+        anthropic_api_key=anthropic_api_key,
+        anthropic_auth_token=anthropic_auth_token,
         work_dir=work_dir,
         mind_dir=mind_dir,
         state_dir=state_dir,

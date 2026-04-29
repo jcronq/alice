@@ -47,6 +47,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
+from alice_core.auth import ensure_auth_env
 from alice_core.kernel import AgentKernel, KernelSpec
 from alice_core.sdk_compat import _short, looks_like_missing_session as _looks_like_missing_session
 
@@ -288,7 +289,11 @@ class SpeakingDaemon:
     # Lifecycle
 
     async def run(self) -> None:
-        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = self.cfg.oauth_token
+        # Resolve auth from alice.env + os.environ. ensure_auth_env() sets
+        # the right vars on os.environ so the Agent SDK's CLI subprocess
+        # inherits either subscription (CLAUDE_CODE_OAUTH_TOKEN) or
+        # api-mode (ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY) credentials.
+        ensure_auth_env()
 
         loop = asyncio.get_event_loop()
         for sig in (_signal.SIGTERM, _signal.SIGINT):

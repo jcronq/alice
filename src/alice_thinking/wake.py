@@ -32,7 +32,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from alice_core.auth import ensure_token
+from alice_core.auth import ensure_auth_env
 from alice_core.events import EventLogger
 from alice_core.kernel import AgentKernel, KernelSpec
 
@@ -94,12 +94,15 @@ def _build_prompt(bootstrap_path: pathlib.Path, directive_path: pathlib.Path) ->
 
 
 def _load_token() -> None:
-    """Populate ``CLAUDE_CODE_OAUTH_TOKEN`` in os.environ (no-op if set).
+    """Resolve auth from alice.env + os.environ into the subprocess env.
 
-    Thin wrapper over :func:`alice_core.auth.ensure_token` — kept as a
-    local function so the module's public API stays stable.
+    Thin wrapper over :func:`alice_core.auth.ensure_auth_env` — kept
+    as a local function so the module's public API stays stable.
+    Sets either ``CLAUDE_CODE_OAUTH_TOKEN`` (subscription mode) or
+    ``ANTHROPIC_BASE_URL`` + ``ANTHROPIC_API_KEY`` (api / LiteLLM mode)
+    so the Agent SDK's CLI subprocess inherits the right credentials.
     """
-    ensure_token()
+    ensure_auth_env()
 
 
 def _apply_config_overrides(args: argparse.Namespace) -> None:
