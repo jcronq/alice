@@ -164,8 +164,22 @@ mint_token() {
     local tok
     tok=$(python3 - "$logfile" <<'PY' || true
 import re, sys, pathlib
-data = pathlib.Path(sys.argv[1]).read_text(errors="replace")
-data = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", data)   # strip ANSI/CSI
+# read_text() does universal-newline translation (\r → \n) which would
+# turn the PTY's \r\x1b[1B wrap into \n\x1b[1B, and after our cursor-down
+# substitution that becomes \n\n — a false blank line that truncates
+# the token at the wrap. Read bytes, decode manually.
+data = pathlib.Path(sys.argv[1]).read_bytes().decode("utf-8", errors="replace")
+# claude setup-token uses ANSI cursor-down (CSI N B) for visual line
+# breaks instead of real newlines. Convert those to newlines first so
+# our blank-line stop heuristic actually has something to match.
+def _cud(m):
+    n = int(m.group(1) or "1")
+    return "\n" * n
+data = re.sub(r"\x1b\[(\d*)B", _cud, data)
+# Strip remaining ANSI / CSI sequences (color, cursor-right padding, etc).
+data = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", data)
+# CR is just column-zeroing within a line; drop it.
+data = data.replace("\r", "")
 i = data.rfind("sk-ant-oat01-")
 if i < 0:
     sys.exit(1)
@@ -173,7 +187,7 @@ tail = data[i:]
 m = re.search(r"\n[ \t]*\n", tail)                    # stop at blank line
 if m:
     tail = tail[: m.start()]
-candidate = re.sub(r"[\s]+", "", tail)                # join wraps
+candidate = re.sub(r"\s+", "", tail)                  # join wraps
 m = re.match(r"sk-ant-oat01-[A-Za-z0-9_-]+", candidate)
 if not m:
     sys.exit(1)
