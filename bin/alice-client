@@ -159,35 +159,98 @@ def run_one_shot(sock: socket.socket, args: argparse.Namespace) -> int:
 
 
 def run_interactive(sock: socket.socket, args: argparse.Namespace) -> int:
-    if not args.json_mode:
-        sys.stderr.write(
-            "alice-client: interactive mode (Ctrl-D to exit). Type a message and press Enter.\n"
-        )
+    """Two modes:
+
+    - ``--json`` (TUIs / agents wanting raw events): a background thread
+      drains the socket continuously so server-pushed events (surface
+      wakes, emergency dispatches, anything not tied to *this* prompt)
+      reach the consumer immediately. Without this, async pushes sit in
+      the kernel buffer until the next stdin send wakes the reader.
+    - human REPL (no ``--json``): the original synchronous drain-on-turn
+      loop. Keeps `> ` prompt sane and avoids interleaved output mid-edit.
+    """
+    if args.json_mode:
+        return _run_interactive_async(sock, args)
+    return _run_interactive_sync(sock, args)
+
+
+def _run_interactive_sync(sock: socket.socket, args: argparse.Namespace) -> int:
+    sys.stderr.write(
+        "alice-client: interactive mode (Ctrl-D to exit). Type a message and press Enter.\n"
+    )
     while True:
-        if not args.json_mode:
-            sys.stderr.write("> ")
-            sys.stderr.flush()
+        sys.stderr.write("> ")
+        sys.stderr.flush()
         try:
             line = sys.stdin.readline()
         except KeyboardInterrupt:
             sys.stderr.write("\n")
             return 0
         if not line:
-            # EOF
-            if not args.json_mode:
-                sys.stderr.write("\n")
+            sys.stderr.write("\n")
             return 0
         text = line.rstrip("\n")
         if not text.strip():
             continue
         send_message(sock, text)
-        rc = drain_one_turn(
-            sock, json_mode=args.json_mode, timeout=args.timeout
-        )
-        if rc != 0:
+        rc = drain_one_turn(sock, json_mode=False, timeout=args.timeout)
+        if rc == 1:
             # Connection problem — exit. (Alice-reported errors continue.)
-            if rc == 1:
-                return 1
+            return 1
+
+
+def _run_interactive_async(sock: socket.socket, args: argparse.Namespace) -> int:
+    """JSON-mode REPL with a background socket reader.
+
+    The reader thread pumps every event through stdout the moment it
+    arrives — including ones that originate from a turn the consumer
+    didn't initiate (surface wakes pushing notifications, emergency
+    chunks, etc.). The main thread just forwards stdin lines to the
+    socket; turn boundary tracking is the consumer's job.
+    """
+    import threading
+
+    if args.timeout is not None:
+        sock.settimeout(args.timeout)
+
+    stop = threading.Event()
+    exit_code = [0]
+
+    def reader() -> None:
+        try:
+            for event in event_stream(sock):
+                if stop.is_set():
+                    return
+                sys.stdout.write(json.dumps(event) + "\n")
+                sys.stdout.flush()
+            # event_stream returned → socket closed by peer
+            stop.set()
+            exit_code[0] = 1
+        except Exception:  # noqa: BLE001
+            stop.set()
+            exit_code[0] = 1
+
+    t = threading.Thread(target=reader, name="alice-client-reader", daemon=True)
+    t.start()
+
+    while not stop.is_set():
+        try:
+            line = sys.stdin.readline()
+        except KeyboardInterrupt:
+            break
+        if not line:  # EOF
+            break
+        text = line.rstrip("\n")
+        if not text.strip():
+            continue
+        try:
+            send_message(sock, text)
+        except (BrokenPipeError, ConnectionError, OSError):
+            # Reader thread will set stop on socket close; exit cleanly.
+            break
+
+    stop.set()
+    return exit_code[0]
 
 
 def main(argv: Optional[list[str]] = None) -> int:

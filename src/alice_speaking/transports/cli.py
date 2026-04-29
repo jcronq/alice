@@ -109,6 +109,13 @@ class CLITransport:
         # connection_id → StreamWriter, so :meth:`send` can find the right
         # client to deliver an OutboundMessage to.
         self._writers: dict[str, asyncio.StreamWriter] = {}
+        # uid (str) → set of active conn_ids. Lets the address book's
+        # CLI channel — which uses uid as its address — broadcast to
+        # every TUI/agent currently connected as that user. Without
+        # this, surface- and emergency-driven sends to "owner" had no
+        # way to reach a live socket: the address book stored uids but
+        # :meth:`send` only knew conn_ids.
+        self._conns_by_uid: dict[str, set[str]] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -156,34 +163,50 @@ class CLITransport:
     # Outbound
 
     async def send(self, out: OutboundMessage) -> int:
-        """Deliver an OutboundMessage to the correct connection.
+        """Deliver an OutboundMessage to the correct connection(s).
 
-        ``out.destination.address`` is the connection_id assigned at
-        accept time. If that connection has gone away (client
-        disconnected mid-turn), the send is logged and dropped — there's
-        no recovery for an ephemeral channel.
+        ``out.destination.address`` is either:
+        - a per-connection ``conn_id`` (assigned at accept time) — a
+          turn replying on its inbound channel uses this form.
+        - a uid string — what the address book stores when the channel
+          comes from a principal lookup. Broadcasts to every active
+          connection for that uid (e.g. a TUI session you have open
+          when a surface wake fires). No live connections is logged
+          and dropped — there's no offline queue for CLI.
 
-        Renders + chunks per :data:`CLI_CAPS` (full markdown, 1MB
-        chunks — practically a single chunk for any reasonable reply).
-        Returns the chunk count.
+        Renders + chunks per :data:`CLI_CAPS`. Returns the total chunk
+        count (sum across all delivered connections).
         """
         from ..render import render
 
-        conn_id = out.destination.address
-        writer = self._writers.get(conn_id)
-        if writer is None:
+        addr = out.destination.address
+        writers: list[asyncio.StreamWriter] = []
+        direct = self._writers.get(addr)
+        if direct is not None:
+            writers.append(direct)
+        else:
+            for cid in self._conns_by_uid.get(addr, set()):
+                w = self._writers.get(cid)
+                if w is not None:
+                    writers.append(w)
+
+        if not writers:
             log.warning(
-                "cli send: connection %s no longer present; dropping %d chars",
-                conn_id,
+                "cli send: no live connection for address %s; dropping %d chars",
+                addr,
                 len(out.text),
             )
             return 0
+
         chunks = render(out.text, self.caps)
         if not chunks:
             return 0
-        for chunk in chunks:
-            await self._write_event(writer, {"type": "chunk", "text": chunk})
-        return len(chunks)
+        total = 0
+        for writer in writers:
+            for chunk in chunks:
+                await self._write_event(writer, {"type": "chunk", "text": chunk})
+            total += len(chunks)
+        return total
 
     async def typing(self, channel: ChannelRef, on: bool) -> None:
         """No-op for CLI — terminals don't have typing indicators."""
@@ -206,6 +229,18 @@ class CLITransport:
         if writer is None:
             return
         await self._write_event(writer, {"type": "error", "message": message})
+
+    async def push_trace(self, channel: ChannelRef, event: dict) -> None:
+        """Forward an arbitrary event payload to a connected CLI client.
+
+        Used by the daemon's CLI trace handler to surface tool_use and
+        result events to TUIs that want to render them. No-op if the
+        connection has gone away mid-turn.
+        """
+        writer = self._writers.get(channel.address)
+        if writer is None:
+            return
+        await self._write_event(writer, event)
 
     # ------------------------------------------------------------------
     # Internals
@@ -246,6 +281,7 @@ class CLITransport:
         )
         channel = ChannelRef(transport="cli", address=conn_id, durable=False)
         self._writers[conn_id] = writer
+        self._conns_by_uid.setdefault(peer_uid_str, set()).add(conn_id)
         log.info(
             "cli connection accepted: conn_id=%s uid=%d",
             conn_id,
@@ -320,6 +356,11 @@ class CLITransport:
                     )
         finally:
             self._writers.pop(conn_id, None)
+            uid_conns = self._conns_by_uid.get(peer_uid_str)
+            if uid_conns is not None:
+                uid_conns.discard(conn_id)
+                if not uid_conns:
+                    self._conns_by_uid.pop(peer_uid_str, None)
             with contextlib.suppress(Exception):
                 writer.close()
                 await writer.wait_closed()

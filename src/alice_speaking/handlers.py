@@ -31,6 +31,47 @@ from . import compaction as compaction_module
 log = logging.getLogger(__name__)
 
 
+# Per-tool "primary" parameter — the one humans care about at a glance.
+# Anything not in this map falls back to the first stringy key.
+_PRIMARY_PARAM: dict = {
+    "Bash": "command",
+    "Read": "file_path",
+    "Edit": "file_path",
+    "Write": "file_path",
+    "Glob": "pattern",
+    "Grep": "pattern",
+    "WebFetch": "url",
+    "WebSearch": "query",
+    "Task": "description",
+}
+
+_PRIMARY_MAX_CHARS = 80
+
+
+def _trim_input(name: str, input) -> dict | None:
+    """Pull the most useful single field out of a tool's input for the
+    CLI trace stream. Returns ``{key: short_value}`` or ``None`` when
+    there's nothing meaningful to show. Bounded length keeps the wire
+    event small and the TUI's one-line summary readable.
+    """
+    if not isinstance(input, dict) or not input:
+        return None
+    primary = _PRIMARY_PARAM.get(name)
+    # Fallback: first key whose value is a non-empty string.
+    if primary is None or primary not in input:
+        primary = next(
+            (k for k, v in input.items() if isinstance(v, str) and v),
+            None,
+        )
+    if primary is None:
+        keys = ",".join(list(input.keys())[:4])
+        return {"args": keys} if keys else None
+    val = str(input.get(primary, ""))
+    if len(val) > _PRIMARY_MAX_CHARS:
+        val = val[: _PRIMARY_MAX_CHARS - 1] + "…"
+    return {primary: val}
+
+
 class SessionHandler(NullHandler):
     """Update the daemon's session_id on each turn's result.
 
@@ -105,4 +146,56 @@ class CompactionArmer(NullHandler):
             )
 
 
-__all__ = ["SessionHandler", "CompactionArmer"]
+class CLITraceHandler(NullHandler):
+    """Forward tool_use + result events to a connected CLI client.
+
+    Lets a TUI (e.g. bin/alice-tui) render Claude-Code-style tool
+    indicators and per-turn cost/duration footers. The handler is a
+    no-op when the active reply channel isn't a CLI channel — safe to
+    install unconditionally.
+
+    The transport's push_trace handles the "client disconnected
+    mid-turn" case silently.
+    """
+
+    def __init__(
+        self,
+        *,
+        transport,
+        get_channel: Callable[[], object],
+    ) -> None:
+        self._transport = transport
+        self._get_channel = get_channel
+
+    def _cli_channel(self):
+        ch = self._get_channel()
+        if ch is None:
+            return None
+        if getattr(ch, "transport", None) != "cli":
+            return None
+        return ch
+
+    async def on_tool_use(self, name: str, input, id: str) -> None:
+        ch = self._cli_channel()
+        if ch is None:
+            return
+        await self._transport.push_trace(
+            ch,
+            {"type": "tool_use", "name": name, "input": _trim_input(name, input)},
+        )
+
+    async def on_result(self, msg) -> None:
+        ch = self._cli_channel()
+        if ch is None:
+            return
+        evt: dict = {"type": "result"}
+        cost = getattr(msg, "total_cost_usd", None)
+        if cost is not None:
+            evt["total_cost_usd"] = cost
+        dur = getattr(msg, "duration_ms", None)
+        if dur is not None:
+            evt["duration_ms"] = dur
+        await self._transport.push_trace(ch, evt)
+
+
+__all__ = ["SessionHandler", "CompactionArmer", "CLITraceHandler"]

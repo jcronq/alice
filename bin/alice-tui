@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# alice-tui — pretty TUI for talking to Alice. Companion to bin/alice
+# (the docker-exec wrapper around the agent-friendly alice-client).
+#
+# This script lives on the host. It launches a Node app under tui/ that
+# in turn spawns `docker exec -i WORKER alice-client --json` and renders
+# the event stream as a chat-style interface using Ink.
+#
+# Usage:
+#     alice-tui                    # interactive
+#     alice-tui --worker alice-worker-green
+#     alice-tui --help
+#
+# First run does an `npm install` + `tsc`; subsequent runs are instant.
+
+set -euo pipefail
+
+ALICE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TUI_DIR="$ALICE_ROOT/tui"
+
+err() { printf "alice-tui: %s\n" "$*" >&2; exit 1; }
+
+# ---- prereq checks --------------------------------------------------------
+
+command -v node >/dev/null 2>&1 || err "node not found on PATH (need >=18). Install with 'brew install node' or nvm."
+command -v npm  >/dev/null 2>&1 || err "npm not found on PATH (ships with node)."
+
+NODE_MAJOR=$(node --version | sed 's/^v//; s/\..*//')
+if [ "$NODE_MAJOR" -lt 18 ]; then
+    err "node $NODE_MAJOR is too old (need >=18)."
+fi
+
+[ -d "$TUI_DIR" ] || err "tui directory missing at $TUI_DIR"
+
+# ---- lazy install + build -------------------------------------------------
+
+# node_modules absent → first run, install. We don't time-check after
+# because tsx/ts-node are not in play; we always re-build below if the
+# dist is stale (cheap).
+if [ ! -d "$TUI_DIR/node_modules" ]; then
+    printf "alice-tui: first run — installing npm deps...\n" >&2
+    (cd "$TUI_DIR" && npm install --silent) || err "npm install failed"
+fi
+
+# Rebuild if any source file is newer than dist/index.js. `find -newer`
+# avoids the cost when nothing changed; tsc itself is fast (<1s here).
+DIST_ENTRY="$TUI_DIR/dist/index.js"
+needs_build=0
+if [ ! -f "$DIST_ENTRY" ]; then
+    needs_build=1
+elif [ -n "$(find "$TUI_DIR/src" -newer "$DIST_ENTRY" -print -quit 2>/dev/null)" ]; then
+    needs_build=1
+fi
+if [ "$needs_build" = "1" ]; then
+    printf "alice-tui: building...\n" >&2
+    (cd "$TUI_DIR" && npm run --silent build) || err "tsc build failed"
+fi
+
+# ---- launch ---------------------------------------------------------------
+
+exec node "$DIST_ENTRY" "$@"

@@ -12,8 +12,37 @@ if [ -d /host-claude ]; then
     mkdir -p "$HOME/.claude"
     ln -sf /host-claude/.credentials.json "$HOME/.claude/.credentials.json"
 fi
-if [ -d /host-home ]; then
-    ln -sf /host-home/.claude.json "$HOME/.claude.json"
+# .claude.json: COPY from host (don't symlink). The host's claude binary
+# rewrites this file constantly (it stores per-project session state and
+# updates on every interaction); a live symlink lets Alice's claude
+# subprocess hit a torn read mid-rewrite — JSON parse fails, the wake
+# dies with "Unterminated string" / exit 1. With a copy, host edits no
+# longer reach us, but Alice's claude has a stable file to read.
+# Validate the read; retry briefly if the host was mid-write at the
+# moment we copied; fall back to "{}" so claude has a parseable file
+# even when validation never succeeds.
+if [ -f /host-home/.claude.json ]; then
+    python3 - <<'PY' >&2
+import json, os, pathlib, shutil, time
+src = pathlib.Path("/host-home/.claude.json")
+dst = pathlib.Path(os.path.expanduser("~/.claude.json"))
+ok = False
+for attempt in range(5):
+    try:
+        data = src.read_text(encoding="utf-8")
+        json.loads(data)
+        tmp = dst.with_suffix(".json.tmp")
+        tmp.write_text(data, encoding="utf-8")
+        tmp.replace(dst)
+        ok = True
+        break
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+        print(f"[entrypoint] .claude.json copy attempt {attempt+1} failed: {exc}")
+        time.sleep(0.2)
+if not ok:
+    print("[entrypoint] giving up on .claude.json copy; writing empty {}")
+    dst.write_text("{}\n", encoding="utf-8")
+PY
 fi
 
 # Point git at gh for HTTPS auth. The mounted ~/.config/gh provides the token.

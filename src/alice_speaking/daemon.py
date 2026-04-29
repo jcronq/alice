@@ -59,7 +59,7 @@ from . import tools as tools_module
 from .config import Config
 from .dedup import DedupStore
 from .events import EventLogger
-from .handlers import CompactionArmer, SessionHandler
+from .handlers import CLITraceHandler, CompactionArmer, SessionHandler
 from .principals import AddressBook
 from .quiet_hours import QueuedMessage, QuietQueue, is_quiet_hours
 from .signal_client import SignalClient, SignalEnvelope
@@ -1297,18 +1297,13 @@ class SpeakingDaemon:
             assert isinstance(recipient, ChannelRef)
             channel = recipient
 
-        # CLI deliverability — refuse explicit sends to dead ephemeral
-        # channels rather than dropping them silently.
-        if (
-            channel.transport == "cli"
-            and not channel.durable
-            and recipient != SELF_RECIPIENT
-        ):
-            raise RuntimeError(
-                "cannot send to ephemeral cli channel outside its "
-                "originating turn — use recipient='self' during the "
-                "inbound CLI turn instead"
-            )
+        # CLI deliverability is now decided at write time inside
+        # CLITransport.send: if the address book's CLI channel (uid)
+        # has any live connection, the send broadcasts to all of them;
+        # otherwise the transport logs and drops. The previous
+        # pre-flight `durable=False` reject was too aggressive — it
+        # blocked surface- and emergency-driven sends to "owner" even
+        # when a TUI session was actively connected and addressable.
 
         emergency = getattr(self, "_emergency_bypass", False)
         # Bypass triggers: emergency-flavored turn, or we're inside an
@@ -1617,6 +1612,17 @@ class SpeakingDaemon:
             )
             handlers.append(
                 CompactionArmer(threshold=threshold, arm=_arm_compaction)
+            )
+        # CLI trace pass-through. No-op when the active channel isn't
+        # CLI, so safe to install for every turn (signal/discord/surface
+        # turns all silently skip). Installed for silent turns too —
+        # bootstrap/compaction trace events would just have no listener.
+        if self.cli_transport is not None:
+            handlers.append(
+                CLITraceHandler(
+                    transport=self.cli_transport,
+                    get_channel=lambda: self._current_reply_channel,
+                )
             )
         return handlers
 
