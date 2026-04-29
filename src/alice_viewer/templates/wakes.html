@@ -2,14 +2,16 @@
 {% block title %}wakes{% endblock %}
 {% block body %}
   <h1>thinking wakes · {{ total_wakes }}</h1>
-  <table>
-    <thead>
-      <tr>
-        <th>when</th><th>summary</th><th>status</th><th>model</th><th>duration</th><th>cost</th><th>tools</th><th>events</th><th>wake id</th>
-      </tr>
-    </thead>
-    <tbody id="wakes-body">
-      {% include "_wakes_partial.html" %}
-    </tbody>
-  </table>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>when</th><th>summary</th><th>status</th><th>model</th><th>duration</th><th>cost</th><th>tools</th><th>events</th><th>wake id</th>
+        </tr>
+      </thead>
+      <tbody id="wakes-body">
+        {% include "_wakes_partial.html" %}
+      </tbody>
+    </table>
+  </div>
 {% endblock %}

@@ -24,20 +24,22 @@
   </div>
 
   <h2>tool use</h2>
-  <table>
-    <thead><tr><th>hemisphere</th><th>tool</th><th>count</th></tr></thead>
-    <tbody>
-      {% for row in tool_histogram %}
-        <tr>
-          <td><span class="badge {{ row.hemisphere }}">{{ row.hemisphere }}</span></td>
-          <td class="mono">{{ row.name }}</td>
-          <td class="mono">{{ row.count }}</td>
-        </tr>
-      {% else %}
-        <tr><td colspan="3" class="muted">no tool_use events yet</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>hemisphere</th><th>tool</th><th>count</th></tr></thead>
+      <tbody>
+        {% for row in tool_histogram %}
+          <tr>
+            <td><span class="badge {{ row.hemisphere }}">{{ row.hemisphere }}</span></td>
+            <td class="mono">{{ row.name }}</td>
+            <td class="mono">{{ row.count }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="3" class="muted">no tool_use events yet</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 
   <script id="buckets-data" type="application/json">{{ buckets_json | safe }}</script>
   <script>

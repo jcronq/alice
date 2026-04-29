@@ -37,7 +37,12 @@ nav a {
 nav a.on { color: var(--text); background: var(--panel-2); }
 nav a:hover { color: var(--text); text-decoration: none; background: var(--panel-2); }
 
-.layout { display: grid; grid-template-columns: 280px 1fr; min-height: calc(100vh - 48px); }
+/* minmax(0, 1fr) (not bare 1fr) lets <main> shrink below its content's
+   intrinsic min-width — without it, a long unbreakable string inside
+   any descendant (e.g. a wake_id link in a table cell) blows the
+   second column out and pushes the whole page wider than the
+   viewport. */
+.layout { display: grid; grid-template-columns: 280px minmax(0, 1fr); min-height: calc(100vh - 48px); }
 
 .sidebar {
   background: var(--panel); padding: 16px; border-right: 1px solid var(--border);
@@ -181,11 +186,17 @@ pre.code-block {
 .filter-bar a.on { background: var(--panel-2); color: var(--text); border-color: var(--accent); }
 
 /* Tables */
+/* .table-wrap keeps a wide table from pushing the page wider than the
+   viewport — at narrow widths the table scrolls horizontally inside
+   its own container instead of overflowing main. */
+.table-wrap { overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; font-size: 12px; }
 th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
 th { color: var(--muted); font-weight: 500; text-transform: uppercase; font-size: 10px; letter-spacing: 1px; }
 tr:hover td { background: var(--panel-2); }
-td.mono { font-family: var(--mono); color: var(--muted); font-size: 11px; }
+/* break-word lets long unbreakable strings (wake_ids, turn_ids, hash
+   model names) wrap inside their cell instead of expanding the column. */
+td.mono { font-family: var(--mono); color: var(--muted); font-size: 11px; word-break: break-word; overflow-wrap: anywhere; }
 td.wrap { white-space: normal; max-width: 600px; }
 
 /* Detail blocks */

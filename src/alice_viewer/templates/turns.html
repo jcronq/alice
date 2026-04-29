@@ -2,14 +2,16 @@
 {% block title %}turns{% endblock %}
 {% block body %}
   <h1>speaking turns · {{ total_turns }}</h1>
-  <table>
-    <thead>
-      <tr>
-        <th>when</th><th>kind</th><th>who/what</th><th>inbound</th><th>outbound</th><th>dur</th><th>cost</th><th>tools</th><th>turn id</th>
-      </tr>
-    </thead>
-    <tbody id="turns-body">
-      {% include "_turns_partial.html" %}
-    </tbody>
-  </table>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>when</th><th>kind</th><th>who/what</th><th>inbound</th><th>outbound</th><th>dur</th><th>cost</th><th>tools</th><th>turn id</th>
+        </tr>
+      </thead>
+      <tbody id="turns-body">
+        {% include "_turns_partial.html" %}
+      </tbody>
+    </table>
+  </div>
 {% endblock %}
