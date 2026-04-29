@@ -49,18 +49,20 @@ for name in alice-worker-blue alice-worker-green; do
     fi
 done
 
+# Build any image whose Dockerfile or build context changed since last
+# build. Cached layers stay cached, so a no-op warm start costs ~1-2s of
+# "everything cached" output. The previous "build only when no image
+# exists" gate skipped rebuilds after a `git pull` that changed a
+# Dockerfile, so a stale `:blue` from an earlier install kept being
+# reused — the daemon then crash-looped on whatever new dep the new
+# Dockerfile expected (issue #1). Building blue here also seeds it on
+# very first start. Green is left alone: alice-deploy is the path that
+# updates green, and pre-building both slots would double the cost
+# without benefit.
+docker compose --profile blue build alice-daemon alice-viewer alice-worker-blue >/dev/null
+
 # Bring up the daemon + observability viewer (always-on, host-side UI).
 docker compose up -d alice-daemon alice-viewer >/dev/null
-
-# Pick a worker slot to bring up. Prefer blue on cold start; if blue has a
-# previously-built image that isn't latest, still fine — it holds the image
-# it was tagged with at last deploy.
-if ! docker image inspect alice-worker:blue >/dev/null 2>&1 \
-   && ! docker image inspect alice-worker:green >/dev/null 2>&1; then
-    # Very first start — build + tag :blue.
-    docker compose --profile blue build alice-worker-blue >/dev/null
-    docker tag alice-worker:blue alice-worker:blue 2>/dev/null || true
-fi
 
 # Start whichever slot has a built image (prefer blue).
 if docker image inspect alice-worker:blue >/dev/null 2>&1; then
