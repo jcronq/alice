@@ -1,8 +1,13 @@
 """CLITransport: a Unix-domain-socket transport for local CLI / agent traffic.
 
 Listens on a Unix socket inside the worker container (default
-``/state/alice.sock``). Each connection is one ephemeral channel — when
+``/tmp/alice.sock``). Each connection is one ephemeral channel — when
 the client disconnects, that ChannelRef is no longer reachable.
+
+The socket lives on the container's local filesystem rather than a
+bind-mounted directory because virtiofs/9p (Rancher Desktop, Docker
+Desktop on macOS) doesn't support AF_UNIX sockets — bind() returns
+EPERM. Container-local paths are always backed by overlayfs/tmpfs.
 
 Wire protocol (line-delimited JSON, UTF-8):
 

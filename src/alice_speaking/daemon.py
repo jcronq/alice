@@ -156,16 +156,22 @@ class SpeakingDaemon:
             fallback_signal_senders=cfg.allowed_senders_fallback,
             fallback_cli_uid=os.getuid(),
         )
-        self.signal = SignalClient(
-            api=cfg.signal_api,
-            account=cfg.signal_account,
-            log_path=cfg.signal_log_path,
-            offset_path=cfg.offset_path,
+        # Signal is opt-in. Without SIGNAL_ACCOUNT in alice.env we skip the
+        # transport entirely and let CLI / Discord (if configured) carry
+        # conversation. The daemon still runs.
+        self.signal: Optional[SignalClient] = (
+            SignalClient(
+                api=cfg.signal_api,
+                account=cfg.signal_account,
+                log_path=cfg.signal_log_path,
+                offset_path=cfg.offset_path,
+            )
+            if cfg.signal_account
+            else None
         )
-        # Phase 2: SignalTransport wraps the SignalClient under the
-        # Transport interface. Phase 2a constructs it; Phase 2b cuts
-        # outbound dispatch over to it.
-        self.signal_transport = SignalTransport(signal_client=self.signal)
+        self.signal_transport: Optional[SignalTransport] = (
+            SignalTransport(signal_client=self.signal) if self.signal else None
+        )
         self.dedup = DedupStore(cfg.seen_path)
         self.turns = TurnLog(cfg.turn_log_path)
         self.events = EventLogger(cfg.event_log_path)
@@ -296,9 +302,12 @@ class SpeakingDaemon:
             bootstrap_turns=self.cfg.speaking.get("context_bootstrap_turns"),
         )
         try:
-            log.info("waiting for signal-cli at %s", self.cfg.signal_api)
-            await self.signal.wait_ready()
-            await self.signal_transport.start()
+            if self.signal is not None and self.signal_transport is not None:
+                log.info("waiting for signal-cli at %s", self.cfg.signal_api)
+                await self.signal.wait_ready()
+                await self.signal_transport.start()
+            else:
+                log.info("signal disabled (no SIGNAL_ACCOUNT); skipping signal-cli")
             log.info("daemon ready; listening")
             self.events.emit("daemon_ready", signal_api=self.cfg.signal_api)
 
@@ -311,11 +320,14 @@ class SpeakingDaemon:
             self._prime_bootstrap_preamble()
 
             producers = [
-                asyncio.create_task(self._signal_producer(), name="sig-produce"),
                 asyncio.create_task(self._surface_producer(), name="sur-produce"),
                 asyncio.create_task(self._emergency_producer(), name="emg-produce"),
                 asyncio.create_task(self._quiet_watcher(), name="quiet-watch"),
             ]
+            if self.signal is not None:
+                producers.append(
+                    asyncio.create_task(self._signal_producer(), name="sig-produce")
+                )
             if self.cli_transport is not None:
                 await self.cli_transport.start()
                 producers.append(
@@ -342,9 +354,11 @@ class SpeakingDaemon:
                 with contextlib.suppress(BaseException):
                     await task
         finally:
-            with contextlib.suppress(Exception):
-                await self.signal_transport.stop()
-            await self.signal.aclose()
+            if self.signal_transport is not None:
+                with contextlib.suppress(Exception):
+                    await self.signal_transport.stop()
+            if self.signal is not None:
+                await self.signal.aclose()
             if self.cli_transport is not None:
                 with contextlib.suppress(Exception):
                     await self.cli_transport.stop()
@@ -358,6 +372,7 @@ class SpeakingDaemon:
     # Producers
 
     async def _signal_producer(self) -> None:
+        assert self.signal is not None  # only scheduled when signal is enabled
         async for env in self.signal.receive():
             if not self.address_book.is_allowed("signal", env.source):
                 log.info("ignoring envelope from %s", env.source)
@@ -578,6 +593,10 @@ class SpeakingDaemon:
         """
         if not batch:
             return
+        # SignalEvents only enter the queue when signal is enabled (the
+        # producer is gated in :meth:`run`). The assert narrows the type
+        # for the rest of the body and catches any future accidents.
+        assert self.signal_transport is not None
         head = batch[0]
         sender_name = head.sender_name
         source = head.envelope.source

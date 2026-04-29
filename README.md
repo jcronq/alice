@@ -36,31 +36,54 @@ alice/
 
 ## Quickstart
 
-You'll need Docker (or Docker Desktop on macOS), `gh`, and `git`.
+You'll need Docker (or Docker Desktop on macOS), `git`, and the Claude
+Code CLI (`npm install -g @anthropic-ai/claude-code`). `gh` is optional —
+only needed if you want her mind pushed to GitHub.
 
 ```bash
-# 1. Clone this repo
+# 1. Clone this repo (any path works — alice-up auto-detects)
 git clone https://github.com/jcronq/alice.git ~/alice
+cd ~/alice
 
-# 2. Add the CLI to your PATH
+# 2. Run the interactive installer — it walks you through everything:
+#      • prereq check
+#      • mind scaffold
+#      • Claude long-lived OAuth token (via `claude setup-token`)
+#      • optional Signal config
+#      • container build + bring-up
+#      • smoke test (alice -p "...")
+./install.sh
+
+# 3. Add the CLI to your PATH (the installer prints this too)
 export PATH="$HOME/alice/bin:$PATH"     # persist in your shell rc
 
-# 3. First-run setup — scaffolds a mind repo and writes alice.env
-alice-init
-
-# 4. Register signal-cli (one time; interactive QR scan inside the daemon)
-docker exec -it alice-daemon signal-cli \
-    -a "$(. ~/.config/alice/alice.env; echo "$SIGNAL_ACCOUNT")" link -n "Alice"
-
-# 5. Bring up the daemon + a worker (blue by default) + viewer
-alice-up
-
-# 6. Talk to her
+# 4. Talk to her
 alice                 # interactive (CLI transport, Unix-socket)
 alice -p "ping"       # one-shot
-# Or send her a Signal message from an allowed sender.
-# Or DM/mention her in a Discord guild she's joined.
 ```
+
+If you'd rather wire things by hand, the installer's steps each map to
+a single `bin/alice-*` script — read `install.sh` for the order and
+skip what you've already done.
+
+### Adding Signal later
+
+Edit `~/.config/alice/alice.env`, set `SIGNAL_ACCOUNT` (E.164) and
+`ALLOWED_SENDERS`, then:
+
+```bash
+alice-up
+docker exec -it alice-daemon signal-cli \
+    -a "$(. ~/.config/alice/alice.env; echo "$SIGNAL_ACCOUNT")" link -n "Alice"
+# Scan the QR code with your phone's Signal app.
+docker restart alice-daemon
+```
+
+### Adding Discord later
+
+Set `DISCORD_BOT_TOKEN` in `~/.config/alice/alice.env`, restart the
+worker. See the comments in `config/alice.env.example` for the bot
+permissions/intents.
 
 ## Architecture
 

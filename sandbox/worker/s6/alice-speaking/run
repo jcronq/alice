@@ -7,16 +7,26 @@
 # handoff correctly. When blue/green is retired the flock wrapper can go.
 set -e
 
-# Wait for signal-cli's HTTP endpoint. depends_on's service_healthy normally
-# handles this but belt-and-braces.
-for _ in $(seq 1 60); do
-    if curl -sfo /dev/null -X POST "${SIGNAL_API:-http://alice-daemon:8080}/api/v1/rpc" \
-        -H 'Content-Type: application/json' \
-        -d '{"jsonrpc":"2.0","method":"version","id":"ping"}' 2>/dev/null; then
-        break
-    fi
-    sleep 1
-done
+# Skip the signal-cli readiness probe when Signal is disabled — the daemon
+# container is up but signal-cli isn't running, so polling would just burn
+# 60s before timing out on every (re)start.
+SIGNAL_DISABLED=
+if [ -f /state/daemon/signal-disabled ]; then
+    SIGNAL_DISABLED=1
+fi
+
+if [ -z "${SIGNAL_DISABLED}" ]; then
+    # Wait for signal-cli's HTTP endpoint. depends_on's service_healthy normally
+    # handles this but belt-and-braces.
+    for _ in $(seq 1 60); do
+        if curl -sfo /dev/null -X POST "${SIGNAL_API:-http://alice-daemon:8080}/api/v1/rpc" \
+            -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","method":"version","id":"ping"}' 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+fi
 
 export ALICE_CONFIG=/home/alice/.config/alice/alice.env
 # Monorepo root bind-mounted at /home/alice/alice — src/ holds all Python
@@ -25,5 +35,8 @@ export PYTHONPATH=/home/alice/alice/src
 # Unbuffered stdout so s6 can see logs in real time.
 export PYTHONUNBUFFERED=1
 
+# Redirect stderr to a host-visible log file so install/runtime issues are
+# debuggable from `tail -F ~/.local/state/alice/worker/speaking-stderr.log`.
+# stdlib logging defaults to stderr; the EventLogger writes to /state/speaking.log.
 exec s6-setuidgid alice flock -x /state/worker/lease \
-    /opt/alice-venv/bin/python -m alice_speaking
+    /opt/alice-venv/bin/python -m alice_speaking 2>>/state/worker/speaking-stderr.log

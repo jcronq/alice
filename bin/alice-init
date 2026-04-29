@@ -4,7 +4,8 @@
 # Prompts for:
 #   1. Where Alice's mind lives (existing repo URL, existing local path,
 #      or new local scaffold).
-#   2. Signal account + allowlisted senders, to seed ~/.config/alice/alice.env.
+#   2. Optional Signal account + allowlisted senders, to seed
+#      ~/.config/alice/alice.env. Skip this step to run CLI-only.
 #
 # Does NOT:
 #   - Register the signal-cli account (interactive `signal-cli link`).
@@ -14,7 +15,7 @@
 # Usage:
 #   alice-init                 # interactive, targets ~/alice-mind
 #   alice-init --target PATH   # scaffold into a different dir
-#   alice-init --yes           # accept defaults; don't prompt
+#   alice-init --yes           # accept defaults (skips Signal prompt)
 
 set -euo pipefail
 
@@ -22,6 +23,16 @@ ALICE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCAFFOLD_SRC="$ALICE_ROOT/templates/mind-scaffold"
 TARGET="$HOME/alice-mind"
 NON_INTERACTIVE=0
+
+# ----- prerequisite check -----
+missing=()
+command -v docker >/dev/null 2>&1 || missing+=(docker)
+command -v git    >/dev/null 2>&1 || missing+=(git)
+if [ ${#missing[@]} -gt 0 ]; then
+    echo "alice-init: missing prerequisites: ${missing[*]}" >&2
+    echo "  Install them and retry. (gh is optional; only needed if you push the mind to GitHub.)" >&2
+    exit 1
+fi
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -141,11 +152,17 @@ mkdir -p "$cfg_dir"
 if [ -f "$cfg_file" ]; then
     echo "$cfg_file already exists; leaving it alone."
 else
-    echo "=== Signal config (stored in $cfg_file) ==="
-    echo "You'll still need to register the account via 'signal-cli link' later."
+    signal_account=""
+    allowed_senders=""
+    echo "=== Transports (stored in $cfg_file) ==="
+    echo "Signal is optional. Skip this step if you only want the CLI"
+    echo "transport (alice / alice -p '...') — you can wire Signal later."
     echo
-    signal_account=$(ask "SIGNAL_ACCOUNT (E.164, e.g. +15555550100)")
-    allowed_senders=$(ask "ALLOWED_SENDERS (comma-separated, e.g. +15555551212:Alice)")
+    if confirm "Configure Signal now?" "n"; then
+        echo "(You'll still need to register the account via 'signal-cli link' afterwards.)"
+        signal_account=$(ask "SIGNAL_ACCOUNT (E.164, e.g. +15555550100)")
+        allowed_senders=$(ask "ALLOWED_SENDERS (comma-separated, e.g. +15555551212:Alice)")
+    fi
 
     cp "$ALICE_ROOT/config/alice.env.example" "$cfg_file"
     # Use python for safe sed replacement (handles metacharacters).
@@ -161,25 +178,74 @@ PY
     echo "wrote $cfg_file"
 fi
 
+# Pre-create host directories that compose binds, so docker doesn't make
+# them root-owned on first start. alice-up does this too — running here
+# means a user who edits files between init and up sees the right paths.
+mkdir -p \
+    "$HOME/alice-tools" \
+    "$HOME/.config/gh" \
+    "$HOME/.alice-claude" \
+    "$HOME/.local/state/alice" \
+    "$HOME/.local/share/signal-cli"
+
+# Resolve the Signal account from the env file for the next-steps blurb
+# (empty when Signal wasn't configured).
+SIGNAL_ACCOUNT_VAL=""
+if [ -f "$cfg_file" ]; then
+    SIGNAL_ACCOUNT_VAL="$(. "$cfg_file" 2>/dev/null && echo "${SIGNAL_ACCOUNT:-}")"
+fi
+
 # ----- wrap-up -----
 cat <<EOF
 
 === Next steps ===
 
-1. Register Signal (once, interactive):
-      signal-cli -a "$(. "$cfg_file" && echo "\$SIGNAL_ACCOUNT")" link -n "Alice"
-   Scan the QR code with your phone's Signal app.
+1. Add $ALICE_ROOT/bin to your PATH:
+      export PATH="$ALICE_ROOT/bin:\$PATH"   # persist in your shell rc
 
-2. Personalize Alice's mind:
+2. Personalize Alice's mind (optional — defaults work):
       editor $TARGET/IDENTITY.md
       editor $TARGET/CLAUDE.md
       editor $TARGET/USER.md
 
-3. Add $ALICE_ROOT/bin to your PATH, then:
-      alice-up        # starts the sandbox
-      alice           # talk to her
+EOF
 
-4. Optional: create a private github repo for the mind:
+step=3
+# Always nudge toward the long-lived token. We do not direct users to
+# 'claude /login' because on macOS that token lives in the system
+# Keychain (unreachable from the container), and even on Linux a
+# refresh in ~/.claude/.credentials.json doesn't always propagate
+# cleanly through the bind mount.
+cat <<EOF
+$step. Mint a long-lived Claude OAuth token (one-time):
+      claude setup-token      # opens a browser; copy the printed token
+   Then add it to $cfg_file:
+      CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-…
+
+EOF
+step=$((step + 1))
+
+if [ -n "$SIGNAL_ACCOUNT_VAL" ]; then
+    cat <<EOF
+$step. Register Signal (once, interactive — the daemon must be up):
+      alice-up
+      docker exec -it alice-daemon signal-cli -a "$SIGNAL_ACCOUNT_VAL" link -n "Alice"
+   Scan the QR code with your phone's Signal app.
+
+EOF
+    step=$((step + 1))
+fi
+
+cat <<EOF
+$step. Bring up the sandbox and talk to her:
+      alice-up        # starts the daemon + worker + viewer
+      alice           # interactive CLI
+      alice -p "ping" # one-shot
+
+EOF
+
+cat <<EOF
+Optional: push the mind to a private GitHub repo:
       cd $TARGET
       gh repo create --private --source . --push
 

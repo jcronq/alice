@@ -116,6 +116,27 @@ def _patch_query(monkeypatch: pytest.MonkeyPatch, messages_fn: Callable[[], list
 # --------------------------------------------------------------------- tests
 
 
+def test_init_skips_signal_when_account_unset(cfg, monkeypatch) -> None:
+    """Signal-disabled deploys (CLI/Discord-only) must construct cleanly:
+    no SignalClient, no SignalTransport, and the daemon shouldn't blow up
+    looking up signal attributes during __init__ or shutdown."""
+    cfg.signal_account = ""
+    # If the daemon tried to instantiate SignalClient, this lambda would
+    # produce a FakeSignal — but with signal disabled we expect it never
+    # to be called.
+    called: list[bool] = []
+
+    def boom(**kwargs):
+        called.append(True)
+        return FakeSignal()
+
+    monkeypatch.setattr(daemon_module, "SignalClient", boom)
+    d = SpeakingDaemon(cfg)
+    assert d.signal is None
+    assert d.signal_transport is None
+    assert called == []
+
+
 def test_init_loads_persisted_session(cfg, tmp_path, monkeypatch) -> None:
     # Pre-persist session.json AND the SDK JSONL so preflight passes.
     state_dir = cfg.mind_dir / "inner" / "state"

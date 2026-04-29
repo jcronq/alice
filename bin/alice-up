@@ -3,10 +3,36 @@
 # Idempotent. Readiness = some worker holds the flock on /state/worker/lease.
 set -euo pipefail
 
-cd "$(dirname "$0")/../sandbox"
+ALICE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ALICE_ROOT/sandbox"
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "alice-up: docker not found on PATH. Install Docker (or Docker Desktop) and retry." >&2
+    exit 1
+fi
+if ! docker info >/dev/null 2>&1; then
+    echo "alice-up: docker daemon isn't running (or your user can't reach it). Start it and retry." >&2
+    exit 1
+fi
 
 export USER_ID="${USER_ID:-$(id -u)}"
 export GROUP_ID="${GROUP_ID:-$(id -g)}"
+# Bind the alice repo from wherever this script lives, so the worker's
+# /home/alice/alice mount points at *this* checkout — no matter if it's
+# ~/alice, ~/dev/alice, or somewhere else entirely.
+export ALICE_REPO="${ALICE_REPO:-$ALICE_ROOT}"
+
+# Pre-create host directories that compose binds. If we don't, the docker
+# daemon creates them as root:root on first run and Alice (uid 1000) can't
+# write. Idempotent.
+mkdir -p \
+    "$HOME/alice-mind" \
+    "$HOME/alice-tools" \
+    "$HOME/.config/alice" \
+    "$HOME/.config/gh" \
+    "$HOME/.alice-claude" \
+    "$HOME/.local/state/alice" \
+    "$HOME/.local/share/signal-cli"
 
 # Is a worker already up and holding the lease?
 for name in alice-worker-blue alice-worker-green; do

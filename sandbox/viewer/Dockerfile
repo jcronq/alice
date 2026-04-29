@@ -26,8 +26,10 @@ RUN python3 -m venv /opt/alice-venv \
         'fastapi>=0.115' 'uvicorn[standard]>=0.30' 'jinja2>=3.1' \
         'sse-starlette>=2.0' 'httpx>=0.28.1' 'claude-agent-sdk>=0.1.66'
 
-RUN groupadd -g ${GROUP_ID} alice \
-    && useradd -m -u ${USER_ID} -g ${GROUP_ID} -s /bin/bash alice \
+# -o allows the GID/UID to collide with a stock Debian entry (macOS GID 20
+# overlaps `dialout`, etc.). Lookups are by name, so collisions are harmless.
+RUN groupadd -o -g ${GROUP_ID} alice \
+    && useradd -o -m -u ${USER_ID} -g ${GROUP_ID} -s /bin/bash alice \
     && mkdir -p /home/alice/alice /home/alice/alice-mind /state \
     && chown -R alice:alice /home/alice /state
 

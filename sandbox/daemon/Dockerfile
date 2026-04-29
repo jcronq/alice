@@ -24,9 +24,12 @@ RUN tar -C / -Jxpf /tmp/s6-overlay-noarch.tar.xz \
     && tar -C / -Jxpf /tmp/s6-overlay-x86_64.tar.xz \
     && rm /tmp/s6-overlay-*.tar.xz
 
-# alice user (uid matches the worker + host so shared volume ownership lines up)
-RUN groupadd -g ${GROUP_ID} alice \
-    && useradd -m -u ${USER_ID} -g ${GROUP_ID} -s /bin/bash alice \
+# alice user (uid matches the worker + host so shared volume ownership lines up).
+# -o on both groupadd and useradd: macOS hosts commonly have GID/UID values
+# that collide with stock Debian entries (e.g. GID 20 = dialout). Allowing
+# non-unique IDs is fine here — we never look up alice by ID, only by name.
+RUN groupadd -o -g ${GROUP_ID} alice \
+    && useradd -o -m -u ${USER_ID} -g ${GROUP_ID} -s /bin/bash alice \
     && mkdir -p /home/alice/.local/share/signal-cli /state/daemon \
     && chown -R alice:alice /home/alice /state
 
@@ -38,9 +41,7 @@ ENV PATH=/usr/local/bin:/usr/bin:/bin
 ENV S6_KEEP_ENV=1
 
 HEALTHCHECK --interval=10s --timeout=3s --retries=3 --start-period=15s \
-    CMD curl -sf -X POST http://127.0.0.1:8080/api/v1/rpc \
-        -H 'Content-Type: application/json' \
-        -d '{"jsonrpc":"2.0","method":"version","id":"hc"}' >/dev/null || exit 1
+    CMD sh -c '[ -f /state/daemon/signal-disabled ] || curl -sf -X POST http://127.0.0.1:8080/api/v1/rpc -H "Content-Type: application/json" -d "{\"jsonrpc\":\"2.0\",\"method\":\"version\",\"id\":\"hc\"}" >/dev/null' || exit 1
 
 ENTRYPOINT ["/init"]
 CMD ["sleep", "infinity"]

@@ -42,7 +42,9 @@ x-worker-base: &worker-base
     # path holds everything that runs her — agent kernel, speaking
     # daemon, thinking wake, viewer — under src/*. Policy: thinking MUST
     # NOT write here (hemisphere boundary); enforcement is documentation.
-    - ${HOME}/alice:/home/alice/alice:rw
+    # Override ALICE_REPO when this repo lives somewhere other than ~/alice
+    # (e.g. ~/dev/alice). alice-up auto-detects from its own location.
+    - ${ALICE_REPO:-${HOME}/alice}:/home/alice/alice:rw
     - ${HOME}/.config/gh:/home/alice/.config/gh:ro
     - ${HOME}/.ssh:/home/alice/.ssh:ro
     - ${HOME}/.config/alice:/home/alice/.config/alice:ro
@@ -117,7 +119,7 @@ services:
       ALICE_VIEWER_CACHE_DIR: "/state/viewer-cache"
       TZ: "${ALICE_TZ:-America/New_York}"
     volumes:
-      - ${HOME}/alice:/home/alice/alice:ro
+      - ${ALICE_REPO:-${HOME}/alice}:/home/alice/alice:ro
       - ${HOME}/alice-mind:/home/alice/alice-mind:ro
       - ${HOME}/.local/state/alice:/state:rw
       # alice.env carries CLAUDE_CODE_OAUTH_TOKEN for run_summary's

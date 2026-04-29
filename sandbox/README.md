@@ -84,11 +84,16 @@ alice-up           # start fresh on new image
 
 ## Debugging
 
-- `docker logs alice` — s6 + service startup output
+- `docker logs alice-worker-blue` — s6 + service startup output
 - `alice-shell` → poke around as Alice
-- `docker inspect alice` → see mounts, env, network
-- Speaking daemon log: `docker logs alice-worker-blue` (or `-green`)
-- Signal daemon log: `~/.local/state/alice/signal-daemon.log`
+- `docker inspect alice-worker-blue` → see mounts, env, network
+- Speaking daemon stderr (Python tracebacks):
+  `~/.local/state/alice/worker/speaking-stderr.log`
+- Speaking event stream (structured JSON):
+  `~/.local/state/alice/worker/speaking.log`
+- Thinking event stream:
+  `~/.local/state/alice/worker/thinking.log`
+- Signal daemon log: `~/.local/state/alice/daemon/signal-daemon.log`
 
 ## Extending (adding personal sidecars)
 

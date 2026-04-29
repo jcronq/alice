@@ -2,7 +2,7 @@
 """alice-client — speaks the CLITransport socket protocol.
 
 Runs *inside* the worker container (the host wrapper at bin/alice does
-the docker-exec dance). Connects to ``/state/alice.sock`` (override with
+the docker-exec dance). Connects to ``/tmp/alice.sock`` (override with
 ``ALICE_CLI_SOCKET``), sends a message, and prints Alice's reply chunks
 to stdout until she signals ``done``.
 
@@ -37,7 +37,7 @@ import sys
 from typing import Iterator, Optional
 
 
-DEFAULT_SOCKET = "/state/alice.sock"
+DEFAULT_SOCKET = "/tmp/alice.sock"
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:

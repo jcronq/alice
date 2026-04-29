@@ -23,10 +23,13 @@ from typing import Any
 DEFAULT_ALICE_ENV = pathlib.Path.home() / ".config" / "alice" / "alice.env"
 DEFAULT_MIND_DIR = pathlib.Path.home() / "alice-mind"
 DEFAULT_STATE_DIR = pathlib.Path("/state/worker")
-# CLI transport socket. Lives under /state (shared between worker and
-# daemon containers, but only the worker process binds it). Override with
+# CLI transport socket. Lives in the container's local filesystem (not on
+# a bind-mounted volume) — bind mounts from macOS / Rancher Desktop are
+# served via virtiofs/9p, which doesn't support AF_UNIX socket files
+# (bind() returns EPERM). The socket is ephemeral anyway: the daemon
+# unlinks any stale path and rebinds on every restart. Override with
 # ALICE_CLI_SOCKET in alice.env or the environment.
-DEFAULT_CLI_SOCKET = pathlib.Path("/state/alice.sock")
+DEFAULT_CLI_SOCKET = pathlib.Path("/tmp/alice.sock")
 
 # Fallback speaking-hemisphere config, applied when alice.config.json is absent
 # or omits fields. Matches the defaults in HEMISPHERES.md.
@@ -60,7 +63,13 @@ SPEAKING_DEFAULTS: dict[str, Any] = {
 class Config:
     # From alice.env
     signal_api: str
+    # Empty string when Signal is disabled (no SIGNAL_ACCOUNT in alice.env).
+    # The daemon skips SignalClient/SignalTransport construction in that case
+    # and the CLI / Discord transports run on their own.
     signal_account: str
+    # Empty string when no token is in alice.env or the env. The Claude
+    # Code SDK falls back to ~/.claude/.credentials.json (the entrypoint
+    # symlinks it from the host), so this isn't strictly required.
     oauth_token: str
     work_dir: pathlib.Path
 
@@ -138,16 +147,15 @@ def load() -> Config:
     def from_any(key: str, default: str | None = None) -> str | None:
         return env.get(key) or os.environ.get(key) or default
 
-    def required(key: str) -> str:
-        value = from_any(key)
-        if not value:
-            raise KeyError(f"{key} missing from {env_path} and process env")
-        return value
-
     signal_api = from_any("SIGNAL_API", "http://127.0.0.1:8080") or ""
-    signal_account = required("SIGNAL_ACCOUNT")
-    oauth_token = required("CLAUDE_CODE_OAUTH_TOKEN")
-    allowed = _parse_allowed_senders(required("ALLOWED_SENDERS"))
+    # Signal is opt-in. When SIGNAL_ACCOUNT is unset, the daemon skips the
+    # transport entirely; CLI + Discord still work standalone.
+    signal_account = from_any("SIGNAL_ACCOUNT", "") or ""
+    # Claude OAuth token: prefer alice.env, fall back to the symlinked
+    # ~/.claude/.credentials.json that the entrypoint maintains. Empty
+    # here means "let the SDK find it on disk."
+    oauth_token = from_any("CLAUDE_CODE_OAUTH_TOKEN", "") or ""
+    allowed = _parse_allowed_senders(from_any("ALLOWED_SENDERS", "") or "")
     work_dir = pathlib.Path(from_any("WORK_DIR", str(DEFAULT_MIND_DIR)) or str(DEFAULT_MIND_DIR))
 
     mind_dir = pathlib.Path(from_any("ALICE_MIND_DIR", str(work_dir)) or str(work_dir))

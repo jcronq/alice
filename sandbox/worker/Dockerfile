@@ -30,7 +30,11 @@ RUN npm install -g @anthropic-ai/claude-code@latest
 RUN python3 -m venv /opt/alice-venv \
     && /opt/alice-venv/bin/pip install --no-cache-dir --upgrade pip \
     && /opt/alice-venv/bin/pip install --no-cache-dir \
-        'claude-agent-sdk>=0.1.66' 'httpx>=0.28.1' 'mistune>=3.0'
+        'claude-agent-sdk>=0.1.66' \
+        'httpx>=0.28.1' \
+        'mistune>=3.0' \
+        'pyyaml>=6.0' \
+        'discord.py>=2.4'
 
 # s6-overlay for process supervision (bridge + autopush)
 ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz /tmp/
@@ -39,8 +43,10 @@ RUN tar -C / -Jxpf /tmp/s6-overlay-noarch.tar.xz \
     && tar -C / -Jxpf /tmp/s6-overlay-x86_64.tar.xz \
     && rm /tmp/s6-overlay-*.tar.xz
 
-RUN groupadd -g ${GROUP_ID} alice \
-    && useradd -m -u ${USER_ID} -g ${GROUP_ID} -s /bin/bash alice \
+# -o allows the GID/UID to collide with a stock Debian entry (macOS GID 20
+# overlaps `dialout`, etc.). Lookups are by name, so collisions are harmless.
+RUN groupadd -o -g ${GROUP_ID} alice \
+    && useradd -o -m -u ${USER_ID} -g ${GROUP_ID} -s /bin/bash alice \
     && mkdir -p /home/alice/alice-mind /home/alice/alice-tools /state/worker \
     && chown -R alice:alice /home/alice /state
 
