@@ -1,0 +1,30 @@
+# Address book / ACL — who Alice will accept messages from and how she
+# routes outbound. Copy to principals.yaml and edit.
+#
+# When this file is absent, the daemon synthesizes an in-memory book
+# from the ALLOWED_SENDERS env var (legacy fallback). Authoring this
+# file lets you specify multiple channels per person, a preferred
+# channel, and the local-CLI principal.
+
+principals:
+  owner:
+    display_name: Owner
+    allowed: true
+    channels:
+      - transport: signal
+        address: "+15555550100"     # E.164; preferred=true picked when no transport hint
+        preferred: true
+      - transport: cli
+        address: "1000"             # uid of the host user — local-socket auth
+        durable: false
+      # Optional Discord — DM by user id, or guild scope by channel id:
+      # - { transport: discord, address: "user:123456789012345678" }
+      # - { transport: discord, address: "channel:987654321098765432" }
+
+  friend:
+    display_name: Friend
+    allowed: true
+    channels:
+      - transport: signal
+        address: "+15555550101"
+        preferred: true
