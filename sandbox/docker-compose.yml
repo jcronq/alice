@@ -34,6 +34,13 @@ x-worker-base: &worker-base
     STATE_DIR: "/state/worker"
     TZ: "${ALICE_TZ:-America/New_York}"
     PATH: "/home/alice/alice-tools/bin:/home/alice/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    # GitHub PAT for the gh CLI (and git-over-https via gh's credential
+    # helper). Sourced from alice.env by bin/_alice-env.sh, so adding
+    # GH_TOKEN=ghp_... to alice.env then bouncing the worker is enough
+    # to pick it up. Empty (the default) lets gh fall through to the
+    # mounted ~/.config/gh OAuth credentials instead — existing host
+    # auth setups keep working.
+    GH_TOKEN: "${GH_TOKEN:-}"
   volumes:
     # Mind + tools default to <repo>/data/{alice-mind,alice-tools}; alice-up
     # exports ALICE_MIND / ALICE_TOOLS pointing there. Fall back to the

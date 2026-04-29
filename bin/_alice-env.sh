@@ -35,3 +35,19 @@ export ALICE_REPO="${ALICE_REPO:-$ALICE_ROOT}"
 # Override either env var to put them elsewhere.
 export ALICE_MIND="${ALICE_MIND:-$ALICE_ROOT/data/alice-mind}"
 export ALICE_TOOLS="${ALICE_TOOLS:-$ALICE_ROOT/data/alice-tools}"
+
+# Source alice.env so any secrets the user keeps there (CLAUDE_*,
+# ANTHROPIC_*, GH_TOKEN, etc.) are visible to compose's variable
+# interpolation. The compose file only consumes the keys it explicitly
+# references via ${VAR:-default}; unreferenced vars are inert. Done
+# after the ALICE_* exports above so the file can override container
+# paths if the operator chooses, without us caring how. Missing file
+# is fine — install.sh hasn't run yet on a fresh checkout.
+_alice_env_file="${ALICE_CONFIG:-$HOME/.config/alice/alice.env}"
+if [ -f "$_alice_env_file" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$_alice_env_file"
+    set +a
+fi
+unset _alice_env_file
