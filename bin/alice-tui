@@ -56,6 +56,43 @@ if [ "$needs_build" = "1" ]; then
     (cd "$TUI_DIR" && npm run --silent build) || err "tsc build failed"
 fi
 
+# ---- worker resolution ----------------------------------------------------
+
+# Mirror bin/alice's behavior: auto-run alice-up so the sandbox boots
+# behind the scenes, and pick the worker holding the lease so the TUI
+# follows blue/green slot swaps without arguments. (Skipped if the
+# user just wants --help.)
+help_only=0
+explicit_worker=0
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) help_only=1 ;;
+        --worker)  explicit_worker=1 ;;
+    esac
+done
+
+if [ "$help_only" = "0" ]; then
+    "$ALICE_ROOT/bin/alice-up"
+
+    if [ "$explicit_worker" = "0" ]; then
+        # Lease-holder first, falling back to any worker that exists if we're
+        # mid-handoff and nobody currently holds the lease.
+        pick_worker() {
+            local name
+            for name in $(docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null); do
+                if ! docker exec "$name" flock -n /state/worker/lease true 2>/dev/null; then
+                    printf '%s\n' "$name"
+                    return 0
+                fi
+            done
+            docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null | head -n1
+        }
+        WORKER="$(pick_worker)"
+        [ -n "$WORKER" ] || err "no worker container running. did alice-up succeed?"
+        set -- --worker "$WORKER" "$@"
+    fi
+fi
+
 # ---- launch ---------------------------------------------------------------
 
 exec node "$DIST_ENTRY" "$@"
