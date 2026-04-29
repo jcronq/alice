@@ -66,7 +66,8 @@ ok "Docker daemon reachable"
 
 if ! command -v claude >/dev/null 2>&1; then
     info "Claude Code CLI not on PATH. Alice's worker doesn't need it, but"
-    info "this installer uses it to mint a long-lived token. Install with:"
+    info "the subscription auth path uses it to mint a long-lived token."
+    info "Skip if you'll use API-key auth instead. To install:"
     info "    npm install -g @anthropic-ai/claude-code"
     confirm "Continue without it?" "n" || fail "Install claude and re-run."
 fi
@@ -94,24 +95,29 @@ set +a
 
 step "Setting up Claude authentication"
 
-token_in_env="${CLAUDE_CODE_OAUTH_TOKEN:-}"
+oauth_in_env="${CLAUDE_CODE_OAUTH_TOKEN:-}"
+api_base_in_env="${ANTHROPIC_BASE_URL:-}"
+api_key_in_env="${ANTHROPIC_API_KEY:-}"
 
-write_token_to_env() {
-    local token="$1"
-    python3 - "$ENV_FILE" "$token" <<'PY'
+write_var_to_env() {
+    # write_var_to_env KEY VALUE — upsert KEY=VALUE in alice.env (line-replace,
+    # appending if absent). Used for the auth vars in either mode.
+    local key="$1" value="$2"
+    python3 - "$ENV_FILE" "$key" "$value" <<'PY'
 import sys, pathlib
-path, token = sys.argv[1], sys.argv[2]
+path, key, value = sys.argv[1], sys.argv[2], sys.argv[3]
 p = pathlib.Path(path)
 text = p.read_text() if p.exists() else ""
+prefix = f"{key}="
 out, replaced = [], False
 for line in text.splitlines():
-    if line.startswith("CLAUDE_CODE_OAUTH_TOKEN="):
-        out.append(f"CLAUDE_CODE_OAUTH_TOKEN={token}")
+    if line.startswith(prefix):
+        out.append(f"{prefix}{value}")
         replaced = True
     else:
         out.append(line)
 if not replaced:
-    out.append(f"CLAUDE_CODE_OAUTH_TOKEN={token}")
+    out.append(f"{prefix}{value}")
 p.write_text("\n".join(out).rstrip("\n") + "\n")
 PY
     chmod 600 "$ENV_FILE"
@@ -212,43 +218,83 @@ PY
     printf '%s' "$tok"
 }
 
-if [ -n "$token_in_env" ]; then
-    ok "CLAUDE_CODE_OAUTH_TOKEN already set in alice.env"
+if [ -n "$oauth_in_env" ]; then
+    ok "Subscription auth already configured (CLAUDE_CODE_OAUTH_TOKEN in alice.env)"
+elif [ -n "$api_base_in_env" ] || [ -n "$api_key_in_env" ]; then
+    ok "API auth already configured (ANTHROPIC_* in alice.env)"
 else
     cat <<EOF
 
-    Alice's worker authenticates to Claude with a long-lived OAuth token
-    in alice.env. (We do NOT use 'claude /login' — on macOS that token
-    lives in the system Keychain, which the container can't reach, and
-    on any platform it's short-lived and refreshes don't propagate
-    cleanly into the container.)
+    Alice's worker can authenticate to Claude two ways:
 
-    A browser will open. Sign in; the token is captured automatically
-    and written to alice.env.
+      [1] Claude subscription (default).
+          A browser opens; sign in once; we capture a long-lived OAuth
+          token (sk-ant-oat01-…) and write it to alice.env. Billing
+          uses your Claude subscription. We do NOT use 'claude /login'
+          — that token lives in the macOS Keychain (the container
+          can't reach it) and refreshes don't propagate cleanly.
+
+      [2] API key (direct or via LiteLLM proxy).
+          Use a raw Anthropic API key, optionally routed through a
+          LiteLLM proxy that maps to any backend. Billing follows
+          whichever service the key/proxy points at.
 
 EOF
-    token=""
-    if token=$(mint_token); then
-        ok "Token captured: ${#token} chars, ends …${token: -8}"
-        info "Compare to the token printed above — the last 8 chars should match."
+    auth_mode=""
+    while [ -z "$auth_mode" ]; do
+        choice="$(ask "Choose [1] subscription or [2] api" "1")"
+        case "$choice" in
+            1|sub|subscription) auth_mode="subscription" ;;
+            2|api|key)          auth_mode="api" ;;
+            *)                  warn "Pick 1 or 2." ;;
+        esac
+    done
+
+    if [ "$auth_mode" = "subscription" ]; then
+        info "A browser will open. Sign in; we'll capture the token automatically."
+        echo
+        token=""
+        if token=$(mint_token); then
+            ok "Token captured: ${#token} chars, ends …${token: -8}"
+            info "Compare to the token printed above — the last 8 chars should match."
+        else
+            info "Auto-capture didn't produce a token. Paste it manually:"
+            token=$(ask "Token (sk-ant-oat01-…) or empty to abort")
+            [ -z "$token" ] && fail "No token entered."
+        fi
+        write_var_to_env "CLAUDE_CODE_OAUTH_TOKEN" "$token"
+        ok "Token written to $ENV_FILE"
+        unset token
     else
-        info "Auto-capture didn't produce a token. Paste it manually:"
-        token=$(ask "Token (sk-ant-oat01-…) or empty to abort")
-        [ -z "$token" ] && fail "No token entered."
+        info "API mode. ANTHROPIC_BASE_URL is optional — leave blank to talk to"
+        info "api.anthropic.com directly; set it to your LiteLLM (or other"
+        info "Anthropic-compatible) proxy URL to route through there."
+        echo
+        api_base="$(ask "ANTHROPIC_BASE_URL (blank = direct anthropic)" "")"
+        api_key=""
+        while [ -z "$api_key" ]; do
+            api_key="$(ask "ANTHROPIC_API_KEY (required)")"
+            [ -z "$api_key" ] && warn "Required."
+        done
+        api_auth="$(ask "ANTHROPIC_AUTH_TOKEN (optional bearer for proxy)" "")"
+
+        write_var_to_env "ANTHROPIC_BASE_URL" "$api_base"
+        write_var_to_env "ANTHROPIC_API_KEY" "$api_key"
+        write_var_to_env "ANTHROPIC_AUTH_TOKEN" "$api_auth"
+        ok "API auth written to $ENV_FILE"
+        [ -n "$api_base" ] && info "Endpoint: $api_base" || info "Endpoint: (default Anthropic API)"
+        unset api_base api_key api_auth
     fi
 
-    write_token_to_env "$token"
-    ok "Token written to $ENV_FILE"
-    unset token
-
-    # The worker daemon caches CLAUDE_CODE_OAUTH_TOKEN into os.environ at
-    # startup (daemon.py:291). If the container is already running with a
-    # stale token, restart it so the fresh value takes effect.
+    # The worker daemon caches the resolved auth into os.environ at
+    # startup (daemon.run() → ensure_auth_env). If the container is
+    # already running with a stale value, restart it so the fresh
+    # config takes effect.
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx alice-worker-blue; then
-        info "Restarting alice-worker-blue so it picks up the new token…"
+        info "Restarting alice-worker-blue so it picks up the new auth…"
         docker restart alice-worker-blue >/dev/null
     fi
-    # Re-source so the rest of the script sees it.
+    # Re-source so the rest of the script sees the new vars.
     set -a
     # shellcheck disable=SC1090
     source "$ENV_FILE"

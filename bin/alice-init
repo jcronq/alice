@@ -219,16 +219,26 @@ cat <<EOF
 EOF
 
 step=3
-# Always nudge toward the long-lived token. We do not direct users to
+# Pick ONE of the two auth modes. We don't direct users to
 # 'claude /login' because on macOS that token lives in the system
 # Keychain (unreachable from the container), and even on Linux a
 # refresh in ~/.claude/.credentials.json doesn't always propagate
 # cleanly through the bind mount.
 cat <<EOF
-$step. Mint a long-lived Claude OAuth token (one-time):
-      claude setup-token      # opens a browser; copy the printed token
-   Then add it to $cfg_file:
-      CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-…
+$step. Authenticate to Claude — pick ONE of:
+
+   a) Subscription (Claude account, long-lived OAuth token):
+        claude setup-token       # opens a browser; copy the token
+      Then add to $cfg_file:
+        CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-…
+
+   b) API key (direct Anthropic, or via LiteLLM / any proxy):
+      Add to $cfg_file:
+        ANTHROPIC_API_KEY=sk-…
+        ANTHROPIC_BASE_URL=         # blank = direct anthropic;
+                                    # set to your proxy URL otherwise.
+
+   (./install.sh prompts you for these; alice-init only scaffolds the file.)
 
 EOF
 step=$((step + 1))
