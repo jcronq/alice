@@ -1,30 +1,15 @@
 {% extends "base.html" %}
 {% block title %}turns{% endblock %}
 {% block body %}
-  <h1>speaking turns · {{ turns | length }}</h1>
+  <h1>speaking turns · {{ total_turns }}</h1>
   <table>
     <thead>
       <tr>
         <th>when</th><th>kind</th><th>who/what</th><th>inbound</th><th>outbound</th><th>dur</th><th>cost</th><th>tools</th><th>turn id</th>
       </tr>
     </thead>
-    <tbody>
-      {% for t in turns %}
-        <tr>
-          <td class="mono">{{ t.start_ts | localtime }}<br><span class="muted">{{ t.start_ts | ago }}</span></td>
-          <td><span class="badge speaking">{{ t.kind }}</span></td>
-          <td class="mono">{{ t.sender_name or t.surface_id or t.emergency_id or '—' }}</td>
-          <td class="wrap">{{ (t.inbound or '')[:200] }}{% if (t.inbound or '') | length > 200 %}…{% endif %}</td>
-          <td class="wrap">
-            {% if t.error %}<span style="color:var(--err)">{{ t.error }}</span>
-            {% else %}{{ (t.outbound or '')[:200] }}{% if (t.outbound or '') | length > 200 %}…{% endif %}{% endif %}
-          </td>
-          <td class="mono">{% if t.duration_ms %}{{ (t.duration_ms / 1000.0) | round(1) }}s{% else %}—{% endif %}</td>
-          <td class="mono">{% if t.total_cost_usd %}${{ t.total_cost_usd | round(4) }}{% else %}—{% endif %}</td>
-          <td class="mono">{{ t.tools | join(', ') or '—' }}</td>
-          <td><a href="/turns/{{ t.turn_id }}">{{ t.turn_id }}</a></td>
-        </tr>
-      {% endfor %}
+    <tbody id="turns-body">
+      {% include "_turns_partial.html" %}
     </tbody>
   </table>
 {% endblock %}

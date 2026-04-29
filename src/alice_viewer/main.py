@@ -153,22 +153,54 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         return JSONResponse([r.to_dict() for r in runs[:limit]])
 
     @app.get("/wakes", response_class=HTMLResponse)
-    async def wakes_index(request: Request):
+    async def wakes_index(request: Request, limit: int = 50):
         from . import run_summary
 
         p: Paths = app.state.paths
         events = sources.load_all(p)
         wakes = aggregators.group_wakes(events)
-        summaries = {w.wake_id: aggregators.summarize_wake(w, run_summary) for w in wakes}
         wakes.reverse()
+        total = len(wakes)
+        page = wakes[:limit]
+        summaries = {w.wake_id: aggregators.summarize_wake(w, run_summary) for w in page}
         return templates.TemplateResponse(
             request,
             "wakes.html",
             {
-                "wakes": wakes,
+                "wakes": page,
                 "summaries": summaries,
+                "total_wakes": total,
+                "limit": limit,
+                "next_offset": limit,
+                "has_more": total > limit,
                 "state": _state_context(),
                 "active": "wakes",
+            },
+        )
+
+    @app.get("/wakes/page", response_class=HTMLResponse)
+    async def wakes_page(request: Request, offset: int = 0, limit: int = 50):
+        """HTML partial for one page of wake rows + (optionally) a new
+        infinite-scroll sentinel. Called by HTMX when the previous
+        sentinel scrolls into view."""
+        from . import run_summary
+
+        p: Paths = app.state.paths
+        events = sources.load_all(p)
+        wakes = aggregators.group_wakes(events)
+        wakes.reverse()
+        page = wakes[offset : offset + limit]
+        summaries = {w.wake_id: aggregators.summarize_wake(w, run_summary) for w in page}
+        next_offset = offset + limit
+        return templates.TemplateResponse(
+            request,
+            "_wakes_partial.html",
+            {
+                "wakes": page,
+                "summaries": summaries,
+                "limit": limit,
+                "next_offset": next_offset,
+                "has_more": next_offset < len(wakes),
             },
         )
 
@@ -219,19 +251,48 @@ def create_app(paths: Paths | None = None) -> FastAPI:
                     break
 
     @app.get("/turns", response_class=HTMLResponse)
-    async def turns_index(request: Request):
+    async def turns_index(request: Request, limit: int = 50):
         p: Paths = app.state.paths
         events = sources.load_all(p)
         turns = aggregators.group_turns(events)
         _enrich_turns_with_outbound(turns, p)
         turns.reverse()
+        total = len(turns)
+        page = turns[:limit]
         return templates.TemplateResponse(
             request,
             "turns.html",
             {
-                "turns": turns,
+                "turns": page,
+                "total_turns": total,
+                "limit": limit,
+                "next_offset": limit,
+                "has_more": total > limit,
                 "state": _state_context(),
                 "active": "turns",
+            },
+        )
+
+    @app.get("/turns/page", response_class=HTMLResponse)
+    async def turns_page(request: Request, offset: int = 0, limit: int = 50):
+        """HTML partial for one page of turn rows + (optionally) a new
+        infinite-scroll sentinel. Called by HTMX when the previous
+        sentinel scrolls into view."""
+        p: Paths = app.state.paths
+        events = sources.load_all(p)
+        turns = aggregators.group_turns(events)
+        _enrich_turns_with_outbound(turns, p)
+        turns.reverse()
+        page = turns[offset : offset + limit]
+        next_offset = offset + limit
+        return templates.TemplateResponse(
+            request,
+            "_turns_partial.html",
+            {
+                "turns": page,
+                "limit": limit,
+                "next_offset": next_offset,
+                "has_more": next_offset < len(turns),
             },
         )
 

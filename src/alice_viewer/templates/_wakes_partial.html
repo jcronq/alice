@@ -1,0 +1,28 @@
+{# One page of wake rows + (optionally) an HTMX sentinel that fetches
+   the next page when scrolled into view. Included by wakes.html for
+   the first page; rendered standalone by /wakes/page for subsequent
+   pages (replaces the previous sentinel via hx-swap=outerHTML). #}
+{% for w in wakes %}
+  <tr>
+    <td class="mono">{{ w.start_ts | localtime }}<br><span class="muted">{{ w.start_ts | ago }}</span></td>
+    <td>{{ summaries.get(w.wake_id, '') }}</td>
+    <td>{% if w.status == 'ended' %}<span class="muted">ended</span>
+        {% elif w.status == 'timeout' %}<span style="color:var(--warn)">timeout</span>
+        {% elif w.status == 'exception' %}<span style="color:var(--err)">exception</span>
+        {% else %}<span style="color:var(--ok)">{{ w.status }}</span>{% endif %}</td>
+    <td class="mono">{{ w.model or '—' }}</td>
+    <td class="mono">{% if w.duration_ms %}{{ (w.duration_ms / 1000.0) | round(1) }}s{% else %}—{% endif %}</td>
+    <td class="mono">{% if w.total_cost_usd %}${{ w.total_cost_usd | round(4) }}{% else %}—{% endif %}</td>
+    <td class="mono">{{ w.tools | join(', ') or '—' }}</td>
+    <td class="mono">{{ w.event_count if w.event_count is defined else (w.events | length) }}</td>
+    <td><a href="/wakes/{{ w.wake_id }}">{{ w.wake_id }}</a></td>
+  </tr>
+{% endfor %}
+{% if has_more %}
+  <tr class="wakes-sentinel"
+      hx-get="/wakes/page?offset={{ next_offset }}&limit={{ limit }}"
+      hx-trigger="revealed"
+      hx-swap="outerHTML">
+    <td colspan="9" class="muted" style="padding:14px;text-align:center;font-size:11px">loading more…</td>
+  </tr>
+{% endif %}

@@ -1,0 +1,28 @@
+{# One page of turn rows + (optionally) an HTMX sentinel that fetches
+   the next page when scrolled into view. Included by turns.html for
+   the first page; rendered standalone by /turns/page for subsequent
+   pages (replaces the previous sentinel via hx-swap=outerHTML). #}
+{% for t in turns %}
+  <tr>
+    <td class="mono">{{ t.start_ts | localtime }}<br><span class="muted">{{ t.start_ts | ago }}</span></td>
+    <td><span class="badge speaking">{{ t.kind }}</span></td>
+    <td class="mono">{{ t.sender_name or t.surface_id or t.emergency_id or '—' }}</td>
+    <td class="wrap">{{ (t.inbound or '')[:200] }}{% if (t.inbound or '') | length > 200 %}…{% endif %}</td>
+    <td class="wrap">
+      {% if t.error %}<span style="color:var(--err)">{{ t.error }}</span>
+      {% else %}{{ (t.outbound or '')[:200] }}{% if (t.outbound or '') | length > 200 %}…{% endif %}{% endif %}
+    </td>
+    <td class="mono">{% if t.duration_ms %}{{ (t.duration_ms / 1000.0) | round(1) }}s{% else %}—{% endif %}</td>
+    <td class="mono">{% if t.total_cost_usd %}${{ t.total_cost_usd | round(4) }}{% else %}—{% endif %}</td>
+    <td class="mono">{{ t.tools | join(', ') or '—' }}</td>
+    <td><a href="/turns/{{ t.turn_id }}">{{ t.turn_id }}</a></td>
+  </tr>
+{% endfor %}
+{% if has_more %}
+  <tr class="turns-sentinel"
+      hx-get="/turns/page?offset={{ next_offset }}&limit={{ limit }}"
+      hx-trigger="revealed"
+      hx-swap="outerHTML">
+    <td colspan="9" class="muted" style="padding:14px;text-align:center;font-size:11px">loading more…</td>
+  </tr>
+{% endif %}
