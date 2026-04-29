@@ -23,14 +23,20 @@ from .base import (
     Transport,
 )
 from .cli import CLITransport
-from .discord import DiscordTransport
 from .signal import SignalTransport
+
+# DiscordTransport is intentionally NOT re-exported here: ``transports.discord``
+# does ``import discord`` at module top, so importing it eagerly would crash
+# the speaking daemon at startup whenever the optional ``discord.py``
+# dependency isn't installed (or the worker image is stale). Callers that
+# actually need DiscordTransport import it lazily from
+# ``alice_speaking.transports.discord`` only when a Discord bot token is
+# configured. See daemon.py.
 
 __all__ = [
     "Capabilities",
     "ChannelRef",
     "CLITransport",
-    "DiscordTransport",
     "InboundMessage",
     "OutboundMessage",
     "Principal",

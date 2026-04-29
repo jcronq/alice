@@ -45,7 +45,10 @@ import signal as _signal
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
+
+if TYPE_CHECKING:
+    from .transports.discord import DiscordTransport
 
 from alice_core.auth import ensure_auth_env
 from alice_core.kernel import AgentKernel, KernelSpec
@@ -68,11 +71,14 @@ from .tools.messaging import SELF_RECIPIENT, ResolvedRecipient
 from .transports import (
     CLITransport,
     ChannelRef,
-    DiscordTransport,
     InboundMessage,
     OutboundMessage,
     SignalTransport,
 )
+# DiscordTransport is imported lazily below, only when the daemon is actually
+# configured to use Discord. Module-top ``import discord`` in transports.discord
+# would otherwise crash the daemon at import time when discord.py isn't
+# installed (e.g. stale worker image after a Dockerfile bump).
 from .transports.base import SIGNAL_CAPS
 from .turn_log import TurnLog, new_turn
 
@@ -265,12 +271,13 @@ class SpeakingDaemon:
 
         # Discord transport — optional. Constructed only when a bot token
         # is configured; absent token = transport stays None and existing
-        # deploys keep working unchanged.
-        self.discord_transport: Optional[DiscordTransport] = (
-            DiscordTransport(token=cfg.discord_bot_token)
-            if cfg.discord_bot_token
-            else None
-        )
+        # deploys keep working unchanged. The import itself is lazy: the
+        # transport module top-imports ``discord``, which would otherwise
+        # crash the daemon at startup when the optional dep is missing.
+        self.discord_transport: Optional["DiscordTransport"] = None
+        if cfg.discord_bot_token:
+            from .transports.discord import DiscordTransport
+            self.discord_transport = DiscordTransport(token=cfg.discord_bot_token)
 
         self._queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=64)
         self._dispatched_surfaces: set[str] = set()
