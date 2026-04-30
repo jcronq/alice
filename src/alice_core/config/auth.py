@@ -1,6 +1,6 @@
 """Auth-env loading — unified across hemispheres.
 
-Two auth modes are supported:
+Three auth modes are supported (Plan 06 added the third):
 
 - ``subscription`` — long-lived OAuth token from Anthropic's web flow,
   stored in ``alice.env`` as ``CLAUDE_CODE_OAUTH_TOKEN``. The Claude
@@ -10,11 +10,19 @@ Two auth modes are supported:
   ``ANTHROPIC_BASE_URL`` (proxy endpoint; omit for direct Anthropic
   API), ``ANTHROPIC_API_KEY``, and optionally ``ANTHROPIC_AUTH_TOKEN``
   (bearer-token style proxy auth).
+- ``bedrock`` — AWS Bedrock via ``CLAUDE_CODE_USE_BEDROCK=1``. AWS
+  credentials flow through the standard boto3 credential chain
+  (env vars, ``~/.aws/credentials``, EC2 instance profile).
+  ``auth.py`` only manages the SDK-facing flag + region/profile
+  hints; it doesn't touch ``AWS_ACCESS_KEY_ID`` etc.
 
-The mode is picked implicitly: presence of ``ANTHROPIC_BASE_URL`` or
-``ANTHROPIC_API_KEY`` selects ``api``; otherwise ``subscription``. When
-``api`` is active we explicitly clear ``CLAUDE_CODE_OAUTH_TOKEN`` from
-the subprocess env — the CLI gets confused if both are set.
+Without a ``mode_hint`` argument the mode is picked implicitly:
+presence of ``ANTHROPIC_BASE_URL`` or ``ANTHROPIC_API_KEY`` selects
+``api``; ``CLAUDE_CODE_OAUTH_TOKEN`` selects ``subscription``;
+otherwise ``none``. With a ``mode_hint`` the caller chooses
+explicitly — Plan 06 wires this from ``mind/config/model.yml`` so a
+hemisphere can declare ``backend: bedrock`` without setting any env
+vars first.
 
 The Agent SDK reads these vars from the subprocess environment, so
 :func:`ensure_auth_env` mutates ``os.environ`` once at process startup
@@ -26,14 +34,15 @@ from __future__ import annotations
 import os
 import pathlib
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Optional
 
 
 DEFAULT_ALICE_ENV = pathlib.Path.home() / ".config" / "alice" / "alice.env"
 
-AuthMode = Literal["subscription", "api", "none"]
+AuthMode = Literal["subscription", "api", "bedrock", "none"]
 
 _API_VARS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+_BEDROCK_VARS = ("CLAUDE_CODE_USE_BEDROCK", "AWS_REGION", "AWS_PROFILE")
 
 
 @dataclass(frozen=True)
@@ -45,6 +54,8 @@ class AuthEnv:
     api_key: str = ""
     auth_token: str = ""
     base_url: str = ""
+    aws_region: str = ""
+    aws_profile: str = ""
 
 
 def _resolve_env_path(env_file: pathlib.Path | None) -> pathlib.Path | None:
@@ -75,13 +86,26 @@ def _load_env_file(path: pathlib.Path) -> dict[str, str]:
     return out
 
 
-def find_auth_env(env_file: pathlib.Path | None = None) -> AuthEnv:
+def find_auth_env(
+    env_file: pathlib.Path | None = None,
+    *,
+    mode_hint: Optional[AuthMode] = None,
+    aws_region: str = "",
+    aws_profile: str = "",
+) -> AuthEnv:
     """Resolve auth settings from process env and alice.env (in that order).
 
     Returns an :class:`AuthEnv` with ``mode`` set based on which vars are
     populated. ``mode == "none"`` means nothing was found — the caller
     decides whether that's fatal (the SDK can still fall back to a host
     ``~/.claude/.credentials.json`` symlinked into the container).
+
+    ``mode_hint`` lets a caller pin the mode explicitly (Plan 06's
+    ``model.yml``: hemispheres declare ``backend: bedrock`` and pass
+    that down). When ``mode_hint`` is ``None`` the implicit-from-env
+    logic above runs unchanged so minds without ``model.yml`` keep
+    working. ``aws_region`` / ``aws_profile`` only matter for
+    ``mode_hint == "bedrock"``.
     """
     file_env: dict[str, str] = {}
     path = _resolve_env_path(env_file)
@@ -95,9 +119,14 @@ def find_auth_env(env_file: pathlib.Path | None = None) -> AuthEnv:
     api_key = pick("ANTHROPIC_API_KEY")
     auth_token = pick("ANTHROPIC_AUTH_TOKEN")
     oauth_token = pick("CLAUDE_CODE_OAUTH_TOKEN")
+    region = aws_region or pick("AWS_REGION")
+    profile = aws_profile or pick("AWS_PROFILE")
 
-    if base_url or api_key or auth_token:
-        mode: AuthMode = "api"
+    mode: AuthMode
+    if mode_hint is not None:
+        mode = mode_hint
+    elif base_url or api_key or auth_token:
+        mode = "api"
     elif oauth_token:
         mode = "subscription"
     else:
@@ -109,21 +138,44 @@ def find_auth_env(env_file: pathlib.Path | None = None) -> AuthEnv:
         api_key=api_key,
         auth_token=auth_token,
         base_url=base_url,
+        aws_region=region,
+        aws_profile=profile,
     )
 
 
-def ensure_auth_env(env_file: pathlib.Path | None = None) -> AuthEnv:
+def ensure_auth_env(
+    env_file: pathlib.Path | None = None,
+    *,
+    mode_hint: Optional[AuthMode] = None,
+    aws_region: str = "",
+    aws_profile: str = "",
+) -> AuthEnv:
     """Resolve auth settings and write the right vars into ``os.environ``.
 
     The Claude Code CLI subprocess inherits the parent environment, so we
-    set what we want it to see and clear what we don't. In ``subscription``
-    mode this means ``CLAUDE_CODE_OAUTH_TOKEN`` set, ``ANTHROPIC_*`` clear.
-    In ``api`` mode it's the inverse.
+    set what we want it to see and clear what we don't. ``subscription``
+    mode sets ``CLAUDE_CODE_OAUTH_TOKEN`` and clears the rest;
+    ``api`` mode sets ``ANTHROPIC_*`` and clears the rest;
+    ``bedrock`` mode sets ``CLAUDE_CODE_USE_BEDROCK=1`` (+ optional
+    ``AWS_REGION`` / ``AWS_PROFILE``) and clears the rest. Note that
+    bedrock mode doesn't touch ``AWS_ACCESS_KEY_ID`` etc. — boto3's
+    credential chain handles those.
+
+    ``mode_hint``, ``aws_region``, ``aws_profile`` are forwarded to
+    :func:`find_auth_env` to support Plan 06's per-hemisphere
+    backend selection.
     """
-    auth = find_auth_env(env_file)
+    auth = find_auth_env(
+        env_file,
+        mode_hint=mode_hint,
+        aws_region=aws_region,
+        aws_profile=aws_profile,
+    )
 
     if auth.mode == "api":
         os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        for key in _BEDROCK_VARS:
+            os.environ.pop(key, None)
         for key, value in (
             ("ANTHROPIC_BASE_URL", auth.base_url),
             ("ANTHROPIC_API_KEY", auth.api_key),
@@ -135,6 +187,17 @@ def ensure_auth_env(env_file: pathlib.Path | None = None) -> AuthEnv:
                 os.environ.pop(key, None)
     elif auth.mode == "subscription":
         os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = auth.oauth_token
+        for key in _API_VARS:
+            os.environ.pop(key, None)
+        for key in _BEDROCK_VARS:
+            os.environ.pop(key, None)
+    elif auth.mode == "bedrock":
+        os.environ["CLAUDE_CODE_USE_BEDROCK"] = "1"
+        if auth.aws_region:
+            os.environ["AWS_REGION"] = auth.aws_region
+        if auth.aws_profile:
+            os.environ["AWS_PROFILE"] = auth.aws_profile
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
         for key in _API_VARS:
             os.environ.pop(key, None)
     # mode == "none": leave environment untouched; SDK falls back to
