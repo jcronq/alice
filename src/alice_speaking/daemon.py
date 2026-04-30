@@ -70,6 +70,7 @@ from .internal import (
 from .outbox import OutboxRouter
 from .principals import AddressBook
 from .quiet_hours import QuietQueue, is_quiet_hours
+from .quiet_queue_runner import QuietQueueRunner
 from .signal_client import SignalClient
 from .tools.messaging import SELF_RECIPIENT, ResolvedRecipient
 from .transports import (
@@ -97,8 +98,6 @@ from .turn_log import TurnLog
 
 log = logging.getLogger("alice_speaking")
 
-
-QUIET_CHECK_SECONDS = 30.0
 
 # Turns after which tail-trim happens when composing the summary preamble.
 # Matches the design: 5 verbatim turns bridge the gap between summary
@@ -315,6 +314,17 @@ class SpeakingDaemon:
         # owns the same invariant explicitly.
         self._turn_lock: asyncio.Lock = asyncio.Lock()
         self._stop = asyncio.Event()
+        # Phase 6c of plan 01: quiet-hours queue watcher + drain
+        # entry point live on QuietQueueRunner. Daemon's run loop
+        # schedules ``runner.watch()`` and the startup path calls
+        # ``runner.drain()``.
+        self.quiet_queue_runner = QuietQueueRunner(
+            speaking_cfg=cfg.speaking,
+            quiet_queue=self.quiet_queue,
+            events=self.events,
+            dispatch_outbound=self._dispatch_outbound,
+            stop_event=self._stop,
+        )
         self._config_path = cfg.mind_dir / "config" / "alice.config.json"
         self._config_mtime: float = (
             self._config_path.stat().st_mtime if self._config_path.is_file() else 0.0
@@ -353,7 +363,7 @@ class SpeakingDaemon:
 
             # If quiet hours ended while we were down, drain the queue first.
             if not is_quiet_hours(self.cfg.speaking) and self.quiet_queue.size() > 0:
-                await self._drain_quiet_queue(reason="startup")
+                await self.quiet_queue_runner.drain(reason="startup")
 
             # Prime the Layer 2 bootstrap preamble if we don't have a
             # session to resume. The consumer picks it up on the first turn.
@@ -375,7 +385,9 @@ class SpeakingDaemon:
             await factory_module.run_startup_phase(self._registry, ctx)
 
             producers: list[asyncio.Task] = [
-                asyncio.create_task(self._quiet_watcher(), name="quiet-watch"),
+                asyncio.create_task(
+                    self.quiet_queue_runner.watch(), name="quiet-watch"
+                ),
             ]
             for source in self._registry.all_event_sources():
                 # Transports that need a network-level handshake
@@ -523,51 +535,11 @@ class SpeakingDaemon:
     # (Phase 6c of plan 01) — handlers in :mod:`_dispatch` reach
     # ``ctx.<name>_transport.build_prompt(...)``.
 
-    async def _quiet_watcher(self) -> None:
-        """Poll quiet-hours state; drain the queue on transition out."""
-        was_quiet = is_quiet_hours(self.cfg.speaking)
-        while not self._stop.is_set():
-            await asyncio.sleep(QUIET_CHECK_SECONDS)
-            now_quiet = is_quiet_hours(self.cfg.speaking)
-            if was_quiet and not now_quiet:
-                await self._drain_quiet_queue(reason="quiet-hours-ended")
-            was_quiet = now_quiet
-
-    async def _drain_quiet_queue(self, *, reason: str) -> None:
-        messages = self.quiet_queue.drain()
-        if not messages:
-            return
-        log.info("draining quiet queue (%d msgs) — %s", len(messages), reason)
-        self.events.emit("quiet_queue_drain", count=len(messages), reason=reason)
-        for msg in messages:
-            channel = ChannelRef(
-                transport=msg.transport,
-                address=msg.recipient,
-                durable=True,
-            )
-            try:
-                await self._dispatch_outbound(
-                    channel,
-                    msg.text,
-                    bypass_quiet=True,  # we're past the window already
-                )
-            except Exception:  # noqa: BLE001
-                log.exception(
-                    "failed to send queued %s message to %s; re-queueing",
-                    msg.transport,
-                    msg.recipient,
-                )
-                self.quiet_queue.append(msg)
-
-    # ------------------------------------------------------------------
-    # Surface helpers — :func:`_dispatch.handle_surface` reaches back
-    # into these via the DaemonContext proxy.
-
-    # ------------------------------------------------------------------
-    # Surface / emergency archive: now owned by the watcher classes
-    # (Phase 6c of plan 01). _dispatch reaches them as
-    # ``ctx._surface_watcher.archive_unresolved(...)`` /
-    # ``ctx._emergency_watcher.archive(...)``.
+    # Quiet-hours queue watcher + manual drain live on
+    # :class:`QuietQueueRunner` (Phase 6c of plan 01). Surface /
+    # emergency archive live on the watcher classes
+    # (``ctx._surface_watcher.archive_unresolved(...)`` /
+    # ``ctx._emergency_watcher.archive(...)``).
 
     # ------------------------------------------------------------------
     # send_message router (closure given to tools.messaging)
