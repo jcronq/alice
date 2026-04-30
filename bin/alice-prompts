@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# alice-prompts — inventory + render + validate the prompt templates.
+#
+# Plan 04 Phase 8 of the speaking refactor. Useful for plan 05/07
+# review and for anyone who wants to see what a prompt looks like
+# with realistic context.
+#
+# Usage:
+#   alice-prompts list
+#   alice-prompts render <name> [--context-file PATH]
+#   alice-prompts validate
+#
+# Runs from the host's editable venv (the one used for tests).
+# Inside the worker container the same module is invokable as
+#   /opt/alice-venv/bin/python -m alice_prompts.cli <args>
+#
+# We pick a Python interpreter the same way bin/alice-think does:
+# venv first, fall back to system python3 if the user runs this on
+# a fresh checkout without the venv yet.
+
+set -eu
+
+ALICE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+if [ -x "$ALICE_ROOT/.venv/bin/python3" ]; then
+    PY="$ALICE_ROOT/.venv/bin/python3"
+elif [ -x "/opt/alice-venv/bin/python" ]; then
+    PY="/opt/alice-venv/bin/python"
+else
+    PY="$(command -v python3)"
+fi
+
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$ALICE_ROOT/src"
+exec "$PY" -m alice_prompts.cli "$@"
