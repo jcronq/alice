@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Alice Viewer · {% block title %}{% endblock %}</title>
+  <title>{{ personae.agent.name }} Viewer · {% block title %}{% endblock %}</title>
   <link rel="stylesheet" href="/static/style.css" />
   <script src="https://unpkg.com/htmx.org@1.9.12"></script>
   <script src="https://unpkg.com/htmx.org@1.9.12/dist/ext/sse.js"></script>
@@ -16,7 +16,7 @@
   <header class="topbar">
     <div class="brand">
       <span class="logo">◑</span>
-      <span>Alice Viewer</span>
+      <span>{{ personae.agent.name }} Viewer</span>
     </div>
     <nav>
       <a href="/"           class="{% if active == 'timeline' %}on{% endif %}">timeline</a>

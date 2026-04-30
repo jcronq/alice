@@ -24,8 +24,30 @@ STATIC_DIR = BASE_DIR / "static"
 
 
 def create_app(paths: Paths | None = None) -> FastAPI:
-    app = FastAPI(title="Alice Viewer", version="0.1.0")
-    app.state.paths = paths or load_paths()
+    # Plan 05 Phase 6: load personae before constructing the FastAPI
+    # app so the chrome (title, header, narrative copy) can use the
+    # configured agent name instead of hardcoding "Alice".
+    from alice_core.config.personae import (
+        PersonaeError,
+        load as load_personae,
+        placeholder as placeholder_personae,
+    )
+
+    resolved_paths = paths or load_paths()
+    try:
+        personae = load_personae(resolved_paths.mind_dir)
+    except FileNotFoundError:
+        personae = placeholder_personae()
+    except PersonaeError:
+        # Surface but don't crash the viewer — the operator should be
+        # able to read narrative even with a half-edited personae.yml.
+        personae = placeholder_personae()
+
+    app = FastAPI(
+        title=f"{personae.agent.name} Viewer", version="0.1.0"
+    )
+    app.state.paths = resolved_paths
+    app.state.personae = personae
     # Plan 06 Phase 4: load mind/config/model.yml so the viewer's
     # narrative + run_summary calls can route to the operator's
     # configured backend. Missing file → subscription default
@@ -42,6 +64,10 @@ def create_app(paths: Paths | None = None) -> FastAPI:
     templates.env.filters["humanize_kind"] = kind_labels.humanize
     templates.env.filters["kind_family"] = kind_labels.family
     templates.env.filters["tool_results"] = sources.parse_tool_results
+    # Plan 05 Phase 6: every viewer template can reach the personae
+    # without each route having to thread it through. Templates
+    # use ``{{ personae.agent.name }}`` etc.
+    templates.env.globals["personae"] = personae
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 

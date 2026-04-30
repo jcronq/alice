@@ -71,7 +71,7 @@
         `${data.nodes.length} nodes · ${data.edges.length} edges`;
 
       if (!data.nodes.length) {
-        wrap.innerHTML = '<p class="muted" style="padding:20px">No memory notes yet. Alice\'s thinking hemisphere will populate <code>alice-mind/memory/</code> as she grooms.</p>';
+        wrap.innerHTML = '<p class="muted" style="padding:20px">No memory notes yet. {{ personae.agent.name }}\'s thinking hemisphere will populate <code>alice-mind/memory/</code> as she grooms.</p>';
         return;
       }
 
