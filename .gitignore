@@ -36,3 +36,6 @@ htmlcov/
 *.bak
 *.bak.*
 *.orig
+
+# Local Claude Code runtime state (wakeup locks, plan files)
+.claude/
