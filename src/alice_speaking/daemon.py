@@ -42,7 +42,6 @@ import logging
 import os
 import pathlib
 import signal as _signal
-import uuid
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -206,8 +205,11 @@ class SpeakingDaemon:
             sender=self._send_message,
         )
 
-        # Compaction bookkeeping.
-        self._compaction_pending: bool = False
+        # Compaction policy + state. Phase 6b of plan 01 replaced
+        # the bare ``self._compaction_pending`` flag with a
+        # CompactionTrigger that owns ``should_run(event)`` and the
+        # actual run orchestration. Both consumers go through it.
+        self.compaction = compaction_module.CompactionTrigger()
         # Per-turn did-send tracker. Set back to False at the start of each
         # call to _run_turn(); flipped to True by _send_message when Alice
         # explicitly sends. Used to flag missed_reply events.
@@ -470,28 +472,28 @@ class SpeakingDaemon:
                     )
                     continue
                 async with self._turn_lock:
-                    await self._pre_turn()
+                    await self._pre_turn(event)
                     await source.handle(ctx, event)
             except Exception:
                 log.exception("consumer error handling %s", type(event).__name__)
             finally:
                 self._queue.task_done()
 
-    async def _pre_turn(self) -> None:
+    async def _pre_turn(self, event: object) -> None:
         """Pre-turn services run before any handler.
 
-        Two consumers (the main loop and SignalTransport's per-transport
-        batch loop) call this; both must hold ``self._turn_lock`` so the
-        config reload + compaction trigger can't race. Phase 6 of plan
-        01 replaces the lock + this helper with a real
-        :class:`CompactionTrigger` that owns the policy.
+        Both consumers (the dispatcher main loop and SignalTransport's
+        per-transport batch loop) hold ``self._turn_lock`` and call
+        this so the config reload + compaction policy can't race.
+        Compaction runs BEFORE any inbound event so the token check
+        from the previous turn has a chance to roll the session
+        before we append more context. Phase 6b of plan 01 routes
+        the policy through :class:`CompactionTrigger.should_run` —
+        the deferral hook lives there.
         """
         self._maybe_reload_config()
-        # Compaction runs BEFORE any inbound event so the token check
-        # from the previous turn has a chance to roll the session
-        # before we append more context.
-        if self._compaction_pending:
-            await self._run_compaction()
+        if self.compaction.should_run(event):
+            await self.compaction.run(_dispatch_module.DaemonContext(self))
 
     def _maybe_reload_config(self) -> None:
         """Reload alice.config.json if it has changed on disk.
@@ -1015,7 +1017,7 @@ class SpeakingDaemon:
             self.session_id = sid
 
         def _arm_compaction() -> None:
-            self._compaction_pending = True
+            self.compaction.arm()
 
         handlers: list = [
             SessionHandler(
@@ -1096,52 +1098,8 @@ class SpeakingDaemon:
                 "primed bootstrap preamble from turn_log (%d turns)", len(tail)
             )
 
-    async def _run_compaction(self) -> None:
-        """Run a silent compaction turn, write the summary, roll the
-        session."""
-        turn_id = f"compact-{uuid.uuid4().hex[:8]}"
-        self.events.emit("context_compaction_start", turn_id=turn_id)
-        try:
-            summary = await self._run_turn(
-                compaction_module.COMPACTION_PROMPT,
-                turn_id=turn_id,
-                outbound_recipient=None,
-                silent=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.exception("compaction turn failed; leaving session intact")
-            self.events.emit(
-                "context_compaction_error",
-                turn_id=turn_id,
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            self._compaction_pending = False
-            return
-
-        if not summary:
-            log.warning("compaction turn returned empty summary; rolling anyway")
-            summary = "(compaction produced no summary — session rolled on empty)"
-
-        try:
-            compaction_module.write_summary(self._summary_path, summary)
-        except OSError:
-            log.exception("failed to write %s", self._summary_path)
-
-        # Roll.
-        old_sid = self.session_id
-        self.session_id = None
-        session_state.clear(self._session_path)
-        self._compaction_pending = False
-        self.events.emit(
-            "context_compaction",
-            turn_id=turn_id,
-            summary_len=len(summary),
-            previous_session_id=old_sid,
-        )
-        self.events.emit("session_roll", previous_session_id=old_sid)
-
-        # Prime the next real turn with the summary injection.
-        self._prime_bootstrap_preamble()
+    # Compaction execution lives on :class:`CompactionTrigger`
+    # (Phase 6b of plan 01); reach it via ``self.compaction.run``.
 
 
 async def _amain() -> None:

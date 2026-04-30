@@ -340,14 +340,17 @@ def test_token_threshold_arms_compaction(cfg, monkeypatch) -> None:
     asyncio.run(
         d._run_turn("hi", turn_id="t1", outbound_recipient="+15555550100")
     )
-    assert d._compaction_pending is True
+    # Phase 6b of plan 01: pending state lives on the trigger.
+    assert d.compaction.pending() is True
 
 
 def test_compaction_rolls_session_and_writes_summary(cfg, monkeypatch) -> None:
+    from alice_speaking import _dispatch as _dispatch_module
+
     d = _make_daemon(cfg, monkeypatch)
     d.session_id = "to-be-rolled"
     session_state.write(d._session_path, "to-be-rolled")
-    d._compaction_pending = True
+    d.compaction.arm()  # Phase 6b: trigger owns the pending flag.
 
     summary_text = (
         "1. Active threads: none\n2. Owner's state: tired\n"
@@ -362,10 +365,12 @@ def test_compaction_rolls_session_and_writes_summary(cfg, monkeypatch) -> None:
 
     _patch_query(monkeypatch, msgs)
 
-    asyncio.run(d._run_compaction())
+    # Compaction execution moved to CompactionTrigger.run(ctx); reach
+    # it through the daemon-context proxy.
+    asyncio.run(d.compaction.run(_dispatch_module.DaemonContext(d)))
 
     assert d.session_id is None
-    assert d._compaction_pending is False
+    assert d.compaction.pending() is False
     assert not d._session_path.is_file()
     assert d._summary_path.is_file()
     assert summary_text.split("\n", 1)[0] in d._summary_path.read_text()

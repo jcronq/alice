@@ -187,7 +187,12 @@ class SignalTransport:
             try:
                 batch = self._drain_batch(head)
                 async with ctx._turn_lock:
-                    await ctx._pre_turn()
+                    # Plan 01 Phase 6b routes the compaction policy
+                    # through CompactionTrigger.should_run; pass the
+                    # batch head so the deep-thread deferral hook (TODO
+                    # — needs SessionDepthSignal) has the inbound event
+                    # to inspect.
+                    await ctx._pre_turn(head)
                     await handle_signal(ctx, batch)
             except Exception:  # noqa: BLE001
                 log.exception("signal consume error")
