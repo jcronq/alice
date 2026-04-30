@@ -3,6 +3,7 @@ FROM debian:trixie-slim
 ARG USER_ID=1000
 ARG GROUP_ID=1000
 ARG S6_OVERLAY_VERSION=3.2.2.0
+ARG TARGETARCH
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
@@ -37,12 +38,22 @@ RUN python3 -m venv /opt/alice-venv \
         'discord.py>=2.4' \
         'a2a-sdk[http-server]>=1.0.2'
 
-# s6-overlay for process supervision (bridge + autopush)
-ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz /tmp/
-ADD https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-x86_64.tar.xz /tmp/
-RUN tar -C / -Jxpf /tmp/s6-overlay-noarch.tar.xz \
-    && tar -C / -Jxpf /tmp/s6-overlay-x86_64.tar.xz \
-    && rm /tmp/s6-overlay-*.tar.xz
+# s6-overlay for process supervision (bridge + autopush). Arch-branched
+# because the upstream tarball is per-arch; ADD can't expand a shell var
+# mid-URL, so we curl. TARGETARCH is auto-populated by BuildKit from the
+# host platform (amd64 on x86_64 hosts, arm64 on aarch64 like DGX Spark).
+RUN case "${TARGETARCH}" in \
+        amd64) S6_ARCH=x86_64 ;; \
+        arm64) S6_ARCH=aarch64 ;; \
+        *)     echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz" \
+         -o /tmp/s6-noarch.tar.xz \
+    && curl -fsSL "https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-${S6_ARCH}.tar.xz" \
+         -o /tmp/s6-arch.tar.xz \
+    && tar -C / -Jxpf /tmp/s6-noarch.tar.xz \
+    && tar -C / -Jxpf /tmp/s6-arch.tar.xz \
+    && rm /tmp/s6-noarch.tar.xz /tmp/s6-arch.tar.xz
 
 # -o allows the GID/UID to collide with a stock Debian entry (macOS GID 20
 # overlaps `dialout`, etc.). Lookups are by name, so collisions are harmless.
