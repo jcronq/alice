@@ -26,17 +26,26 @@ stores the mapping and returns it on demand.
 
 from __future__ import annotations
 
-from typing import Iterable, Optional, Union
+from typing import TYPE_CHECKING, Iterable, Optional, Union
 
-from ..internal.base import InternalSource
-from ..startup.base import StartupSource
 from .base import Transport
 
+if TYPE_CHECKING:
+    # InternalSource / StartupSource are only referenced in annotations
+    # (every callsite below uses them through a string-evaluated type
+    # hint, courtesy of ``from __future__ import annotations``). Pulling
+    # them at runtime would create a cycle:
+    # ``transports/__init__`` imports this module, which would import
+    # ``internal.base``, which imports ``transports.base`` — and
+    # ``internal.base`` is mid-load when ``factory.py`` enters via the
+    # ``alice_speaking.factory`` path.
+    from ..internal.base import InternalSource
+    from ..startup.base import StartupSource
 
-# A "source" with a handler is either a Transport or an InternalSource —
-# both protocols carry the ``event_type`` / ``handle`` shape the
-# dispatcher needs.
-EventSource = Union[Transport, InternalSource]
+    # A "source" with a handler is either a Transport or an
+    # InternalSource — both protocols carry the
+    # ``event_type`` / ``handle`` shape the dispatcher needs.
+    EventSource = Union[Transport, InternalSource]
 
 
 class SourceRegistry:
