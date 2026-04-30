@@ -1,10 +1,16 @@
-"""Phase F of plan 05: thinking wake threads personae into KernelSpec.
+"""Plan 03 + Plan 05 Phase 4: thinking wake tests.
 
-The wake is a one-shot CLI; we don't need an end-to-end smoke. The
-load-bearing assertion is that the constructed ``KernelSpec`` carries
-``append_system_prompt`` containing the rendered persona fragment, so
-extending the kernel translates that to the SDK's ``system_prompt``
-preset shape.
+Two surfaces:
+
+- :mod:`alice_thinking.wake` — argparse + config loading + context build.
+- :mod:`alice_thinking.kernel_adapter` + :mod:`alice_thinking.modes` —
+  protocol-driven mode dispatch.
+
+Plan 03 Phase 1 split the original monolithic ``_run_wake`` into
+``run_wake(ctx, mode, emitter)`` driving a :class:`Mode`'s
+``build_prompt`` + ``kernel_spec``. Tests pin: the personae system
+prompt threads through; the mode + spec are observable; placeholder
+fallbacks still work.
 """
 
 from __future__ import annotations
@@ -13,44 +19,60 @@ import asyncio
 import pathlib
 from typing import Any
 
+from alice_thinking import kernel_adapter as ka
 from alice_thinking import wake as wake_module
+from alice_thinking.modes import ActiveMode, WakeContext
 
 
 class _CapturingEmitter:
-    def emit(self, event: str, **fields: Any) -> None:  # pragma: no cover
-        pass
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, Any]]] = []
+
+    def emit(self, event: str, **fields: Any) -> None:
+        self.events.append((event, fields))
+
+
+def _make_ctx(tmp_path: pathlib.Path, *, system_prompt: str = "") -> WakeContext:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from alice_core.config.personae import placeholder
+
+    return WakeContext(
+        mind_dir=tmp_path,
+        cwd=tmp_path,
+        now=datetime(2026, 4, 30, 14, 0, tzinfo=ZoneInfo("America/New_York")),
+        personae=placeholder(),
+        model="claude-sonnet-test",
+        max_seconds=0,
+        tools=[],
+        system_prompt=system_prompt,
+        quick=True,  # use the cheap quick prompt so we don't hit a real bootstrap
+    )
 
 
 def test_run_wake_passes_system_prompt_to_kernel(monkeypatch, tmp_path) -> None:
-    """``_run_wake`` constructs a KernelSpec with append_system_prompt;
-    a fake AgentKernel captures the spec it receives so we can pin
-    the field made it through."""
+    """The mode's KernelSpec carries append_system_prompt; the kernel
+    adapter does not modify it. Use ActiveMode + WakeContext for the
+    end-to-end shape."""
     captured: dict[str, Any] = {}
 
     class _FakeResult:
         error = None
 
     class _FakeKernel:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:  # noqa: D401
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
 
         async def run(self, prompt: str, spec: Any) -> _FakeResult:
             captured["spec"] = spec
+            captured["prompt"] = prompt
             return _FakeResult()
 
-    monkeypatch.setattr(wake_module, "AgentKernel", _FakeKernel)
+    monkeypatch.setattr(ka, "AgentKernel", _FakeKernel)
 
-    rc = asyncio.run(
-        wake_module._run_wake(
-            prompt_text="hi",
-            model="claude-sonnet-test",
-            tools=[],
-            cwd=tmp_path,
-            max_seconds=0,
-            emitter=_CapturingEmitter(),
-            system_prompt="You are Eve. Talk to Jordan.",
-        )
-    )
+    ctx = _make_ctx(tmp_path, system_prompt="You are Eve. Talk to Jordan.")
+    rc = asyncio.run(ka.run_wake(ctx=ctx, mode=ActiveMode(), emitter=_CapturingEmitter()))
     assert rc == 0
     assert captured["spec"].append_system_prompt == "You are Eve. Talk to Jordan."
 
@@ -58,8 +80,8 @@ def test_run_wake_passes_system_prompt_to_kernel(monkeypatch, tmp_path) -> None:
 def test_run_wake_with_empty_system_prompt_passes_none(
     monkeypatch, tmp_path
 ) -> None:
-    """An empty string is treated as ``None`` so the kernel skips
-    setting ``system_prompt`` entirely (back-compat for callers that
+    """Empty system_prompt → kernel sees None so it skips the
+    system_prompt kwarg entirely (back-compat with callers that
     don't render personae)."""
     captured: dict[str, Any] = {}
 
@@ -67,26 +89,45 @@ def test_run_wake_with_empty_system_prompt_passes_none(
         error = None
 
     class _FakeKernel:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:  # noqa: D401
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
 
         async def run(self, prompt: str, spec: Any) -> _FakeResult:
             captured["spec"] = spec
             return _FakeResult()
 
-    monkeypatch.setattr(wake_module, "AgentKernel", _FakeKernel)
+    monkeypatch.setattr(ka, "AgentKernel", _FakeKernel)
 
-    asyncio.run(
-        wake_module._run_wake(
-            prompt_text="hi",
-            model="m",
-            tools=[],
-            cwd=tmp_path,
-            max_seconds=0,
-            emitter=_CapturingEmitter(),
-        )
-    )
+    ctx = _make_ctx(tmp_path)
+    asyncio.run(ka.run_wake(ctx=ctx, mode=ActiveMode(), emitter=_CapturingEmitter()))
     assert captured["spec"].append_system_prompt is None
+
+
+def test_run_wake_emits_mode_in_envelope_events(monkeypatch, tmp_path) -> None:
+    """Plan 03: every wake emits ``mode=<name>`` on wake_start +
+    wake_end so the viewer / telemetry can attribute behavior to a
+    specific mode without parsing prompt bodies."""
+
+    class _FakeResult:
+        error = None
+
+    class _FakeKernel:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def run(self, prompt: str, spec: Any) -> _FakeResult:
+            return _FakeResult()
+
+    monkeypatch.setattr(ka, "AgentKernel", _FakeKernel)
+
+    emitter = _CapturingEmitter()
+    asyncio.run(
+        ka.run_wake(ctx=_make_ctx(tmp_path), mode=ActiveMode(), emitter=emitter)
+    )
+    starts = [f for ev, f in emitter.events if ev == "wake_start"]
+    ends = [f for ev, f in emitter.events if ev == "wake_end"]
+    assert starts and starts[0]["mode"] == "active"
+    assert ends and ends[0]["mode"] == "active"
 
 
 def test_load_personae_falls_back_to_placeholder(tmp_path: pathlib.Path) -> None:
@@ -97,7 +138,7 @@ def test_load_personae_falls_back_to_placeholder(tmp_path: pathlib.Path) -> None
 
 
 def test_render_system_prompt_includes_agent_and_user(
-    tmp_path: pathlib.Path, monkeypatch
+    tmp_path: pathlib.Path,
 ) -> None:
     """End-to-end: install loader + render system prompt with a
     fixture personae. Both names show up in the rendered string."""
