@@ -1,0 +1,53 @@
+"""ConsolidationStage (Stage B) — sleep-mode default sub-stage.
+
+Phase 3 implementation: identical kernel spec + prompt as
+:class:`ActiveMode`. The point of Phase 3 is the *shape* — the
+selector dispatches to a Stage object that the kernel adapter
+treats like any other mode. Phase 4 differentiates the prompt
+body (Stage B-specific operations: inbox drain, link audit, etc.).
+
+The class name appears in the ``mode`` field of ``wake_start`` /
+``wake_end`` events as ``"sleep:consolidate"`` so the viewer can
+attribute behavior even before Phase 4 lands.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from alice_core.kernel import KernelSpec
+
+from ..base import WakeContext, _NullPostRun
+
+
+if TYPE_CHECKING:
+    from alice_core.kernel import KernelResult
+
+
+class ConsolidationStage(_NullPostRun):
+    """Stage B: vault consolidation. Phase 3 stub mirrors ActiveMode."""
+
+    name = "sleep:consolidate"
+
+    def kernel_spec(self, ctx: WakeContext) -> KernelSpec:
+        return KernelSpec(
+            model=ctx.model,
+            allowed_tools=list(ctx.tools),
+            cwd=ctx.cwd,
+            max_seconds=ctx.max_seconds,
+            thinking={"type": "adaptive", "display": "summarized"},
+            append_system_prompt=ctx.system_prompt or None,
+        )
+
+    async def build_prompt(self, ctx: WakeContext) -> str:
+        # Phase 3 stub: same prompt source as ActiveMode. Phase 4
+        # introduces a stage-specific template.
+        if ctx.quick:
+            from alice_prompts import load as load_prompt
+
+            return load_prompt("thinking.quick")
+        if ctx.inline_prompt:
+            return ctx.inline_prompt
+        from ..._prompt_assembly import build_active_prompt
+
+        return build_active_prompt(now=ctx.now, directive_path=ctx.directive_path)

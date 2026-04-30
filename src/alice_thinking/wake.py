@@ -39,7 +39,9 @@ from alice_core.events import EventLogger
 from ._prompt_assembly import WAKE_TZ, wake_timestamp_header
 from .kernel_adapter import run_wake
 from .modes.base import WakeContext
+from .modes.sleep import SleepMode
 from .selector import select_mode
+from .vault_state import snapshot as snapshot_vault
 
 
 DEFAULT_MIND = pathlib.Path("/home/alice/alice-mind")
@@ -222,9 +224,19 @@ def main() -> int:
     _install_prompt_loader(mind, personae)
 
     ctx = _build_context(args, personae)
-    mode = select_mode(now=ctx.now)
+    # Phase 3: vault-state snapshot at wake-start. Cheap I/O; gives
+    # the selector + (Phase 4) sleep sub-stage logic something to
+    # reason against. Skipped for --quick because /tmp isn't a mind.
+    vault = None if args.quick else snapshot_vault(mind, now=ctx.now)
+    mode = select_mode(now=ctx.now, vault=vault)
+    # SleepMode delegates to a Stage; emit the stage's specific name
+    # (e.g. ``sleep:consolidate``) so the viewer can attribute behavior.
+    if isinstance(mode, SleepMode):
+        emitted_mode = mode.stage
+    else:
+        emitted_mode = mode
 
-    return asyncio.run(run_wake(ctx=ctx, mode=mode, emitter=emitter))
+    return asyncio.run(run_wake(ctx=ctx, mode=emitted_mode, emitter=emitter))
 
 
 if __name__ == "__main__":

@@ -7,6 +7,13 @@ its ``build_prompt`` + ``post_run`` around the kernel call.
 
 from .active import ActiveMode
 from .base import Mode, WakeContext
+from .sleep import ConsolidationStage, SleepMode
 
 
-__all__ = ["ActiveMode", "Mode", "WakeContext"]
+__all__ = [
+    "ActiveMode",
+    "ConsolidationStage",
+    "Mode",
+    "SleepMode",
+    "WakeContext",
+]
