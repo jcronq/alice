@@ -23,11 +23,14 @@ from __future__ import annotations
 import logging
 import pathlib
 from dataclasses import dataclass, field
-from typing import Iterable, Optional
+from typing import TYPE_CHECKING, Iterable, Optional
 
 import yaml
 
 from ..transports.base import ChannelRef, InboundMessage
+
+if TYPE_CHECKING:
+    from alice_core.config.personae import Personae
 
 
 log = logging.getLogger(__name__)
@@ -211,6 +214,7 @@ def load(
     fallback_cli_uid: Optional[int] = None,
     fallback_cli_principal_id: str = "owner",
     fallback_cli_display_name: str = "Owner (local CLI)",
+    personae: Optional["Personae"] = None,
 ) -> AddressBook:
     """Load an :class:`AddressBook`.
 
@@ -223,7 +227,20 @@ def load(
     The fallback exists so existing ``ALLOWED_SENDERS`` deploys keep
     working without a coordinated config-file rollout. Once a deploy
     authors ``principals.yaml`` the env-var inputs become irrelevant.
+
+    Plan 05 Phase 8: when a ``personae`` is supplied, the fallback CLI
+    principal id + display default to the operator's configured user
+    name (e.g. ``Friend`` → id ``friend``, display ``Friend (CLI)``)
+    instead of the legacy ``owner`` / ``Owner (local CLI)``. The
+    explicit ``fallback_cli_*`` kwargs still win when both are set.
     """
+    if personae is not None:
+        # Caller didn't pin custom defaults — derive from personae.
+        if fallback_cli_principal_id == "owner":
+            fallback_cli_principal_id = personae.user.name.lower().replace(" ", "_")
+        if fallback_cli_display_name == "Owner (local CLI)":
+            fallback_cli_display_name = f"{personae.user.name} (CLI)"
+
     if yaml_path is not None and yaml_path.is_file():
         try:
             data = yaml.safe_load(yaml_path.read_text()) or {}

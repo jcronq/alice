@@ -233,3 +233,66 @@ def test_load_normalizes_bare_discord_ids_to_user_prefix(tmp_path: pathlib.Path)
     assert book.is_allowed("discord", "user:123") is True
     assert book.is_allowed("discord", "channel:789") is True
     assert book.is_allowed("discord", "123") is False  # not bare anymore
+
+
+# ---------------------------------------------------------------------------
+# Plan 05 Phase 8 — personae drives the fallback CLI principal
+
+
+def test_load_default_cli_principal_uses_user_name(tmp_path: pathlib.Path):
+    """When personae is supplied and the explicit fallback args stay
+    on their legacy defaults, the synthesized CLI principal id +
+    display draw from ``personae.user.name`` instead of "owner"."""
+    from alice_core.config.personae import (
+        AgentPersona,
+        Personae,
+        UserPersona,
+    )
+
+    personae = Personae(
+        agent=AgentPersona(name="Eve"),
+        user=UserPersona(name="Jordan"),
+    )
+    # No yaml on disk → synth path, with personae driving the defaults.
+    book = load(
+        yaml_path=tmp_path / "missing.yaml",
+        fallback_cli_uid=1234,
+        personae=personae,
+    )
+    cli_principal = book.lookup_by_id("jordan")
+    assert cli_principal is not None
+    assert cli_principal.display_name == "Jordan (CLI)"
+
+
+def test_explicit_fallback_args_win_over_personae(tmp_path: pathlib.Path):
+    """If the caller pins a custom fallback id (e.g. for tests) and
+    personae is also supplied, the explicit value wins — personae only
+    fills the slot when the legacy 'owner' default is in place."""
+    from alice_core.config.personae import (
+        AgentPersona,
+        Personae,
+        UserPersona,
+    )
+
+    personae = Personae(
+        agent=AgentPersona(name="Eve"),
+        user=UserPersona(name="Jordan"),
+    )
+    book = load(
+        yaml_path=tmp_path / "missing.yaml",
+        fallback_cli_uid=1234,
+        fallback_cli_principal_id="custom",
+        fallback_cli_display_name="Custom",
+        personae=personae,
+    )
+    assert book.lookup_by_id("custom") is not None
+    assert book.lookup_by_id("jordan") is None
+
+
+def test_load_without_personae_keeps_legacy_owner_default(tmp_path: pathlib.Path):
+    """Back-compat: callers that don't pass personae continue to get
+    the legacy owner / Owner (local CLI) default — no behaviour
+    change for code that hasn't migrated yet."""
+    book = load(yaml_path=tmp_path / "missing.yaml", fallback_cli_uid=42)
+    assert book.lookup_by_id("owner") is not None
+    assert book.lookup_by_id("owner").display_name == "Owner (local CLI)"

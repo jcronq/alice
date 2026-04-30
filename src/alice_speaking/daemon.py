@@ -117,10 +117,16 @@ class SpeakingDaemon:
         # resolution surface. Loaded from principals.yaml when present;
         # synthesized from ALLOWED_SENDERS + the daemon's own uid as a
         # migration shim when it isn't.
+        # Resolve personae once up front — both the address book's
+        # CLI fallback (Phase L) and the tool descriptions (Phase I)
+        # need it. The factory loader handles missing/malformed
+        # personae files; reused here.
+        self._personae = factory_module.build_personae(cfg)
         self.address_book: AddressBook = principals_module.load(
             yaml_path=cfg.principals_path,
             fallback_signal_senders=cfg.allowed_senders_fallback,
             fallback_cli_uid=os.getuid(),
+            personae=self._personae,
         )
         # Signal is opt-in. Without SIGNAL_ACCOUNT in alice.env we skip the
         # transport entirely and let CLI / Discord (if configured) carry
@@ -175,9 +181,8 @@ class SpeakingDaemon:
         # MCP tools — build AFTER we know signal/session state because the
         # send_message sender closure needs self.signal plus the did-send
         # tracker below.
-        # Personae must be resolved before tools so descriptions
-        # interpolate the right agent + user names.
-        self._personae = factory_module.build_personae(cfg)
+        # ``self._personae`` already resolved earlier — pass it into
+        # the tool builder so descriptions reflect the agent's name.
         self.mcp_servers, self.custom_tool_names = tools_module.build(
             cfg,
             address_book=self.address_book,
