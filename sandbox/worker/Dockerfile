@@ -36,7 +36,13 @@ RUN python3 -m venv /opt/alice-venv \
         'mistune>=3.0' \
         'pyyaml>=6.0' \
         'discord.py>=2.4' \
-        'a2a-sdk[http-server]>=1.0.2'
+        'a2a-sdk[http-server]>=1.0.2' \
+        'jinja2>=3.1'
+# jinja2 is the prompt-template engine for ``alice_prompts``
+# (Plan 04 of the runtime refactor). Listed alongside the other
+# runtime deps because the worker bypasses ``uv sync`` and
+# pip-installs directly, so pyproject.toml's deps don't reach
+# this venv automatically.
 
 # s6-overlay for process supervision (bridge + autopush). Arch-branched
 # because the upstream tarball is per-arch; ADD can't expand a shell var
