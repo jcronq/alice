@@ -44,7 +44,7 @@ import pathlib
 import signal as _signal
 import time
 import uuid
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from .transports.a2a import A2ATransport
@@ -87,12 +87,13 @@ from .transports import (
 # would otherwise crash the daemon at import time when discord.py isn't
 # installed (e.g. stale worker image after a Dockerfile bump).
 from .transports.base import SIGNAL_CAPS
-# Per-transport event dataclasses live next to their transports (Phase
-# 2 of plan 01). Re-exported here so existing call sites (the ``Event``
-# union type, the consumer's isinstance ladder for non-Signal events)
-# and external callers (tests, viewer) keep working unchanged. Phase 5
-# moves SurfaceEvent / EmergencyEvent into ``internal/`` and these
-# re-exports retire.
+# Per-transport event dataclasses live next to their transports
+# (transport events: Phase 2; SurfaceEvent / EmergencyEvent: Phase 3).
+# Daemon no longer touches them directly — the registry routes by
+# ``type(event)`` and the per-transport / per-internal-source
+# producers construct them. These re-imports stay only so existing
+# external callers (tests, the viewer's narrative dump) keep their
+# ``from alice_speaking.daemon import …Event`` paths working.
 from .transports.a2a import A2AEvent
 from .transports.cli import CLIEvent
 from .transports.discord import DiscordEvent
@@ -125,7 +126,19 @@ def _format_envelope_time(timestamp_ms: int) -> str:
     return dt.strftime("%-I:%M:%S %p %Z")
 
 
-Event = Union[SignalEvent, SurfaceEvent, EmergencyEvent, CLIEvent, DiscordEvent, A2AEvent]
+# Public names re-exported from this module for back-compat. The
+# event types live in their owning modules (transports/* and
+# internal/*) — see the import block above. Listed here so the
+# re-exports are intentional, not accidental.
+__all__ = [
+    "A2AEvent",
+    "CLIEvent",
+    "DiscordEvent",
+    "EmergencyEvent",
+    "SignalEvent",
+    "SpeakingDaemon",
+    "SurfaceEvent",
+]
 
 
 class SpeakingDaemon:
@@ -269,7 +282,11 @@ class SpeakingDaemon:
                 external_url=cfg.a2a_external_url or None,
             )
 
-        self._queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=64)
+        # Heterogeneous event queue: each producer pushes its own
+        # event type, the registry routes by ``type(event)`` (Phase 3
+        # of plan 01). No Union annotation — the closed set lives in
+        # the registry, not here.
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=64)
         # Phase 3 of plan 01: dispatcher routes by event type via a
         # registry instead of an isinstance ladder. Signal is
         # intentionally omitted — its events flow through the
