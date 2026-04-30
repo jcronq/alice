@@ -48,16 +48,31 @@ import socket
 import struct
 import time
 import uuid
+from dataclasses import dataclass
 from typing import AsyncIterator, Callable, Optional
 
 from .base import (
     CLI_CAPS,
     Capabilities,
     ChannelRef,
+    DaemonContext,
     InboundMessage,
     OutboundMessage,
     Principal,
 )
+
+
+@dataclass
+class CLIEvent:
+    """An inbound CLI message wrapped for the dispatcher.
+
+    Mirrors :class:`SignalEvent` but for the local CLI transport.
+    Carries the full :class:`InboundMessage` so the handler can find the
+    reply channel without extra plumbing. Re-exported from
+    ``alice_speaking.daemon`` for back-compat.
+    """
+
+    message: InboundMessage
 
 
 # Callback the transport invokes during connection accept to decide
@@ -85,6 +100,7 @@ class CLITransport:
 
     name = "cli"
     caps: Capabilities = CLI_CAPS
+    event_type = CLIEvent
 
     def __init__(
         self,
@@ -211,6 +227,27 @@ class CLITransport:
     async def typing(self, channel: ChannelRef, on: bool) -> None:
         """No-op for CLI — terminals don't have typing indicators."""
         return
+
+    # ------------------------------------------------------------------
+    # Dispatcher integration (Phase 2 of plan 01)
+
+    def producer(self, ctx: DaemonContext) -> Optional[asyncio.Task]:
+        """Pump :class:`InboundMessage` objects from the CLI inbox onto
+        ``ctx._queue`` as :class:`CLIEvent` events.
+        """
+        return asyncio.create_task(self._produce(ctx), name="cli-produce")
+
+    async def _produce(self, ctx: DaemonContext) -> None:
+        async for msg in self.messages():
+            await ctx._queue.put(CLIEvent(message=msg))
+
+    async def handle(self, ctx: DaemonContext, event: CLIEvent) -> None:
+        """Run one turn for one CLI event. Phase 2 — declared for
+        protocol conformance; the daemon's consumer still calls
+        :func:`_dispatch.handle_cli` directly until Phase 3."""
+        from .._dispatch import handle_cli
+
+        await handle_cli(ctx, event)
 
     # ------------------------------------------------------------------
     # Event sentinels for the daemon to write through us

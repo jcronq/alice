@@ -20,8 +20,20 @@ naturally.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Literal, Optional, Protocol, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Literal,
+    Optional,
+    Protocol,
+    runtime_checkable,
+)
+
+if TYPE_CHECKING:
+    from ..daemon import SpeakingDaemon
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +194,52 @@ class OutboundMessage:
 
 
 # ---------------------------------------------------------------------------
+# Event marker + dispatcher context (Phase 2 of plan 01)
+#
+# Each Transport produces events of a known dataclass type (`event_type`).
+# The dispatcher uses the event's runtime type to route to the right
+# transport's `handle()` — no isinstance ladder. `Event` is just a name
+# for "the dataclass a transport produces"; we don't enforce a base
+# class because transport events are plain dataclasses today (Signal's
+# wraps an envelope, CLI/Discord/A2A wrap an InboundMessage). The alias
+# documents intent without forcing a refactor of every event class.
+
+
+Event = Any  # see comment above; intentionally permissive
+
+
+class DaemonContext:
+    """Per-turn handle into the speaking daemon, passed to handlers and
+    producers as ``ctx``.
+
+    Phase 2 ships this as a thin passthrough proxy onto
+    :class:`SpeakingDaemon`: every attribute access (read or write)
+    routes back to the underlying daemon instance, so handlers and
+    producers continue to share daemon state exactly as they did when
+    they were methods. Phase 6 narrows this to a real public surface
+    backed by `OutboxRouter` / `CompactionTrigger`.
+
+    Lives in `transports/base.py` (not `_dispatch.py`) so transports
+    can refer to it in their `producer()` / `handle()` signatures
+    without importing from the daemon module.
+    """
+
+    __slots__ = ("_daemon",)
+
+    def __init__(self, daemon: "SpeakingDaemon") -> None:
+        object.__setattr__(self, "_daemon", daemon)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._daemon, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "_daemon":
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._daemon, name, value)
+
+
+# ---------------------------------------------------------------------------
 # Transport protocol
 
 
@@ -189,18 +247,31 @@ class OutboundMessage:
 class Transport(Protocol):
     """A bidirectional human-conversation channel.
 
-    Lifecycle: ``start()`` opens the listener / connection. ``messages()``
-    is an async iterator that yields :class:`InboundMessage` until the
-    transport stops. ``send()`` delivers an :class:`OutboundMessage`.
-    ``stop()`` cleans up.
+    Two layers of obligations, both required for a class to satisfy this
+    protocol:
+
+    *Channel layer* — ``start()``/``stop()``/``messages()``/``send()``/
+    ``typing()``. The transport's job as a wire-format adapter: open
+    the listener, yield :class:`InboundMessage` objects, deliver
+    :class:`OutboundMessage` objects, drive the typing indicator if any.
+
+    *Dispatcher layer* — ``event_type``/``producer()``/``handle()``. How
+    the transport plugs into the speaking daemon's event loop:
+    ``producer(ctx)`` returns a long-running task that pumps inbound
+    messages onto ``ctx._queue`` as ``event_type`` instances, and
+    ``handle(ctx, event)`` runs one turn for one such event. Phase 3
+    of plan 01 will let the daemon route by ``event_type`` through a
+    registry; until then the daemon still wires producers manually
+    in :meth:`SpeakingDaemon.run`.
 
     Implementations should be safe to call ``send()`` concurrently with
-    ``messages()`` iteration. They should NOT block the event loop —
+    ``messages()`` iteration and should NOT block the event loop —
     network I/O goes through asyncio primitives.
     """
 
     name: str
     caps: Capabilities
+    event_type: type
 
     async def start(self) -> None: ...
 
@@ -215,3 +286,15 @@ class Transport(Protocol):
         ...
 
     async def typing(self, channel: ChannelRef, on: bool) -> None: ...
+
+    def producer(self, ctx: DaemonContext) -> Optional[asyncio.Task]:
+        """Schedule a long-running task that pushes events onto
+        ``ctx._queue``. Returns the task so the daemon can supervise
+        it, or ``None`` if this transport has no producer (e.g. wired
+        only as an outbound sink)."""
+        ...
+
+    async def handle(self, ctx: DaemonContext, event: Event) -> None:
+        """Process one event of :attr:`event_type`. Owns the prompt
+        build + kernel call + outbox send for this transport."""
+        ...

@@ -53,6 +53,7 @@ import contextlib
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from typing import AsyncIterator, Optional
 
 import uvicorn
@@ -81,6 +82,7 @@ from .base import (
     A2A_CAPS,
     Capabilities,
     ChannelRef,
+    DaemonContext,
     InboundMessage,
     OutboundMessage,
     Principal,
@@ -151,6 +153,21 @@ _install_proto_utils_patch()
 _REPLY_ARTIFACT = "reply"
 
 
+@dataclass
+class A2AEvent:
+    """An inbound A2A task wrapped for the dispatcher.
+
+    Each event corresponds to one A2A task; the channel is ephemeral
+    (lives for the duration of the SSE stream). Like :class:`CLIEvent`,
+    but the daemon must explicitly call ``signal_done`` / ``signal_error``
+    on the transport at end-of-turn so the SDK can close the SSE stream
+    with a terminal status update. Re-exported from
+    ``alice_speaking.daemon`` for back-compat.
+    """
+
+    message: InboundMessage
+
+
 class A2ATransport:
     """A2A protocol server transport — inbound only in Phase 1.
 
@@ -161,6 +178,7 @@ class A2ATransport:
 
     name = "a2a"
     caps: Capabilities = A2A_CAPS
+    event_type = A2AEvent
 
     def __init__(
         self,
@@ -295,6 +313,31 @@ class A2ATransport:
     async def typing(self, channel: ChannelRef, on: bool) -> None:
         # No-op: A2A status updates fill the same role.
         return
+
+    # ------------------------------------------------------------------
+    # Dispatcher integration (Phase 2 of plan 01)
+
+    def producer(self, ctx: DaemonContext) -> Optional[asyncio.Task]:
+        """Pump per-task :class:`InboundMessage` objects from the SDK
+        executor onto ``ctx._queue`` as :class:`A2AEvent` events.
+
+        v1: all A2A traffic shares a single configured principal
+        (the transport attaches it when building the InboundMessage),
+        so there's no per-caller ACL gate here. Auth, when needed,
+        lives upstream of the worker (proxy / ingress)."""
+        return asyncio.create_task(self._produce(ctx), name="a2a-produce")
+
+    async def _produce(self, ctx: DaemonContext) -> None:
+        async for msg in self.messages():
+            await ctx._queue.put(A2AEvent(message=msg))
+
+    async def handle(self, ctx: DaemonContext, event: A2AEvent) -> None:
+        """Run one turn for one A2A event. Phase 2 — declared for
+        protocol conformance; the daemon's consumer still calls
+        :func:`_dispatch.handle_a2a` directly until Phase 3."""
+        from .._dispatch import handle_a2a
+
+        await handle_a2a(ctx, event)
 
     # ------------------------------------------------------------------
     # Sentinels (called by the daemon's A2A handler at end-of-turn)

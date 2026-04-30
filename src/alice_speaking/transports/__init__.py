@@ -17,6 +17,8 @@ through the daemon's ``_signal_producer`` until Phase 3).
 from .base import (
     Capabilities,
     ChannelRef,
+    DaemonContext,
+    Event,
     InboundMessage,
     OutboundMessage,
     Principal,
@@ -37,6 +39,8 @@ __all__ = [
     "Capabilities",
     "ChannelRef",
     "CLITransport",
+    "DaemonContext",
+    "Event",
     "InboundMessage",
     "OutboundMessage",
     "Principal",

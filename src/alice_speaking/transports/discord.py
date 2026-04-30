@@ -50,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from dataclasses import dataclass
 from typing import AsyncIterator, Optional
 
 import discord
@@ -58,6 +59,7 @@ from .base import (
     DISCORD_CAPS,
     Capabilities,
     ChannelRef,
+    DaemonContext,
     InboundMessage,
     OutboundMessage,
     Principal,
@@ -65,6 +67,19 @@ from .base import (
 
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class DiscordEvent:
+    """An inbound Discord message wrapped for the dispatcher.
+
+    Same shape as :class:`CLIEvent` — the inbound :class:`InboundMessage`
+    carries everything the handler needs. Discord channels are durable
+    (DM history persists), unlike CLI's ephemeral sockets. Re-exported
+    from ``alice_speaking.daemon`` for back-compat.
+    """
+
+    message: InboundMessage
 
 
 def _default_intents() -> discord.Intents:
@@ -112,6 +127,7 @@ class DiscordTransport:
 
     name = "discord"
     caps: Capabilities = DISCORD_CAPS
+    event_type = DiscordEvent
 
     def __init__(
         self,
@@ -344,3 +360,61 @@ class DiscordTransport:
             await target.trigger_typing()
         except Exception as exc:  # noqa: BLE001
             log.debug("discord typing indicator failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Dispatcher integration (Phase 2 of plan 01)
+
+    def producer(self, ctx: DaemonContext) -> Optional[asyncio.Task]:
+        """Pump :class:`InboundMessage` objects through the address-book
+        ACL and onto ``ctx._queue`` as :class:`DiscordEvent` events.
+
+        Two-level ACL (preserved verbatim from
+        ``SpeakingDaemon._discord_producer``):
+
+        1. The user (``msg.principal.native_id`` = ``user:<id>``) must
+           be a known, allowed principal.
+        2. For guild messages, the originating channel
+           (``msg.origin.address`` = ``channel:<id>``) must be listed
+           in that principal's channels.
+        DMs satisfy (2) trivially since their origin matches the
+        principal's own ``user:`` entry.
+        """
+        return asyncio.create_task(self._produce(ctx), name="discord-produce")
+
+    async def _produce(self, ctx: DaemonContext) -> None:
+        async for msg in self.messages():
+            principal = ctx.address_book.lookup_by_native(
+                "discord", msg.principal.native_id
+            )
+            if principal is None or not principal.allowed:
+                log.info(
+                    "ignoring discord message from unknown user %s",
+                    msg.principal.native_id,
+                )
+                continue
+            channel_kind = msg.metadata.get("discord_channel_kind")
+            if channel_kind == "guild":
+                channel_addr = msg.origin.address
+                if not any(
+                    ch.transport == "discord" and ch.address == channel_addr
+                    for ch in principal.channels
+                ):
+                    log.info(
+                        "ignoring guild discord message from %s in %s "
+                        "(channel not in principal's address-book entries)",
+                        msg.principal.native_id,
+                        channel_addr,
+                    )
+                    continue
+            # Refresh display name in the address book if the inbound
+            # carried a richer one (Discord users can change global_name).
+            ctx.address_book.learn(msg)
+            await ctx._queue.put(DiscordEvent(message=msg))
+
+    async def handle(self, ctx: DaemonContext, event: DiscordEvent) -> None:
+        """Run one turn for one Discord event. Phase 2 — declared for
+        protocol conformance; the daemon's consumer still calls
+        :func:`_dispatch.handle_discord` directly until Phase 3."""
+        from .._dispatch import handle_discord
+
+        await handle_discord(ctx, event)

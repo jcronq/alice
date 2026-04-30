@@ -110,10 +110,16 @@ def _format_envelope_time(timestamp_ms: int) -> str:
     return dt.strftime("%-I:%M:%S %p %Z")
 
 
-@dataclass
-class SignalEvent:
-    envelope: SignalEnvelope
-    sender_name: str
+# Per-transport event dataclasses live next to their transports (Phase
+# 2 of plan 01). They're re-exported here so existing call sites
+# (`_drain_signal_batch`, `_consumer`'s isinstance ladder, the
+# ``Event`` union type) and external callers (tests, viewer) keep
+# working unchanged. Phase 5 of plan 01 moves SurfaceEvent /
+# EmergencyEvent into ``internal/`` and these re-exports retire.
+from .transports.signal import SignalEvent
+from .transports.cli import CLIEvent
+from .transports.discord import DiscordEvent
+from .transports.a2a import A2AEvent
 
 
 @dataclass
@@ -124,44 +130,6 @@ class SurfaceEvent:
 @dataclass
 class EmergencyEvent:
     path: pathlib.Path
-
-
-@dataclass
-class CLIEvent:
-    """A message that came in over the CLI transport (Unix socket).
-
-    Mirrors :class:`SignalEvent` but for the local CLI transport.
-    Carries the full :class:`InboundMessage` so the handler can find the
-    reply channel without extra plumbing.
-    """
-
-    message: InboundMessage
-
-
-@dataclass
-class DiscordEvent:
-    """A message that came in over the Discord transport.
-
-    Same shape as :class:`CLIEvent` — the inbound :class:`InboundMessage`
-    carries everything the handler needs. Discord channels are durable
-    (DM history persists), unlike CLI's ephemeral sockets.
-    """
-
-    message: InboundMessage
-
-
-@dataclass
-class A2AEvent:
-    """A message that came in over the A2A transport (Google A2A protocol).
-
-    Each event corresponds to one A2A task; the channel is ephemeral
-    (lives for the duration of the SSE stream). Like :class:`CLIEvent`,
-    but the daemon must explicitly call ``signal_done`` / ``signal_error``
-    on the transport at end-of-turn so the SDK can close the SSE stream
-    with a terminal status update.
-    """
-
-    message: InboundMessage
 
 
 Event = Union[SignalEvent, SurfaceEvent, EmergencyEvent, CLIEvent, DiscordEvent, A2AEvent]
@@ -360,32 +328,34 @@ class SpeakingDaemon:
             # session to resume. The consumer picks it up on the first turn.
             self._prime_bootstrap_preamble()
 
-            producers = [
+            # Phase 2 of plan 01: each transport owns its producer
+            # task. Surfaces / emergencies / quiet watcher stay
+            # daemon-private until Phase 5 moves them into ``internal/``.
+            ctx = _dispatch_module.DaemonContext(self)
+            producers: list[asyncio.Task] = [
                 asyncio.create_task(self._surface_producer(), name="sur-produce"),
                 asyncio.create_task(self._emergency_producer(), name="emg-produce"),
                 asyncio.create_task(self._quiet_watcher(), name="quiet-watch"),
             ]
-            if self.signal is not None:
-                producers.append(
-                    asyncio.create_task(self._signal_producer(), name="sig-produce")
-                )
+            if self.signal_transport is not None:
+                task = self.signal_transport.producer(ctx)
+                if task is not None:
+                    producers.append(task)
             if self.cli_transport is not None:
                 await self.cli_transport.start()
-                producers.append(
-                    asyncio.create_task(self._cli_producer(), name="cli-produce")
-                )
+                task = self.cli_transport.producer(ctx)
+                if task is not None:
+                    producers.append(task)
             if self.discord_transport is not None:
                 await self.discord_transport.start()
-                producers.append(
-                    asyncio.create_task(
-                        self._discord_producer(), name="discord-produce"
-                    )
-                )
+                task = self.discord_transport.producer(ctx)
+                if task is not None:
+                    producers.append(task)
             if self.a2a_transport is not None:
                 await self.a2a_transport.start()
-                producers.append(
-                    asyncio.create_task(self._a2a_producer(), name="a2a-produce")
-                )
+                task = self.a2a_transport.producer(ctx)
+                if task is not None:
+                    producers.append(task)
             consumer = asyncio.create_task(self._consumer(), name="consumer")
             stop_task = asyncio.create_task(self._stop.wait(), name="stop")
 
@@ -419,21 +389,11 @@ class SpeakingDaemon:
 
     # ------------------------------------------------------------------
     # Producers
-
-    async def _signal_producer(self) -> None:
-        assert self.signal is not None  # only scheduled when signal is enabled
-        async for env in self.signal.receive():
-            if not self.address_book.is_allowed("signal", env.source):
-                log.info("ignoring envelope from %s", env.source)
-                continue
-            if self.dedup.seen(env.timestamp):
-                log.debug("duplicate ts=%d; skipping", env.timestamp)
-                continue
-            self.dedup.mark(env.timestamp)
-            sender_name = self.address_book.display_name_for("signal", env.source)
-            await self._queue.put(
-                SignalEvent(envelope=env, sender_name=sender_name)
-            )
+    #
+    # Signal / CLI / Discord / A2A producers moved into their
+    # transports in Phase 2 of plan 01 (each transport owns
+    # ``producer(ctx)``). Surface and emergency producers live here
+    # until Phase 5 relocates them into ``alice_speaking.internal``.
 
     async def _surface_producer(self) -> None:
         """Watch ``inner/surface/`` for new .md surfaces and queue them.
@@ -482,67 +442,6 @@ class SpeakingDaemon:
             except OSError as exc:
                 log.warning("emergency poll error: %s", exc)
             await asyncio.sleep(SURFACE_POLL_SECONDS)
-
-    async def _cli_producer(self) -> None:
-        """Pump InboundMessages from the CLI transport onto the consumer queue."""
-        assert self.cli_transport is not None
-        async for msg in self.cli_transport.messages():
-            await self._queue.put(CLIEvent(message=msg))
-
-    async def _a2a_producer(self) -> None:
-        """Pump InboundMessages from the A2A transport onto the consumer queue.
-
-        v1: all A2A traffic shares a single configured principal
-        (``cfg.a2a_principal``), so there's no per-caller ACL gate
-        here — the transport already attaches the configured principal
-        when it builds the InboundMessage. Auth, when needed, lives
-        upstream of the worker (proxy / ingress)."""
-        assert self.a2a_transport is not None
-        async for msg in self.a2a_transport.messages():
-            await self._queue.put(A2AEvent(message=msg))
-
-    async def _discord_producer(self) -> None:
-        """Pump InboundMessages from the Discord transport, ACL-gated.
-
-        Two-level ACL:
-        1. The user (``msg.principal.native_id`` = ``user:<id>``) must
-           be a known, allowed principal.
-        2. For guild messages (Phase 4c), the originating channel
-           (``msg.origin.address`` = ``channel:<id>``) must be listed
-           in that principal's channels — letting the address book gate
-           guild access at channel granularity.
-        DMs satisfy (2) trivially since their origin matches the
-        principal's own ``user:`` entry.
-        """
-        assert self.discord_transport is not None
-        async for msg in self.discord_transport.messages():
-            principal = self.address_book.lookup_by_native(
-                "discord", msg.principal.native_id
-            )
-            if principal is None or not principal.allowed:
-                log.info(
-                    "ignoring discord message from unknown user %s",
-                    msg.principal.native_id,
-                )
-                continue
-            channel_kind = msg.metadata.get("discord_channel_kind")
-            if channel_kind == "guild":
-                channel_addr = msg.origin.address
-                if not any(
-                    ch.transport == "discord" and ch.address == channel_addr
-                    for ch in principal.channels
-                ):
-                    log.info(
-                        "ignoring guild discord message from %s in %s "
-                        "(channel not in principal's address-book entries)",
-                        msg.principal.native_id,
-                        channel_addr,
-                    )
-                    continue
-            # Refresh display name in the address book if the inbound
-            # carried a richer one (Discord users can change global_name).
-            self.address_book.learn(msg)
-            await self._queue.put(DiscordEvent(message=msg))
 
     # ------------------------------------------------------------------
     # Consumer

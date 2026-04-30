@@ -25,16 +25,36 @@ with the daemon for the same reason.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import AsyncIterator
+from dataclasses import dataclass
+from typing import AsyncIterator, Optional
 
+from ..signal_client import SignalEnvelope
 from .base import (
     SIGNAL_CAPS,
     Capabilities,
     ChannelRef,
+    DaemonContext,
     InboundMessage,
     OutboundMessage,
 )
+
+
+@dataclass
+class SignalEvent:
+    """One inbound Signal message, carried with the resolved sender display
+    name so handlers and the prompt builder don't have to re-look it up.
+
+    Lives next to :class:`SignalTransport` (Phase 2 / Plan 01 Phase 4): the
+    transport produces this type, and the dispatcher routes by
+    ``type(event)`` to :meth:`SignalTransport.handle`. Daemon code
+    historically defined the dataclass; it's re-exported from
+    ``alice_speaking.daemon`` for back-compat with callers and tests.
+    """
+
+    envelope: SignalEnvelope
+    sender_name: str
 
 
 log = logging.getLogger(__name__)
@@ -56,6 +76,7 @@ class SignalTransport:
 
     name = "signal"
     caps: Capabilities = SIGNAL_CAPS
+    event_type = SignalEvent
 
     def __init__(self, *, signal_client) -> None:
         # Delayed import-style annotation: SignalClient lives in a sibling
@@ -80,18 +101,59 @@ class SignalTransport:
         return
 
     # ------------------------------------------------------------------
-    # Inbound — not implemented in Phase 2.
+    # Inbound — not implemented as an async iterator yet.
+    #
+    # Signal's dedup + allowed-sender + per-source batching never fit
+    # cleanly under :meth:`Transport.messages`; the producer below
+    # publishes :class:`SignalEvent` objects directly onto the daemon
+    # queue instead.
 
     def messages(self) -> AsyncIterator[InboundMessage]:
-        """Inbound for Signal still flows through the daemon's
-        ``_signal_producer`` so dedup + allowed-sender + batching keep
-        their existing shape. Phase 3 will move it under this interface
-        when address-book / principal-based ACL lands.
-        """
         raise NotImplementedError(
-            "SignalTransport.messages() is not wired in Phase 2 — "
-            "inbound is still pumped by daemon._signal_producer"
+            "SignalTransport doesn't expose messages() — its producer "
+            "publishes SignalEvent directly onto the daemon queue"
         )
+
+    # ------------------------------------------------------------------
+    # Dispatcher integration (Phase 2 of plan 01)
+
+    def producer(self, ctx: DaemonContext) -> Optional[asyncio.Task]:
+        """Long-running task that pumps Signal envelopes onto
+        ``ctx._queue`` as :class:`SignalEvent` objects.
+
+        Owns ACL gating (``ctx.address_book.is_allowed``), envelope
+        dedup (``ctx.dedup``), and display-name resolution — all the
+        per-source state that used to live in
+        ``SpeakingDaemon._signal_producer``.
+        """
+        return asyncio.create_task(self._produce(ctx), name="sig-produce")
+
+    async def _produce(self, ctx: DaemonContext) -> None:
+        async for env in self._signal.receive():
+            if not ctx.address_book.is_allowed("signal", env.source):
+                log.info("ignoring envelope from %s", env.source)
+                continue
+            if ctx.dedup.seen(env.timestamp):
+                log.debug("duplicate ts=%d; skipping", env.timestamp)
+                continue
+            ctx.dedup.mark(env.timestamp)
+            sender_name = ctx.address_book.display_name_for("signal", env.source)
+            await ctx._queue.put(
+                SignalEvent(envelope=env, sender_name=sender_name)
+            )
+
+    async def handle(self, ctx: DaemonContext, event: SignalEvent) -> None:
+        """Run one turn for one Signal event.
+
+        Phase 2 — not yet wired into the daemon's consumer loop, which
+        still calls :func:`_dispatch.handle_signal` directly with a
+        coalesced batch. The single-event adapter here exists for
+        protocol conformance and Phase 3's registry dispatch; Phase 2a
+        relocates batch coalescing into the transport itself.
+        """
+        from .._dispatch import handle_signal
+
+        await handle_signal(ctx, [event])
 
     # ------------------------------------------------------------------
     # Outbound

@@ -1,14 +1,12 @@
 """Per-event handlers extracted from :class:`SpeakingDaemon`.
 
-Phase 1 of the transport-plugin-interface refactor (see
+Plan 01 of the speaking-runtime refactor (see
 ``docs/refactor/01-transport-plugin-interface.md``). The six former
 ``SpeakingDaemon._handle_*`` methods live here as module-level async
-functions taking a :class:`DaemonContext` instead of ``self``.
-
-DaemonContext is a thin proxy onto ``SpeakingDaemon`` for Phase 1 — every
-attribute access (read or write) routes back to the underlying daemon
-instance. Phase 2 narrows this to a real public interface and the proxy
-goes away.
+functions taking a :class:`DaemonContext` instead of ``self``. The
+context type now lives in :mod:`alice_speaking.transports.base` (Phase 2)
+so producers and handlers can both import it without depending on the
+daemon module directly.
 
 Behavior is preserved verbatim; only the mechanical move out of the
 class scope changed.
@@ -21,12 +19,12 @@ import datetime
 import logging
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Optional
 
 from alice_core.sdk_compat import _short
 
 from .quiet_hours import is_quiet_hours
-from .transports import ChannelRef, OutboundMessage
+from .transports import ChannelRef, DaemonContext, OutboundMessage
 from .turn_log import new_turn
 
 if TYPE_CHECKING:
@@ -36,37 +34,11 @@ if TYPE_CHECKING:
         DiscordEvent,
         EmergencyEvent,
         SignalEvent,
-        SpeakingDaemon,
         SurfaceEvent,
     )
 
 
 log = logging.getLogger("alice_speaking._dispatch")
-
-
-class DaemonContext:
-    """Per-turn context handed to handler functions.
-
-    Phase 1 — passthrough proxy onto :class:`SpeakingDaemon`. Reads and
-    writes route to the underlying daemon, so the handlers continue to
-    share daemon state exactly as they did when they were methods.
-    Phase 2 will replace this with a narrowed interface that exposes
-    only the surfaces handlers actually need.
-    """
-
-    __slots__ = ("_daemon",)
-
-    def __init__(self, daemon: "SpeakingDaemon") -> None:
-        object.__setattr__(self, "_daemon", daemon)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._daemon, name)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        if name == "_daemon":
-            object.__setattr__(self, name, value)
-        else:
-            setattr(self._daemon, name, value)
 
 
 # ---------------------------------------------------------------------------
