@@ -27,8 +27,12 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "jinja2>=3.1",
     "sse-starlette>=2.0",
-    # A2A protocol server (alice_speaking.transports.a2a).
-    "a2a-sdk>=0.2",
+    # A2A protocol server (alice_speaking.transports.a2a). The
+    # http-server extra pulls uvicorn + starlette; we reference 1.0+
+    # APIs (new_task_from_user_message, AgentInterface,
+    # protocol_version="1.0") and ship a workaround for issue #1011
+    # specific to 1.0.x — must match the worker Dockerfile pin.
+    "a2a-sdk[http-server]>=1.0.2",
 ]
 
 [project.scripts]
