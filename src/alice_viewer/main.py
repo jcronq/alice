@@ -26,6 +26,13 @@ STATIC_DIR = BASE_DIR / "static"
 def create_app(paths: Paths | None = None) -> FastAPI:
     app = FastAPI(title="Alice Viewer", version="0.1.0")
     app.state.paths = paths or load_paths()
+    # Plan 06 Phase 4: load mind/config/model.yml so the viewer's
+    # narrative + run_summary calls can route to the operator's
+    # configured backend. Missing file → subscription default
+    # (today's behaviour).
+    from alice_core.config.model import load as load_model_config
+
+    app.state.model_config = load_model_config(app.state.paths.mind_dir)
 
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     templates.env.filters["localtime"] = _localtime

@@ -111,3 +111,27 @@ def test_render_system_prompt_includes_agent_and_user(
     assert "Jordan" in out
     assert "Alice" not in out
     assert "the operator" not in out
+
+
+def test_viewer_loads_model_config_at_startup(tmp_path: pathlib.Path) -> None:
+    """Plan 06 Phase 4: viewer's create_app pulls mind/config/model.yml
+    into app.state.model_config so narrative + run_summary can read
+    backend + model from there in the future."""
+    from alice_viewer.main import create_app
+    from alice_viewer.settings import Paths
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "model.yml").write_text(
+        "viewer:\n  backend: subscription\n  model: claude-haiku-test\n"
+    )
+    paths = Paths(
+        thinking_log=tmp_path / "t.log",
+        speaking_log=tmp_path / "s.log",
+        turn_log=tmp_path / "turn.jsonl",
+        mind_dir=tmp_path,
+        state_dir=tmp_path / "state",
+    )
+    app = create_app(paths)
+    assert app.state.model_config.viewer.model == "claude-haiku-test"
+    assert app.state.model_config.viewer.backend == "subscription"

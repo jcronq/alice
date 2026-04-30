@@ -32,6 +32,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from alice_core.config.auth import ensure_auth_env
+from alice_core.config.model import load as load_model_config
 from alice_core.config.personae import (
     PersonaeError,
     load as load_personae,
@@ -111,13 +112,13 @@ def _build_prompt(bootstrap_path: pathlib.Path, directive_path: pathlib.Path) ->
 
 
 def _load_token() -> None:
-    """Resolve auth from alice.env + os.environ into the subprocess env.
+    """Resolve auth from alice.env + os.environ (no model.yml hint).
 
-    Thin wrapper over :func:`alice_core.auth.ensure_auth_env` — kept
-    as a local function so the module's public API stays stable.
-    Sets either ``CLAUDE_CODE_OAUTH_TOKEN`` (subscription mode) or
-    ``ANTHROPIC_BASE_URL`` + ``ANTHROPIC_API_KEY`` (api / LiteLLM mode)
-    so the Agent SDK's CLI subprocess inherits the right credentials.
+    Thin wrapper over :func:`alice_core.config.auth.ensure_auth_env`.
+    Plan 06 Phase 4 superseded direct callers (``main()`` now reads
+    ``mind/config/model.yml`` and passes a ``mode_hint`` so bedrock
+    + LiteLLM are first-class). Kept as a back-compat shim for any
+    external scripts that import it.
     """
     ensure_auth_env()
 
@@ -251,15 +252,30 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    _load_token()
     _apply_config_overrides(args)
+
+    # Plan 06 Phase 4: load model.yml so the wake's auth resolution +
+    # kernel model use the right backend. Missing → subscription
+    # default (today's behaviour).
+    mind = pathlib.Path(args.mind)
+    model_config = load_model_config(mind)
+    thinking_spec = model_config.thinking
+    ensure_auth_env(
+        mode_hint=thinking_spec.backend,
+        aws_region=thinking_spec.region,
+        aws_profile=thinking_spec.profile,
+    )
+    # When model.yml declares thinking.model, prefer that over
+    # alice.config.json's thinking.model + the built-in default. CLI
+    # ``--model`` still wins (only overrides defaults via _apply_config_overrides).
+    if args.model == DEFAULT_MODEL and thinking_spec.model:
+        args.model = thinking_spec.model
 
     emitter = EventLogger(pathlib.Path(args.log), echo=args.echo)
 
     # Plan 05 Phase 4: load personae + install a wake-side prompt
     # loader so the bootstrap template's {{agent.name}} substitutions
     # resolve, and the persona system-prompt fragment is available.
-    mind = pathlib.Path(args.mind)
     personae = _load_personae(mind)
     _install_prompt_loader(mind, personae)
     system_prompt_text = _render_system_prompt(personae)
