@@ -151,7 +151,7 @@ def _build_prompt(events: list) -> str:
         "1–3 short sentences, ~240 characters max. Cover distinct phases",
         "if there were several (e.g. groom + fix + verify), in order.",
         "FIRST PERSON past tense — 'I groomed X, then fixed Y' not",
-        "'Alice groomed X'. You ARE Alice; the wake is yours.",
+        "third person. You ARE the agent; the wake is yours.",
         "No quotes, no preamble like 'In this wake', just the summary.",
         "",
     ]

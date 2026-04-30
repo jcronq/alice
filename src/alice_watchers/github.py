@@ -864,7 +864,7 @@ def run(
 
 
 def main(argv: Iterable[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="One pass of Alice's GitHub watcher.")
+    parser = argparse.ArgumentParser(description="One pass of the agent's GitHub watcher.")
     parser.add_argument("--mind", default=str(DEFAULT_MIND), help="alice-mind path")
     parser.add_argument(
         "--state",

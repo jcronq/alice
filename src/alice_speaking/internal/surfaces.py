@@ -147,7 +147,7 @@ class SurfaceWatcher:
         trailer = (
             "\n\n---\n"
             + f"resolved: {datetime.datetime.now().astimezone().isoformat(timespec='seconds')}\n"
-            + "verdict: (unresolved — Alice did not call resolve_surface)\n"
+            + "verdict: (unresolved — agent did not call resolve_surface)\n"
             + "action_taken: auto-archived by daemon\n"
         )
         dest.write_text(body + trailer)

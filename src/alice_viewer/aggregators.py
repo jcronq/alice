@@ -715,7 +715,7 @@ def group_arcs(
         if turn.kind == "signal":
             sender = turn.sender_name
         elif turn.kind == "surface":
-            sender = "Thinking Alice"
+            sender = "thinking"
         elif turn.kind == "emergency":
             sender = "EMERGENCY"
         else:

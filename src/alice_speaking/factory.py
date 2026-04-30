@@ -59,7 +59,7 @@ def build_personae(cfg: Config) -> Personae:
         return load_personae(cfg.mind_dir)
     except FileNotFoundError:
         log.info(
-            "personae.yml missing at %s — using placeholder (Alice/operator)",
+            "personae.yml missing at %s — using placeholder defaults",
             cfg.mind_dir,
         )
         return placeholder_personae()
