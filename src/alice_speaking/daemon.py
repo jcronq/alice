@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     from .transports.a2a import A2ATransport
     from .transports.discord import DiscordTransport
 
-from alice_core.auth import ensure_auth_env
+from alice_core.config.auth import ensure_auth_env
 from . import _dispatch as _dispatch_module
 from . import factory as factory_module
 from . import tools as tools_module

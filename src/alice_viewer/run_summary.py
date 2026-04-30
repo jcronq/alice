@@ -204,7 +204,7 @@ def _tool_primary(name: str, raw_input: Any) -> str:
 async def _generate(run_id: str, events: list) -> None:
     prompt = _build_prompt(events)
     try:
-        from alice_core.auth import ensure_auth_env
+        from alice_core.config.auth import ensure_auth_env
         from alice_core.kernel import AgentKernel, KernelSpec
         from alice_core.events import CapturingEmitter
     except ImportError:

@@ -37,7 +37,7 @@ def _ensure_auth():
     Returns the resolved ``AuthEnv``; ``mode == "none"`` means no
     credentials were found and the caller should surface an error.
     """
-    from alice_core.auth import ensure_auth_env
+    from alice_core.config.auth import ensure_auth_env
 
     return ensure_auth_env()
 

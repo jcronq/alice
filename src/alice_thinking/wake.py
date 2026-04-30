@@ -31,7 +31,7 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from alice_core.auth import ensure_auth_env
+from alice_core.config.auth import ensure_auth_env
 from alice_core.events import EventLogger
 from alice_core.kernel import AgentKernel, KernelSpec
 

@@ -21,7 +21,7 @@ import os
 
 import pytest
 
-from alice_core.auth import ensure_auth_env
+from alice_core.config.auth import ensure_auth_env
 
 
 MARKER = "SDK-AUTH-OK"
