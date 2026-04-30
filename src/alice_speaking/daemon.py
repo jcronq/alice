@@ -42,7 +42,6 @@ import logging
 import os
 import pathlib
 import signal as _signal
-import time
 import uuid
 from typing import TYPE_CHECKING, Optional
 
@@ -72,14 +71,14 @@ from .internal import (
     SurfaceEvent,
     SurfaceWatcher,
 )
+from .outbox import OutboxRouter
 from .principals import AddressBook
-from .quiet_hours import QueuedMessage, QuietQueue, is_quiet_hours
+from .quiet_hours import QuietQueue, is_quiet_hours
 from .signal_client import SignalClient
 from .tools.messaging import SELF_RECIPIENT, ResolvedRecipient
 from .transports import (
     CLITransport,
     ChannelRef,
-    OutboundMessage,
     SignalTransport,
 )
 # DiscordTransport is imported lazily below, only when the daemon is actually
@@ -304,6 +303,23 @@ class SpeakingDaemon:
             ),
             surface_watcher=self._surface_watcher,
             emergency_watcher=self._emergency_watcher,
+        )
+        # Phase 6a of plan 01: outbound dispatch + quiet-queue
+        # routing + canonical send-event emission live in
+        # :class:`OutboxRouter`. Daemon's ``_send_message`` becomes
+        # a thin facade that resolves recipient → channel and
+        # delegates here.
+        self.outbox = OutboxRouter(
+            transport_for=lambda name: {
+                "signal": self.signal_transport,
+                "cli": self.cli_transport,
+                "discord": self.discord_transport,
+                "a2a": self.a2a_transport,
+            }.get(name),
+            address_book=self.address_book,
+            events=self.events,
+            quiet_queue=self.quiet_queue,
+            speaking_cfg=cfg.speaking,
         )
         # Phase 2a of plan 01 introduced a second consumer (Signal's
         # per-transport batch loop runs alongside the main consumer).
@@ -845,20 +861,10 @@ class SpeakingDaemon:
         self._turn_did_send = True
 
     # ------------------------------------------------------------------
-    # Unified outbound dispatch
-    #
-    # One function = one path = one event emission. Replaces the old
-    # branched-by-transport routing in ``_send_message`` (which had two
-    # ``signal_send`` emit sites with subtly different field shapes) and
-    # the signal-only ``_send_or_queue``.
-
-    def _transport_for(self, name: str):
-        return {
-            "signal": self.signal_transport,
-            "cli": self.cli_transport,
-            "discord": self.discord_transport,
-            "a2a": self.a2a_transport,
-        }.get(name)
+    # Unified outbound dispatch — Phase 6a of plan 01 lifted the
+    # routing + quiet-queue + send-event code into
+    # :class:`OutboxRouter`. Daemon-side helpers are thin facades
+    # that pass the daemon's per-turn principal-display-name through.
 
     async def _dispatch_outbound(
         self,
@@ -870,118 +876,14 @@ class SpeakingDaemon:
         emergency: bool = False,
         bypass_quiet: bool = False,
     ) -> None:
-        """Deliver ``text`` to ``channel``. Honors quiet hours (when not
-        bypassed) for durable transports; emits the canonical
-        ``<transport>_send`` event after delivery."""
-        transport = self._transport_for(channel.transport)
-        if transport is None:
-            raise RuntimeError(
-                f"transport {channel.transport!r} is not available "
-                "(disabled or not configured)"
-            )
-
-        # Queueable transports: signal, discord. CLI never queues.
-        queueable = channel.transport in ("signal", "discord")
-        if queueable and not bypass_quiet and is_quiet_hours(self.cfg.speaking):
-            self.quiet_queue.append(
-                QueuedMessage(
-                    transport=channel.transport,
-                    recipient=channel.address,
-                    text=text,
-                    queued_at=time.time(),
-                )
-            )
-            sender_name = self.address_book.display_name_for(
-                channel.transport, channel.address
-            )
-            log.info(
-                "quiet hours: queued %s reply for %s (%d chars); queue size=%d",
-                channel.transport,
-                sender_name,
-                len(text),
-                self.quiet_queue.size(),
-            )
-            self.events.emit(
-                "quiet_queue_enter",
-                turn_id=turn_id,
-                transport=channel.transport,
-                recipient=channel.address,
-                sender_name=sender_name,
-                text_len=len(text),
-                queue_size=self.quiet_queue.size(),
-            )
-            return
-
-        if attachments and channel.transport != "signal":
-            log.warning(
-                "ignoring %d attachment(s) for %s reply; transport doesn't "
-                "support outbound files yet",
-                len(attachments),
-                channel.transport,
-            )
-            attachments = None
-
-        chunk_count = await transport.send(
-            OutboundMessage(
-                destination=channel,
-                text=text,
-                attachments=list(attachments) if attachments else [],
-            )
-        )
-        log.info(
-            "%s send to %s (%d chars%s)",
-            "emergency" if emergency else "reply",
-            channel.address,
-            len(text),
-            f", {len(attachments)} attachment(s)" if attachments else "",
-        )
-        self._emit_send_event(
-            channel=channel,
-            text_len=len(text),
-            chunk_count=chunk_count,
-            attachment_count=len(attachments) if attachments else 0,
-            emergency=emergency,
-            bypassed_quiet=is_quiet_hours(self.cfg.speaking),
+        await self.outbox.dispatch(
+            channel,
+            text,
+            attachments,
             turn_id=turn_id,
-        )
-
-    def _emit_send_event(
-        self,
-        *,
-        channel: ChannelRef,
-        text_len: int,
-        chunk_count: int,
-        attachment_count: int,
-        emergency: bool,
-        bypassed_quiet: bool,
-        turn_id: Optional[str],
-    ) -> None:
-        """Single canonical ``<transport>_send`` event shape across all
-        transports. ``bypassed_quiet`` is ``True`` only when delivery
-        happened despite the wall-clock being inside the quiet window
-        (i.e. a real bypass took effect, not just "we sent at 3pm").
-
-        ``sender_name`` resolution: prefer the address book; fall back
-        to the in-flight turn's principal display name (set by handlers
-        on entry); finally fall back to the channel address. The middle
-        case matters for CLI replies — the channel.address is an
-        ephemeral conn_id with no address-book entry.
-        """
-        sender_name = self.address_book.display_name_for(
-            channel.transport, channel.address
-        )
-        if sender_name == channel.address and self._current_principal_display_name:
-            sender_name = self._current_principal_display_name
-        self.events.emit(
-            f"{channel.transport}_send",
-            turn_id=turn_id,
-            recipient=channel.address,
-            sender_name=sender_name,
-            text_len=text_len,
-            chunk_count=chunk_count,
-            attachment_count=attachment_count,
             emergency=emergency,
-            bypassed_quiet=bypassed_quiet,
+            bypass_quiet=bypass_quiet,
+            principal_display_name=self._current_principal_display_name,
         )
 
     def _sender_name_for(self, recipient: str) -> str:
