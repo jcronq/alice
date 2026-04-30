@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from alice_speaking.signal_client import (
+from alice_speaking.infra.signal_rpc import (
     Attachment,
     SignalEnvelope,
     _parse_attachments,

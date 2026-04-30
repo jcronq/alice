@@ -6,8 +6,8 @@ import pathlib
 
 import pytest
 
-from alice_speaking.config import Config, SPEAKING_DEFAULTS
-from alice_speaking.principals import (
+from alice_speaking.infra.config import Config, SPEAKING_DEFAULTS
+from alice_speaking.domain.principals import (
     AddressBook,
     PrincipalChannel,
     PrincipalRecord,

@@ -24,7 +24,7 @@ import json
 import pathlib
 from typing import Any
 
-from alice_speaking.compaction import CompactionTrigger
+from alice_speaking.pipeline.compaction import CompactionTrigger
 
 
 # ---------------------------------------------------------------------------

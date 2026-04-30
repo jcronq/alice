@@ -16,8 +16,8 @@ import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
 from alice_speaking import daemon as daemon_module
-from alice_speaking import session_state
 from alice_speaking.daemon import SpeakingDaemon
+from alice_speaking.domain import session_state
 
 
 # --------------------------------------------------------------------- fakes
@@ -379,7 +379,7 @@ def test_compaction_rolls_session_and_writes_summary(cfg, monkeypatch) -> None:
 def test_layer2_bootstrap_preamble_primed_from_turn_log(cfg, monkeypatch) -> None:
     # Seed a couple turns in the turn log.
     d = _make_daemon(cfg, monkeypatch)
-    from alice_speaking.turn_log import new_turn
+    from alice_speaking.domain.turn_log import new_turn
 
     d.turns.append(new_turn("+15555550100", "Owner", "morning", "hey owner"))
     d.turns.append(
@@ -423,7 +423,7 @@ def test_resume_failure_clears_and_retries(cfg, monkeypatch) -> None:
     d = _make_daemon(cfg, monkeypatch)
     d.session_id = "stale"
     session_state.write(d._session_path, "stale")
-    from alice_speaking.turn_log import new_turn
+    from alice_speaking.domain.turn_log import new_turn
 
     d.turns.append(new_turn("+15555550100", "Owner", "hi", "hey"))
 

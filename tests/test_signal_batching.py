@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 
-from alice_speaking.signal_client import SignalEnvelope
+from alice_speaking.infra.signal_rpc import SignalEnvelope
 from alice_speaking.transports import (
     ChannelRef,
     InboundMessage,

@@ -6,7 +6,7 @@ import json
 import pathlib
 
 
-from alice_speaking import session_state
+from alice_speaking.domain import session_state
 
 
 def test_write_read_roundtrip(tmp_path: pathlib.Path) -> None:

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pathlib
 
-from alice_speaking import compaction
-from alice_speaking.turn_log import Turn
+from alice_speaking.pipeline import compaction
+from alice_speaking.domain.turn_log import Turn
 
 
 def _turn(inbound: str = "hi", outbound: str = "hello") -> Turn:

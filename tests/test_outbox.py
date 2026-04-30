@@ -22,14 +22,14 @@ from typing import Optional
 import pytest
 
 from alice_speaking.pipeline import outbox as outbox_module
-from alice_speaking.events import EventLogger
-from alice_speaking.outbox import OutboxRouter
-from alice_speaking.principals import (
+from alice_speaking.infra.events import EventLogger
+from alice_speaking.pipeline.outbox import OutboxRouter
+from alice_speaking.domain.principals import (
     AddressBook,
     PrincipalChannel,
     PrincipalRecord,
 )
-from alice_speaking.quiet_hours import QuietQueue
+from alice_speaking.pipeline.quiet_hours import QuietQueue
 from alice_speaking.transports import ChannelRef
 
 

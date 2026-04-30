@@ -7,7 +7,7 @@ import textwrap
 
 import pytest
 
-from alice_speaking.principals import (
+from alice_speaking.domain.principals import (
     AddressBook,
     PrincipalChannel,
     PrincipalRecord,
