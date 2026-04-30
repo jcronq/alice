@@ -8,19 +8,32 @@ no event_type. It runs once via ``run_once(ctx)``, completes, and
 returns; failures are logged but don't block the daemon from
 starting.
 
-Phase 5 of plan 01 will land the concrete sources designed in
-``cortex-memory/research/2026-04-29-speaking-session-start-pipeline.md``:
+Phase 5 of plan 01 ships four concrete sources, all fail-soft so a
+fresh install with no mind data still boots:
 
-- ``surface_scan.SurfaceScanStartup``
-- ``prebrief_registry.PrebriefRegistryStartup``
-- ``meso_state.MesoStateStartup``
-- ``cortex_index_freshness.CortexIndexFreshnessStartup``
-- ``cortex_l1.CortexL1Startup`` (deferred to plan 04)
+- :class:`SurfaceScanStartup` — count stranded items in
+  ``inner/surface/{today,yesterday}/``.
+- :class:`PrebriefRegistryStartup` — load
+  ``memory/fitness/PHASE1-PREBRIEF-REGISTRY.md`` (when present).
+- :class:`MesoStateStartup` — load ``memory/fitness/MESO-STATE.md``
+  (when present).
+- :class:`CortexIndexFreshnessStartup` — rebuild the FTS index
+  via ``alice_core.cortex_index`` if stale.
 
-Phase 2 ships only the protocol so the dispatcher can already type
-its way around the seam.
+Plan 04's cue runner will add a ``CortexL1Startup`` here once the
+prompt-template loader lands.
 """
 
 from .base import StartupSource
+from .cortex_index_freshness import CortexIndexFreshnessStartup
+from .meso_state import MesoStateStartup
+from .prebrief_registry import PrebriefRegistryStartup
+from .surface_scan import SurfaceScanStartup
 
-__all__ = ["StartupSource"]
+__all__ = [
+    "CortexIndexFreshnessStartup",
+    "MesoStateStartup",
+    "PrebriefRegistryStartup",
+    "StartupSource",
+    "SurfaceScanStartup",
+]

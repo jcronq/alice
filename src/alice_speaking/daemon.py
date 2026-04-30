@@ -57,6 +57,7 @@ from alice_core.sdk_compat import looks_like_missing_session as _looks_like_miss
 from . import _dispatch as _dispatch_module
 from . import compaction as compaction_module
 from . import config as config_module
+from . import factory as factory_module
 from . import principals as principals_module
 from . import render as render_module
 from . import session_state
@@ -80,7 +81,6 @@ from .transports import (
     ChannelRef,
     OutboundMessage,
     SignalTransport,
-    SourceRegistry,
 )
 # DiscordTransport is imported lazily below, only when the daemon is actually
 # configured to use Discord. Module-top ``import discord`` in transports.discord
@@ -286,23 +286,25 @@ class SpeakingDaemon:
         # of plan 01). No Union annotation — the closed set lives in
         # the registry, not here.
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=64)
-        # Phase 3 of plan 01: dispatcher routes by event type via a
-        # registry instead of an isinstance ladder. Signal is
+        # Phase 3 / 5 of plan 01: dispatcher routes by event type
+        # via a registry instead of an isinstance ladder. Signal is
         # intentionally omitted — its events flow through the
         # transport's own inbox (Phase 2a), never the main queue.
-        # Phase 5 hands the watcher instances mind_dir so they can
-        # own their poll loop end-to-end.
+        # Watchers are constructed up here because the daemon also
+        # reaches them directly for archive bookkeeping; the factory
+        # registers them by reference.
         self._surface_watcher = SurfaceWatcher(cfg.mind_dir)
         self._emergency_watcher = EmergencyWatcher(cfg.mind_dir)
-        self._registry = SourceRegistry()
-        if self.cli_transport is not None:
-            self._registry.register(self.cli_transport)
-        if self.discord_transport is not None:
-            self._registry.register(self.discord_transport)
-        if self.a2a_transport is not None:
-            self._registry.register(self.a2a_transport)
-        self._registry.register_internal(self._surface_watcher)
-        self._registry.register_internal(self._emergency_watcher)
+        self._registry = factory_module.build_registry(
+            cfg,
+            transports=(
+                self.cli_transport,
+                self.discord_transport,
+                self.a2a_transport,
+            ),
+            surface_watcher=self._surface_watcher,
+            emergency_watcher=self._emergency_watcher,
+        )
         # Phase 2a of plan 01 introduced a second consumer (Signal's
         # per-transport batch loop runs alongside the main consumer).
         # Both must serialise on shared kernel state — _run_turn,
@@ -363,6 +365,14 @@ class SpeakingDaemon:
             # daemon-private is the quiet-hours queue watcher (a
             # cross-cutting concern, not an event source).
             ctx = _dispatch_module.DaemonContext(self)
+
+            # Startup phase: best-effort one-shot tasks that prime
+            # ``ctx`` with mind-state (surface backlog, fitness
+            # registry, meso-cycle, cortex-index freshness). Each
+            # source is fail-soft per-source, so a missing mind
+            # file or a kernel-side OSError doesn't block boot.
+            await factory_module.run_startup_phase(self._registry, ctx)
+
             producers: list[asyncio.Task] = [
                 asyncio.create_task(self._quiet_watcher(), name="quiet-watch"),
             ]
