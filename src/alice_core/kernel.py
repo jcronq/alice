@@ -85,6 +85,12 @@ class KernelSpec:
     resume: Optional[str] = None
     max_seconds: int = 0  # 0 or negative = unbounded
     thinking: Optional[dict] = None  # ThinkingConfig dict from claude_agent_sdk.types
+    # Personae rendering target (plan 05 phase 2). The speaking and
+    # thinking factories build this from ``mind/personae.yml``; the
+    # kernel passes it through to ``ClaudeAgentOptions.append_system_prompt``
+    # so the SDK adds it to whatever default system prompt Claude Code
+    # already wires up. ``None`` (the default) keeps today's behaviour.
+    append_system_prompt: Optional[str] = None
 
 
 @dataclass
@@ -306,6 +312,8 @@ class AgentKernel:
             kwargs["resume"] = spec.resume
         if spec.thinking is not None:
             kwargs["thinking"] = spec.thinking
+        if spec.append_system_prompt:
+            kwargs["append_system_prompt"] = spec.append_system_prompt
         return ClaudeAgentOptions(**kwargs)
 
 

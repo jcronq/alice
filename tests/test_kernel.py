@@ -269,6 +269,59 @@ async def test_kernel_resume_passes_through_to_options(patched_sdk, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_kernel_passes_append_system_prompt_to_options(
+    patched_sdk, monkeypatch
+):
+    """Plan 05 phase 2: KernelSpec.append_system_prompt threads through
+    to ClaudeAgentOptions so the SDK adds it to its default system
+    prompt. ``None`` (the default) keeps the kwarg out of the options
+    so we don't break callers running on an older SDK."""
+    captured: dict[str, Any] = {}
+
+    async def capturing_query(*, prompt, options):
+        captured["options"] = options
+        yield _FakeResultMessage(session_id="s")
+
+    import alice_core.kernel as k
+    monkeypatch.setattr(k, "query", capturing_query)
+
+    cap = CapturingEmitter()
+    kernel = AgentKernel(cap)
+    await kernel.run(
+        "prompt",
+        KernelSpec(
+            model="m",
+            append_system_prompt="You are Alice. Talk to Friend.",
+        ),
+    )
+
+    opts = captured["options"]
+    assert opts.append_system_prompt == "You are Alice. Talk to Friend."
+
+
+@pytest.mark.asyncio
+async def test_kernel_omits_append_system_prompt_when_none(
+    patched_sdk, monkeypatch
+):
+    captured: dict[str, Any] = {}
+
+    async def capturing_query(*, prompt, options):
+        captured["options"] = options
+        yield _FakeResultMessage(session_id="s")
+
+    import alice_core.kernel as k
+    monkeypatch.setattr(k, "query", capturing_query)
+
+    cap = CapturingEmitter()
+    kernel = AgentKernel(cap)
+    await kernel.run("prompt", KernelSpec(model="m"))
+
+    opts = captured["options"]
+    # Field must NOT be set so older SDKs (without the kwarg) still work.
+    assert not hasattr(opts, "append_system_prompt")
+
+
+@pytest.mark.asyncio
 async def test_kernel_without_correlation_id_omits_turn_id(patched_sdk, monkeypatch):
     messages = [
         _FakeAssistantMessage(content=[_FakeTextBlock(text="hi")]),
