@@ -32,6 +32,11 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from alice_core.config.auth import ensure_auth_env
+from alice_core.config.personae import (
+    PersonaeError,
+    load as load_personae,
+    placeholder as placeholder_personae,
+)
 from alice_core.events import EventLogger
 from alice_core.kernel import AgentKernel, KernelSpec
 
@@ -147,6 +152,7 @@ async def _run_wake(
     cwd: pathlib.Path,
     max_seconds: int,
     emitter: EventLogger,
+    system_prompt: str = "",
 ) -> int:
     """One thinking wake through the agent kernel.
 
@@ -182,6 +188,10 @@ async def _run_wake(
         # Adaptive thinking with summarized display so ThinkingBlocks
         # come back with non-empty text.
         thinking={"type": "adaptive", "display": "summarized"},
+        # Plan 05 Phase 4: personae-rendered system prompt; empty
+        # string falls through as None-equivalent (kernel skips the
+        # system_prompt kwarg entirely).
+        append_system_prompt=system_prompt or None,
     )
 
     try:
@@ -246,6 +256,14 @@ def main() -> int:
 
     emitter = EventLogger(pathlib.Path(args.log), echo=args.echo)
 
+    # Plan 05 Phase 4: load personae + install a wake-side prompt
+    # loader so the bootstrap template's {{agent.name}} substitutions
+    # resolve, and the persona system-prompt fragment is available.
+    mind = pathlib.Path(args.mind)
+    personae = _load_personae(mind)
+    _install_prompt_loader(mind, personae)
+    system_prompt_text = _render_system_prompt(personae)
+
     if args.quick:
         from alice_prompts import load as load_prompt
         prompt_text = load_prompt("thinking.quick")
@@ -253,7 +271,6 @@ def main() -> int:
         cwd = pathlib.Path("/tmp")
         max_seconds = QUICK_MAX_SECONDS
     else:
-        mind = pathlib.Path(args.mind)
         if args.prompt:
             prompt_text = args.prompt
         else:
@@ -273,8 +290,56 @@ def main() -> int:
             cwd=cwd,
             max_seconds=max_seconds,
             emitter=emitter,
+            system_prompt=system_prompt_text,
         )
     )
+
+
+def _load_personae(mind: pathlib.Path):
+    """Load mind/personae.yml; placeholder on missing file; raise on
+    malformed. Same shape as the speaking factory's helper — kept
+    inline here so the wake doesn't pull alice_speaking for one
+    function (and the dependency direction stays clean: thinking
+    depends on alice_core only)."""
+    try:
+        return load_personae(mind)
+    except FileNotFoundError:
+        return placeholder_personae()
+    except PersonaeError:
+        # Surface to stderr + propagate; the wake should fail loudly
+        # rather than run with degraded identity.
+        print(
+            f"thinking: personae.yml at {mind / 'personae.yml'} is invalid",
+            file=sys.stderr,
+        )
+        raise
+
+
+def _install_prompt_loader(mind: pathlib.Path, personae) -> None:
+    """Wire a mind-aware PromptLoader as the alice_prompts singleton.
+
+    Plan 04 Phase 7 wired this for speaking; thinking stayed on the
+    package-level loader (placeholder personae). Phase F installs a
+    real loader so wake.active.md.j2's {{agent.name}} renders the
+    operator's actual configured name and any per-mind override at
+    .alice/prompts/thinking/wake.active.md.j2 applies.
+    """
+    import alice_prompts as _prompts
+    from alice_prompts import DEFAULTS_DIR, PromptLoader
+
+    loader = PromptLoader(
+        defaults_path=DEFAULTS_DIR,
+        override_path=mind / ".alice" / "prompts",
+        context_defaults=personae.as_template_context(),
+    )
+    _prompts.set_default_loader(loader)
+
+
+def _render_system_prompt(personae) -> str:
+    """Render meta.system_persona for the wake's system prompt."""
+    from alice_prompts import load as load_prompt
+
+    return load_prompt("meta.system_persona", **personae.as_template_context())
 
 
 if __name__ == "__main__":
