@@ -40,7 +40,11 @@ WAKE_TZ = ZoneInfo("America/New_York")
 
 
 DEFAULT_MIND = pathlib.Path("/home/alice/alice-mind")
-DEFAULT_BOOTSTRAP = DEFAULT_MIND / "prompts" / "thinking-bootstrap.md"
+# DEFAULT_BOOTSTRAP retired in Plan 04 Phase 6: the bootstrap body
+# now ships in alice_prompts/templates/thinking/wake.active.md.j2.
+# The CLI arg ``--bootstrap`` and ``_build_prompt`` accept the
+# path for back-compat but ignore it; override via
+# ``mind/.alice/prompts/thinking/wake.active.md.j2`` instead.
 DEFAULT_DIRECTIVE = DEFAULT_MIND / "inner" / "directive.md"
 DEFAULT_LOG = pathlib.Path("/state/worker/thinking.log")
 DEFAULT_TOOLS = "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch"
@@ -69,27 +73,35 @@ def _wake_timestamp_header(now: datetime | None = None) -> str:
 
 
 def _build_prompt(bootstrap_path: pathlib.Path, directive_path: pathlib.Path) -> str:
-    """Compose the wake prompt: timestamp + directive contents + bootstrap.
+    """Compose the wake prompt via the prompts package.
 
-    Inlining directive.md saves the agent one Read tool round-trip per
-    wake. The directive is small (~30 lines, well under the 1024-token
-    cache threshold) — the win is the saved round-trip, not caching.
+    The bootstrap body lives in
+    ``alice_prompts/templates/thinking/wake.active.md.j2`` (Plan 04
+    Phase 6 of the runtime refactor); ``bootstrap_path`` is now an
+    optional fallback for callers who pass a custom path that
+    doesn't exist as a template.
 
-    The wake timestamp is prepended so Thinking sees current local time
-    before any other prompt content. Mode/stage selection should read
-    this line rather than computing the hour themselves.
+    The directive is operator-edited and lives in the mind, not in
+    the runtime — so it's loaded as a runtime variable and injected
+    into the template via ``{% if directive %}``. The override path
+    at ``mind/.alice/prompts/thinking/wake.active.md.j2`` overrides
+    the *template*; the directive remains data the template
+    includes.
+
+    Inlining the directive saves the agent one Read tool round-trip
+    per wake. The directive is small (~30 lines, well under the
+    1024-token cache threshold) — the win is the saved round-trip,
+    not caching.
     """
-    bootstrap = bootstrap_path.read_text()
-    header = _wake_timestamp_header()
-    if not directive_path.is_file():
-        return f"{header}\n\n{bootstrap}"
-    directive = directive_path.read_text()
-    return (
-        f"{header}\n\n"
-        "## Directive (current standing orders — read this first)\n\n"
-        f"{directive.strip()}\n\n"
-        "---\n\n"
-        f"{bootstrap}"
+    from alice_prompts import load as load_prompt
+
+    directive_text = ""
+    if directive_path.is_file():
+        directive_text = directive_path.read_text().strip()
+    return load_prompt(
+        "thinking.wake.active",
+        timestamp_header=_wake_timestamp_header(),
+        directive=directive_text,
     )
 
 

@@ -338,3 +338,37 @@ def test_turn_emergency_renders():
     assert "hb-stale.md" in rendered
     assert "heartbeat 50 minutes stale" in rendered
     assert "EMERGENCY" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — wake.active bootstrap template
+
+
+def test_wake_active_template_renders_with_directive():
+    """The wake.active template injects the timestamp header at the
+    top, the directive (when supplied) under a Standing-orders
+    heading, then the bootstrap body. Rendered output should contain
+    all three sections."""
+    rendered = load(
+        "thinking.wake.active",
+        timestamp_header="Current local time: 2026-04-30 12:00 EDT (Wednesday)",
+        directive="Avoid drama. Ship the work.",
+    )
+    assert "Current local time: 2026-04-30" in rendered
+    assert "Avoid drama. Ship the work." in rendered
+    assert "Directive (current standing orders" in rendered
+    # Bootstrap body still present (anchor near the start).
+    assert "You are Alice in reflection" in rendered
+
+
+def test_wake_active_template_skips_directive_when_empty():
+    """Empty directive means no Standing-orders heading — the
+    template's ``{% if directive %}`` guards it."""
+    rendered = load(
+        "thinking.wake.active",
+        timestamp_header="Current local time: 2026-04-30 12:00 EDT",
+        directive="",
+    )
+    assert "Current local time" in rendered
+    assert "Directive (current standing orders" not in rendered
+    assert "You are Alice in reflection" in rendered
