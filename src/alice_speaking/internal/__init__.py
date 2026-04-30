@@ -13,13 +13,22 @@ categories with sibling Protocols:
   outbound concept; the reaction goes back through ``send_message`` /
   the address book like any other turn.
 
-Phase 5 of plan 01 fleshes this out: ``surfaces.py`` (today's
-``daemon._surface_producer`` + ``_handle_surface``) and ``emergency.py``
-(today's ``_emergency_producer`` + ``_handle_emergency``) will land
-here. Phase 2 ships only the protocol so the rest of the runtime can
-already type its way around the seam.
+Phase 3 of plan 01 lands the handler-shaped wrappers
+(:class:`SurfaceWatcher`, :class:`EmergencyWatcher`) so the
+dispatcher's registry has a uniform ``(event_type → source)``
+mapping. Phase 5 will move the producer bodies (currently
+``SpeakingDaemon._surface_producer`` / ``_emergency_producer``)
+into the wrappers' :meth:`producer` methods.
 """
 
 from .base import InternalSource
+from .emergency import EmergencyEvent, EmergencyWatcher
+from .surfaces import SurfaceEvent, SurfaceWatcher
 
-__all__ = ["InternalSource"]
+__all__ = [
+    "EmergencyEvent",
+    "EmergencyWatcher",
+    "InternalSource",
+    "SurfaceEvent",
+    "SurfaceWatcher",
+]

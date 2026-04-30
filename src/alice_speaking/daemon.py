@@ -44,7 +44,6 @@ import pathlib
 import signal as _signal
 import time
 import uuid
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
 if TYPE_CHECKING:
@@ -66,6 +65,12 @@ from .config import Config
 from .dedup import DedupStore
 from .events import EventLogger
 from .handlers import CLITraceHandler, CompactionArmer, SessionHandler
+from .internal import (
+    EmergencyEvent,
+    EmergencyWatcher,
+    SurfaceEvent,
+    SurfaceWatcher,
+)
 from .principals import AddressBook
 from .quiet_hours import QueuedMessage, QuietQueue, is_quiet_hours
 from .signal_client import SignalClient
@@ -75,6 +80,7 @@ from .transports import (
     ChannelRef,
     OutboundMessage,
     SignalTransport,
+    SourceRegistry,
 )
 # DiscordTransport is imported lazily below, only when the daemon is actually
 # configured to use Discord. Module-top ``import discord`` in transports.discord
@@ -117,16 +123,6 @@ def _format_envelope_time(timestamp_ms: int) -> str:
     except (OSError, ValueError, OverflowError):
         return str(timestamp_ms)
     return dt.strftime("%-I:%M:%S %p %Z")
-
-
-@dataclass
-class SurfaceEvent:
-    path: pathlib.Path
-
-
-@dataclass
-class EmergencyEvent:
-    path: pathlib.Path
 
 
 Event = Union[SignalEvent, SurfaceEvent, EmergencyEvent, CLIEvent, DiscordEvent, A2AEvent]
@@ -274,6 +270,19 @@ class SpeakingDaemon:
             )
 
         self._queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=64)
+        # Phase 3 of plan 01: dispatcher routes by event type via a
+        # registry instead of an isinstance ladder. Signal is
+        # intentionally omitted — its events flow through the
+        # transport's own inbox (Phase 2a), never the main queue.
+        self._registry = SourceRegistry()
+        if self.cli_transport is not None:
+            self._registry.register(self.cli_transport)
+        if self.discord_transport is not None:
+            self._registry.register(self.discord_transport)
+        if self.a2a_transport is not None:
+            self._registry.register(self.a2a_transport)
+        self._registry.register_internal(SurfaceWatcher())
+        self._registry.register_internal(EmergencyWatcher())
         # Phase 2a of plan 01 introduced a second consumer (Signal's
         # per-transport batch loop runs alongside the main consumer).
         # Both must serialise on shared kernel state — _run_turn,
@@ -452,25 +461,24 @@ class SpeakingDaemon:
     # Consumer
 
     async def _consumer(self) -> None:
-        # Signal events no longer reach this loop — Phase 2a of plan 01
-        # routes them through the per-transport inbox owned by
-        # SignalTransport. This loop now drains everything else: CLI,
-        # Discord, A2A, surfaces, emergencies.
+        # Signal events bypass this loop — Phase 2a of plan 01 routes
+        # them through SignalTransport's own per-transport inbox.
+        # Everything else (CLI, Discord, A2A, surfaces, emergencies)
+        # reaches the dispatcher here, and Phase 3's registry routes
+        # by ``type(event)`` instead of an isinstance ladder.
+        ctx = _dispatch_module.DaemonContext(self)
         while True:
             event = await self._queue.get()
             try:
+                source = self._registry.lookup(type(event))
+                if source is None:
+                    log.warning(
+                        "no handler for event type: %s", type(event).__name__
+                    )
+                    continue
                 async with self._turn_lock:
                     await self._pre_turn()
-                    if isinstance(event, CLIEvent):
-                        await self._handle_cli(event)
-                    elif isinstance(event, DiscordEvent):
-                        await self._handle_discord(event)
-                    elif isinstance(event, A2AEvent):
-                        await self._handle_a2a(event)
-                    elif isinstance(event, SurfaceEvent):
-                        await self._handle_surface(event)
-                    elif isinstance(event, EmergencyEvent):
-                        await self._handle_emergency(event)
+                    await source.handle(ctx, event)
             except Exception:
                 log.exception("consumer error handling %s", type(event).__name__)
             finally:
@@ -527,28 +535,11 @@ class SpeakingDaemon:
         self.events.emit("config_reload", changes=list(changes.keys()))
 
     # ------------------------------------------------------------------
-    # Signal turn — no auto-capture; Alice replies via send_message.
-
-    async def _handle_signal(self, batch: list[SignalEvent]) -> None:
-        await _dispatch_module.handle_signal(
-            _dispatch_module.DaemonContext(self), batch
-        )
-
-    # ------------------------------------------------------------------
-    # CLI turn — local-socket transport for terminal users + agents.
-
-    async def _handle_cli(self, event: CLIEvent) -> None:
-        await _dispatch_module.handle_cli(
-            _dispatch_module.DaemonContext(self), event
-        )
-
-    # ------------------------------------------------------------------
-    # Discord turn — DMs only in Phase 3b.
-
-    async def _handle_discord(self, event: DiscordEvent) -> None:
-        await _dispatch_module.handle_discord(
-            _dispatch_module.DaemonContext(self), event
-        )
+    # Per-event handlers (CLI, Discord, A2A, Signal, Surface, Emergency)
+    # all live in :mod:`alice_speaking._dispatch` (Phase 1 of plan 01)
+    # and are reached via the source registry (Phase 3) or — for Signal
+    # — its per-transport consumer loop (Phase 2a). Daemon-side delegate
+    # methods retired with Phase 3.
 
     def _build_discord_prompt(
         self,
@@ -580,14 +571,6 @@ class SpeakingDaemon:
             "the user.",
         ]
         return "\n".join(lines)
-
-    # ------------------------------------------------------------------
-    # A2A turn — Google Agent2Agent protocol over HTTP/JSON-RPC.
-
-    async def _handle_a2a(self, event: A2AEvent) -> None:
-        await _dispatch_module.handle_a2a(
-            _dispatch_module.DaemonContext(self), event
-        )
 
     def _build_a2a_prompt(
         self,
@@ -764,12 +747,8 @@ class SpeakingDaemon:
                 self.quiet_queue.append(msg)
 
     # ------------------------------------------------------------------
-    # Surface turn
-
-    async def _handle_surface(self, event: SurfaceEvent) -> None:
-        await _dispatch_module.handle_surface(
-            _dispatch_module.DaemonContext(self), event
-        )
+    # Surface helpers — :func:`_dispatch.handle_surface` reaches back
+    # into these via the DaemonContext proxy.
 
     def _archive_unresolved(self, path: pathlib.Path) -> None:
         today = datetime.date.today().isoformat()
@@ -788,17 +767,12 @@ class SpeakingDaemon:
         log.info("auto-archived unresolved surface: %s", path.name)
 
     # ------------------------------------------------------------------
-    # Emergency turn
-    #
-    # External monitors drop files into inner/emergency/. Emergency voice
-    # BYPASSES quiet hours — that's the whole point. Alice voices via
-    # send_message like any other turn; the daemon routes around the
-    # quiet-hours queue when the sender context is "emergency".
-
-    async def _handle_emergency(self, event: EmergencyEvent) -> None:
-        await _dispatch_module.handle_emergency(
-            _dispatch_module.DaemonContext(self), event
-        )
+    # Emergency helpers — :func:`_dispatch.handle_emergency` reaches
+    # back into these via the DaemonContext proxy. External monitors
+    # drop files into inner/emergency/; emergency voice BYPASSES quiet
+    # hours (the whole point). Alice voices via send_message like any
+    # other turn; the daemon routes around the quiet-hours queue when
+    # the sender context is "emergency".
 
     def _archive_emergency(
         self,

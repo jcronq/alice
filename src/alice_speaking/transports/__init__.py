@@ -25,6 +25,7 @@ from .base import (
     Transport,
 )
 from .cli import CLITransport
+from .registry import SourceRegistry
 from .signal import SignalTransport
 
 # DiscordTransport is intentionally NOT re-exported here: ``transports.discord``
@@ -45,5 +46,6 @@ __all__ = [
     "OutboundMessage",
     "Principal",
     "SignalTransport",
+    "SourceRegistry",
     "Transport",
 ]
