@@ -22,12 +22,22 @@ from .auth import (
     find_auth_env,
     find_token,
 )
+from .personae import (
+    AgentPersona,
+    Personae,
+    PersonaeError,
+    UserPersona,
+)
 
 
 __all__ = [
+    "AgentPersona",
     "AuthEnv",
     "AuthMode",
     "DEFAULT_ALICE_ENV",
+    "Personae",
+    "PersonaeError",
+    "UserPersona",
     "ensure_auth_env",
     "ensure_token",
     "find_auth_env",

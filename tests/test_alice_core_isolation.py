@@ -30,6 +30,11 @@ _STDLIB = set(sys.stdlib_module_names)
 ALLOWED_TOPLEVEL = _STDLIB | {
     "alice_core",
     "claude_agent_sdk",
+    # ``yaml`` (PyYAML) is a config-format dep, like the SDK is a
+    # transport dep — third-party but foundational. Config loaders
+    # (auth, personae, model) use it to parse YAML files in the mind.
+    # Sibling packages still aren't allowed.
+    "yaml",
 }
 
 
