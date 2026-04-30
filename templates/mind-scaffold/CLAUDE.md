@@ -74,6 +74,47 @@ If a recurring task isn't a skill yet and I've done it 3+ times, add one at
 **Ask first:** Emails, messages, public posts, anything that leaves the
 machine and wasn't requested.
 
+## Identity (personae.yml)
+
+`personae.yml` at the top of this mind names the agent and the user.
+Loaded once at process start by speaking + thinking + viewer; rendered
+into the system prompt and into every prompt template's `{{ agent.name }}`
+/ `{{ user.name }}` substitutions. Edit the file and restart the daemon
+(`bin/alice-deploy worker`) to apply.
+
+Required fields are `agent.name` and `user.name`; everything else is
+optional (pronouns, tagline, voice rules, addressing, about). Missing
+file → placeholder personae (Alice / "the operator") so existing minds
+keep working.
+
+The file lives in this mind repo. If you've configured a public mirror
+for the mind, the values are visible — don't put PII you wouldn't share.
+
+## LLM backend (config/model.yml)
+
+`config/model.yml` picks the LLM backend each hemisphere runs on.
+Three backends are supported through the Claude Agent SDK:
+
+- **subscription** — Anthropic Max OAuth (`CLAUDE_CODE_OAUTH_TOKEN`
+  in `alice.env`). Default; lowest setup cost.
+- **api** — Anthropic API key, optionally via a LiteLLM (or any
+  Anthropic-compatible) proxy. `ANTHROPIC_BASE_URL` +
+  `ANTHROPIC_API_KEY` in `alice.env`.
+- **bedrock** — AWS Bedrock (`CLAUDE_CODE_USE_BEDROCK=1` + AWS
+  credentials via the standard chain). The worker container needs
+  `~/.aws/:/home/alice/.aws/:ro` mounted; add to `docker-compose.yml`.
+  Bedrock model IDs differ from the subscription ones — they look
+  like `anthropic.claude-sonnet-4-5-20250929-v1:0` rather than
+  `claude-sonnet-4-6`.
+
+Each hemisphere (speaking, thinking, viewer) picks its own backend +
+model. When `model.yml` is absent every hemisphere falls back to
+subscription with the model named in `alice.config.json`.
+
+Inspect what's resolved with `bin/alice-backend show`.
+
+See `config/model.yml.example` for a commented template.
+
 ## Customizing prompts (per-mind override)
 
 The runtime ships its own prompt templates under
