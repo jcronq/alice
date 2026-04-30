@@ -46,41 +46,17 @@ def render(text: str, caps: Capabilities) -> list[str]:
 def capability_prompt_fragment(transport_name: str, caps: Capabilities) -> str:
     """Build a system-prompt fragment telling Alice the channel's shape.
 
-    Appended to the system prompt for the duration of one turn.
+    Appended to the system prompt for the duration of one turn. Plan
+    04 Phase 3 of the runtime refactor moved the per-transport
+    bodies into ``alice_prompts/templates/speaking/capability.<name>.md.j2``;
+    this function is now a thin loader-call so existing callers
+    don't need to change.
     """
-    parts = [f"You are responding via the **{transport_name}** transport."]
-    if caps.markdown == "none":
-        parts.append(
-            "Format: PLAIN TEXT only. No markdown — no **bold**, no _italics_, "
-            "no `inline code`, no ``` code fences, no # headings, no - bullet "
-            "markers, no [links](url). Write as if for SMS."
-        )
-    elif caps.markdown == "limited":
-        parts.append(
-            "Format: limited markdown. **bold** and _italics_ work, ``` code "
-            "fences work, but headings (# ##) and tables do not render — "
-            "use plain paragraphs instead."
-        )
-    else:
-        parts.append("Format: full markdown. The client renders it.")
+    from alice_prompts import load as load_prompt
 
-    parts.append(
-        f"Length budget: at most {caps.max_message_bytes} bytes per message. "
-        "Be terse."
-    )
-    if not caps.code_blocks:
-        parts.append("No code blocks — paste short snippets inline only.")
-    if caps.reactions:
-        parts.append(
-            "Reactions: prefer a single emoji acknowledgement (👍, ❤️, etc.) "
-            "for short confirmations rather than a text reply."
-        )
-    if caps.interactive:
-        parts.append(
-            "This is an interactive session — the user is waiting at a "
-            "terminal. Reply promptly; long deliberation costs them wall time."
-        )
-    return "\n".join(parts)
+    return load_prompt(
+        f"speaking.capability.{transport_name}", caps=caps
+    ).rstrip()
 
 
 # ---------------------------------------------------------------------------

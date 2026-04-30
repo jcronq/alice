@@ -156,3 +156,56 @@ def test_sanity_template_renders():
     ``meta/sanity.md.j2``. Single-line prompt, no placeholders."""
     rendered = load("meta.sanity").strip()
     assert rendered == "Reply verbatim to anything the user says. No preamble."
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — capability templates
+
+
+def test_capability_template_per_transport_exists():
+    """Recurrence guard: every transport class declared in the
+    speaking registry must have a matching capability template.
+    Catches "added a new transport but forgot the template" at
+    CI time, not on the first live event."""
+    from alice_speaking.transports import CLITransport, SignalTransport
+    from alice_speaking.transports.a2a import A2ATransport
+    from alice_speaking.transports.discord import DiscordTransport
+
+    for transport_cls in (
+        SignalTransport,
+        CLITransport,
+        DiscordTransport,
+        A2ATransport,
+    ):
+        # transport.name is the lowercase identifier the loader uses.
+        path = (
+            DEFAULTS_DIR
+            / "speaking"
+            / f"capability.{transport_cls.name}.md.j2"
+        )
+        assert path.is_file(), (
+            f"capability template missing for transport "
+            f"{transport_cls.name!r}: expected {path}"
+        )
+
+
+def test_capability_signal_template_renders_with_caps():
+    """The capability templates take ``caps`` and substitute
+    ``{{caps.max_message_bytes}}`` etc. Pin against the real
+    Signal caps so rendering changes surface as test failures."""
+    from alice_speaking.transports.base import SIGNAL_CAPS
+
+    rendered = load("speaking.capability.signal", caps=SIGNAL_CAPS)
+    assert "**signal** transport" in rendered
+    assert str(SIGNAL_CAPS.max_message_bytes) in rendered
+    # Signal renders zero markdown.
+    assert "PLAIN TEXT only" in rendered
+
+
+def test_capability_cli_template_marks_interactive():
+    """CLI is the one transport whose capability fragment notes
+    the user is waiting at a terminal."""
+    from alice_speaking.transports.base import CLI_CAPS
+
+    rendered = load("speaking.capability.cli", caps=CLI_CAPS)
+    assert "interactive session" in rendered
