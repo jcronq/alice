@@ -22,6 +22,13 @@ from .auth import (
     find_auth_env,
     find_token,
 )
+from .model import (
+    BackendDefaults,
+    BackendName,
+    BackendSpec,
+    ModelConfig,
+    ModelConfigError,
+)
 from .personae import (
     AgentPersona,
     Personae,
@@ -34,7 +41,12 @@ __all__ = [
     "AgentPersona",
     "AuthEnv",
     "AuthMode",
+    "BackendDefaults",
+    "BackendName",
+    "BackendSpec",
     "DEFAULT_ALICE_ENV",
+    "ModelConfig",
+    "ModelConfigError",
     "Personae",
     "PersonaeError",
     "UserPersona",

@@ -1,0 +1,58 @@
+# model.yml — pick the LLM backend each hemisphere runs on.
+#
+# Three backends are supported:
+#   subscription — Anthropic Max OAuth (CLAUDE_CODE_OAUTH_TOKEN).
+#   api          — direct API key, optionally via a LiteLLM proxy
+#                  (ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY).
+#   bedrock      — AWS Bedrock (CLAUDE_CODE_USE_BEDROCK=1 + AWS creds).
+#
+# When this file is absent, every hemisphere falls back to
+# subscription with the model named in alice.config.json. That's the
+# back-compat path for minds that pre-date plan 06.
+#
+# Rename to model.yml (drop the .example) and edit per below.
+
+speaking:
+  backend: subscription
+  model: claude-opus-4-7
+
+thinking:
+  backend: subscription
+  model: claude-sonnet-4-6
+
+viewer:
+  backend: subscription
+  model: claude-haiku-4-5-20251001
+
+# Backend-level defaults inherited by hemispheres above unless they
+# override the field themselves.
+backends:
+  api:
+    # base_url: https://litellm.your-proxy.example.com/v1
+  bedrock:
+    # region: us-east-1
+    # profile: alice-prod
+
+# ------------------------------------------------------------------
+# Examples (uncomment + adapt to use):
+#
+# # LiteLLM proxy (Anthropic-compatible):
+# speaking:
+#   backend: api
+#   model: claude-opus-4-7
+# backends:
+#   api:
+#     base_url: https://litellm.your-proxy.example.com/v1
+#
+# # AWS Bedrock for cost-sensitive hemispheres:
+# thinking:
+#   backend: bedrock
+#   model: anthropic.claude-sonnet-4-5-20250929-v1:0
+#   region: us-east-1
+# backends:
+#   bedrock:
+#     profile: alice-prod
+#
+# Bedrock requires the worker container to mount AWS creds. See
+# templates/mind-scaffold/CLAUDE.md (Phase O) for the docker-compose
+# adjustment.
