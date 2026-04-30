@@ -46,8 +46,9 @@ DEFAULT_LOG = pathlib.Path("/state/worker/thinking.log")
 DEFAULT_TOOLS = "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch"
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_SECONDS = 0  # 0 == no timeout. Thinking runs as long as it needs.
-QUICK_PROMPT = "Reply exactly: QUICK-OK"
 QUICK_MAX_SECONDS = 30
+# QUICK_PROMPT moved to alice_prompts/templates/thinking/quick.md.j2
+# (Plan 04 Phase 1). Use ``alice_prompts.load("thinking.quick")``.
 
 
 def _wake_timestamp_header(now: datetime | None = None) -> str:
@@ -234,7 +235,8 @@ def main() -> int:
     emitter = EventLogger(pathlib.Path(args.log), echo=args.echo)
 
     if args.quick:
-        prompt_text = QUICK_PROMPT
+        from alice_prompts import load as load_prompt
+        prompt_text = load_prompt("thinking.quick")
         tools: list[str] = []
         cwd = pathlib.Path("/tmp")
         max_seconds = QUICK_MAX_SECONDS
