@@ -53,7 +53,7 @@ if TYPE_CHECKING:
 
 from alice_core.auth import ensure_auth_env
 from alice_core.kernel import AgentKernel, KernelSpec
-from alice_core.sdk_compat import _short, looks_like_missing_session as _looks_like_missing_session
+from alice_core.sdk_compat import looks_like_missing_session as _looks_like_missing_session
 
 from . import _dispatch as _dispatch_module
 from . import compaction as compaction_module
@@ -68,12 +68,11 @@ from .events import EventLogger
 from .handlers import CLITraceHandler, CompactionArmer, SessionHandler
 from .principals import AddressBook
 from .quiet_hours import QueuedMessage, QuietQueue, is_quiet_hours
-from .signal_client import SignalClient, SignalEnvelope
+from .signal_client import SignalClient
 from .tools.messaging import SELF_RECIPIENT, ResolvedRecipient
 from .transports import (
     CLITransport,
     ChannelRef,
-    InboundMessage,
     OutboundMessage,
     SignalTransport,
 )
@@ -82,7 +81,17 @@ from .transports import (
 # would otherwise crash the daemon at import time when discord.py isn't
 # installed (e.g. stale worker image after a Dockerfile bump).
 from .transports.base import SIGNAL_CAPS
-from .turn_log import TurnLog, new_turn
+# Per-transport event dataclasses live next to their transports (Phase
+# 2 of plan 01). Re-exported here so existing call sites (the ``Event``
+# union type, the consumer's isinstance ladder for non-Signal events)
+# and external callers (tests, viewer) keep working unchanged. Phase 5
+# moves SurfaceEvent / EmergencyEvent into ``internal/`` and these
+# re-exports retire.
+from .transports.a2a import A2AEvent
+from .transports.cli import CLIEvent
+from .transports.discord import DiscordEvent
+from .transports.signal import SignalEvent
+from .turn_log import TurnLog
 
 
 log = logging.getLogger("alice_speaking")
@@ -108,18 +117,6 @@ def _format_envelope_time(timestamp_ms: int) -> str:
     except (OSError, ValueError, OverflowError):
         return str(timestamp_ms)
     return dt.strftime("%-I:%M:%S %p %Z")
-
-
-# Per-transport event dataclasses live next to their transports (Phase
-# 2 of plan 01). They're re-exported here so existing call sites
-# (the ``Event`` union type, the consumer's isinstance ladder for
-# non-Signal events) and external callers (tests, viewer) keep
-# working unchanged. Phase 5 of plan 01 moves SurfaceEvent /
-# EmergencyEvent into ``internal/`` and these re-exports retire.
-from .transports.signal import SignalEvent
-from .transports.cli import CLIEvent
-from .transports.discord import DiscordEvent
-from .transports.a2a import A2AEvent
 
 
 @dataclass
