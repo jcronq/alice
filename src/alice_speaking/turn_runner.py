@@ -93,6 +93,7 @@ class TurnRunner:
         turn_did_send_getter: Callable[[], bool],
         current_reply_channel_getter: Callable[[], Optional[ChannelRef]],
         system_prompt: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> None:
         self._cfg = cfg
         self._events = events
@@ -110,6 +111,11 @@ class TurnRunner:
         # call via KernelSpec.append_system_prompt. None keeps today's
         # behaviour (no system prompt injected).
         self._system_prompt = system_prompt
+        # Plan 06 Phase 3: model picked by the daemon factory from
+        # mind/config/model.yml (or alice.config.json fallback).
+        # ``None`` falls back to cfg.speaking["model"] inside
+        # ``_build_spec`` for callers that haven't migrated yet.
+        self._model = model
         self.session_id: Optional[str] = None
         self._pending_preamble: Optional[str] = None
 
@@ -178,7 +184,7 @@ class TurnRunner:
 
     def _build_spec(self) -> KernelSpec:
         return KernelSpec(
-            model=self._cfg.speaking.get("model"),
+            model=self._model or self._cfg.speaking.get("model"),
             allowed_tools=_BUILTIN_TOOLS + self._custom_tool_names,
             mcp_servers=self._mcp_servers,
             cwd=self._cfg.work_dir,

@@ -23,6 +23,8 @@ from __future__ import annotations
 import logging
 from typing import Iterable, Optional
 
+from alice_core.config.model import BackendSpec, ModelConfig
+from alice_core.config.model import load as load_model_config
 from alice_core.config.personae import Personae, PersonaeError
 from alice_core.config.personae import load as load_personae
 from alice_core.config.personae import placeholder as placeholder_personae
@@ -88,6 +90,28 @@ def build_prompt_loader(cfg: Config, personae: Personae) -> PromptLoader:
         override_path=cfg.mind_dir / ".alice" / "prompts",
         context_defaults=personae.as_template_context(),
     )
+
+
+def build_model_config(cfg: Config) -> ModelConfig:
+    """Load ``mind/config/model.yml``; missing file → subscription
+    default.
+
+    Plan 06 Phase 3. Caller decides whether to act on the resolved
+    backend (auth vars) and which fields to use for the kernel
+    spec. The loader itself never raises on the missing-file path —
+    that's the back-compat case for minds that pre-date Plan 06.
+    """
+    return load_model_config(cfg.mind_dir)
+
+
+def build_kernel_model(speaking_cfg: dict, spec: BackendSpec) -> str:
+    """Pick the speaking model: prefer ``model.yml``'s value, fall
+    back to ``alice.config.json``'s ``speaking.model``.
+
+    Empty in both → empty string; the SDK errors out at first call,
+    which is the right behaviour for a fully-misconfigured mind.
+    """
+    return spec.model or speaking_cfg.get("model", "")
 
 
 def build_system_prompt(personae: Personae) -> str:

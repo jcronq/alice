@@ -271,6 +271,12 @@ class SpeakingDaemon:
         # registers them by reference.
         self._surface_watcher = SurfaceWatcher(cfg.mind_dir)
         self._emergency_watcher = EmergencyWatcher(cfg.mind_dir)
+        # Plan 06 Phase 3: load model.yml so the daemon knows which
+        # backend speaking will run on. Missing → subscription default
+        # (today's behaviour). The auth env-mutation happens in
+        # :meth:`run` once the daemon is actually about to dispatch
+        # turns; here we only resolve the spec.
+        self._model_config = factory_module.build_model_config(cfg)
         # Plan 05 Phase 3: load personae before the prompt loader so
         # context_defaults carries the real agent + user identity.
         # Missing file → placeholder (today's behaviour); malformed
@@ -354,6 +360,13 @@ class SpeakingDaemon:
             turn_did_send_getter=lambda: self._turn_did_send,
             current_reply_channel_getter=lambda: self._current_reply_channel,
             system_prompt=self._system_prompt,
+            # Plan 06 Phase 3: model.yml's speaking.model wins over
+            # alice.config.json's speaking.model when set; back-compat
+            # falls through to the legacy field when model.yml is
+            # missing or omits speaking.model.
+            model=factory_module.build_kernel_model(
+                cfg.speaking, self._model_config.speaking
+            ),
         )
         self.turn_runner.session_id = initial_session_id
         self._config_path = cfg.mind_dir / "config" / "alice.config.json"
@@ -419,9 +432,20 @@ class SpeakingDaemon:
     async def run(self) -> None:
         # Resolve auth from alice.env + os.environ. ensure_auth_env() sets
         # the right vars on os.environ so the Agent SDK's CLI subprocess
-        # inherits either subscription (CLAUDE_CODE_OAUTH_TOKEN) or
-        # api-mode (ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY) credentials.
-        ensure_auth_env()
+        # inherits either subscription (CLAUDE_CODE_OAUTH_TOKEN), api-mode
+        # (ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY), or bedrock-mode
+        # (CLAUDE_CODE_USE_BEDROCK=1 + AWS_REGION) credentials.
+        #
+        # Plan 06 Phase 3: when model.yml declares the speaking backend
+        # explicitly, pass that as ``mode_hint`` so the resolution is
+        # config-driven rather than implicit-from-env. Minds without
+        # model.yml fall through to the implicit logic (mode_hint=None).
+        speaking_backend = self._model_config.speaking
+        ensure_auth_env(
+            mode_hint=speaking_backend.backend,
+            aws_region=speaking_backend.region,
+            aws_profile=speaking_backend.profile,
+        )
 
         loop = asyncio.get_event_loop()
         for sig in (_signal.SIGTERM, _signal.SIGINT):
@@ -429,7 +453,8 @@ class SpeakingDaemon:
 
         self.events.emit(
             "daemon_start",
-            model=self.cfg.speaking.get("model"),
+            model=self.turn_runner._model or self.cfg.speaking.get("model"),
+            backend=self._model_config.speaking.backend,
             session_id=self.session_id,
             compaction_threshold=self.cfg.speaking.get("context_compaction_threshold"),
             bootstrap_turns=self.cfg.speaking.get("context_bootstrap_turns"),

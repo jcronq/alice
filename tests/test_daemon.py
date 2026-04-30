@@ -523,6 +523,48 @@ def test_preamble_consumed_on_next_turn(cfg, monkeypatch) -> None:
     assert d._pending_preamble is None
 
 
+def test_kernel_spec_model_from_model_yml(cfg, monkeypatch, tmp_path) -> None:
+    """Plan 06 phase 3: when ``model.yml`` declares ``speaking.model``,
+    the daemon's KernelSpec uses that value (overriding the legacy
+    ``alice.config.json`` ``speaking.model``)."""
+    cfg_dir = cfg.mind_dir / "config"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "model.yml").write_text(
+        "speaking:\n  backend: subscription\n  model: claude-from-yml\n"
+    )
+
+    d = _make_daemon(cfg, monkeypatch)
+    assert d.turn_runner._model == "claude-from-yml"
+
+    captured: dict[str, Any] = {}
+
+    async def capturing_query(*, prompt, options):
+        captured["options"] = options
+        for m in (
+            _assistant("ok"),
+            _result("session-x"),
+        ):
+            yield m
+
+    monkeypatch.setattr("alice_core.kernel.query", lambda **kw: capturing_query(**kw))
+    asyncio.run(
+        d._run_turn("hi", turn_id="t1", outbound_recipient="+15555550100")
+    )
+    assert captured["options"].model == "claude-from-yml"
+
+
+def test_falls_back_to_alice_config_when_model_yml_absent(
+    cfg, monkeypatch
+) -> None:
+    """No ``model.yml`` → daemon falls back to ``alice.config.json``'s
+    ``speaking.model`` (today's behaviour)."""
+    d = _make_daemon(cfg, monkeypatch)
+    assert d._model_config.speaking.backend == "subscription"
+    assert d._model_config.speaking.model == ""
+    # build_kernel_model picks up the legacy field.
+    assert d.turn_runner._model == cfg.speaking.get("model")
+
+
 def test_kernel_spec_includes_personae_system_prompt(cfg, monkeypatch) -> None:
     """Plan 05 phase 3: TurnRunner threads the daemon-rendered persona
     string into KernelSpec.append_system_prompt, which the kernel
