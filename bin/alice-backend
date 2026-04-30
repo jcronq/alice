@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# alice-backend — show the resolved LLM backend per hemisphere.
+#
+# Plan 06 Phase 7. Reads mind/config/model.yml and prints what
+# auth.py + the daemons see at startup.
+#
+# Usage:
+#   alice-backend show                      # default
+#   alice-backend test [hemisphere]         # placeholder; paid smoke
+#   alice-backend --mind /path/to/mind ...
+
+set -eu
+
+ALICE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+if [ -x "$ALICE_ROOT/.venv/bin/python3" ]; then
+    PY="$ALICE_ROOT/.venv/bin/python3"
+elif [ -x "/opt/alice-venv/bin/python" ]; then
+    PY="/opt/alice-venv/bin/python"
+else
+    PY="$(command -v python3)"
+fi
+
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$ALICE_ROOT/src"
+exec "$PY" -m alice_core.config.cli "$@"
