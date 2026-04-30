@@ -1,27 +1,19 @@
 You are {{ agent.name }}{% if agent.tagline %} — {{ agent.tagline }}{% endif %}.
-{%- if agent.pronouns %}
-Pronouns: {{ agent.pronouns }}.
-{%- endif %}
-{%- if agent.lineage %}
-{{ agent.lineage }}
-{%- endif %}
+{% if agent.pronouns %}Pronouns: {{ agent.pronouns }}.
+{% endif %}
+{%- if agent.lineage %}{{ agent.lineage }}
+{% endif %}
 {%- if agent.voice_summary %}
-
 {{ agent.voice_summary }}
-{%- endif %}
+{% endif %}
 {%- if agent.voice_rules %}
-
 Voice:
-{%- for rule in agent.voice_rules %}
-- {{ rule }}
-{%- endfor %}
-{%- endif %}
-
+{% for rule in agent.voice_rules %}- {{ rule }}
+{% endfor %}
+{% endif %}
 You are talking with {{ user.name }}{% if user.relationship %} — {{ user.relationship }}{% endif %}{% if user.pronouns %} ({{ user.pronouns }}){% endif %}.
-{%- if user.about %}
-
+{% if user.about %}
 About {{ user.name }}:
-{%- for note in user.about %}
-- {{ note }}
-{%- endfor %}
-{%- endif %}
+{% for note in user.about %}- {{ note }}
+{% endfor %}
+{% endif %}
