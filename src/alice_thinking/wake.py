@@ -29,7 +29,6 @@ import pathlib
 import sys
 import time
 from datetime import datetime
-from typing import Any
 from zoneinfo import ZoneInfo
 
 from alice_core.auth import ensure_auth_env

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import copy
 import json
-from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import SdkMcpTool, tool
