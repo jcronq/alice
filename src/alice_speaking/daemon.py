@@ -271,6 +271,12 @@ class SpeakingDaemon:
         # registers them by reference.
         self._surface_watcher = SurfaceWatcher(cfg.mind_dir)
         self._emergency_watcher = EmergencyWatcher(cfg.mind_dir)
+        # Plan 04 Phase 7: install the mind-aware prompt loader as
+        # the package-level singleton so every ``alice_prompts.load(...)``
+        # call site (compaction, transport build_prompt, surface /
+        # emergency handlers) sees this mind's override path.
+        import alice_prompts as _prompts
+        _prompts.set_default_loader(factory_module.build_prompt_loader(cfg))
         self._registry = factory_module.build_registry(
             cfg,
             transports=(

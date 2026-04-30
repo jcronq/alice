@@ -74,6 +74,26 @@ If a recurring task isn't a skill yet and I've done it 3+ times, add one at
 **Ask first:** Emails, messages, public posts, anything that leaves the
 machine and wasn't requested.
 
+## Customizing prompts (per-mind override)
+
+The runtime ships its own prompt templates under
+`alice_prompts/templates/`. Drop a same-named file under
+`.alice/prompts/<same-path>` here to override one for this mind
+without forking the runtime. Examples:
+
+- `.alice/prompts/speaking/turn.signal.md.j2` — your custom Signal
+  turn shape.
+- `.alice/prompts/thinking/wake.active.md.j2` — your custom wake
+  bootstrap. The directive at `inner/directive.md` is data the
+  template includes; edit the directive there, not in this
+  override.
+
+The override path resolves before the runtime defaults; if you don't
+override a name, the runtime default applies. List every known prompt
+with `.venv/bin/python3 -c "from alice_prompts import list_prompts;
+print('\n'.join(list_prompts()))"` (or `bin/alice-prompts list` once
+plan 04 phase 8 lands).
+
 ---
 
 *This is the minimum scaffold. Extend it with sections specific to what

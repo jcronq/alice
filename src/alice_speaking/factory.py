@@ -23,6 +23,9 @@ from __future__ import annotations
 import logging
 from typing import Iterable, Optional
 
+from alice_prompts import DEFAULTS_DIR as PROMPT_DEFAULTS_DIR
+from alice_prompts import PromptLoader
+
 from .infra.config import Config
 from .internal import EmergencyWatcher, SurfaceWatcher
 from .startup import (
@@ -35,6 +38,30 @@ from .transports import SourceRegistry, Transport
 
 
 log = logging.getLogger(__name__)
+
+
+def build_prompt_loader(cfg: Config) -> PromptLoader:
+    """Construct a :class:`PromptLoader` wired with this mind's
+    override path.
+
+    The override path is ``mind/.alice/prompts/`` — populated by
+    ``alice-init`` when the operator scaffolds a fresh mind (Plan 04
+    Phase 7). If it doesn't exist (older minds, custom paths), the
+    loader silently falls back to the runtime defaults bundled with
+    the wheel.
+
+    The persona placeholder context is the same stand-in the package-
+    level loader uses; Plan 05 will replace it with real personae
+    drawn from the mind.
+    """
+    return PromptLoader(
+        defaults_path=PROMPT_DEFAULTS_DIR,
+        override_path=cfg.mind_dir / ".alice" / "prompts",
+        context_defaults={
+            "agent": {"name": "Alice"},
+            "user": {"name": "the operator"},
+        },
+    )
 
 
 def build_registry(

@@ -372,3 +372,62 @@ def test_wake_active_template_skips_directive_when_empty():
     assert "Current local time" in rendered
     assert "Directive (current standing orders" not in rendered
     assert "You are Alice in reflection" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 — daemon-built loader picks up mind override
+
+
+def test_daemon_loader_uses_mind_override(tmp_path):
+    """End-to-end: build the daemon-side loader against a fixture
+    mind directory containing a custom template; the loader returns
+    the override, not the runtime default."""
+    from alice_speaking.factory import build_prompt_loader
+    from alice_speaking.infra.config import Config, SPEAKING_DEFAULTS
+
+    # Write a custom override at .alice/prompts/speaking/compact.md.j2.
+    mind_dir = tmp_path / "alice-mind"
+    override_dir = mind_dir / ".alice" / "prompts" / "speaking"
+    override_dir.mkdir(parents=True)
+    (override_dir / "compact.md.j2").write_text(
+        "OVERRIDE compact for {{ user.name }}"
+    )
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    cfg = Config(
+        signal_api="x",
+        signal_account="x",
+        oauth_token="x",
+        work_dir=mind_dir,
+        mind_dir=mind_dir,
+        state_dir=state_dir,
+        signal_log_path=state_dir / "s.log",
+        offset_path=state_dir / "off",
+        seen_path=state_dir / "seen",
+        turn_log_path=mind_dir / "turn.jsonl",
+        event_log_path=state_dir / "events.log",
+        speaking=dict(SPEAKING_DEFAULTS),
+    )
+
+    loader = build_prompt_loader(cfg)
+    rendered = loader.load("speaking.compact")
+    # Override wins over runtime default.
+    assert rendered.startswith("OVERRIDE compact for")
+    # Persona placeholder defaults still substitute.
+    assert "the operator" in rendered
+
+
+def test_mind_scaffold_includes_alice_prompts_dir():
+    """Recurrence guard: the mind-scaffold ships ``.alice/prompts/``
+    so freshly-scaffolded minds have the override path even when
+    they don't customise anything yet."""
+    import pathlib
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    scaffold_prompts = repo_root / "templates" / "mind-scaffold" / ".alice" / "prompts"
+    assert scaffold_prompts.is_dir(), (
+        f"mind scaffold missing .alice/prompts/ at {scaffold_prompts}"
+    )
+    # Tracked-in-git via .gitkeep (otherwise alice-init's cp -a would
+    # skip the empty directory).
+    assert (scaffold_prompts / ".gitkeep").is_file()

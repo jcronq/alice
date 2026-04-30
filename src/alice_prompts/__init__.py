@@ -31,6 +31,7 @@ __all__ = [
     "list_prompts",
     "load",
     "reload",
+    "set_default_loader",
 ]
 
 
@@ -93,3 +94,15 @@ def list_prompts() -> list[str]:
 def reload() -> None:
     """Re-discover templates on the package-level loader."""
     default_loader().reload()
+
+
+def set_default_loader(loader: PromptLoader) -> None:
+    """Replace the package-level singleton with a custom loader.
+
+    Used by :func:`alice_speaking.factory.build_prompt_loader` so the
+    daemon's mind-override path applies to every call site that uses
+    the convenience ``alice_prompts.load(...)``. Idempotent: calling
+    again replaces the previous override.
+    """
+    global _default_loader
+    _default_loader = loader
