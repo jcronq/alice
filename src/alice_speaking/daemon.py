@@ -47,9 +47,6 @@ if TYPE_CHECKING:
     from .transports.discord import DiscordTransport
 
 from alice_core.auth import ensure_auth_env
-from alice_core.kernel import AgentKernel, KernelSpec
-from alice_core.sdk_compat import looks_like_missing_session as _looks_like_missing_session
-
 from . import _dispatch as _dispatch_module
 from . import compaction as compaction_module
 from . import config as config_module
@@ -60,7 +57,6 @@ from . import tools as tools_module
 from .config import Config
 from .dedup import DedupStore
 from .events import EventLogger
-from .handlers import CLITraceHandler, CompactionArmer, SessionHandler
 from .internal import (
     EmergencyEvent,
     EmergencyWatcher,
@@ -71,6 +67,7 @@ from .outbox import OutboxRouter
 from .principals import AddressBook
 from .quiet_hours import QuietQueue, is_quiet_hours
 from .quiet_queue_runner import QuietQueueRunner
+from .turn_runner import TurnRunner
 from .signal_client import SignalClient
 from .tools.messaging import SELF_RECIPIENT, ResolvedRecipient
 from .transports import (
@@ -97,12 +94,6 @@ from .turn_log import TurnLog
 
 
 log = logging.getLogger("alice_speaking")
-
-
-# Turns after which tail-trim happens when composing the summary preamble.
-# Matches the design: 5 verbatim turns bridge the gap between summary
-# cutoff and now.
-SUMMARY_TAIL_TURNS = 5
 
 
 # Public names re-exported from this module for back-compat. The
@@ -159,13 +150,17 @@ class SpeakingDaemon:
         self._session_path = self._state_dir / "session.json"
         self._summary_path = self._state_dir / "context-summary.md"
 
-        # Session identity (Layer 1): pre-populate from disk if present,
-        # drop it if the underlying SDK JSONL is gone.
-        self.session_id: Optional[str] = None
+        # Session identity (Layer 1): pre-populate from disk if
+        # present, drop it if the underlying SDK JSONL is gone.
+        # Stored on :class:`TurnRunner` (Phase 6c of plan 01); the
+        # ``session_id`` property below delegates so handlers and
+        # the compaction trigger can keep their existing
+        # ``ctx.session_id`` access unchanged.
+        initial_session_id: Optional[str] = None
         persisted = session_state.read(self._session_path)
         if persisted is not None:
             if session_state.sdk_session_exists(cfg.work_dir, persisted.session_id):
-                self.session_id = persisted.session_id
+                initial_session_id = persisted.session_id
                 log.info(
                     "loaded persisted session %s (saved_at=%s)",
                     persisted.session_id,
@@ -218,10 +213,9 @@ class SpeakingDaemon:
         # the principal's display name rather than the opaque conn_id
         # from the ChannelRef. None outside of an inbound conversational turn.
         self._current_principal_display_name: Optional[str] = None
-        # When set, the very next turn will prepend this text as a
-        # bootstrap preamble (Layer 2 restart OR post-compaction summary
-        # injection).
-        self._pending_preamble: Optional[str] = None
+        # The bootstrap preamble lives on :class:`TurnRunner` —
+        # constructed below, after the CLI transport gates so the
+        # CLITraceHandler can wire to it.
         # One-shot consumer startup guard.
         self._consumer_started: bool = False
 
@@ -325,10 +319,82 @@ class SpeakingDaemon:
             dispatch_outbound=self._dispatch_outbound,
             stop_event=self._stop,
         )
+        # Phase 6c of plan 01: kernel-call orchestration + session
+        # identity + bootstrap preamble live on :class:`TurnRunner`.
+        # Daemon proxies ``session_id`` and ``_run_turn`` /
+        # ``_prime_bootstrap_preamble`` through to it so existing
+        # callers (the handlers in ``_dispatch.py``, the compaction
+        # trigger reaching via ``ctx``) keep working.
+        self.turn_runner = TurnRunner(
+            cfg=cfg,
+            events=self.events,
+            turns=self.turns,
+            mcp_servers=self.mcp_servers,
+            custom_tool_names=self.custom_tool_names,
+            session_path=self._session_path,
+            summary_path=self._summary_path,
+            compaction=self.compaction,
+            cli_transport=self.cli_transport,
+            turn_did_send_getter=lambda: self._turn_did_send,
+            current_reply_channel_getter=lambda: self._current_reply_channel,
+        )
+        self.turn_runner.session_id = initial_session_id
         self._config_path = cfg.mind_dir / "config" / "alice.config.json"
         self._config_mtime: float = (
             self._config_path.stat().st_mtime if self._config_path.is_file() else 0.0
         )
+
+    # ------------------------------------------------------------------
+    # session_id / pending_preamble live on :class:`TurnRunner`
+    # (Phase 6c of plan 01); proxy them so existing callers (the
+    # handlers in ``_dispatch.py``, ``compaction.run()`` reaching
+    # via ctx) keep working unchanged.
+
+    @property
+    def session_id(self) -> Optional[str]:
+        return self.turn_runner.session_id
+
+    @session_id.setter
+    def session_id(self, value: Optional[str]) -> None:
+        self.turn_runner.session_id = value
+
+    @property
+    def _pending_preamble(self) -> Optional[str]:
+        return self.turn_runner._pending_preamble
+
+    @_pending_preamble.setter
+    def _pending_preamble(self, value: Optional[str]) -> None:
+        self.turn_runner._pending_preamble = value
+
+    async def _run_turn(
+        self,
+        prompt: str,
+        *,
+        turn_id: str,
+        outbound_recipient: Optional[str],
+        silent: bool = False,
+    ) -> str:
+        """Facade so handlers / tests can keep calling ``ctx._run_turn``.
+
+        Resets the per-turn flags (``_turn_did_send`` /
+        ``_turn_last_outbound``) before delegating because those
+        live on the daemon — :meth:`_send_message` writes them, and
+        :class:`TurnRunner` reads ``_turn_did_send`` via the
+        injected getter to decide whether to emit ``missed_reply``.
+        """
+        self._turn_did_send = False
+        self._turn_last_outbound = None
+        return await self.turn_runner.run_turn(
+            prompt,
+            turn_id=turn_id,
+            outbound_recipient=outbound_recipient,
+            silent=silent,
+        )
+
+    def _prime_bootstrap_preamble(self) -> None:
+        """Facade so :class:`CompactionTrigger.run` can reach the
+        preamble primer through ctx."""
+        self.turn_runner.prime_bootstrap_preamble()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -642,214 +708,16 @@ class SpeakingDaemon:
         return self.address_book.display_name_for("signal", recipient)
 
     # ------------------------------------------------------------------
-    # Agent SDK invocation (shared by signal + surface + emergency + compaction)
-
-    async def _run_turn(
-        self,
-        prompt: str,
-        *,
-        turn_id: str,
-        outbound_recipient: Optional[str],
-        silent: bool = False,
-    ) -> str:
-        """Execute one SDK turn through the agent kernel.
-
-        ``silent=True`` marks the turn as internal (bootstrap or
-        compaction) — no missed_reply event, no usage-threshold check,
-        no session.json flap. ``outbound_recipient`` is informational
-        for the missed_reply event.
-
-        On Layer 1 failure (resume= points at a session the SDK no
-        longer has) we clear self.session_id, prime the Layer 2
-        bootstrap preamble, and transparently retry the same prompt
-        with a fresh session.
-
-        Returns the concatenated assistant text (useful for compaction
-        turns which consume the summary).
-        """
-        self._turn_did_send = False
-        self._turn_last_outbound = None   # reset per turn
-
-        final_prompt = self._compose_prompt(prompt)
-        spec = self._build_spec()
-        handlers = self._build_handlers(silent=silent)
-
-        kernel = AgentKernel(
-            self.events,
-            correlation_id=turn_id,
-            silent=silent,
-            # Generous so Opus's reasoning + replies aren't sliced mid-
-            # sentence in the modal trace. Logs grow ~2x on busy days
-            # but disk is cheap and the viewer's value depends on this.
-            short_cap=4000,
-        )
-
-        try:
-            result = await kernel.run(final_prompt, spec, handlers=handlers)
-        except Exception as exc:  # noqa: BLE001
-            # Layer 1 failure recovery: if resume= points at a stale
-            # session, drop session state, prime Layer 2, and retry the
-            # same prompt once with a fresh session.
-            if self.session_id and _looks_like_missing_session(exc):
-                self.events.emit(
-                    "session_resume_failed",
-                    turn_id=turn_id,
-                    session_id=self.session_id,
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-                log.warning(
-                    "resume=%s failed (%s); retrying with fresh session",
-                    self.session_id,
-                    type(exc).__name__,
-                )
-                self.session_id = None
-                session_state.clear(self._session_path)
-                self._prime_bootstrap_preamble()
-                retry_prompt = self._compose_prompt(prompt)
-                retry_spec = self._build_spec()
-                retry_handlers = self._build_handlers(silent=silent)
-                result = await kernel.run(
-                    retry_prompt, retry_spec, handlers=retry_handlers
-                )
-            else:
-                raise
-
-        if result.is_error or result.error:
-            # Kernel returned an error result (timeout, etc.). Callers
-            # see an empty / partial text; the kernel already emitted
-            # the specific error event. We just flow through.
-            pass
-
-        # Missed-reply observability: only meaningful when the turn was
-        # supposed to be able to reach a user and Alice skipped it.
-        if not silent and not self._turn_did_send:
-            self.events.emit(
-                "missed_reply",
-                turn_id=turn_id,
-                outbound_recipient=outbound_recipient,
-                session_id=result.session_id,
-            )
-
-        return result.text
-
-    def _compose_prompt(self, prompt: str) -> str:
-        """Prepend the one-shot bootstrap preamble if one is pending."""
-        if not self._pending_preamble:
-            return prompt
-        composed = f"{self._pending_preamble}\n\n{prompt}"
-        self._pending_preamble = None
-        return composed
-
-    def _build_spec(self) -> KernelSpec:
-        builtin_tools = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch"]
-        return KernelSpec(
-            model=self.cfg.speaking.get("model"),
-            allowed_tools=builtin_tools + self.custom_tool_names,
-            mcp_servers=self.mcp_servers,
-            cwd=self.cfg.work_dir,
-            resume=self.session_id,
-            # Adaptive thinking with summarized display so ThinkingBlocks
-            # come back with non-empty text. Without display='summarized'
-            # the SDK omits thinking text entirely (signature only) and
-            # the viewer's trace shows empty (thought) rows.
-            thinking={"type": "adaptive", "display": "summarized"},
-        )
-
-    def _build_handlers(self, *, silent: bool) -> list:
-        """Compose the per-turn kernel handlers.
-
-        Silent turns still need their session_id tracked (so the next
-        turn passes ``resume=``) but skip the session.json write and the
-        compaction arming — those are production-turn concerns only.
-        """
-
-        def _set_session_id(sid: str) -> None:
-            self.session_id = sid
-
-        def _arm_compaction() -> None:
-            self.compaction.arm()
-
-        handlers: list = [
-            SessionHandler(
-                session_path=self._session_path,
-                set_session_id=_set_session_id,
-                persist=not silent,
-            ),
-        ]
-        if not silent:
-            threshold = int(
-                self.cfg.speaking.get(
-                    "context_compaction_threshold",
-                    compaction_module.DEFAULT_THRESHOLD,
-                )
-            )
-            handlers.append(
-                CompactionArmer(threshold=threshold, arm=_arm_compaction)
-            )
-        # CLI trace pass-through. No-op when the active channel isn't
-        # CLI, so safe to install for every turn (signal/discord/surface
-        # turns all silently skip). Installed for silent turns too —
-        # bootstrap/compaction trace events would just have no listener.
-        if self.cli_transport is not None:
-            handlers.append(
-                CLITraceHandler(
-                    transport=self.cli_transport,
-                    get_channel=lambda: self._current_reply_channel,
-                )
-            )
-        return handlers
-
-    # ------------------------------------------------------------------
-    # Layer 2 bootstrap + compaction
-
-    def _prime_bootstrap_preamble(self) -> None:
-        """When we have no warm session, prime the next turn with a
-        turn_log-derived preamble (+ compaction summary if present).
-
-        This covers three cases:
-        - Daemon start with no session.json: bootstrap from turn_log.
-        - session.json pointed at a stale SDK session: same bootstrap.
-        - Just rolled the session after compaction: inject summary +
-          tail. (That caller also sets self.session_id = None before
-          priming.)
-
-        Empty preamble means "first boot, no turn history" — we just
-        start fresh.
-        """
-        if self.session_id is not None:
-            return
-        summary = compaction_module.read_summary_if_any(self._summary_path)
-        if summary:
-            tail = self.turns.tail(SUMMARY_TAIL_TURNS)
-            self._pending_preamble = compaction_module.build_summary_preamble(
-                summary, tail
-            )
-            self.events.emit(
-                "context_bootstrap",
-                source="summary",
-                tail_len=len(tail),
-            )
-            log.info("primed bootstrap preamble from context summary")
-            return
-
-        bootstrap_turns = int(
-            self.cfg.speaking.get("context_bootstrap_turns", 20)
-        )
-        tail = self.turns.tail(bootstrap_turns)
-        preamble = compaction_module.build_bootstrap_preamble(tail)
-        if preamble:
-            self._pending_preamble = preamble
-            self.events.emit(
-                "context_bootstrap",
-                source="turn_log",
-                tail_len=len(tail),
-            )
-            log.info(
-                "primed bootstrap preamble from turn_log (%d turns)", len(tail)
-            )
-
-    # Compaction execution lives on :class:`CompactionTrigger`
-    # (Phase 6b of plan 01); reach it via ``self.compaction.run``.
+    # Kernel invocation + bootstrap preamble + compaction execution
+    # all live in their own modules now (Phase 6c of plan 01):
+    #
+    #   - ``_run_turn`` / ``_compose_prompt`` / ``_build_spec`` /
+    #     ``_build_handlers`` → :class:`TurnRunner`
+    #     (see ``self.turn_runner``).
+    #   - ``_prime_bootstrap_preamble`` → :meth:`TurnRunner.prime_bootstrap_preamble`
+    #     (the daemon facade above delegates).
+    #   - Compaction execution → :class:`CompactionTrigger.run`
+    #     (see ``self.compaction``).
 
 
 async def _amain() -> None:
