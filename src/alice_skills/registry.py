@@ -74,7 +74,7 @@ class SkillRegistry:
     @classmethod
     def from_mind(
         cls,
-        mind_dir: pathlib.Path,
+        mind_dir: pathlib.Path | str,
         *,
         include_defaults: bool = True,
     ) -> "SkillRegistry":
@@ -89,9 +89,10 @@ class SkillRegistry:
         3. :data:`alice_skills.discovery.DEFAULTS_DIR` (runtime
            defaults shipped with the package).
         """
+        mind = pathlib.Path(mind_dir)
         paths: list[pathlib.Path] = [
-            mind_dir / ".claude" / "skills",
-            mind_dir / ".alice" / "skills",
+            mind / ".claude" / "skills",
+            mind / ".alice" / "skills",
         ]
         if include_defaults:
             paths.append(DEFAULTS_DIR)
