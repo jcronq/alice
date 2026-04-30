@@ -8,7 +8,7 @@ paths — without hitting the real Claude subprocess.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 

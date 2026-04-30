@@ -156,7 +156,7 @@ def _build_prompt(events: list) -> str:
         "",
     ]
     if sampled_thoughts:
-        parts.append(f"Thinking samples (across the wake, in order):")
+        parts.append("Thinking samples (across the wake, in order):")
         for i, t in enumerate(sampled_thoughts, 1):
             parts.append(f"[{i}] {t}")
         parts.append("")

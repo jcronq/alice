@@ -45,7 +45,7 @@ import signal as _signal
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 if TYPE_CHECKING:
     from .transports.a2a import A2ATransport
