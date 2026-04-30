@@ -410,7 +410,9 @@ def test_daemon_loader_uses_mind_override(tmp_path):
         speaking=dict(SPEAKING_DEFAULTS),
     )
 
-    loader = build_prompt_loader(cfg)
+    from alice_core.config.personae import placeholder as placeholder_personae
+
+    loader = build_prompt_loader(cfg, placeholder_personae())
     rendered = loader.load("speaking.compact")
     # Override wins over runtime default.
     assert rendered.startswith("OVERRIDE compact for")

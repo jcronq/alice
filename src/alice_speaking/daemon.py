@@ -271,12 +271,23 @@ class SpeakingDaemon:
         # registers them by reference.
         self._surface_watcher = SurfaceWatcher(cfg.mind_dir)
         self._emergency_watcher = EmergencyWatcher(cfg.mind_dir)
+        # Plan 05 Phase 3: load personae before the prompt loader so
+        # context_defaults carries the real agent + user identity.
+        # Missing file → placeholder (today's behaviour); malformed
+        # file → daemon refuses to boot.
+        self._personae = factory_module.build_personae(cfg)
         # Plan 04 Phase 7: install the mind-aware prompt loader as
         # the package-level singleton so every ``alice_prompts.load(...)``
         # call site (compaction, transport build_prompt, surface /
         # emergency handlers) sees this mind's override path.
         import alice_prompts as _prompts
-        _prompts.set_default_loader(factory_module.build_prompt_loader(cfg))
+        _prompts.set_default_loader(
+            factory_module.build_prompt_loader(cfg, self._personae)
+        )
+        # Plan 05 Phase 3: render the persona system-prompt fragment
+        # once at startup; TurnRunner threads it into every kernel
+        # call via KernelSpec.append_system_prompt.
+        self._system_prompt = factory_module.build_system_prompt(self._personae)
         self._registry = factory_module.build_registry(
             cfg,
             transports=(
@@ -342,6 +353,7 @@ class SpeakingDaemon:
             cli_transport=self.cli_transport,
             turn_did_send_getter=lambda: self._turn_did_send,
             current_reply_channel_getter=lambda: self._current_reply_channel,
+            system_prompt=self._system_prompt,
         )
         self.turn_runner.session_id = initial_session_id
         self._config_path = cfg.mind_dir / "config" / "alice.config.json"

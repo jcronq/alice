@@ -313,7 +313,18 @@ class AgentKernel:
         if spec.thinking is not None:
             kwargs["thinking"] = spec.thinking
         if spec.append_system_prompt:
-            kwargs["append_system_prompt"] = spec.append_system_prompt
+            # The SDK exposes append-to-default via the
+            # ``system_prompt`` preset shape:
+            # ``{type: preset, preset: claude_code, append: <str>}``
+            # — there is no top-level ``append_system_prompt`` kwarg.
+            # Using the preset keeps the Claude Code CLI's default
+            # system prompt (tools, MCP servers, etc.) intact and
+            # adds our personae fragment after it.
+            kwargs["system_prompt"] = {
+                "type": "preset",
+                "preset": "claude_code",
+                "append": spec.append_system_prompt,
+            }
         return ClaudeAgentOptions(**kwargs)
 
 

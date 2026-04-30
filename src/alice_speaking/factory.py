@@ -23,6 +23,9 @@ from __future__ import annotations
 import logging
 from typing import Iterable, Optional
 
+from alice_core.config.personae import Personae, PersonaeError
+from alice_core.config.personae import load as load_personae
+from alice_core.config.personae import placeholder as placeholder_personae
 from alice_prompts import DEFAULTS_DIR as PROMPT_DEFAULTS_DIR
 from alice_prompts import PromptLoader
 
@@ -40,9 +43,32 @@ from .transports import SourceRegistry, Transport
 log = logging.getLogger(__name__)
 
 
-def build_prompt_loader(cfg: Config) -> PromptLoader:
+def build_personae(cfg: Config) -> Personae:
+    """Load ``mind/personae.yml``; fall back to the placeholder when
+    the file is missing.
+
+    Plan 05 Phase 3. A malformed file is fatal — :class:`PersonaeError`
+    propagates so the daemon refuses to boot rather than running with
+    a half-resolved identity. A missing file isn't fatal: existing
+    minds without ``personae.yml`` keep working with today's
+    Alice/operator stand-ins until the operator drops one in.
+    """
+    try:
+        return load_personae(cfg.mind_dir)
+    except FileNotFoundError:
+        log.info(
+            "personae.yml missing at %s — using placeholder (Alice/operator)",
+            cfg.mind_dir,
+        )
+        return placeholder_personae()
+    except PersonaeError:
+        log.exception("personae.yml is invalid — refusing to boot")
+        raise
+
+
+def build_prompt_loader(cfg: Config, personae: Personae) -> PromptLoader:
     """Construct a :class:`PromptLoader` wired with this mind's
-    override path.
+    override path + the resolved personae.
 
     The override path is ``mind/.alice/prompts/`` — populated by
     ``alice-init`` when the operator scaffolds a fresh mind (Plan 04
@@ -50,18 +76,32 @@ def build_prompt_loader(cfg: Config) -> PromptLoader:
     loader silently falls back to the runtime defaults bundled with
     the wheel.
 
-    The persona placeholder context is the same stand-in the package-
-    level loader uses; Plan 05 will replace it with real personae
-    drawn from the mind.
+    Plan 05 Phase 3: ``context_defaults`` carries the resolved
+    ``agent`` / ``user`` mappings, so every ``alice_prompts.load(...)``
+    call site picks them up automatically. Templates that reference
+    ``{{ agent.name }}`` / ``{{ user.name }}`` (compaction, narrative,
+    capability sheets, the new system_persona) substitute the real
+    values without each call site having to pass them.
     """
     return PromptLoader(
         defaults_path=PROMPT_DEFAULTS_DIR,
         override_path=cfg.mind_dir / ".alice" / "prompts",
-        context_defaults={
-            "agent": {"name": "Alice"},
-            "user": {"name": "the operator"},
-        },
+        context_defaults=personae.as_template_context(),
     )
+
+
+def build_system_prompt(personae: Personae) -> str:
+    """Render the ``meta.system_persona`` template into a string
+    suitable for ``KernelSpec.append_system_prompt``.
+
+    Uses the package-level ``alice_prompts`` loader, which the daemon
+    has already pointed at this mind via :func:`build_prompt_loader`
+    + :func:`alice_prompts.set_default_loader`. So per-mind overrides
+    of ``meta/system_persona.md.j2`` apply.
+    """
+    from alice_prompts import load as load_prompt
+
+    return load_prompt("meta.system_persona", **personae.as_template_context())
 
 
 def build_registry(

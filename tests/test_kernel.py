@@ -296,7 +296,14 @@ async def test_kernel_passes_append_system_prompt_to_options(
     )
 
     opts = captured["options"]
-    assert opts.append_system_prompt == "You are Alice. Talk to Friend."
+    # SDK exposes append-to-default via the system_prompt preset shape;
+    # the kernel wraps the persona string accordingly so the Claude
+    # Code default system prompt stays in front of our addition.
+    assert opts.system_prompt == {
+        "type": "preset",
+        "preset": "claude_code",
+        "append": "You are Alice. Talk to Friend.",
+    }
 
 
 @pytest.mark.asyncio
@@ -317,8 +324,9 @@ async def test_kernel_omits_append_system_prompt_when_none(
     await kernel.run("prompt", KernelSpec(model="m"))
 
     opts = captured["options"]
-    # Field must NOT be set so older SDKs (without the kwarg) still work.
-    assert not hasattr(opts, "append_system_prompt")
+    # Without a personae fragment the kernel must NOT set system_prompt
+    # at all — the SDK's default preset stays in effect.
+    assert not hasattr(opts, "system_prompt")
 
 
 @pytest.mark.asyncio

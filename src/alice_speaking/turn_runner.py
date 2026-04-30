@@ -92,6 +92,7 @@ class TurnRunner:
         # Borrowed callables — see module docstring.
         turn_did_send_getter: Callable[[], bool],
         current_reply_channel_getter: Callable[[], Optional[ChannelRef]],
+        system_prompt: Optional[str] = None,
     ) -> None:
         self._cfg = cfg
         self._events = events
@@ -104,6 +105,11 @@ class TurnRunner:
         self._cli_transport = cli_transport
         self._turn_did_send_getter = turn_did_send_getter
         self._current_reply_channel_getter = current_reply_channel_getter
+        # Plan 05 Phase 3: persona system-prompt fragment, rendered
+        # once by the daemon factory and threaded into every kernel
+        # call via KernelSpec.append_system_prompt. None keeps today's
+        # behaviour (no system prompt injected).
+        self._system_prompt = system_prompt
         self.session_id: Optional[str] = None
         self._pending_preamble: Optional[str] = None
 
@@ -183,6 +189,7 @@ class TurnRunner:
             # entirely (signature only) and the viewer's trace shows
             # empty (thought) rows.
             thinking={"type": "adaptive", "display": "summarized"},
+            append_system_prompt=self._system_prompt,
         )
 
     def _build_handlers(self, *, silent: bool) -> list:

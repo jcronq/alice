@@ -521,3 +521,42 @@ def test_preamble_consumed_on_next_turn(cfg, monkeypatch) -> None:
     assert "real body" in captured["prompt"]
     # One-shot: preamble cleared after consumption.
     assert d._pending_preamble is None
+
+
+def test_kernel_spec_includes_personae_system_prompt(cfg, monkeypatch) -> None:
+    """Plan 05 phase 3: TurnRunner threads the daemon-rendered persona
+    string into KernelSpec.append_system_prompt, which the kernel
+    serializes onto the SDK's system_prompt preset.
+
+    No personae.yml is on disk in this fixture, so the daemon falls
+    back to the placeholder personae (Alice / the operator). We pin
+    the resulting append text contains both names — proves the
+    system-prompt fragment is being built and threaded, not silently
+    dropped."""
+    d = _make_daemon(cfg, monkeypatch)
+    # Sanity: system prompt was rendered at __init__ time.
+    assert "Alice" in d._system_prompt
+    assert "the operator" in d._system_prompt
+
+    captured: dict[str, Any] = {}
+
+    async def capturing_query(*, prompt, options):
+        captured["options"] = options
+        for m in (
+            _assistant("ok"),
+            _result("session-x"),
+        ):
+            yield m
+
+    monkeypatch.setattr("alice_core.kernel.query", lambda **kw: capturing_query(**kw))
+
+    asyncio.run(
+        d._run_turn("hi", turn_id="t1", outbound_recipient="+15555550100")
+    )
+
+    sp = captured["options"].system_prompt
+    # The kernel wraps our string in the SDK's append-preset shape.
+    assert sp["type"] == "preset"
+    assert sp["preset"] == "claude_code"
+    assert "Alice" in sp["append"]
+    assert "the operator" in sp["append"]
