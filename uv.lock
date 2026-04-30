@@ -27,6 +27,12 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/c9/03/58c92a44e7b94a42614880df2365f074969e47067c4c736e31e855aca2fd/a2a_sdk-1.0.2-py3-none-any.whl", hash = "sha256:4dbc083b6808ee28207ac6daad263360f87612c37b2d06f5521efb530318141c", size = 234302, upload-time = "2026-04-24T13:50:22.412Z" },
 ]
 
+[package.optional-dependencies]
+http-server = [
+    { name = "sse-starlette" },
+    { name = "starlette" },
+]
+
 [[package]]
 name = "aiohappyeyeballs"
 version = "2.6.1"
@@ -170,7 +176,7 @@ name = "alice"
 version = "0.3.0"
 source = { editable = "." }
 dependencies = [
-    { name = "a2a-sdk" },
+    { name = "a2a-sdk", extra = ["http-server"] },
     { name = "claude-agent-sdk" },
     { name = "discord-py" },
     { name = "fastapi" },
@@ -192,7 +198,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "a2a-sdk", specifier = ">=0.2" },
+    { name = "a2a-sdk", extras = ["http-server"], specifier = ">=1.0.2" },
     { name = "claude-agent-sdk", specifier = ">=0.1.66" },
     { name = "discord-py", specifier = ">=2.4" },
     { name = "fastapi", specifier = ">=0.115" },
