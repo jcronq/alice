@@ -427,8 +427,9 @@ async def handle_a2a(ctx: DaemonContext, event: "A2AEvent") -> None:
 async def handle_surface(ctx: DaemonContext, event: "SurfaceEvent") -> None:
     path = event.path
     if not path.is_file():
-        # Already handled by someone else (race). Nothing to do.
-        ctx._dispatched_surfaces.discard(path.name)
+        # Already handled by someone else (race). Nothing to do —
+        # SurfaceWatcher.handle's finally block clears the
+        # dispatched-set slot whether we ran a turn or not.
         return
     body = path.read_text()
     turn_id = uuid.uuid4().hex[:12]
@@ -469,7 +470,8 @@ async def handle_surface(ctx: DaemonContext, event: "SurfaceEvent") -> None:
                 ctx._archive_unresolved(path)
             except OSError as exc:
                 log.warning("unresolved-archive failed for %s: %s", path.name, exc)
-        ctx._dispatched_surfaces.discard(path.name)
+        # Dispatched-set release is owned by SurfaceWatcher.handle's
+        # finally block (Phase 5 of plan 01).
         ctx.events.emit(
             "surface_turn_end",
             turn_id=turn_id,
@@ -491,7 +493,9 @@ async def handle_surface(ctx: DaemonContext, event: "SurfaceEvent") -> None:
 async def handle_emergency(ctx: DaemonContext, event: "EmergencyEvent") -> None:
     path = event.path
     if not path.is_file():
-        ctx._dispatched_emergencies.discard(path.name)
+        # Already handled by someone else (race). Nothing to do —
+        # EmergencyWatcher.handle's finally block clears the
+        # dispatched-set slot whether we ran a turn or not.
         return
     body = path.read_text()
     turn_id = uuid.uuid4().hex[:12]
@@ -583,7 +587,8 @@ async def handle_emergency(ctx: DaemonContext, event: "EmergencyEvent") -> None:
         ctx._current_reply_channel = prev_channel
         if path.is_file():
             ctx._archive_emergency(path, verdict=verdict, action=action)
-        ctx._dispatched_emergencies.discard(path.name)
+        # Dispatched-set release is owned by EmergencyWatcher.handle's
+        # finally block (Phase 5 of plan 01).
         ctx.events.emit(
             "emergency_turn_end",
             turn_id=turn_id,

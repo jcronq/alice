@@ -104,7 +104,6 @@ from .turn_log import TurnLog
 log = logging.getLogger("alice_speaking")
 
 
-SURFACE_POLL_SECONDS = 5.0
 QUIET_CHECK_SECONDS = 30.0
 
 # Turns after which tail-trim happens when composing the summary preamble.
@@ -291,6 +290,10 @@ class SpeakingDaemon:
         # registry instead of an isinstance ladder. Signal is
         # intentionally omitted — its events flow through the
         # transport's own inbox (Phase 2a), never the main queue.
+        # Phase 5 hands the watcher instances mind_dir so they can
+        # own their poll loop end-to-end.
+        self._surface_watcher = SurfaceWatcher(cfg.mind_dir)
+        self._emergency_watcher = EmergencyWatcher(cfg.mind_dir)
         self._registry = SourceRegistry()
         if self.cli_transport is not None:
             self._registry.register(self.cli_transport)
@@ -298,8 +301,8 @@ class SpeakingDaemon:
             self._registry.register(self.discord_transport)
         if self.a2a_transport is not None:
             self._registry.register(self.a2a_transport)
-        self._registry.register_internal(SurfaceWatcher())
-        self._registry.register_internal(EmergencyWatcher())
+        self._registry.register_internal(self._surface_watcher)
+        self._registry.register_internal(self._emergency_watcher)
         # Phase 2a of plan 01 introduced a second consumer (Signal's
         # per-transport batch loop runs alongside the main consumer).
         # Both must serialise on shared kernel state — _run_turn,
@@ -308,13 +311,7 @@ class SpeakingDaemon:
         # body. Phase 6 replaces the lock with a TurnDispatcher that
         # owns the same invariant explicitly.
         self._turn_lock: asyncio.Lock = asyncio.Lock()
-        self._dispatched_surfaces: set[str] = set()
         self._stop = asyncio.Event()
-        self._surface_dir = cfg.mind_dir / "inner" / "surface"
-        self._surface_handled_dir = self._surface_dir / ".handled"
-        self._emergency_dir = cfg.mind_dir / "inner" / "emergency"
-        self._emergency_handled_dir = self._emergency_dir / ".handled"
-        self._dispatched_emergencies: set[str] = set()
         self._config_path = cfg.mind_dir / "config" / "alice.config.json"
         self._config_mtime: float = (
             self._config_path.stat().st_mtime if self._config_path.is_file() else 0.0
@@ -359,32 +356,32 @@ class SpeakingDaemon:
             # session to resume. The consumer picks it up on the first turn.
             self._prime_bootstrap_preamble()
 
-            # Phase 2 of plan 01: each transport owns its producer
-            # task. Surfaces / emergencies / quiet watcher stay
-            # daemon-private until Phase 5 moves them into ``internal/``.
+            # Phase 5 of plan 01: every event-producing source owns
+            # its own producer task, including the surface and
+            # emergency watchers. Daemon supervises them under
+            # uniform start/cancel semantics; the only thing left
+            # daemon-private is the quiet-hours queue watcher (a
+            # cross-cutting concern, not an event source).
             ctx = _dispatch_module.DaemonContext(self)
             producers: list[asyncio.Task] = [
-                asyncio.create_task(self._surface_producer(), name="sur-produce"),
-                asyncio.create_task(self._emergency_producer(), name="emg-produce"),
                 asyncio.create_task(self._quiet_watcher(), name="quiet-watch"),
             ]
+            for source in self._registry.all_event_sources():
+                # Transports that need a network-level handshake
+                # (Discord, A2A) expose ``start()`` on the channel-
+                # layer half of the Transport protocol. Internal
+                # sources (SurfaceWatcher, EmergencyWatcher) don't.
+                start = getattr(source, "start", None)
+                if start is not None:
+                    await start()
+                task = source.producer(ctx)
+                if task is not None:
+                    producers.append(task)
+            # Signal owns its own per-transport consumer loop
+            # (Phase 2a) and is intentionally absent from the
+            # registry; schedule it separately.
             if self.signal_transport is not None:
                 task = self.signal_transport.producer(ctx)
-                if task is not None:
-                    producers.append(task)
-            if self.cli_transport is not None:
-                await self.cli_transport.start()
-                task = self.cli_transport.producer(ctx)
-                if task is not None:
-                    producers.append(task)
-            if self.discord_transport is not None:
-                await self.discord_transport.start()
-                task = self.discord_transport.producer(ctx)
-                if task is not None:
-                    producers.append(task)
-            if self.a2a_transport is not None:
-                await self.a2a_transport.start()
-                task = self.a2a_transport.producer(ctx)
                 if task is not None:
                     producers.append(task)
             consumer = asyncio.create_task(self._consumer(), name="consumer")
@@ -421,58 +418,11 @@ class SpeakingDaemon:
     # ------------------------------------------------------------------
     # Producers
     #
-    # Signal / CLI / Discord / A2A producers moved into their
-    # transports in Phase 2 of plan 01 (each transport owns
-    # ``producer(ctx)``). Surface and emergency producers live here
-    # until Phase 5 relocates them into ``alice_speaking.internal``.
-
-    async def _surface_producer(self) -> None:
-        """Watch ``inner/surface/`` for new .md surfaces and queue them.
-
-        Flat-file only. Files in subdirs of ``inner/surface/`` (other than
-        ``.handled/``) will not be picked up — the glob is non-recursive.
-        Producers of surfaces (thinking Alice, manual injects) must drop
-        files at the top level of the surface directory.
-        """
-        self._surface_dir.mkdir(parents=True, exist_ok=True)
-        self._surface_handled_dir.mkdir(parents=True, exist_ok=True)
-        # One-shot drift check — warn if surfaces are stranded in subdirs
-        for entry in self._surface_dir.iterdir():
-            if entry.is_dir() and entry.name not in (".handled",):
-                md_count = len(list(entry.glob("*.md")))
-                if md_count:
-                    log.warning(
-                        "surface drift: %d .md file(s) in subdir %s — "
-                        "_surface_producer is non-recursive; these will not dispatch. "
-                        "Move them to flat inner/surface/ format.",
-                        md_count, entry.name,
-                    )
-        while not self._stop.is_set():
-            try:
-                for path in sorted(self._surface_dir.glob("*.md")):
-                    if path.name.startswith(".") or path.name in self._dispatched_surfaces:
-                        continue
-                    self._dispatched_surfaces.add(path.name)
-                    log.info("surface detected: %s", path.name)
-                    await self._queue.put(SurfaceEvent(path=path))
-            except OSError as exc:
-                log.warning("surface poll error: %s", exc)
-            await asyncio.sleep(SURFACE_POLL_SECONDS)
-
-    async def _emergency_producer(self) -> None:
-        self._emergency_dir.mkdir(parents=True, exist_ok=True)
-        self._emergency_handled_dir.mkdir(parents=True, exist_ok=True)
-        while not self._stop.is_set():
-            try:
-                for path in sorted(self._emergency_dir.glob("*.md")):
-                    if path.name.startswith(".") or path.name in self._dispatched_emergencies:
-                        continue
-                    self._dispatched_emergencies.add(path.name)
-                    log.warning("EMERGENCY detected: %s", path.name)
-                    await self._queue.put(EmergencyEvent(path=path))
-            except OSError as exc:
-                log.warning("emergency poll error: %s", exc)
-            await asyncio.sleep(SURFACE_POLL_SECONDS)
+    # All event-producing sources own their producer task in Phase 5
+    # of plan 01: transports under ``transports/*`` (Phase 2),
+    # internal sources under ``internal/*`` (Phase 5). Daemon's
+    # ``run()`` schedules them via ``self._registry``; nothing
+    # event-source-specific lives here anymore.
 
     # ------------------------------------------------------------------
     # Consumer
@@ -769,7 +719,7 @@ class SpeakingDaemon:
 
     def _archive_unresolved(self, path: pathlib.Path) -> None:
         today = datetime.date.today().isoformat()
-        dest_dir = self._surface_handled_dir / today
+        dest_dir = self._surface_watcher.handled_dir / today
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / path.name
         body = path.read_text()
@@ -799,7 +749,7 @@ class SpeakingDaemon:
         action: str,
     ) -> None:
         today = datetime.date.today().isoformat()
-        dest_dir = self._emergency_handled_dir / today
+        dest_dir = self._emergency_watcher.handled_dir / today
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / path.name
         body = path.read_text()
