@@ -1,0 +1,70 @@
+# GitHub Actions CI for alice-runtime.
+#
+# Known follow-ups (NOT addressed in this PR):
+#   - ruff format drift: 39/63 files would be reformatted by `ruff format`.
+#     The format-check step runs with continue-on-error so the drift is
+#     visible in CI without blocking. Decide whether to bulk-format in a
+#     follow-up commit (39 files, mechanical) or to disable format-check.
+#   - mypy errors: 17 real type errors across 8 files (Optional leaking
+#     into non-Optional params, KernelSpec(model=...), etc.). The mypy
+#     step runs with continue-on-error so the failures are visible without
+#     blocking. Address in a follow-up PR or disable the step entirely.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # needed for the secret-scan commit range
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8
+        with:
+          enable-cache: true   # caches the uv download cache via uv.lock hash
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: pytest
+        run: uv run --python ${{ matrix.python-version }} pytest
+
+      - name: ruff check
+        run: uv run ruff check src/ tests/
+
+      # TODO: 39/63 files have format drift. Either bulk-format in a
+      # follow-up commit or remove this step.
+      - name: ruff format check
+        run: uv run ruff format --check src/ tests/
+        continue-on-error: true
+
+      # TODO: 17 type errors across 8 files. Continue-on-error keeps the
+      # signal visible without blocking CI. Address in a follow-up PR.
+      - name: mypy
+        run: uv run mypy src/
+        continue-on-error: true
+
+      - name: secret scan
+        run: |
+          LOCAL_SHA=$(git rev-parse HEAD)
+          BASE_SHA=$(git merge-base HEAD origin/master 2>/dev/null \
+                     || echo "0000000000000000000000000000000000000000")
+          printf 'refs/heads/ci %s refs/heads/master %s\n' "$LOCAL_SHA" "$BASE_SHA" \
+            | bash .githooks/pre-push
