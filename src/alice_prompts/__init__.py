@@ -50,11 +50,34 @@ def default_loader() -> PromptLoader:
     The daemon path doesn't use this — it builds its own loader with
     the mind's override path injected. This singleton is for the
     callers that don't have an override (wake.py at Phase 1, tests,
-    the inventory CLI)."""
+    the inventory CLI).
+
+    The ``context_defaults`` here include placeholder personae so
+    templates with ``{{agent.name}}`` / ``{{user.name}}`` render
+    sensibly until Plan 05 wires real personae from the mind. The
+    placeholders are intentionally generic — Plan 05 replaces them.
+    """
     global _default_loader
     if _default_loader is None:
-        _default_loader = PromptLoader(defaults_path=DEFAULTS_DIR)
+        _default_loader = PromptLoader(
+            defaults_path=DEFAULTS_DIR,
+            context_defaults=_persona_placeholder_defaults(),
+        )
     return _default_loader
+
+
+def _persona_placeholder_defaults() -> dict[str, Any]:
+    """Stand-in personae values used until Plan 05 lands real ones.
+
+    Templates already reference ``{{agent.name}}`` / ``{{user.name}}``
+    so the substitution surface is in place; once Plan 05 wires
+    actual personae into the loader's context_defaults, this
+    function retires.
+    """
+    return {
+        "agent": {"name": "Alice"},
+        "user": {"name": "the operator"},
+    }
 
 
 def load(name: str, /, **context: Any) -> str:

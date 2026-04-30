@@ -47,11 +47,13 @@ def test_sdk_auth_smoke() -> None:
             "or ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY)"
         )
 
+    from alice_prompts import load as load_prompt
+
     async def go() -> str:
         opts = ClaudeAgentOptions(
             model="claude-sonnet-4-6",
             allowed_tools=[],
-            system_prompt="Reply verbatim to anything the user says. No preamble.",
+            system_prompt=load_prompt("meta.sanity"),
         )
         reply = ""
         async for msg in query(prompt=f"Reply exactly: {MARKER}", options=opts):

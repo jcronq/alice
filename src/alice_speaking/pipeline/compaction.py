@@ -32,25 +32,10 @@ log = logging.getLogger(__name__)
 DEFAULT_THRESHOLD = 150_000
 
 
-COMPACTION_PROMPT = (
-    "[Internal — context compaction. Do NOT call send_message or any "
-    "outbound tool. This turn produces a summary for your own use and "
-    "then ends.]\n\n"
-    "Before we continue, summarize our conversation in this exact "
-    "structure. Keep the whole thing under 600 words.\n\n"
-    "1. Active threads — open questions and pending tasks the owner or "
-    "trusted contacts mentioned that are not yet resolved.\n"
-    "2. The owner's current state — mood, schedule, what they're working "
-    "on, what they're avoiding, energy level.\n"
-    "3. Recent surface verdicts — decisions that shaped your behavior "
-    "this session (e.g. 'voiced / filed / let pass').\n"
-    "4. Uncaptured facts — anything established in this session that "
-    "isn't yet in cortex-memory and should be.\n\n"
-    "This summary becomes your bootstrap context after the session "
-    "rolls. Write it as plain prose under the four headings. Reply "
-    "with only the summary text — no preamble, no apology, no "
-    "closing remark."
-)
+# The compaction prompt template lives at
+# ``alice_prompts/templates/speaking/compact.md.j2`` (Plan 04
+# Phase 2). Loaded lazily inside ``CompactionTrigger.run`` so the
+# import graph stays clean.
 
 
 def should_compact(
@@ -204,13 +189,14 @@ class CompactionTrigger:
         explicit.
         """
         # Lazy imports — these create cycles if pulled at module top.
+        from alice_prompts import load as load_prompt
         from ..domain import session_state
 
         turn_id = f"compact-{uuid.uuid4().hex[:8]}"
         ctx.events.emit("context_compaction_start", turn_id=turn_id)
         try:
             summary = await ctx._run_turn(
-                COMPACTION_PROMPT,
+                load_prompt("speaking.compact"),
                 turn_id=turn_id,
                 outbound_recipient=None,
                 silent=True,
@@ -254,7 +240,6 @@ class CompactionTrigger:
 
 
 __all__ = [
-    "COMPACTION_PROMPT",
     "CompactionTrigger",
     "DEFAULT_THRESHOLD",
     "build_bootstrap_preamble",

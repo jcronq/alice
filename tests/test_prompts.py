@@ -131,3 +131,28 @@ def test_default_dir_constant_points_at_runtime_templates():
     than mysteriously dropping every prompt."""
     assert DEFAULTS_DIR.is_dir()
     assert (DEFAULTS_DIR / "thinking" / "quick.md.j2").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — compact + sanity templates
+
+
+def test_compact_template_renders_with_persona_placeholders():
+    """The compact template uses ``{{user.name}}``; the package-level
+    loader's placeholder defaults make it render as ``the operator``
+    until plan 05 wires real personae."""
+    rendered = load("speaking.compact")
+    # No literal Jinja tags should leak.
+    assert "{{" not in rendered
+    # The placeholder default substituted in.
+    assert "the operator" in rendered
+    # Structural anchors still present.
+    assert "Active threads" in rendered
+    assert "Uncaptured facts" in rendered
+
+
+def test_sanity_template_renders():
+    """The sanity smoke's system prompt comes from
+    ``meta/sanity.md.j2``. Single-line prompt, no placeholders."""
+    rendered = load("meta.sanity").strip()
+    assert rendered == "Reply verbatim to anything the user says. No preamble."
