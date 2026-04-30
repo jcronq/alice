@@ -14,6 +14,8 @@ from typing import Any
 
 from claude_agent_sdk import SdkMcpTool, tool
 
+from alice_core.config.personae import Personae, placeholder as placeholder_personae
+
 from ..infra.config import Config
 
 
@@ -36,7 +38,11 @@ def _stamp_utc() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d-%H%M%S")
 
 
-def build(cfg: Config) -> list[SdkMcpTool[Any]]:
+def build(
+    cfg: Config, *, personae: Personae | None = None
+) -> list[SdkMcpTool[Any]]:
+    p = personae or placeholder_personae()
+    agent = p.agent.name
     inner_dir = cfg.mind_dir / "inner"
     directive_path = inner_dir / "directive.md"
     notes_dir = inner_dir / "notes"
@@ -59,8 +65,8 @@ def build(cfg: Config) -> list[SdkMcpTool[Any]]:
     @tool(
         name="write_directive",
         description=(
-            "Rewrite directive.md with new content. Use sparingly — this "
-            "redirects thinking Alice's focus. Prefer append_note for one-offs."
+            f"Rewrite directive.md with new content. Use sparingly — this "
+            f"redirects thinking {agent}'s focus. Prefer append_note for one-offs."
         ),
         input_schema={"content": str},
     )
@@ -121,9 +127,9 @@ def build(cfg: Config) -> list[SdkMcpTool[Any]]:
     @tool(
         name="read_thoughts",
         description=(
-            "List recent items from inner/thoughts/ — what thinking has "
-            "produced. Returns paths and first line of each. Reading here is "
-            "how speaking Alice 'recalls what she's been thinking about'."
+            f"List recent items from inner/thoughts/ — what thinking has "
+            f"produced. Returns paths and first line of each. Reading here is "
+            f"how speaking {agent} 'recalls what she's been thinking about'."
         ),
         input_schema={"since": str, "limit": int},
     )

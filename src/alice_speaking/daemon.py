@@ -175,10 +175,14 @@ class SpeakingDaemon:
         # MCP tools — build AFTER we know signal/session state because the
         # send_message sender closure needs self.signal plus the did-send
         # tracker below.
+        # Personae must be resolved before tools so descriptions
+        # interpolate the right agent + user names.
+        self._personae = factory_module.build_personae(cfg)
         self.mcp_servers, self.custom_tool_names = tools_module.build(
             cfg,
             address_book=self.address_book,
             sender=self._send_message,
+            personae=self._personae,
         )
 
         # Compaction policy + state. Phase 6b of plan 01 replaced
@@ -277,15 +281,11 @@ class SpeakingDaemon:
         # :meth:`run` once the daemon is actually about to dispatch
         # turns; here we only resolve the spec.
         self._model_config = factory_module.build_model_config(cfg)
-        # Plan 05 Phase 3: load personae before the prompt loader so
-        # context_defaults carries the real agent + user identity.
-        # Missing file → placeholder (today's behaviour); malformed
-        # file → daemon refuses to boot.
-        self._personae = factory_module.build_personae(cfg)
         # Plan 04 Phase 7: install the mind-aware prompt loader as
         # the package-level singleton so every ``alice_prompts.load(...)``
         # call site (compaction, transport build_prompt, surface /
         # emergency handlers) sees this mind's override path.
+        # ``self._personae`` was resolved earlier (before tools_module.build).
         import alice_prompts as _prompts
         _prompts.set_default_loader(
             factory_module.build_prompt_loader(cfg, self._personae)

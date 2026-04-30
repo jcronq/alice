@@ -21,6 +21,8 @@ from typing import Any
 
 from claude_agent_sdk import SdkMcpTool, tool
 
+from alice_core.config.personae import Personae, placeholder as placeholder_personae
+
 from ..infra.config import Config
 
 
@@ -35,20 +37,24 @@ def _err(text: str) -> dict[str, Any]:
 _ROOTS = ("cortex-memory", "memory")
 
 
-def build(cfg: Config) -> list[SdkMcpTool[Any]]:
+def build(
+    cfg: Config, *, personae: Personae | None = None
+) -> list[SdkMcpTool[Any]]:
+    p = personae or placeholder_personae()
+    agent = p.agent.name
     mind_dir = cfg.mind_dir
     PREVIEW_CAP = 4000
 
     @tool(
         name="read_memory",
         description=(
-            "Read Alice's memory. Pattern is glob-style, searched across both "
-            "`cortex-memory/` (groomed wiki) and `memory/` (legacy stream). "
-            "Patterns can be plain filenames, dated entries like "
-            "'2026-04-24.md', folder-scoped ('people/*'), or globs across "
-            "subtrees ('*/<keyword>*'). Single-match returns verbatim "
-            "content and bumps last_accessed + access_count. Multi-match "
-            "returns a listing of first lines."
+            f"Read {agent}'s memory. Pattern is glob-style, searched across both "
+            f"`cortex-memory/` (groomed wiki) and `memory/` (legacy stream). "
+            f"Patterns can be plain filenames, dated entries like "
+            f"'2026-04-24.md', folder-scoped ('people/*'), or globs across "
+            f"subtrees ('*/<keyword>*'). Single-match returns verbatim "
+            f"content and bumps last_accessed + access_count. Multi-match "
+            f"returns a listing of first lines."
         ),
         input_schema={"pattern": str},
     )

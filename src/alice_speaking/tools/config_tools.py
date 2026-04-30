@@ -12,6 +12,8 @@ from typing import Any
 
 from claude_agent_sdk import SdkMcpTool, tool
 
+from alice_core.config.personae import Personae, placeholder as placeholder_personae
+
 from ..infra.config import Config
 
 
@@ -33,15 +35,19 @@ def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def build(cfg: Config) -> list[SdkMcpTool[Any]]:
+def build(
+    cfg: Config, *, personae: Personae | None = None
+) -> list[SdkMcpTool[Any]]:
+    p = personae or placeholder_personae()
+    agent = p.agent.name
     config_path = cfg.mind_dir / "config" / "alice.config.json"
 
     @tool(
         name="read_config",
         description=(
-            "Return the current contents of alice.config.json (Alice's "
-            "runtime config — model per role, thinking cadence, quiet hours, "
-            "tool allowlists, etc.). Empty object if the file doesn't exist."
+            f"Return the current contents of alice.config.json ({agent}'s "
+            f"runtime config — model per role, thinking cadence, quiet hours, "
+            f"tool allowlists, etc.). Empty object if the file doesn't exist."
         ),
         input_schema={},
     )
@@ -53,11 +59,11 @@ def build(cfg: Config) -> list[SdkMcpTool[Any]]:
     @tool(
         name="write_config",
         description=(
-            "Deep-merge a JSON patch into alice.config.json. Only changed keys "
-            "are overwritten; everything else is preserved. Pass the patch as "
-            "a JSON string in `patch`. Changes take effect on Alice's next turn "
-            "for hot-reloadable fields (model, quiet_hours, allowed_tools); "
-            "other fields may require a daemon restart."
+            f"Deep-merge a JSON patch into alice.config.json. Only changed keys "
+            f"are overwritten; everything else is preserved. Pass the patch as "
+            f"a JSON string in `patch`. Changes take effect on {agent}'s next turn "
+            f"for hot-reloadable fields (model, quiet_hours, allowed_tools); "
+            f"other fields may require a daemon restart."
         ),
         input_schema={"patch": str, "reason": str},
     )
