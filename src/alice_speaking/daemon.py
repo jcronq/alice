@@ -37,10 +37,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import datetime
 import logging
 import os
-import pathlib
 import signal as _signal
 from typing import TYPE_CHECKING, Optional
 
@@ -57,7 +55,6 @@ from . import compaction as compaction_module
 from . import config as config_module
 from . import factory as factory_module
 from . import principals as principals_module
-from . import render as render_module
 from . import session_state
 from . import tools as tools_module
 from .config import Config
@@ -84,7 +81,6 @@ from .transports import (
 # configured to use Discord. Module-top ``import discord`` in transports.discord
 # would otherwise crash the daemon at import time when discord.py isn't
 # installed (e.g. stale worker image after a Dockerfile bump).
-from .transports.base import SIGNAL_CAPS
 # Per-transport event dataclasses live next to their transports
 # (transport events: Phase 2; SurfaceEvent / EmergencyEvent: Phase 3).
 # Daemon no longer touches them directly — the registry routes by
@@ -108,19 +104,6 @@ QUIET_CHECK_SECONDS = 30.0
 # Matches the design: 5 verbatim turns bridge the gap between summary
 # cutoff and now.
 SUMMARY_TAIL_TURNS = 5
-
-
-def _format_envelope_time(timestamp_ms: int) -> str:
-    """Render an envelope's millisecond Unix timestamp as a local time string.
-
-    Used by the multi-message prompt format so Alice can see when each
-    queued message arrived relative to the others.
-    """
-    try:
-        dt = datetime.datetime.fromtimestamp(int(timestamp_ms) / 1000).astimezone()
-    except (OSError, ValueError, OverflowError):
-        return str(timestamp_ms)
-    return dt.strftime("%-I:%M:%S %p %Z")
 
 
 # Public names re-exported from this module for back-compat. The
@@ -536,174 +519,9 @@ class SpeakingDaemon:
     # — its per-transport consumer loop (Phase 2a). Daemon-side delegate
     # methods retired with Phase 3.
 
-    def _build_discord_prompt(
-        self,
-        *,
-        principal_name: str,
-        stamp: str,
-        text: str,
-    ) -> str:
-        """Compose the prompt for a single Discord DM. Mirrors the CLI/Signal
-        prompts but advertises Discord's caps (limited markdown, 1900-byte
-        chunks) so Alice writes in the right shape."""
-        caps = self.discord_transport.caps if self.discord_transport else None
-        cap_fragment = (
-            render_module.capability_prompt_fragment("discord", caps)
-            if caps is not None
-            else ""
-        )
-        lines: list[str] = [
-            f"[Discord DM from {principal_name} | {stamp}]",
-            "",
-            text,
-            "",
-            "---",
-            cap_fragment,
-            "",
-            "To reply, call the `send_message` tool with "
-            "recipient='self' (replies on the same Discord DM the "
-            "message came from). Returning text alone will NOT reach "
-            "the user.",
-        ]
-        return "\n".join(lines)
-
-    def _build_a2a_prompt(
-        self,
-        *,
-        principal_name: str,
-        stamp: str,
-        text: str,
-    ) -> str:
-        """Compose the prompt for a single A2A task. Reuses the CLI prompt
-        capabilities (full markdown, large message size) — A2A consumers
-        are typically other agents that handle structured output well."""
-        caps = self.a2a_transport.caps if self.a2a_transport else None
-        cap_fragment = (
-            render_module.capability_prompt_fragment("a2a", caps)
-            if caps is not None
-            else ""
-        )
-        lines: list[str] = [
-            f"[A2A task from {principal_name} | {stamp}]",
-            "",
-            text,
-            "",
-            "---",
-            cap_fragment,
-            "",
-            "To reply, call the `send_message` tool with "
-            "recipient='self' (the reply streams back over the same A2A "
-            "task as text artifacts). Returning text alone will NOT reach "
-            "the caller.",
-        ]
-        return "\n".join(lines)
-
-    def _build_cli_prompt(
-        self,
-        *,
-        principal_name: str,
-        stamp: str,
-        text: str,
-    ) -> str:
-        """Compose the prompt for a single CLI message.
-
-        Mirrors the Signal prompt's structure but tells Alice the channel
-        is local + interactive + markdown-capable, and instructs her to
-        reply via send_message(recipient='self').
-        """
-        cli_caps = self.cli_transport.caps if self.cli_transport else None
-        cap_fragment = (
-            render_module.capability_prompt_fragment("cli", cli_caps)
-            if cli_caps is not None
-            else ""
-        )
-        lines: list[str] = [
-            f"[CLI from {principal_name} | {stamp}]",
-            "",
-            text,
-            "",
-            "---",
-            cap_fragment,
-            "",
-            "To reply, call the `send_message` tool with "
-            "recipient='self' (replies on the same CLI socket the "
-            "message came from). Returning text alone will NOT reach "
-            "the user. If there's nothing useful to say, let the turn "
-            "close silently — the client will see an empty response.",
-        ]
-        return "\n".join(lines)
-
-    def _build_signal_prompt(
-        self,
-        *,
-        sender_name: str,
-        stamp: str,
-        batch: list[SignalEvent],
-    ) -> str:
-        """Compose the per-turn prompt for one or more signal envelopes.
-
-        Single-envelope batches use the simple original layout. Multi-
-        envelope batches enumerate each message in arrival order with a
-        per-message timestamp; attachments are listed inline under the
-        message they came in with. Either way, the closing instruction
-        block tells Alice how to reply via send_message.
-        """
-        lines: list[str] = []
-        if len(batch) == 1:
-            env = batch[0].envelope
-            body = env.body or "(no text — see attachments below)"
-            lines.extend([
-                f"[Signal from {sender_name} | {stamp}]",
-                "",
-                body,
-            ])
-            if env.attachments:
-                lines.append("")
-                lines.append(
-                    f"--- {len(env.attachments)} attachment"
-                    f"{'s' if len(env.attachments) != 1 else ''} ---"
-                )
-                for att in env.attachments:
-                    fn = f' "{att.filename}"' if att.filename else ""
-                    lines.append(
-                        f"- {att.path} ({att.content_type}{fn}) — "
-                        f"use the Read tool to view."
-                    )
-        else:
-            lines.extend([
-                f"[Signal from {sender_name} | {stamp}]",
-                f"{len(batch)} messages came in while you were busy — "
-                "handle them together as one reply (or several, your call). "
-                "Each is shown in arrival order:",
-                "",
-            ])
-            for i, ev in enumerate(batch, start=1):
-                env = ev.envelope
-                ts_str = _format_envelope_time(env.timestamp)
-                body = env.body or "(no text — see attachments below)"
-                lines.append(f"--- message {i} of {len(batch)} (sent {ts_str}) ---")
-                lines.append(body)
-                if env.attachments:
-                    for att in env.attachments:
-                        fn = f' "{att.filename}"' if att.filename else ""
-                        lines.append(
-                            f"  attachment: {att.path} "
-                            f"({att.content_type}{fn}) — Read it."
-                        )
-                lines.append("")
-        lines.extend([
-            "",
-            "---",
-            render_module.capability_prompt_fragment("signal", SIGNAL_CAPS),
-            "",
-            "To reply, call the `send_message` tool "
-            "(recipient='self' to reply to the sender, a principal id "
-            "from the address book to reach someone else, or an E.164 "
-            "number; message=your reply text). Returning text alone "
-            "will NOT send. If there's nothing to say, let the turn "
-            "close silently.",
-        ])
-        return "\n".join(lines)
+    # Per-transport prompt assembly lives on each transport class
+    # (Phase 6c of plan 01) — handlers in :mod:`_dispatch` reach
+    # ``ctx.<name>_transport.build_prompt(...)``.
 
     async def _quiet_watcher(self) -> None:
         """Poll quiet-hours state; drain the queue on transition out."""
@@ -745,51 +563,11 @@ class SpeakingDaemon:
     # Surface helpers — :func:`_dispatch.handle_surface` reaches back
     # into these via the DaemonContext proxy.
 
-    def _archive_unresolved(self, path: pathlib.Path) -> None:
-        today = datetime.date.today().isoformat()
-        dest_dir = self._surface_watcher.handled_dir / today
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / path.name
-        body = path.read_text()
-        trailer = (
-            "\n\n---\n"
-            + f"resolved: {datetime.datetime.now().astimezone().isoformat(timespec='seconds')}\n"
-            + "verdict: (unresolved — Alice did not call resolve_surface)\n"
-            + "action_taken: auto-archived by daemon\n"
-        )
-        dest.write_text(body + trailer)
-        path.unlink()
-        log.info("auto-archived unresolved surface: %s", path.name)
-
     # ------------------------------------------------------------------
-    # Emergency helpers — :func:`_dispatch.handle_emergency` reaches
-    # back into these via the DaemonContext proxy. External monitors
-    # drop files into inner/emergency/; emergency voice BYPASSES quiet
-    # hours (the whole point). Alice voices via send_message like any
-    # other turn; the daemon routes around the quiet-hours queue when
-    # the sender context is "emergency".
-
-    def _archive_emergency(
-        self,
-        path: pathlib.Path,
-        *,
-        verdict: str,
-        action: str,
-    ) -> None:
-        today = datetime.date.today().isoformat()
-        dest_dir = self._emergency_watcher.handled_dir / today
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / path.name
-        body = path.read_text()
-        trailer = (
-            "\n\n---\n"
-            + f"resolved: {datetime.datetime.now().astimezone().isoformat(timespec='seconds')}\n"
-            + f"verdict: {verdict}\n"
-            + f"action_taken: {action}\n"
-        )
-        dest.write_text(body + trailer)
-        path.unlink()
-        log.info("emergency archived: %s (%s)", path.name, verdict)
+    # Surface / emergency archive: now owned by the watcher classes
+    # (Phase 6c of plan 01). _dispatch reaches them as
+    # ``ctx._surface_watcher.archive_unresolved(...)`` /
+    # ``ctx._emergency_watcher.archive(...)``.
 
     # ------------------------------------------------------------------
     # send_message router (closure given to tools.messaging)

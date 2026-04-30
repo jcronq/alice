@@ -106,7 +106,7 @@ def test_parse_envelope_ignores_non_json_lines() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Prompt composition (daemon._build_signal_prompt)
+# Prompt composition (daemon.signal_transport.build_prompt)
 
 
 @pytest.fixture
@@ -131,7 +131,7 @@ def _signal_event(env: SignalEnvelope, name: str = "Owner"):
 
 def test_prompt_with_no_attachments(daemon) -> None:
     env = SignalEnvelope(timestamp=1, source="+15555550100", body="hi alice")
-    prompt = daemon._build_signal_prompt(
+    prompt = daemon.signal_transport.build_prompt(
         sender_name="Owner",
         stamp="Friday, April 25, 2026 at 9:00 AM EDT",
         batch=[_signal_event(env)],
@@ -153,7 +153,7 @@ def test_prompt_with_attachments_lists_paths(daemon, tmp_path) -> None:
             Attachment(id="y.pdf", path=p2, content_type="application/pdf"),
         ],
     )
-    prompt = daemon._build_signal_prompt(
+    prompt = daemon.signal_transport.build_prompt(
         sender_name="Owner", stamp="t", batch=[_signal_event(env)]
     )
     assert "see attached" in prompt
@@ -175,7 +175,7 @@ def test_prompt_with_image_only_message(daemon, tmp_path) -> None:
         body="",
         attachments=[Attachment(id="selfie.jpg", path=p, content_type="image/jpeg")],
     )
-    prompt = daemon._build_signal_prompt(
+    prompt = daemon.signal_transport.build_prompt(
         sender_name="Owner", stamp="t", batch=[_signal_event(env)]
     )
     assert "(no text" in prompt
@@ -195,7 +195,7 @@ def test_prompt_with_batched_messages(daemon) -> None:
             timestamp=1735131610000, source="+15555550100", body="what's the time"
         ),
     ]
-    prompt = daemon._build_signal_prompt(
+    prompt = daemon.signal_transport.build_prompt(
         sender_name="Owner",
         stamp="t",
         batch=[_signal_event(e) for e in envs],

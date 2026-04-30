@@ -362,6 +362,38 @@ class DiscordTransport:
             log.debug("discord typing indicator failed: %s", exc)
 
     # ------------------------------------------------------------------
+    # Prompt assembly (Phase 6c of plan 01)
+
+    def build_prompt(
+        self,
+        *,
+        principal_name: str,
+        stamp: str,
+        text: str,
+    ) -> str:
+        """Compose the prompt for a single Discord DM. Mirrors the
+        CLI/Signal prompts but advertises Discord's caps (limited
+        markdown, 1900-byte chunks) so Alice writes in the right shape.
+        """
+        from ..render import capability_prompt_fragment
+
+        cap_fragment = capability_prompt_fragment("discord", self.caps)
+        lines: list[str] = [
+            f"[Discord DM from {principal_name} | {stamp}]",
+            "",
+            text,
+            "",
+            "---",
+            cap_fragment,
+            "",
+            "To reply, call the `send_message` tool with "
+            "recipient='self' (replies on the same Discord DM the "
+            "message came from). Returning text alone will NOT reach "
+            "the user.",
+        ]
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # Dispatcher integration (Phase 2 of plan 01)
 
     def producer(self, ctx: DaemonContext) -> Optional[asyncio.Task]:

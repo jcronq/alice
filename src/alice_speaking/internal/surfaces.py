@@ -19,6 +19,7 @@ those services.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import pathlib
 from dataclasses import dataclass
@@ -127,3 +128,28 @@ class SurfaceWatcher:
             await handle_surface(ctx, event)
         finally:
             self._dispatched.discard(event.path.name)
+
+    def archive_unresolved(self, path: pathlib.Path) -> None:
+        """Move a surface that closed without a ``resolve_surface``
+        call into the dated handled-dir, with an inline trailer
+        documenting the auto-archival.
+
+        Lives on the watcher (Phase 6c of plan 01) so the surface
+        directory layout stays in one place. Called from
+        :func:`alice_speaking._dispatch.handle_surface` when the
+        kernel returns without Alice calling ``resolve_surface``.
+        """
+        today = datetime.date.today().isoformat()
+        dest_dir = self._handled_dir / today
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / path.name
+        body = path.read_text()
+        trailer = (
+            "\n\n---\n"
+            + f"resolved: {datetime.datetime.now().astimezone().isoformat(timespec='seconds')}\n"
+            + "verdict: (unresolved — Alice did not call resolve_surface)\n"
+            + "action_taken: auto-archived by daemon\n"
+        )
+        dest.write_text(body + trailer)
+        path.unlink()
+        log.info("auto-archived unresolved surface: %s", path.name)

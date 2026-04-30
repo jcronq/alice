@@ -229,6 +229,41 @@ class CLITransport:
         return
 
     # ------------------------------------------------------------------
+    # Prompt assembly (Phase 6c of plan 01)
+
+    def build_prompt(
+        self,
+        *,
+        principal_name: str,
+        stamp: str,
+        text: str,
+    ) -> str:
+        """Compose the prompt for a single CLI message.
+
+        Mirrors the Signal prompt's structure but advertises CLI's
+        capabilities (full markdown, large message size, interactive)
+        and instructs Alice to reply via send_message(recipient='self').
+        """
+        from ..render import capability_prompt_fragment
+
+        cap_fragment = capability_prompt_fragment("cli", self.caps)
+        lines: list[str] = [
+            f"[CLI from {principal_name} | {stamp}]",
+            "",
+            text,
+            "",
+            "---",
+            cap_fragment,
+            "",
+            "To reply, call the `send_message` tool with "
+            "recipient='self' (replies on the same CLI socket the "
+            "message came from). Returning text alone will NOT reach "
+            "the user. If there's nothing useful to say, let the turn "
+            "close silently — the client will see an empty response.",
+        ]
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # Dispatcher integration (Phase 2 of plan 01)
 
     def producer(self, ctx: DaemonContext) -> Optional[asyncio.Task]:

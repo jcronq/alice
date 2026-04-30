@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import logging
 from dataclasses import dataclass
 from typing import AsyncIterator, Optional
@@ -46,6 +47,18 @@ from .base import (
     InboundMessage,
     OutboundMessage,
 )
+
+
+def _format_envelope_time(timestamp_ms: int) -> str:
+    """Render a Signal envelope's millisecond Unix timestamp as a
+    local time string. Used in multi-message prompts so Alice can
+    see when each queued message arrived relative to the others.
+    """
+    try:
+        dt = datetime.datetime.fromtimestamp(int(timestamp_ms) / 1000).astimezone()
+    except (OSError, ValueError, OverflowError):
+        return str(timestamp_ms)
+    return dt.strftime("%-I:%M:%S %p %Z")
 
 
 @dataclass
@@ -122,6 +135,85 @@ class SignalTransport:
             "publishes SignalEvent onto a per-transport inbox the "
             "transport drains itself"
         )
+
+    # ------------------------------------------------------------------
+    # Prompt assembly (Phase 6c of plan 01)
+
+    def build_prompt(
+        self,
+        *,
+        sender_name: str,
+        stamp: str,
+        batch: list[SignalEvent],
+    ) -> str:
+        """Compose the per-turn prompt for one or more Signal envelopes.
+
+        Single-envelope batches use the simple original layout. Multi-
+        envelope batches enumerate each message in arrival order with
+        a per-message timestamp; attachments are listed inline under
+        the message they came in with. Either way, the closing
+        instruction block tells Alice how to reply via send_message.
+        """
+        from ..render import capability_prompt_fragment
+
+        lines: list[str] = []
+        if len(batch) == 1:
+            env = batch[0].envelope
+            body = env.body or "(no text — see attachments below)"
+            lines.extend([
+                f"[Signal from {sender_name} | {stamp}]",
+                "",
+                body,
+            ])
+            if env.attachments:
+                lines.append("")
+                lines.append(
+                    f"--- {len(env.attachments)} attachment"
+                    f"{'s' if len(env.attachments) != 1 else ''} ---"
+                )
+                for att in env.attachments:
+                    fn = f' "{att.filename}"' if att.filename else ""
+                    lines.append(
+                        f"- {att.path} ({att.content_type}{fn}) — "
+                        f"use the Read tool to view."
+                    )
+        else:
+            lines.extend([
+                f"[Signal from {sender_name} | {stamp}]",
+                f"{len(batch)} messages came in while you were busy — "
+                "handle them together as one reply (or several, your call). "
+                "Each is shown in arrival order:",
+                "",
+            ])
+            for i, ev in enumerate(batch, start=1):
+                env = ev.envelope
+                ts_str = _format_envelope_time(env.timestamp)
+                body = env.body or "(no text — see attachments below)"
+                lines.append(
+                    f"--- message {i} of {len(batch)} (sent {ts_str}) ---"
+                )
+                lines.append(body)
+                if env.attachments:
+                    for att in env.attachments:
+                        fn = f' "{att.filename}"' if att.filename else ""
+                        lines.append(
+                            f"  attachment: {att.path} "
+                            f"({att.content_type}{fn}) — Read it."
+                        )
+                lines.append("")
+        lines.extend([
+            "",
+            "---",
+            capability_prompt_fragment("signal", SIGNAL_CAPS),
+            "",
+            "To reply, call the `send_message` tool "
+            "(recipient='self' to reply to the sender, a principal id "
+            "from the address book to reach someone else, or an E.164 "
+            "number; message=your reply text). Returning text alone "
+            "will NOT send. If there's nothing to say, let the turn "
+            "close silently.",
+        ])
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Dispatcher integration (Phase 2a of plan 01)

@@ -14,6 +14,7 @@ difference is the directory and the urgency.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import pathlib
 from dataclasses import dataclass
@@ -93,3 +94,34 @@ class EmergencyWatcher:
             await handle_emergency(ctx, event)
         finally:
             self._dispatched.discard(event.path.name)
+
+    def archive(
+        self,
+        path: pathlib.Path,
+        *,
+        verdict: str,
+        action: str,
+    ) -> None:
+        """Move a handled emergency into the dated handled-dir with
+        a verdict / action trailer.
+
+        Lives on the watcher (Phase 6c of plan 01). Called from
+        :func:`alice_speaking._dispatch.handle_emergency` after the
+        kernel turn closes — the verdict captures whether Alice
+        voiced it or downgraded it; the action records the
+        send_message recipient when applicable.
+        """
+        today = datetime.date.today().isoformat()
+        dest_dir = self._handled_dir / today
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / path.name
+        body = path.read_text()
+        trailer = (
+            "\n\n---\n"
+            + f"resolved: {datetime.datetime.now().astimezone().isoformat(timespec='seconds')}\n"
+            + f"verdict: {verdict}\n"
+            + f"action_taken: {action}\n"
+        )
+        dest.write_text(body + trailer)
+        path.unlink()
+        log.info("emergency archived: %s (%s)", path.name, verdict)

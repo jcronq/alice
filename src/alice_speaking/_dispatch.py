@@ -123,7 +123,7 @@ async def handle_signal(ctx: DaemonContext, batch: list["SignalEvent"]) -> None:
     try:
         now = datetime.datetime.now().astimezone()
         stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
-        prompt = ctx._build_signal_prompt(
+        prompt = ctx.signal_transport.build_prompt(
             sender_name=sender_name, stamp=stamp, batch=batch
         )
         await ctx._run_turn(prompt, turn_id=turn_id, outbound_recipient=source)
@@ -217,7 +217,7 @@ async def handle_cli(ctx: DaemonContext, event: "CLIEvent") -> None:
     try:
         now = datetime.datetime.now().astimezone()
         stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
-        prompt = ctx._build_cli_prompt(
+        prompt = ctx.cli_transport.build_prompt(
             principal_name=msg.principal.display_name,
             stamp=stamp,
             text=msg.text,
@@ -295,7 +295,7 @@ async def handle_discord(ctx: DaemonContext, event: "DiscordEvent") -> None:
     try:
         now = datetime.datetime.now().astimezone()
         stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
-        prompt = ctx._build_discord_prompt(
+        prompt = ctx.discord_transport.build_prompt(
             principal_name=msg.principal.display_name,
             stamp=stamp,
             text=msg.text,
@@ -375,7 +375,7 @@ async def handle_a2a(ctx: DaemonContext, event: "A2AEvent") -> None:
     try:
         now = datetime.datetime.now().astimezone()
         stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
-        prompt = ctx._build_a2a_prompt(
+        prompt = ctx.a2a_transport.build_prompt(
             principal_name=msg.principal.display_name,
             stamp=stamp,
             text=msg.text,
@@ -467,7 +467,7 @@ async def handle_surface(ctx: DaemonContext, event: "SurfaceEvent") -> None:
         ctx._current_turn_kind = prev_kind
         if path.is_file():
             try:
-                ctx._archive_unresolved(path)
+                ctx._surface_watcher.archive_unresolved(path)
             except OSError as exc:
                 log.warning("unresolved-archive failed for %s: %s", path.name, exc)
         # Dispatched-set release is owned by SurfaceWatcher.handle's
@@ -519,7 +519,9 @@ async def handle_emergency(ctx: DaemonContext, event: "EmergencyEvent") -> None:
             turn_id=turn_id,
             emergency_id=path.name,
         )
-        ctx._archive_emergency(path, verdict="no-recipient", action="daemon-archived")
+        ctx._emergency_watcher.archive(
+            path, verdict="no-recipient", action="daemon-archived"
+        )
         return
     recipient = emergency_channel.address
 
@@ -586,7 +588,7 @@ async def handle_emergency(ctx: DaemonContext, event: "EmergencyEvent") -> None:
         ctx._current_turn_kind = prev_kind
         ctx._current_reply_channel = prev_channel
         if path.is_file():
-            ctx._archive_emergency(path, verdict=verdict, action=action)
+            ctx._emergency_watcher.archive(path, verdict=verdict, action=action)
         # Dispatched-set release is owned by EmergencyWatcher.handle's
         # finally block (Phase 5 of plan 01).
         ctx.events.emit(

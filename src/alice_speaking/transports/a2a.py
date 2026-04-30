@@ -315,6 +315,39 @@ class A2ATransport:
         return
 
     # ------------------------------------------------------------------
+    # Prompt assembly (Phase 6c of plan 01)
+
+    def build_prompt(
+        self,
+        *,
+        principal_name: str,
+        stamp: str,
+        text: str,
+    ) -> str:
+        """Compose the prompt for a single A2A task. Reuses the CLI
+        prompt structure (full markdown, large message size) — A2A
+        consumers are typically other agents that handle structured
+        output well.
+        """
+        from ..render import capability_prompt_fragment
+
+        cap_fragment = capability_prompt_fragment("a2a", self.caps)
+        lines: list[str] = [
+            f"[A2A task from {principal_name} | {stamp}]",
+            "",
+            text,
+            "",
+            "---",
+            cap_fragment,
+            "",
+            "To reply, call the `send_message` tool with "
+            "recipient='self' (the reply streams back over the same A2A "
+            "task as text artifacts). Returning text alone will NOT reach "
+            "the caller.",
+        ]
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # Dispatcher integration (Phase 2 of plan 01)
 
     def producer(self, ctx: DaemonContext) -> Optional[asyncio.Task]:
