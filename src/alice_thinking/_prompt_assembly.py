@@ -38,21 +38,22 @@ def wake_timestamp_header(now: Optional[datetime] = None) -> str:
     )
 
 
-def build_active_prompt(
+def build_wake_prompt(
+    template_name: str,
     *,
     now: Optional[datetime] = None,
     directive_path: Optional[pathlib.Path] = None,
 ) -> str:
-    """Compose the active-mode wake prompt via the prompts package.
+    """Compose a wake prompt via the prompts package.
 
-    The bootstrap body lives in
-    ``alice_prompts/templates/thinking/wake.active.md.j2``. The
-    directive is operator-edited and lives in the mind, so it's
-    loaded as a runtime variable and injected into the template
-    via ``{% if directive %}``. The override path at
-    ``mind/.alice/prompts/thinking/wake.active.md.j2`` overrides
-    the *template*; the directive remains data the template
-    includes.
+    ``template_name`` selects the prompt — e.g.
+    ``"thinking.wake.active"`` for active mode,
+    ``"thinking.wake.sleep.consolidate"`` for Stage B. The directive
+    is operator-edited and lives in the mind, so it's loaded as a
+    runtime variable and injected via ``{% if directive %}``. Per-
+    mind overrides drop into ``mind/.alice/prompts/<same-path>``
+    and apply automatically (the wake's PromptLoader carries that
+    path).
     """
     from alice_prompts import load as load_prompt
 
@@ -60,7 +61,19 @@ def build_active_prompt(
     if directive_path is not None and directive_path.is_file():
         directive_text = directive_path.read_text().strip()
     return load_prompt(
-        "thinking.wake.active",
+        template_name,
         timestamp_header=wake_timestamp_header(now),
         directive=directive_text,
+    )
+
+
+def build_active_prompt(
+    *,
+    now: Optional[datetime] = None,
+    directive_path: Optional[pathlib.Path] = None,
+) -> str:
+    """Back-compat shim: delegates to :func:`build_wake_prompt` with
+    the active-mode template name. Existing callers stay unchanged."""
+    return build_wake_prompt(
+        "thinking.wake.active", now=now, directive_path=directive_path
     )

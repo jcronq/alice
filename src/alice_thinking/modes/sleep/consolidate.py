@@ -40,14 +40,20 @@ class ConsolidationStage(_NullPostRun):
         )
 
     async def build_prompt(self, ctx: WakeContext) -> str:
-        # Phase 3 stub: same prompt source as ActiveMode. Phase 4
-        # introduces a stage-specific template.
+        # Phase 5: load via the stage-specific template name. The
+        # template currently extends thinking.wake.active so behavior
+        # is unchanged; Phase 4 (deferred) swaps in Stage B-specific
+        # body without touching this code.
         if ctx.quick:
             from alice_prompts import load as load_prompt
 
             return load_prompt("thinking.quick")
         if ctx.inline_prompt:
             return ctx.inline_prompt
-        from ..._prompt_assembly import build_active_prompt
+        from ..._prompt_assembly import build_wake_prompt
 
-        return build_active_prompt(now=ctx.now, directive_path=ctx.directive_path)
+        return build_wake_prompt(
+            "thinking.wake.sleep.consolidate",
+            now=ctx.now,
+            directive_path=ctx.directive_path,
+        )

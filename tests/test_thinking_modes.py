@@ -103,3 +103,31 @@ def test_selector_returns_active_mode(tmp_path) -> None:
     ctx = _ctx(tmp_path)
     mode = select_mode(now=ctx.now)
     assert isinstance(mode, ActiveMode)
+
+
+def test_consolidation_stage_loads_stage_template(tmp_path) -> None:
+    """Plan 03 Phase 5: ConsolidationStage loads its own template
+    name (``thinking.wake.sleep.consolidate``) rather than the
+    active template directly. The template currently extends
+    thinking.wake.active so the rendered body equals the active
+    body byte-for-byte — Phase 4 (deferred) is what differentiates."""
+    from alice_thinking.modes import ConsolidationStage
+
+    directive = tmp_path / "directive.md"
+    directive.write_text("Standing orders: be terse.")
+    ctx = _ctx(tmp_path, directive_path=directive)
+    out = asyncio.run(ConsolidationStage().build_prompt(ctx))
+    # Directive is included in both via the shared template body.
+    assert "Standing orders: be terse." in out
+
+
+def test_active_and_sleep_consolidate_render_identical_body(tmp_path) -> None:
+    """Phase 5 stub-equivalence: the two templates should produce
+    the same prompt today (different templates, same body via
+    Jinja {% include %}). Phase 4 removes the include."""
+    from alice_thinking.modes import ActiveMode, ConsolidationStage
+
+    ctx = _ctx(tmp_path)
+    a = asyncio.run(ActiveMode().build_prompt(ctx))
+    s = asyncio.run(ConsolidationStage().build_prompt(ctx))
+    assert a == s
