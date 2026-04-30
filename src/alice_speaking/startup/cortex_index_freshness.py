@@ -54,7 +54,7 @@ class CortexIndexFreshnessStartup:
     async def run_once(self, ctx: DaemonContext) -> None:
         # Lazy import keeps the cortex_index module out of the
         # speaking import path when this startup source isn't wired.
-        from alice_core.cortex_index.build_index import build, needs_rebuild
+        from alice_indexer.build_index import build, needs_rebuild
 
         if not self._vault.is_dir():
             log.debug(

@@ -42,16 +42,18 @@ alice-viewer = "alice_viewer.main:run"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-# Six sibling Python packages under src/:
+# Seven sibling Python packages under src/:
 #   alice_core      — agentic kernel (SDK lifecycle + observability + auth)
+#   alice_indexer   — vault SQLite/FTS5 indexer (CLI; cortex-memory tooling)
+#   alice_prompts   — Jinja2 templates the runtime renders into model prompts
 #   alice_speaking  — Signal daemon (composes kernel with producers/handlers/outbox)
 #   alice_thinking  — one-shot wake (python -m alice_thinking)
 #   alice_viewer    — FastAPI observability UI (serves /state logs)
 #   alice_watchers  — one-shot pollers feeding inner/notes/ (github, …)
-#   alice_prompts   — Jinja2 templates the runtime renders into model prompts
 [tool.hatch.build.targets.wheel]
 packages = [
     "src/alice_core",
+    "src/alice_indexer",
     "src/alice_prompts",
     "src/alice_speaking",
     "src/alice_thinking",

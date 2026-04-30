@@ -152,7 +152,7 @@ def test_cortex_index_calls_kernel_when_vault_present(
     rebuild_calls: list[tuple[pathlib.Path, pathlib.Path]] = []
     needs_calls: list[tuple[pathlib.Path, pathlib.Path]] = []
 
-    import alice_core.cortex_index.build_index as bi
+    import alice_indexer.build_index as bi
 
     def fake_needs(v, db, **kw):
         needs_calls.append((v, db))
@@ -182,7 +182,7 @@ def test_cortex_index_skips_rebuild_when_fresh(
 
     rebuild_called = False
 
-    import alice_core.cortex_index.build_index as bi
+    import alice_indexer.build_index as bi
 
     def fake_needs(v, db, **kw):
         return False
@@ -209,7 +209,7 @@ def test_cortex_index_swallows_oserror_from_check(
     vault = tmp_path / "cortex-memory"
     vault.mkdir()
 
-    import alice_core.cortex_index.build_index as bi
+    import alice_indexer.build_index as bi
 
     def fake_needs(*a, **kw):
         raise OSError("bad sqlite")
