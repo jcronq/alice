@@ -1,21 +1,27 @@
 """SignalTransport: wraps :class:`SignalClient` under the Transport interface.
 
-Phase 2 scope is narrow: the daemon stops branching on transport type for
-**outbound** dispatch. Inbound still flows through the daemon's
-``_signal_producer`` (which owns dedup, allowed-sender filtering, and
-multi-message batching from the same source) — those behaviors are
-signal-specific and don't generalize cleanly under
-:meth:`Transport.messages` yet. Phase 3 (address book + principal-based
-ACL) is the natural place to move inbound under this interface.
+Owns Signal's full inbound pipeline end-to-end:
 
-What this class adds today:
-
-- :meth:`send` applies :func:`render` (markdown stripping + chunking via
-  :data:`SIGNAL_CAPS`) before handing each chunk to
+- :meth:`producer` returns one supervisor task that runs two inner
+  loops: a *production* loop reading the Signal RPC (ACL gate +
+  dedup + display-name lookup, then push to the per-transport
+  inbox), and a *consumer* loop draining the inbox in same-sender
+  bursts and running one kernel turn per burst. A daemon-level
+  ``_turn_lock`` serialises with the main consumer so kernel state
+  isn't shared across concurrent turns.
+- :meth:`send` applies :func:`render` (markdown stripping + chunking
+  via :data:`SIGNAL_CAPS`) before handing each chunk to
   :meth:`SignalClient.send`. Multi-chunk messages get a ``(i/N)``
   prefix so recipients can tell they go together. Attachments ride on
   chunk 1 only — same rule as :meth:`SignalClient.send`.
 - :meth:`typing` delegates to the client's typing heartbeat.
+
+Phase 2a of plan 01 moved batch coalescing here from
+``SpeakingDaemon._drain_signal_batch``. Today's main consumer reaches
+into the shared queue — that broke the "add a transport = one new
+file" promise the moment a developer wrote a transport that bursts.
+A per-transport inbox keeps that asymmetry inside Signal where it
+belongs.
 
 The class composes :class:`SignalClient` rather than reimplementing it —
 ``signal-cli``'s JSON-RPC, the receive log tail, the offset file, etc.
@@ -26,6 +32,7 @@ with the daemon for the same reason.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass
 from typing import AsyncIterator, Optional
@@ -78,12 +85,16 @@ class SignalTransport:
     caps: Capabilities = SIGNAL_CAPS
     event_type = SignalEvent
 
-    def __init__(self, *, signal_client) -> None:
+    def __init__(self, *, signal_client, inbox_size: int = 64) -> None:
         # Delayed import-style annotation: SignalClient lives in a sibling
         # module and importing it eagerly would create a cycle through
         # alice_speaking.daemon. Type-checkers can still see it via
         # `from .signal_client import SignalClient` at the call site.
         self._signal = signal_client
+        # Per-transport inbox for inbound SignalEvents (Phase 2a of plan
+        # 01). Keeps Signal's same-sender batching from reaching into
+        # the daemon's shared queue.
+        self._inbox: asyncio.Queue[SignalEvent] = asyncio.Queue(maxsize=inbox_size)
 
     # ------------------------------------------------------------------
     # Lifecycle (no-op — SignalClient lifecycle stays on the daemon)
@@ -101,34 +112,59 @@ class SignalTransport:
         return
 
     # ------------------------------------------------------------------
-    # Inbound — not implemented as an async iterator yet.
-    #
-    # Signal's dedup + allowed-sender + per-source batching never fit
-    # cleanly under :meth:`Transport.messages`; the producer below
-    # publishes :class:`SignalEvent` objects directly onto the daemon
-    # queue instead.
+    # Inbound — events flow through the per-transport inbox below, not
+    # through :meth:`Transport.messages`. Signal's dedup + allowed-sender
+    # + per-source batching don't fit the InboundMessage iterator shape.
 
     def messages(self) -> AsyncIterator[InboundMessage]:
         raise NotImplementedError(
             "SignalTransport doesn't expose messages() — its producer "
-            "publishes SignalEvent directly onto the daemon queue"
+            "publishes SignalEvent onto a per-transport inbox the "
+            "transport drains itself"
         )
 
     # ------------------------------------------------------------------
-    # Dispatcher integration (Phase 2 of plan 01)
+    # Dispatcher integration (Phase 2a of plan 01)
 
     def producer(self, ctx: DaemonContext) -> Optional[asyncio.Task]:
-        """Long-running task that pumps Signal envelopes onto
-        ``ctx._queue`` as :class:`SignalEvent` objects.
+        """Supervisor task that runs Signal's full inbound pipeline.
+
+        Internally schedules two sub-tasks:
+
+        - ``_produce`` reads the Signal RPC, gates by ACL + dedup, and
+          pushes :class:`SignalEvent` objects onto :attr:`_inbox`.
+        - ``_consume`` drains :attr:`_inbox` in same-sender bursts and
+          runs one kernel turn per burst, holding ``ctx._turn_lock``
+          across the pre-turn services + handler so it serialises with
+          the daemon's main consumer.
+
+        Returning a single supervisor task lets the daemon supervise
+        Signal's pipeline with the same start/cancel semantics as any
+        other transport. The two sub-tasks shut down together.
+        """
+        return asyncio.create_task(self._run(ctx), name="sig-produce")
+
+    async def _run(self, ctx: DaemonContext) -> None:
+        produce = asyncio.create_task(self._produce(ctx), name="sig-prod-inner")
+        consume = asyncio.create_task(self._consume(ctx), name="sig-cons-inner")
+        try:
+            await asyncio.gather(produce, consume)
+        except asyncio.CancelledError:
+            for task in (produce, consume):
+                task.cancel()
+            for task in (produce, consume):
+                with contextlib.suppress(BaseException):
+                    await task
+            raise
+
+    async def _produce(self, ctx: DaemonContext) -> None:
+        """Push raw Signal envelopes onto the per-transport inbox.
 
         Owns ACL gating (``ctx.address_book.is_allowed``), envelope
         dedup (``ctx.dedup``), and display-name resolution — all the
         per-source state that used to live in
         ``SpeakingDaemon._signal_producer``.
         """
-        return asyncio.create_task(self._produce(ctx), name="sig-produce")
-
-    async def _produce(self, ctx: DaemonContext) -> None:
         async for env in self._signal.receive():
             if not ctx.address_book.is_allowed("signal", env.source):
                 log.info("ignoring envelope from %s", env.source)
@@ -138,18 +174,63 @@ class SignalTransport:
                 continue
             ctx.dedup.mark(env.timestamp)
             sender_name = ctx.address_book.display_name_for("signal", env.source)
-            await ctx._queue.put(
+            await self._inbox.put(
                 SignalEvent(envelope=env, sender_name=sender_name)
             )
+
+    async def _consume(self, ctx: DaemonContext) -> None:
+        """Drain the inbox in same-sender bursts and run one turn per burst."""
+        from .._dispatch import handle_signal
+
+        while True:
+            head = await self._inbox.get()
+            try:
+                batch = self._drain_batch(head)
+                async with ctx._turn_lock:
+                    await ctx._pre_turn()
+                    await handle_signal(ctx, batch)
+            except Exception:  # noqa: BLE001
+                log.exception("signal consume error")
+            finally:
+                self._inbox.task_done()
+
+    def _drain_batch(self, head: SignalEvent) -> list[SignalEvent]:
+        """Coalesce all currently-queued :class:`SignalEvent` objects from
+        ``head``'s source into a batch.
+
+        Best-effort coalescing: anything that arrives during the turn this
+        batch produces will hit the next consumer iteration. Like Claude
+        Code, queued input applies to the NEXT turn, not the current one.
+
+        Events from a different sender stay on the inbox in their original
+        order — they're popped, classified, and (when not part of the
+        current batch) put back. Each ``get_nowait`` is matched by a
+        ``task_done`` for queue-counter symmetry.
+        """
+        batch: list[SignalEvent] = [head]
+        held: list[SignalEvent] = []
+        while True:
+            try:
+                ev = self._inbox.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._inbox.task_done()
+            if ev.envelope.source == head.envelope.source:
+                batch.append(ev)
+            else:
+                held.append(ev)
+        for ev in held:
+            self._inbox.put_nowait(ev)
+        return batch
 
     async def handle(self, ctx: DaemonContext, event: SignalEvent) -> None:
         """Run one turn for one Signal event.
 
-        Phase 2 — not yet wired into the daemon's consumer loop, which
-        still calls :func:`_dispatch.handle_signal` directly with a
-        coalesced batch. The single-event adapter here exists for
-        protocol conformance and Phase 3's registry dispatch; Phase 2a
-        relocates batch coalescing into the transport itself.
+        Reachable only through Phase 3's registry dispatch — Signal's
+        own consumer loop drives turns in Phase 2a. Kept for protocol
+        conformance and as the entry point an external caller (a test,
+        a future replay tool) can use to drive a single signal turn
+        without spinning up the inbox loop.
         """
         from .._dispatch import handle_signal
 

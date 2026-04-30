@@ -49,9 +49,9 @@ async def handle_signal(ctx: DaemonContext, batch: list["SignalEvent"]) -> None:
     """Process a batch of one or more SignalEvents from the same sender.
 
     All events in the batch share the same source + sender (caller
-    guarantees, via :meth:`SpeakingDaemon._drain_signal_batch`). One
-    kernel turn handles the whole batch; the prompt enumerates each
-    message in arrival order, with timestamps + attachments.
+    guarantees, via :meth:`SignalTransport._drain_batch`). One kernel
+    turn handles the whole batch; the prompt enumerates each message
+    in arrival order, with timestamps + attachments.
     """
     if not batch:
         return

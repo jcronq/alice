@@ -112,8 +112,8 @@ def _format_envelope_time(timestamp_ms: int) -> str:
 
 # Per-transport event dataclasses live next to their transports (Phase
 # 2 of plan 01). They're re-exported here so existing call sites
-# (`_drain_signal_batch`, `_consumer`'s isinstance ladder, the
-# ``Event`` union type) and external callers (tests, viewer) keep
+# (the ``Event`` union type, the consumer's isinstance ladder for
+# non-Signal events) and external callers (tests, viewer) keep
 # working unchanged. Phase 5 of plan 01 moves SurfaceEvent /
 # EmergencyEvent into ``internal/`` and these re-exports retire.
 from .transports.signal import SignalEvent
@@ -277,6 +277,14 @@ class SpeakingDaemon:
             )
 
         self._queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=64)
+        # Phase 2a of plan 01 introduced a second consumer (Signal's
+        # per-transport batch loop runs alongside the main consumer).
+        # Both must serialise on shared kernel state — _run_turn,
+        # session_id, _current_turn_kind, etc. — so each turn-runner
+        # acquires this lock around the pre-turn services + handler
+        # body. Phase 6 replaces the lock with a TurnDispatcher that
+        # owns the same invariant explicitly.
+        self._turn_lock: asyncio.Lock = asyncio.Lock()
         self._dispatched_surfaces: set[str] = set()
         self._stop = asyncio.Event()
         self._surface_dir = cfg.mind_dir / "inner" / "surface"
@@ -447,66 +455,45 @@ class SpeakingDaemon:
     # Consumer
 
     async def _consumer(self) -> None:
+        # Signal events no longer reach this loop — Phase 2a of plan 01
+        # routes them through the per-transport inbox owned by
+        # SignalTransport. This loop now drains everything else: CLI,
+        # Discord, A2A, surfaces, emergencies.
         while True:
             event = await self._queue.get()
             try:
-                self._maybe_reload_config()
-                # Compaction runs BEFORE any inbound event so the token
-                # check from the previous turn has a chance to roll the
-                # session before we append more context.
-                if self._compaction_pending:
-                    await self._run_compaction()
-
-                if isinstance(event, SignalEvent):
-                    # Coalesce any other queued signals from the same
-                    # sender so Alice handles a burst in one turn instead
-                    # of N back-to-back ones — same UX as Claude Code's
-                    # input queue while a turn is mid-flight.
-                    batch = self._drain_signal_batch(event)
-                    await self._handle_signal(batch)
-                elif isinstance(event, CLIEvent):
-                    await self._handle_cli(event)
-                elif isinstance(event, DiscordEvent):
-                    await self._handle_discord(event)
-                elif isinstance(event, A2AEvent):
-                    await self._handle_a2a(event)
-                elif isinstance(event, SurfaceEvent):
-                    await self._handle_surface(event)
-                elif isinstance(event, EmergencyEvent):
-                    await self._handle_emergency(event)
+                async with self._turn_lock:
+                    await self._pre_turn()
+                    if isinstance(event, CLIEvent):
+                        await self._handle_cli(event)
+                    elif isinstance(event, DiscordEvent):
+                        await self._handle_discord(event)
+                    elif isinstance(event, A2AEvent):
+                        await self._handle_a2a(event)
+                    elif isinstance(event, SurfaceEvent):
+                        await self._handle_surface(event)
+                    elif isinstance(event, EmergencyEvent):
+                        await self._handle_emergency(event)
             except Exception:
                 log.exception("consumer error handling %s", type(event).__name__)
             finally:
                 self._queue.task_done()
 
-    def _drain_signal_batch(self, head: SignalEvent) -> list["SignalEvent"]:
-        """Pull all currently-queued SignalEvents from head's source into a
-        batch. Non-matching events (from a different sender, or surfaces /
-        emergencies) get put back on the queue in their original order — so
-        the next consumer iteration sees them unchanged.
+    async def _pre_turn(self) -> None:
+        """Pre-turn services run before any handler.
 
-        Best-effort coalescing: anything that arrives during the turn this
-        batch produces will hit the next consumer iteration. Like Claude
-        Code, queued input applies to the NEXT turn, not the current one.
+        Two consumers (the main loop and SignalTransport's per-transport
+        batch loop) call this; both must hold ``self._turn_lock`` so the
+        config reload + compaction trigger can't race. Phase 6 of plan
+        01 replaces the lock + this helper with a real
+        :class:`CompactionTrigger` that owns the policy.
         """
-        batch: list[SignalEvent] = [head]
-        held: list = []
-        while True:
-            try:
-                ev = self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            self._queue.task_done()
-            if (
-                isinstance(ev, SignalEvent)
-                and ev.envelope.source == head.envelope.source
-            ):
-                batch.append(ev)
-            else:
-                held.append(ev)
-        for ev in held:
-            self._queue.put_nowait(ev)
-        return batch
+        self._maybe_reload_config()
+        # Compaction runs BEFORE any inbound event so the token check
+        # from the previous turn has a chance to roll the session
+        # before we append more context.
+        if self._compaction_pending:
+            await self._run_compaction()
 
     def _maybe_reload_config(self) -> None:
         """Reload alice.config.json if it has changed on disk.
