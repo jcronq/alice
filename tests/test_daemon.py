@@ -303,7 +303,7 @@ def test_discord_surface_send_routes_through_quiet_queue(cfg, monkeypatch) -> No
     # source module so the rebound names in daemon and outbox both
     # resolve to the stub. (Phase 6a of plan 01 split the dispatch
     # path; patching daemon alone no longer reaches the router.)
-    from alice_speaking import outbox as outbox_module
+    from alice_speaking.pipeline import outbox as outbox_module
     monkeypatch.setattr(daemon_module, "is_quiet_hours", lambda *_a, **_k: True)
     monkeypatch.setattr(outbox_module, "is_quiet_hours", lambda *_a, **_k: True)
     d.discord_transport = object()  # truthy stand-in; we won't reach .send()

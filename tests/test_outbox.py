@@ -21,7 +21,7 @@ from typing import Optional
 
 import pytest
 
-from alice_speaking import outbox as outbox_module
+from alice_speaking.pipeline import outbox as outbox_module
 from alice_speaking.events import EventLogger
 from alice_speaking.outbox import OutboxRouter
 from alice_speaking.principals import (
