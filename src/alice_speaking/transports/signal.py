@@ -38,7 +38,7 @@ import logging
 from dataclasses import dataclass
 from typing import AsyncIterator, Optional
 
-from ..signal_client import SignalEnvelope
+from ..infra.signal_rpc import SignalEnvelope
 from .base import (
     SIGNAL_CAPS,
     Capabilities,
@@ -154,7 +154,7 @@ class SignalTransport:
         the message they came in with. Either way, the closing
         instruction block tells Alice how to reply via send_message.
         """
-        from ..render import capability_prompt_fragment
+        from ..domain.render import capability_prompt_fragment
 
         lines: list[str] = []
         if len(batch) == 1:
@@ -355,7 +355,7 @@ class SignalTransport:
         # Lazy import: alice_speaking.render imports transports.base, so
         # importing it at module scope would cycle through this module
         # back to render before render finishes initializing.
-        from ..render import render
+        from ..domain.render import render
 
         chunks = render(out.text, self.caps)
         if not chunks:

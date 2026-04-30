@@ -23,9 +23,9 @@ from typing import TYPE_CHECKING, Optional
 
 from alice_core.sdk_compat import _short
 
-from .quiet_hours import is_quiet_hours
+from .domain.turn_log import new_turn
+from .pipeline.quiet_hours import is_quiet_hours
 from .transports import ChannelRef, DaemonContext, OutboundMessage
-from .turn_log import new_turn
 
 if TYPE_CHECKING:
     from .daemon import (

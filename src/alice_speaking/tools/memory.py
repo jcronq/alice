@@ -21,7 +21,7 @@ from typing import Any
 
 from claude_agent_sdk import SdkMcpTool, tool
 
-from ..config import Config
+from ..infra.config import Config
 
 
 def _ok(text: str) -> dict[str, Any]:

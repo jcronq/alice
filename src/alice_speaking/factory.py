@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from typing import Iterable, Optional
 
-from .config import Config
+from .infra.config import Config
 from .internal import EmergencyWatcher, SurfaceWatcher
 from .startup import (
     CortexIndexFreshnessStartup,

@@ -23,7 +23,7 @@ import pathlib
 import uuid
 from typing import Any, Iterable, Optional
 
-from ..turn_log import Turn, render_for_prompt
+from ..domain.turn_log import Turn, render_for_prompt
 
 
 log = logging.getLogger(__name__)
@@ -204,7 +204,7 @@ class CompactionTrigger:
         explicit.
         """
         # Lazy imports — these create cycles if pulled at module top.
-        from .. import session_state
+        from ..domain import session_state
 
         turn_id = f"compact-{uuid.uuid4().hex[:8]}"
         ctx.events.emit("context_compaction_start", turn_id=turn_id)

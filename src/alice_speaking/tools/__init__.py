@@ -15,9 +15,9 @@ from typing import Any, Optional
 
 from claude_agent_sdk import McpSdkServerConfig, create_sdk_mcp_server
 
-from ..config import Config
-from ..principals import AddressBook
-from ..signal_client import SignalClient
+from ..domain.principals import AddressBook
+from ..infra.config import Config
+from ..infra.signal_rpc import SignalRPC as SignalClient
 from . import config_tools, inner, memory, messaging
 
 

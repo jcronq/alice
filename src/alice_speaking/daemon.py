@@ -48,27 +48,27 @@ if TYPE_CHECKING:
 
 from alice_core.auth import ensure_auth_env
 from . import _dispatch as _dispatch_module
-from . import compaction as compaction_module
-from . import config as config_module
 from . import factory as factory_module
-from . import principals as principals_module
-from . import session_state
 from . import tools as tools_module
-from .config import Config
-from .dedup import DedupStore
-from .events import EventLogger
+from .domain import principals as principals_module
+from .domain import session_state
+from .domain.principals import AddressBook
+from .domain.turn_log import TurnLog
+from .infra import config as config_module
+from .infra.config import Config
+from .infra.events import EventLogger
+from .infra.signal_rpc import SignalRPC as SignalClient
 from .internal import (
     EmergencyEvent,
     EmergencyWatcher,
     SurfaceEvent,
     SurfaceWatcher,
 )
-from .outbox import OutboxRouter
-from .principals import AddressBook
-from .quiet_hours import QuietQueue, is_quiet_hours
-from .quiet_queue_runner import QuietQueueRunner
-from .turn_runner import TurnRunner
-from .signal_client import SignalClient
+from .pipeline import compaction as compaction_module
+from .pipeline.dedup import DedupStore
+from .pipeline.outbox import OutboxRouter
+from .pipeline.quiet_hours import QuietQueue, is_quiet_hours
+from .pipeline.quiet_queue_runner import QuietQueueRunner
 from .tools.messaging import SELF_RECIPIENT, ResolvedRecipient
 from .transports import (
     CLITransport,
@@ -80,17 +80,16 @@ from .transports import (
 # would otherwise crash the daemon at import time when discord.py isn't
 # installed (e.g. stale worker image after a Dockerfile bump).
 # Per-transport event dataclasses live next to their transports
-# (transport events: Phase 2; SurfaceEvent / EmergencyEvent: Phase 3).
-# Daemon no longer touches them directly — the registry routes by
-# ``type(event)`` and the per-transport / per-internal-source
-# producers construct them. These re-imports stay only so existing
+# (transport events: Plan 01 Phase 2; SurfaceEvent / EmergencyEvent:
+# Phase 3). Daemon no longer touches them directly — the registry
+# routes by ``type(event)``. These re-imports stay so existing
 # external callers (tests, the viewer's narrative dump) keep their
 # ``from alice_speaking.daemon import …Event`` paths working.
 from .transports.a2a import A2AEvent
 from .transports.cli import CLIEvent
 from .transports.discord import DiscordEvent
 from .transports.signal import SignalEvent
-from .turn_log import TurnLog
+from .turn_runner import TurnRunner
 
 
 log = logging.getLogger("alice_speaking")

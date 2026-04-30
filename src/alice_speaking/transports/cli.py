@@ -193,7 +193,7 @@ class CLITransport:
         Renders + chunks per :data:`CLI_CAPS`. Returns the total chunk
         count (sum across all delivered connections).
         """
-        from ..render import render
+        from ..domain.render import render
 
         addr = out.destination.address
         writers: list[asyncio.StreamWriter] = []
@@ -244,7 +244,7 @@ class CLITransport:
         capabilities (full markdown, large message size, interactive)
         and instructs Alice to reply via send_message(recipient='self').
         """
-        from ..render import capability_prompt_fragment
+        from ..domain.render import capability_prompt_fragment
 
         cap_fragment = capability_prompt_fragment("cli", self.caps)
         lines: list[str] = [

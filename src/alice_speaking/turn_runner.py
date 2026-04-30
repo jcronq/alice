@@ -45,13 +45,13 @@ from typing import Any, Callable, Optional
 from alice_core.kernel import AgentKernel, KernelSpec
 from alice_core.sdk_compat import looks_like_missing_session as _looks_like_missing_session
 
-from . import compaction as compaction_module
-from . import session_state
-from .config import Config
-from .events import EventLogger
-from .handlers import CLITraceHandler, CompactionArmer, SessionHandler
+from .domain import session_state
+from .domain.turn_log import TurnLog
+from .infra.config import Config
+from .infra.events import EventLogger
+from .pipeline import compaction as compaction_module
+from .pipeline.handlers import CLITraceHandler, CompactionArmer, SessionHandler
 from .transports import ChannelRef
-from .turn_log import TurnLog
 
 
 log = logging.getLogger(__name__)

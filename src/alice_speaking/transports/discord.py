@@ -272,7 +272,7 @@ class DiscordTransport:
         Signal convention. Attachments are accepted but logged-and-
         dropped for now. Returns the chunk count delivered.
         """
-        from ..render import render
+        from ..domain.render import render
 
         if self._client is None:
             raise RuntimeError("DiscordTransport.send before start()")
@@ -375,7 +375,7 @@ class DiscordTransport:
         CLI/Signal prompts but advertises Discord's caps (limited
         markdown, 1900-byte chunks) so Alice writes in the right shape.
         """
-        from ..render import capability_prompt_fragment
+        from ..domain.render import capability_prompt_fragment
 
         cap_fragment = capability_prompt_fragment("discord", self.caps)
         lines: list[str] = [

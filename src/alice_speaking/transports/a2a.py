@@ -292,7 +292,7 @@ class A2ATransport:
         ended (executor exited and dropped its outbox) we log + drop the
         send — same shape as CLI's "no live connection" handling.
         """
-        from ..render import render
+        from ..domain.render import render
 
         task_id = out.destination.address
         q = self._outbox.get(task_id)
@@ -329,7 +329,7 @@ class A2ATransport:
         consumers are typically other agents that handle structured
         output well.
         """
-        from ..render import capability_prompt_fragment
+        from ..domain.render import capability_prompt_fragment
 
         cap_fragment = capability_prompt_fragment("a2a", self.caps)
         lines: list[str] = [

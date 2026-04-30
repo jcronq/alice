@@ -24,8 +24,8 @@ import logging
 import time
 from typing import Callable, Optional
 
-from ..events import EventLogger
-from ..principals import AddressBook
+from ..domain.principals import AddressBook
+from ..infra.events import EventLogger
 from ..transports import ChannelRef, OutboundMessage, Transport
 from .quiet_hours import QueuedMessage, QuietQueue, is_quiet_hours
 

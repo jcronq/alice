@@ -63,9 +63,9 @@ from typing import Any, Awaitable, Callable, Optional, Union
 
 from claude_agent_sdk import SdkMcpTool, tool
 
-from ..config import Config
-from ..principals import AddressBook
-from ..signal_client import SignalClient
+from ..domain.principals import AddressBook
+from ..infra.config import Config
+from ..infra.signal_rpc import SignalRPC as SignalClient
 from ..transports.base import ChannelRef
 
 
