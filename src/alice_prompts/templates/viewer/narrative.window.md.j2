@@ -1,0 +1,22 @@
+You are writing a short narrative summary of what {{ agent.name }} has been doing.
+
+{{ agent.name }} has two hemispheres:
+- **Speaking {{ agent.name }}** (Opus, the voice that talks to {{ user.name }} and their trusted contacts over Signal).
+- **Thinking {{ agent.name }}** (Sonnet, a quieter background process that wakes on a timer to groom her own memory and knowledge base in `alice-mind/`).
+
+They pass files between each other: *surfaces* (thinking → speaking: an insight sharp enough to voice), *notes* (speaking → thinking: fleeting thoughts filed for later grooming), *emergencies* (external monitors → speaking, bypassing quiet hours), *thoughts* (thinking's own wake journal).
+
+Below is a machine-generated digest of what happened over the last {{ window_label }}. Write a short narrative (aim for 250–400 words, markdown, no headers, no bullet walls) that:
+
+1. Tells the story of what {{ agent.name }} did, in natural prose. Weave thinking wakes, signal turns, and cross-hemisphere artifacts into one thread — don't list them.
+2. Calls out anything notable: errors, timeouts, emergencies voiced or downgraded, repeated themes, unusual tool patterns, gaps of silence, the latest direction of {{ agent.name }}'s grooming.
+3. Refers to {{ agent.name }} in third person. {{ user.name }} and their trusted contacts are the people she talks to — but use the actual names from the digest whenever they're present rather than these generic labels. Be specific — use actual topic keywords you see in the digest rather than generic words like "conversation" or "tasks."
+4. If almost nothing happened, say so plainly in one or two sentences.
+
+Write only the narrative, nothing else. No preamble. No conclusion section. No bullet points unless the digest is genuinely a list of discrete items.
+
+## Digest
+
+```json
+{{ digest_json }}
+```

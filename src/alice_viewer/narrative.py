@@ -124,30 +124,18 @@ def _trim(s: str, cap: int) -> str:
 
 
 def render_prompt(digest: dict, window_label: str) -> str:
-    """Build the prompt Claude will narrate over."""
-    return f"""You are writing a short narrative summary of what Alice has been doing.
+    """Build the prompt Claude will narrate over.
 
-Alice has two hemispheres:
-- **Speaking Alice** (Opus, the voice that talks to the owner and their trusted contacts over Signal).
-- **Thinking Alice** (Sonnet, a quieter background process that wakes on a timer to groom her own memory and knowledge base in `alice-mind/`).
+    Body lives in ``alice_prompts/templates/viewer/narrative.window.md.j2``
+    (Plan 04 Phase 4 of the runtime refactor).
+    """
+    from alice_prompts import load as load_prompt
 
-They pass files between each other: *surfaces* (thinking → speaking: an insight sharp enough to voice), *notes* (speaking → thinking: fleeting thoughts filed for later grooming), *emergencies* (external monitors → speaking, bypassing quiet hours), *thoughts* (thinking's own wake journal).
-
-Below is a machine-generated digest of what happened over the last {window_label}. Write a short narrative (aim for 250–400 words, markdown, no headers, no bullet walls) that:
-
-1. Tells the story of what Alice did, in natural prose. Weave thinking wakes, signal turns, and cross-hemisphere artifacts into one thread — don't list them.
-2. Calls out anything notable: errors, timeouts, emergencies voiced or downgraded, repeated themes, unusual tool patterns, gaps of silence, the latest direction of Alice's grooming.
-3. Refers to Alice in third person. The owner and their trusted contacts are the people she talks to — but use the actual names from the digest whenever they're present rather than these generic labels. Be specific — use actual topic keywords you see in the digest rather than generic words like "conversation" or "tasks."
-4. If almost nothing happened, say so plainly in one or two sentences.
-
-Write only the narrative, nothing else. No preamble. No conclusion section. No bullet points unless the digest is genuinely a list of discrete items.
-
-## Digest
-
-```json
-{json.dumps(digest, ensure_ascii=False, indent=2, default=str)}
-```
-"""
+    return load_prompt(
+        "viewer.narrative.window",
+        digest_json=json.dumps(digest, ensure_ascii=False, indent=2, default=str),
+        window_label=window_label,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -348,15 +336,16 @@ def _bucket_digest(slot: BucketSlot) -> str:
 
 
 def _bucket_prompt(slot: BucketSlot) -> str:
-    start = time.strftime("%Y-%m-%d %H:%M", time.localtime(slot.start))
-    end = time.strftime("%H:%M", time.localtime(slot.end))
-    return f"""Summarize what happened in Alice's systems during this short time window. Write 1-3 sentences. Be specific: name tool calls, topics, people, surfaces, emergencies. No preamble, no bullet points, no header.
+    """Body lives in ``alice_prompts/templates/viewer/narrative.bucket.md.j2``
+    (Plan 04 Phase 4)."""
+    from alice_prompts import load as load_prompt
 
-Window: {start} → {end}
-
-Events:
-{_bucket_digest(slot)}
-"""
+    return load_prompt(
+        "viewer.narrative.bucket",
+        start=time.strftime("%Y-%m-%d %H:%M", time.localtime(slot.start)),
+        end=time.strftime("%H:%M", time.localtime(slot.end)),
+        events=_bucket_digest(slot),
+    )
 
 
 async def _summarize_bucket(slot: BucketSlot) -> bucket_cache.BucketSummary:
@@ -471,6 +460,10 @@ async def ensure_bucket_cache(
 def render_merge_prompt(
     summaries: list[bucket_cache.BucketSummary], window_label: str
 ) -> str:
+    """Body lives in ``alice_prompts/templates/viewer/narrative.weave.md.j2``
+    (Plan 04 Phase 4)."""
+    from alice_prompts import load as load_prompt
+
     lines = []
     for s in summaries:
         if not s.summary:
@@ -478,15 +471,8 @@ def render_merge_prompt(
         ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(s.bucket_start))
         lines.append(f"[{ts}] ({s.event_count} events) {s.summary}")
     body = "\n".join(lines) if lines else "(no activity in window)"
-    return f"""Weave the following per-time-period summaries of Alice's activity into one narrative (~250-400 words, markdown, no headers, no bullet walls). Keep proper nouns and specifics. Third person. If nothing happened, say so in one or two sentences.
-
-Alice has two hemispheres: Speaking (Opus, voices Signal to the owner and their trusted contacts) and Thinking (Sonnet, background grooming of alice-mind). They pass artifacts between each other — surfaces, notes, emergencies, thoughts.
-
-Window: last {window_label}
-
-Per-period summaries (chronological):
-
-{body}
-
-Write only the narrative, nothing else.
-"""
+    return load_prompt(
+        "viewer.narrative.weave",
+        body=body,
+        window_label=window_label,
+    )

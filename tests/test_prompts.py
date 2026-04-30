@@ -209,3 +209,46 @@ def test_capability_cli_template_marks_interactive():
 
     rendered = load("speaking.capability.cli", caps=CLI_CAPS)
     assert "interactive session" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — viewer narrative templates
+
+
+def test_narrative_templates_exist():
+    for stem in ("narrative.window", "narrative.bucket", "narrative.weave"):
+        path = DEFAULTS_DIR / "viewer" / f"{stem}.md.j2"
+        assert path.is_file(), f"missing template: {path}"
+
+
+def test_narrative_window_renders_with_digest():
+    rendered = load(
+        "viewer.narrative.window",
+        digest_json='{"events": []}',
+        window_label="6h",
+    )
+    assert "Alice" in rendered  # placeholder agent.name default
+    assert '{"events": []}' in rendered
+    assert "6h" in rendered
+
+
+def test_narrative_bucket_renders_with_window():
+    rendered = load(
+        "viewer.narrative.bucket",
+        start="2026-04-30 10:00",
+        end="10:30",
+        events="(no events)",
+    )
+    assert "10:00" in rendered
+    assert "10:30" in rendered
+    assert "(no events)" in rendered
+
+
+def test_narrative_weave_renders_with_body():
+    rendered = load(
+        "viewer.narrative.weave",
+        body="[10:00] (3 events) hi",
+        window_label="day",
+    )
+    assert "[10:00]" in rendered
+    assert "day" in rendered
