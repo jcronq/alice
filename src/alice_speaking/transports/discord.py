@@ -371,27 +371,22 @@ class DiscordTransport:
         stamp: str,
         text: str,
     ) -> str:
-        """Compose the prompt for a single Discord DM. Mirrors the
-        CLI/Signal prompts but advertises Discord's caps (limited
-        markdown, 1900-byte chunks) so Alice writes in the right shape.
+        """Compose the prompt for a single Discord DM.
+
+        Body lives in
+        ``alice_prompts/templates/speaking/turn.discord.md.j2``
+        (Plan 04 Phase 5).
         """
+        from alice_prompts import load as load_prompt
         from ..domain.render import capability_prompt_fragment
 
-        cap_fragment = capability_prompt_fragment("discord", self.caps)
-        lines: list[str] = [
-            f"[Discord DM from {principal_name} | {stamp}]",
-            "",
-            text,
-            "",
-            "---",
-            cap_fragment,
-            "",
-            "To reply, call the `send_message` tool with "
-            "recipient='self' (replies on the same Discord DM the "
-            "message came from). Returning text alone will NOT reach "
-            "the user.",
-        ]
-        return "\n".join(lines)
+        return load_prompt(
+            "speaking.turn.discord",
+            principal_name=principal_name,
+            stamp=stamp,
+            text=text,
+            capability=capability_prompt_fragment("discord", self.caps),
+        )
 
     # ------------------------------------------------------------------
     # Dispatcher integration (Phase 2 of plan 01)

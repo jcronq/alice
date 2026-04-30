@@ -1,0 +1,30 @@
+[Signal from {{ sender_name }} | {{ stamp }}]
+{% if messages|length == 1 %}
+{% set m = messages[0] %}
+{{ m.body }}
+{% if m.attachments %}
+
+--- {{ m.attachments|length }} attachment{% if m.attachments|length != 1 %}s{% endif %} ---
+{% for att in m.attachments %}
+- {{ att.path }} ({{ att.content_type }}{% if att.filename %} "{{ att.filename }}"{% endif %}) — use the Read tool to view.
+{% endfor %}
+{% endif %}
+{% else %}
+{{ messages|length }} messages came in while you were busy — handle them together as one reply (or several, your call). Each is shown in arrival order:
+
+{% for m in messages %}
+--- message {{ loop.index }} of {{ messages|length }} (sent {{ m.timestamp_str }}) ---
+{{ m.body }}
+{% if m.attachments %}
+{% for att in m.attachments %}
+  attachment: {{ att.path }} ({{ att.content_type }}{% if att.filename %} "{{ att.filename }}"{% endif %}) — Read it.
+{% endfor %}
+{% endif %}
+
+{% endfor %}
+{% endif %}
+
+---
+{{ capability }}
+
+To reply, call the `send_message` tool (recipient='self' to reply to the sender, a principal id from the address book to reach someone else, or an E.164 number; message=your reply text). Returning text alone will NOT send. If there's nothing to say, let the turn close silently.

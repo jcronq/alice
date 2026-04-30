@@ -252,3 +252,89 @@ def test_narrative_weave_renders_with_body():
     )
     assert "[10:00]" in rendered
     assert "day" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — per-event turn templates
+
+
+# Every event kind that flows through the dispatcher needs a
+# matching ``turn.<kind>.md.j2``. This test is the recurrence
+# guard: catches "added a new transport but forgot the template"
+# at CI time, not first live event.
+TURN_KINDS = ("signal", "cli", "discord", "a2a", "surface", "emergency")
+
+
+@pytest.mark.parametrize("kind", TURN_KINDS)
+def test_every_event_kind_has_turn_template(kind: str):
+    path = DEFAULTS_DIR / "speaking" / f"turn.{kind}.md.j2"
+    assert path.is_file(), f"missing turn template: {path}"
+
+
+def test_turn_cli_renders_with_context():
+    rendered = load(
+        "speaking.turn.cli",
+        principal_name="Owner",
+        stamp="now",
+        text="hi",
+        capability="(caps)",
+    )
+    assert "[CLI from Owner | now]" in rendered
+    assert "hi" in rendered
+    assert "(caps)" in rendered
+
+
+def test_turn_signal_single_message_renders():
+    """Single-envelope batches use the simple layout."""
+    rendered = load(
+        "speaking.turn.signal",
+        sender_name="Owner",
+        stamp="now",
+        messages=[{"body": "hi", "attachments": [], "timestamp_str": "10:00"}],
+        capability="(caps)",
+    )
+    assert "[Signal from Owner | now]" in rendered
+    assert "hi" in rendered
+    # Single-message branch does NOT include the "messages came in" preamble.
+    assert "messages came in" not in rendered
+
+
+def test_turn_signal_multi_message_renders():
+    """Multi-envelope batches enumerate with timestamps."""
+    rendered = load(
+        "speaking.turn.signal",
+        sender_name="Owner",
+        stamp="now",
+        messages=[
+            {"body": "first", "attachments": [], "timestamp_str": "10:00"},
+            {"body": "second", "attachments": [], "timestamp_str": "10:01"},
+        ],
+        capability="(caps)",
+    )
+    assert "2 messages came in" in rendered
+    assert "first" in rendered
+    assert "second" in rendered
+    assert "10:01" in rendered
+
+
+def test_turn_surface_renders_with_persona_default():
+    rendered = load(
+        "speaking.turn.surface",
+        surface_id="2026-04-30T15-00.md",
+        body="What if Owner needs lunch?",
+    )
+    assert "2026-04-30T15-00.md" in rendered
+    # Placeholder persona default substituted ("the operator" — Plan 05
+    # replaces with real personae).
+    assert "the operator" in rendered
+
+
+def test_turn_emergency_renders():
+    rendered = load(
+        "speaking.turn.emergency",
+        emergency_id="hb-stale.md",
+        body="heartbeat 50 minutes stale",
+    )
+    assert "hb-stale.md" in rendered
+    assert "heartbeat 50 minutes stale" in rendered
+    assert "EMERGENCY" in rendered

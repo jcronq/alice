@@ -148,72 +148,39 @@ class SignalTransport:
     ) -> str:
         """Compose the per-turn prompt for one or more Signal envelopes.
 
-        Single-envelope batches use the simple original layout. Multi-
-        envelope batches enumerate each message in arrival order with
-        a per-message timestamp; attachments are listed inline under
-        the message they came in with. Either way, the closing
-        instruction block tells Alice how to reply via send_message.
+        Body lives in
+        ``alice_prompts/templates/speaking/turn.signal.md.j2``
+        (Plan 04 Phase 5). Pre-flattens the batch into a list of
+        ``{body, attachments, timestamp_str}`` dicts so the template
+        owns the single-vs-multi rendering branch.
         """
+        from alice_prompts import load as load_prompt
         from ..domain.render import capability_prompt_fragment
 
-        lines: list[str] = []
-        if len(batch) == 1:
-            env = batch[0].envelope
-            body = env.body or "(no text — see attachments below)"
-            lines.extend([
-                f"[Signal from {sender_name} | {stamp}]",
-                "",
-                body,
-            ])
-            if env.attachments:
-                lines.append("")
-                lines.append(
-                    f"--- {len(env.attachments)} attachment"
-                    f"{'s' if len(env.attachments) != 1 else ''} ---"
-                )
-                for att in env.attachments:
-                    fn = f' "{att.filename}"' if att.filename else ""
-                    lines.append(
-                        f"- {att.path} ({att.content_type}{fn}) — "
-                        f"use the Read tool to view."
-                    )
-        else:
-            lines.extend([
-                f"[Signal from {sender_name} | {stamp}]",
-                f"{len(batch)} messages came in while you were busy — "
-                "handle them together as one reply (or several, your call). "
-                "Each is shown in arrival order:",
-                "",
-            ])
-            for i, ev in enumerate(batch, start=1):
-                env = ev.envelope
-                ts_str = _format_envelope_time(env.timestamp)
-                body = env.body or "(no text — see attachments below)"
-                lines.append(
-                    f"--- message {i} of {len(batch)} (sent {ts_str}) ---"
-                )
-                lines.append(body)
-                if env.attachments:
-                    for att in env.attachments:
-                        fn = f' "{att.filename}"' if att.filename else ""
-                        lines.append(
-                            f"  attachment: {att.path} "
-                            f"({att.content_type}{fn}) — Read it."
-                        )
-                lines.append("")
-        lines.extend([
-            "",
-            "---",
-            capability_prompt_fragment("signal", SIGNAL_CAPS),
-            "",
-            "To reply, call the `send_message` tool "
-            "(recipient='self' to reply to the sender, a principal id "
-            "from the address book to reach someone else, or an E.164 "
-            "number; message=your reply text). Returning text alone "
-            "will NOT send. If there's nothing to say, let the turn "
-            "close silently.",
-        ])
-        return "\n".join(lines)
+        messages = []
+        for ev in batch:
+            env = ev.envelope
+            messages.append(
+                {
+                    "body": env.body or "(no text — see attachments below)",
+                    "attachments": [
+                        {
+                            "path": att.path,
+                            "content_type": att.content_type,
+                            "filename": att.filename,
+                        }
+                        for att in env.attachments
+                    ],
+                    "timestamp_str": _format_envelope_time(env.timestamp),
+                }
+            )
+        return load_prompt(
+            "speaking.turn.signal",
+            sender_name=sender_name,
+            stamp=stamp,
+            messages=messages,
+            capability=capability_prompt_fragment("signal", SIGNAL_CAPS),
+        )
 
     # ------------------------------------------------------------------
     # Dispatcher integration (Phase 2a of plan 01)

@@ -441,16 +441,11 @@ async def handle_surface(ctx: DaemonContext, event: "SurfaceEvent") -> None:
         chars=len(body),
         body=_short(body),
     )
-    prompt = (
-        f"[Internal — a thought just surfaced from reflection: {path.name}]\n\n"
-        f"{body}\n\n"
-        "This is your own thought that just came to you. Decide what to do: "
-        "voice it to the user via the `send_message` tool, file it into "
-        "memory, reply to thinking via a note (append_note), or let it "
-        "pass. When you've decided, call mcp__alice__resolve_surface with "
-        "the file's `id` (its filename), a short `verdict`, and "
-        "`action_taken`. If you voice it, call send_message BEFORE "
-        "resolve_surface."
+    from alice_prompts import load as load_prompt
+    prompt = load_prompt(
+        "speaking.turn.surface",
+        surface_id=path.name,
+        body=body,
     )
     error: Optional[str] = None
     prev_kind = ctx._current_turn_kind
@@ -525,18 +520,11 @@ async def handle_emergency(ctx: DaemonContext, event: "EmergencyEvent") -> None:
         return
     recipient = emergency_channel.address
 
-    prompt = (
-        f"[EMERGENCY — signal from an external monitor: {path.name}]\n\n"
-        f"{body}\n\n"
-        "Review this emergency. Verify the frontmatter contains "
-        "`evidence_paths` with at least one verifiable source. If the "
-        "evidence is insufficient, do NOT call send_message — let the "
-        "turn close and the daemon will archive it as downgraded.\n\n"
-        "If the emergency is real, call `send_message` to voice it. "
-        "Your send_message call during an emergency bypasses quiet "
-        "hours automatically. Be concise and direct — name the "
-        "emergency, the evidence, and the recommended action in one "
-        "short message."
+    from alice_prompts import load as load_prompt
+    prompt = load_prompt(
+        "speaking.turn.emergency",
+        emergency_id=path.name,
+        body=body,
     )
 
     # For this turn only, flip the emergency bypass so _send_message

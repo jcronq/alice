@@ -324,28 +324,22 @@ class A2ATransport:
         stamp: str,
         text: str,
     ) -> str:
-        """Compose the prompt for a single A2A task. Reuses the CLI
-        prompt structure (full markdown, large message size) — A2A
-        consumers are typically other agents that handle structured
-        output well.
+        """Compose the prompt for a single A2A task.
+
+        Body lives in
+        ``alice_prompts/templates/speaking/turn.a2a.md.j2``
+        (Plan 04 Phase 5).
         """
+        from alice_prompts import load as load_prompt
         from ..domain.render import capability_prompt_fragment
 
-        cap_fragment = capability_prompt_fragment("a2a", self.caps)
-        lines: list[str] = [
-            f"[A2A task from {principal_name} | {stamp}]",
-            "",
-            text,
-            "",
-            "---",
-            cap_fragment,
-            "",
-            "To reply, call the `send_message` tool with "
-            "recipient='self' (the reply streams back over the same A2A "
-            "task as text artifacts). Returning text alone will NOT reach "
-            "the caller.",
-        ]
-        return "\n".join(lines)
+        return load_prompt(
+            "speaking.turn.a2a",
+            principal_name=principal_name,
+            stamp=stamp,
+            text=text,
+            capability=capability_prompt_fragment("a2a", self.caps),
+        )
 
     # ------------------------------------------------------------------
     # Dispatcher integration (Phase 2 of plan 01)
