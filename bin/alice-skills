@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# alice-skills — inventory + validate skills the runtime sees.
+#
+# Plan 07 Phase 2. Wraps alice_skills.cli with the same venv-
+# resolution logic as bin/alice-prompts and bin/alice-backend.
+#
+# Usage:
+#   alice-skills list [--ops]
+#   alice-skills show <name>
+#   alice-skills validate
+#   alice-skills --mind /path/to/mind ...
+
+set -eu
+
+ALICE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+if [ -x "$ALICE_ROOT/.venv/bin/python3" ]; then
+    PY="$ALICE_ROOT/.venv/bin/python3"
+elif [ -x "/opt/alice-venv/bin/python" ]; then
+    PY="/opt/alice-venv/bin/python"
+else
+    PY="$(command -v python3)"
+fi
+
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$ALICE_ROOT/src"
+exec "$PY" -m alice_skills.cli "$@"

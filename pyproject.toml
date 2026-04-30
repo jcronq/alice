@@ -42,10 +42,11 @@ alice-viewer = "alice_viewer.main:run"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-# Seven sibling Python packages under src/:
+# Eight sibling Python packages under src/:
 #   alice_core      — agentic kernel (SDK lifecycle + observability + auth)
 #   alice_indexer   — vault SQLite/FTS5 indexer (CLI; cortex-memory tooling)
 #   alice_prompts   — Jinja2 templates the runtime renders into model prompts
+#   alice_skills    — registry over .claude/skills/ markdown (plan 07)
 #   alice_speaking  — Signal daemon (composes kernel with producers/handlers/outbox)
 #   alice_thinking  — one-shot wake (python -m alice_thinking)
 #   alice_viewer    — FastAPI observability UI (serves /state logs)
@@ -55,6 +56,7 @@ packages = [
     "src/alice_core",
     "src/alice_indexer",
     "src/alice_prompts",
+    "src/alice_skills",
     "src/alice_speaking",
     "src/alice_thinking",
     "src/alice_viewer",
@@ -63,9 +65,11 @@ packages = [
 
 # alice_prompts ships .md.j2 template files alongside its Python
 # modules; hatch needs the include-pattern to bundle them in the
-# wheel.
+# wheel. alice_skills bundles its runtime-default SKILL.md files
+# the same way (plan 07 phase 6).
 [tool.hatch.build.targets.wheel.force-include]
 "src/alice_prompts/templates" = "alice_prompts/templates"
+"src/alice_skills/defaults" = "alice_skills/defaults"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
