@@ -47,14 +47,16 @@ fi
 
 # Codex → pi auth bridge. The host runs `codex login` (device-auth);
 # the resulting ~/.codex/auth.json is mounted into /host-codex (read-
-# only). Translate it into ~/.pi/agent/auth.json so pi-coding-agent
-# can use the ChatGPT subscription without its own browser-OAuth
-# flow. Fail-soft: pi backends won't work, but Anthropic-side
-# functionality still comes up.
+# only). Translate it into ~/alice/.pi/agent/auth.json so
+# pi-coding-agent can use the ChatGPT subscription without its own
+# browser-OAuth flow. Entrypoint runs as root; the alice user reads
+# the file, so we chown after writing. Fail-soft: pi backends won't
+# work, but Anthropic-side functionality still comes up.
 if [ -d /host-codex ] && [ -x /home/alice/alice/bin/codex-to-pi-auth ]; then
     if /home/alice/alice/bin/codex-to-pi-auth \
             --codex /host-codex/auth.json \
-            --pi "$HOME/.pi/agent/auth.json" >&2; then
+            --pi /home/alice/.pi/agent/auth.json >&2; then
+        chown -R alice:alice /home/alice/.pi
         echo "[entrypoint] pi auth bridged from /host-codex/auth.json" >&2
     else
         echo "[entrypoint] WARNING: codex-to-pi-auth failed; pi backend will not work" >&2

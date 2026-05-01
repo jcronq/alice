@@ -71,8 +71,11 @@ class _State:
     error_message: Optional[str] = None
     num_turns: int = 0
     finished: bool = False
+    # First user-message timestamp (ms) — start of the wall clock.
+    # Pi's session event has no timestamp; we use the first message
+    # we see (typically the user prompt arriving) as t0.
+    start_ms: Optional[int] = None
     # Last assistant message timestamp (ms), for duration calc.
-    first_message_ms: Optional[int] = None
     last_message_ms: Optional[int] = None
 
 
@@ -125,7 +128,17 @@ class PiEventTranslator:
                 await h.on_system(sysev)
             return
 
-        if kind == "agent_start" or kind == "turn_start":
+        if kind in ("agent_start", "turn_start"):
+            return
+
+        if kind == "message_start":
+            # Framing marker; capture timestamp for duration calc but
+            # don't emit (would be redundant with the more useful
+            # message_end which has usage + final content).
+            msg = event.get("message") or {}
+            ts_ms = msg.get("timestamp")
+            if isinstance(ts_ms, int) and self._state.start_ms is None:
+                self._state.start_ms = ts_ms
             return
 
         if kind == "message_update":
@@ -229,17 +242,19 @@ class PiEventTranslator:
 
         ts_ms = msg.get("timestamp")
         if isinstance(ts_ms, int):
-            if self._state.first_message_ms is None:
-                self._state.first_message_ms = ts_ms
+            if self._state.start_ms is None:
+                self._state.start_ms = ts_ms
             self._state.last_message_ms = ts_ms
 
-        # Derive duration when both endpoints known.
+        # Derive duration: from the first message we saw (user prompt
+        # if message_start fired, otherwise this assistant message)
+        # to the assistant's terminal timestamp.
         if (
-            self._state.first_message_ms is not None
+            self._state.start_ms is not None
             and self._state.last_message_ms is not None
         ):
             self._state.duration_ms = (
-                self._state.last_message_ms - self._state.first_message_ms
+                self._state.last_message_ms - self._state.start_ms
             )
 
         self._emit(
