@@ -39,7 +39,7 @@ from typing import Literal, Optional
 
 DEFAULT_ALICE_ENV = pathlib.Path.home() / ".config" / "alice" / "alice.env"
 
-AuthMode = Literal["subscription", "api", "bedrock", "none"]
+AuthMode = Literal["subscription", "api", "bedrock", "none", "pi"]
 
 _API_VARS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 _BEDROCK_VARS = ("CLAUDE_CODE_USE_BEDROCK", "AWS_REGION", "AWS_PROFILE")
@@ -199,6 +199,17 @@ def ensure_auth_env(
             os.environ["AWS_PROFILE"] = auth.aws_profile
         os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
         for key in _API_VARS:
+            os.environ.pop(key, None)
+    elif auth.mode == "pi":
+        # Pi-coding-agent reads its own auth file (~/.pi/agent/auth.json)
+        # populated by the codex→pi bridge in the container entrypoint.
+        # Clear the Anthropic-specific env vars so a stale subscription
+        # token / API key doesn't accidentally re-enter when Anthropic
+        # backends run later in the same process.
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        for key in _API_VARS:
+            os.environ.pop(key, None)
+        for key in _BEDROCK_VARS:
             os.environ.pop(key, None)
     # mode == "none": leave environment untouched; SDK falls back to
     # ~/.claude/.credentials.json (entrypoint symlinks it into the container).

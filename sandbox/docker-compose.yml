@@ -81,6 +81,11 @@ x-worker-base: &worker-base
     # token refresh. The entrypoint symlinks .credentials.json and
     # .claude.json into their expected locations.
     - ${HOME}/.claude:/host-claude:ro
+    # Host's Codex CLI auth — same directory-not-file rule as Claude
+    # above. The entrypoint runs codex-to-pi-auth at container start
+    # to translate ~/.codex/auth.json into ~/.pi/agent/auth.json so
+    # PiKernel can use the ChatGPT subscription.
+    - ${HOME}/.codex:/host-codex:ro
     - ${HOME}:/host-home:ro
     - ${HOME}/.local/state/alice:/state:rw
   working_dir: /home/alice/alice-mind

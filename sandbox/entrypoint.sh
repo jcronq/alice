@@ -45,6 +45,22 @@ if not ok:
 PY
 fi
 
+# Codex → pi auth bridge. The host runs `codex login` (device-auth);
+# the resulting ~/.codex/auth.json is mounted into /host-codex (read-
+# only). Translate it into ~/.pi/agent/auth.json so pi-coding-agent
+# can use the ChatGPT subscription without its own browser-OAuth
+# flow. Fail-soft: pi backends won't work, but Anthropic-side
+# functionality still comes up.
+if [ -d /host-codex ] && [ -x /home/alice/alice/bin/codex-to-pi-auth ]; then
+    if /home/alice/alice/bin/codex-to-pi-auth \
+            --codex /host-codex/auth.json \
+            --pi "$HOME/.pi/agent/auth.json" >&2; then
+        echo "[entrypoint] pi auth bridged from /host-codex/auth.json" >&2
+    else
+        echo "[entrypoint] WARNING: codex-to-pi-auth failed; pi backend will not work" >&2
+    fi
+fi
+
 # Point git at gh for HTTPS auth. The mounted ~/.config/gh provides the token.
 if command -v gh >/dev/null 2>&1; then
     git config --global credential."https://github.com".helper '!gh auth git-credential' 2>/dev/null || true

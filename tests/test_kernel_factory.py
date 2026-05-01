@@ -51,13 +51,8 @@ def test_make_kernel_default_branch_is_subscription() -> None:
     assert isinstance(kernel, AnthropicKernel)
 
 
-@pytest.mark.xfail(
-    reason="PiKernel not implemented until Phase D; factory branch "
-    "ImportErrors until alice_pi.kernel exists."
-)
 def test_make_kernel_returns_pi_for_pi_backend() -> None:
-    spec = BackendSpec(backend="pi")  # type: ignore[arg-type]
-    # Phase D ships alice_pi.kernel.PiKernel; until then this raises
-    # ImportError and the xfail marker keeps the suite green.
+    spec = BackendSpec(backend="pi")
     kernel = make_kernel(spec, CapturingEmitter())
     assert kernel.__class__.__name__ == "PiKernel"
+    assert isinstance(kernel, Kernel)

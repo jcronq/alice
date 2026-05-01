@@ -57,8 +57,8 @@ __all__ = [
 
 MODEL_FILENAME = "model.yml"
 HEMISPHERES: tuple[str, ...] = ("speaking", "thinking", "viewer")
-BackendName = Literal["subscription", "api", "bedrock"]
-_VALID_BACKENDS: frozenset[str] = frozenset({"subscription", "api", "bedrock"})
+BackendName = Literal["subscription", "api", "bedrock", "pi"]
+_VALID_BACKENDS: frozenset[str] = frozenset({"subscription", "api", "bedrock", "pi"})
 
 
 class ModelConfigError(ValueError):

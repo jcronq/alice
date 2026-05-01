@@ -1,0 +1,142 @@
+#!/usr/bin/env node
+// codex-to-pi-auth — translate ~/.codex/auth.json (Codex CLI) into
+// ~/.pi/agent/auth.json (pi-coding-agent) so the headless container
+// can use Jason's host-side `codex login` ChatGPT subscription
+// without running pi's browser-OAuth flow.
+//
+// Pi-coding-agent has no --device-auth and binds 127.0.0.1:1455 for
+// its OAuth callback — useless on a headless host. Codex CLI does
+// have device-auth and is the de-facto auth source on this machine.
+// Both speak the same OpenAI OAuth flow, so the access_token from
+// codex is directly usable by pi.
+//
+// Usage:
+//   codex-to-pi-auth [--codex /path/to/codex/auth.json] \
+//                    [--pi /path/to/pi/agent/auth.json]
+//
+// Defaults to $HOME/.codex/auth.json (read) and $HOME/.pi/agent/auth.json
+// (written, mode 0600).
+//
+// Exit codes:
+//   0 — wrote pi auth file successfully
+//   1 — codex auth file missing / unreadable / unparseable
+//   2 — codex token doesn't have the expected ChatGPT account ID
+//   3 — output write failed
+
+const fs = require("fs");
+const path = require("path");
+
+function parseArgs(argv) {
+  const home = process.env.HOME || "/root";
+  const opts = {
+    codex: path.join(home, ".codex", "auth.json"),
+    pi: path.join(home, ".pi", "agent", "auth.json"),
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--codex") opts.codex = argv[++i];
+    else if (a === "--pi") opts.pi = argv[++i];
+    else if (a === "-h" || a === "--help") {
+      console.log(
+        "Usage: codex-to-pi-auth [--codex <path>] [--pi <path>]\n" +
+          "  Default codex: ~/.codex/auth.json\n" +
+          "  Default pi:    ~/.pi/agent/auth.json"
+      );
+      process.exit(0);
+    } else {
+      console.error(`Unknown arg: ${a}`);
+      process.exit(1);
+    }
+  }
+  return opts;
+}
+
+function decodeJwtPayload(token) {
+  const parts = token.split(".");
+  if (parts.length !== 3) throw new Error("not a JWT");
+  let payload = parts[1];
+  payload += "=".repeat((4 - (payload.length % 4)) % 4);
+  return JSON.parse(Buffer.from(payload, "base64").toString());
+}
+
+function main() {
+  const { codex: codexPath, pi: piPath } = parseArgs(process.argv.slice(2));
+
+  let codexAuth;
+  try {
+    codexAuth = JSON.parse(fs.readFileSync(codexPath, "utf8"));
+  } catch (err) {
+    console.error(`codex auth not readable at ${codexPath}: ${err.message}`);
+    process.exit(1);
+  }
+
+  const tokens = codexAuth.tokens || {};
+  const accessToken = tokens.access_token;
+  const refreshToken = tokens.refresh_token;
+  if (!accessToken || !refreshToken) {
+    console.error(
+      `codex auth at ${codexPath} missing tokens.access_token or ` +
+        `tokens.refresh_token — re-run 'codex login' on host`
+    );
+    process.exit(1);
+  }
+
+  let payload;
+  try {
+    payload = decodeJwtPayload(accessToken);
+  } catch (err) {
+    console.error(`failed to decode access_token JWT: ${err.message}`);
+    process.exit(2);
+  }
+
+  const expSec = payload.exp;
+  const accountId =
+    payload["https://api.openai.com/auth"] &&
+    payload["https://api.openai.com/auth"].chatgpt_account_id;
+  if (!accountId) {
+    console.error(
+      "codex access_token missing chatgpt_account_id claim — token " +
+        "might be from a non-ChatGPT auth path"
+    );
+    process.exit(2);
+  }
+  const expiresMs = Number(expSec) * 1000;
+
+  const piAuth = {
+    "openai-codex": {
+      type: "oauth",
+      access: accessToken,
+      refresh: refreshToken,
+      expires: expiresMs,
+      accountId: accountId,
+    },
+  };
+
+  // Preserve any non-codex entries already in pi auth (e.g. an
+  // explicitly-set anthropic API key) by reading + merging.
+  let merged = piAuth;
+  if (fs.existsSync(piPath)) {
+    try {
+      const existing = JSON.parse(fs.readFileSync(piPath, "utf8"));
+      merged = { ...existing, ...piAuth };
+    } catch {
+      // Treat unparseable existing file as empty; we replace it.
+    }
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(piPath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(piPath, JSON.stringify(merged, null, 2));
+    fs.chmodSync(piPath, 0o600);
+  } catch (err) {
+    console.error(`failed to write ${piPath}: ${err.message}`);
+    process.exit(3);
+  }
+
+  const remainingMin = Math.round((expiresMs - Date.now()) / 60000);
+  console.error(
+    `wrote ${piPath} (openai-codex; expires in ~${remainingMin} min)`
+  );
+}
+
+main();

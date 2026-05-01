@@ -23,6 +23,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN npm install -g @anthropic-ai/claude-code@latest
 
+# pi-coding-agent — drives the PiKernel (Codex / OpenAI subscription
+# routing) when model.yml routes a hemisphere through `backend: pi`.
+# Pinned: spike report (docs/refactor/09-spike-pi-coding-agent.md)
+# verified the JSONL event vocabulary against 0.71.0; later versions
+# need a re-check before bumping.
+RUN npm install -g @mariozechner/pi-coding-agent@0.71.0
+
 # Dedicated venv for alice (agent kernel + speaking daemon + thinking wake).
 # The monorepo src/ tree is bind-mounted at /home/alice/alice/src and added
 # to PYTHONPATH by the s6 services and /usr/local/bin/alice-think — so this

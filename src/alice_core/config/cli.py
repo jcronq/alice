@@ -35,6 +35,7 @@ def _show(args: argparse.Namespace) -> int:
     print(f"# {mind / 'config' / 'model.yml'}")
     if cfg == ModelConfig.subscription_default():
         print("(no model.yml present — every hemisphere on subscription default)")
+    has_pi = False
     for name in HEMISPHERES:
         spec = cfg.hemisphere(name)
         bits = [f"backend={spec.backend}"]
@@ -47,7 +48,41 @@ def _show(args: argparse.Namespace) -> int:
         if spec.base_url:
             bits.append(f"base_url={spec.base_url}")
         print(f"{name:>10}: " + "  ".join(bits))
+        if spec.backend == "pi":
+            has_pi = True
+
+    if has_pi:
+        # Pi backend reads ~/.pi/agent/auth.json; surface its presence
+        # + token expiry so the operator can spot a stale auth before
+        # the next rate-limit window hits.
+        _print_pi_auth_status()
     return 0
+
+
+def _print_pi_auth_status() -> None:
+    import json as _json
+    import time as _time
+
+    pi_auth = pathlib.Path.home() / ".pi" / "agent" / "auth.json"
+    print()
+    if not pi_auth.is_file():
+        print(f"      pi: {pi_auth} not found — run codex-to-pi-auth on host")
+        return
+    try:
+        data = _json.loads(pi_auth.read_text())
+    except _json.JSONDecodeError:
+        print(f"      pi: {pi_auth} unparseable")
+        return
+    cred = data.get("openai-codex")
+    if not cred or cred.get("type") != "oauth":
+        print(f"      pi: {pi_auth} has no openai-codex oauth entry")
+        return
+    expires_ms = cred.get("expires", 0)
+    remaining_min = int((expires_ms - _time.time() * 1000) / 60000)
+    if remaining_min > 0:
+        print(f"      pi: openai-codex token valid (~{remaining_min} min remaining)")
+    else:
+        print(f"      pi: openai-codex token EXPIRED — re-run codex login + bridge")
 
 
 def _test(args: argparse.Namespace) -> int:
