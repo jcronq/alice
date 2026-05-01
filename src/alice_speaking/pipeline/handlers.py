@@ -1,12 +1,12 @@
 """BlockHandlers for the speaking daemon.
 
-Compose-time extensions to :class:`alice_core.kernel.AgentKernel` that
+Compose-time extensions to :class:`alice_core.kernel.Kernel` that
 encode speaking-specific semantics the kernel doesn't know about:
 
-- :class:`SessionHandler` — on each ``ResultMessage``, update the
+- :class:`SessionHandler` — on each :class:`TurnSummary`, update the
   daemon's session_id and (unless silent) persist it to ``session.json``
   so the next process start can ``resume=`` warm.
-- :class:`CompactionArmer` — on each ``ResultMessage``, arm the
+- :class:`CompactionArmer` — on each :class:`TurnSummary`, arm the
   compaction flag if ``usage.input_tokens`` crossed the threshold.
 
 The missed-reply detector is NOT a handler. Whether a turn produced
@@ -14,6 +14,10 @@ outbound is determined by whether Alice's ``send_message`` tool callback
 fired on the daemon — not by observing ``tool_use`` blocks — because the
 tool invocation could legally error out between block and callback. The
 daemon still tracks that via ``self._turn_did_send``.
+
+Handlers receive backend-agnostic types (:class:`TurnSummary`,
+:class:`SystemEvent`) — they work unchanged across AnthropicKernel
+and PiKernel.
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ import logging
 import pathlib
 from typing import Callable
 
-from alice_core.kernel import NullHandler
+from alice_core.kernel import NullHandler, TurnSummary
 from alice_core import session as session_state
 
 from . import compaction as compaction_module  # sibling within pipeline/
@@ -93,14 +97,14 @@ class SessionHandler(NullHandler):
         self._set_session_id = set_session_id
         self._persist = persist
 
-    async def on_result(self, msg) -> None:
-        if not msg.session_id:
+    async def on_result(self, summary: TurnSummary) -> None:
+        if not summary.session_id:
             return
-        self._set_session_id(msg.session_id)
+        self._set_session_id(summary.session_id)
         if not self._persist:
             return
         try:
-            session_state.write(self._session_path, msg.session_id)
+            session_state.write(self._session_path, summary.session_id)
         except OSError:
             log.exception(
                 "failed to persist session_id to %s", self._session_path
@@ -125,24 +129,33 @@ class CompactionArmer(NullHandler):
         self._threshold = threshold
         self._arm = arm
 
-    async def on_result(self, msg) -> None:
-        if not msg.usage:
+    async def on_result(self, summary: TurnSummary) -> None:
+        if not summary.usage:
             return
-        if compaction_module.should_compact(msg.usage, self._threshold):
+        # should_compact still takes a dict for backward-compat with its
+        # existing tests (they fuzz with malformed input). UsageInfo is
+        # the canonical typed shape; convert at the boundary.
+        usage_dict = {
+            "input_tokens": summary.usage.input_tokens,
+            "output_tokens": summary.usage.output_tokens,
+            "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
+            "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
+        }
+        if compaction_module.should_compact(usage_dict, self._threshold):
             self._arm()
             effective = (
-                (msg.usage.get("input_tokens") or 0)
-                + (msg.usage.get("cache_read_input_tokens") or 0)
-                + (msg.usage.get("cache_creation_input_tokens") or 0)
+                (summary.usage.input_tokens or 0)
+                + (summary.usage.cache_read_input_tokens or 0)
+                + (summary.usage.cache_creation_input_tokens or 0)
             )
             log.info(
                 "compaction armed (effective_tokens=%d > threshold=%d; "
                 "input=%s cache_read=%s cache_create=%s)",
                 effective,
                 self._threshold,
-                msg.usage.get("input_tokens"),
-                msg.usage.get("cache_read_input_tokens"),
-                msg.usage.get("cache_creation_input_tokens"),
+                summary.usage.input_tokens,
+                summary.usage.cache_read_input_tokens,
+                summary.usage.cache_creation_input_tokens,
             )
 
 
@@ -184,17 +197,15 @@ class CLITraceHandler(NullHandler):
             {"type": "tool_use", "name": name, "input": _trim_input(name, input)},
         )
 
-    async def on_result(self, msg) -> None:
+    async def on_result(self, summary: TurnSummary) -> None:
         ch = self._cli_channel()
         if ch is None:
             return
         evt: dict = {"type": "result"}
-        cost = getattr(msg, "total_cost_usd", None)
-        if cost is not None:
-            evt["total_cost_usd"] = cost
-        dur = getattr(msg, "duration_ms", None)
-        if dur is not None:
-            evt["duration_ms"] = dur
+        if summary.cost_usd is not None:
+            evt["total_cost_usd"] = summary.cost_usd
+        if summary.duration_ms is not None:
+            evt["duration_ms"] = summary.duration_ms
         await self._transport.push_trace(ch, evt)
 
 

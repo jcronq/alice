@@ -39,8 +39,11 @@ class ActiveMode(_NullPostRun):
             cwd=ctx.cwd,
             max_seconds=ctx.max_seconds,
             # Adaptive thinking with summarized display so
-            # ThinkingBlocks come back with non-empty text.
-            thinking={"type": "adaptive", "display": "summarized"},
+            # ThinkingBlocks come back with non-empty text. AnthropicKernel's
+            # _thinking_to_sdk_dict maps "medium" to the previous default
+            # ({type: adaptive, display: summarized}); PiKernel maps the
+            # same level to its --thinking flag.
+            thinking="medium",
             # Plan 05 Phase 4: persona-rendered system prompt.
             # Empty string falls through as None-equivalent so the
             # kernel skips the system_prompt kwarg entirely.

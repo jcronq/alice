@@ -1,4 +1,4 @@
-"""Unit tests for AgentKernel.
+"""Unit tests for AnthropicKernel.
 
 Uses a CapturingEmitter + a fake SDK query() to exercise the kernel's
 block dispatch, event emission, handler fan-out, timeout, and error
@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from alice_core.events import CapturingEmitter
-from alice_core.kernel import AgentKernel, KernelSpec, NullHandler
+from alice_core.kernel import AnthropicKernel, KernelSpec, NullHandler, TurnSummary
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +72,7 @@ class _FakeSystemMessage:
 @pytest.fixture
 def patched_sdk(monkeypatch):
     """Replace kernel's SDK imports with our fakes."""
-    import alice_core.kernel as k
+    import alice_core.kernel.anthropic as k
 
     monkeypatch.setattr(k, "AssistantMessage", _FakeAssistantMessage)
     monkeypatch.setattr(k, "UserMessage", _FakeUserMessage)
@@ -86,7 +86,7 @@ def patched_sdk(monkeypatch):
 
 def _install_fake_query(monkeypatch, messages):
     """Install a fake query() that yields the given messages in order."""
-    import alice_core.kernel as k
+    import alice_core.kernel.anthropic as k
 
     async def fake_query(*, prompt, options):
         for msg in messages:
@@ -114,7 +114,7 @@ async def test_kernel_emits_events_for_text_tool_and_result(patched_sdk, monkeyp
     _install_fake_query(monkeypatch, messages)
 
     cap = CapturingEmitter()
-    kernel = AgentKernel(cap, correlation_id="c-1")
+    kernel = AnthropicKernel(cap, correlation_id="c-1")
     result = await kernel.run(
         "hello", KernelSpec(model="m", allowed_tools=["Bash"], max_seconds=0)
     )
@@ -162,7 +162,7 @@ async def test_kernel_fires_handlers_for_each_block(patched_sdk, monkeypatch):
         async def on_result(self, msg): seen["result"].append(msg.session_id)
 
     cap = CapturingEmitter()
-    kernel = AgentKernel(cap)
+    kernel = AnthropicKernel(cap)
     await kernel.run("x", KernelSpec(model="m"), handlers=[SpyHandler()])
 
     assert seen["text"] == ["final"]
@@ -187,7 +187,7 @@ async def test_kernel_silent_suppresses_emission_but_fires_handlers(
         async def on_text(self, text): fired.append(text)
 
     cap = CapturingEmitter()
-    kernel = AgentKernel(cap, correlation_id="c", silent=True)
+    kernel = AnthropicKernel(cap, correlation_id="c", silent=True)
     await kernel.run("x", KernelSpec(model="m"), handlers=[H()])
 
     assert fired == ["silent text"]  # handlers still run
@@ -202,11 +202,11 @@ async def test_kernel_timeout_returns_error_result(patched_sdk, monkeypatch):
         if False:
             yield None
 
-    import alice_core.kernel as k
+    import alice_core.kernel.anthropic as k
     monkeypatch.setattr(k, "query", slow_query)
 
     cap = CapturingEmitter()
-    kernel = AgentKernel(cap, correlation_id="c")
+    kernel = AnthropicKernel(cap, correlation_id="c")
     # 0.05s timeout — cancels the sleep(10) above
     result = await kernel.run("x", KernelSpec(model="m", max_seconds=1))
 
@@ -225,7 +225,7 @@ async def test_kernel_raises_on_rate_limit(patched_sdk, monkeypatch):
     _install_fake_query(monkeypatch, messages)
 
     cap = CapturingEmitter()
-    kernel = AgentKernel(cap)
+    kernel = AnthropicKernel(cap)
     with pytest.raises(RuntimeError, match="rate_limit"):
         await kernel.run("x", KernelSpec(model="m"))
 
@@ -239,7 +239,7 @@ async def test_kernel_raises_on_result_is_error(patched_sdk, monkeypatch):
     _install_fake_query(monkeypatch, messages)
 
     cap = CapturingEmitter()
-    kernel = AgentKernel(cap)
+    kernel = AnthropicKernel(cap)
     with pytest.raises(RuntimeError, match="claude result error"):
         await kernel.run("x", KernelSpec(model="m"))
 
@@ -252,11 +252,11 @@ async def test_kernel_resume_passes_through_to_options(patched_sdk, monkeypatch)
         captured["options"] = options
         yield _FakeResultMessage(session_id="s")
 
-    import alice_core.kernel as k
+    import alice_core.kernel.anthropic as k
     monkeypatch.setattr(k, "query", capturing_query)
 
     cap = CapturingEmitter()
-    kernel = AgentKernel(cap)
+    kernel = AnthropicKernel(cap)
     await kernel.run(
         "prompt",
         KernelSpec(model="m", resume="prev-session-id", mcp_servers={"x": 1}),
@@ -282,11 +282,11 @@ async def test_kernel_passes_append_system_prompt_to_options(
         captured["options"] = options
         yield _FakeResultMessage(session_id="s")
 
-    import alice_core.kernel as k
+    import alice_core.kernel.anthropic as k
     monkeypatch.setattr(k, "query", capturing_query)
 
     cap = CapturingEmitter()
-    kernel = AgentKernel(cap)
+    kernel = AnthropicKernel(cap)
     await kernel.run(
         "prompt",
         KernelSpec(
@@ -316,11 +316,11 @@ async def test_kernel_omits_append_system_prompt_when_none(
         captured["options"] = options
         yield _FakeResultMessage(session_id="s")
 
-    import alice_core.kernel as k
+    import alice_core.kernel.anthropic as k
     monkeypatch.setattr(k, "query", capturing_query)
 
     cap = CapturingEmitter()
-    kernel = AgentKernel(cap)
+    kernel = AnthropicKernel(cap)
     await kernel.run("prompt", KernelSpec(model="m"))
 
     opts = captured["options"]
@@ -338,7 +338,7 @@ async def test_kernel_without_correlation_id_omits_turn_id(patched_sdk, monkeypa
     _install_fake_query(monkeypatch, messages)
 
     cap = CapturingEmitter()
-    kernel = AgentKernel(cap)  # no correlation_id
+    kernel = AnthropicKernel(cap)  # no correlation_id
     await kernel.run("x", KernelSpec(model="m"))
 
     for ev in cap.events:

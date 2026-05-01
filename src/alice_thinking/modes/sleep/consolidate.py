@@ -35,7 +35,7 @@ class ConsolidationStage(_NullPostRun):
             allowed_tools=list(ctx.tools),
             cwd=ctx.cwd,
             max_seconds=ctx.max_seconds,
-            thinking={"type": "adaptive", "display": "summarized"},
+            thinking="medium",
             append_system_prompt=ctx.system_prompt or None,
         )
 

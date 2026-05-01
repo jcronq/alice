@@ -15,7 +15,7 @@ What this owns:
   is available; consumed by :meth:`compose_prompt` on the next
   turn and cleared.
 - The ``run_turn`` method itself: build kernel spec + handlers,
-  call :class:`AgentKernel`, recover from a Layer-1 resume failure
+  call :class:`AnthropicKernel`, recover from a Layer-1 resume failure
   by clearing ``session_id`` + priming Layer 2 + retrying once.
 
 What it borrows (callables, not mutated):
@@ -42,7 +42,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Optional
 
-from alice_core.kernel import AgentKernel, KernelSpec
+from alice_core.kernel import AnthropicKernel, KernelSpec
 from alice_core.sdk_compat import looks_like_missing_session as _looks_like_missing_session
 
 from .domain import session_state
@@ -193,8 +193,10 @@ class TurnRunner:
             # ThinkingBlocks come back with non-empty text. Without
             # display='summarized' the SDK omits thinking text
             # entirely (signature only) and the viewer's trace shows
-            # empty (thought) rows.
-            thinking={"type": "adaptive", "display": "summarized"},
+            # empty (thought) rows. The "medium" level translates to
+            # {type: adaptive, display: summarized} inside
+            # AnthropicKernel — see _thinking_to_sdk_dict.
+            thinking="medium",
             append_system_prompt=self._system_prompt,
         )
 
@@ -274,7 +276,7 @@ class TurnRunner:
         spec = self._build_spec()
         handlers = self._build_handlers(silent=silent)
 
-        kernel = AgentKernel(
+        kernel = AnthropicKernel(
             self._events,
             correlation_id=turn_id,
             silent=silent,

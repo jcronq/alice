@@ -69,7 +69,7 @@ def test_run_wake_passes_system_prompt_to_kernel(monkeypatch, tmp_path) -> None:
             captured["prompt"] = prompt
             return _FakeResult()
 
-    monkeypatch.setattr(ka, "AgentKernel", _FakeKernel)
+    monkeypatch.setattr(ka, "AnthropicKernel", _FakeKernel)
 
     ctx = _make_ctx(tmp_path, system_prompt="You are Eve. Talk to Jordan.")
     rc = asyncio.run(ka.run_wake(ctx=ctx, mode=ActiveMode(), emitter=_CapturingEmitter()))
@@ -96,7 +96,7 @@ def test_run_wake_with_empty_system_prompt_passes_none(
             captured["spec"] = spec
             return _FakeResult()
 
-    monkeypatch.setattr(ka, "AgentKernel", _FakeKernel)
+    monkeypatch.setattr(ka, "AnthropicKernel", _FakeKernel)
 
     ctx = _make_ctx(tmp_path)
     asyncio.run(ka.run_wake(ctx=ctx, mode=ActiveMode(), emitter=_CapturingEmitter()))
@@ -118,7 +118,7 @@ def test_run_wake_emits_mode_in_envelope_events(monkeypatch, tmp_path) -> None:
         async def run(self, prompt: str, spec: Any) -> _FakeResult:
             return _FakeResult()
 
-    monkeypatch.setattr(ka, "AgentKernel", _FakeKernel)
+    monkeypatch.setattr(ka, "AnthropicKernel", _FakeKernel)
 
     emitter = _CapturingEmitter()
     asyncio.run(

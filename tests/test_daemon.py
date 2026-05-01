@@ -108,7 +108,7 @@ def _patch_query(monkeypatch: pytest.MonkeyPatch, messages_fn: Callable[[], list
     def outer(**kwargs):
         return fake_query(**kwargs)
 
-    monkeypatch.setattr("alice_core.kernel.query", outer)
+    monkeypatch.setattr("alice_core.kernel.anthropic.query", outer)
 
 
 # --------------------------------------------------------------------- tests
@@ -442,7 +442,7 @@ def test_resume_failure_clears_and_retries(cfg, monkeypatch) -> None:
         yield _result("fresh")
 
     monkeypatch.setattr(
-        "alice_core.kernel.query",
+        "alice_core.kernel.anthropic.query",
         lambda **kw: first_call_fails_then_succeeds(**kw),
     )
 
@@ -483,7 +483,7 @@ def test_resume_failure_does_not_loop_on_retry(cfg, monkeypatch) -> None:
         raise SessionNotFoundError("Session not found")
         yield  # pragma: no cover
 
-    monkeypatch.setattr("alice_core.kernel.query", lambda **kw: always_fails(**kw))
+    monkeypatch.setattr("alice_core.kernel.anthropic.query", lambda **kw: always_fails(**kw))
 
     with pytest.raises(SessionNotFoundError):
         asyncio.run(
@@ -511,7 +511,7 @@ def test_preamble_consumed_on_next_turn(cfg, monkeypatch) -> None:
         for m in msgs():
             yield m
 
-    monkeypatch.setattr("alice_core.kernel.query", lambda **kw: fake_query(**kw))
+    monkeypatch.setattr("alice_core.kernel.anthropic.query", lambda **kw: fake_query(**kw))
 
     asyncio.run(
         d._run_turn("real body", turn_id="t1", outbound_recipient="+15555550100")
@@ -546,7 +546,7 @@ def test_kernel_spec_model_from_model_yml(cfg, monkeypatch, tmp_path) -> None:
         ):
             yield m
 
-    monkeypatch.setattr("alice_core.kernel.query", lambda **kw: capturing_query(**kw))
+    monkeypatch.setattr("alice_core.kernel.anthropic.query", lambda **kw: capturing_query(**kw))
     asyncio.run(
         d._run_turn("hi", turn_id="t1", outbound_recipient="+15555550100")
     )
@@ -590,7 +590,7 @@ def test_kernel_spec_includes_personae_system_prompt(cfg, monkeypatch) -> None:
         ):
             yield m
 
-    monkeypatch.setattr("alice_core.kernel.query", lambda **kw: capturing_query(**kw))
+    monkeypatch.setattr("alice_core.kernel.anthropic.query", lambda **kw: capturing_query(**kw))
 
     asyncio.run(
         d._run_turn("hi", turn_id="t1", outbound_recipient="+15555550100")

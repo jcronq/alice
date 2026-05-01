@@ -205,14 +205,14 @@ async def _generate(run_id: str, events: list) -> None:
     prompt = _build_prompt(events)
     try:
         from alice_core.config.auth import ensure_auth_env
-        from alice_core.kernel import AgentKernel, KernelSpec
+        from alice_core.kernel import AnthropicKernel, KernelSpec
         from alice_core.events import CapturingEmitter
     except ImportError:
         return
     ensure_auth_env()
 
     emitter = CapturingEmitter()
-    kernel = AgentKernel(emitter, correlation_id=f"summary-{run_id}", silent=True)
+    kernel = AnthropicKernel(emitter, correlation_id=f"summary-{run_id}", silent=True)
     spec = KernelSpec(
         model=HAIKU_MODEL,
         allowed_tools=[],

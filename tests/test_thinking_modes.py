@@ -55,9 +55,11 @@ def test_active_mode_kernel_spec_uses_context_fields(tmp_path) -> None:
     assert spec.model == "claude-sonnet-test"
     assert spec.allowed_tools == ["Bash", "Read"]
     assert spec.cwd == tmp_path
-    # Adaptive thinking with summarized display is the
-    # always-on viewer-friendly setting.
-    assert spec.thinking == {"type": "adaptive", "display": "summarized"}
+    # "medium" is the normalized ThinkingLevel that AnthropicKernel
+    # maps to {type: adaptive, display: summarized}; PiKernel will map
+    # it to its own --thinking flag. The Mode no longer constructs
+    # SDK-specific dicts.
+    assert spec.thinking == "medium"
 
 
 def test_active_mode_kernel_spec_threads_system_prompt(tmp_path) -> None:

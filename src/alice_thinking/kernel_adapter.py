@@ -1,4 +1,4 @@
-"""Kernel adapter — drives one wake through :class:`AgentKernel`.
+"""Kernel adapter — drives one wake through :class:`AnthropicKernel`.
 
 Plan 03 Phase 1 extracts the kernel-driving logic from ``wake.py``
 into its own module. The same envelope (``wake_start`` /
@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
-from alice_core.kernel import AgentKernel
+from alice_core.kernel import AnthropicKernel
 
 
 if TYPE_CHECKING:
@@ -51,7 +51,7 @@ async def run_wake(
         prompt_chars=len(prompt_text),
     )
 
-    kernel = AgentKernel(
+    kernel = AnthropicKernel(
         emitter,
         correlation_id=wake_id,
         # Cap is generous — Sonnet's reasoning blocks are often >1k chars
