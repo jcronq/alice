@@ -1,11 +1,14 @@
 """Model + backend config loader — ``mind/config/model.yml``.
 
-Plan 06 Phase 1 of the runtime refactor. The runtime supports three
-LLM backends through the Claude Agent SDK:
+Plan 06 Phase 1 of the runtime refactor. The runtime supports four
+LLM backends:
 
 - ``subscription`` — Anthropic Max OAuth (today's default).
 - ``api`` — Anthropic API key, optionally via a LiteLLM proxy.
 - ``bedrock`` — AWS Bedrock via ``CLAUDE_CODE_USE_BEDROCK=1``.
+- ``pi`` — pi-coding-agent subprocess; routes to ChatGPT/Codex
+  subscription via the codex→pi auth bridge. See
+  :mod:`alice_pi.kernel` and ``docs/refactor/10-pi-kernel.md``.
 
 Each hemisphere (speaking, thinking, viewer) picks its own backend +
 model. ``mind/config/model.yml`` is the source of truth; if missing,
@@ -18,9 +21,8 @@ Schema (full form):
       backend: subscription
       model: claude-opus-4-7
     thinking:
-      backend: bedrock
-      model: anthropic.claude-sonnet-4-5-20250929-v1:0
-      region: us-east-1
+      backend: pi                    # routes through pi-coding-agent
+      model: gpt-5.3-codex           # PiKernel adds openai-codex/ prefix
     viewer:
       backend: subscription
       model: claude-haiku-4-5-20251001

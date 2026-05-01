@@ -232,6 +232,17 @@ def main() -> int:
             "thinking workflow."
         ),
     )
+    parser.add_argument(
+        "--backend",
+        choices=("subscription", "api", "bedrock", "pi"),
+        default=None,
+        help=(
+            "Override mind/config/model.yml's thinking backend for this "
+            "wake. Useful for ad-hoc smoke tests without editing config "
+            "(e.g. --backend=pi to verify the codex auth bridge after "
+            "a fresh `codex login`)."
+        ),
+    )
     args = parser.parse_args()
 
     _apply_config_overrides(args)
@@ -240,6 +251,19 @@ def main() -> int:
     mind = pathlib.Path(args.mind)
     model_config = load_model_config(mind)
     thinking_spec = model_config.thinking
+    if args.backend is not None:
+        # Plan-pi Phase E: ad-hoc backend override for smoke testing.
+        # Reuse the model.yml-resolved model + region/profile/base_url
+        # but flip the backend value.
+        from alice_core.config.model import BackendSpec
+
+        thinking_spec = BackendSpec(
+            backend=args.backend,
+            model=thinking_spec.model,
+            region=thinking_spec.region,
+            profile=thinking_spec.profile,
+            base_url=thinking_spec.base_url,
+        )
     ensure_auth_env(
         mode_hint=thinking_spec.backend,
         aws_region=thinking_spec.region,
