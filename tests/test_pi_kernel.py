@@ -247,3 +247,44 @@ def test_pi_kernel_argv_passes_skill_path_when_cwd_has_skills(tmp_path) -> None:
     # And --no-skills is set so directory-based discovery doesn't
     # double-up with the explicit path.
     assert "--no-skills" in argv
+
+
+def test_pi_kernel_argv_translates_tool_names_to_lowercase() -> None:
+    """Pi's built-in tools are lowercase (bash, read, write, edit,
+    grep, find, ls); Alice passes Claude-Code-style capitalized
+    names (Bash, Read, ...). The argv builder must translate so pi
+    actually recognizes the allowlist; otherwise pi ends up with
+    zero tools and the agent reports 'no file/tool access'."""
+    cap = CapturingEmitter()
+    kernel = PiKernel(cap)
+    spec = KernelSpec(
+        model="gpt-5.3-codex",
+        allowed_tools=["Bash", "Read", "Write", "Edit", "Glob", "Grep"],
+    )
+    argv = kernel._build_argv("hi", spec)
+    idx = argv.index("--tools")
+    tools = argv[idx + 1].split(",")
+    # Glob → find; everything else lowercases.
+    assert tools == ["bash", "read", "write", "edit", "find", "grep"]
+
+
+def test_pi_kernel_argv_drops_tools_without_pi_equivalent() -> None:
+    """WebFetch and WebSearch have no pi built-in; they drop
+    silently. If the operator's allowlist is ALL drops, --tools is
+    omitted so pi falls back to its default tool set."""
+    cap = CapturingEmitter()
+    kernel = PiKernel(cap)
+    spec = KernelSpec(
+        model="gpt-5.3-codex",
+        allowed_tools=["WebFetch", "WebSearch"],
+    )
+    argv = kernel._build_argv("hi", spec)
+    assert "--tools" not in argv
+
+    spec_mixed = KernelSpec(
+        model="gpt-5.3-codex",
+        allowed_tools=["Bash", "WebFetch", "Read"],
+    )
+    argv_mixed = kernel._build_argv("hi", spec_mixed)
+    idx = argv_mixed.index("--tools")
+    assert argv_mixed[idx + 1] == "bash,read"

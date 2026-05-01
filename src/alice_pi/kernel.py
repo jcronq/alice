@@ -56,6 +56,43 @@ def _normalize_pi_model(model: str) -> str:
     return f"openai-codex/{model}"
 
 
+# Map Alice's Claude-Code-style tool names to pi-coding-agent's
+# lowercase tool names. WebFetch / WebSearch have no pi equivalent
+# and get dropped silently (pi extensions can add them later).
+_PI_TOOL_NAME_MAP: dict[str, Optional[str]] = {
+    "Bash": "bash",
+    "Read": "read",
+    "Write": "write",
+    "Edit": "edit",
+    "Grep": "grep",
+    "Glob": "find",       # closest pi equivalent
+    "LS": "ls",
+    "Ls": "ls",
+    "WebFetch": None,     # not available in pi
+    "WebSearch": None,    # not available in pi
+}
+
+
+def _translate_tools(allowed: list[str]) -> list[str]:
+    """Translate Claude tool names to pi names. Unknown names pass
+    through lowercased so custom/extension tools (which the
+    operator wrote in their pi-native form) still work. Returns
+    [] when every requested tool dropped — caller treats that as
+    "fall back to pi's default tool set"."""
+    out: list[str] = []
+    for name in allowed:
+        if name in _PI_TOOL_NAME_MAP:
+            mapped = _PI_TOOL_NAME_MAP[name]
+            if mapped is not None:
+                out.append(mapped)
+            continue
+        # Unknown name: lowercased pass-through. Either it's already
+        # a pi-native name, or pi will reject it and the operator
+        # gets a clear error.
+        out.append(name.lower())
+    return out
+
+
 class PiKernel:
     """Drive one pi session to completion. Implements :class:`Kernel`."""
 
@@ -132,8 +169,14 @@ class PiKernel:
             if skills_dir.is_dir():
                 argv.extend(["--skill", str(skills_dir)])
 
-        if spec.allowed_tools:
-            argv.extend(["--tools", ",".join(spec.allowed_tools)])
+        # Translate Alice's Claude-Code-style tool names ("Bash",
+        # "Read", ...) to pi's lowercase set ("bash", "read", ...).
+        # If translation drops every name (e.g. all-WebFetch list)
+        # don't pass --tools at all — that lets pi default to its
+        # full built-in set rather than running with zero tools.
+        translated = _translate_tools(spec.allowed_tools or [])
+        if translated:
+            argv.extend(["--tools", ",".join(translated)])
 
         argv.extend(["--model", _normalize_pi_model(spec.model)])
         argv.extend(["--thinking", _thinking_to_pi_arg(spec.thinking)])
