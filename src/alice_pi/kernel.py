@@ -141,11 +141,12 @@ class PiKernel:
         if spec.append_system_prompt:
             argv.extend(["--append-system-prompt", spec.append_system_prompt])
 
-        # add_dirs: pi's --add-dir grants additional read access.
-        if spec.add_dirs:
-            for path in spec.add_dirs:
-                argv.extend(["--add-dir", str(path)])
-
-        # mcp_servers (Anthropic-only): silently ignored — pi has
-        # no built-in MCP. Documented in the spike report.
+        # add_dirs: silently ignored. Anthropic's claude_agent_sdk
+        # uses ``add_dirs`` to grant the agent extra read access
+        # beyond cwd, but pi has no equivalent flag — its tools
+        # default to whole-filesystem read access from the user
+        # account, so skill bodies referencing absolute paths
+        # (e.g. ~/alice-mind/...) still resolve via Read/Bash.
+        # mcp_servers (Anthropic-only): also silently ignored — pi
+        # has no built-in MCP. Documented in the spike report.
         return argv

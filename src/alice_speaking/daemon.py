@@ -161,10 +161,18 @@ class SpeakingDaemon:
         # ``session_id`` property below delegates so handlers and
         # the compaction trigger can keep their existing
         # ``ctx.session_id`` access unchanged.
+        # Plan-pi Phase C swapped the kernel cwd from cfg.work_dir to
+        # the per-hemisphere rendered skills dir. The Claude Code SDK
+        # stores session JSONL files per-cwd, so a session_id created
+        # under the old cwd is invalid in the new one. Resolve the
+        # ACTUAL kernel cwd here so the preflight checks the right
+        # location.
+        self._skills_cwd = cfg.state_dir / "alice-skills" / "speaking"
+
         initial_session_id: Optional[str] = None
         persisted = session_state.read(self._session_path)
         if persisted is not None:
-            if session_state.sdk_session_exists(cfg.work_dir, persisted.session_id):
+            if session_state.sdk_session_exists(self._skills_cwd, persisted.session_id):
                 initial_session_id = persisted.session_id
                 log.info(
                     "loaded persisted session %s (saved_at=%s)",
@@ -173,8 +181,10 @@ class SpeakingDaemon:
                 )
             else:
                 log.warning(
-                    "persisted session %s has no SDK JSONL; starting cold",
+                    "persisted session %s has no SDK JSONL under %s; "
+                    "starting cold (cwd may have changed since persist)",
                     persisted.session_id,
+                    self._skills_cwd,
                 )
                 session_state.clear(self._session_path)
 
@@ -300,13 +310,14 @@ class SpeakingDaemon:
         # call via KernelSpec.append_system_prompt.
         self._system_prompt = factory_module.build_system_prompt(self._personae)
         # Plan 07 P3 / plan-pi Phase C: render speaking-scope skills
-        # to a per-hemisphere ephemeral dir. Kernel cwd swaps to this
-        # dir so the SDK auto-loader / pi auto-discovery sees only
-        # in-scope, Jinja-rendered, strict-YAML SKILL.md files.
+        # to a per-hemisphere ephemeral dir (computed earlier as
+        # self._skills_cwd so the session preflight uses the right
+        # cwd). Kernel cwd swaps to this dir so the SDK auto-loader /
+        # pi auto-discovery sees only in-scope, Jinja-rendered,
+        # strict-YAML SKILL.md files.
         from alice_skills.registry import SkillRegistry
         from alice_skills.render import render_to_disk
 
-        self._skills_cwd = cfg.state_dir / "alice-skills" / "speaking"
         skill_registry = SkillRegistry.from_mind(cfg.mind_dir)
         render_to_disk(
             skill_registry,

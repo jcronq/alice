@@ -136,13 +136,16 @@ def test_init_skips_signal_when_account_unset(cfg, monkeypatch) -> None:
 
 
 def test_init_loads_persisted_session(cfg, tmp_path, monkeypatch) -> None:
-    # Pre-persist session.json AND the SDK JSONL so preflight passes.
+    # Pre-persist session.json AND the SDK JSONL under the SAME cwd
+    # the kernel will use (the per-hemisphere rendered skills dir
+    # introduced by plan-pi Phase C — NOT cfg.work_dir).
     state_dir = cfg.mind_dir / "inner" / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
     session_path = state_dir / "session.json"
     session_state.write(session_path, "persisted-123")
 
-    sdk_jsonl = session_state.sdk_session_jsonl_path(cfg.work_dir, "persisted-123")
+    skills_cwd = cfg.state_dir / "alice-skills" / "speaking"
+    sdk_jsonl = session_state.sdk_session_jsonl_path(skills_cwd, "persisted-123")
     sdk_jsonl.parent.mkdir(parents=True, exist_ok=True)
     sdk_jsonl.write_text("{}\n")
 

@@ -204,7 +204,12 @@ def test_pi_kernel_argv_normalizes_model_and_threads_thinking() -> None:
     assert no_thinking[idx + 1] == "off"
 
 
-def test_pi_kernel_argv_passes_add_dirs() -> None:
+def test_pi_kernel_argv_silently_drops_add_dirs() -> None:
+    """add_dirs is Anthropic-SDK shape; pi has no equivalent flag.
+    The argv builder must not pass ``--add-dir`` (pi exits 1 on
+    unknown flags). Skill bodies referencing absolute mind paths
+    still resolve because pi's tools default to filesystem-wide
+    read access from the running user account."""
     cap = CapturingEmitter()
     kernel = PiKernel(cap)
     spec = KernelSpec(
@@ -212,11 +217,7 @@ def test_pi_kernel_argv_passes_add_dirs() -> None:
         add_dirs=[pathlib.Path("/home/alice/alice-mind"), pathlib.Path("/extra")],
     )
     argv = kernel._build_argv("hi", spec)
-    assert argv.count("--add-dir") == 2
-    # Each --add-dir is followed by the path string.
-    indices = [i for i, a in enumerate(argv) if a == "--add-dir"]
-    assert argv[indices[0] + 1] == "/home/alice/alice-mind"
-    assert argv[indices[1] + 1] == "/extra"
+    assert "--add-dir" not in argv
 
 
 def test_pi_kernel_argv_passes_skill_path_when_cwd_has_skills(tmp_path) -> None:
