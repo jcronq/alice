@@ -30,7 +30,12 @@ HAIKU_MODEL = "claude-haiku-4-5"
 
 # Bump when the prompt or output shape changes — cached entries with a
 # lower schema are treated as missing so summaries regenerate lazily.
-CACHE_SCHEMA = 2
+# Schema 3: concatenate assistant_text events (handles both
+# per-block claude_agent_sdk wakes AND fragmented per-token pi wakes
+# from before alice_pi.translator's text_end fix; the previous version
+# overwrote on each event, leaving final_text="OK" or similar for
+# pi-routed wakes whose deltas arrived in 2-5 char chunks).
+CACHE_SCHEMA = 3
 
 
 def cache_dir() -> pathlib.Path:
@@ -124,7 +129,7 @@ def _build_prompt(events: list) -> str:
     end-to-end.
     """
     thoughts: list[str] = []
-    final_text = None
+    text_parts: list[str] = []
     tool_lines: list[str] = []
     for ev in events:
         if ev.kind == "thinking":
@@ -132,9 +137,9 @@ def _build_prompt(events: list) -> str:
             if t:
                 thoughts.append(t[:500])
         elif ev.kind == "assistant_text":
-            t = (ev.detail.get("text") or "").strip()
+            t = ev.detail.get("text") or ""
             if t:
-                final_text = t[:600]
+                text_parts.append(t)
         elif ev.kind == "tool_use":
             name = ev.detail.get("name", "?")
             raw_input = ev.detail.get("input", "")
@@ -166,6 +171,15 @@ def _build_prompt(events: list) -> str:
         if len(tool_lines) > 40:
             parts.append(f"…and {len(tool_lines) - 40} more")
         parts.append("")
+    # Concatenate all assistant_text events instead of taking only
+    # the last. Pi-routed wakes used to emit one event per 2-5 char
+    # delta (pre-text_end fix); without concatenation the prompt
+    # captured only the trailing fragment ("OK" for "QUICK-OK"),
+    # leaving the summarizer with no context. Anthropic-side wakes
+    # emit one event per TextBlock so concatenation just runs them
+    # together with no separator — the deltas already carry their
+    # own leading whitespace.
+    final_text = "".join(text_parts).strip()[:1200]
     if final_text:
         parts.append(f"Closing text: {final_text}")
 
