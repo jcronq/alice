@@ -20,6 +20,16 @@ from typing import AsyncIterator, Optional, Sequence
 __all__ = ["stream_pi_events", "PI_BIN", "pi_bin"]
 
 
+# Buffer cap for the line-by-line JSONL reader. asyncio.StreamReader
+# defaults to 64KiB per line, which a single pi ``message_end`` event
+# (full message content + usage + nested partials) can blow through —
+# observed "Separator is found, but chunk is longer than limit"
+# exceptions on real wakes that wrote large note bodies. 10 MiB
+# matches the cap claude_agent_sdk's subprocess transport uses for
+# the same reason.
+_PI_STDOUT_BUFFER_LIMIT = 10 * 1024 * 1024
+
+
 def pi_bin() -> str:
     """Return the pi binary path. Read fresh from the environment
     every call so test fixtures + runtime config changes take
@@ -52,6 +62,7 @@ async def stream_pi_events(
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
         env=env,
+        limit=_PI_STDOUT_BUFFER_LIMIT,
     )
     assert proc.stdout is not None and proc.stderr is not None
 
