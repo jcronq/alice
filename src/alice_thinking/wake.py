@@ -236,7 +236,9 @@ def main() -> int:
     else:
         emitted_mode = mode
 
-    return asyncio.run(run_wake(ctx=ctx, mode=emitted_mode, emitter=emitter))
+    return asyncio.run(
+        run_wake(ctx=ctx, mode=emitted_mode, emitter=emitter, backend=thinking_spec)
+    )
 
 
 if __name__ == "__main__":

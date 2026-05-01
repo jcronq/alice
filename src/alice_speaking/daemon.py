@@ -372,6 +372,11 @@ class SpeakingDaemon:
             model=factory_module.build_kernel_model(
                 cfg.speaking, self._model_config.speaking
             ),
+            # Plan-pi Phase B: thread the BackendSpec through so the
+            # TurnRunner's per-turn make_kernel call picks the right
+            # impl (AnthropicKernel for subscription/api/bedrock,
+            # PiKernel for pi).
+            backend=self._model_config.speaking,
         )
         self.turn_runner.session_id = initial_session_id
         self._config_path = cfg.mind_dir / "config" / "alice.config.json"

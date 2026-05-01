@@ -18,6 +18,7 @@ concrete impl. Use :func:`make_kernel` to construct.
 """
 
 from .anthropic import AnthropicKernel
+from .factory import make_kernel
 from .protocol import BlockHandler, Kernel, NullHandler
 from .types import (
     KernelResult,
@@ -40,4 +41,5 @@ __all__ = [
     "ThinkingLevel",
     "TurnSummary",
     "UsageInfo",
+    "make_kernel",
 ]

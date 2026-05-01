@@ -61,15 +61,12 @@ def test_run_wake_passes_system_prompt_to_kernel(monkeypatch, tmp_path) -> None:
         error = None
 
     class _FakeKernel:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            pass
-
-        async def run(self, prompt: str, spec: Any) -> _FakeResult:
+        async def run(self, prompt: str, spec: Any, handlers: Any = None) -> _FakeResult:
             captured["spec"] = spec
             captured["prompt"] = prompt
             return _FakeResult()
 
-    monkeypatch.setattr(ka, "AnthropicKernel", _FakeKernel)
+    monkeypatch.setattr(ka, "make_kernel", lambda *a, **kw: _FakeKernel())
 
     ctx = _make_ctx(tmp_path, system_prompt="You are Eve. Talk to Jordan.")
     rc = asyncio.run(ka.run_wake(ctx=ctx, mode=ActiveMode(), emitter=_CapturingEmitter()))
@@ -89,14 +86,11 @@ def test_run_wake_with_empty_system_prompt_passes_none(
         error = None
 
     class _FakeKernel:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            pass
-
-        async def run(self, prompt: str, spec: Any) -> _FakeResult:
+        async def run(self, prompt: str, spec: Any, handlers: Any = None) -> _FakeResult:
             captured["spec"] = spec
             return _FakeResult()
 
-    monkeypatch.setattr(ka, "AnthropicKernel", _FakeKernel)
+    monkeypatch.setattr(ka, "make_kernel", lambda *a, **kw: _FakeKernel())
 
     ctx = _make_ctx(tmp_path)
     asyncio.run(ka.run_wake(ctx=ctx, mode=ActiveMode(), emitter=_CapturingEmitter()))
@@ -112,13 +106,10 @@ def test_run_wake_emits_mode_in_envelope_events(monkeypatch, tmp_path) -> None:
         error = None
 
     class _FakeKernel:
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            pass
-
-        async def run(self, prompt: str, spec: Any) -> _FakeResult:
+        async def run(self, prompt: str, spec: Any, handlers: Any = None) -> _FakeResult:
             return _FakeResult()
 
-    monkeypatch.setattr(ka, "AnthropicKernel", _FakeKernel)
+    monkeypatch.setattr(ka, "make_kernel", lambda *a, **kw: _FakeKernel())
 
     emitter = _CapturingEmitter()
     asyncio.run(

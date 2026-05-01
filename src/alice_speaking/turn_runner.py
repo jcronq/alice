@@ -42,7 +42,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Optional
 
-from alice_core.kernel import AnthropicKernel, KernelSpec
+from alice_core.config.model import BackendSpec
+from alice_core.kernel import KernelSpec, make_kernel
 from alice_core.sdk_compat import looks_like_missing_session as _looks_like_missing_session
 
 from .domain import session_state
@@ -94,6 +95,7 @@ class TurnRunner:
         current_reply_channel_getter: Callable[[], Optional[ChannelRef]],
         system_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        backend: Optional[BackendSpec] = None,
     ) -> None:
         self._cfg = cfg
         self._events = events
@@ -116,6 +118,10 @@ class TurnRunner:
         # ``None`` falls back to cfg.speaking["model"] inside
         # ``_build_spec`` for callers that haven't migrated yet.
         self._model = model
+        # Plan-pi Phase B: backend spec used to construct the
+        # kernel via the factory. ``None`` defaults to the
+        # subscription path (legacy behavior).
+        self._backend = backend or BackendSpec(backend="subscription")
         self.session_id: Optional[str] = None
         self._pending_preamble: Optional[str] = None
 
@@ -276,7 +282,8 @@ class TurnRunner:
         spec = self._build_spec()
         handlers = self._build_handlers(silent=silent)
 
-        kernel = AnthropicKernel(
+        kernel = make_kernel(
+            self._backend,
             self._events,
             correlation_id=turn_id,
             silent=silent,
