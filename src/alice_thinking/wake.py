@@ -26,6 +26,7 @@ import json
 import pathlib
 import sys
 from datetime import datetime
+from typing import Optional
 
 from alice_core.config.auth import ensure_auth_env
 from alice_core.config.model import load as load_model_config
@@ -47,6 +48,7 @@ from .vault_state import snapshot as snapshot_vault
 DEFAULT_MIND = pathlib.Path("/home/alice/alice-mind")
 DEFAULT_DIRECTIVE = DEFAULT_MIND / "inner" / "directive.md"
 DEFAULT_LOG = pathlib.Path("/state/worker/thinking.log")
+DEFAULT_STATE_DIR = pathlib.Path("/state/worker")
 DEFAULT_TOOLS = "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch"
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_SECONDS = 0  # 0 == no timeout. Thinking runs as long as it needs.
@@ -131,16 +133,37 @@ def _build_context(args: argparse.Namespace, personae) -> WakeContext:
 
     The selector + mode read fields off the context; this is the one
     place that knows about argparse + alice.config.json + model.yml.
+
+    For non-quick wakes, the kernel cwd swaps to the rendered
+    thinking-scope skills dir under ``state_dir`` so the agent's
+    auto-loader (SDK or pi) sees only ``thinking | both`` skills.
+    The original mind stays reachable via :attr:`add_dirs`.
     """
     mind = pathlib.Path(args.mind)
+    state_dir = pathlib.Path(args.state_dir)
+    add_dirs: Optional[list[pathlib.Path]] = None
     if args.quick:
         cwd = pathlib.Path("/tmp")
         max_seconds = QUICK_MAX_SECONDS
         tools: list[str] = []
     else:
-        cwd = mind
         max_seconds = args.max_seconds
         tools = [t.strip() for t in args.tools.split(",") if t.strip()]
+        # Plan 07 P3 / plan-pi Phase C: render thinking-scope skills
+        # to the per-hemisphere ephemeral dir, then point cwd there.
+        from alice_skills.registry import SkillRegistry
+        from alice_skills.render import render_to_disk
+
+        cwd = state_dir / "alice-skills" / "thinking"
+        registry = SkillRegistry.from_mind(mind)
+        render_to_disk(
+            registry,
+            hemisphere="thinking",
+            target_dir=cwd,
+            personae=personae,
+            mind_dir=mind,
+        )
+        add_dirs = [mind]
 
     bootstrap_path: pathlib.Path | None = None
     if not args.quick and not args.prompt:
@@ -161,6 +184,7 @@ def _build_context(args: argparse.Namespace, personae) -> WakeContext:
         inline_prompt=args.prompt,
         bootstrap_path=bootstrap_path,
         directive_path=mind / "inner" / "directive.md",
+        add_dirs=add_dirs,
     )
 
 
@@ -180,6 +204,14 @@ def main() -> int:
         help="inline prompt (overrides --bootstrap)",
     )
     parser.add_argument("--log", default=str(DEFAULT_LOG), help="event log path")
+    parser.add_argument(
+        "--state-dir",
+        default=str(DEFAULT_STATE_DIR),
+        help=(
+            "Worker state dir. Used as the parent for the rendered "
+            "thinking-scope skills dir; must be writable."
+        ),
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument(
         "--max-seconds",

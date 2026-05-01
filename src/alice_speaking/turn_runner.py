@@ -40,6 +40,7 @@ What it doesn't touch:
 from __future__ import annotations
 
 import logging
+import pathlib
 from typing import Any, Callable, Optional
 
 from alice_core.config.model import BackendSpec
@@ -96,6 +97,8 @@ class TurnRunner:
         system_prompt: Optional[str] = None,
         model: Optional[str] = None,
         backend: Optional[BackendSpec] = None,
+        skills_cwd: Optional[pathlib.Path] = None,
+        mind_dir: Optional[pathlib.Path] = None,
     ) -> None:
         self._cfg = cfg
         self._events = events
@@ -122,6 +125,16 @@ class TurnRunner:
         # kernel via the factory. ``None`` defaults to the
         # subscription path (legacy behavior).
         self._backend = backend or BackendSpec(backend="subscription")
+        # Plan-pi Phase C: kernel cwd points at the rendered skills
+        # dir so the SDK auto-loader / pi discovery sees the
+        # filtered, strict-YAML, Jinja-rendered SKILL.md files.
+        # ``None`` falls back to cfg.work_dir (legacy single-skills
+        # behavior).
+        self._skills_cwd = skills_cwd
+        # ``add_dirs`` keeps the mind reachable for skill bodies
+        # that reference absolute paths or that the agent may need
+        # to read for general operation.
+        self._mind_dir = mind_dir
         self.session_id: Optional[str] = None
         self._pending_preamble: Optional[str] = None
 
@@ -193,7 +206,8 @@ class TurnRunner:
             model=self._model or self._cfg.speaking.get("model"),
             allowed_tools=_BUILTIN_TOOLS + self._custom_tool_names,
             mcp_servers=self._mcp_servers,
-            cwd=self._cfg.work_dir,
+            cwd=self._skills_cwd or self._cfg.work_dir,
+            add_dirs=[self._mind_dir] if self._mind_dir is not None else None,
             resume=self.session_id,
             # Adaptive thinking with summarized display so
             # ThinkingBlocks come back with non-empty text. Without

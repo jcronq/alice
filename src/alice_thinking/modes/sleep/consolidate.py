@@ -34,6 +34,7 @@ class ConsolidationStage(_NullPostRun):
             model=ctx.model,
             allowed_tools=list(ctx.tools),
             cwd=ctx.cwd,
+            add_dirs=ctx.add_dirs,
             max_seconds=ctx.max_seconds,
             thinking="medium",
             append_system_prompt=ctx.system_prompt or None,

@@ -299,6 +299,22 @@ class SpeakingDaemon:
         # once at startup; TurnRunner threads it into every kernel
         # call via KernelSpec.append_system_prompt.
         self._system_prompt = factory_module.build_system_prompt(self._personae)
+        # Plan 07 P3 / plan-pi Phase C: render speaking-scope skills
+        # to a per-hemisphere ephemeral dir. Kernel cwd swaps to this
+        # dir so the SDK auto-loader / pi auto-discovery sees only
+        # in-scope, Jinja-rendered, strict-YAML SKILL.md files.
+        from alice_skills.registry import SkillRegistry
+        from alice_skills.render import render_to_disk
+
+        self._skills_cwd = cfg.state_dir / "alice-skills" / "speaking"
+        skill_registry = SkillRegistry.from_mind(cfg.mind_dir)
+        render_to_disk(
+            skill_registry,
+            hemisphere="speaking",
+            target_dir=self._skills_cwd,
+            personae=self._personae,
+            mind_dir=cfg.mind_dir,
+        )
         self._registry = factory_module.build_registry(
             cfg,
             transports=(
@@ -377,6 +393,12 @@ class SpeakingDaemon:
             # impl (AnthropicKernel for subscription/api/bedrock,
             # PiKernel for pi).
             backend=self._model_config.speaking,
+            # Plan-pi Phase C: kernel cwd swaps to the per-hemisphere
+            # rendered skills dir; the agent retains read access to
+            # the mind via add_dirs so skill bodies referencing
+            # ~/alice-mind/... paths keep working.
+            skills_cwd=self._skills_cwd,
+            mind_dir=cfg.mind_dir,
         )
         self.turn_runner.session_id = initial_session_id
         self._config_path = cfg.mind_dir / "config" / "alice.config.json"

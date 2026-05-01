@@ -37,6 +37,7 @@ class ActiveMode(_NullPostRun):
             model=ctx.model,
             allowed_tools=list(ctx.tools),
             cwd=ctx.cwd,
+            add_dirs=ctx.add_dirs,
             max_seconds=ctx.max_seconds,
             # Adaptive thinking with summarized display so
             # ThinkingBlocks come back with non-empty text. AnthropicKernel's

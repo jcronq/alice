@@ -43,6 +43,11 @@ class WakeContext:
     inline_prompt: Optional[str] = None
     bootstrap_path: Optional[pathlib.Path] = None
     directive_path: Optional[pathlib.Path] = None
+    # Plan-pi Phase C: extra dirs the kernel grants the agent read
+    # access to. When cwd points at the per-hemisphere rendered
+    # skills dir, add_dirs typically contains the original mind so
+    # skill bodies referencing ``~/alice-mind/...`` keep working.
+    add_dirs: Optional[list[pathlib.Path]] = None
 
 
 class Mode(Protocol):
