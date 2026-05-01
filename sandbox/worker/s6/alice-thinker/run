@@ -4,22 +4,29 @@
 # rather than queues, matching the REM-cycle design where overlap is bad.
 #
 # Mode-aware cadence per Alice's active/sleep design:
-#   sleep mode (23:00–07:00): vault grooming, 5-min cadence
-#   active mode (07:00–23:00): generative learning, 5-min cadence
+#   active mode (07:00–23:00): generative learning, fixed 5-min cadence
+#     (overridable via thinking.active_cadence_minutes)
+#   sleep mode (23:00–07:00): vault grooming with exponential backoff —
+#     5 → 10 → 20 → 40 min, hard-resets to 5 on meaningful work. The
+#     wake.py process writes the next interval to
+#     /state/worker/next-thinking-interval-seconds after each wake;
+#     the supervisor reads that here. See
+#     cortex-memory/research/2026-05-01-sleep-mode-exponential-backoff-design.md.
 #
-# Both default to 5 min — matches the directive's stated cadence and
-# keeps Alice responsive to surfaces during the day. Override either via
-# `thinking.rem_cadence_minutes` / `thinking.active_cadence_minutes` in
-# alice.config.json; live config changes take effect on the next cycle
-# boundary. See cortex-memory/reference/design-day-night-modes.md.
+# Inbox interrupt: a new file in $MIND/inner/notes/ wakes the thinker
+# immediately regardless of the current backoff interval. We use
+# inotifywait with a timeout so the wait returns on either condition.
+# See cortex-memory/research/2026-05-01-sleep-mode-exponential-backoff-design.md.
 set -e
 
 LOCK=/state/worker/thinking.lock
+INTERVAL_FILE=/state/worker/next-thinking-interval-seconds
 CONFIG_JSON=/home/alice/alice-mind/config/alice.config.json
+NOTES_DIR=/home/alice/alice-mind/inner/notes
 DEFAULT_REM_CADENCE_MIN=5
 DEFAULT_ACTIVE_CADENCE_MIN=5
 
-mkdir -p "$(dirname "$LOCK")"
+mkdir -p "$(dirname "$LOCK")" "$NOTES_DIR"
 touch "$LOCK"
 chown alice:alice "$LOCK" || true
 
@@ -30,30 +37,54 @@ while true; do
     hour=${hour#0}
     if [ "$hour" -lt 7 ] || [ "$hour" -ge 23 ]; then
         mode=sleep
-        default_min="$DEFAULT_REM_CADENCE_MIN"
-        config_key=rem_cadence_minutes
     else
         mode=active
-        default_min="$DEFAULT_ACTIVE_CADENCE_MIN"
-        config_key=active_cadence_minutes
     fi
-
-    cadence_min="$default_min"
-    if [ -f "$CONFIG_JSON" ] && command -v jq >/dev/null 2>&1; then
-        v=$(jq -r ".thinking.$config_key // empty" "$CONFIG_JSON" 2>/dev/null || true)
-        case "$v" in
-            ''|*[!0-9]*) ;;
-            *) cadence_min="$v" ;;
-        esac
-    fi
-    cadence=$(( cadence_min * 60 ))
 
     start_ts=$(date +%s)
     flock -n "$LOCK" s6-setuidgid alice /usr/local/bin/alice-think || true
     end_ts=$(date +%s)
     elapsed=$(( end_ts - start_ts ))
+
+    # Determine the wait interval AFTER the wake — wake.py just wrote
+    # the new sleep-mode interval to $INTERVAL_FILE.
+    if [ "$mode" = sleep ] && [ -r "$INTERVAL_FILE" ]; then
+        cadence=$(cat "$INTERVAL_FILE" 2>/dev/null || echo "")
+        case "$cadence" in
+            ''|*[!0-9]*) cadence=$(( DEFAULT_REM_CADENCE_MIN * 60 )) ;;
+        esac
+    else
+        if [ "$mode" = sleep ]; then
+            default_min="$DEFAULT_REM_CADENCE_MIN"
+            config_key=rem_cadence_minutes
+        else
+            default_min="$DEFAULT_ACTIVE_CADENCE_MIN"
+            config_key=active_cadence_minutes
+        fi
+        cadence_min="$default_min"
+        if [ -f "$CONFIG_JSON" ] && command -v jq >/dev/null 2>&1; then
+            v=$(jq -r ".thinking.$config_key // empty" "$CONFIG_JSON" 2>/dev/null || true)
+            case "$v" in
+                ''|*[!0-9]*) ;;
+                *) cadence_min="$v" ;;
+            esac
+        fi
+        cadence=$(( cadence_min * 60 ))
+    fi
+
     remainder=$(( cadence - elapsed ))
     if [ "$remainder" -gt 0 ]; then
-        sleep "$remainder"
+        # If a note arrived between the wake finishing and now, skip
+        # the wait so the next wake drains it immediately. Otherwise
+        # wait on inotify so a future arrival interrupts the backoff.
+        if [ -d "$NOTES_DIR" ] && find "$NOTES_DIR" -mindepth 1 -maxdepth 1 -type f \
+                \( -name '*.md' -o -name '*.markdown' \) -print -quit 2>/dev/null | grep -q .; then
+            :
+        elif command -v inotifywait >/dev/null 2>&1 && [ -d "$NOTES_DIR" ]; then
+            inotifywait -q -e create -e moved_to -t "$remainder" "$NOTES_DIR" \
+                >/dev/null 2>&1 || true
+        else
+            sleep "$remainder"
+        fi
     fi
 done
