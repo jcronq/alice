@@ -94,6 +94,25 @@ def write(run_id: str, summary: str, *, cost_usd: float | None = None) -> None:
 # here and discard on completion.
 _inflight: set[asyncio.Task] = set()
 
+# Concurrency cap. Without this, a CACHE_SCHEMA bump (or a fresh
+# viewer-cache wipe) lets the timeline render trigger a parallel
+# burst — one Haiku subprocess per uncached wake — that pegs the
+# host with hundreds of `claude` subprocesses (observed: 239 after
+# the schema 2 → 3 bump). The semaphore queues schedules without
+# blocking the FastAPI request, so the timeline still paints
+# instantly; summaries fill in serially behind the scenes.
+_MAX_CONCURRENT = int(os.environ.get("ALICE_RUN_SUMMARY_CONCURRENCY", "2"))
+_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    """Lazy-create the semaphore on the running event loop. Cannot be
+    constructed at module import — there's no loop yet."""
+    global _semaphore
+    if _semaphore is None:
+        _semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
+    return _semaphore
+
 
 def schedule(run_id: str, events: list) -> None:
     """Fire-and-forget summary generation for ``run_id``.
@@ -216,36 +235,44 @@ def _tool_primary(name: str, raw_input: Any) -> str:
 
 
 async def _generate(run_id: str, events: list) -> None:
-    prompt = _build_prompt(events)
-    try:
-        from alice_core.config.auth import ensure_auth_env
-        from alice_core.kernel import AnthropicKernel, KernelSpec
-        from alice_core.events import CapturingEmitter
-    except ImportError:
-        return
-    ensure_auth_env()
+    # Defer the actual work behind a semaphore — see _get_semaphore.
+    # The body double-checks the cache after acquiring the slot in
+    # case another scheduling produced the summary while we waited.
+    async with _get_semaphore():
+        if read(run_id):
+            return
+        prompt = _build_prompt(events)
+        try:
+            from alice_core.config.auth import ensure_auth_env
+            from alice_core.kernel import AnthropicKernel, KernelSpec
+            from alice_core.events import CapturingEmitter
+        except ImportError:
+            return
+        ensure_auth_env()
 
-    emitter = CapturingEmitter()
-    kernel = AnthropicKernel(emitter, correlation_id=f"summary-{run_id}", silent=True)
-    spec = KernelSpec(
-        model=HAIKU_MODEL,
-        allowed_tools=[],
-        cwd=pathlib.Path("/tmp"),
-    )
-    try:
-        result = await kernel.run(prompt, spec)
-    except Exception:  # noqa: BLE001
-        return
-    summary = (result.text or "").strip()
-    if not summary:
-        return
-    # Strip surrounding quotes if Haiku added them despite the instruction.
-    if (summary.startswith('"') and summary.endswith('"')) or (
-        summary.startswith("'") and summary.endswith("'")
-    ):
-        summary = summary[1:-1]
-    summary = summary.replace("\n", " ").strip()[:280]
-    write(run_id, summary, cost_usd=result.cost_usd)
+        emitter = CapturingEmitter()
+        kernel = AnthropicKernel(
+            emitter, correlation_id=f"summary-{run_id}", silent=True
+        )
+        spec = KernelSpec(
+            model=HAIKU_MODEL,
+            allowed_tools=[],
+            cwd=pathlib.Path("/tmp"),
+        )
+        try:
+            result = await kernel.run(prompt, spec)
+        except Exception:  # noqa: BLE001
+            return
+        summary = (result.text or "").strip()
+        if not summary:
+            return
+        # Strip surrounding quotes if Haiku added them despite the instruction.
+        if (summary.startswith('"') and summary.endswith('"')) or (
+            summary.startswith("'") and summary.endswith("'")
+        ):
+            summary = summary[1:-1]
+        summary = summary.replace("\n", " ").strip()[:280]
+        write(run_id, summary, cost_usd=result.cost_usd)
 
 
 __all__ = ["read", "write", "schedule", "cache_dir"]
