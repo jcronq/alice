@@ -25,6 +25,7 @@ import asyncio
 import json
 import pathlib
 import sys
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -37,6 +38,7 @@ from alice_core.config.personae import (
 )
 from alice_core.events import EventLogger
 
+from . import backoff
 from ._prompt_assembly import WAKE_TZ, wake_timestamp_header
 from .kernel_adapter import run_wake
 from .modes.base import WakeContext
@@ -53,6 +55,7 @@ DEFAULT_TOOLS = "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch"
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_SECONDS = 0  # 0 == no timeout. Thinking runs as long as it needs.
 QUICK_MAX_SECONDS = 30
+INTERVAL_FILE_NAME = "next-thinking-interval-seconds"
 
 
 def _load_token() -> None:
@@ -292,9 +295,33 @@ def main() -> int:
     else:
         emitted_mode = mode
 
-    return asyncio.run(
+    wake_start_ts = time.time()
+    rc = asyncio.run(
         run_wake(ctx=ctx, mode=emitted_mode, emitter=emitter, backend=thinking_spec)
     )
+
+    # Sleep-mode exponential backoff: write the next wake-to-wake
+    # interval for the s6 supervisor. Skipped for --quick (a smoke
+    # test shouldn't reshape the live cadence). See
+    # cortex-memory/research/2026-05-01-sleep-mode-exponential-backoff-design.md.
+    if not args.quick:
+        interval_path = pathlib.Path(args.state_dir) / INTERVAL_FILE_NAME
+        prev_interval = backoff.read_interval(interval_path)
+        did_work = backoff.detect_did_work(mind, since_ts=wake_start_ts)
+        next_interval = backoff.next_interval_seconds(
+            prev_seconds=prev_interval,
+            mode=emitted_mode.name,
+            did_work=did_work,
+        )
+        try:
+            backoff.write_interval_atomic(interval_path, next_interval)
+        except OSError as exc:
+            # State-dir issues shouldn't fail the wake; supervisor
+            # falls back to its built-in default if the file is
+            # unreadable on the next iteration.
+            print(f"thinking: failed to write {interval_path}: {exc}", file=sys.stderr)
+
+    return rc
 
 
 if __name__ == "__main__":
