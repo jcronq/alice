@@ -53,14 +53,19 @@ def test_session_event_records_session_id_and_emits_system() -> None:
     assert "system" in kinds
 
 
-def test_text_delta_accumulates_and_calls_on_text() -> None:
+def test_text_deltas_accumulate_and_emit_once_on_text_end() -> None:
+    """text_delta events accumulate into KernelResult.text but do
+    NOT fire on_text per delta — handlers + the assistant_text
+    event get one call per completed block, on text_end. Matches
+    AnthropicKernel's TextBlock semantic."""
     fired: list[str] = []
+    emitted_texts: list[str] = []
 
     class H(NullHandler):
         async def on_text(self, text):
             fired.append(text)
 
-    emit, _ = _emit_recorder()
+    emit, recorded = _emit_recorder()
     t = PiEventTranslator(emit)
     asyncio.run(
         _drain(
@@ -80,12 +85,25 @@ def test_text_delta_accumulates_and_calls_on_text() -> None:
                         "delta": "world",
                     },
                 },
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {
+                        "type": "text_end",
+                        "content": "Hello world",
+                    },
+                },
             ],
             handlers=[H()],
         )
     )
 
-    assert fired == ["Hello ", "world"]
+    # One handler call, one event emission — both with the full
+    # block content rather than per-delta chunks.
+    assert fired == ["Hello world"]
+    emitted_texts = [
+        f.get("text") for name, f in recorded if name == "assistant_text"
+    ]
+    assert emitted_texts == ["Hello world"]
     assert t.to_kernel_result().text == "Hello world"
 
 

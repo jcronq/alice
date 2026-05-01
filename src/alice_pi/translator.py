@@ -211,22 +211,33 @@ class PiEventTranslator:
         ame = event.get("assistantMessageEvent") or {}
         ame_kind = ame.get("type")
         if ame_kind == "text_delta":
+            # Accumulate into KernelResult.text; defer event emission
+            # to text_end so the trace + handlers see one
+            # ``assistant_text`` per completed block (matching
+            # AnthropicKernel's TextBlock semantic). Streaming
+            # per-delta produced one node per ~3-character chunk in
+            # the viewer — visually noisy without giving the operator
+            # extra information.
             delta = ame.get("delta") or ""
-            if not delta:
+            if delta:
+                self._state.parts.append(delta)
+        elif ame_kind == "text_end":
+            content = ame.get("content") or ""
+            if not content:
                 return
-            self._state.parts.append(delta)
-            self._emit("assistant_text", text=_short(delta, self._cap))
+            self._emit("assistant_text", text=_short(content, self._cap))
             for h in handlers:
-                await h.on_text(delta)
-        elif ame_kind == "thinking_delta":
-            delta = ame.get("delta") or ""
-            if not delta:
+                await h.on_text(content)
+        elif ame_kind == "thinking_end":
+            content = ame.get("content") or ""
+            if not content:
                 return
-            self._emit("thinking", text=_short(delta, self._cap))
+            self._emit("thinking", text=_short(content, self._cap))
             for h in handlers:
-                await h.on_thinking(delta)
-        # text_start / text_end / thinking_start / thinking_end are
-        # framing markers; no action needed beyond text_delta.
+                await h.on_thinking(content)
+        # text_start / thinking_start / thinking_delta are framing /
+        # streaming markers; their content surfaces on the matching
+        # _end event.
 
     async def _handle_message_end(
         self, event: dict, handlers: list[BlockHandler]

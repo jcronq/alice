@@ -70,6 +70,10 @@ async def test_pi_kernel_run_against_recorded_stream(fake_pi_env, tmp_path) -> N
                 '{"type":"text_delta","delta":"ok"}}'
             ),
             (
+                '{"type":"message_update","assistantMessageEvent":'
+                '{"type":"text_end","content":"ok"}}'
+            ),
+            (
                 '{"type":"message_end","message":{"role":"assistant",'
                 '"content":[{"type":"text","text":"ok"}],'
                 '"usage":{"input":1050,"output":5,"cacheRead":0,'
@@ -137,6 +141,10 @@ async def test_pi_kernel_emits_turn_id_when_correlation_id_set(fake_pi_env) -> N
                 '{"type":"message_update","assistantMessageEvent":'
                 '{"type":"text_delta","delta":"hi"}}'
             ),
+            (
+                '{"type":"message_update","assistantMessageEvent":'
+                '{"type":"text_end","content":"hi"}}'
+            ),
             '{"type":"agent_end","messages":[]}',
         ]
     )
@@ -155,6 +163,10 @@ async def test_pi_kernel_silent_suppresses_events_but_runs_handlers(fake_pi_env)
             (
                 '{"type":"message_update","assistantMessageEvent":'
                 '{"type":"text_delta","delta":"hi"}}'
+            ),
+            (
+                '{"type":"message_update","assistantMessageEvent":'
+                '{"type":"text_end","content":"hi"}}'
             ),
             '{"type":"agent_end","messages":[]}',
         ]
