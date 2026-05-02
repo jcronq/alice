@@ -1,10 +1,16 @@
-# model.yml — pick the LLM backend each hemisphere runs on.
+# model.yml — pick the agent harness + LLM model each hemisphere runs on.
 #
-# Three backends are supported:
+# Two harnesses are supported:
+#   claude-code — Claude Code / claude-agent-sdk.
+#   pi-mono     — pi-coding-agent (ChatGPT/Codex subscription routing).
+#
+# Claude Code supports these Anthropic auth backends:
 #   subscription — Anthropic Max OAuth (CLAUDE_CODE_OAUTH_TOKEN).
 #   api          — direct API key, optionally via a LiteLLM proxy
 #                  (ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY).
 #   bedrock      — AWS Bedrock (CLAUDE_CODE_USE_BEDROCK=1 + AWS creds).
+# pi-mono uses:
+#   pi           — pi-coding-agent with ~/.pi/agent/auth.json.
 #
 # When this file is absent, every hemisphere falls back to
 # subscription with the model named in alice.config.json. That's the
@@ -13,14 +19,17 @@
 # Rename to model.yml (drop the .example) and edit per below.
 
 speaking:
+  harness: claude-code
   backend: subscription
   model: claude-opus-4-7
 
 thinking:
-  backend: subscription
-  model: claude-sonnet-4-6
+  harness: pi-mono
+  backend: pi
+  model: gpt-5.3-codex
 
 viewer:
+  harness: claude-code
   backend: subscription
   model: claude-haiku-4-5-20251001
 
@@ -38,6 +47,7 @@ backends:
 #
 # # LiteLLM proxy (Anthropic-compatible):
 # speaking:
+#   harness: claude-code
 #   backend: api
 #   model: claude-opus-4-7
 # backends:
@@ -46,6 +56,7 @@ backends:
 #
 # # AWS Bedrock for cost-sensitive hemispheres:
 # thinking:
+#   harness: claude-code
 #   backend: bedrock
 #   model: anthropic.claude-sonnet-4-5-20250929-v1:0
 #   region: us-east-1
@@ -56,3 +67,13 @@ backends:
 # Bedrock requires the worker container to mount AWS creds. See
 # templates/mind-scaffold/CLAUDE.md (Phase O) for the docker-compose
 # adjustment.
+#
+# # pi-mono for both speaking and thinking:
+# speaking:
+#   harness: pi-mono
+#   backend: pi
+#   model: gpt-5.3-codex
+# thinking:
+#   harness: pi-mono
+#   backend: pi
+#   model: gpt-5.3-codex

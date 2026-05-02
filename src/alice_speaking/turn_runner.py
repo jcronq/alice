@@ -41,10 +41,10 @@ from __future__ import annotations
 
 import logging
 import pathlib
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from alice_core.config.model import BackendSpec
-from alice_core.kernel import KernelSpec, make_kernel
+from alice_core.kernel import KernelSpec, NullHandler, make_kernel
 from alice_core.sdk_compat import looks_like_missing_session as _looks_like_missing_session
 
 from .domain import session_state
@@ -97,6 +97,7 @@ class TurnRunner:
         system_prompt: Optional[str] = None,
         model: Optional[str] = None,
         backend: Optional[BackendSpec] = None,
+        pi_send_message: Optional[Callable[[dict], Awaitable[dict]]] = None,
         skills_cwd: Optional[pathlib.Path] = None,
         mind_dir: Optional[pathlib.Path] = None,
     ) -> None:
@@ -125,6 +126,7 @@ class TurnRunner:
         # kernel via the factory. ``None`` defaults to the
         # subscription path (legacy behavior).
         self._backend = backend or BackendSpec(backend="subscription")
+        self._pi_send_message = pi_send_message
         # Plan-pi Phase C: kernel cwd points at the rendered skills
         # dir so the SDK auto-loader / pi discovery sees the
         # filtered, strict-YAML, Jinja-rendered SKILL.md files.
@@ -264,6 +266,8 @@ class TurnRunner:
                     get_channel=self._current_reply_channel_getter,
                 )
             )
+        if self._backend.harness == "pi-mono" and self._pi_send_message is not None:
+            handlers.append(PiSendMessageHandler(self._pi_send_message, self._events))
         return handlers
 
     # ------------------------------------------------------------------
@@ -358,3 +362,35 @@ class TurnRunner:
 
 
 __all__ = ["SUMMARY_TAIL_TURNS", "TurnRunner"]
+
+
+class PiSendMessageHandler(NullHandler):
+    """Bridge pi's native ``send_message`` tool back into Alice outbox.
+
+    Pi has no MCP client, so :class:`alice_pi.kernel.PiKernel` exposes a
+    tiny extension-defined tool named ``send_message``. When pi emits the
+    tool call, this handler executes the same Python sender used by the MCP
+    tool in the Claude-Code harness.
+    """
+
+    def __init__(
+        self,
+        send_message: Callable[[dict], Awaitable[dict]],
+        events: EventLogger,
+    ) -> None:
+        self._send_message = send_message
+        self._events = events
+
+    async def on_tool_use(self, name: str, input: Any, id: str) -> None:
+        if name not in ("send_message", "mcp__alice__send_message"):
+            return
+        if not isinstance(input, dict):
+            input = {}
+        result = await self._send_message(input)
+        is_error = bool(result.get("isError"))
+        self._events.emit(
+            "pi_send_message_result",
+            tool_call_id=id,
+            is_error=is_error,
+            result=result,
+        )

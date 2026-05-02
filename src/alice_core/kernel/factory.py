@@ -56,7 +56,8 @@ def make_kernel(
     ``backend.backend`` string attribute).
 
     Lookup:
-    - ``"pi"`` → :class:`alice_pi.kernel.PiKernel` via
+    - ``harness="pi-mono"`` / ``backend="pi"`` →
+      :class:`alice_pi.kernel.PiKernel` via
       :func:`importlib.import_module`.
     - ``"subscription"``, ``"api"``, ``"bedrock"`` →
       :class:`AnthropicKernel` (claude_agent_sdk under the hood).
@@ -64,7 +65,8 @@ def make_kernel(
       surfaces later via the auth layer rather than at construct
       time.
     """
-    name = getattr(backend, "backend", "subscription")
+    harness = getattr(backend, "harness", "")
+    name = "pi" if harness == "pi-mono" else getattr(backend, "backend", "subscription")
     sibling = _SIBLING_KERNELS.get(name)
     if sibling is not None:
         module_path, attr = sibling.split(":", 1)
