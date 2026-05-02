@@ -22,6 +22,7 @@ own context.
 from __future__ import annotations
 
 import asyncio
+from importlib import resources
 from typing import Any, Optional
 
 from alice_core.events import EventEmitter
@@ -70,6 +71,10 @@ _PI_TOOL_NAME_MAP: dict[str, Optional[str]] = {
     "Ls": "ls",
     "WebFetch": None,     # not available in pi
     "WebSearch": None,    # not available in pi
+    # Alice's speaking outbox is MCP-backed in Claude Code. Pi has no
+    # MCP client, so PiKernel loads a tiny native extension with the same
+    # tool name and TurnRunner handles the emitted tool call.
+    "mcp__alice__send_message": "send_message",
 }
 
 
@@ -85,6 +90,8 @@ def _translate_tools(allowed: list[str]) -> list[str]:
             mapped = _PI_TOOL_NAME_MAP[name]
             if mapped is not None:
                 out.append(mapped)
+            continue
+        if name.startswith("mcp__"):
             continue
         # Unknown name: lowercased pass-through. Either it's already
         # a pi-native name, or pi will reject it and the operator
@@ -175,6 +182,8 @@ class PiKernel:
         # don't pass --tools at all — that lets pi default to its
         # full built-in set rather than running with zero tools.
         translated = _translate_tools(spec.allowed_tools or [])
+        if "send_message" in translated:
+            argv.extend(["--extension", _send_message_extension_path()])
         if translated:
             argv.extend(["--tools", ",".join(translated)])
 
@@ -193,3 +202,7 @@ class PiKernel:
         # mcp_servers (Anthropic-only): also silently ignored — pi
         # has no built-in MCP. Documented in the spike report.
         return argv
+
+
+def _send_message_extension_path() -> str:
+    return str(resources.files("alice_pi").joinpath("extensions", "send-message.js"))

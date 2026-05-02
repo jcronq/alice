@@ -38,7 +38,7 @@ def _show(args: argparse.Namespace) -> int:
     has_pi = False
     for name in HEMISPHERES:
         spec = cfg.hemisphere(name)
-        bits = [f"backend={spec.backend}"]
+        bits = [f"backend={spec.backend}", f"harness={spec.harness}"]
         if spec.model:
             bits.append(f"model={spec.model}")
         if spec.region:

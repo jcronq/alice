@@ -404,6 +404,11 @@ class SpeakingDaemon:
             # impl (AnthropicKernel for subscription/api/bedrock,
             # PiKernel for pi).
             backend=self._model_config.speaking,
+            pi_send_message=lambda args: tools_module.messaging.send_message_from_args(
+                args,
+                address_book=self.address_book,
+                sender=self._send_message,
+            ),
             # Plan-pi Phase C: kernel cwd swaps to the per-hemisphere
             # rendered skills dir; the agent retains read access to
             # the mind via add_dirs so skill bodies referencing
