@@ -18,10 +18,12 @@ existing minds keep working unchanged.
 Schema (full form):
 
     speaking:
+      harness: claude-code
       backend: subscription
       model: claude-opus-4-7
     thinking:
-      backend: pi                    # routes through pi-coding-agent
+      harness: pi-mono               # routes through pi-coding-agent
+      backend: pi
       model: gpt-5.3-codex           # PiKernel adds openai-codex/ prefix
     viewer:
       backend: subscription
@@ -50,6 +52,7 @@ __all__ = [
     "BackendName",
     "BackendDefaults",
     "BackendSpec",
+    "HarnessName",
     "ModelConfig",
     "ModelConfigError",
     "from_mapping",
@@ -60,7 +63,18 @@ __all__ = [
 MODEL_FILENAME = "model.yml"
 HEMISPHERES: tuple[str, ...] = ("speaking", "thinking", "viewer")
 BackendName = Literal["subscription", "api", "bedrock", "pi"]
+HarnessName = Literal["claude-code", "pi-mono"]
 _VALID_BACKENDS: frozenset[str] = frozenset({"subscription", "api", "bedrock", "pi"})
+_VALID_HARNESSES: frozenset[str] = frozenset({"claude-code", "pi-mono"})
+_HARNESS_ALIASES: dict[str, HarnessName] = {
+    "claude-code": "claude-code",
+    "claude": "claude-code",
+    "anthropic": "claude-code",
+    "agent-sdk": "claude-code",
+    "pi": "pi-mono",
+    "pi-mono": "pi-mono",
+    "pi-coding-agent": "pi-mono",
+}
 
 
 class ModelConfigError(ValueError):
@@ -89,6 +103,7 @@ class BackendSpec:
 
     backend: BackendName = "subscription"
     model: str = ""
+    harness: HarnessName = "claude-code"
     region: str = ""
     profile: str = ""
     base_url: str = ""
@@ -107,9 +122,9 @@ class ModelConfig:
         on subscription with no model override (caller layers its own
         default). Matches today's behaviour."""
         return cls(
-            speaking=BackendSpec(backend="subscription"),
-            thinking=BackendSpec(backend="subscription"),
-            viewer=BackendSpec(backend="subscription"),
+            speaking=BackendSpec(backend="subscription", harness="claude-code"),
+            thinking=BackendSpec(backend="subscription", harness="claude-code"),
+            viewer=BackendSpec(backend="subscription", harness="claude-code"),
             backends={},
         )
 
@@ -136,6 +151,19 @@ def _coerce_str(value: Any, field_name: str) -> str:
     )
 
 
+def _coerce_harness(value: Any, field_name: str) -> HarnessName | None:
+    raw = _coerce_str(value, field_name)
+    if not raw:
+        return None
+    normalized = _HARNESS_ALIASES.get(raw.strip().lower())
+    if normalized is None:
+        raise ModelConfigError(
+            f"{field_name} = {raw!r}; "
+            f"expected one of {sorted(_VALID_HARNESSES)}"
+        )
+    return normalized
+
+
 def _backend_defaults_from_dict(
     name: str, data: Mapping[str, Any]
 ) -> BackendDefaults:
@@ -160,24 +188,41 @@ def _hemisphere_spec(
     ``backends.<name>`` defaults for any field the hemisphere didn't
     set itself."""
     if data is None:
-        return BackendSpec(backend="subscription")
+        return BackendSpec(backend="subscription", harness="claude-code")
     if not isinstance(data, Mapping):
         raise ModelConfigError(
             f"{name!r} must be a mapping (got {type(data).__name__})"
         )
-    backend_raw = _coerce_str(data.get("backend"), f"{name}.backend") or "subscription"
+    harness = _coerce_harness(
+        data.get("harness", data.get("agent_harness")),
+        f"{name}.harness",
+    )
+    backend_raw = _coerce_str(data.get("backend"), f"{name}.backend")
+    if not backend_raw:
+        backend_raw = "pi" if harness == "pi-mono" else "subscription"
     if backend_raw not in _VALID_BACKENDS:
         raise ModelConfigError(
             f"{name}.backend = {backend_raw!r}; "
             f"expected one of {sorted(_VALID_BACKENDS)}"
         )
     backend: BackendName = backend_raw  # type: ignore[assignment]
+    if harness is None:
+        harness = "pi-mono" if backend == "pi" else "claude-code"
+    if harness == "pi-mono" and backend != "pi":
+        raise ModelConfigError(
+            f"{name}.harness = 'pi-mono' requires {name}.backend = 'pi'"
+        )
+    if harness == "claude-code" and backend == "pi":
+        raise ModelConfigError(
+            f"{name}.backend = 'pi' requires {name}.harness = 'pi-mono'"
+        )
 
     defaults = backends.get(backend, BackendDefaults())
 
     return BackendSpec(
         backend=backend,
         model=_coerce_str(data.get("model"), f"{name}.model"),
+        harness=harness,
         region=_coerce_str(data.get("region"), f"{name}.region") or defaults.region,
         profile=_coerce_str(data.get("profile"), f"{name}.profile") or defaults.profile,
         base_url=_coerce_str(data.get("base_url"), f"{name}.base_url")

@@ -53,6 +53,44 @@ def test_load_minimal_config(tmp_path: pathlib.Path) -> None:
     assert cfg.viewer.model == ""
 
 
+def test_harness_pi_mono_selects_pi_backend() -> None:
+    cfg = from_mapping(
+        {
+            "speaking": {
+                "harness": "pi-mono",
+                "model": "gpt-5.3-codex",
+            },
+            "thinking": {
+                "agent_harness": "pi",
+                "model": "gpt-5.3-codex",
+            },
+        }
+    )
+    assert cfg.speaking.harness == "pi-mono"
+    assert cfg.speaking.backend == "pi"
+    assert cfg.thinking.harness == "pi-mono"
+    assert cfg.thinking.backend == "pi"
+
+
+def test_backend_pi_defaults_to_pi_mono_harness() -> None:
+    cfg = from_mapping({"thinking": {"backend": "pi", "model": "gpt-5.3-codex"}})
+    assert cfg.thinking.harness == "pi-mono"
+    assert cfg.thinking.backend == "pi"
+
+
+def test_harness_backend_mismatch_raises() -> None:
+    with pytest.raises(ModelConfigError, match="requires .*backend = 'pi'"):
+        from_mapping(
+            {
+                "speaking": {
+                    "harness": "pi-mono",
+                    "backend": "subscription",
+                    "model": "gpt-5.3-codex",
+                }
+            }
+        )
+
+
 def test_load_full_config(tmp_path: pathlib.Path) -> None:
     _write(
         tmp_path,

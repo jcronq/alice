@@ -187,6 +187,68 @@ SendCallable = Callable[
 ]
 
 
+async def send_message_from_args(
+    args: dict,
+    *,
+    address_book: AddressBook,
+    sender: SendCallable,
+    outbox_dir: Optional[pathlib.Path] = None,
+) -> dict:
+    """Execute a ``send_message`` call from a backend-native tool payload.
+
+    The Claude Agent SDK reaches this through an MCP tool. Pi has no MCP
+    client, so its extension bridge calls this same helper from a
+    :class:`BlockHandler` when pi emits ``tool_execution_start``.
+    """
+    raw_recipient = args.get("recipient") or ""
+    message = args.get("message") or ""
+    if not isinstance(message, str) or not message.strip():
+        return _err("message must be a non-empty string")
+    resolved = _resolve_recipient(raw_recipient, address_book)
+    if resolved is None:
+        return _err(
+            f"could not resolve recipient {raw_recipient!r}; "
+            "use 'self', a known principal id / display name, or an "
+            "E.164 number (+...)."
+        )
+
+    spool_dir = outbox_dir if outbox_dir is not None else DEFAULT_OUTBOX_DIR
+    raw_attachments = args.get("attachments")
+    attachment_paths: Optional[list[str]] = None
+    if raw_attachments is not None and raw_attachments != []:
+        if not isinstance(raw_attachments, list) or not all(
+            isinstance(p, str) for p in raw_attachments
+        ):
+            return _err("attachments must be a list of filesystem path strings")
+        try:
+            staged, cleanups = _stage_attachments(list(raw_attachments), spool_dir)
+        except (FileNotFoundError, IsADirectoryError, PermissionError) as exc:
+            return _err(f"{type(exc).__name__}: {exc}")
+        attachment_paths = staged
+    else:
+        cleanups = []
+
+    try:
+        await sender(resolved, message, attachment_paths)
+    except Exception as exc:  # noqa: BLE001
+        _cleanup(cleanups)
+        return _err(f"{type(exc).__name__}: {exc}")
+    _cleanup(cleanups)
+
+    suffix = (
+        f" (+{len(attachment_paths)} attachment"
+        f"{'s' if len(attachment_paths) != 1 else ''})"
+        if attachment_paths
+        else ""
+    )
+    if resolved == SELF_RECIPIENT:
+        target_desc = "via current channel"
+    else:
+        assert isinstance(resolved, ChannelRef)
+        target_desc = f"to {resolved.transport}:{resolved.address}"
+    return _ok(f"sent {target_desc} ({len(message)} chars){suffix}")
+
+
 # JSON Schema for the send_message tool. We use the explicit JSON-Schema
 # form (rather than the {"name": str} shorthand) because the SDK forces
 # every key in the shorthand into ``required`` — there's no way to mark
@@ -280,8 +342,6 @@ def build(
 
         actual_sender = _direct
 
-    spool_dir = outbox_dir if outbox_dir is not None else DEFAULT_OUTBOX_DIR
-
     @tool(
         name="send_message",
         description=(
@@ -297,67 +357,19 @@ def build(
         input_schema=_SEND_MESSAGE_SCHEMA,
     )
     async def send_message(args: dict) -> dict:
-        raw_recipient = args.get("recipient") or ""
-        message = args.get("message") or ""
-        if not isinstance(message, str) or not message.strip():
-            return _err("message must be a non-empty string")
-        resolved = _resolve_recipient(raw_recipient, address_book)
-        if resolved is None:
-            return _err(
-                f"could not resolve recipient {raw_recipient!r}; "
-                "use 'self', a known principal id / display name, or an "
-                "E.164 number (+...)."
-            )
-
-        # Validate + normalize attachments. Empty list is treated as None
-        # (no attachment, no spool work).
-        raw_attachments = args.get("attachments")
-        attachment_paths: Optional[list[str]] = None
-        if raw_attachments is not None and raw_attachments != []:
-            if not isinstance(raw_attachments, list) or not all(
-                isinstance(p, str) for p in raw_attachments
-            ):
-                return _err(
-                    "attachments must be a list of filesystem path strings"
-                )
-            try:
-                staged, cleanups = _stage_attachments(
-                    list(raw_attachments), spool_dir
-                )
-            except (FileNotFoundError, IsADirectoryError, PermissionError) as exc:
-                return _err(f"{type(exc).__name__}: {exc}")
-            attachment_paths = staged
-        else:
-            cleanups = []
-
-        try:
-            await actual_sender(resolved, message, attachment_paths)
-        except Exception as exc:  # noqa: BLE001
-            _cleanup(cleanups)
-            return _err(f"{type(exc).__name__}: {exc}")
-        # Cleanup happens after the send returns. signal-cli reads the
-        # file synchronously during the JSON-RPC call, so by the time
-        # we get control back the upload is done.
-        _cleanup(cleanups)
-
-        suffix = (
-            f" (+{len(attachment_paths)} attachment"
-            f"{'s' if len(attachment_paths) != 1 else ''})"
-            if attachment_paths
-            else ""
+        return await send_message_from_args(
+            args,
+            address_book=address_book,
+            sender=actual_sender,
+            outbox_dir=outbox_dir,
         )
-        if resolved == SELF_RECIPIENT:
-            target_desc = "via current channel"
-        else:
-            assert isinstance(resolved, ChannelRef)
-            target_desc = f"to {resolved.transport}:{resolved.address}"
-        return _ok(f"sent {target_desc} ({len(message)} chars){suffix}")
 
     return [send_message]
 
 
 __all__ = [
     "build",
+    "send_message_from_args",
     "SELF_RECIPIENT",
     "_resolve_recipient",
     "_stage_attachments",

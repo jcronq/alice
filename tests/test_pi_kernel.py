@@ -268,6 +268,21 @@ def test_pi_kernel_argv_translates_tool_names_to_lowercase() -> None:
     assert tools == ["bash", "read", "write", "edit", "find", "grep"]
 
 
+def test_pi_kernel_argv_maps_send_message_mcp_tool_to_extension() -> None:
+    cap = CapturingEmitter()
+    kernel = PiKernel(cap)
+    spec = KernelSpec(
+        model="gpt-5.3-codex",
+        allowed_tools=["Bash", "mcp__alice__send_message", "mcp__alice__read_memory"],
+    )
+    argv = kernel._build_argv("hi", spec)
+    idx = argv.index("--tools")
+    assert argv[idx + 1] == "bash,send_message"
+    assert "--extension" in argv
+    ext = argv[argv.index("--extension") + 1]
+    assert ext.endswith("alice_pi/extensions/send-message.js")
+
+
 def test_pi_kernel_argv_drops_tools_without_pi_equivalent() -> None:
     """WebFetch and WebSearch have no pi built-in; they drop
     silently. If the operator's allowlist is ALL drops, --tools is
