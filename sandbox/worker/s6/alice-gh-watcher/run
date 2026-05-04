@@ -37,8 +37,11 @@ while true; do
     fi
 
     start_ts=$(date +%s)
-    flock -n "$LOCK" s6-setuidgid alice /usr/local/bin/alice-gh-watcher \
-        2>>/state/worker/gh-watcher-stderr.log || true
+    # s6-redirfd opens fd 2 after the privilege drop so the log file is
+    # owned by alice; shell `2>>` would open it as the supervising root
+    # shell (#10).
+    flock -n "$LOCK" s6-setuidgid alice s6-redirfd -a 2 /state/worker/gh-watcher-stderr.log \
+        /usr/local/bin/alice-gh-watcher || true
     end_ts=$(date +%s)
     elapsed=$(( end_ts - start_ts ))
     remainder=$(( interval - elapsed ))

@@ -1,0 +1,4 @@
+foreground {
+    mkdir -p /state/worker
+}
+chown alice:alice /state/worker

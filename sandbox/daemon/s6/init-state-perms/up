@@ -1,0 +1,4 @@
+foreground {
+    mkdir -p /state/daemon
+}
+chown alice:alice /state/daemon
