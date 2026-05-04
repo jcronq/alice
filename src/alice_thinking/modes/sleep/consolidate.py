@@ -21,7 +21,7 @@ from ..base import WakeContext, _NullPostRun
 
 
 if TYPE_CHECKING:
-    from alice_core.kernel import KernelResult
+    pass
 
 
 class ConsolidationStage(_NullPostRun):

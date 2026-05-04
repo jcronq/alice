@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from alice_core.events import CapturingEmitter
-from alice_core.kernel import AnthropicKernel, KernelSpec, NullHandler, TurnSummary
+from alice_core.kernel import AnthropicKernel, KernelSpec, NullHandler
 
 
 # ---------------------------------------------------------------------------

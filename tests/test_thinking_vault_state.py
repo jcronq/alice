@@ -11,7 +11,6 @@ from __future__ import annotations
 import datetime
 import pathlib
 
-import pytest
 
 from alice_thinking.vault_state import (
     STAGE_D_NIGHTLY_CAP,

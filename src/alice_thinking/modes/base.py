@@ -14,7 +14,7 @@ from __future__ import annotations
 import pathlib
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Optional, Protocol
+from typing import TYPE_CHECKING, Optional, Protocol
 
 
 if TYPE_CHECKING:

@@ -63,7 +63,7 @@ from typing import Any, Awaitable, Callable, Optional, Union
 
 from claude_agent_sdk import SdkMcpTool, tool
 
-from alice_core.config.personae import Personae, placeholder as placeholder_personae
+from alice_core.config.personae import Personae
 
 from ..domain.principals import AddressBook
 from ..infra.config import Config
@@ -248,8 +248,6 @@ def build(
     """
     if sender is None and signal is None:
         raise ValueError("messaging.build requires either `sender` or `signal`")
-    p = personae or placeholder_personae()
-    user_name = p.user.name
 
     actual_sender: SendCallable
     if sender is not None:

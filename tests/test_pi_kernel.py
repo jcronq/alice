@@ -7,10 +7,8 @@ translation, and KernelResult assembly without spinning up real pi.
 
 from __future__ import annotations
 
-import os
 import pathlib
 import stat
-import textwrap
 
 import pytest
 

@@ -82,7 +82,7 @@ def _print_pi_auth_status() -> None:
     if remaining_min > 0:
         print(f"      pi: openai-codex token valid (~{remaining_min} min remaining)")
     else:
-        print(f"      pi: openai-codex token EXPIRED — re-run codex login + bridge")
+        print("      pi: openai-codex token EXPIRED — re-run codex login + bridge")
 
 
 def _test(args: argparse.Namespace) -> int:

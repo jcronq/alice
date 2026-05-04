@@ -15,11 +15,11 @@ from typing import TYPE_CHECKING
 
 from alice_core.kernel import KernelSpec
 
-from .base import Mode, WakeContext, _NullPostRun
+from .base import WakeContext, _NullPostRun
 
 
 if TYPE_CHECKING:
-    from alice_core.kernel import KernelResult
+    pass
 
 
 class ActiveMode(_NullPostRun):

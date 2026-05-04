@@ -37,7 +37,7 @@ from alice_core.config.personae import (
 )
 from alice_core.events import EventLogger
 
-from ._prompt_assembly import WAKE_TZ, wake_timestamp_header
+from ._prompt_assembly import WAKE_TZ
 from .kernel_adapter import run_wake
 from .modes.base import WakeContext
 from .modes.sleep import SleepMode
