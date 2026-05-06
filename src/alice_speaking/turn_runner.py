@@ -55,6 +55,7 @@ from .infra.config import Config
 from .infra.events import EventLogger
 from .pipeline import compaction as compaction_module
 from .pipeline.handlers import CLITraceHandler, CompactionArmer, SessionHandler
+from .retrieval import build_cue_packet
 from .transports import ChannelRef
 
 
@@ -199,6 +200,28 @@ class TurnRunner:
         return composed
 
     # ------------------------------------------------------------------
+    # Cue runner (pre-turn vault retrieval)
+
+    async def _build_cue_packet(self, query: str) -> str:
+        """Query ``cortex-index.db`` and return a vault-context preamble.
+
+        Always returns a string (possibly empty). Failure must NEVER
+        break the turn — :func:`build_cue_packet` enforces this with
+        a top-level try/except. The check here keeps the gating
+        cheap for the common ``cue_runner.enabled = False`` path.
+        """
+        cue_cfg = self._cfg.speaking.get("cue_runner", {})
+        if not cue_cfg.get("enabled", False):
+            return ""
+        return await build_cue_packet(
+            query,
+            cue_cfg,
+            vault_root=(
+                self._mind_dir / "cortex-memory" if self._mind_dir is not None else None
+            ),
+        )
+
+    # ------------------------------------------------------------------
     # Kernel spec + handlers
 
     def _build_spec(self) -> KernelSpec:
@@ -292,6 +315,17 @@ class TurnRunner:
         Returns the concatenated assistant text (useful for
         compaction turns which consume the summary).
         """
+        # Cue runner: prepend a vault-context packet to the pending
+        # preamble before ``compose_prompt`` consumes it. Silent turns
+        # (bootstrap / compaction) skip the cue runner — there's no
+        # user query to retrieve against, and the DB lookup would be
+        # noise on the hot internal-turn path.
+        if not silent:
+            cue_packet = await self._build_cue_packet(prompt)
+            if cue_packet:
+                self._pending_preamble = (
+                    cue_packet + "\n\n" + (self._pending_preamble or "")
+                )
         final_prompt = self.compose_prompt(prompt)
         spec = self._build_spec()
         handlers = self._build_handlers(silent=silent)

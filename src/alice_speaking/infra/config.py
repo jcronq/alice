@@ -59,6 +59,32 @@ SPEAKING_DEFAULTS: dict[str, Any] = {
     # appears to extend via prompt caching, so we leave generous headroom
     # rather than fire on phantom pressure.
     "context_compaction_threshold": 750_000,
+    # Cue runner — pre-turn FTS retrieval against cortex-index.db.
+    # See alice_speaking.retrieval.cue_runner. Default to disabled
+    # so a fresh deploy doesn't query the DB until Jason flips this
+    # in alice.config.json. Phase 2 reranker is gated separately.
+    "cue_runner": {
+        "enabled": False,
+        # Empty string defaults to ~/alice-mind/inner/state/cortex-index.db
+        # at call time. Override here if the indexer DB lives elsewhere.
+        "db_path": "",
+        "top_n": 5,
+        "per_note_line_cap": 5,
+        "packet_token_ceiling": 1000,
+        "timeout_ms": 500,
+        # Phase 2: optional LLM reranker. Default off — Phase 1 is FTS +
+        # type-aware boost only. The model name is intentionally a
+        # config field so the swap to qwen3-4b via LiteLLM is a config
+        # change. v1 honours this via the Anthropic SDK; see
+        # alice_speaking.retrieval.cue_runner._call_reranker for the
+        # swap path.
+        "reranker": {
+            "enabled": False,
+            "model": "claude-haiku-4-5-20251001",
+            "litellm_endpoint": "",
+            "timeout_ms": 1500,
+        },
+    },
 }
 
 
