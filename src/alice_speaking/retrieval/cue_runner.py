@@ -47,12 +47,23 @@ from typing import Any, Iterable
 log = logging.getLogger(__name__)
 
 
-# Type-aware boost weights (see brief §Type-Aware Boost).
-STATE_BOOST = 2.0
-BEHAVIOR_BOOST = 1.5
-BUCKET2_BOOST = 1.3
+# Type-aware boost weights. Calibrated to 1.0 across the board on 2026-05-06
+# after eval (cortex-memory/research/2026-05-06-cue-runner-eval.md): the
+# proposed coefficients (state 2.0, behavior 1.5, bucket2 1.3) regressed F1@5
+# by 14% relative to pure FTS across every topic except `state` (which tied).
+# bucket2=1.3 was the load-bearing degradation — it elevated tag-tagged
+# research notes above more topically-precise ones. Constants kept (rather
+# than removed) so future calibrated values can be slotted in without code
+# shape change. Re-evaluate before raising any of these above 1.0.
+STATE_BOOST = 1.0
+BEHAVIOR_BOOST = 1.0
+BUCKET2_BOOST = 1.0
 BUCKET1_BOOST = 1.0
-TRIGGER_KEYWORD_EXTRA = 1.5
+# Trigger-keyword secondary boost: a no-op in v1 because no vault notes carry
+# `trigger_keywords` in frontmatter yet (proposed in
+# cortex-memory/research/2026-05-05-vault-behavior-notes-jit-retrieval.md but
+# not backfilled). Constant kept; re-evaluate after the backfill.
+TRIGGER_KEYWORD_EXTRA = 1.0
 
 _STATE_TYPES = {"daily", "state-snapshot", "skill"}
 _BUCKET2_TAGS = {

@@ -399,9 +399,15 @@ async def test_build_cue_packet_dedupes_context_slugs(tmp_path: pathlib.Path):
 
 
 @pytest.mark.asyncio
-async def test_build_cue_packet_state_note_outranks_research(tmp_path: pathlib.Path):
-    """A daily (STATE 2.0×) should outrank a plain research note (1.0×)
-    even when the research note's raw FTS rank is comparable."""
+async def test_build_cue_packet_state_note_outranks_research(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+    """When STATE_BOOST is non-1.0, a daily (state-tier) outranks a plain
+    research note. Verifies the boost MECHANISM (not the calibrated
+    coefficient — calibrated to 1.0 on 2026-05-06 per
+    cortex-memory/research/2026-05-06-cue-runner-eval.md). Test patches
+    STATE_BOOST so the mechanism is measurable independent of the default."""
+    monkeypatch.setattr("alice_speaking.retrieval.cue_runner.STATE_BOOST", 2.0)
     db = tmp_path / "cortex-index.db"
     vault = tmp_path / "vault"
     vault.mkdir()
@@ -431,11 +437,18 @@ async def test_build_cue_packet_state_note_outranks_research(tmp_path: pathlib.P
 
 @pytest.mark.asyncio
 async def test_build_cue_packet_trigger_keyword_boost_promotes_match(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """A behavior note with trigger_keywords matching the query gets
-    BEHAVIOR_BOOST × TRIGGER_KEYWORD_EXTRA = 2.25× — should outrank a
-    plain bucket1 note with similar FTS rank."""
+    """When BEHAVIOR_BOOST and TRIGGER_KEYWORD_EXTRA are non-1.0, a behavior
+    note with trigger_keywords matching the query outranks a plain bucket1
+    note. Verifies the secondary-boost MECHANISM (not the calibrated
+    coefficient — calibrated to 1.0 on 2026-05-06 per
+    cortex-memory/research/2026-05-06-cue-runner-eval.md). Test patches the
+    constants so the mechanism is measurable independent of the default."""
+    monkeypatch.setattr("alice_speaking.retrieval.cue_runner.BEHAVIOR_BOOST", 1.5)
+    monkeypatch.setattr(
+        "alice_speaking.retrieval.cue_runner.TRIGGER_KEYWORD_EXTRA", 1.5
+    )
     db = tmp_path / "cortex-index.db"
     vault = tmp_path / "vault"
     vault.mkdir()
