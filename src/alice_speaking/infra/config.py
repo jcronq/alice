@@ -68,7 +68,11 @@ SPEAKING_DEFAULTS: dict[str, Any] = {
         # Empty string defaults to ~/alice-mind/inner/state/cortex-index.db
         # at call time. Override here if the indexer DB lives elsewhere.
         "db_path": "",
-        "top_n": 5,
+        # Top-N cut. Calibrated to 3 on 2026-05-06 (eval at
+        # cortex-memory/research/2026-05-06-cue-runner-eval.md §10): top-3
+        # raised precision from 0.30 to 0.39 and F1 from 0.363 to 0.376
+        # vs top-5, with 40% fewer noise tokens injected per turn.
+        "top_n": 3,
         "per_note_line_cap": 5,
         "packet_token_ceiling": 1000,
         "timeout_ms": 500,

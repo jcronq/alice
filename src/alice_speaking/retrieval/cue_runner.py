@@ -81,7 +81,12 @@ _FTS_OVER_FETCH = 15
 # Defaults pulled from SPEAKING_DEFAULTS["cue_runner"]. Re-stated here
 # so build_cue_packet() can fall back when callers pass a partial cfg
 # (notably in tests).
-_DEFAULT_TOP_N = 5
+# Calibrated to 3 on 2026-05-06 after the noise-reduction sweep
+# (cortex-memory/research/2026-05-06-cue-runner-eval.md §10):
+# top-3 has higher precision (0.39 vs 0.30 at top-5), higher F1 (0.376 vs 0.363),
+# 40% fewer noise tokens injected per turn, at the cost of lower recall (0.41 vs 0.52).
+# Score-floor and min-query-length gates were also tested — neither paid off.
+_DEFAULT_TOP_N = 3
 _DEFAULT_LINE_CAP = 5
 _DEFAULT_TIMEOUT_MS = 500
 _DEFAULT_PACKET_TOKEN_CEILING = 1000
