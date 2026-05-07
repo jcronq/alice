@@ -5,18 +5,31 @@ The Mode protocol stays alive — :class:`alice_thinking.modes.ActiveMode`
 and :class:`alice_thinking.modes.sleep.SleepMode` shrink to thin
 wrappers that delegate here.
 
-Phase 2 of the migration wires the per-phase tool allowlists
-(:data:`_PHASE_TOOL_ALLOWLIST`) and ``max_seconds`` budgets
-(:data:`_PHASE_MAX_SECONDS`) into the produced :class:`KernelSpec`.
+Tool allowlist resolution (post Speaking review 2026-05-07): every
+phase except :attr:`Phase.QUICK` gets the same full tool set
+(:data:`_FULL_TOOL_ALLOWLIST`). Per-phase tool restrictions were
+removed — locking down web/MCP per phase narrowed the design space
+unnecessarily; the prompt fragment guides use, not the harness.
+Quick keeps an empty allowlist as the smoke-test sanity guard.
+
+``max_seconds`` resolution: the wake interval is "fire at least
+this often," not "kill after this long." There is no per-phase
+``max_seconds`` default. Quick keeps the 30-second smoke-test
+bound. Real phases default to ``0`` (unbounded) and honor only the
+single user-facing knob ``thinking.max_wake_seconds`` (or
+:class:`PhaseConfig.max_seconds`, which it feeds).
+
 Resolution order (highest precedence first) for both fields:
 
 1. ``PhaseConfig.allowed_tools`` / ``PhaseConfig.max_seconds`` —
-   set via ``alice.config.json thinking.phase_routing.*``.
+   set via ``alice.config.json thinking.phase_routing.*`` or the
+   convenience ``thinking.max_wake_seconds`` top-level key.
 2. ``ctx.tools`` / ``ctx.max_seconds`` — populated by
    ``alice_thinking.wake`` from the CLI ``--tools`` / ``--max-seconds``
    flags (or the legacy ``thinking.allowed_tools`` /
    ``thinking.max_wake_seconds`` config block).
-3. Per-phase defaults from this module.
+3. The full tool set (everywhere except Quick) and ``0`` for
+   ``max_seconds`` (everywhere except Quick=30).
 
 Phase 3 ships ``enable_full_sleep_dispatch=True`` so the cascade in
 :func:`select_phase` fans sleep wakes out to B/C/D.
@@ -48,92 +61,45 @@ __all__ = [
     "PhaseRunner",
     "load_phase_config",
     "phase_default_allowed_tools",
-    "phase_default_max_seconds",
+    "QUICK_MAX_SECONDS",
 ]
 
 
-# Per-phase tool allowlists. Phase 2 wires these into the produced
-# :class:`KernelSpec` as the *default* — config (``PhaseConfig``) and
-# CLI (``ctx.tools``) overrides take precedence in :meth:`PhaseRunner.kernel_spec`.
-# Names are Claude-style (matching ``WakeContext.tools``); PiKernel's
-# ``_PI_TOOL_NAME_MAP`` translates them to pi-native names downstream.
-_PHASE_TOOL_ALLOWLIST: dict[Phase, tuple[str, ...]] = {
-    Phase.ACTIVE: (
-        "Bash",
-        "Read",
-        "Write",
-        "Edit",
-        "Grep",
-        "Glob",
-        "WebFetch",
-        "WebSearch",
-        "mcp__alice__send_message",
-    ),
-    Phase.SLEEP_B: (
-        "Bash",
-        "Read",
-        "Write",
-        "Edit",
-        "Grep",
-        "Glob",
-        "WebFetch",
-        "WebSearch",
-        "mcp__alice__send_message",
-    ),
-    # Stage C / D: vault-only maintenance + recombination — no Web*.
-    Phase.SLEEP_C: (
-        "Bash",
-        "Read",
-        "Write",
-        "Edit",
-        "Grep",
-        "Glob",
-        "mcp__alice__send_message",
-    ),
-    Phase.SLEEP_D: (
-        "Bash",
-        "Read",
-        "Write",
-        "Edit",
-        "Grep",
-        "Glob",
-        "mcp__alice__send_message",
-    ),
-    # Quick smoke test — no tools.
-    Phase.QUICK: (),
-    # Design commission — pure design work, no Web*, no MCP.
-    Phase.DESIGN_COMMISSION: (
-        "Bash",
-        "Read",
-        "Write",
-        "Edit",
-        "Grep",
-        "Glob",
-    ),
-}
+# Single full tool allowlist shared by every non-Quick phase. Per
+# Speaking's review (2026-05-07): per-phase restrictions narrowed
+# the design space — a Stage D synthesis might want WebFetch for a
+# citation, a Stage C cleanup might want MCP. The prompt fragment
+# is the right place to guide use, not the harness. Names are
+# Claude-style (matching ``WakeContext.tools``); PiKernel's
+# ``_PI_TOOL_NAME_MAP`` translates them to pi-native names
+# downstream.
+_FULL_TOOL_ALLOWLIST: tuple[str, ...] = (
+    "Bash",
+    "Read",
+    "Write",
+    "Edit",
+    "Grep",
+    "Glob",
+    "WebFetch",
+    "WebSearch",
+    "mcp__alice__send_message",
+)
 
 
-# Per-phase ``max_seconds`` defaults. ``0`` == unbounded. Quick keeps
-# its 30-second smoke-test budget; the rest run unbounded by default
-# and can be tightened via ``alice.config.json``.
-_PHASE_MAX_SECONDS: dict[Phase, int] = {
-    Phase.ACTIVE: 0,
-    Phase.SLEEP_B: 0,
-    Phase.SLEEP_C: 0,
-    Phase.SLEEP_D: 0,
-    Phase.QUICK: 30,
-    Phase.DESIGN_COMMISSION: 0,
-}
+# Quick keeps its 30s smoke-test sanity bound. Real phases run
+# unbounded unless the user pins ``thinking.max_wake_seconds``.
+QUICK_MAX_SECONDS = 30
 
 
 def phase_default_allowed_tools(phase: Phase) -> list[str]:
-    """Return the default tool allowlist for ``phase`` (Claude-style names)."""
-    return list(_PHASE_TOOL_ALLOWLIST.get(phase, ()))
+    """Return the default tool allowlist for ``phase`` (Claude-style names).
 
-
-def phase_default_max_seconds(phase: Phase) -> int:
-    """Return the default ``max_seconds`` budget for ``phase``."""
-    return _PHASE_MAX_SECONDS.get(phase, 0)
+    Every non-Quick phase shares :data:`_FULL_TOOL_ALLOWLIST`. Quick
+    is empty (no tools — the smoke test runs in /tmp).
+    """
+    if phase == Phase.QUICK:
+        return []
+    return list(_FULL_TOOL_ALLOWLIST)
 
 
 def load_phase_config(mind: pathlib.Path) -> PhaseConfig:
@@ -242,25 +208,26 @@ class PhaseRunner:
     def kernel_spec(self, phase: Phase, ctx: "WakeContext") -> KernelSpec:
         """Build a :class:`KernelSpec` for this phase + context.
 
-        Phase 2: tool allowlist + ``max_seconds`` resolve in this
-        precedence order:
+        Tool allowlist + ``max_seconds`` resolve in this precedence
+        order:
 
         1. :class:`PhaseConfig` (``alice.config.json``).
         2. :class:`WakeContext` (CLI / legacy ``thinking.*``).
-        3. The per-phase default (:data:`_PHASE_TOOL_ALLOWLIST`,
-           :data:`_PHASE_MAX_SECONDS`).
+        3. The runtime default — full tool set everywhere except
+           Quick (empty), and ``0`` (unbounded) for ``max_seconds``
+           everywhere except Quick (30s smoke-test bound).
 
-        Quick mode short-circuits to its own (tools=[], max_seconds=30)
-        so smoke-test wakes don't accidentally pick up the active
-        allowlist.
+        Quick mode short-circuits to its own (tools=[],
+        max_seconds=30) so smoke-test wakes don't accidentally pick
+        up the full allowlist.
         """
         if phase == Phase.QUICK or ctx.quick:
             return KernelSpec(
                 model=ctx.model,
-                allowed_tools=list(_PHASE_TOOL_ALLOWLIST[Phase.QUICK]),
+                allowed_tools=[],
                 cwd=ctx.cwd,
                 add_dirs=ctx.add_dirs,
-                max_seconds=_PHASE_MAX_SECONDS[Phase.QUICK],
+                max_seconds=QUICK_MAX_SECONDS,
                 thinking="medium",
                 append_system_prompt=ctx.system_prompt or None,
             )
@@ -270,7 +237,7 @@ class PhaseRunner:
             allowed_tools=self._resolve_tools(phase, ctx),
             cwd=ctx.cwd,
             add_dirs=ctx.add_dirs,
-            max_seconds=self._resolve_max_seconds(phase, ctx),
+            max_seconds=self._resolve_max_seconds(ctx),
             thinking="medium",
             append_system_prompt=ctx.system_prompt or None,
         )
@@ -286,17 +253,18 @@ class PhaseRunner:
             return list(ctx.tools)
         return phase_default_allowed_tools(phase)
 
-    def _resolve_max_seconds(self, phase: Phase, ctx: "WakeContext") -> int:
-        """Return the resolved ``max_seconds`` for ``phase`` + ``ctx``.
+    def _resolve_max_seconds(self, ctx: "WakeContext") -> int:
+        """Return the resolved ``max_seconds`` for this real-phase wake.
 
         ``0`` (or negative) at any layer == "fall through to the next
-        layer." See :meth:`kernel_spec` for the precedence rules.
+        layer." Real phases run unbounded by default; Quick is
+        handled before this method is reached.
         """
         if self.config.max_seconds and self.config.max_seconds > 0:
             return self.config.max_seconds
         if ctx.max_seconds and ctx.max_seconds > 0:
             return ctx.max_seconds
-        return phase_default_max_seconds(phase)
+        return 0
 
     def run(
         self,
@@ -311,6 +279,34 @@ class PhaseRunner:
         )
         spec = self.kernel_spec(phase, ctx)
         return prompt_text, spec
+
+    # ------------------------------------------------------------------ #
+    # Conflict resolution — task-type triggered, mirrors design commission.
+
+    def _run_conflict_resolution(
+        self, ctx: "WakeContext"
+    ) -> dict[str, Any]:
+        """Stub conflict-resolution dispatch.
+
+        Mirrors the structural shape of
+        :func:`alice_thinking.wake._run_commission` so the wake-side
+        preempt hook can be wired today. The actual resolution
+        logic (Sonnet review of vault contradictions, merge or fork
+        the conflicting facts, archive into ``conflicts/.resolved/``)
+        is deferred to a follow-up commit.
+
+        Returns a no-op result dict with ``verdict="deferred"`` so
+        callers can log telemetry and resolve the surface without
+        committing fictitious work to the vault.
+        """
+
+        return {
+            "phase": Phase.CONFLICT_RESOLUTION.value,
+            "verdict": "deferred",
+            "summary": (
+                "Conflict resolution stub — real resolution logic deferred."
+            ),
+        }
 
     # ------------------------------------------------------------------ #
     # Companion-design extension point — STM/LTM Hebbian updates land here.

@@ -22,6 +22,7 @@ from alice_thinking.phase import (
     VaultSnapshot,
     build_vault_snapshot,
     detect_commission_notes,
+    detect_conflict_notes,
     select_phase,
 )
 
@@ -461,3 +462,100 @@ def test_compose_carries_step_5_close_in_every_phase() -> None:
     for phase in (Phase.ACTIVE, Phase.SLEEP_B, Phase.SLEEP_C, Phase.SLEEP_D):
         out = loader.compose(phase, timestamp_header=header)
         assert "Step 5 — close clean" in out
+
+
+# ---------------------------------------------------------------------------
+# detect_conflict_notes — vault-state-driven conflict resolution preempt.
+#
+# Speaking review 2026-05-07: conflict resolution mirrors design commission
+# as a task-type-triggered phase. ``select_phase()`` is NOT modified — the
+# preempt is task-detected in ``wake.py``, not cadence-dispatched.
+# ---------------------------------------------------------------------------
+
+
+def test_detect_conflict_notes_returns_open_items(tmp_path: pathlib.Path) -> None:
+    """An ``open`` conflict (or one with no status field) is returned."""
+    conflicts = tmp_path / "conflicts"
+    conflicts.mkdir(parents=True)
+
+    open_explicit = conflicts / "alpha.md"
+    open_explicit.write_text("---\nstatus: open\n---\n\nbody\n")
+
+    no_status = conflicts / "beta.md"
+    no_status.write_text("---\ntopic: weight\n---\n\nbody\n")
+
+    found = detect_conflict_notes(tmp_path)
+    assert open_explicit in found
+    assert no_status in found
+
+
+def test_detect_conflict_notes_ignores_resolved(tmp_path: pathlib.Path) -> None:
+    """Conflicts with ``status: resolved`` (or anything other than
+    ``open``) are excluded."""
+    conflicts = tmp_path / "conflicts"
+    conflicts.mkdir(parents=True)
+
+    open_one = conflicts / "open.md"
+    open_one.write_text("---\nstatus: open\n---\n")
+    resolved = conflicts / "resolved.md"
+    resolved.write_text("---\nstatus: resolved\n---\n")
+
+    found = detect_conflict_notes(tmp_path)
+    assert open_one in found
+    assert resolved not in found
+
+
+def test_detect_conflict_notes_ignores_resolved_subdir(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Files under ``conflicts/.resolved/`` are excluded — that's the
+    archive folder for items already worked through."""
+    conflicts = tmp_path / "conflicts"
+    archive = conflicts / ".resolved"
+    archive.mkdir(parents=True)
+    (archive / "old.md").write_text("---\nstatus: open\n---\n")
+
+    found = detect_conflict_notes(tmp_path)
+    assert found == []
+
+
+def test_detect_conflict_notes_handles_missing_dir(tmp_path: pathlib.Path) -> None:
+    """No ``conflicts/`` directory → empty list (no crash)."""
+    assert detect_conflict_notes(tmp_path) == []
+
+
+def test_detect_conflict_notes_sorted_oldest_first(tmp_path: pathlib.Path) -> None:
+    conflicts = tmp_path / "conflicts"
+    conflicts.mkdir(parents=True)
+    a = conflicts / "a.md"
+    a.write_text("---\nstatus: open\n---\n")
+    b = conflicts / "b.md"
+    b.write_text("---\nstatus: open\n---\n")
+
+    import os
+
+    os.utime(a, (1000, 1000))
+    os.utime(b, (2000, 2000))
+    found = detect_conflict_notes(tmp_path)
+    assert found == [a, b]
+
+
+def test_select_phase_does_not_dispatch_to_conflict_resolution() -> None:
+    """``Phase.CONFLICT_RESOLUTION`` is task-detected (mirrors
+    ``DESIGN_COMMISSION``), not cadence-dispatched. The selector
+    must never return it from any vault snapshot — the preempt
+    lives in ``wake.py``.
+    """
+    # Sweep representative snapshots across the day; none should
+    # produce CONFLICT_RESOLUTION.
+    snaps = [
+        _snap(hour=h)
+        for h in (0, 1, 4, 7, 12, 16, 22, 23)
+    ] + [
+        _snap(hour=2, has_inbox_items=True),
+        _snap(hour=4, has_recent_research=True),
+        _snap(hour=1, consecutive_b=10, has_recent_research=True),
+    ]
+    for snap in snaps:
+        out = select_phase(snap)
+        assert out is not Phase.CONFLICT_RESOLUTION

@@ -9,6 +9,8 @@ vault state, no model calls. Phases:
 - ``SLEEP_B`` / ``SLEEP_C`` / ``SLEEP_D`` (23:00–06:59 sub-stages)
 - ``QUICK`` (smoke test)
 - ``DESIGN_COMMISSION`` (task-type dispatched, not cadence-driven)
+- ``CONFLICT_RESOLUTION`` (task-type dispatched, vault-state driven —
+  open items in ``cortex-memory/conflicts/``, not cadence-driven)
 
 Migration phases (per the design doc):
 
@@ -47,6 +49,7 @@ __all__ = [
     "select_phase",
     "build_vault_snapshot",
     "detect_commission_notes",
+    "detect_conflict_notes",
     "STAGE_D_NIGHTLY_CAP",
 ]
 
@@ -69,6 +72,7 @@ class Phase(enum.Enum):
     SLEEP_D = "sleep_d"
     QUICK = "quick"
     DESIGN_COMMISSION = "design_commission"
+    CONFLICT_RESOLUTION = "conflict_resolution"
 
 
 @dataclass(frozen=True)
@@ -103,17 +107,18 @@ class PhaseConfig:
     ``thinking.phase_routing.enable_full_sleep_dispatch`` to fall back
     to Phase-0 single-stage behavior if production behavior surprises.
 
-    ``allowed_tools`` and ``max_seconds`` are config overrides over the
-    per-phase defaults declared in
-    :data:`alice_thinking.runtime._PHASE_TOOL_ALLOWLIST` and
-    :data:`alice_thinking.runtime._PHASE_MAX_SECONDS`. ``None`` /
-    ``0`` mean "fall through to the phase default."
+    ``allowed_tools`` and ``max_seconds`` are config overrides over
+    the runtime defaults: every non-Quick phase ships with the full
+    tool set (:data:`alice_thinking.runtime._FULL_TOOL_ALLOWLIST`)
+    and an unbounded budget (Quick keeps its 30s smoke-test guard).
+    ``None`` / ``0`` mean "fall through to the runtime default."
     """
 
     quick_mode: bool = False
     enable_full_sleep_dispatch: bool = True
 
-    # Per-phase budget overrides — 0 == fall through to the per-phase default.
+    # Budget override — 0 == fall through to the runtime default
+    # (unbounded for real phases, 30s for Quick).
     max_seconds: int = 0
     allowed_tools: Optional[list[str]] = None
 
@@ -489,6 +494,51 @@ def detect_commission_notes(mind: pathlib.Path) -> list[pathlib.Path]:
     if commission_dir.is_dir():
         for f in commission_dir.glob("*.md"):
             _push(f)
+
+    out.sort(key=lambda f: (f.stat().st_mtime if f.exists() else 0.0))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Conflict resolution task detection
+# ---------------------------------------------------------------------------
+
+
+def detect_conflict_notes(vault_dir: pathlib.Path) -> list[pathlib.Path]:
+    """Return open conflict notes from ``cortex-memory/conflicts/``.
+
+    A conflict note counts as "open" when its frontmatter ``status``
+    field is ``"open"`` OR the field is absent (treat absent as
+    open — vault contradictions land here unannotated).
+
+    Files under ``cortex-memory/conflicts/.resolved/`` are excluded
+    (resolved archive). Top-level hidden files are also ignored.
+
+    Output is sorted oldest-first by mtime (same convention as
+    :func:`detect_commission_notes`).
+
+    ``vault_dir`` is the vault root (``cortex-memory/``). Pass
+    ``mind / "cortex-memory"`` from callers in ``wake.py``.
+    """
+
+    conflicts_dir = vault_dir / "conflicts"
+    if not conflicts_dir.is_dir():
+        return []
+
+    out: list[pathlib.Path] = []
+    for f in conflicts_dir.glob("*.md"):
+        if f.name.startswith("."):
+            continue
+        if not f.is_file():
+            continue
+        try:
+            fm = _parse_frontmatter(f.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        status = fm.get("status", "").strip().strip('"').strip("'").lower()
+        if status and status != "open":
+            continue
+        out.append(f)
 
     out.sort(key=lambda f: (f.stat().st_mtime if f.exists() else 0.0))
     return out

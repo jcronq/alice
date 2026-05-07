@@ -49,6 +49,7 @@ from .phase import (
     Phase,
     build_vault_snapshot,
     detect_commission_notes,
+    detect_conflict_notes,
     select_phase,
 )
 from .runtime import PhaseRunner, load_phase_config
@@ -61,8 +62,8 @@ DEFAULT_DIRECTIVE = DEFAULT_MIND / "inner" / "directive.md"
 DEFAULT_LOG = pathlib.Path("/state/worker/thinking.log")
 DEFAULT_STATE_DIR = pathlib.Path("/state/worker")
 # Empty default — when the user doesn't pass ``--tools``, ctx.tools is
-# left empty and PhaseRunner picks the per-phase default from
-# :data:`alice_thinking.runtime._PHASE_TOOL_ALLOWLIST`. Passing
+# left empty and PhaseRunner picks the runtime default (the full tool
+# set for every non-Quick phase, an empty list for Quick). Passing
 # ``--tools=Foo,Bar`` (or setting ``thinking.allowed_tools`` in
 # ``alice.config.json``) still overrides at the WakeContext layer.
 DEFAULT_TOOLS = ""
@@ -141,6 +142,37 @@ def _run_commission(
     emitter.emit(
         "design_commission",
         **_design_pipeline.telemetry_payload(result, phase_value=phase.value),
+    )
+
+
+def _run_conflict_resolution(
+    conflict_note: pathlib.Path,
+    *,
+    mind: pathlib.Path,
+    emitter: EventLogger,
+    phase: Phase,
+) -> None:
+    """Drive one conflict-resolution wake.
+
+    Mirrors :func:`_run_commission`'s structural shape — task-type
+    dispatched, single note per wake, telemetry event logged.
+
+    The real resolution logic (Sonnet review of the contradictory
+    facts, merge or fork, archive into
+    ``cortex-memory/conflicts/.resolved/``) is deferred. Today the
+    runner stub returns a ``deferred`` verdict and we log it; the
+    conflict note stays open until the follow-up commit lands.
+    """
+
+    runner = PhaseRunner()
+    result = runner._run_conflict_resolution(ctx=None)  # type: ignore[arg-type]
+
+    emitter.emit(
+        "conflict_resolution",
+        phase=phase.value,
+        verdict=result.get("verdict", "deferred"),
+        conflict_path=str(conflict_note),
+        summary=result.get("summary", ""),
     )
 
 
@@ -389,16 +421,45 @@ def main() -> int:
         )
         phase = select_phase(snap, phase_cfg)
 
-        # Design-commission preempt — task-type dispatched, not cadence.
-        # If a commission note is waiting in inner/notes/, run the
-        # pipeline instead of the regular wake. Caller intent: only one
-        # commission per wake; oldest first.
+        # Task-type preempts — these run BEFORE the cadence-routed
+        # phase fires. Order is deterministic:
+        #   1. Design commission (Jason-explicit work) — highest priority.
+        #   2. Conflict resolution (vault-state-driven) — vault hygiene.
+        #   3. Cadence routing (Active / Sleep B/C/D) — falls through.
+        # Only one task-type wake per cron tick; oldest note wins
+        # within a category.
+
+        # Design-commission preempt.
         commissions = detect_commission_notes(mind)
         if commissions:
             phase = Phase.DESIGN_COMMISSION
             try:
                 _run_commission(
                     commissions[0],
+                    mind=mind,
+                    emitter=emitter,
+                    phase=phase,
+                )
+            except Exception as exc:  # noqa: BLE001
+                emitter.emit(
+                    "exception",
+                    phase=phase.value,
+                    type=type(exc).__name__,
+                    message=str(exc),
+                )
+                return 1
+            return 0
+
+        # Conflict-resolution preempt — open items in
+        # ``cortex-memory/conflicts/`` get one wake of attention.
+        # Stub today (deferred verdict + telemetry); real resolution
+        # logic ships in a follow-up commit.
+        conflicts = detect_conflict_notes(mind / "cortex-memory")
+        if conflicts:
+            phase = Phase.CONFLICT_RESOLUTION
+            try:
+                _run_conflict_resolution(
+                    conflicts[0],
                     mind=mind,
                     emitter=emitter,
                     phase=phase,
