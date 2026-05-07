@@ -68,11 +68,14 @@ packages = [
 # alice_prompts ships .md.j2 template files alongside its Python
 # modules; hatch needs the include-pattern to bundle them in the
 # wheel. alice_skills bundles its runtime-default SKILL.md files
-# the same way (plan 07 phase 6).
+# the same way (plan 07 phase 6). alice_thinking ships the
+# per-phase prompt fragments under prompts/ — loaded via
+# importlib.resources, see alice_thinking.phase.PromptFragmentLoader.
 [tool.hatch.build.targets.wheel.force-include]
 "src/alice_prompts/templates" = "alice_prompts/templates"
 "src/alice_skills/defaults" = "alice_skills/defaults"
 "src/alice_pi/extensions" = "alice_pi/extensions"
+"src/alice_thinking/prompts" = "alice_thinking/prompts"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -12,7 +12,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from alice_thinking.modes import ActiveMode, ConsolidationStage, SleepMode
+from alice_thinking.modes import ActiveMode, SleepMode
+from alice_thinking.phase import Phase
 from alice_thinking.selector import is_active_hour, select_mode
 
 
@@ -42,13 +43,14 @@ def test_active_window_endpoints() -> None:
     assert is_active_hour(0) is False
 
 
-def test_sleep_mode_picks_consolidation_stage_phase3() -> None:
-    """Phase 3 contract: SleepMode always returns ConsolidationStage.
-    Phase 4 swaps in the full sub-stage selector."""
+def test_sleep_mode_defaults_to_phase_sleep_b() -> None:
+    """Phase routing migration Phase 0/1: SleepMode wraps PhaseRunner
+    pinned to ``Phase.SLEEP_B`` (matching the legacy Stage B
+    behavior). Phase 3 of the migration unlocks B/C/D dispatch."""
     sm = SleepMode()
-    assert isinstance(sm.stage, ConsolidationStage)
-    # The stage's reported name flows through to wake_start.mode
-    assert sm.stage.name == "sleep:consolidate"
+    assert sm.phase is Phase.SLEEP_B
+    # The stage label flows through to wake_start.mode for telemetry.
+    assert sm.stage == "sleep_b"
 
 
 def test_selector_dst_aware() -> None:

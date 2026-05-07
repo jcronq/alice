@@ -89,47 +89,47 @@ def test_active_mode_build_prompt_inline(tmp_path) -> None:
     assert out == "custom prompt body"
 
 
-def test_active_mode_build_prompt_with_directive(tmp_path) -> None:
-    """A directive.md on disk gets injected into the bootstrap
-    template; missing directive still renders without errors."""
-    directive = tmp_path / "directive.md"
-    directive.write_text("Standing orders: be terse.")
-    ctx = _ctx(tmp_path, directive_path=directive)
+def test_active_mode_build_prompt_includes_prelude_and_active_fragment(
+    tmp_path,
+) -> None:
+    """Phase routing: ActiveMode delegates to PhaseRunner which
+    composes ``timestamp_header + prelude + active.md``."""
+    ctx = _ctx(tmp_path)
     out = asyncio.run(ActiveMode().build_prompt(ctx))
-    assert "Standing orders: be terse." in out
+    # Identity from prelude.md + Step 0 from active.md should both appear.
+    assert "Thinking Alice — wake" in out
+    assert "Step 0 — active mode" in out
 
 
 def test_selector_returns_active_mode(tmp_path) -> None:
-    """Phase 2 contract: selector always returns ActiveMode. Phase 3
-    swaps in hour-based dispatch."""
+    """Phase 2 contract: selector returns ActiveMode for the active
+    hour window."""
     ctx = _ctx(tmp_path)
     mode = select_mode(now=ctx.now)
     assert isinstance(mode, ActiveMode)
 
 
-def test_consolidation_stage_loads_stage_template(tmp_path) -> None:
-    """Plan 03 Phase 5: ConsolidationStage loads its own template
-    name (``thinking.wake.sleep.consolidate``) rather than the
-    active template directly. The template currently extends
-    thinking.wake.active so the rendered body equals the active
-    body byte-for-byte — Phase 4 (deferred) is what differentiates."""
-    from alice_thinking.modes import ConsolidationStage
+def test_sleep_mode_loads_sleep_b_fragment(tmp_path) -> None:
+    """SleepMode wraps PhaseRunner pinned to Phase.SLEEP_B. The
+    composed prompt picks up sleep-b.md rather than active.md."""
+    from alice_thinking.modes import SleepMode
 
-    directive = tmp_path / "directive.md"
-    directive.write_text("Standing orders: be terse.")
-    ctx = _ctx(tmp_path, directive_path=directive)
-    out = asyncio.run(ConsolidationStage().build_prompt(ctx))
-    # Directive is included in both via the shared template body.
-    assert "Standing orders: be terse." in out
+    ctx = _ctx(tmp_path)
+    out = asyncio.run(SleepMode().build_prompt(ctx))
+    assert "Stage B (Consolidation)" in out
+    # Should NOT carry the active-mode-only Step 2b context-summary §4 drain.
+    assert "context-summary §4" not in out
 
 
-def test_active_and_sleep_consolidate_render_identical_body(tmp_path) -> None:
-    """Phase 5 stub-equivalence: the two templates should produce
-    the same prompt today (different templates, same body via
-    Jinja {% include %}). Phase 4 removes the include."""
-    from alice_thinking.modes import ActiveMode, ConsolidationStage
+def test_active_and_sleep_render_distinct_phase_bodies(tmp_path) -> None:
+    """Phase routing intent: active and sleep wakes load different
+    phase fragments. Both share the prelude verbatim."""
+    from alice_thinking.modes import SleepMode
 
     ctx = _ctx(tmp_path)
     a = asyncio.run(ActiveMode().build_prompt(ctx))
-    s = asyncio.run(ConsolidationStage().build_prompt(ctx))
-    assert a == s
+    s = asyncio.run(SleepMode().build_prompt(ctx))
+    assert a != s
+    # Both pick up the same prelude.
+    assert "Thinking Alice — wake" in a
+    assert "Thinking Alice — wake" in s

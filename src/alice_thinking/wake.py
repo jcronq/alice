@@ -40,9 +40,18 @@ from alice_core.events import EventLogger
 
 from . import backoff
 from ._prompt_assembly import WAKE_TZ
+from . import design_pipeline as _design_pipeline
 from .kernel_adapter import run_wake
+from .modes.active import ActiveMode
 from .modes.base import WakeContext
 from .modes.sleep import SleepMode
+from .phase import (
+    Phase,
+    build_vault_snapshot,
+    detect_commission_notes,
+    select_phase,
+)
+from .runtime import PhaseRunner, load_phase_config
 from .selector import select_mode
 from .vault_state import snapshot as snapshot_vault
 
@@ -56,6 +65,78 @@ DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_SECONDS = 0  # 0 == no timeout. Thinking runs as long as it needs.
 QUICK_MAX_SECONDS = 30
 INTERVAL_FILE_NAME = "next-thinking-interval-seconds"
+
+
+def _run_commission(
+    commission_note: pathlib.Path,
+    *,
+    mind: pathlib.Path,
+    emitter: EventLogger,
+    phase: Phase,
+) -> None:
+    """Drive one design-commission pipeline, surface the result.
+
+    Approved → commit draft to ``cortex-memory/research/`` + emit a
+    ``design-commission-result`` surface.
+    Cap-hit → DO NOT commit; emit a ``design-commission-cap-hit``
+    surface that includes the unresolved feedback for human review.
+    Always emit a ``design_commission`` telemetry event.
+    """
+
+    runner = _design_pipeline.DesignPipelineRunner()
+    result = runner.run(commission_note)
+
+    if result.verdict == "approved":
+        slug_hint = commission_note.stem
+        output_path = _design_pipeline.commit_approved_draft(
+            mind, draft=result.draft, slug_hint=slug_hint
+        )
+        result.output_path = output_path
+        body = (
+            f"Design commission approved after {result.iteration_count} "
+            f"iteration(s).\n\n{result.summary}\n\nDraft committed to "
+            f"`{output_path.relative_to(mind) if output_path.is_absolute() else output_path}`."
+        )
+        _design_pipeline.write_surface(
+            mind,
+            surface_type="design-commission-result",
+            body=body,
+            extra_frontmatter={
+                "verdict": "approved",
+                "iterations": result.iteration_count,
+                "draft_path": str(output_path),
+                "spec_path": str(commission_note),
+            },
+        )
+    else:
+        # Cap hit — DO NOT commit. Surface the feedback verbatim.
+        feedback_text = "\n".join(
+            f"- [{fb.get('severity', '?')}] {fb.get('category', '?')}: "
+            f"{fb.get('description', '')}"
+            for fb in result.last_feedback
+        ) or "(no feedback recorded)"
+        body = (
+            f"Design commission hit the {result.iteration_count}-iteration "
+            "cap without approval. Draft has known unresolved issues; "
+            "human review required.\n\n"
+            f"Last summary: {result.summary}\n\n"
+            f"Outstanding feedback:\n\n{feedback_text}\n"
+        )
+        _design_pipeline.write_surface(
+            mind,
+            surface_type="design-commission-cap-hit",
+            body=body,
+            extra_frontmatter={
+                "verdict": "cap_hit",
+                "iterations": result.iteration_count,
+                "spec_path": str(commission_note),
+            },
+        )
+
+    emitter.emit(
+        "design_commission",
+        **_design_pipeline.telemetry_payload(result, phase_value=phase.value),
+    )
 
 
 def _load_token() -> None:
@@ -283,21 +364,77 @@ def main() -> int:
     _install_prompt_loader(mind, personae)
 
     ctx = _build_context(args, personae)
-    # Phase 3: vault-state snapshot at wake-start. Cheap I/O; gives
-    # the selector + (Phase 4) sleep sub-stage logic something to
-    # reason against. Skipped for --quick because /tmp isn't a mind.
-    vault = None if args.quick else snapshot_vault(mind, now=ctx.now)
-    mode = select_mode(now=ctx.now, vault=vault)
-    # SleepMode delegates to a Stage; emit the stage's specific name
-    # (e.g. ``sleep:consolidate``) so the viewer can attribute behavior.
-    if isinstance(mode, SleepMode):
-        emitted_mode = mode.stage
+    # Phase routing — design:
+    # cortex-memory/research/2026-05-07-thinking-phase-routing-design.md.
+    # Build the vault snapshot once at wake-start, pass it to
+    # ``select_phase``. ``--quick`` short-circuits to Phase.QUICK so
+    # the selector doesn't touch the filesystem in /tmp.
+    phase_cfg = load_phase_config(mind)
+    if args.quick:
+        from dataclasses import replace as _replace
+
+        phase_cfg = _replace(phase_cfg, quick_mode=True)
+        phase = Phase.QUICK
     else:
-        emitted_mode = mode
+        snap = build_vault_snapshot(
+            mind,
+            now=ctx.now,
+            state_dir=pathlib.Path(args.state_dir),
+            cfg=phase_cfg,
+        )
+        phase = select_phase(snap, phase_cfg)
+
+        # Design-commission preempt — task-type dispatched, not cadence.
+        # If a commission note is waiting in inner/notes/, run the
+        # pipeline instead of the regular wake. Caller intent: only one
+        # commission per wake; oldest first.
+        commissions = detect_commission_notes(mind)
+        if commissions:
+            phase = Phase.DESIGN_COMMISSION
+            try:
+                _run_commission(
+                    commissions[0],
+                    mind=mind,
+                    emitter=emitter,
+                    phase=phase,
+                )
+            except Exception as exc:  # noqa: BLE001
+                emitter.emit(
+                    "exception",
+                    phase=phase.value,
+                    type=type(exc).__name__,
+                    message=str(exc),
+                )
+                return 1
+            return 0
+
+    runner = PhaseRunner(config=phase_cfg)
+    if phase == Phase.ACTIVE:
+        mode_obj = ActiveMode(runner=runner)
+    elif phase in (Phase.SLEEP_B, Phase.SLEEP_C, Phase.SLEEP_D):
+        mode_obj = SleepMode(runner=runner, phase=phase)
+    else:
+        # QUICK / DESIGN_COMMISSION fall back to the active wrapper —
+        # the runner handles ``ctx.quick`` / inline_prompt internally.
+        mode_obj = ActiveMode(runner=runner)
+
+    # ``vault`` is still computed for backoff (existing contract) —
+    # build_vault_snapshot doesn't replace VaultState's frontmatter
+    # heuristics for did_work counting.
+    vault = None if args.quick else snapshot_vault(mind, now=ctx.now)
+    # Selector kept around for the explicit `select_mode` invariant
+    # the existing test suite asserts on.
+    _ = select_mode(now=ctx.now, vault=vault)
 
     wake_start_ts = time.time()
     rc = asyncio.run(
-        run_wake(ctx=ctx, mode=emitted_mode, emitter=emitter, backend=thinking_spec)
+        run_wake(
+            ctx=ctx,
+            mode=mode_obj,
+            emitter=emitter,
+            backend=thinking_spec,
+            phase=phase.value,
+        )
     )
 
     # Sleep-mode exponential backoff: write the next wake-to-wake
@@ -310,7 +447,7 @@ def main() -> int:
         did_work = backoff.detect_did_work(mind, since_ts=wake_start_ts)
         next_interval = backoff.next_interval_seconds(
             prev_seconds=prev_interval,
-            mode=emitted_mode.name,
+            mode=mode_obj.name,
             did_work=did_work,
         )
         try:

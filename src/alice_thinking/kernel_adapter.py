@@ -34,6 +34,7 @@ async def run_wake(
     mode: "Mode",
     emitter: "EventLogger",
     backend: Optional["BackendSpec"] = None,
+    phase: Optional[str] = None,
 ) -> int:
     """Drive one wake through the kernel chosen for ``backend``.
 
@@ -45,6 +46,11 @@ async def run_wake(
     ``backend`` defaults to a subscription :class:`BackendSpec` so
     legacy callers (test fixtures, ad-hoc invocations) keep working
     without explicit threading.
+
+    ``phase`` is the phase-routing label (``"active"``, ``"sleep_b"``,
+    ``"quick"``, ...) and is added to ``wake_start`` telemetry so the
+    viewer can filter + aggregate by phase. Defaults to ``mode.name``
+    for callers that haven't migrated to phase-aware dispatch yet.
     """
     if backend is None:
         from alice_core.config.model import BackendSpec
@@ -54,6 +60,7 @@ async def run_wake(
     wake_id = f"wake-{int(time.time())}"
     prompt_text = await mode.build_prompt(ctx)
     spec = mode.kernel_spec(ctx)
+    phase_label = phase or mode.name
 
     emitter.emit(
         "wake_start",
@@ -61,6 +68,7 @@ async def run_wake(
         mode=mode.name,
         model=spec.model,
         max_seconds=spec.max_seconds,
+        phase=phase_label,
         tools=list(spec.allowed_tools),
         cwd=str(ctx.cwd),
         prompt_chars=len(prompt_text),

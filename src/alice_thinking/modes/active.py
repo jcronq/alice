@@ -1,20 +1,21 @@
-"""ActiveMode — the single mode that exists today.
+"""ActiveMode — thin wrapper that delegates to :class:`PhaseRunner`.
 
-Plan 03 Phase 2 codifies the existing single-mode behavior as a
-:class:`Mode` implementation. Behavior unchanged: same prompt,
-same kernel spec, same allowed tools.
-
-Future phases introduce ``SleepMode`` (with Consolidation /
-Downscaling / Recombination sub-stages); the selector picks
-between them by hour + vault state.
+Plan 03 Phase 2 introduced the :class:`Mode` protocol; the phase-routing
+work (design: ``cortex-memory/research/2026-05-07-thinking-phase-routing-design.md``)
+collapses prompt assembly + kernel spec construction into
+:class:`alice_thinking.runtime.PhaseRunner`. ``ActiveMode`` now exists
+to satisfy callers that still want a Mode object — every method
+forwards to :class:`PhaseRunner` with :attr:`Phase.ACTIVE`.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from alice_core.kernel import KernelSpec
 
+from ..phase import Phase, PhaseConfig
+from ..runtime import PhaseRunner
 from .base import WakeContext, _NullPostRun
 
 
@@ -23,44 +24,23 @@ if TYPE_CHECKING:
 
 
 class ActiveMode(_NullPostRun):
-    """The 07:00–23:00 mode (and today's only mode).
+    """The 07:00–22:59 mode.
 
-    Reads the bootstrap template + injected directive (Plan 04
-    Phase 6 wiring) and constructs the same KernelSpec the
-    pre-refactor wake used inline.
+    Delegates to :class:`PhaseRunner` — both methods compose the
+    same prompt + spec the runner produces for :attr:`Phase.ACTIVE`.
     """
 
     name = "active"
 
+    def __init__(
+        self,
+        runner: Optional[PhaseRunner] = None,
+        config: Optional[PhaseConfig] = None,
+    ) -> None:
+        self._runner = runner or PhaseRunner(config=config)
+
     def kernel_spec(self, ctx: WakeContext) -> KernelSpec:
-        return KernelSpec(
-            model=ctx.model,
-            allowed_tools=list(ctx.tools),
-            cwd=ctx.cwd,
-            add_dirs=ctx.add_dirs,
-            max_seconds=ctx.max_seconds,
-            # Adaptive thinking with summarized display so
-            # ThinkingBlocks come back with non-empty text. AnthropicKernel's
-            # _thinking_to_sdk_dict maps "medium" to the previous default
-            # ({type: adaptive, display: summarized}); PiKernel maps the
-            # same level to its --thinking flag.
-            thinking="medium",
-            # Plan 05 Phase 4: persona-rendered system prompt.
-            # Empty string falls through as None-equivalent so the
-            # kernel skips the system_prompt kwarg entirely.
-            append_system_prompt=ctx.system_prompt or None,
-        )
+        return self._runner.kernel_spec(Phase.ACTIVE, ctx)
 
     async def build_prompt(self, ctx: WakeContext) -> str:
-        if ctx.quick:
-            from alice_prompts import load as load_prompt
-
-            return load_prompt("thinking.quick")
-        if ctx.inline_prompt:
-            return ctx.inline_prompt
-        from .._prompt_assembly import build_active_prompt
-
-        return build_active_prompt(
-            now=ctx.now,
-            directive_path=ctx.directive_path,
-        )
+        return self._runner.build_prompt(Phase.ACTIVE, ctx)
