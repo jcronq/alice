@@ -57,7 +57,7 @@ def _snap(
 
 
 # ---------------------------------------------------------------------------
-# select_phase — Phase 0 contract (default config)
+# select_phase — Phase 3 default (full B/C/D cascade enabled)
 # ---------------------------------------------------------------------------
 
 
@@ -66,25 +66,11 @@ def test_default_config_returns_active_during_day(hour: int) -> None:
     assert select_phase(_snap(hour=hour)) is Phase.ACTIVE
 
 
-@pytest.mark.parametrize("hour", [23, 0, 1, 3, 5, 6])
-def test_default_config_collapses_sleep_to_b(hour: int) -> None:
-    """Phase 0 contract: default config keeps sleep dispatch collapsed
-    to SLEEP_B, ignoring vault state. Phase 3 unlocks B/C/D."""
-    snap = _snap(
-        hour=hour,
-        has_inbox_items=False,
-        has_recent_research=True,
-        consecutive_b=10,
-    )
-    assert select_phase(snap) is Phase.SLEEP_B
-
-
 def test_default_config_active_window_endpoints() -> None:
-    """07:00 active, 22:59 active, 23:00 sleep, 06:59 sleep."""
+    """07:00 active, 22:59 active. Sleep window split between B/C/D
+    once Phase 3 default fires."""
     assert select_phase(_snap(hour=7)) is Phase.ACTIVE
     assert select_phase(_snap(hour=22)) is Phase.ACTIVE
-    assert select_phase(_snap(hour=23)) is Phase.SLEEP_B
-    assert select_phase(_snap(hour=6)) is Phase.SLEEP_B
 
 
 def test_quick_mode_short_circuits() -> None:
@@ -94,36 +80,87 @@ def test_quick_mode_short_circuits() -> None:
     assert select_phase(snap, cfg) is Phase.QUICK
 
 
+def test_default_config_full_dispatch_is_on_by_default() -> None:
+    """Phase 3 default contract: ``enable_full_sleep_dispatch`` is on.
+    Sleep wakes route to B/C/D from vault state. Inbox-or-issues
+    rule wins → B; clean vault, late hour, fresh research → D."""
+    # 02:00 with inbox items: Rule 2a fires.
+    assert select_phase(_snap(hour=2, has_inbox_items=True)) is Phase.SLEEP_B
+    # 04:00 clean vault, fresh research: Rule 2d fires.
+    assert select_phase(_snap(hour=4, has_recent_research=True)) is Phase.SLEEP_D
+
+
+def test_kill_switch_collapses_sleep_to_b() -> None:
+    """Setting ``enable_full_sleep_dispatch=False`` (the Phase 0
+    behavior) collapses every sleep wake to ``SLEEP_B`` regardless
+    of vault state. Kept as a config override for emergencies."""
+    cfg = PhaseConfig(enable_full_sleep_dispatch=False)
+    snap = _snap(
+        hour=4,
+        has_inbox_items=False,
+        has_recent_research=True,
+        consecutive_b=10,
+    )
+    assert select_phase(snap, cfg) is Phase.SLEEP_B
+
+
 # ---------------------------------------------------------------------------
-# select_phase — Phase 3 cascade (full dispatch)
+# select_phase — full B/C/D cascade (six rules + fallback)
+#
+# Rules under ``enable_full_sleep_dispatch=True``:
+#   - Rule 2a: inbox / broken-links / orphan-stubs   → SLEEP_B
+#   - Rule 2b: 6+ consecutive Stage B wakes          → SLEEP_C / D
+#   - Rule 2c: 23:00–02:59 default                   → SLEEP_C (with null-C escape to D)
+#   - Rule 2d: 03:00–06:59 with research corpus     → SLEEP_D
+#   - Fallback: late phase, no corpus                → SLEEP_B
 # ---------------------------------------------------------------------------
 
 
 def _full_cfg() -> PhaseConfig:
+    """Explicit full-dispatch config — same as the default, but
+    repeated here so the cascade tests document the rule under test."""
     return PhaseConfig(enable_full_sleep_dispatch=True)
 
 
-def test_full_dispatch_inbox_wins() -> None:
+# Rule 2a — inbox / broken links / orphan stubs always win
+def test_rule_2a_inbox_wins() -> None:
     snap = _snap(hour=2, has_inbox_items=True, has_recent_research=True)
     assert select_phase(snap, _full_cfg()) is Phase.SLEEP_B
 
 
-def test_full_dispatch_broken_links_route_to_b() -> None:
+def test_rule_2a_broken_links_route_to_b() -> None:
     snap = _snap(hour=4, has_broken_links=True)
     assert select_phase(snap, _full_cfg()) is Phase.SLEEP_B
 
 
-def test_full_dispatch_consecutive_b_loop_breaks_to_c_when_no_corpus() -> None:
+def test_rule_2a_orphan_stubs_route_to_b() -> None:
+    snap = _snap(hour=5, has_orphan_stubs=True)
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_B
+
+
+def test_rule_2a_inbox_beats_consecutive_b_loop_break() -> None:
+    """Inbox always wins, even when the loop-break threshold is met."""
+    snap = _snap(
+        hour=1,
+        has_inbox_items=True,
+        consecutive_b=10,
+        has_recent_research=True,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_B
+
+
+# Rule 2b — consecutive-B threshold breaks the loop
+def test_rule_2b_consecutive_b_loop_breaks_to_c_when_no_corpus() -> None:
     snap = _snap(hour=1, consecutive_b=6, has_recent_research=False)
     assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
 
 
-def test_full_dispatch_consecutive_b_loop_breaks_to_d_when_corpus_exists() -> None:
+def test_rule_2b_consecutive_b_loop_breaks_to_d_when_corpus_exists() -> None:
     snap = _snap(hour=1, consecutive_b=6, has_recent_research=True)
     assert select_phase(snap, _full_cfg()) is Phase.SLEEP_D
 
 
-def test_full_dispatch_consecutive_b_skips_d_when_cap_exhausted() -> None:
+def test_rule_2b_consecutive_b_skips_d_when_cap_exhausted() -> None:
     snap = _snap(
         hour=1,
         consecutive_b=6,
@@ -133,12 +170,26 @@ def test_full_dispatch_consecutive_b_skips_d_when_cap_exhausted() -> None:
     assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
 
 
-def test_full_dispatch_early_phase_default_is_c() -> None:
+def test_rule_2b_threshold_is_configurable() -> None:
+    """``consecutive_b_threshold`` is tunable from config."""
+    cfg = PhaseConfig(enable_full_sleep_dispatch=True, consecutive_b_threshold=3)
+    snap = _snap(hour=1, consecutive_b=3, has_recent_research=False)
+    assert select_phase(snap, cfg) is Phase.SLEEP_C
+
+
+# Rule 2c — early phase (23:00–02:59) defaults to C
+def test_rule_2c_early_phase_default_is_c() -> None:
     snap = _snap(hour=23, consecutive_null_c=0)
     assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
 
 
-def test_full_dispatch_early_null_c_loop_escapes_to_d() -> None:
+@pytest.mark.parametrize("hour", [23, 0, 1, 2])
+def test_rule_2c_covers_full_early_window(hour: int) -> None:
+    snap = _snap(hour=hour)
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+def test_rule_2c_early_null_c_loop_escapes_to_d() -> None:
     snap = _snap(
         hour=0,
         consecutive_null_c=6,
@@ -147,12 +198,45 @@ def test_full_dispatch_early_null_c_loop_escapes_to_d() -> None:
     assert select_phase(snap, _full_cfg()) is Phase.SLEEP_D
 
 
-def test_full_dispatch_late_phase_with_corpus_is_d() -> None:
+def test_rule_2c_null_c_threshold_blocked_by_cap() -> None:
+    snap = _snap(
+        hour=0,
+        consecutive_null_c=6,
+        has_recent_research=True,
+        stage_d_cap_exhausted=True,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+def test_rule_2c_null_c_threshold_blocked_without_corpus() -> None:
+    snap = _snap(hour=1, consecutive_null_c=6, has_recent_research=False)
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+# Rule 2d — late phase (03:00–06:59) with corpus → D, else fallback
+def test_rule_2d_late_phase_with_corpus_is_d() -> None:
     snap = _snap(hour=4, has_recent_research=True)
     assert select_phase(snap, _full_cfg()) is Phase.SLEEP_D
 
 
-def test_full_dispatch_late_phase_without_corpus_falls_back_to_b() -> None:
+@pytest.mark.parametrize("hour", [3, 4, 5, 6])
+def test_rule_2d_covers_full_late_window(hour: int) -> None:
+    snap = _snap(hour=hour, has_recent_research=True)
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_D
+
+
+def test_rule_2d_skipped_when_cap_exhausted() -> None:
+    snap = _snap(
+        hour=4,
+        has_recent_research=True,
+        stage_d_cap_exhausted=True,
+    )
+    # Cap exhausted → falls through to the trailing fallback (SLEEP_B).
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_B
+
+
+# Fallback — late phase, no corpus → B
+def test_fallback_late_phase_without_corpus_is_b() -> None:
     snap = _snap(hour=5, has_recent_research=False)
     assert select_phase(snap, _full_cfg()) is Phase.SLEEP_B
 

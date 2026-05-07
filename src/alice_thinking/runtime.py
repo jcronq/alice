@@ -5,10 +5,21 @@ The Mode protocol stays alive — :class:`alice_thinking.modes.ActiveMode`
 and :class:`alice_thinking.modes.sleep.SleepMode` shrink to thin
 wrappers that delegate here.
 
-Phase 0 of the migration ships this layer with the sleep window
-collapsed to ``Phase.SLEEP_B`` (matching today's behavior). Phase 3
-flips ``PhaseConfig.enable_full_sleep_dispatch=True`` to unlock
-B/C/D dispatch.
+Phase 2 of the migration wires the per-phase tool allowlists
+(:data:`_PHASE_TOOL_ALLOWLIST`) and ``max_seconds`` budgets
+(:data:`_PHASE_MAX_SECONDS`) into the produced :class:`KernelSpec`.
+Resolution order (highest precedence first) for both fields:
+
+1. ``PhaseConfig.allowed_tools`` / ``PhaseConfig.max_seconds`` —
+   set via ``alice.config.json thinking.phase_routing.*``.
+2. ``ctx.tools`` / ``ctx.max_seconds`` — populated by
+   ``alice_thinking.wake`` from the CLI ``--tools`` / ``--max-seconds``
+   flags (or the legacy ``thinking.allowed_tools`` /
+   ``thinking.max_wake_seconds`` config block).
+3. Per-phase defaults from this module.
+
+Phase 3 ships ``enable_full_sleep_dispatch=True`` so the cascade in
+:func:`select_phase` fans sleep wakes out to B/C/D.
 
 The :meth:`PhaseRunner._run_post_wake_hooks` extension point exists
 as a no-op stub for the companion STM/LTM design — Hebbian
@@ -33,14 +44,19 @@ if TYPE_CHECKING:
     from .modes.base import WakeContext
 
 
-__all__ = ["PhaseRunner", "load_phase_config"]
+__all__ = [
+    "PhaseRunner",
+    "load_phase_config",
+    "phase_default_allowed_tools",
+    "phase_default_max_seconds",
+]
 
 
-# Per-phase soft tool allowlists. Phase 2 wires these into the kernel
-# spec; Phase 1 keeps them as guidance only — the kernel still receives
-# ``ctx.tools`` so behavior is identical to today. Stored here as the
-# canonical reference so the matrix and the runtime stay in sync when
-# Phase 2 lands.
+# Per-phase tool allowlists. Phase 2 wires these into the produced
+# :class:`KernelSpec` as the *default* — config (``PhaseConfig``) and
+# CLI (``ctx.tools``) overrides take precedence in :meth:`PhaseRunner.kernel_spec`.
+# Names are Claude-style (matching ``WakeContext.tools``); PiKernel's
+# ``_PI_TOOL_NAME_MAP`` translates them to pi-native names downstream.
 _PHASE_TOOL_ALLOWLIST: dict[Phase, tuple[str, ...]] = {
     Phase.ACTIVE: (
         "Bash",
@@ -64,6 +80,7 @@ _PHASE_TOOL_ALLOWLIST: dict[Phase, tuple[str, ...]] = {
         "WebSearch",
         "mcp__alice__send_message",
     ),
+    # Stage C / D: vault-only maintenance + recombination — no Web*.
     Phase.SLEEP_C: (
         "Bash",
         "Read",
@@ -82,7 +99,9 @@ _PHASE_TOOL_ALLOWLIST: dict[Phase, tuple[str, ...]] = {
         "Glob",
         "mcp__alice__send_message",
     ),
+    # Quick smoke test — no tools.
     Phase.QUICK: (),
+    # Design commission — pure design work, no Web*, no MCP.
     Phase.DESIGN_COMMISSION: (
         "Bash",
         "Read",
@@ -94,42 +113,87 @@ _PHASE_TOOL_ALLOWLIST: dict[Phase, tuple[str, ...]] = {
 }
 
 
+# Per-phase ``max_seconds`` defaults. ``0`` == unbounded. Quick keeps
+# its 30-second smoke-test budget; the rest run unbounded by default
+# and can be tightened via ``alice.config.json``.
+_PHASE_MAX_SECONDS: dict[Phase, int] = {
+    Phase.ACTIVE: 0,
+    Phase.SLEEP_B: 0,
+    Phase.SLEEP_C: 0,
+    Phase.SLEEP_D: 0,
+    Phase.QUICK: 30,
+    Phase.DESIGN_COMMISSION: 0,
+}
+
+
 def phase_default_allowed_tools(phase: Phase) -> list[str]:
-    """Return the default allowlist for a phase. Reference only — the
-    runtime currently honors ``ctx.tools`` (set from CLI/config) so
-    Phase 0 ships behavior unchanged."""
+    """Return the default tool allowlist for ``phase`` (Claude-style names)."""
     return list(_PHASE_TOOL_ALLOWLIST.get(phase, ()))
+
+
+def phase_default_max_seconds(phase: Phase) -> int:
+    """Return the default ``max_seconds`` budget for ``phase``."""
+    return _PHASE_MAX_SECONDS.get(phase, 0)
 
 
 def load_phase_config(mind: pathlib.Path) -> PhaseConfig:
     """Resolve a :class:`PhaseConfig` from ``alice.config.json``.
 
-    Reads the ``thinking.phase_routing`` block (if any) and applies it
-    over the dataclass defaults. Unknown keys are ignored so configs
-    can ship ahead of the code that consumes them.
+    Two override sources, in this order (later wins on conflict):
+
+    1. The ``thinking`` block: ``enable_full_sleep_dispatch``
+       (bool) and ``max_wake_seconds`` (int) — surfaced at the top
+       level alongside the other ``thinking.*`` knobs (``model``,
+       ``allowed_tools``, ...) so Jason can flip the kill-switch
+       without nesting it under a sub-block.
+    2. The ``thinking.phase_routing`` block: the canonical home for
+       phase-routing tunables. Any field name on
+       :class:`PhaseConfig` may be set here. Unknown keys are
+       ignored so configs can ship ahead of the code consuming them.
+
+    Phase-routing keys defined in both places resolve to the
+    ``phase_routing`` value (the explicit block wins).
     """
     cfg_path = mind / "config" / "alice.config.json"
-    overrides: dict[str, Any] = {}
-    if cfg_path.is_file():
-        try:
-            blob = json.loads(cfg_path.read_text())
-        except (OSError, json.JSONDecodeError):
-            blob = None
-        if isinstance(blob, dict):
-            think = blob.get("thinking") or {}
-            block = think.get("phase_routing") or {}
-            if isinstance(block, dict):
-                overrides = block
+    if not cfg_path.is_file():
+        return PhaseConfig()
+    try:
+        blob = json.loads(cfg_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return PhaseConfig()
+    if not isinstance(blob, dict):
+        return PhaseConfig()
 
-    base = PhaseConfig()
+    think = blob.get("thinking") or {}
+    if not isinstance(think, dict):
+        think = {}
+
+    overrides: dict[str, Any] = {}
+
+    # Top-level convenience overrides on the ``thinking`` block.
+    if "enable_full_sleep_dispatch" in think and isinstance(
+        think["enable_full_sleep_dispatch"], bool
+    ):
+        overrides["enable_full_sleep_dispatch"] = think["enable_full_sleep_dispatch"]
+    if "max_wake_seconds" in think:
+        try:
+            overrides["max_seconds"] = int(think["max_wake_seconds"])
+        except (TypeError, ValueError):
+            pass
+
+    # Canonical block — wins on conflict with the top-level keys.
+    block = think.get("phase_routing") or {}
+    if isinstance(block, dict):
+        for k, v in block.items():
+            overrides[k] = v
+
     fields = {f for f in PhaseConfig.__dataclass_fields__}
     kwargs = {k: v for k, v in overrides.items() if k in fields}
     if not kwargs:
-        return base
-    # PhaseConfig is frozen; rebuild via dataclass replace semantics.
+        return PhaseConfig()
     from dataclasses import replace
 
-    return replace(base, **kwargs)
+    return replace(PhaseConfig(), **kwargs)
 
 
 class PhaseRunner:
@@ -178,21 +242,61 @@ class PhaseRunner:
     def kernel_spec(self, phase: Phase, ctx: "WakeContext") -> KernelSpec:
         """Build a :class:`KernelSpec` for this phase + context.
 
-        Phase 0/1: tool allowlist + ``max_seconds`` come from
-        ``ctx.tools`` / ``ctx.max_seconds`` (CLI/config wired in
-        :mod:`alice_thinking.wake`). Phase 2 swaps in the per-phase
-        defaults from :data:`_PHASE_TOOL_ALLOWLIST` — this method is
-        the single place that change lands.
+        Phase 2: tool allowlist + ``max_seconds`` resolve in this
+        precedence order:
+
+        1. :class:`PhaseConfig` (``alice.config.json``).
+        2. :class:`WakeContext` (CLI / legacy ``thinking.*``).
+        3. The per-phase default (:data:`_PHASE_TOOL_ALLOWLIST`,
+           :data:`_PHASE_MAX_SECONDS`).
+
+        Quick mode short-circuits to its own (tools=[], max_seconds=30)
+        so smoke-test wakes don't accidentally pick up the active
+        allowlist.
         """
+        if phase == Phase.QUICK or ctx.quick:
+            return KernelSpec(
+                model=ctx.model,
+                allowed_tools=list(_PHASE_TOOL_ALLOWLIST[Phase.QUICK]),
+                cwd=ctx.cwd,
+                add_dirs=ctx.add_dirs,
+                max_seconds=_PHASE_MAX_SECONDS[Phase.QUICK],
+                thinking="medium",
+                append_system_prompt=ctx.system_prompt or None,
+            )
+
         return KernelSpec(
             model=ctx.model,
-            allowed_tools=list(ctx.tools),
+            allowed_tools=self._resolve_tools(phase, ctx),
             cwd=ctx.cwd,
             add_dirs=ctx.add_dirs,
-            max_seconds=ctx.max_seconds,
+            max_seconds=self._resolve_max_seconds(phase, ctx),
             thinking="medium",
             append_system_prompt=ctx.system_prompt or None,
         )
+
+    def _resolve_tools(self, phase: Phase, ctx: "WakeContext") -> list[str]:
+        """Return the resolved tool allowlist for ``phase`` + ``ctx``.
+
+        See :meth:`kernel_spec` for the precedence rules.
+        """
+        if self.config.allowed_tools is not None:
+            return list(self.config.allowed_tools)
+        if ctx.tools:
+            return list(ctx.tools)
+        return phase_default_allowed_tools(phase)
+
+    def _resolve_max_seconds(self, phase: Phase, ctx: "WakeContext") -> int:
+        """Return the resolved ``max_seconds`` for ``phase`` + ``ctx``.
+
+        ``0`` (or negative) at any layer == "fall through to the next
+        layer." See :meth:`kernel_spec` for the precedence rules.
+        """
+        if self.config.max_seconds and self.config.max_seconds > 0:
+            return self.config.max_seconds
+        if ctx.max_seconds and ctx.max_seconds > 0:
+            return ctx.max_seconds
+        return phase_default_max_seconds(phase)
 
     def run(
         self,

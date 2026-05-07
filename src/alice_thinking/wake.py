@@ -60,7 +60,12 @@ DEFAULT_MIND = pathlib.Path("/home/alice/alice-mind")
 DEFAULT_DIRECTIVE = DEFAULT_MIND / "inner" / "directive.md"
 DEFAULT_LOG = pathlib.Path("/state/worker/thinking.log")
 DEFAULT_STATE_DIR = pathlib.Path("/state/worker")
-DEFAULT_TOOLS = "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch"
+# Empty default — when the user doesn't pass ``--tools``, ctx.tools is
+# left empty and PhaseRunner picks the per-phase default from
+# :data:`alice_thinking.runtime._PHASE_TOOL_ALLOWLIST`. Passing
+# ``--tools=Foo,Bar`` (or setting ``thinking.allowed_tools`` in
+# ``alice.config.json``) still overrides at the WakeContext layer.
+DEFAULT_TOOLS = ""
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_SECONDS = 0  # 0 == no timeout. Thinking runs as long as it needs.
 QUICK_MAX_SECONDS = 30
