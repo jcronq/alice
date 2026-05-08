@@ -9,6 +9,15 @@ Auth: pi reads ``~/.pi/agent/auth.json``. The container entrypoint
 runs the codex→pi bridge to populate that file from
 ``~/.codex/auth.json``; PiKernel itself doesn't touch auth.
 
+Models registry: pi reads ``~/.pi/agent/models.json`` for its
+provider/model list. Alice's source-of-truth registry lives in
+the vault at ``~/alice-mind/config/pi-models.json``. PiKernel.run()
+stages vault → pi runtime location via
+:func:`alice_pi.models_staging.ensure_pi_models_json` at the start
+of every run. Idempotent (skips when content matches) and
+fail-soft (warning event, no raise) — pi can always fall back to
+its built-in providers.
+
 Skills: PiKernel passes ``--skill <rendered_dir>`` (the per-hemisphere
 ephemeral skills dir from Plan 07 P3). Pi auto-discovery falls back
 to ``.claude/skills/`` under cwd as well; we set cwd to the same
@@ -34,6 +43,7 @@ from alice_core.kernel import (
 )
 
 from . import transport as _transport_mod
+from .models_staging import ensure_pi_models_json
 from .transport import stream_pi_events
 from .translator import PiEventTranslator
 
@@ -129,6 +139,11 @@ class PiKernel:
         spec: KernelSpec,
         handlers: Optional[list[BlockHandler]] = None,
     ) -> KernelResult:
+        # Stage the alice-managed pi model registry before pi reads
+        # ``~/.pi/agent/models.json``. Idempotent + fail-soft — never
+        # blocks the run, just emits a warning event on failure.
+        ensure_pi_models_json(emit=self._emit)
+
         handlers = list(handlers or [])
         argv = self._build_argv(prompt, spec)
         translator = PiEventTranslator(self._emit, short_cap=self._cap)

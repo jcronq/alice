@@ -15,6 +15,29 @@ from alice_speaking.domain.principals import (
 
 
 @pytest.fixture(autouse=True)
+def _isolate_pi_models_staging(tmp_path_factory, monkeypatch):
+    """Redirect alice_pi.models_staging at tmp paths for every test.
+
+    The PiKernel.run() integration stages
+    ``~/alice-mind/config/pi-models.json`` → ``~/.pi/agent/models.json``
+    at the start of each run. Without this fixture, any test that
+    actually invokes ``PiKernel.run()`` would touch the real user's
+    home directory. Tests that need to exercise staging directly
+    pass explicit ``source=``/``dest=`` kwargs to the helper, which
+    take priority over these env vars.
+    """
+    isolation_dir = tmp_path_factory.mktemp("pi-models-isolation")
+    # Source path that doesn't exist → staging no-ops cleanly.
+    monkeypatch.setenv(
+        "ALICE_PI_MODELS_JSON", str(isolation_dir / "absent-source.json")
+    )
+    # Dest under tmp → even if a test writes a source, output is
+    # contained.
+    monkeypatch.setenv("PI_AGENT_DIR", str(isolation_dir / "pi-agent"))
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_alice_prompts_default_loader():
     """Reset the alice_prompts package-level loader after every test.
 
