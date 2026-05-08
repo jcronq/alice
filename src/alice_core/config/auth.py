@@ -92,6 +92,7 @@ def find_auth_env(
     mode_hint: Optional[AuthMode] = None,
     aws_region: str = "",
     aws_profile: str = "",
+    base_url: str = "",
 ) -> AuthEnv:
     """Resolve auth settings from process env and alice.env (in that order).
 
@@ -105,7 +106,9 @@ def find_auth_env(
     that down). When ``mode_hint`` is ``None`` the implicit-from-env
     logic above runs unchanged so minds without ``model.yml`` keep
     working. ``aws_region`` / ``aws_profile`` only matter for
-    ``mode_hint == "bedrock"``.
+    ``mode_hint == "bedrock"``. ``base_url`` overrides the env-derived
+    ``ANTHROPIC_BASE_URL`` when non-empty (Plan 06 fix: per-hemisphere
+    ``base_url`` from ``model.yml`` was previously silently ignored).
     """
     file_env: dict[str, str] = {}
     path = _resolve_env_path(env_file)
@@ -115,7 +118,7 @@ def find_auth_env(
     def pick(key: str) -> str:
         return os.environ.get(key) or file_env.get(key, "") or ""
 
-    base_url = pick("ANTHROPIC_BASE_URL")
+    resolved_base_url = base_url or pick("ANTHROPIC_BASE_URL")
     api_key = pick("ANTHROPIC_API_KEY")
     auth_token = pick("ANTHROPIC_AUTH_TOKEN")
     oauth_token = pick("CLAUDE_CODE_OAUTH_TOKEN")
@@ -125,7 +128,7 @@ def find_auth_env(
     mode: AuthMode
     if mode_hint is not None:
         mode = mode_hint
-    elif base_url or api_key or auth_token:
+    elif resolved_base_url or api_key or auth_token:
         mode = "api"
     elif oauth_token:
         mode = "subscription"
@@ -137,7 +140,7 @@ def find_auth_env(
         oauth_token=oauth_token,
         api_key=api_key,
         auth_token=auth_token,
-        base_url=base_url,
+        base_url=resolved_base_url,
         aws_region=region,
         aws_profile=profile,
     )
@@ -149,6 +152,7 @@ def ensure_auth_env(
     mode_hint: Optional[AuthMode] = None,
     aws_region: str = "",
     aws_profile: str = "",
+    base_url: str = "",
 ) -> AuthEnv:
     """Resolve auth settings and write the right vars into ``os.environ``.
 
@@ -170,6 +174,7 @@ def ensure_auth_env(
         mode_hint=mode_hint,
         aws_region=aws_region,
         aws_profile=aws_profile,
+        base_url=base_url,
     )
 
     if auth.mode == "api":

@@ -72,6 +72,13 @@ DEFAULT_MAX_SECONDS = 0  # 0 == no timeout. Thinking runs as long as it needs.
 QUICK_MAX_SECONDS = 30
 INTERVAL_FILE_NAME = "next-thinking-interval-seconds"
 
+_PHASE_TO_STAGE: dict[Phase, str] = {
+    Phase.ACTIVE: "active",
+    Phase.SLEEP_B: "sleep_b",
+    Phase.SLEEP_C: "sleep_c",
+    Phase.SLEEP_D: "sleep_d",
+}
+
 
 def _run_commission(
     commission_note: pathlib.Path,
@@ -116,11 +123,14 @@ def _run_commission(
         )
     else:
         # Cap hit — DO NOT commit. Surface the feedback verbatim.
-        feedback_text = "\n".join(
-            f"- [{fb.get('severity', '?')}] {fb.get('category', '?')}: "
-            f"{fb.get('description', '')}"
-            for fb in result.last_feedback
-        ) or "(no feedback recorded)"
+        feedback_text = (
+            "\n".join(
+                f"- [{fb.get('severity', '?')}] {fb.get('category', '?')}: "
+                f"{fb.get('description', '')}"
+                for fb in result.last_feedback
+            )
+            or "(no feedback recorded)"
+        )
         body = (
             f"Design commission hit the {result.iteration_count}-iteration "
             "cap without approval. Draft has known unresolved issues; "
@@ -389,6 +399,7 @@ def main() -> int:
         mode_hint=thinking_spec.backend,
         aws_region=thinking_spec.region,
         aws_profile=thinking_spec.profile,
+        base_url=thinking_spec.base_url,
     )
     if args.model == DEFAULT_MODEL and thinking_spec.model:
         args.model = thinking_spec.model
@@ -473,6 +484,33 @@ def main() -> int:
                 )
                 return 1
             return 0
+
+    # Per-stage backend override from model.yml (Strix Halo Phase 2).
+    # CLI --backend wins; the override only applies when no CLI flag
+    # was passed. Non-cadence phases (QUICK / preempts) have no entry
+    # in _PHASE_TO_STAGE and skip the override path.
+    stage_key = _PHASE_TO_STAGE.get(phase)
+    if stage_key and args.backend is None:
+        stage_override = model_config.stage_spec("thinking", stage_key)
+        if stage_override is not None:
+            from dataclasses import replace as _replace_dc
+
+            thinking_spec = stage_override
+            ensure_auth_env(
+                mode_hint=thinking_spec.backend,
+                aws_region=thinking_spec.region,
+                aws_profile=thinking_spec.profile,
+                base_url=thinking_spec.base_url,
+            )
+            if args.model == DEFAULT_MODEL and thinking_spec.model:
+                args.model = thinking_spec.model
+                ctx = _replace_dc(ctx, model=args.model)
+            emitter.emit(
+                "stage_backend_override",
+                phase=phase.value,
+                backend=thinking_spec.backend,
+                model=thinking_spec.model,
+            )
 
     runner = PhaseRunner(config=phase_cfg)
     if phase == Phase.ACTIVE:

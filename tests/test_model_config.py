@@ -195,3 +195,135 @@ def test_hemisphere_lookup_by_name() -> None:
     assert cfg.hemisphere("viewer") is cfg.viewer
     with pytest.raises(KeyError):
         cfg.hemisphere("voicing")
+
+
+# Strix Halo Phase 2: per-stage backend overrides.
+
+
+def test_stage_spec_returns_none_when_stages_block_absent() -> None:
+    cfg = from_mapping(
+        {
+            "thinking": {
+                "harness": "pi-mono",
+                "backend": "pi",
+                "model": "openai-local/Qwen3.6-35B",
+            }
+        }
+    )
+    assert cfg.stage_spec("thinking", "sleep_d") is None
+    assert cfg.stage_spec("thinking", "active") is None
+
+
+def test_stage_spec_unknown_hemisphere_raises() -> None:
+    cfg = ModelConfig.subscription_default()
+    with pytest.raises(KeyError):
+        cfg.stage_spec("voicing", "active")
+
+
+def test_stage_block_inherits_from_hemisphere_base() -> None:
+    """A stage entry that omits ``harness``/``backend`` inherits them
+    from the resolved hemisphere spec, not from ``backends.*``."""
+    cfg = from_mapping(
+        {
+            "thinking": {
+                "harness": "pi-mono",
+                "backend": "pi",
+                "model": "openai-local/Qwen3.6-35B",
+                "stages": {
+                    "active": {"model": "openai-local/some-other-model"},
+                },
+            }
+        }
+    )
+    spec = cfg.stage_spec("thinking", "active")
+    assert spec is not None
+    assert spec.backend == "pi"
+    assert spec.harness == "pi-mono"
+    assert spec.model == "openai-local/some-other-model"
+
+
+def test_stage_block_overrides_backend_harness_and_model() -> None:
+    cfg = from_mapping(
+        {
+            "thinking": {
+                "harness": "pi-mono",
+                "backend": "pi",
+                "model": "openai-local/Qwen3.6-35B",
+                "stages": {
+                    "sleep_d": {
+                        "backend": "subscription",
+                        "model": "claude-sonnet-4-6",
+                        "harness": "claude-code",
+                    },
+                },
+            }
+        }
+    )
+    spec = cfg.stage_spec("thinking", "sleep_d")
+    assert spec is not None
+    assert spec.backend == "subscription"
+    assert spec.harness == "claude-code"
+    assert spec.model == "claude-sonnet-4-6"
+
+
+def test_stage_block_unknown_stage_key_raises() -> None:
+    with pytest.raises(ModelConfigError, match="unknown stage 'sleep_e'"):
+        from_mapping(
+            {
+                "thinking": {
+                    "backend": "subscription",
+                    "stages": {"sleep_e": {"model": "x"}},
+                }
+            }
+        )
+
+
+def test_stage_block_invalid_harness_backend_pairing_raises() -> None:
+    with pytest.raises(ModelConfigError, match="requires .*backend = 'pi'"):
+        from_mapping(
+            {
+                "thinking": {
+                    "backend": "subscription",
+                    "stages": {
+                        "sleep_d": {
+                            "harness": "pi-mono",
+                            "backend": "subscription",
+                        }
+                    },
+                }
+            }
+        )
+
+
+def test_stage_block_supports_all_four_stage_keys() -> None:
+    cfg = from_mapping(
+        {
+            "thinking": {
+                "harness": "pi-mono",
+                "backend": "pi",
+                "model": "openai-local/base",
+                "stages": {
+                    "active": {"model": "openai-local/active-model"},
+                    "sleep_b": {"model": "openai-local/sleep-b-model"},
+                    "sleep_c": {"model": "openai-local/sleep-c-model"},
+                    "sleep_d": {"model": "openai-local/sleep-d-model"},
+                },
+            }
+        }
+    )
+    for stage in ("active", "sleep_b", "sleep_c", "sleep_d"):
+        spec = cfg.stage_spec("thinking", stage)
+        assert spec is not None
+        assert spec.model == f"openai-local/{stage.replace('_', '-')}-model"
+
+
+def test_stage_block_must_be_mapping() -> None:
+    with pytest.raises(ModelConfigError, match="thinking.stages"):
+        from_mapping(
+            {
+                "thinking": {
+                    "backend": "subscription",
+                    "stages": ["sleep_d"],
+                }
+            }
+        )

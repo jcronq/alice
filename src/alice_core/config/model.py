@@ -66,6 +66,7 @@ BackendName = Literal["subscription", "api", "bedrock", "pi"]
 HarnessName = Literal["claude-code", "pi-mono"]
 _VALID_BACKENDS: frozenset[str] = frozenset({"subscription", "api", "bedrock", "pi"})
 _VALID_HARNESSES: frozenset[str] = frozenset({"claude-code", "pi-mono"})
+_VALID_STAGES: frozenset[str] = frozenset({"active", "sleep_b", "sleep_c", "sleep_d"})
 _HARNESS_ALIASES: dict[str, HarnessName] = {
     "claude-code": "claude-code",
     "claude": "claude-code",
@@ -115,6 +116,7 @@ class ModelConfig:
     thinking: BackendSpec = field(default_factory=BackendSpec)
     viewer: BackendSpec = field(default_factory=BackendSpec)
     backends: Mapping[str, BackendDefaults] = field(default_factory=dict)
+    stages: Mapping[tuple[str, str], BackendSpec] = field(default_factory=dict)
 
     @classmethod
     def subscription_default(cls) -> "ModelConfig":
@@ -139,6 +141,15 @@ class ModelConfig:
         if name == "viewer":
             return self.viewer
         raise KeyError(f"unknown hemisphere {name!r}; expected one of {HEMISPHERES}")
+
+    def stage_spec(self, hemisphere: str, stage: str) -> BackendSpec | None:
+        """Return the resolved BackendSpec for ``hemisphere`` at ``stage``,
+        or ``None`` if no override is configured. Stage keys: ``active``,
+        ``sleep_b``, ``sleep_c``, ``sleep_d``. Raises :class:`KeyError`
+        on unknown hemisphere; returns ``None`` on unconfigured stage."""
+        # Validate hemisphere existence (raises KeyError on typo).
+        self.hemisphere(hemisphere)
+        return self.stages.get((hemisphere, stage))
 
 
 def _coerce_str(value: Any, field_name: str) -> str:
@@ -227,6 +238,88 @@ def _hemisphere_spec(
     )
 
 
+def _stage_spec(
+    hemisphere: str,
+    stage: str,
+    data: Mapping[str, Any],
+    base: BackendSpec,
+) -> BackendSpec:
+    """Build a per-stage override spec. Unset fields fall through to
+    ``base`` (the resolved hemisphere spec) rather than to
+    ``backends.*`` defaults — those have already been layered into
+    ``base``."""
+    field_prefix = f"{hemisphere}.stages.{stage}"
+    if not isinstance(data, Mapping):
+        raise ModelConfigError(
+            f"{field_prefix!r} must be a mapping (got {type(data).__name__})"
+        )
+
+    harness_override = _coerce_harness(
+        data.get("harness", data.get("agent_harness")),
+        f"{field_prefix}.harness",
+    )
+    backend_raw = _coerce_str(data.get("backend"), f"{field_prefix}.backend")
+    if backend_raw and backend_raw not in _VALID_BACKENDS:
+        raise ModelConfigError(
+            f"{field_prefix}.backend = {backend_raw!r}; "
+            f"expected one of {sorted(_VALID_BACKENDS)}"
+        )
+
+    backend: BackendName = backend_raw or base.backend  # type: ignore[assignment]
+    harness: HarnessName = harness_override or base.harness
+
+    if harness == "pi-mono" and backend != "pi":
+        raise ModelConfigError(
+            f"{field_prefix}.harness = 'pi-mono' requires {field_prefix}.backend = 'pi'"
+        )
+    if harness == "claude-code" and backend == "pi":
+        raise ModelConfigError(
+            f"{field_prefix}.backend = 'pi' requires {field_prefix}.harness = 'pi-mono'"
+        )
+
+    model_raw = _coerce_str(data.get("model"), f"{field_prefix}.model")
+    region_raw = _coerce_str(data.get("region"), f"{field_prefix}.region")
+    profile_raw = _coerce_str(data.get("profile"), f"{field_prefix}.profile")
+    base_url_raw = _coerce_str(data.get("base_url"), f"{field_prefix}.base_url")
+
+    return BackendSpec(
+        backend=backend,
+        model=model_raw or base.model,
+        harness=harness,
+        region=region_raw or base.region,
+        profile=profile_raw or base.profile,
+        base_url=base_url_raw or base.base_url,
+    )
+
+
+def _parse_stages(
+    hemisphere: str,
+    data: Mapping[str, Any] | None,
+    base: BackendSpec,
+) -> dict[tuple[str, str], BackendSpec]:
+    if data is None:
+        return {}
+    raw = data.get("stages")
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ModelConfigError(
+            f"{hemisphere}.stages must be a mapping (got {type(raw).__name__})"
+        )
+    out: dict[tuple[str, str], BackendSpec] = {}
+    for stage_key, stage_data in raw.items():
+        stage_name = str(stage_key)
+        if stage_name not in _VALID_STAGES:
+            raise ModelConfigError(
+                f"unknown stage {stage_name!r} in {hemisphere}.stages; "
+                f"expected one of {sorted(_VALID_STAGES)}"
+            )
+        out[(hemisphere, stage_name)] = _stage_spec(
+            hemisphere, stage_name, stage_data, base
+        )
+    return out
+
+
 def from_mapping(data: Mapping[str, Any]) -> ModelConfig:
     """Parse the YAML body (a mapping) into a :class:`ModelConfig`."""
     backends_raw = data.get("backends") or {}
@@ -242,11 +335,21 @@ def from_mapping(data: Mapping[str, Any]) -> ModelConfig:
             )
         backends[str(name)] = _backend_defaults_from_dict(str(name), value)
 
+    speaking = _hemisphere_spec("speaking", data.get("speaking"), backends)
+    thinking = _hemisphere_spec("thinking", data.get("thinking"), backends)
+    viewer = _hemisphere_spec("viewer", data.get("viewer"), backends)
+
+    stages: dict[tuple[str, str], BackendSpec] = {}
+    stages.update(_parse_stages("speaking", data.get("speaking"), speaking))
+    stages.update(_parse_stages("thinking", data.get("thinking"), thinking))
+    stages.update(_parse_stages("viewer", data.get("viewer"), viewer))
+
     return ModelConfig(
-        speaking=_hemisphere_spec("speaking", data.get("speaking"), backends),
-        thinking=_hemisphere_spec("thinking", data.get("thinking"), backends),
-        viewer=_hemisphere_spec("viewer", data.get("viewer"), backends),
+        speaking=speaking,
+        thinking=thinking,
+        viewer=viewer,
         backends=backends,
+        stages=stages,
     )
 
 

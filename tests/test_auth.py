@@ -177,3 +177,44 @@ def test_aws_region_falls_back_to_env_when_not_passed(
     import os
 
     assert os.environ.get("AWS_REGION") == "eu-west-1"
+
+
+def test_find_auth_env_base_url_kwarg_overrides_env(
+    clean_env, monkeypatch: pytest.MonkeyPatch, empty_env_file
+) -> None:
+    """Plan 06 fix: per-hemisphere ``base_url`` from ``model.yml`` was
+    silently ignored before. With the kwarg threaded through, a caller
+    passing ``base_url=...`` overrides whatever's in the process env."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://env.example.com/v1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "key")
+    auth = find_auth_env(
+        empty_env_file,
+        mode_hint="api",
+        base_url="https://override.example.com/v1",
+    )
+    assert auth.base_url == "https://override.example.com/v1"
+
+
+def test_find_auth_env_base_url_falls_back_to_env_when_not_passed(
+    clean_env, monkeypatch: pytest.MonkeyPatch, empty_env_file
+) -> None:
+    """Without the ``base_url`` kwarg, existing env-derived behaviour
+    is preserved."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://env.example.com/v1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "key")
+    auth = find_auth_env(empty_env_file, mode_hint="api")
+    assert auth.base_url == "https://env.example.com/v1"
+
+
+def test_ensure_auth_env_base_url_kwarg_writes_override_into_env(
+    clean_env, monkeypatch: pytest.MonkeyPatch, empty_env_file
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "key")
+    ensure_auth_env(
+        empty_env_file,
+        mode_hint="api",
+        base_url="https://override.example.com/v1",
+    )
+    import os
+
+    assert os.environ.get("ANTHROPIC_BASE_URL") == "https://override.example.com/v1"
