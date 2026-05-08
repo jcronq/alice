@@ -39,10 +39,10 @@ export PYTHONUNBUFFERED=1
 # debuggable from `tail -F ~/.local/state/alice/worker/speaking-stderr.log`.
 # stdlib logging defaults to stderr; the EventLogger writes to /state/speaking.log.
 #
-# s6-redirfd opens fd 2 *after* s6-setuidgid drops privileges, so the log
-# file is created/owned by alice. A shell-level `2>>` would be evaluated by
-# the parent shell (still root), leaving the inode root-owned and breaking
-# subsequent alice-uid writes (#10).
+# redirfd (execline) opens fd 2 *after* s6-setuidgid drops privileges, so
+# the log file is created/owned by alice. A shell-level `2>>` would be
+# evaluated by the parent shell (still root), leaving the inode root-owned
+# and breaking subsequent alice-uid writes (#10).
 #
 # Hot-restart loop: the inner `while true` re-execs the Python interpreter
 # when /state/worker/reload-requested-internal exists. The alice-reload-watcher
@@ -53,7 +53,7 @@ export PYTHONUNBUFFERED=1
 # flag isn't set after the Python process exits, this is a normal shutdown
 # (or a crash) and we break out so s6's own restart-backoff handles it.
 # Design: cortex-memory/research/2026-05-05-speaking-self-deploy-design.md.
-exec s6-setuidgid alice s6-redirfd -a 2 /state/worker/speaking-stderr.log \
+exec s6-setuidgid alice redirfd -a 2 /state/worker/speaking-stderr.log \
     flock -x /state/worker/lease \
     bash -c '
         while true; do
