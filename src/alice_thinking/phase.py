@@ -169,21 +169,76 @@ def _has_inbox_items(mind: pathlib.Path) -> bool:
     return False
 
 
+_PLACEHOLDER_PREFIXES = ("(empty", "(none", "*(empty", "*(none", "_(empty", "_(none")
+
+
+def _open_section(text: str) -> str:
+    """Return the body of the ``## Open`` section of an unresolved-style note.
+
+    The file's authoring convention is ``## Open`` for the live backlog
+    plus ad-hoc instructional prose elsewhere (frontmatter, tl;dr, usage
+    notes). Probes that key off the whole file get tripped by that prose
+    and fire false positives even when the live backlog is empty. The
+    section helper scopes inspection to the live content.
+
+    Returns ``""`` when ``## Open`` is absent.
+    """
+    lines = text.splitlines()
+    in_open = False
+    out: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            if in_open:
+                break  # next H2 closes the Open section
+            if stripped[3:].lower().lstrip().startswith("open"):
+                in_open = True
+            continue
+        if in_open:
+            out.append(line)
+    return "\n".join(out).strip()
+
+
+def _open_section_is_empty(section: str) -> bool:
+    """Treat placeholder markers like ``*(empty — ...)`` as empty."""
+    if not section:
+        return True
+    for line in section.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Strip italics / emphasis markers for the leading-token check.
+        head = stripped.lstrip("*_ ").lstrip()
+        if head.lower().startswith(_PLACEHOLDER_PREFIXES):
+            continue
+        return False
+    return True
+
+
 def _has_broken_links(mind: pathlib.Path) -> bool:
     """Cheap broken-link probe — `cortex-memory/unresolved.md` lists them.
 
-    The file's structure varies; treat any non-blank line that contains
-    ``[[`` as evidence of an unresolved link.
+    Scoped to the ``## Open`` section so frontmatter, tl;dr, and usage
+    prose can't false-positive. A non-empty entry containing ``[[`` is
+    evidence of an unresolved link.
     """
     p = mind / "cortex-memory" / "unresolved.md"
     if not p.is_file():
         return False
     try:
-        text = p.read_text()
+        section = _open_section(p.read_text())
     except OSError:
         return False
-    for line in text.splitlines():
-        if "[[" in line and not line.lstrip().startswith("#"):
+    if _open_section_is_empty(section):
+        return False
+    for line in section.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        head = stripped.lstrip("*_ ").lstrip()
+        if head.lower().startswith(_PLACEHOLDER_PREFIXES):
+            continue
+        if "[[" in stripped:
             return True
     return False
 
@@ -192,18 +247,21 @@ def _has_orphan_stubs(mind: pathlib.Path) -> bool:
     """Probe for orphan stubs.
 
     A full O(n) vault scan is too expensive for every wake. Cheap proxy:
-    if `unresolved.md` exists at all, treat it as evidence (orphans tend
-    to live in the same audit file as broken links). The Phase 1 design
-    doc accepts this approximation; Phase 3 may swap in a finer check.
+    inspect the ``## Open`` section of ``cortex-memory/unresolved.md``.
+    The Phase 1 approximation kept the previous "any text in the file"
+    check, but unresolved.md always has frontmatter + tl;dr + instructional
+    prose, so the check fired every wake and pinned select_phase Rule 2a
+    to ``Phase.SLEEP_B`` regardless of true vault state. Scope to the
+    live backlog section instead.
     """
     p = mind / "cortex-memory" / "unresolved.md"
     if not p.is_file():
         return False
     try:
-        text = p.read_text().strip()
+        section = _open_section(p.read_text())
     except OSError:
         return False
-    return bool(text)
+    return not _open_section_is_empty(section)
 
 
 def _has_recent_research(
@@ -480,7 +538,10 @@ def detect_commission_notes(mind: pathlib.Path) -> list[pathlib.Path]:
                 fm = _parse_frontmatter(f.read_text(encoding="utf-8", errors="replace"))
             except OSError:
                 continue
-            if fm.get("task_type", "").strip().strip('"').strip("'") == "design-commission":
+            if (
+                fm.get("task_type", "").strip().strip('"').strip("'")
+                == "design-commission"
+            ):
                 _push(f)
 
         # Filename fallback
@@ -495,7 +556,7 @@ def detect_commission_notes(mind: pathlib.Path) -> list[pathlib.Path]:
         for f in commission_dir.glob("*.md"):
             _push(f)
 
-    out.sort(key=lambda f: (f.stat().st_mtime if f.exists() else 0.0))
+    out.sort(key=lambda f: f.stat().st_mtime if f.exists() else 0.0)
     return out
 
 
@@ -540,5 +601,5 @@ def detect_conflict_notes(vault_dir: pathlib.Path) -> list[pathlib.Path]:
             continue
         out.append(f)
 
-    out.sort(key=lambda f: (f.stat().st_mtime if f.exists() else 0.0))
+    out.sort(key=lambda f: f.stat().st_mtime if f.exists() else 0.0)
     return out
