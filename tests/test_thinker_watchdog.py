@@ -35,7 +35,9 @@ def _make_lock(tmp_path: pathlib.Path) -> pathlib.Path:
     return lock
 
 
-def _make_state_dir(tmp_path: pathlib.Path, *, cadence: Optional[int] = None) -> pathlib.Path:
+def _make_state_dir(
+    tmp_path: pathlib.Path, *, cadence: Optional[int] = None
+) -> pathlib.Path:
     state = tmp_path / "state"
     state.mkdir()
     if cadence is not None:
@@ -170,28 +172,54 @@ def test_cadence_read_from_state_file_with_fallback(tmp_path):
 
 
 def test_stale_threshold_math():
-    assert wd.stale_threshold_seconds(300) == 660  # 5min cadence → 11min
-    assert wd.stale_threshold_seconds(2400) == 4860  # 40min cadence → 81min
-    assert wd.stale_threshold_seconds(600) == 1260  # 10min fallback → 21min
+    # 5x cadence + 60s cushion. Sized for native Stage B workflow runs
+    # (LLM subroutines push the legitimate-completion window to ~20 min).
+    assert wd.stale_threshold_seconds(300) == 1560  # 5min cadence → 26 min
+    assert wd.stale_threshold_seconds(2400) == 12060  # 40min cadence → 201 min
+    assert wd.stale_threshold_seconds(600) == 3060  # 10min fallback → 51 min
+
+
+def test_stale_threshold_covers_native_workflow_duration():
+    """Regression guard: a native Stage B workflow with LLM-subroutine
+    fan-out can legitimately run 15–20 minutes. Active-mode threshold
+    must be at least 20 minutes so a healthy long workflow isn't
+    SIGTERMed mid-flight.
+
+    Prior 2x multiplier (660s = 11 min) was the original bug — see PR
+    #21 follow-up commit.
+    """
+    workflow_worst_case_seconds = 20 * 60  # 20 minutes
+    active_cadence = 300
+    threshold = wd.stale_threshold_seconds(active_cadence)
+    assert threshold > workflow_worst_case_seconds, (
+        f"threshold {threshold}s must exceed workflow worst-case "
+        f"{workflow_worst_case_seconds}s to avoid false-positive kills"
+    )
 
 
 # ---------- is_stuck rule branches ----------
 
 
 def test_no_process_no_lock_returns_idle():
-    assert wd.is_stuck(pid=None, wake_age=None, cadence=300, lock_exists=False) == wd.Decision.IDLE
+    assert (
+        wd.is_stuck(pid=None, wake_age=None, cadence=300, lock_exists=False)
+        == wd.Decision.IDLE
+    )
 
 
 def test_process_alive_recent_wake_returns_working():
-    assert wd.is_stuck(pid=4242, wake_age=10.0, cadence=300, lock_exists=True) == wd.Decision.WORKING
+    assert (
+        wd.is_stuck(pid=4242, wake_age=10.0, cadence=300, lock_exists=True)
+        == wd.Decision.WORKING
+    )
 
 
 @pytest.mark.parametrize(
     "cadence,wake_age",
     [
-        (300, 700),  # active mode (5min) past the 660s threshold
-        (600, 1300),  # 10min cadence past the 1260s threshold
-        (2400, 5000),  # sleep@40min past the 4860s threshold
+        (300, 1700),  # active mode (5min) past the 1560s threshold
+        (600, 3200),  # 10min cadence past the 3060s threshold
+        (2400, 13000),  # sleep@40min past the 12060s threshold
     ],
 )
 def test_process_alive_stale_wake_returns_stuck(cadence, wake_age, monkeypatch):
@@ -209,15 +237,15 @@ def test_no_process_with_lock_returns_orphan_lock():
 
 
 def test_no_wake_file_with_young_process_is_working(monkeypatch):
-    # Process started 5s ago, threshold is 660s → still working.
+    # Process started 5s ago, threshold is 1560s → still working.
     monkeypatch.setattr(wd, "_proc_age_seconds", lambda pid, now=None: 5.0)
     decision = wd.is_stuck(pid=4242, wake_age=None, cadence=300, lock_exists=True)
     assert decision == wd.Decision.WORKING
 
 
 def test_no_wake_file_with_old_process_is_stuck(monkeypatch):
-    # Process started 20min ago, no wake file at all → stuck.
-    monkeypatch.setattr(wd, "_proc_age_seconds", lambda pid, now=None: 20 * 60)
+    # Process started 35min ago, no wake file at all → stuck.
+    monkeypatch.setattr(wd, "_proc_age_seconds", lambda pid, now=None: 35 * 60)
     decision = wd.is_stuck(pid=4242, wake_age=None, cadence=300, lock_exists=True)
     assert decision == wd.Decision.STUCK
 
@@ -338,7 +366,10 @@ def test_run_tick_idle_no_events(tmp_path, monkeypatch):
     lock = tmp_path / "no-such-lock"
     monkeypatch.setattr(wd, "_read_proc_locks", lambda: [])
     result = wd.run_tick(
-        lock_path=lock, state_dir=state, mind=mind, events_log=mind / "memory" / "events.jsonl"
+        lock_path=lock,
+        state_dir=state,
+        mind=mind,
+        events_log=mind / "memory" / "events.jsonl",
     )
     assert result.decision == wd.Decision.IDLE
     assert _read_events(mind / "memory" / "events.jsonl") == []
@@ -370,15 +401,13 @@ def test_telemetry_event_emitted_on_intervention(tmp_path, monkeypatch):
     events.jsonl with the expected schema."""
     today = "2026-05-08"
     state = _make_state_dir(tmp_path, cadence=300)
-    mind = _make_mind(tmp_path, today=today, wake_age_seconds=900)  # > 660s threshold
+    mind = _make_mind(tmp_path, today=today, wake_age_seconds=1700)  # > 1560s threshold
     lock = _make_lock(tmp_path)
     inode = lock.stat().st_ino
     fake_pid = 12345
 
     # Synthesize /proc/locks to claim our fake_pid holds the lock.
-    monkeypatch.setattr(
-        wd, "_read_proc_locks", lambda: [(fake_pid, inode)]
-    )
+    monkeypatch.setattr(wd, "_read_proc_locks", lambda: [(fake_pid, inode)])
     # /proc/<pid>/wchan reads — simulate the SDK epoll leak signature.
     monkeypatch.setattr(wd, "_read_wchan", lambda pid: "ep_poll")
 
@@ -417,8 +446,8 @@ def test_telemetry_event_emitted_on_intervention(tmp_path, monkeypatch):
     assert e["pid"] == fake_pid
     assert e["wchan"] == "ep_poll"
     assert e["cadence_seconds"] == 300
-    assert e["stale_threshold_seconds"] == 660
-    assert e["wake_file_age_seconds"] >= 660
+    assert e["stale_threshold_seconds"] == 1560
+    assert e["wake_file_age_seconds"] >= 1560
     assert e["sigterm_sent"] is True
     assert e["sigterm_sufficient"] is True
 

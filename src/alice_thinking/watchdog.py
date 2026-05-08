@@ -28,7 +28,7 @@ Staleness threshold M (seconds):
 ``current_cadence`` is read from ``/state/worker/next-thinking-interval-seconds``
 (the file ``wake.py`` writes via ``backoff.write_interval_atomic``);
 fallback is 600 if the file is missing or malformed. So in active mode
-(5-min cadence) M = 11 min; in sleep with the 40-min backoff M = 81 min.
+(5-min cadence) M = 25 min; in sleep with the 40-min backoff M = 200 min.
 
 On ``"stuck"`` we send SIGTERM, wait up to 30s, then SIGKILL if the
 process is still alive. A ``thinker_watchdog_intervention`` record
@@ -73,8 +73,17 @@ INTERVAL_FILE_NAME = "next-thinking-interval-seconds"
 DEFAULT_CADENCE_SECONDS = 600
 
 # Multiplier on the current cadence + a constant cushion. Active wakes
-# (5-min cadence) get an 11-minute window; sleep@40min gets 81 minutes.
-STALE_CADENCE_MULTIPLIER = 2
+# (5-min cadence) get a 25-minute window; sleep@40min gets 200 minutes.
+#
+# The 5x multiplier covers native workflows (Stage B in
+# ``alice_thinking.workflows.stage_b``) that legitimately take 15-20
+# minutes when their LLM subroutines fan out. The earlier 2x
+# (660s active) would SIGTERM healthy workflows. Phase 2 (per-step
+# heartbeat) is the structural fix that lets us tighten this back down;
+# until heartbeats land, 5x is the safe floor — it still beats the
+# 21-minute manual-intervention window we hit before the watchdog
+# existed.
+STALE_CADENCE_MULTIPLIER = 5
 STALE_CUSHION_SECONDS = 60
 
 # How long to wait for SIGTERM to be honored before escalating to SIGKILL.
@@ -304,10 +313,14 @@ def current_cadence_seconds(
 
 
 def stale_threshold_seconds(cadence: int) -> int:
-    """``2 * cadence + 60`` — the M from the spec.
+    """``5 * cadence + 60`` — the M from the spec (post-PR-#19 update).
 
-    Active mode (5-min cadence) → 11 min.
-    Sleep@40min                 → 81 min.
+    Active mode (5-min cadence) → 25 min.
+    Sleep@40min                 → 200 min.
+
+    Sized to cover native Stage B workflow runs (LLM-subroutine fan-out
+    can take 15-20 minutes). Phase 2 (per-step heartbeats) lets us
+    tighten this back down.
     """
     return STALE_CADENCE_MULTIPLIER * int(cadence) + STALE_CUSHION_SECONDS
 

@@ -72,19 +72,31 @@ hang.
 ## Staleness threshold M
 
 ```
-M = 2 × current_cadence + 60
+M = 5 × current_cadence + 60
 ```
 
 | Cadence            | M       | Notes |
 |--------------------|---------|-------|
-| 300s (active 5min) | 660s    | 11 min — fires fast in normal operation |
-| 600s (fallback)    | 1260s   | 21 min |
-| 1200s (sleep 20min)| 2460s   | 41 min |
-| 2400s (sleep 40min)| 4860s   | 81 min — generous for Stage D synthesis |
+| 300s (active 5min) | 1560s   | 26 min — covers native Stage B workflow runs |
+| 600s (fallback)    | 3060s   | 51 min |
+| 1200s (sleep 20min)| 6060s   | 101 min |
+| 2400s (sleep 40min)| 12060s  | 201 min — generous for Stage D synthesis |
 
-The factor of 2 means a single wake can run twice as long as the
-current cadence before we worry. The `+60s` cushion absorbs filesystem
-mtime granularity and clock-skew artifacts.
+The factor of 5 was chosen so a native workflow (`alice_thinking.workflows.stage_b`)
+with LLM subroutines that legitimately fan out to 15-20 minutes
+doesn't get false-positive killed. The earlier 2x value (660s active)
+was sized for prompt-driven wakes only; once the typed workflow
+shipped (PR #19), 660s started clipping healthy runs.
+
+Phase 2 (per-step heartbeat in the workflow) is the structural fix
+that lets us tighten this back down — when each step touches a
+heartbeat file, the watchdog can detect "no progress in N seconds"
+much sooner than "no completed wake file in N seconds." Until that
+ships, 5x is the safe floor — still beats the 21-minute manual
+intervention windows we hit before the watchdog existed.
+
+The `+60s` cushion absorbs filesystem mtime granularity and clock-skew
+artifacts.
 
 A **failure mode this avoids**: the supervisor's interval file gets
 stomped to `60` (corrupt write), M becomes 180, watchdog murders a
@@ -114,7 +126,7 @@ Telemetry written to `memory/events.jsonl`:
   "wake_file": "/home/alice/alice-mind/inner/thoughts/2026-05-08/120000-wake.md",
   "wake_file_age_seconds": 970.4,
   "cadence_seconds": 300,
-  "stale_threshold_seconds": 660,
+  "stale_threshold_seconds": 1560,
   "sigterm_sent": true,
   "sigterm_sufficient": false,
   "sigkill_sent": true,
