@@ -61,3 +61,23 @@ Notes:
 `bin/alice-shell` (exec into the live worker), `bin/alice-think` (trigger
 a thinking-hemisphere wake), `bin/alice-init` (first-run scaffold),
 `bin/event-log` (tail/query `memory/events.jsonl`).
+
+## Stage B (Consolidation) — google-adk workflow
+
+Stage B sleep wakes can route through a typed-step workflow built on
+google-adk's `SequentialAgent` / `ParallelAgent` instead of the
+prompt-driven `sleep-b.md` path. Two flags in `alice.config.json`
+under `thinking`:
+
+- `stage_b_workflow_enabled` (default `false`) — flip the cutover.
+- `stage_b_shadow_enabled` (default `false`) — run the workflow in
+  shadow alongside the prompt path with `apply_writes=False`;
+  telemetry tagged `stage_b_shadow_*`.
+
+LLM calls dispatch through google-adk's `LiteLlm` adapter to the
+local Qwen endpoint (`http://10.20.30.177:8033/v1`). Per-step
+timeouts, error containment, and structured telemetry come for free
+from the workflow shape.
+
+Design: `docs/designs/stage-b-adk-workflow-sketch.md`. Cutover
+protocol + flag-flip steps: `docs/designs/stage-b-cutover.md`.

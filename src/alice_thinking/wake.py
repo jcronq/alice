@@ -55,6 +55,11 @@ from .phase import (
 from .runtime import PhaseRunner, load_phase_config
 from .selector import select_mode
 from .vault_state import snapshot as snapshot_vault
+from .workflows.stage_b import (
+    load_runner_config as _load_stage_b_config,
+    run_stage_b_shadow as _run_stage_b_shadow,
+    run_stage_b_wake as _run_stage_b_wake,
+)
 
 
 DEFAULT_MIND = pathlib.Path("/home/alice/alice-mind")
@@ -216,6 +221,36 @@ def _apply_config_overrides(args: argparse.Namespace) -> None:
         args.max_seconds = int(think["max_wake_seconds"])
     if args.tools == DEFAULT_TOOLS and "allowed_tools" in think:
         args.tools = ",".join(think["allowed_tools"])
+
+
+def _stage_b_workflow_flags(mind: pathlib.Path) -> tuple[bool, bool]:
+    """Read ``thinking.stage_b_workflow_enabled`` +
+    ``thinking.stage_b_shadow_enabled`` from ``alice.config.json``.
+
+    Both default ``False``. Cutover protocol per
+    ``docs/designs/stage-b-cutover.md``:
+
+    1. Both flags false (initial commit).
+    2. Flip ``stage_b_shadow_enabled=true`` to run the workflow in
+       shadow alongside the existing prompt-driven Stage B path.
+    3. Compare actions over a few wakes — workflow output should be a
+       strict subset of prompt output.
+    4. Flip ``stage_b_workflow_enabled=true`` to cut over.
+    """
+    cfg_path = mind / "config" / "alice.config.json"
+    if not cfg_path.is_file():
+        return False, False
+    try:
+        blob = json.loads(cfg_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False, False
+    think = (blob or {}).get("thinking") or {}
+    if not isinstance(think, dict):
+        return False, False
+    return (
+        bool(think.get("stage_b_workflow_enabled", False)),
+        bool(think.get("stage_b_shadow_enabled", False)),
+    )
 
 
 def _load_personae(mind: pathlib.Path):
@@ -512,6 +547,55 @@ def main() -> int:
                 model=thinking_spec.model,
             )
 
+    # Stage B workflow cutover — see ``docs/designs/stage-b-cutover.md``.
+    # When ``thinking.stage_b_workflow_enabled=true`` and the selected
+    # phase is SLEEP_B, route through the google-adk SequentialAgent
+    # workflow instead of the prompt-driven SleepMode. Shadow flag is
+    # honored separately below: it runs the workflow alongside the
+    # prompt path with apply_writes=False so cutover comparison can
+    # diff the two outputs without doubling LLM-induced side effects.
+    workflow_enabled, shadow_enabled = (
+        (False, False) if args.quick else _stage_b_workflow_flags(mind)
+    )
+
+    if not args.quick and phase == Phase.SLEEP_B and workflow_enabled:
+        wake_start_ts = time.time()
+        runner_cfg = _load_stage_b_config(
+            mind_dir=mind,
+            state_dir=pathlib.Path(args.state_dir),
+            wake_file_path=None,
+            now=ctx.now,
+            event_log_path=pathlib.Path(args.log),
+        )
+        try:
+            asyncio.run(_run_stage_b_wake(runner_cfg, emitter=emitter))
+            rc = 0
+        except Exception as exc:  # noqa: BLE001
+            emitter.emit(
+                "exception",
+                phase=phase.value,
+                type=type(exc).__name__,
+                message=str(exc),
+            )
+            rc = 1
+        # Backoff bookkeeping mirrors the prompt-path block below.
+        interval_path = pathlib.Path(args.state_dir) / INTERVAL_FILE_NAME
+        prev_interval = backoff.read_interval(interval_path)
+        did_work = backoff.detect_did_work(mind, since_ts=wake_start_ts)
+        next_interval = backoff.next_interval_seconds(
+            prev_seconds=prev_interval,
+            mode="sleep",
+            did_work=did_work,
+        )
+        try:
+            backoff.write_interval_atomic(interval_path, next_interval)
+        except OSError as exc:
+            print(
+                f"thinking: failed to write {interval_path}: {exc}",
+                file=sys.stderr,
+            )
+        return rc
+
     runner = PhaseRunner(config=phase_cfg)
     if phase == Phase.ACTIVE:
         mode_obj = ActiveMode(runner=runner)
@@ -531,6 +615,38 @@ def main() -> int:
     _ = select_mode(now=ctx.now, vault=vault)
 
     wake_start_ts = time.time()
+
+    # Stage B shadow hook — when shadow_enabled is true and the prompt
+    # path is still authoritative (workflow_enabled=false OR phase is
+    # not SLEEP_B), also run the workflow with apply_writes=False so we
+    # can compare outputs against the live writes. Shadow telemetry is
+    # tagged ``stage_b_shadow_*`` so the viewer can filter it from real
+    # ``stage_b_*`` events.
+    if (
+        not args.quick
+        and shadow_enabled
+        and phase == Phase.SLEEP_B
+        and not workflow_enabled
+    ):
+        try:
+            shadow_cfg = _load_stage_b_config(
+                mind_dir=mind,
+                state_dir=pathlib.Path(args.state_dir),
+                wake_file_path=None,
+                now=ctx.now,
+                shadow_mode=True,
+                event_log_path=pathlib.Path(args.log),
+            )
+            asyncio.run(_run_stage_b_shadow(shadow_cfg, emitter=emitter))
+        except Exception as exc:  # noqa: BLE001
+            emitter.emit(
+                "exception",
+                phase=phase.value,
+                type=type(exc).__name__,
+                message=f"shadow stage_b: {exc}",
+            )
+            # Shadow failures must NEVER take down the live wake.
+
     rc = asyncio.run(
         run_wake(
             ctx=ctx,

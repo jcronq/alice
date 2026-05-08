@@ -33,6 +33,13 @@ dependencies = [
     # protocol_version="1.0") and ship a workaround for issue #1011
     # specific to 1.0.x — must match the worker Dockerfile pin.
     "a2a-sdk[http-server]>=1.0.2",
+    # Stage B workflow runtime (alice_thinking.workflows.stage_b).
+    # google-adk's SequentialAgent / ParallelAgent / LiteLlm wrap the
+    # workflow shape; litellm pinned explicitly so the local Qwen
+    # backend (openai-compatible provider) wires up without touching
+    # the kernel layer.
+    "google-adk>=1.32",
+    "litellm>=1.83",
 ]
 
 [project.scripts]
@@ -78,6 +85,7 @@ packages = [
 "src/alice_skills/defaults" = "alice_skills/defaults"
 "src/alice_pi/extensions" = "alice_pi/extensions"
 "src/alice_thinking/prompts" = "alice_thinking/prompts"
+"src/alice_thinking/workflows/stage_b/prompts" = "alice_thinking/workflows/stage_b/prompts"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
