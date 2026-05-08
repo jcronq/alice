@@ -168,13 +168,18 @@ def _split_flow(inner: str) -> list[str]:
 # wikilink extraction
 _WIKILINK_RE = re.compile(r"\[\[([^\[\]\|]+?)(?:\|[^\[\]]*?)?\]\]")
 _FENCE_RE = re.compile(r"^(```|~~~)", re.MULTILINE)
+# Inline code spans of varying tick width. Markdown allows N backticks to
+# delimit a span containing fewer-tick runs, so we strip widest-first.
+# A non-greedy body avoids spilling across paragraphs.
+_DOUBLE_BACKTICK_RE = re.compile(r"``[^\n]*?``")
 _INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 
 
 def _strip_code(body: str) -> str:
     """Remove fenced code blocks and inline code so [[..]] inside them isn't
     matched as a wikilink. Bash `[[ -d "$x" ]]`, markdown examples like
-    `[[wikilinks]]`, etc., would otherwise pollute the broken-link queue.
+    `[[wikilinks]]`, and double-backtick spans like ``[[wikilink]]`` would
+    otherwise pollute the broken-link queue.
     """
     # Strip fenced blocks (```...``` or ~~~...~~~). State-machine over lines.
     out_lines = []
@@ -190,7 +195,8 @@ def _strip_code(body: str) -> str:
             continue
         out_lines.append(line)
     cleaned = "\n".join(out_lines)
-    # Strip inline `code` spans.
+    # Strip wider runs first so inner narrower runs don't half-consume them.
+    cleaned = _DOUBLE_BACKTICK_RE.sub("", cleaned)
     cleaned = _INLINE_CODE_RE.sub("", cleaned)
     return cleaned
 

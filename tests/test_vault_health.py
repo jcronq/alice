@@ -254,9 +254,7 @@ def test_orphan_count_resolves_aliases(tmp_path: Path) -> None:
     # Buggy baseline ignores aliases → flags both notes as orphans
     # (foo.md unreferenced; alice-speaking.md only addressed by alias).
     buggy = _buggy_orphans_ignore_aliases(vault)
-    assert buggy >= 2, (
-        f"buggy baseline should flag both notes as orphans; got {buggy}"
-    )
+    assert buggy >= 2, f"buggy baseline should flag both notes as orphans; got {buggy}"
 
 
 # ---------------------------------------------------------------------------
@@ -415,10 +413,7 @@ def test_phase1_check_uses_legacy_mode() -> None:
         pytest.skip(f"phase1-check-script not present at {script}")
     text = script.read_text(encoding="utf-8")
     # Either marker locks in the fix.
-    assert (
-        "delta mode removed" in text
-        or "Mode: legacy" in text
-    ), (
+    assert "delta mode removed" in text or "Mode: legacy" in text, (
         "phase1-check-script.py must keep its legacy-mode marker — "
         "delta mode is broken (see 2026-05-08-phase1-check-delta-mode-bug)."
     )
@@ -436,3 +431,93 @@ def test_count_total_notes_excludes_scaffolding(tmp_path: Path) -> None:
     _write(vault / "research" / "foo.md", "body")
     _write(vault / "reference" / "bar.md", "body")
     assert count_total_notes(vault) == 2
+
+
+# ---------------------------------------------------------------------------
+# Regression: scaffolding files (index.md / README.md / unresolved.md) must
+# resolve as wikilink targets even though they don't count toward
+# total_notes or appear in orphan candidate sets. The original PR #18
+# excluded them everywhere, which made every [[index]] / [[unresolved]]
+# reference register as broken.
+# ---------------------------------------------------------------------------
+
+
+def test_broken_wikilinks_resolves_scaffolding_index(tmp_path: Path) -> None:
+    vault = _make_vault(tmp_path)
+    _write(vault / "index.md", "# Index\n\nVault scaffolding.\n")
+    _write(vault / "research" / "foo.md", "Body links to [[index]].\n")
+    n, broken = count_broken_wikilinks(vault)
+    assert n == 0
+    assert broken == []
+
+
+def test_broken_wikilinks_resolves_scaffolding_unresolved(tmp_path: Path) -> None:
+    vault = _make_vault(tmp_path)
+    _write(vault / "unresolved.md", "# Unresolved\n\nBookkeeping page.\n")
+    _write(vault / "dailies" / "2026-05-08.md", "Backlog: [[unresolved]] today.\n")
+    n, broken = count_broken_wikilinks(vault)
+    assert n == 0
+    assert broken == []
+
+
+def test_broken_wikilinks_resolves_scaffolding_readme(tmp_path: Path) -> None:
+    vault = _make_vault(tmp_path)
+    _write(vault / "README.md", "# Readme\n")
+    _write(vault / "reference" / "x.md", "See [[README]] for the conventions.\n")
+    n, broken = count_broken_wikilinks(vault)
+    assert n == 0
+
+
+def test_total_notes_still_excludes_scaffolding_after_fix(tmp_path: Path) -> None:
+    """Scaffolding resolves as a wikilink target, but it must NOT count
+    toward ``total_notes`` — that's the inverse invariant. Both checks
+    have to coexist."""
+    vault = _make_vault(tmp_path)
+    _write(vault / "index.md", "")
+    _write(vault / "unresolved.md", "")
+    _write(vault / "research" / "foo.md", "")
+    assert count_total_notes(vault) == 1
+
+
+def test_orphans_still_exclude_scaffolding_after_fix(tmp_path: Path) -> None:
+    """Scaffolding resolves as a wikilink target, but it must NOT appear
+    in the orphan candidate set even when nothing references it. This is
+    the inverse of the broken-link case — the scaffolding is conceptually
+    a hub, never an orphan."""
+    vault = _make_vault(tmp_path)
+    _write(vault / "index.md", "")
+    _write(vault / "unresolved.md", "")
+    _write(vault / "README.md", "")
+    n, orphans = count_orphans(vault)
+    assert n == 0
+    assert orphans == []
+
+
+# ---------------------------------------------------------------------------
+# Regression: double-backtick code spans (``[[wikilink]]``) leaked through
+# the inline-code stripper in alice_indexer.yaml_lite. Markdown allows
+# longer tick runs to delimit spans containing inner ticks; widest first
+# is the right strip order.
+# ---------------------------------------------------------------------------
+
+
+def test_broken_wikilinks_excludes_double_backtick_code_spans(tmp_path: Path) -> None:
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "foo.md",
+        "Documenting the wikilink syntax: ``[[example-target]]`` is how you write one.\n",
+    )
+    n, broken = count_broken_wikilinks(vault)
+    assert n == 0
+    assert broken == []
+
+
+def test_broken_wikilinks_excludes_mixed_tick_widths(tmp_path: Path) -> None:
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "foo.md",
+        "Single `[[a]]` and double ``[[b]]`` and real broken [[c]] in body.\n",
+    )
+    n, broken = count_broken_wikilinks(vault)
+    assert n == 1
+    assert broken == [("research/foo.md", "c")]

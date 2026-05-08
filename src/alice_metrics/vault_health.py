@@ -134,6 +134,25 @@ def count_total_notes(vault_dir: Path) -> int:
 # Resolution maps + wikilink extraction
 
 
+def _iter_resolution_targets(vault_dir: Path) -> list[Path]:
+    """Same walk as ``_iter_notes`` but INCLUDES the scaffolding files
+    (``index.md``, ``README.md``, ``unresolved.md``). Those files exist
+    on disk and are routinely linked to from dailies and other notes
+    (e.g. ``[[index]]``, ``[[unresolved]]``); they should resolve as
+    wikilink targets even though they don't count toward ``total_notes``
+    or appear in the orphan candidate set.
+    """
+    if not vault_dir.exists():
+        return []
+    out: list[Path] = []
+    for md in vault_dir.rglob("*.md"):
+        if any(part.startswith(".") for part in md.relative_to(vault_dir).parts):
+            continue
+        out.append(md)
+    out.sort()
+    return out
+
+
 def _build_resolution_index(
     vault_dir: Path,
 ) -> tuple[dict[str, Path], dict[str, list[str]], dict[str, str]]:
@@ -147,12 +166,18 @@ def _build_resolution_index(
 
     ``alias_lower_to_slug`` maps lowercased alias → slug for
     case-insensitive alias resolution.
+
+    The walk uses :func:`_iter_resolution_targets` so scaffolding files
+    (``index.md`` / ``README.md`` / ``unresolved.md``) are registered as
+    resolvable targets too — they're not counted toward ``total_notes``
+    or considered as orphan candidates, but ``[[index]]`` is a valid
+    link that should resolve cleanly.
     """
     by_slug: dict[str, Path] = {}
     slugs_to_aliases: dict[str, list[str]] = {}
     alias_lower_to_slug: dict[str, str] = {}
 
-    for md in _iter_notes(vault_dir):
+    for md in _iter_resolution_targets(vault_dir):
         text = _read_text(md)
         fm, _body = split_frontmatter(text)
         slug = _slug_from_fm(fm, md.stem)
@@ -204,9 +229,7 @@ def count_broken_wikilinks(
     excluded. Resolution checks slug, filename stem, and aliases (case
     insensitive).
     """
-    by_slug, _slugs_to_aliases, alias_lower_to_slug = _build_resolution_index(
-        vault_dir
-    )
+    by_slug, _slugs_to_aliases, alias_lower_to_slug = _build_resolution_index(vault_dir)
     broken: list[tuple[str, str]] = []
     for md in _iter_notes(vault_dir):
         text = _read_text(md)
@@ -232,9 +255,7 @@ def count_orphans(vault_dir: Path) -> tuple[int, list[str]]:
     filename-stem) appears among the union of referenced targets
     across the whole vault.
     """
-    by_slug, slugs_to_aliases, _alias_lower_to_slug = _build_resolution_index(
-        vault_dir
-    )
+    by_slug, slugs_to_aliases, _alias_lower_to_slug = _build_resolution_index(vault_dir)
     # Build the referenced set: every wikilink target seen anywhere,
     # normalized and lowercased so alias-vs-slug matching works.
     referenced_lower: set[str] = set()
@@ -291,9 +312,7 @@ _WAKE_FILENAME_FORMATS: list[re.Pattern[str]] = [
 ]
 
 
-def _parse_wake_filename(
-    name: str, dir_date: datetime | None
-) -> datetime | None:
+def _parse_wake_filename(name: str, dir_date: datetime | None) -> datetime | None:
     """Parse a wake-file name; return a naive ``datetime`` or ``None``.
 
     The HHMMSS-only format takes its date from the parent directory.
