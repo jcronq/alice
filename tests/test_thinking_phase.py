@@ -286,17 +286,88 @@ def test_build_vault_snapshot_ignores_consumed_dir(tmp_path: pathlib.Path) -> No
     assert snap.has_inbox_items is False
 
 
-def test_build_vault_snapshot_reads_consecutive_counters(
+def test_build_vault_snapshot_counts_consecutive_b_from_wake_files(
     tmp_path: pathlib.Path,
 ) -> None:
+    """The consecutive_b/consecutive_null_c counters now derive from
+    ``inner/thoughts/`` wake-file frontmatter rather than from
+    counter-files no code path actually wrote. Regression: the prior
+    ``_read_counter`` implementation always returned 0 because the
+    counter files never existed."""
     state_dir = tmp_path / "state"
     state_dir.mkdir(parents=True)
-    today = _now().date().isoformat()
-    (state_dir / f"consecutive-b-{today}.txt").write_text("4\n")
-    (state_dir / f"consecutive-null-c-{today}.txt").write_text("2\n")
+    thoughts = tmp_path / "inner" / "thoughts" / "2026-05-07"
+    thoughts.mkdir(parents=True)
+    # Three consecutive Stage B wakes, all did_work:false → streak 3.
+    import os as _os
+
+    for i, hhmmss in enumerate(("230000", "230500", "231000")):
+        wake = thoughts / f"{hhmmss}-wake.md"
+        wake.write_text("---\nmode: sleep\nstage: B\ndid_work: false\n---\n")
+        # Force ascending mtimes so newest-first walking works.
+        ts = _now().timestamp() - 3600 + i  # within the 24h window
+        _os.utime(wake, (ts, ts))
     snap = build_vault_snapshot(tmp_path, now=_now(), state_dir=state_dir)
-    assert snap.consecutive_b == 4
-    assert snap.consecutive_null_c == 2
+    assert snap.consecutive_b == 3
+
+
+def test_build_vault_snapshot_consecutive_b_breaks_on_did_work_true(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A Stage B wake with did_work:true breaks the null-pass streak —
+    the model is doing real work, so we don't want to escalate."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+    thoughts = tmp_path / "inner" / "thoughts" / "2026-05-07"
+    thoughts.mkdir(parents=True)
+    import os as _os
+
+    # Newest first: the most recent wake had did_work:true → streak resets.
+    entries = (
+        ("230000", "false"),
+        ("230500", "false"),
+        ("231000", "true"),
+    )
+    for i, (hhmmss, did_work) in enumerate(entries):
+        wake = thoughts / f"{hhmmss}-wake.md"
+        wake.write_text(f"---\nmode: sleep\nstage: B\ndid_work: {did_work}\n---\n")
+        ts = _now().timestamp() - 3600 + i  # within the 24h window
+        _os.utime(wake, (ts, ts))
+    snap = build_vault_snapshot(tmp_path, now=_now(), state_dir=state_dir)
+    assert snap.consecutive_b == 0
+
+
+def test_build_vault_snapshot_consecutive_b_breaks_on_different_stage(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A non-B stage frontmatter (e.g. Stage C) breaks the streak."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+    thoughts = tmp_path / "inner" / "thoughts" / "2026-05-07"
+    thoughts.mkdir(parents=True)
+    import os as _os
+
+    # Newest most recent: stage C → streak should be 0 (most recent isn't B).
+    for i, (hhmmss, stage) in enumerate(
+        (("230000", "B"), ("230500", "B"), ("231000", "C"))
+    ):
+        wake = thoughts / f"{hhmmss}-wake.md"
+        wake.write_text(f"---\nmode: sleep\nstage: {stage}\ndid_work: false\n---\n")
+        ts = _now().timestamp() - 3600 + i  # within the 24h window
+        _os.utime(wake, (ts, ts))
+    snap = build_vault_snapshot(tmp_path, now=_now(), state_dir=state_dir)
+    assert snap.consecutive_b == 0
+
+
+def test_build_vault_snapshot_handles_missing_thoughts_dir(
+    tmp_path: pathlib.Path,
+) -> None:
+    """No thoughts dir at all → counters return 0 cleanly."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+    snap = build_vault_snapshot(tmp_path, now=_now(), state_dir=state_dir)
+    assert snap.consecutive_b == 0
+    assert snap.consecutive_null_c == 0
 
 
 def test_build_vault_snapshot_detects_stage_d_cap_exhaustion(

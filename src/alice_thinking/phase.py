@@ -286,15 +286,37 @@ def _has_recent_research(
     return False
 
 
-def _read_counter(state_dir: pathlib.Path, name: str, *, today: str) -> int:
-    """Read an integer counter from a date-keyed file. Missing → 0."""
-    p = state_dir / f"{name}-{today}.txt"
-    if not p.is_file():
+def _consecutive_stage_count(
+    mind: pathlib.Path,
+    *,
+    stage: str,
+    require_did_work_false: bool,
+    now: _dt.datetime,
+    window_hours: int = 24,
+) -> int:
+    """Count consecutive wake files matching ``stage`` from newest backwards.
+
+    Single source of truth for the escalation counters: the wake-file
+    history under ``inner/thoughts/<date>/`` already records stage:
+    frontmatter on every wake, so deriving the streak from the live data
+    is more reliable than maintaining a separate counter file. The prior
+    implementation (``_read_counter``) read from counter files that no
+    code path actually wrote, so the counters were always 0 and Rule 2b
+    never fired.
+
+    Delegates to :func:`alice_thinking.vault_state._consecutive_count` so
+    both modules agree on the streak definition.
+    """
+    from . import vault_state as _vs
+
+    thoughts_dir = mind / "inner" / "thoughts"
+    if not thoughts_dir.is_dir():
         return 0
-    try:
-        return int(p.read_text().strip() or "0")
-    except (OSError, ValueError):
-        return 0
+    since = now - _dt.timedelta(hours=window_hours)
+    files = _vs._wake_files_within(thoughts_dir, since=since)
+    return _vs._consecutive_count(
+        files, stage=stage, require_did_work_false=require_did_work_false
+    )
 
 
 def _stage_d_cap_exhausted(state_dir: pathlib.Path, *, today: str, cap: int) -> bool:
@@ -357,8 +379,12 @@ def build_vault_snapshot(
             window_days=cfg.recent_research_window_days,
             min_count=cfg.recent_research_min_count,
         ),
-        consecutive_b=_read_counter(state_dir, "consecutive-b", today=today),
-        consecutive_null_c=_read_counter(state_dir, "consecutive-null-c", today=today),
+        consecutive_b=_consecutive_stage_count(
+            mind, stage="B", require_did_work_false=True, now=now
+        ),
+        consecutive_null_c=_consecutive_stage_count(
+            mind, stage="C", require_did_work_false=True, now=now
+        ),
         stage_d_cap_exhausted=_stage_d_cap_exhausted(
             state_dir, today=today, cap=cfg.stage_d_nightly_cap
         ),
