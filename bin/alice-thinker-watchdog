@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# alice-thinker-watchdog — one watchdog tick over /state/worker/thinking.lock.
+#
+# Thin shim over `python -m alice_thinking.watchdog`. The Python entry
+# implements the deterministic rules (stuck / working / orphan-lock /
+# idle), the SIGTERM→SIGKILL escalation, and the events.jsonl emission.
+#
+# Usage:
+#   alice-thinker-watchdog          # one tick, exit 0
+#   alice-thinker-watchdog --echo   # also emit decision to stderr
+#
+# The s6 longrun (`alice-thinker-watchdog`) loops calls to this every
+# 30s — the cadence is in the s6 run script, not here, so manual
+# debugging stays one-shot.
+set -u
+
+VENV_PY="/opt/alice-venv/bin/python"
+ALICE_SRC="${ALICE_SRC:-/home/alice/alice/src}"
+
+if [ ! -x "$VENV_PY" ]; then
+    echo "[alice-thinker-watchdog] venv python missing at $VENV_PY" >&2
+    exit 1
+fi
+
+export PYTHONPATH="$ALICE_SRC"
+export PYTHONUNBUFFERED=1
+exec "$VENV_PY" -m alice_thinking.watchdog "$@"
