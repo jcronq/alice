@@ -73,6 +73,10 @@ class Phase(enum.Enum):
     QUICK = "quick"
     DESIGN_COMMISSION = "design_commission"
     CONFLICT_RESOLUTION = "conflict_resolution"
+    # Task-type dispatched (not cadence-driven). Invoked explicitly by
+    # ``_QwenReviser`` inside the design-commission loop to drive a
+    # single revision turn through the standard PhaseRunner path.
+    REVISE = "revise"
 
 
 @dataclass(frozen=True)
@@ -381,6 +385,10 @@ _PHASE_FRAGMENT_FILES: dict[Phase, str] = {
     # DESIGN_COMMISSION reuses the active fragment (same operational scaffolding;
     # the content being worked on is the commission spec itself).
     Phase.DESIGN_COMMISSION: "active.md",
+    # REVISE is task-type dispatched, parallel to QUICK in shape: no tools,
+    # fixed body. The reviser supplies the spec/draft/feedback as injected
+    # content; the fragment instructs the model to return only revised draft.
+    Phase.REVISE: "revise.md",
 }
 
 

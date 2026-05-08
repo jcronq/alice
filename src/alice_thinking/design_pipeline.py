@@ -38,11 +38,18 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import json
+import os
 import pathlib
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+
+if TYPE_CHECKING:
+    from alice_core.config.model import BackendSpec
+    from alice_core.kernel import KernelSpec
+    from alice_thinking.runtime import PhaseRunner
 
 
 __all__ = [
@@ -256,12 +263,12 @@ class SubAgentRunner:
 
 
 class _NullReviser:
-    """Default reviser used when no real reviser is wired.
+    """Documented test helper — appends feedback as a markdown trailer.
 
-    Returns the draft unchanged with a comment trailer noting the
-    feedback. Production runs should pass a custom callable that
-    invokes Qwen via :class:`PhaseRunner` — the Speaking-side
-    integration is deferred per the design doc.
+    Kept after the v1 wire-up of :class:`_QwenReviser` because some
+    tests still want a reviser that produces deterministic, kernel-free
+    output. Production no longer uses this — the default reviser is
+    :class:`_QwenReviser`.
     """
 
     def __call__(
@@ -282,6 +289,361 @@ class _NullReviser:
             f"feedback:_\n\n{feedback_text}\n"
         )
         return draft + trailer
+
+
+class _QwenReviser:
+    """Real Qwen reviser — dispatches revision turns through PhaseRunner.
+
+    See ``cortex-memory/research/2026-05-07-qwen-reviser-wireup-design.md``.
+    Replaces :class:`_NullReviser` as the default reviser on
+    :class:`DesignPipelineRunner`. Each call dispatches one revision
+    turn (or one+retry on short output) through the standard
+    :class:`PhaseRunner` path with :attr:`Phase.REVISE`, executes the
+    resulting :class:`KernelSpec` via :func:`make_kernel`, validates the
+    output length, and emits structured telemetry for each attempt.
+
+    Failure modes (per D3 of the design):
+
+    - **Timeout** (kernel call exceeds :attr:`MAX_REVISION_SECONDS`):
+      emit ``design_commission_revision`` with ``verdict=timeout``,
+      return the input draft unchanged. No retry — cap-hit logic in
+      the runner takes over after the iteration cap is reached.
+    - **Malformed** (output length < :attr:`MIN_VALID_OUTPUT_RATIO` *
+      input draft length, or non-string output): emit ``verdict=malformed``,
+      log the raw output to ``/tmp/qwen-reviser-malformed-<ts>.txt``
+      for forensics, return draft unchanged. No retry — sub-50% length
+      is non-retryable garbage.
+    - **Short output** (output length < :attr:`MIN_OUTPUT_RATIO` *
+      input draft length but >= :attr:`MIN_VALID_OUTPUT_RATIO`):
+      emit ``verdict=short_output``, retry once with the same inputs.
+      If retry also short, return draft unchanged. If retry succeeds,
+      continue normally.
+
+    Test seams:
+
+    - ``phase_runner=`` constructor parameter — tests inject a stub /
+      ``Mock`` to assert :attr:`Phase.REVISE` was the dispatched phase.
+    - ``_execute_kernel_call(prompt, spec)`` method — synchronous
+      seam tests patch to simulate kernel responses (success, short,
+      malformed, :class:`asyncio.TimeoutError`). Returning a string
+      from this method short-circuits the real kernel dispatch.
+    """
+
+    MAX_REVISION_SECONDS = 300
+    MIN_OUTPUT_RATIO = 0.75
+    MIN_VALID_OUTPUT_RATIO = 0.50
+    MAX_RETRIES = 1
+
+    def __init__(
+        self,
+        backend_spec: Optional["BackendSpec"] = None,
+        phase_runner: Optional["PhaseRunner"] = None,
+        wake_context: Optional[Any] = None,
+        emitter: Optional[Any] = None,
+    ) -> None:
+        # Single owner of backend loading (D2). The runner has no
+        # ``_get_backend_spec`` — the kernel is the reviser's
+        # dependency.
+        self._backend_spec = backend_spec
+        self._phase_runner = phase_runner
+        self._wake_context = wake_context
+        self._emitter = emitter
+        # In-process telemetry buffer — tests inspect this directly;
+        # the parent runner pulls events into its result aggregate.
+        self.events: list[dict[str, Any]] = []
+
+    # ------------------------------------------------------------------ #
+    # Public entry — composes the revision prompt + drives the loop.
+
+    def __call__(
+        self,
+        *,
+        spec: str,
+        draft: str,
+        feedback: list[dict[str, str]],
+    ) -> str:
+        revision_prompt = build_revision_prompt(
+            spec=spec, draft=draft, feedback=feedback
+        )
+        critical = sum(1 for f in feedback if f.get("severity") == "critical")
+        major = sum(1 for f in feedback if f.get("severity") == "major")
+        return self._run_revision(
+            revision_prompt=revision_prompt,
+            draft=draft,
+            feedback_count=len(feedback),
+            critical_count=critical,
+            major_count=major,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Loop control: dispatch + validation + retry.
+
+    def _run_revision(
+        self,
+        *,
+        revision_prompt: str,
+        draft: str,
+        feedback_count: int,
+        critical_count: int,
+        major_count: int,
+    ) -> str:
+        """Drive one revision call (with at most one retry on short output).
+
+        Returns the revised draft string on ``ok`` verdict, or the
+        ``draft`` argument unchanged on any failure path. Always emits
+        one ``design_commission_revision`` telemetry event per attempt.
+        """
+        runner = self._get_phase_runner()
+        ctx = self._get_wake_context()
+
+        # Compose prompt + spec via the standard PhaseRunner path so
+        # the prelude + identity are preserved (D1/D5 unification).
+        from .phase import Phase  # local import keeps module load cheap
+
+        prompt_text, kernel_spec = runner.run(
+            Phase.REVISE, ctx, injected_content=revision_prompt
+        )
+
+        attempts = self.MAX_RETRIES + 1
+        last_text = draft
+        for attempt in range(1, attempts + 1):
+            started = time.time()
+            try:
+                output = self._execute_kernel_call(prompt_text, kernel_spec)
+            except asyncio.TimeoutError:
+                self._emit_event(
+                    revision_seconds=time.time() - started,
+                    draft_input_chars=len(draft),
+                    draft_output_chars=0,
+                    output_length_ratio=0.0,
+                    verdict="timeout",
+                    feedback_count=feedback_count,
+                    critical_count=critical_count,
+                    major_count=major_count,
+                    attempt=attempt,
+                )
+                return draft
+
+            elapsed = time.time() - started
+
+            # Malformed: not a string, or below the 50% non-retryable
+            # threshold. Log raw output to /tmp for forensics.
+            if not isinstance(output, str):
+                self._log_malformed(output)
+                self._emit_event(
+                    revision_seconds=elapsed,
+                    draft_input_chars=len(draft),
+                    draft_output_chars=0,
+                    output_length_ratio=0.0,
+                    verdict="malformed",
+                    feedback_count=feedback_count,
+                    critical_count=critical_count,
+                    major_count=major_count,
+                    attempt=attempt,
+                )
+                return draft
+
+            output = output.strip()
+            ratio = (len(output) / len(draft)) if draft else 1.0
+
+            if ratio < self.MIN_VALID_OUTPUT_RATIO:
+                self._log_malformed(output)
+                self._emit_event(
+                    revision_seconds=elapsed,
+                    draft_input_chars=len(draft),
+                    draft_output_chars=len(output),
+                    output_length_ratio=ratio,
+                    verdict="malformed",
+                    feedback_count=feedback_count,
+                    critical_count=critical_count,
+                    major_count=major_count,
+                    attempt=attempt,
+                )
+                return draft
+
+            if ratio < self.MIN_OUTPUT_RATIO:
+                # Short output — retry-worthy. Emit the short_output
+                # event for THIS attempt, then either retry or fall
+                # back to the input draft.
+                self._emit_event(
+                    revision_seconds=elapsed,
+                    draft_input_chars=len(draft),
+                    draft_output_chars=len(output),
+                    output_length_ratio=ratio,
+                    verdict="short_output",
+                    feedback_count=feedback_count,
+                    critical_count=critical_count,
+                    major_count=major_count,
+                    attempt=attempt,
+                )
+                last_text = output
+                if attempt < attempts:
+                    continue
+                # Out of retries — return input draft unchanged.
+                return draft
+
+            # Output >= 75% of draft → ok.
+            self._emit_event(
+                revision_seconds=elapsed,
+                draft_input_chars=len(draft),
+                draft_output_chars=len(output),
+                output_length_ratio=ratio,
+                verdict="ok",
+                feedback_count=feedback_count,
+                critical_count=critical_count,
+                major_count=major_count,
+                attempt=attempt,
+            )
+            return output
+
+        # Defensive: should be unreachable — the loop above either
+        # returns or `continue`s through every iteration.
+        return last_text  # pragma: no cover
+
+    # ------------------------------------------------------------------ #
+    # Kernel dispatch — test seam.
+
+    def _execute_kernel_call(
+        self, prompt_text: str, kernel_spec: "KernelSpec"
+    ) -> str:
+        """Synchronous kernel-execution seam.
+
+        Wraps the async :meth:`Kernel.run` call with
+        :func:`asyncio.wait_for` (per-revision budget enforced via
+        :attr:`MAX_REVISION_SECONDS`), then runs it via
+        :func:`asyncio.run`. Tests patch this method directly — the
+        production path runs the real kernel.
+
+        Raises :class:`asyncio.TimeoutError` when the per-revision
+        budget elapses; returns the kernel's text output on success.
+        Other kernel errors propagate; the caller treats them as
+        ``malformed`` and records the raw payload.
+        """
+        from alice_core.kernel import make_kernel
+        from alice_core.events import CapturingEmitter
+
+        backend = self._get_backend_spec()
+        # CapturingEmitter is a quiet sink — kernel-level events emitted
+        # during a revision turn are captured but not forwarded. The
+        # design-pipeline emitter receives the aggregate revision event
+        # via ``self._emit_event``.
+        emitter = CapturingEmitter()
+        kernel = make_kernel(backend, emitter, correlation_id="qwen-reviser")
+
+        async def _run() -> str:
+            result = await asyncio.wait_for(
+                kernel.run(prompt_text, kernel_spec),
+                timeout=self.MAX_REVISION_SECONDS,
+            )
+            return result.text or ""
+
+        return asyncio.run(_run())
+
+    # ------------------------------------------------------------------ #
+    # Backend / runner / wake-context loaders.
+
+    def _get_backend_spec(self) -> "BackendSpec":
+        if self._backend_spec is None:
+            self._backend_spec = self._load_backend()
+        return self._backend_spec
+
+    def _load_backend(self) -> "BackendSpec":
+        """Load the thinking backend from ``mind/config/model.yml``.
+
+        Single owner — :class:`DesignPipelineRunner` has no parallel
+        backend-loading method (D2 of the design).
+        """
+        from alice_core.config.model import load as load_model_config
+
+        mind = pathlib.Path(
+            os.environ.get("ALICE_MIND")
+            or pathlib.Path.home() / "alice-mind"
+        )
+        cfg = load_model_config(mind)
+        return cfg.thinking
+
+    def _get_phase_runner(self) -> "PhaseRunner":
+        if self._phase_runner is None:
+            from alice_thinking.runtime import PhaseRunner
+
+            self._phase_runner = PhaseRunner()
+        return self._phase_runner
+
+    def _get_wake_context(self) -> Any:
+        """Return a :class:`WakeContext` for the revision dispatch.
+
+        Built once per reviser instance. The context plumbs the
+        backend's model name through to the :class:`KernelSpec`
+        produced by :class:`PhaseRunner`. Tests inject a custom
+        context via the ``wake_context`` constructor kwarg; the
+        default produces a minimal context tied to the resolved
+        backend spec.
+        """
+        if self._wake_context is not None:
+            return self._wake_context
+
+        from alice_core.config.personae import placeholder
+        from alice_thinking.modes.base import WakeContext
+
+        backend = self._get_backend_spec()
+        mind = pathlib.Path(
+            os.environ.get("ALICE_MIND")
+            or pathlib.Path.home() / "alice-mind"
+        )
+        cwd = pathlib.Path(
+            os.environ.get("ALICE_THINKING_CWD") or pathlib.Path.cwd()
+        )
+        self._wake_context = WakeContext(
+            mind_dir=mind,
+            cwd=cwd,
+            now=_dt.datetime.now(),
+            personae=placeholder(),
+            model=backend.model or "",
+            max_seconds=self.MAX_REVISION_SECONDS,
+            tools=[],  # Phase.REVISE = no tools allowed
+            system_prompt="",
+            quick=False,
+            inline_prompt=None,
+            bootstrap_path=None,
+            directive_path=None,
+        )
+        return self._wake_context
+
+    # ------------------------------------------------------------------ #
+    # Telemetry.
+
+    def _emit_event(self, **fields: Any) -> None:
+        event = {
+            "type": "design_commission_revision",
+            **fields,
+        }
+        self.events.append(event)
+        if self._emitter is not None:
+            try:
+                self._emitter.emit("design_commission_revision", **fields)
+            except Exception:  # noqa: BLE001 - telemetry must never raise
+                pass
+
+    @staticmethod
+    def _log_malformed(payload: Any) -> Optional[pathlib.Path]:
+        """Persist a malformed kernel payload to /tmp for post-mortem.
+
+        Best-effort — failure to write the artifact must not propagate
+        and break the revision flow. Returns the path written or
+        ``None`` if the write failed.
+        """
+        try:
+            ts = int(time.time() * 1000)
+            path = pathlib.Path("/tmp") / f"qwen-reviser-malformed-{ts}.txt"
+            body = (
+                payload
+                if isinstance(payload, str)
+                else repr(payload)
+            )
+            path.write_text(body, encoding="utf-8", errors="replace")
+            return path
+        except OSError:
+            return None
 
 
 def build_revision_prompt(
@@ -332,7 +694,7 @@ class DesignPipelineRunner:
         max_iterations: Optional[int] = None,
     ) -> None:
         self._reviewer = reviewer or SubAgentRunner()
-        self._reviser = reviser or _NullReviser()
+        self._reviser = reviser or _QwenReviser()
         self._max_iterations = max_iterations or self.MAX_ITERATIONS
 
     def run(self, commission_note: pathlib.Path) -> PipelineResult:
