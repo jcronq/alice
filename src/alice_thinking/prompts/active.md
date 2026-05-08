@@ -28,6 +28,17 @@ After draining notes (Step 2), do the work for this wake.
 
 ### Active mode — morning vault scan (preamble, once per day)
 
+> **Algorithm lives in `alice_metrics.vault_health`. Do not re-implement
+> in bash — the metrics are tested in `alice/tests/test_vault_health.py`.**
+> The `total_notes`, `broken_wikilinks`, `orphan_notes`, and
+> `wake_type_distribution` fields below come from a single
+> `python3 -m alice_metrics.vault_health …` call. The bash blocks that
+> used to compute these inline drifted between wakes and produced
+> order-of-magnitude wrong numbers (orphans inflated 930x; broken
+> wikilinks swung 5422 → 2 between scans; wake_type_distribution
+> missed wakes that landed in the next day's directory after
+> midnight). See `cortex-memory/research/2026-05-08-vault-health-metric-stabilization.md`.
+
 **Before picking from the ideas queue**, check whether a `vault_health` event has been written today:
 
 ```bash
@@ -35,7 +46,21 @@ grep '"vault_health"' ~/alice-mind/memory/events.jsonl 2>/dev/null \
   | grep "\"date\": \"$(date +%Y-%m-%d)\""
 ```
 
-If no match → run the morning scan and append one `vault_health` event to `memory/events.jsonl`. Schema and example in `memory/EVENTS-SCHEMA.md §vault_health`. Fields:
+If no match → run the morning scan and append one `vault_health` event to `memory/events.jsonl`. Schema and example in `memory/EVENTS-SCHEMA.md §vault_health`. The four drift-prone fields (`total_notes`, `broken_wikilinks`, `orphan_notes`, `wake_type_distribution`) come from one consolidated module call:
+
+```bash
+yest=$(date -d 'yesterday' +%Y-%m-%d)
+today=$(date +%Y-%m-%d)
+python3 -m alice_metrics.vault_health \
+  --vault ~/alice-mind/cortex-memory \
+  --thoughts ~/alice-mind/inner/thoughts \
+  --window-start "${yest}T23:00:00" \
+  --window-end   "${today}T07:00:00"
+```
+
+The remaining fields (`research_notes_last_night`, surfaces, `stage_c_candidates`, etc.) still come from the bash recipes below — only the four metrics that drifted moved into the module.
+
+Fields:
 
 ```json
 {
@@ -77,17 +102,7 @@ stale=$(find ~/alice-mind/cortex-memory/dailies -name "*.md" | while read f; do
 
 If `total` stays elevated or rises across consecutive days, Stage C is falling behind (debt accumulation — see [[2026-04-28-stage-c-debt-metric-design]]).
 
-`wake_type_distribution` measures last night's stage participation. Count wake files in `inner/thoughts/<yesterday>/` with `stage: <X>` frontmatter and mtime in the 23:00-07:00 window:
-
-```bash
-yest=$(date -d 'yesterday' +%Y-%m-%d)
-for stage in B C D; do
-  count=$(find ~/alice-mind/inner/thoughts/$yest -name "*.md" \
-    -newermt "$yest 23:00" ! -newermt "$(date +%Y-%m-%d) 07:00" 2>/dev/null \
-    -exec grep -l "^stage: $stage$" {} \; 2>/dev/null | wc -l)
-  echo "stage_$(echo $stage | tr A-Z a-z): $count"
-done
-```
+`wake_type_distribution` measures last night's stage participation by counting wake files whose parsed start time falls inside the 23:00→07:00 window, bucketed by `stage:` frontmatter. The bash that used to compute this only scanned `inner/thoughts/<yesterday>/`, missing every wake that landed in `<today>/` after midnight. The Python implementation in `alice_metrics.vault_health` scans both date subdirectories and parses three filename formats (`HHMMSS-wake.md`, `YYYYMMDD-HHMMSS-wake.md`, `YYYYMMDDHHMMSS-wake.md`); the consolidated `python3 -m alice_metrics.vault_health` call above already returns it in the `wake_type_distribution` field — do not re-implement in bash.
 
 If `stage_d == 0` for 3+ consecutive days while `research_notes_last_night > 0` exists, also append `stage_d_drought: true` to the event — Stage D is silently skipping despite eligible vault state. See [[2026-04-27-shadow-path-blindness]] for the precedent (84 Stage-B-only wakes ran unnoticed before Stage C/D were discovered missing).
 
