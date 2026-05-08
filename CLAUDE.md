@@ -61,3 +61,21 @@ Notes:
 `bin/alice-shell` (exec into the live worker), `bin/alice-think` (trigger
 a thinking-hemisphere wake), `bin/alice-init` (first-run scaffold),
 `bin/event-log` (tail/query `memory/events.jsonl`).
+
+## Stage B workflow (typed-step Consolidation)
+
+Stage B (sleep-mode Consolidation) ships in two forms:
+
+- **Prompt-driven** (today's default) — the existing `sleep-b.md` fragment
+  + LLM agent loop. Runs unless `thinking.stage_b_workflow_enabled` is
+  flipped on.
+- **Typed-step workflow** — `alice_thinking.workflows.stage_b`. Native
+  Python workflow with deterministic steps + LLM subroutines for parts
+  needing judgement. Per-step timeouts, telemetry, error containment.
+  See `docs/designs/stage-b-cutover.md` for the flag-flip protocol and
+  `docs/designs/stage-b-adk-workflow-sketch.md` for the design.
+
+The workflow runs in shadow mode (no writes, telemetry tagged
+`stage_b_shadow_*`) when `thinking.stage_b_shadow_enabled=true` while the
+prompt path is still authoritative. Use that to compare outputs before
+flipping the cutover.
