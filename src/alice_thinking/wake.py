@@ -55,11 +55,37 @@ from .phase import (
 from .runtime import PhaseRunner, load_phase_config
 from .selector import select_mode
 from .vault_state import snapshot as snapshot_vault
-from .workflows.stage_b import (
-    load_runner_config as _load_stage_b_config,
-    run_stage_b_shadow as _run_stage_b_shadow,
-    run_stage_b_wake as _run_stage_b_wake,
-)
+# Stage B workflow imports are deferred until a flag actually flips
+# (see ``_import_stage_b_workflow()``). The workflow depends on
+# ``google-adk`` + ``litellm``, which aren't required for the prompt-
+# driven path that runs by default. Import-at-module-load would
+# break every wake on a worker that hasn't pip-installed the new
+# deps yet — exactly what happened when PR #24 merged before the
+# next ``alice-deploy worker`` rebuild.
+
+
+def _import_stage_b_workflow() -> tuple:
+    """Lazy-import the Stage B workflow callables.
+
+    Raises ``ModuleNotFoundError`` with a clear message if the deps
+    aren't installed; callers gate this behind the workflow / shadow
+    flags so default-config wakes never hit it.
+    """
+    try:
+        from .workflows.stage_b import (
+            load_runner_config as load_cfg,
+            run_stage_b_shadow as run_shadow,
+            run_stage_b_wake as run_wake,
+        )
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Stage B workflow dependencies missing. The "
+            "stage_b_workflow_enabled / stage_b_shadow_enabled flags "
+            "require google-adk + litellm. Install in the worker's venv "
+            "or rebuild the container via alice-deploy. Underlying "
+            f"error: {exc}"
+        ) from exc
+    return load_cfg, run_shadow, run_wake
 
 
 DEFAULT_MIND = pathlib.Path("/home/alice/alice-mind")
@@ -560,6 +586,9 @@ def main() -> int:
 
     if not args.quick and phase == Phase.SLEEP_B and workflow_enabled:
         wake_start_ts = time.time()
+        _load_stage_b_config, _run_stage_b_shadow, _run_stage_b_wake = (
+            _import_stage_b_workflow()
+        )
         runner_cfg = _load_stage_b_config(
             mind_dir=mind,
             state_dir=pathlib.Path(args.state_dir),
@@ -629,6 +658,9 @@ def main() -> int:
         and not workflow_enabled
     ):
         try:
+            _load_stage_b_config, _run_stage_b_shadow, _run_stage_b_wake = (
+                _import_stage_b_workflow()
+            )
             shadow_cfg = _load_stage_b_config(
                 mind_dir=mind,
                 state_dir=pathlib.Path(args.state_dir),
