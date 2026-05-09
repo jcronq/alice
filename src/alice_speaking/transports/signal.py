@@ -108,6 +108,12 @@ class SignalTransport:
         # 01). Keeps Signal's same-sender batching from reaching into
         # the daemon's shared queue.
         self._inbox: asyncio.Queue[SignalEvent] = asyncio.Queue(maxsize=inbox_size)
+        # Tracked so the daemon can drain Signal independently from the
+        # rest of shutdown: cancel _produce_task to stop ingesting from
+        # signal-cli, then await _inbox.join() to let _consume_task
+        # finish anything already queued.
+        self._produce_task: Optional[asyncio.Task] = None
+        self._consume_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
     # Lifecycle (no-op — SignalClient lifecycle stays on the daemon)
@@ -204,17 +210,45 @@ class SignalTransport:
         return asyncio.create_task(self._run(ctx), name="sig-produce")
 
     async def _run(self, ctx: DaemonContext) -> None:
-        produce = asyncio.create_task(self._produce(ctx), name="sig-prod-inner")
-        consume = asyncio.create_task(self._consume(ctx), name="sig-cons-inner")
+        self._produce_task = asyncio.create_task(
+            self._produce(ctx), name="sig-prod-inner"
+        )
+        self._consume_task = asyncio.create_task(
+            self._consume(ctx), name="sig-cons-inner"
+        )
         try:
-            await asyncio.gather(produce, consume)
+            # return_exceptions=True so cancelling _produce_task during
+            # drain doesn't propagate cancellation to _consume_task via
+            # gather. Drain explicitly stops _produce, lets _consume
+            # finish the inbox, then cancels the supervisor.
+            await asyncio.gather(
+                self._produce_task, self._consume_task, return_exceptions=True
+            )
         except asyncio.CancelledError:
-            for task in (produce, consume):
+            for task in (self._produce_task, self._consume_task):
                 task.cancel()
-            for task in (produce, consume):
+            for task in (self._produce_task, self._consume_task):
                 with contextlib.suppress(BaseException):
                     await task
             raise
+
+    async def drain(self) -> None:
+        """Stop ingesting new envelopes; wait for the inbox to fully drain.
+
+        Daemon-orchestrated graceful shutdown: cancels :attr:`_produce_task`
+        so signal-cli polling stops (no new events into :attr:`_inbox`),
+        then waits for :meth:`_consume` to finish anything already
+        queued. Returns when ``_inbox`` is empty and ``task_done`` has
+        matched every prior ``put``.
+
+        Caller is expected to subsequently cancel the supervisor task
+        returned by :meth:`producer` to release ``_consume_task``.
+        """
+        if self._produce_task is not None and not self._produce_task.done():
+            self._produce_task.cancel()
+            with contextlib.suppress(BaseException):
+                await self._produce_task
+        await self._inbox.join()
 
     async def _produce(self, ctx: DaemonContext) -> None:
         """Push raw Signal envelopes onto the per-transport inbox.

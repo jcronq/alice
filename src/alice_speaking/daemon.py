@@ -367,6 +367,14 @@ class SpeakingDaemon:
         # body. Phase 6 replaces the lock with a TurnDispatcher that
         # owns the same invariant explicitly.
         self._turn_lock: asyncio.Lock = asyncio.Lock()
+        # Two-stage shutdown:
+        #   _drain (first SIGTERM) — stop accepting new events, finish
+        #       in-flight turn, drain queued events, then exit cleanly
+        #       so the blue/green deploy can hand the lease over without
+        #       killing a turn mid-Claude-call.
+        #   _stop (second SIGTERM) — force-stop, cancels everything
+        #       immediately. Escape hatch for a hung drain.
+        self._drain = asyncio.Event()
         self._stop = asyncio.Event()
         # Phase 6c of plan 01: quiet-hours queue watcher + drain
         # entry point live on QuietQueueRunner. Daemon's run loop
@@ -502,8 +510,17 @@ class SpeakingDaemon:
         )
 
         loop = asyncio.get_event_loop()
+
+        def _on_signal() -> None:
+            if not self._drain.is_set():
+                log.info("signal received; entering drain mode")
+                self._drain.set()
+            else:
+                log.warning("second signal received; force-stopping")
+                self._stop.set()
+
         for sig in (_signal.SIGTERM, _signal.SIGINT):
-            loop.add_signal_handler(sig, self._stop.set)
+            loop.add_signal_handler(sig, _on_signal)
 
         self.events.emit(
             "daemon_start",
@@ -564,26 +581,134 @@ class SpeakingDaemon:
                     producers.append(task)
             # Signal owns its own per-transport consumer loop
             # (Phase 2a) and is intentionally absent from the
-            # registry; schedule it separately.
+            # registry; schedule it separately. Tracked apart from
+            # ``producers`` so drain can stop just its inner _produce
+            # while leaving _consume to finish the inbox.
+            signal_run_task: Optional[asyncio.Task] = None
             if self.signal_transport is not None:
-                task = self.signal_transport.producer(ctx)
-                if task is not None:
-                    producers.append(task)
+                signal_run_task = self.signal_transport.producer(ctx)
             consumer = asyncio.create_task(self._consumer(), name="consumer")
+            drain_task = asyncio.create_task(self._drain.wait(), name="drain")
             stop_task = asyncio.create_task(self._stop.wait(), name="stop")
 
+            watch_set: set[asyncio.Task] = {
+                *producers,
+                consumer,
+                drain_task,
+                stop_task,
+            }
+            if signal_run_task is not None:
+                watch_set.add(signal_run_task)
+
             done, _ = await asyncio.wait(
-                {*producers, consumer, stop_task},
-                return_when=asyncio.FIRST_COMPLETED,
+                watch_set, return_when=asyncio.FIRST_COMPLETED
             )
-            log.info(
-                "shutdown starting (triggered by %s)", [t.get_name() for t in done]
-            )
-            for task in (*producers, consumer):
-                task.cancel()
-            for task in (*producers, consumer):
-                with contextlib.suppress(BaseException):
-                    await task
+            log.info("shutdown trigger: %s", [t.get_name() for t in done])
+
+            if stop_task in done:
+                # Force-stop path: SIGTERM with no preceding drain
+                # (_drain not set first), or a second signal during
+                # drain. Cancel everything now; in-flight turn dies
+                # via CancelledError.
+                log.warning("force-stop: cancelling all tasks")
+                cancel_set: list[asyncio.Task] = [
+                    *producers,
+                    consumer,
+                    drain_task,
+                ]
+                if signal_run_task is not None:
+                    cancel_set.append(signal_run_task)
+                for task in cancel_set:
+                    if not task.done():
+                        task.cancel()
+                for task in cancel_set:
+                    with contextlib.suppress(BaseException):
+                        await task
+            else:
+                # Drain path. Triggered by SIGTERM (drain_task done)
+                # or by an upstream task crashing — either way the
+                # in-flight turn shouldn't pay the price. Stop
+                # accepting new events; let consumers finish what's
+                # already queued; then exit.
+                log.info("drain: stopping producers (no new events accepted)")
+
+                # Cancel non-Signal producers; events they've already
+                # pushed to ``self._queue`` stay there and will be
+                # processed by the main consumer below.
+                for prod in producers:
+                    if not prod.done():
+                        prod.cancel()
+                for prod in producers:
+                    with contextlib.suppress(BaseException):
+                        await prod
+
+                # Signal: stop the inner _produce, let _consume finish
+                # the inbox. Supervisor task is cancelled afterwards.
+                if self.signal_transport is not None:
+                    with contextlib.suppress(Exception):
+                        await self.signal_transport.drain()
+
+                log.info("drain: waiting for in-flight turn + queued events")
+                drain_timeout_env = os.environ.get(
+                    "ALICE_SPEAKING_DRAIN_TIMEOUT", ""
+                ).strip()
+                drain_timeout: Optional[float]
+                try:
+                    drain_timeout = (
+                        float(drain_timeout_env) if drain_timeout_env else None
+                    )
+                except ValueError:
+                    log.warning(
+                        "ignoring non-numeric ALICE_SPEAKING_DRAIN_TIMEOUT=%r",
+                        drain_timeout_env,
+                    )
+                    drain_timeout = None
+
+                # _queue.join() blocks until every put() has a matching
+                # task_done(). Consumer's task_done is in finally
+                # (see _consumer below), so this implicitly waits for
+                # the current turn to complete.
+                drain_await = asyncio.create_task(
+                    self._queue.join(), name="drain-await"
+                )
+                stop_during_drain = asyncio.create_task(
+                    self._stop.wait(), name="stop-during-drain"
+                )
+                try:
+                    if drain_timeout is not None:
+                        done2, _ = await asyncio.wait(
+                            {drain_await, stop_during_drain},
+                            timeout=drain_timeout,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if not done2:
+                            log.warning(
+                                "drain timeout (%.1fs) exceeded", drain_timeout
+                            )
+                    else:
+                        await asyncio.wait(
+                            {drain_await, stop_during_drain},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    if stop_during_drain.done() and not drain_await.done():
+                        log.warning("force-stop received mid-drain")
+                finally:
+                    for task in (drain_await, stop_during_drain):
+                        if not task.done():
+                            task.cancel()
+                        with contextlib.suppress(BaseException):
+                            await task
+
+                log.info("drain complete; cancelling consumers")
+                cancel_set = [consumer, drain_task]
+                if signal_run_task is not None:
+                    cancel_set.append(signal_run_task)
+                for task in cancel_set:
+                    if not task.done():
+                        task.cancel()
+                for task in cancel_set:
+                    with contextlib.suppress(BaseException):
+                        await task
         finally:
             if self.signal_transport is not None:
                 with contextlib.suppress(Exception):

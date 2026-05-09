@@ -130,3 +130,107 @@ def test_burst_does_not_disturb_other_transports():
     while not main_queue.empty():
         drained.append(main_queue.get_nowait())
     assert [ev.message.text for ev in drained] == ["disc-A", "disc-B"]
+
+
+# ----------------------------------------------------------------------
+# Transport drain (graceful shutdown). Separate from _drain_batch above:
+# this is the lifecycle hook the daemon calls on first SIGTERM so a
+# blue/green deploy can release the lease without killing the in-flight
+# Signal turn.
+
+class _FakeRPC:
+    """Minimal SignalRPC stand-in that yields a controllable stream."""
+
+    def __init__(self, envelopes: list[SignalEnvelope]) -> None:
+        self._envelopes = envelopes
+        self._gate = asyncio.Event()  # holds receive() open after the list
+
+    async def receive(self):
+        for env in self._envelopes:
+            yield env
+        # Block forever (until cancelled) so receive() looks like a
+        # real long-lived stream — drain has to cancel us.
+        await self._gate.wait()
+
+
+class _StubAddressBook:
+    def is_allowed(self, *_args, **_kwargs) -> bool:
+        return True
+
+    def display_name_for(self, *_args, **_kwargs) -> str:
+        return "Owner"
+
+
+class _StubDedup:
+    def __init__(self) -> None:
+        self._seen: set[int] = set()
+
+    def seen(self, ts: int) -> bool:
+        return ts in self._seen
+
+    def mark(self, ts: int) -> None:
+        self._seen.add(ts)
+
+
+class _StubCtx:
+    def __init__(self) -> None:
+        self.address_book = _StubAddressBook()
+        self.dedup = _StubDedup()
+
+
+def test_drain_stops_produce_and_waits_for_inbox_to_empty():
+    """drain() must:
+    1. Cancel the inner _produce task so signal-cli polling stops.
+    2. Block until _consume has finished every event already pulled
+       (i.e., _inbox.join() returns).
+    """
+
+    async def _exercise() -> None:
+        envelopes = [
+            SignalEnvelope(timestamp=t, source="+15555550100", body=f"msg-{t}")
+            for t in (1, 2, 3)
+        ]
+        t = SignalTransport(signal_client=_FakeRPC(envelopes))
+
+        consumed: list[SignalEvent] = []
+
+        async def _fake_consume(_ctx) -> None:
+            while True:
+                ev = await t._inbox.get()
+                try:
+                    # Simulate per-turn work that takes a real moment so
+                    # drain() has something to wait on rather than
+                    # racing past an empty inbox.
+                    await asyncio.sleep(0.02)
+                    consumed.append(ev)
+                finally:
+                    t._inbox.task_done()
+
+        t._consume = _fake_consume  # type: ignore[assignment]
+
+        ctx = _StubCtx()
+        run_task = t.producer(ctx)
+        assert run_task is not None
+        try:
+            # Let _produce push all envelopes into the inbox.
+            for _ in range(50):
+                if t._inbox.qsize() == 3 or len(consumed) > 0:
+                    break
+                await asyncio.sleep(0.01)
+
+            await t.drain()
+
+            # All three envelopes ran through the consumer.
+            assert len(consumed) == 3
+            assert [ev.envelope.timestamp for ev in consumed] == [1, 2, 3]
+            # Producer is gone; inbox is empty.
+            assert t._produce_task is not None and t._produce_task.done()
+            assert t._inbox.empty()
+        finally:
+            run_task.cancel()
+            try:
+                await run_task
+            except (asyncio.CancelledError, BaseException):
+                pass
+
+    asyncio.run(_exercise())
