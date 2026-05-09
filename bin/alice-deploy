@@ -10,14 +10,23 @@
 # /state/worker/lease). Deploy alternates:
 #
 #   1. Detect live slot (flock probe). NEXT = the other slot.
-#   2. Build new image; tag as alice-worker:$NEXT.
-#   3. `compose --profile $NEXT up -d alice-worker-$NEXT`. New container
+#   2. Force-remove any leftover container in the NEXT slot — usually the
+#      previous deploy's OLD container that finished draining. If a deploy
+#      cadence outpaces thinker drain (rare), this SIGKILLs an in-flight
+#      wake; the watchdog handles the consequences.
+#   3. Build new image; tag as alice-worker:$NEXT.
+#   4. `compose --profile $NEXT up -d alice-worker-$NEXT`. New container
 #      starts, bridge blocks on flock (live still holds it).
-#   4. SIGTERM live worker. Its bridge drains in-flight claude calls, exits.
-#      Lease auto-releases.
-#   5. NEXT worker's bridge unblocks, acquires lease, does catchup, resumes
-#      processing.
-#   6. Stop + remove live's container. NEXT is now live.
+#   5. SIGTERM live worker. The speaking bridge enters drain mode (finish
+#      current turn + queued events, then exit) — fd 9 released, lease
+#      transfers. The thinker keeps running, finishing its in-flight wake
+#      in the background; the container only fully exits when every
+#      service has drained.
+#   6. NEXT worker's bridge unblocks, acquires lease, does catchup, resumes
+#      processing — Alice is now talking from the new slot.
+#   7. Detach a background cleanup that waits for the old container to
+#      exit (= thinker also drained), then ``docker rm``s it. 30-minute
+#      hard cap.
 #
 # Rollback: same flow but keep the NEXT slot's EXISTING image (don't rebuild).
 # Since each slot's image tag points at whatever it was last deployed with,
@@ -30,6 +39,11 @@ SANDBOX_DIR="$ALICE_ROOT/sandbox"
 DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-300}"
 READY_TIMEOUT="${READY_TIMEOUT:-90}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-60}"
+# Hard cap on background cleanup: how long we wait for the old container
+# to exit naturally (= thinker finished its in-flight wake) before
+# SIGKILLing it. 30 min covers any reasonable wake; longer than that is
+# a hung wake the watchdog should have caught.
+CLEANUP_TIMEOUT="${CLEANUP_TIMEOUT:-1800}"
 
 # shellcheck source=./_alice-env.sh
 . "$ALICE_ROOT/bin/_alice-env.sh"
@@ -148,7 +162,7 @@ deploy_worker() {
         die "deploy aborted"
     fi
 
-    log "SIGTERM → alice-worker-$live (drain up to ${DRAIN_TIMEOUT}s) ..."
+    log "SIGTERM → alice-worker-$live (speaking drains, lease releases) ..."
     docker kill --signal=SIGTERM "alice-worker-$live" 2>/dev/null || true
 
     log "Waiting for alice-worker-$next to acquire lease ..."
@@ -162,10 +176,41 @@ deploy_worker() {
         fi
     fi
 
-    log "alice-worker-$next is live. Removing alice-worker-$live ..."
-    docker stop "alice-worker-$live" >/dev/null 2>&1 || true
-    docker rm "alice-worker-$live" >/dev/null 2>&1 || true
-    log "Done. Live slot is now $next."
+    log "alice-worker-$next is live. Live slot is now $next."
+    log "alice-worker-$live still draining (thinker may have an in-flight wake); cleanup detached."
+    detach_old_container_cleanup "alice-worker-$live"
+}
+
+# Wait in the background for ``$1`` to exit naturally (the thinker
+# supervisor finishes its in-flight wake, then s6 brings the container
+# down) and ``docker rm`` it. ``CLEANUP_TIMEOUT`` (default 30 min) caps
+# the wait — past that we SIGKILL on the assumption the wake is hung
+# and the watchdog will surface it elsewhere. Disowned so the deploy
+# script can return immediately; the subshell survives independent of
+# the parent shell.
+detach_old_container_cleanup() {
+    local name="$1"
+    (
+        local deadline poll_interval=10
+        deadline=$(( $(date +%s) + CLEANUP_TIMEOUT ))
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+            local status
+            status=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || echo missing)
+            case "$status" in
+                missing)
+                    exit 0
+                    ;;
+                exited|dead)
+                    docker rm "$name" >/dev/null 2>&1 || true
+                    exit 0
+                    ;;
+            esac
+            sleep "$poll_interval"
+        done
+        # Cap exceeded — assume hung wake; force-kill and reap.
+        docker rm -f "$name" >/dev/null 2>&1 || true
+    ) </dev/null >/dev/null 2>&1 &
+    disown
 }
 
 # ---------- daemon deploy ----------
