@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>{{ personae.agent.name }} Viewer · {% block title %}{% endblock %}</title>
-  <link rel="stylesheet" href="/static/style.css?v=context-blocks-3-lobe-labels" />
+  <link rel="stylesheet" href="/static/style.css?v=context-blocks-3-lobe-labels-stage-d-1" />
   <script src="https://unpkg.com/htmx.org@1.9.12"></script>
   <script src="https://unpkg.com/htmx.org@1.9.12/dist/ext/sse.js"></script>
   <script src="https://d3js.org/d3.v7.min.js"></script>
@@ -29,6 +29,7 @@
       <a href="/memory"     class="{% if active == 'memory' %}on{% endif %}">memory graph</a>
       <a href="/activity"   class="{% if active == 'activity' %}on{% endif %}">activity</a>
       <a href="/context"    class="{% if active == 'context' %}on{% endif %}">context</a>
+      <a href="/stage-d-review" class="{% if active == 'stage-d-review' %}on{% endif %}">stage D</a>
     </nav>
   </header>
   {# Live-update channel. Emits a `change` event whenever any source
