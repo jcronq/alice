@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import pathlib
 import time
@@ -20,6 +21,7 @@ from . import (
     labels as kind_labels,
     narrative as narrative_mod,
     sources,
+    stage_d_store,
 )
 from .settings import Paths, load as load_paths
 
@@ -1114,6 +1116,220 @@ def create_app(paths: Paths | None = None) -> FastAPI:
             "_sidebar.html",
             {"state": _state_context()},
         )
+
+    # ------------------------------------------------------------------
+    # Stage D review — dual-judge synthesis labeling pipeline.
+    #
+    # Spec: cortex-memory/research/2026-05-08-stage-d-cap-redesign-quality-gated.md
+    # (sections 9-10) and 2026-05-09-stage-d-labeling-pipeline.md.
+    #
+    # Storage and join semantics live in ``stage_d_store``; routes here
+    # are thin orchestration. The attempts log is read-only from the
+    # viewer's side — only the labels sidecar is appended to.
+
+    # Labels we accept from the one-keystroke UI. ``unlabeled`` is the
+    # explicit "clear my prior label" signal — a fresh append wins on
+    # read so we never delete history.
+    _STAGE_D_VALID_LABELS = {"T1", "T2", "T3", "T4", "ship", "reject", "unlabeled"}
+
+    def _stage_d_load_joined() -> list[dict[str, Any]]:
+        p: Paths = app.state.paths
+        attempts = stage_d_store.read_attempts(p.mind_dir)
+        labels = stage_d_store.read_labels(p.mind_dir)
+        return stage_d_store.join_attempts_with_labels(attempts, labels)
+
+    @app.get("/stage-d-review", response_class=HTMLResponse)
+    async def stage_d_review(
+        request: Request,
+        since: str | None = None,
+        status: str | None = None,
+        days: int = 7,
+        focus: str | None = None,
+    ):
+        """Morning review surface for the dual-judge Stage D pipeline.
+
+        ``since`` overrides ``days`` when provided (ISO date). Default
+        window is the last 7 nights, configurable via ``?days=N``.
+        ``status`` filters to one of {disagreement, shipped, dropped,
+        unlabeled}. ``focus`` is the attempt id to scroll to / give
+        focus to on load — used so the post-label htmx swap can advance
+        focus without losing scroll position.
+        """
+        joined = _stage_d_load_joined()
+
+        # Window resolution: explicit ``since`` wins, else compute from days.
+        effective_since = since
+        if not effective_since:
+            try:
+                d = max(1, int(days))
+            except (TypeError, ValueError):
+                d = 7
+            floor = dt.date.today() - dt.timedelta(days=d)
+            effective_since = floor.isoformat()
+
+        # Banner counts run over the windowed corpus *before* the status
+        # filter — so the counts reflect what the operator can see if
+        # they clear the status filter, not just what the current view
+        # shows. Otherwise the totals would be circular.
+        windowed = stage_d_store.filter_attempts(joined, since=effective_since)
+        summary = stage_d_store.summarize(windowed)
+
+        filtered = stage_d_store.filter_attempts(windowed, status=status)
+        rows = stage_d_store.default_sort(filtered)
+
+        return templates.TemplateResponse(
+            request,
+            "stage_d_review.html",
+            {
+                "rows": rows,
+                "summary": summary,
+                "since": effective_since,
+                "days": days,
+                "status": status,
+                "focus": focus,
+                "valid_labels": sorted(_STAGE_D_VALID_LABELS),
+                "state": _state_context(),
+                "active": "stage-d-review",
+            },
+        )
+
+    @app.get("/stage-d-review/rows", response_class=HTMLResponse)
+    async def stage_d_review_rows(
+        request: Request,
+        since: str | None = None,
+        status: str | None = None,
+        days: int = 7,
+        focus: str | None = None,
+    ):
+        """HTML partial — just the rows. Used by htmx to refresh the
+        list after a label without bouncing the whole page (so scroll
+        position is preserved).
+        """
+        joined = _stage_d_load_joined()
+        effective_since = since
+        if not effective_since:
+            try:
+                d = max(1, int(days))
+            except (TypeError, ValueError):
+                d = 7
+            floor = dt.date.today() - dt.timedelta(days=d)
+            effective_since = floor.isoformat()
+        windowed = stage_d_store.filter_attempts(joined, since=effective_since)
+        filtered = stage_d_store.filter_attempts(windowed, status=status)
+        rows = stage_d_store.default_sort(filtered)
+        return templates.TemplateResponse(
+            request,
+            "_stage_d_rows_partial.html",
+            {
+                "rows": rows,
+                "focus": focus,
+                "status": status,
+                "since": effective_since,
+                "days": days,
+                "valid_labels": sorted(_STAGE_D_VALID_LABELS),
+            },
+        )
+
+    @app.get("/stage-d-review/summary", response_class=HTMLResponse)
+    async def stage_d_review_summary(
+        request: Request,
+        since: str | None = None,
+        days: int = 7,
+    ):
+        """HTML partial — the counts banner. Re-rendered after each
+        label so the unlabeled count ticks down live.
+        """
+        joined = _stage_d_load_joined()
+        effective_since = since
+        if not effective_since:
+            try:
+                d = max(1, int(days))
+            except (TypeError, ValueError):
+                d = 7
+            floor = dt.date.today() - dt.timedelta(days=d)
+            effective_since = floor.isoformat()
+        windowed = stage_d_store.filter_attempts(joined, since=effective_since)
+        summary = stage_d_store.summarize(windowed)
+        return templates.TemplateResponse(
+            request,
+            "_stage_d_summary_partial.html",
+            {"summary": summary, "since": effective_since, "days": days},
+        )
+
+    @app.get("/api/stage-d-attempts")
+    async def api_stage_d_attempts(
+        since: str | None = None,
+        status: str | None = None,
+    ) -> JSONResponse:
+        """Joined attempts as JSON. ``since=YYYY-MM-DD`` and
+        ``status=disagreement|shipped|dropped|unlabeled`` supported."""
+        joined = _stage_d_load_joined()
+        filtered = stage_d_store.filter_attempts(joined, since=since, status=status)
+        return JSONResponse(stage_d_store.default_sort(filtered))
+
+    @app.get("/api/stage-d-summary")
+    async def api_stage_d_summary(since: str | None = None) -> JSONResponse:
+        """Counts banner: ``{shipped, dropped, disagreement, total, unlabeled}``."""
+        joined = _stage_d_load_joined()
+        windowed = stage_d_store.filter_attempts(joined, since=since)
+        return JSONResponse(stage_d_store.summarize(windowed))
+
+    @app.post("/api/stage-d-label")
+    async def api_stage_d_label(request: Request) -> JSONResponse:
+        """Append a label record to ``stage-d-labels.jsonl``.
+
+        Accepts JSON ``{"attempt_id", "label", "axes"?}`` *or*
+        form-urlencoded with the same keys (htmx default). The labels
+        log is append-only — re-labeling is just another append, and
+        the join logic picks the newest entry.
+        """
+        # Parse body without depending on python-multipart: try JSON
+        # first, fall back to manually-parsed form-urlencoded.
+        body = await request.body()
+        ct = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+        data: dict[str, Any] = {}
+        if ct == "application/json" or (body and body.lstrip().startswith(b"{")):
+            try:
+                data = json.loads(body or b"{}")
+            except json.JSONDecodeError:
+                return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        else:
+            from urllib.parse import parse_qsl
+
+            data = dict(parse_qsl(body.decode("utf-8", errors="replace")))
+
+        attempt_id = (data.get("attempt_id") or "").strip()
+        label = (data.get("label") or "").strip()
+        axes = data.get("axes") or data.get("label_axes")
+
+        if not attempt_id:
+            return JSONResponse({"error": "attempt_id required"}, status_code=400)
+        if label not in _STAGE_D_VALID_LABELS:
+            return JSONResponse(
+                {
+                    "error": f"invalid label {label!r}; expected one of "
+                    f"{sorted(_STAGE_D_VALID_LABELS)}"
+                },
+                status_code=400,
+            )
+        if axes is not None and not isinstance(axes, dict):
+            # Accept JSON-string axes from form-encoded clients.
+            try:
+                axes = json.loads(axes)
+            except (TypeError, ValueError):
+                axes = None
+
+        p: Paths = app.state.paths
+        try:
+            rec = stage_d_store.append_label(
+                p.mind_dir,
+                attempt_id=attempt_id,
+                label=label,
+                axes=axes if isinstance(axes, dict) else None,
+            )
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse({"ok": True, "label_record": rec})
 
     # ------------------------------------------------------------------
     # SSE live tail
