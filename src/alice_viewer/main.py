@@ -593,6 +593,40 @@ def create_app(paths: Paths | None = None) -> FastAPI:
 
         return EventSourceResponse(gen())
 
+    @app.get("/canvas", response_class=HTMLResponse)
+    async def canvas_index(request: Request):
+        p: Paths = app.state.paths
+        canvases = sources.list_canvases(p.inner)
+        return templates.TemplateResponse(
+            request,
+            "canvas_index.html",
+            {
+                "canvases": canvases,
+                "state": _state_context(),
+                "active": "canvas",
+            },
+        )
+
+    @app.get("/canvas/{slug}", response_class=HTMLResponse)
+    async def canvas_view(request: Request, slug: str):
+        p: Paths = app.state.paths
+        canvas = sources.read_canvas(p.inner, slug)
+        if canvas is None:
+            return HTMLResponse(
+                f"<h1>canvas not found: {slug}</h1>"
+                f"<p><a href='/canvas'>← back to index</a></p>",
+                status_code=404,
+            )
+        return templates.TemplateResponse(
+            request,
+            "canvas_view.html",
+            {
+                "canvas": canvas,
+                "state": _state_context(),
+                "active": "canvas",
+            },
+        )
+
     @app.get("/activity", response_class=HTMLResponse)
     async def activity_view(request: Request, window: str = "24h"):
         p: Paths = app.state.paths

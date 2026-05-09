@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}canvas{% endblock %}
+{% block body %}
+  <h1>canvas</h1>
+  <p class="muted">
+    Slideshows and free-form pages {{ personae.agent.name }} authors when prose isn't enough.
+    Each canvas is a markdown file in <code>~/alice-mind/inner/canvas/</code>; slides separated by <code>---</code>.
+    Direct-link a canvas with <code>/canvas/&lt;slug&gt;</code>.
+  </p>
+
+  {% if canvases %}
+    <ul class="canvas-list">
+      {% for c in canvases %}
+        <li>
+          <a href="/canvas/{{ c.slug }}" class="canvas-row">
+            <span class="canvas-title">{{ c.title }}</span>
+            <span class="canvas-slug">/canvas/{{ c.slug }}</span>
+            <span class="canvas-meta">{{ c.mtime | localtime }} · {{ c.size }} bytes</span>
+          </a>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="muted"><em>No canvases yet. {{ personae.agent.name }} hasn't authored any.</em></p>
+  {% endif %}
+
+  <style>
+    .canvas-list { list-style: none; padding: 0; margin: 1.5em 0; max-width: 820px; }
+    .canvas-list li { margin: 0; }
+    .canvas-row {
+      display: grid; grid-template-columns: 1fr auto; grid-template-rows: auto auto;
+      gap: 2px 16px; padding: 12px 16px; border: 1px solid var(--border); border-radius: 6px;
+      margin-bottom: 8px; background: var(--panel); text-decoration: none; color: inherit;
+      transition: border-color 0.1s, background 0.1s;
+    }
+    .canvas-row:hover { border-color: var(--accent); background: var(--panel-2); }
+    .canvas-title {
+      grid-column: 1; grid-row: 1; font-size: 15px; font-weight: 600; color: var(--text);
+    }
+    .canvas-slug {
+      grid-column: 2; grid-row: 1; font-family: var(--mono, monospace); font-size: 12px;
+      color: var(--accent); align-self: center;
+    }
+    .canvas-meta {
+      grid-column: 1 / -1; grid-row: 2; font-size: 12px; color: var(--muted);
+      font-family: var(--mono, monospace);
+    }
+  </style>
+{% endblock %}

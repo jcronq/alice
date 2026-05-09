@@ -1,0 +1,60 @@
+{# Standalone canvas view — does NOT extend base.html, so the slideshow
+   gets the full viewport. A small fixed-position chrome bar links back. #}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>{{ canvas.title }} · canvas</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5/dist/reveal.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5/dist/theme/black.css" id="theme" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5/plugin/highlight/monokai.css" />
+  <style>
+    .canvas-chrome {
+      position: fixed; top: 8px; left: 12px; z-index: 1000;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 12px;
+      color: rgba(255,255,255,0.5); letter-spacing: 0.04em;
+    }
+    .canvas-chrome a { color: rgba(255,255,255,0.7); text-decoration: none; margin-right: 12px; }
+    .canvas-chrome a:hover { color: white; }
+    .canvas-chrome .slug { font-family: ui-monospace, "SF Mono", monospace; opacity: 0.5; }
+    .reveal .slides section { text-align: left; }
+    .reveal .slides section h1, .reveal .slides section h2 { text-align: left; }
+    .reveal pre { font-size: 0.55em; }
+    .reveal table { font-size: 0.7em; }
+  </style>
+</head>
+<body>
+  <div class="canvas-chrome">
+    <a href="/canvas">← canvas index</a>
+    <a href="/">timeline</a>
+    <span class="slug">/canvas/{{ canvas.slug }}</span>
+  </div>
+
+  <div class="reveal">
+    <div class="slides">
+      <section data-markdown data-separator="^---$" data-separator-vertical="^--$" data-separator-notes="^Notes:">
+        <textarea data-template>
+{{ canvas.body }}
+        </textarea>
+      </section>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5/dist/reveal.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5/plugin/markdown/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5/plugin/highlight/highlight.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/reveal.js@5/plugin/notes/notes.js"></script>
+  <script>
+    Reveal.initialize({
+      hash: true,
+      slideNumber: 'c/t',
+      transition: 'fade',
+      controls: true,
+      progress: true,
+      center: false,
+      plugins: [RevealMarkdown, RevealHighlight, RevealNotes]
+    });
+  </script>
+</body>
+</html>

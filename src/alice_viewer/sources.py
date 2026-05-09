@@ -670,6 +670,86 @@ def read_directive(inner: pathlib.Path) -> str:
     return _read_text(inner / "directive.md")
 
 
+_CANVAS_SLUG_RE = __import__("re").compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def _canvas_dir(inner: pathlib.Path) -> pathlib.Path:
+    return inner / "canvas"
+
+
+def list_canvases(inner: pathlib.Path) -> list[dict[str, Any]]:
+    """Return canvas index entries sorted by mtime descending.
+
+    Each entry: {slug, title, mtime, size, path}. Title is parsed
+    from the first ``# H1`` line if present, else derived from the
+    slug. Missing canvas dir → empty list.
+    """
+    cdir = _canvas_dir(inner)
+    if not cdir.is_dir():
+        return []
+    out: list[dict[str, Any]] = []
+    for path in cdir.glob("*.md"):
+        slug = path.stem
+        if not _CANVAS_SLUG_RE.match(slug):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+            stat = path.stat()
+        except OSError:
+            continue
+        title = slug
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("# "):
+                title = stripped[2:].strip()
+                break
+            if stripped.startswith("---") or stripped == "":
+                continue
+        out.append(
+            {
+                "slug": slug,
+                "title": title,
+                "mtime": stat.st_mtime,
+                "size": stat.st_size,
+                "path": str(path),
+            }
+        )
+    out.sort(key=lambda d: d["mtime"], reverse=True)
+    return out
+
+
+def read_canvas(inner: pathlib.Path, slug: str) -> dict[str, Any] | None:
+    """Read a single canvas by slug. Returns None if slug is invalid
+    or the file doesn't exist. Strips YAML frontmatter from body if
+    present (between leading ``---`` lines)."""
+    if not _CANVAS_SLUG_RE.match(slug):
+        return None
+    cdir = _canvas_dir(inner)
+    path = cdir / f"{slug}.md"
+    try:
+        path = path.resolve()
+        cdir = cdir.resolve()
+    except OSError:
+        return None
+    if not str(path).startswith(str(cdir) + "/"):
+        return None
+    if not path.is_file():
+        return None
+    text = path.read_text(encoding="utf-8")
+    body = text
+    title = slug
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end != -1:
+            body = text[end + 5 :]
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            title = stripped[2:].strip()
+            break
+    return {"slug": slug, "title": title, "body": body, "path": str(path)}
+
+
 def find_wake_thought(
     events: list[UnifiedEvent],
     wake_start_ts: float,
