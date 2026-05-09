@@ -34,6 +34,16 @@ x-worker-base: &worker-base
     STATE_DIR: "/state/worker"
     TZ: "${ALICE_TZ:-America/New_York}"
     PATH: "/home/alice/alice-tools/bin:/home/alice/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    # s6-overlay's default 3-second graceperiod is far too short for the
+    # speaking/thinker drain on shutdown: a SIGTERM during a Claude turn
+    # or an alice-think wake can legitimately take minutes to finish
+    # cleanly, and getting SIGKILLed at the gracetime cliff defeats the
+    # whole point of having drain hooks. 1800000 ms = 30 min, matching
+    # the deploy script's CLEANUP_TIMEOUT for the background old-container
+    # cleanup. A wake older than that is a hung wake the watchdog should
+    # have surfaced; force-kill is fine at that point.
+    S6_SERVICES_GRACETIME: "${S6_SERVICES_GRACETIME:-1800000}"
+    S6_KILL_GRACETIME: "${S6_KILL_GRACETIME:-1800000}"
     # GitHub PAT for the gh CLI (and git-over-https via gh's credential
     # helper). Sourced from alice.env by bin/_alice-env.sh, so adding
     # GH_TOKEN=ghp_... to alice.env then bouncing the worker is enough
