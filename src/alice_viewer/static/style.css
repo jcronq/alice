@@ -786,3 +786,171 @@ svg.graph { width: 100%; height: 70vh; background: var(--bg); border-radius: 4px
 @media (max-width: 900px) {
   .context-layout { grid-template-columns: 1fr; }
 }
+
+/* ==========================================================================
+   Stage D review — dual-judge synthesis labeling tab.
+   Mirrors the table-wrap / badge / panel idioms used elsewhere.
+   ========================================================================== */
+kbd {
+  font-family: var(--mono); font-size: 11px;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 3px;
+  padding: 0 5px; color: var(--text);
+}
+
+.stage-d-controls {
+  display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap;
+  margin: 12px 0 10px;
+}
+.stage-d-controls label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; }
+.stage-d-controls input,
+.stage-d-controls select {
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 3px;
+  padding: 4px 6px; font-family: var(--mono); font-size: 12px;
+}
+
+/* Counts banner pills. */
+.stage-d-summary { margin-bottom: 14px; }
+.stage-d-summary-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.stage-d-summary-meta { font-size: 11px; margin-top: 4px; }
+.stage-d-pill {
+  display: inline-flex; align-items: baseline; gap: 6px;
+  padding: 4px 10px; border-radius: 4px;
+  background: var(--panel); border: 1px solid var(--border);
+  font-size: 12px;
+}
+.stage-d-pill .stage-d-pill-n { font-size: 14px; font-weight: 600; color: var(--text); }
+.stage-d-pill .stage-d-pill-k { color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; font-size: 10px; }
+.stage-d-pill-disagreement { border-color: color-mix(in srgb, var(--warn) 50%, transparent); }
+.stage-d-pill-disagreement .stage-d-pill-n { color: var(--warn); }
+.stage-d-pill-shipped      { border-color: color-mix(in srgb, var(--ok) 50%, transparent); }
+.stage-d-pill-shipped .stage-d-pill-n { color: var(--ok); }
+.stage-d-pill-dropped      { border-color: color-mix(in srgb, var(--muted) 50%, transparent); }
+.stage-d-pill-unlabeled    { border-color: color-mix(in srgb, var(--accent-2) 50%, transparent); }
+.stage-d-pill-unlabeled .stage-d-pill-n { color: var(--accent-2); }
+
+/* Toast (post-label feedback). */
+#stage-d-toast-wrap {
+  position: fixed; right: 20px; bottom: 20px; z-index: 50;
+  display: flex; flex-direction: column; gap: 6px; pointer-events: none;
+}
+.stage-d-toast {
+  background: var(--panel-2); border: 1px solid var(--border);
+  color: var(--text); padding: 6px 10px; border-radius: 4px;
+  font-size: 12px; transition: opacity 0.4s, transform 0.4s;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.5);
+}
+.stage-d-toast-ok  { border-color: color-mix(in srgb, var(--ok)  60%, transparent); }
+.stage-d-toast-err { border-color: color-mix(in srgb, var(--err) 60%, transparent); }
+.stage-d-toast-fade { opacity: 0; transform: translateX(8px); }
+
+/* Empty-state. */
+.stage-d-empty { padding: 24px; border: 1px dashed var(--border); border-radius: 6px; }
+.stage-d-empty pre { background: var(--panel); padding: 8px; border-radius: 3px; }
+
+/* Rows list. */
+.stage-d-rows { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 10px; }
+.stage-d-row {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+  padding: 12px 14px;
+  border-left: 3px solid transparent;
+}
+.stage-d-row.outcome-shipped                       { border-left-color: var(--ok); }
+.stage-d-row.outcome-dropped_agreement_reject      { border-left-color: var(--muted); }
+.stage-d-row.outcome-dropped_disagreement_exhausted{ border-left-color: var(--warn); }
+.stage-d-row.outcome-disagreement_pending          { border-left-color: var(--err); }
+.stage-d-row-active {
+  outline: 1px solid var(--accent);
+  background: var(--panel-2);
+}
+
+.stage-d-row-head {
+  display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  align-items: center; margin-bottom: 8px;
+}
+.stage-d-pair { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.stage-d-slug { font-family: var(--mono); font-size: 12px; }
+.stage-d-pair-x { font-size: 14px; }
+.stage-d-attempt-n { font-size: 11px; padding-left: 8px; border-left: 1px solid var(--border); }
+.stage-d-row-meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 11px; }
+.stage-d-ts { font-family: var(--mono); }
+
+.stage-d-outcome {
+  font-size: 11px; padding: 2px 7px; border-radius: 3px;
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+.stage-d-outcome-shipped                       { background: #1e3a32; color: var(--ok); }
+.stage-d-outcome-dropped_agreement_reject      { background: var(--panel-2); color: var(--muted); }
+.stage-d-outcome-dropped_disagreement_exhausted{ background: #3a2e1a; color: var(--warn); }
+.stage-d-outcome-disagreement_pending          { background: #3a1e1e; color: var(--err); }
+
+.stage-d-label {
+  font-size: 11px; padding: 2px 6px; border-radius: 3px;
+  background: var(--panel-2); color: var(--text);
+}
+.stage-d-label-T1 { background: #1e3a32; color: var(--ok); }
+.stage-d-label-T2 { background: #1e3450; color: var(--accent); }
+.stage-d-label-T3 { background: #3a2e1a; color: var(--warn); }
+.stage-d-label-T4 { background: #3a1e1e; color: var(--err); }
+.stage-d-label-ship    { background: #1e3a32; color: var(--ok); }
+.stage-d-label-reject  { background: #3a1e1e; color: var(--err); }
+.stage-d-label-none    { background: transparent; }
+
+/* Synthesis text + retries. */
+.stage-d-synth { margin: 6px 0; }
+.stage-d-synth summary { cursor: pointer; color: var(--muted); font-size: 11px; user-select: none; }
+.stage-d-synth-body, .stage-d-retry-body {
+  background: var(--bg); padding: 8px 10px; border-radius: 4px;
+  white-space: pre-wrap; word-wrap: break-word; margin: 6px 0; font-size: 12px;
+  border: 1px solid var(--border);
+}
+.stage-d-shipped-link { font-size: 11px; color: var(--muted); margin-top: 4px; }
+.stage-d-retries { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
+
+/* Side-by-side judge verdicts. */
+.stage-d-verdicts {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 8px 0;
+}
+.stage-d-verdict {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 8px 10px;
+}
+.stage-d-verdict-qwen  { border-top: 2px solid var(--accent-2); }
+.stage-d-verdict-haiku { border-top: 2px solid var(--accent-3); }
+.stage-d-verdict-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 11px; }
+.stage-d-judge { font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+.stage-d-tier {
+  font-family: var(--mono); padding: 1px 5px; border-radius: 2px;
+  background: var(--panel-2); color: var(--text);
+}
+.stage-d-tier-t1 { color: var(--ok); }
+.stage-d-tier-t2 { color: var(--accent); }
+.stage-d-tier-t3 { color: var(--warn); }
+.stage-d-tier-t4 { color: var(--err); }
+.stage-d-decision {
+  padding: 1px 5px; border-radius: 2px; font-size: 10px;
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+.stage-d-decision-ship   { background: #1e3a32; color: var(--ok); }
+.stage-d-decision-reject { background: #3a1e1e; color: var(--err); }
+.stage-d-novel { color: var(--muted); }
+.stage-d-verdict-reason { margin-top: 4px; font-size: 12px; }
+
+/* Per-row label buttons (mouse fallback for the keystroke flow). */
+.stage-d-row-actions {
+  display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px;
+  border-top: 1px dashed var(--border); padding-top: 8px;
+}
+.stage-d-btn {
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 3px;
+  padding: 4px 10px; font-family: var(--mono); font-size: 11px; cursor: pointer;
+}
+.stage-d-btn:hover { background: var(--panel); border-color: var(--accent); }
+.stage-d-btn-T1   { color: var(--ok); }
+.stage-d-btn-T2   { color: var(--accent); }
+.stage-d-btn-T3   { color: var(--warn); }
+.stage-d-btn-T4   { color: var(--err); }
+.stage-d-btn-ship { color: var(--ok); }
+.stage-d-btn-reject { color: var(--err); }
+.stage-d-btn-unlabeled { color: var(--muted); }
+

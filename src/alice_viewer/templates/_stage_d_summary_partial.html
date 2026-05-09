@@ -1,0 +1,33 @@
+{# Counts banner for /stage-d-review. Rendered standalone by the
+   /stage-d-review/summary partial endpoint so htmx can refresh it
+   in place after a label append. #}
+<div class="stage-d-summary"
+     id="stage-d-summary"
+     data-since="{{ since }}"
+     data-days="{{ days }}">
+  <div class="stage-d-summary-row">
+    <span class="stage-d-pill stage-d-pill-disagreement">
+      <span class="stage-d-pill-n">{{ summary.disagreement }}</span>
+      <span class="stage-d-pill-k">disagreement</span>
+    </span>
+    <span class="stage-d-pill stage-d-pill-shipped">
+      <span class="stage-d-pill-n">{{ summary.shipped }}</span>
+      <span class="stage-d-pill-k">shipped</span>
+    </span>
+    <span class="stage-d-pill stage-d-pill-dropped">
+      <span class="stage-d-pill-n">{{ summary.dropped }}</span>
+      <span class="stage-d-pill-k">dropped</span>
+    </span>
+    <span class="stage-d-pill stage-d-pill-unlabeled">
+      <span class="stage-d-pill-n">{{ summary.unlabeled }}</span>
+      <span class="stage-d-pill-k">unlabeled</span>
+    </span>
+    <span class="stage-d-pill stage-d-pill-total">
+      <span class="stage-d-pill-n">{{ summary.total }}</span>
+      <span class="stage-d-pill-k">total</span>
+    </span>
+  </div>
+  <div class="stage-d-summary-meta muted">
+    window since {{ since }} ({{ days }} day{{ '' if days == 1 else 's' }})
+  </div>
+</div>

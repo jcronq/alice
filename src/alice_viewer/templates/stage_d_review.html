@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}stage D review{% endblock %}
+{% block body %}
+  <h1>stage D review · dual-judge synthesis labeling</h1>
+  <p class="muted">
+    Every Stage D synthesis attempt — shipped, dropped, or disagreement-pending —
+    is logged here for {{ personae.user.name }} to label. Labels become the
+    calibration set for the judge prompts. One-keystroke scoring:
+    <kbd>1</kbd>–<kbd>4</kbd> = T1–T4,
+    <kbd>S</kbd> = ship,
+    <kbd>R</kbd> = reject,
+    <kbd>U</kbd> = unlabeled,
+    <kbd>J</kbd> = skip to next.
+  </p>
+
+  <form class="stage-d-controls" method="get" action="/stage-d-review"
+        hx-get="/stage-d-review/rows"
+        hx-target="#stage-d-rows-wrap"
+        hx-swap="innerHTML"
+        hx-trigger="change"
+        hx-push-url="true">
+    <label>
+      <span class="muted">since</span>
+      <input type="date" name="since" value="{{ since }}">
+    </label>
+    <label>
+      <span class="muted">days</span>
+      <input type="number" name="days" min="1" max="60" value="{{ days }}" style="width:5em">
+    </label>
+    <label>
+      <span class="muted">status</span>
+      <select name="status">
+        <option value="" {% if not status %}selected{% endif %}>all</option>
+        <option value="disagreement" {% if status == 'disagreement' %}selected{% endif %}>disagreement</option>
+        <option value="shipped" {% if status == 'shipped' %}selected{% endif %}>shipped</option>
+        <option value="dropped" {% if status == 'dropped' %}selected{% endif %}>dropped</option>
+        <option value="unlabeled" {% if status == 'unlabeled' %}selected{% endif %}>unlabeled</option>
+      </select>
+    </label>
+    <noscript><button type="submit">apply</button></noscript>
+  </form>
+
+  <div id="stage-d-summary-wrap">
+    {% include "_stage_d_summary_partial.html" %}
+  </div>
+
+  <div id="stage-d-toast-wrap" aria-live="polite"></div>
+
+  <div id="stage-d-rows-wrap">
+    {% include "_stage_d_rows_partial.html" %}
+  </div>
+
+  {# Page-level config exposed to the keystroke handler so it can build
+     the right partial-refresh URLs after each label append. #}
+  <script id="stage-d-config" type="application/json">
+    {{ {
+      "since": since,
+      "days": days,
+      "status": status,
+      "valid_labels": valid_labels,
+      "key_map": {
+        "1": "T1",
+        "2": "T2",
+        "3": "T3",
+        "4": "T4",
+        "s": "ship",
+        "S": "ship",
+        "r": "reject",
+        "R": "reject",
+        "u": "unlabeled",
+        "U": "unlabeled"
+      },
+      "skip_keys": ["j", "J"]
+    } | tojson }}
+  </script>
+  <script src="/static/stage_d_review.js?v=1"></script>
+{% endblock %}
