@@ -30,9 +30,27 @@ mkdir -p "$(dirname "$LOCK")" "$NOTES_DIR"
 touch "$LOCK"
 chown alice:alice "$LOCK" || true
 
-sleep 60
+# Graceful shutdown: a deploy SIGTERMs the worker container, s6 forwards
+# to this supervisor. We do NOT want to kill an in-flight alice-think
+# wake — the python subprocess writes to the mind repo and a SIGKILL at
+# the s6 gracetime cliff leaves files half-written. Bash defers traps
+# for foreground commands, so the in-flight ``flock + alice-think``
+# finishes naturally before the loop checks STOPPING and breaks. Sleeps
+# run in the background with ``wait`` so the trap fires immediately
+# during quiet periods (otherwise bash would defer the trap until a
+# multi-minute sleep returns).
+STOPPING=
+on_signal() {
+    STOPPING=1
+}
+trap on_signal TERM INT
+
+sleep 60 &
+wait $! 2>/dev/null || true
 
 while true; do
+    [ -n "$STOPPING" ] && break
+
     hour=$(date +%H)
     hour=${hour#0}
     if [ "$hour" -lt 7 ] || [ "$hour" -ge 23 ]; then
@@ -42,9 +60,13 @@ while true; do
     fi
 
     start_ts=$(date +%s)
+    # Foreground on purpose: bash defers the trap until alice-think
+    # returns, so the wake completes rather than being SIGKILLed.
     flock -n "$LOCK" s6-setuidgid alice /usr/local/bin/alice-think || true
     end_ts=$(date +%s)
     elapsed=$(( end_ts - start_ts ))
+
+    [ -n "$STOPPING" ] && break
 
     # Determine the wait interval AFTER the wake — wake.py just wrote
     # the new sleep-mode interval to $INTERVAL_FILE.
@@ -77,14 +99,22 @@ while true; do
         # If a note arrived between the wake finishing and now, skip
         # the wait so the next wake drains it immediately. Otherwise
         # wait on inotify so a future arrival interrupts the backoff.
+        # Both inotifywait and sleep run in the background and we use
+        # ``wait``: ``wait`` is interruptible by signals, so a SIGTERM
+        # during a quiet period fires the trap promptly instead of
+        # waiting up to ``$remainder`` seconds.
         if [ -d "$NOTES_DIR" ] && find "$NOTES_DIR" -mindepth 1 -maxdepth 1 -type f \
                 \( -name '*.md' -o -name '*.markdown' \) -print -quit 2>/dev/null | grep -q .; then
             :
         elif command -v inotifywait >/dev/null 2>&1 && [ -d "$NOTES_DIR" ]; then
             inotifywait -q -e create -e moved_to -t "$remainder" "$NOTES_DIR" \
-                >/dev/null 2>&1 || true
+                >/dev/null 2>&1 &
+            wait $! 2>/dev/null || true
         else
-            sleep "$remainder"
+            sleep "$remainder" &
+            wait $! 2>/dev/null || true
         fi
     fi
+
+    [ -n "$STOPPING" ] && break
 done
