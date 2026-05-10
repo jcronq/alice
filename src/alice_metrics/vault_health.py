@@ -546,7 +546,6 @@ def count_tier1_ratio(
 
     # Count inbound links (excluding dailies as sources to avoid
     # inflating counts with activity-log references).
-    daily_rel_prefix = str(vault_dir / "dailies")
     inbound = count_inbound_links(vault_dir, exclude=frozenset(
         str(d.relative_to(vault_dir))
         for d in (vault_dir / "dailies").rglob("*.md")

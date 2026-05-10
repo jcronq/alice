@@ -11,10 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
-import io
 import os
 import pathlib
-import sys
 import threading
 from typing import Optional
 
