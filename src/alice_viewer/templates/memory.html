@@ -70,8 +70,20 @@
       font: inherit; font-size: 0.9em;
     }
     .mode-btn:hover { background: var(--panel); }
-    .lobe-label { font-size: 12px; fill: var(--text); pointer-events: none; }
-    .lobe-sublabel { font-size: 10px; fill: var(--muted); pointer-events: none; }
+    .lobe-label {
+      font-size: 13px; font-weight: 600;
+      fill: var(--text);
+      pointer-events: none;
+      paint-order: stroke fill;
+      stroke: rgba(13, 16, 21, 0.85); stroke-width: 3px;
+    }
+    .lobe-sublabel {
+      font-size: 11px;
+      fill: #c4cad5;
+      pointer-events: none;
+      paint-order: stroke fill;
+      stroke: rgba(13, 16, 21, 0.85); stroke-width: 2.5px;
+    }
     .lobe-bubble { cursor: pointer; }
     .lobe-bubble:hover { filter: brightness(1.15); }
   </style>
@@ -393,7 +405,9 @@
             .strength(d => Math.min(0.6, 0.05 + d.weight * 0.04)))
           .force('charge', d3.forceManyBody().strength(d => -90 - d.r * 6))
           .force('center', d3.forceCenter(width / 2, height / 2))
-          .force('collide', d3.forceCollide(d => d.r + 6).strength(0.9));
+          // Wide collision pad — labels often spill outside the bubble,
+          // so bubbles need elbow room or text from neighbors overlaps.
+          .force('collide', d3.forceCollide(d => d.r + 36).strength(0.95));
 
         const maxW = Math.max(1, d3.max(links, l => l.weight) || 1);
         const link = zoomG.append('g')
@@ -414,24 +428,36 @@
           .attr('fill-opacity', d => d.is_misc ? 0.4 : 0.78)
           .attr('stroke', '#0d1015').attr('stroke-width', 2);
 
-        // Primary label: dominant folder name (or "miscellany"); secondary
-        // line: count + top-hub hint. Both centered inside the bubble.
+        // Primary label: the lobe's top hub note — that's what
+        // identifies a lobe to the operator at a glance. Secondary
+        // line: dominant folder + size, dimmer. "Miscellany" lobes
+        // have no meaningful hub, so they keep "miscellany" as the
+        // primary label and just show the size below.
+        const trimLabel = (s, max) =>
+          (s || '').length <= max ? s : s.slice(0, max - 1) + '…';
         node.append('text')
           .attr('class', 'lobe-label')
           .attr('text-anchor', 'middle')
-          .attr('dy', '-0.2em')
+          .attr('dy', '-0.45em')
           .text(d => {
             if (d.is_misc) return 'miscellany';
-            const f = d.folder || d.id;
-            return f.startsWith('cortex-memory/') ? f.slice('cortex-memory/'.length) : f;
-          });
+            const hub = d.top_hubs[0];
+            const label = hub ? hub.label : (d.folder || d.id);
+            return trimLabel(label, 28);
+          })
+          .append('title')
+            .text(d => (d.top_hubs[0] && d.top_hubs[0].label) || d.folder || d.id);
         node.append('text')
           .attr('class', 'lobe-sublabel')
           .attr('text-anchor', 'middle')
-          .attr('dy', '1em')
+          .attr('dy', '1.25em')
           .text(d => {
-            const hub = d.top_hubs[0];
-            return hub ? `${d.size} · ${hub.label}` : `${d.size}`;
+            if (d.is_misc) return `${d.size}`;
+            const f = d.folder || d.id;
+            const folder = f.startsWith('cortex-memory/')
+              ? f.slice('cortex-memory/'.length)
+              : f;
+            return `${trimLabel(folder, 24)} · ${d.size}`;
           });
 
         node.on('mouseenter', (e, d) => {
