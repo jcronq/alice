@@ -12,7 +12,6 @@ is hit. Exercises:
 
 from __future__ import annotations
 
-import os
 import pytest
 
 from alice_thinking import stage_d_judges

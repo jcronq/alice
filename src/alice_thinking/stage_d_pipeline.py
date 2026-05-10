@@ -46,7 +46,7 @@ import datetime as _dt
 import json
 import pathlib
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Callable, Literal, Optional
 
 

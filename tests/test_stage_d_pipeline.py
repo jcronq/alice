@@ -22,7 +22,6 @@ import pathlib
 import pytest
 
 from alice_thinking.stage_d_pipeline import (
-    AttemptRecord,
     run_dual_judge,
     update_shipped_slug,
 )
@@ -42,7 +41,7 @@ def _reject_verdict(tier="T3", reason="forced abstract-only") -> dict:
 
 
 def _read_jsonl(path: pathlib.Path) -> list[dict]:
-    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
 def _make_drafter(drafts):
@@ -384,5 +383,5 @@ def test_attempt_id_stable_across_attempts(tmp_path):
     )
 
     lines = _read_jsonl(log)
-    ids = {l["id"] for l in lines}
+    ids = {line["id"] for line in lines}
     assert len(ids) == 1, "attempt_id should be the same across all lines in one run"

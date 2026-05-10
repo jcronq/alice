@@ -36,7 +36,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Literal, Optional, TypedDict
+from typing import Literal, Optional, TypedDict
 
 
 __all__ = [
