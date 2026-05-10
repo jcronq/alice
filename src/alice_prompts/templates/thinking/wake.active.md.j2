@@ -248,17 +248,69 @@ Cross-note synthesis, when vault is stable + time_phase is late (03:00–07:00) 
    ORDER BY rank LIMIT 3;
    ```
    If a closed synthesis already covers the same ground, write a null-result note that cites the existing synthesis (`"covered by [[<existing-slug>]]"`) instead of restating it. This is the dedup mechanism for Stage D — pair-level dedup catches identical pairs, but coverage check catches the same conclusion arriving from different pairs. Stat the vault dir mtime first; if `vault_mtime > db_mtime` run `python3 ~/alice/src/alice_indexer/build_index.py --check && python3 ~/alice/src/alice_indexer/build_index.py`. If the DB is missing entirely, skip the coverage check and proceed; flag via `append_note(tag='infra-degraded')`.
-4. Write a 3-6 sentence synthesis note to `cortex-memory/research/<today>-<slug>.md` with frontmatter that includes **`source: stage-d`**, **`note_a: <note-a-slug>`**, and **`note_b: <note-b-slug>`** (these three fields let the morning quality sample and retrieval system identify Stage D outputs without timestamp heuristics — without them, identification requires fragile mtime-based filtering). OR add a `source: stage-d` field to one of the existing notes if adding a new connection section there. **Then append one line** to `inner/state/stage-d-pairs-$(date +%Y-%m-%d).jsonl`, including the output note slug:
-   ```json
-   {"ts": "<ISO8601>", "note_a": "<slug-alphabetically-first>", "note_b": "<slug-second>", "synthesis": "<output-slug-or-null-for-null-result>"}
+4. **Draft a synthesis** (3-6 sentences) — keep it in a shell variable / scratch file; do NOT write the vault note yet. The dual-judge gate decides whether the draft ships. (Call shapes: `src/alice_thinking/STAGE_D_JUDGES.md`. Full rationale: [[2026-05-08-stage-d-cap-redesign-quality-gated]].)
+
+   **Null-result short-circuit.** If you concluded "no connection" after honest looking, skip the judge gate entirely — write the 2-sentence null-result note and append a `null` synthesis line to the pairs log. That's data, not failure. The judge gate is for actual synthesis attempts only.
+
+5. **Dual-judge quality gate.** Run both judges on the candidate synthesis via the Python pipeline. The pipeline appends one JSONL line PER ATTEMPT to `~/alice-mind/inner/state/stage-d-attempts.jsonl` (firehose — every attempt is logged regardless of outcome).
+
+   ```bash
+   python3 -c "
+   import json
+   from alice_thinking.stage_d_pipeline import run_dual_judge
+
+   synthesis = '''<the candidate synthesis text>'''
+   src_a = open('cortex-memory/<note-a-path>.md').read()
+   src_b = open('cortex-memory/<note-b-path>.md').read()
+
+   def drafter(prior):
+       # First attempt: prior is None — return the original draft.
+       # On disagreement (attempt 2+), prior is the rejected draft;
+       # rewrite it to address the disagreeing judge's concern. The
+       # synthesizer is YOU — re-invoke your reasoning here. For the
+       # first cut of this gate it's fine to return synthesis unchanged
+       # on retries; the wake will simply burn through the 3-attempt
+       # budget and the disagreement will be visible in the JSONL log.
+       return synthesis
+
+   rec = run_dual_judge(
+       slug_a='<slug-a>', slug_b='<slug-b>',
+       source_a_text=src_a, source_b_text=src_b,
+       draft_synthesis_fn=drafter,
+       prior_pair_synthesis=None,
+   )
+   print(json.dumps({'id': rec.id, 'outcome': rec.outcome,
+                     'synthesis': rec.synthesis_text}))
+   " 2>&1
    ```
-   Alphabetical ordering for `note_a`/`note_b` keeps the dedup check order-independent. The `synthesis` field enables the morning quality sample to find Stage D outputs via `jq '[.[].synthesis] | map(select(. != null))'` on the pairs log — faster and more reliable than grepping by timestamp.
 
-**Null result is valid output.** If nothing emerges after honest looking, write a 2-sentence "read X and Y; no connection found because Z" note and close. That's data, not failure. Null-result wakes still append to the pairs log — the pair was tried.
+   Read the printed JSON. Three terminal states:
 
-Budget: 3-4 tool calls (read×2 + write×1, plus the trivial pairs-log read+append). Tight by design — don't spiral on associative recombination; if the connection is there, it announces itself in 2-3 minutes.
+   - **`outcome: shipped`** → Both judges agreed `ship`. Write the vault note (step 6 below), then update the JSONL line with the resulting slug:
+     ```bash
+     python3 -c "from alice_thinking.stage_d_pipeline import update_shipped_slug; update_shipped_slug(attempt_id='<id-from-pipeline>', shipped_slug='research/<today>-<slug>')"
+     ```
+   - **`outcome: dropped_agreement_reject`** → Both judges said `reject`. Skip the vault write. The pair is logged in stage-d-attempts.jsonl; still append to the pairs log (step 7) with `synthesis: null`.
+   - **`outcome: dropped_disagreement_exhausted`** → Judges disagreed through 3 attempts. Skip the vault write. Same pairs-log treatment as above.
 
-Full design + math: [[2026-04-26-stage-d-pair-tracking]].
+   **If the dispatch fails** (Python module raises, `ANTHROPIC_API_KEY` missing, Qwen LAN endpoint unreachable, etc.) → **fall back to the OLD single-attempt vault write** so a buggy judge layer doesn't tank Stage D entirely. Log the fallback to `~/alice-mind/inner/state/stage-d-judge-failures.jsonl`:
+   ```bash
+   echo "{\"ts\": \"$(date -Iseconds)\", \"slug_a\": \"<slug-a>\", \"slug_b\": \"<slug-b>\", \"reason\": \"<short error>\"}" \
+     >> ~/alice-mind/inner/state/stage-d-judge-failures.jsonl
+   ```
+   Then proceed to step 6 with the original draft, unchanged. The fallback exists so a bad night for the judges doesn't take the whole hemisphere offline; absorb it gracefully and let the failures log accumulate evidence.
+
+6. **Write the vault note** (only when shipped or fallback) to `cortex-memory/research/<today>-<slug>.md` with frontmatter that includes **`source: stage-d`**, **`note_a: <note-a-slug>`**, and **`note_b: <note-b-slug>`** (these three fields let the morning quality sample and retrieval system identify Stage D outputs without timestamp heuristics — without them, identification requires fragile mtime-based filtering). OR add a `source: stage-d` field to one of the existing notes if adding a new connection section there.
+
+7. **Append one line** to `inner/state/stage-d-pairs-$(date +%Y-%m-%d).jsonl`, including the output note slug (or `null` for dropped/null-result):
+   ```json
+   {"ts": "<ISO8601>", "note_a": "<slug-alphabetically-first>", "note_b": "<slug-second>", "synthesis": "<output-slug-or-null>"}
+   ```
+   Alphabetical ordering for `note_a`/`note_b` keeps the dedup check order-independent. The `synthesis` field enables the morning quality sample to find Stage D outputs via `jq '[.[].synthesis] | map(select(. != null))'` on the pairs log — faster and more reliable than grepping by timestamp. Dropped attempts log `null` here too — the dual-judge JSONL has the full per-attempt story; the pairs log is just the "this pair was tried" marker.
+
+Budget: 5-7 tool calls (read×2 + python×1 for the gate + write×1 + pairs-log append). Tight by design — don't spiral on associative recombination; if the connection is there, it announces itself in 2-3 minutes. The judge gate adds one Python invocation per pipeline run (which itself runs up to 3 attempts internally).
+
+Full design + math: [[2026-04-26-stage-d-pair-tracking]]; quality-gate rationale: [[2026-05-08-stage-d-cap-redesign-quality-gated]]; per-judge prompts: [[2026-05-09-stage-d-judge-prompts]].
 
 ### Active mode — morning vault scan (preamble, once per day)
 
