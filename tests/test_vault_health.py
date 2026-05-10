@@ -15,22 +15,30 @@ Bug map:
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from textwrap import dedent
 
 import pytest
 
 from alice_metrics.vault_health import (
+    build_vault_health_event,
     count_broken_wikilinks,
     count_inbound_links,
     count_orphans,
     count_output_rate_slope,
+    count_productive_wakes,
     count_research_decay,
+    count_research_notes_created_on,
+    count_stage_c_candidates,
+    count_surfaces_handled_today,
+    count_surfaces_in_window,
     count_tier1_ratio,
     count_total_notes,
     count_wakes_by_stage,
     compute_recovery_state,
+    main as vault_health_main,
+    vault_health_event_exists_for_date,
 )
 
 
@@ -895,3 +903,390 @@ def test_research_decay_cross_directory_link_counts(tmp_path: Path) -> None:
         """,
     )
     assert count_research_decay(vault) == 1  # only 1 link < 2
+
+
+# ---------------------------------------------------------------------------
+# Stage C candidates: bloated + stale-dailies counters
+# Previously bash-computed inside the wake template; absorbed into the
+# module so the morning scan collapses to one command.
+# ---------------------------------------------------------------------------
+
+
+def test_stage_c_candidates_bloated_threshold(tmp_path: Path) -> None:
+    vault = _make_vault(tmp_path)
+    # Three notes: 100 lines, 251 lines (just over), 1000 lines.
+    _write(vault / "research" / "small.md", "x\n" * 100)
+    _write(vault / "research" / "over.md", "x\n" * 251)
+    _write(vault / "research" / "big.md", "x\n" * 1000)
+    result = count_stage_c_candidates(vault)
+    assert result["bloated_notes"] == 2
+    assert result["stale_dailies"] == 0
+    assert result["total"] == 2
+
+
+def test_stage_c_candidates_excludes_dailies_and_scaffolding(tmp_path: Path) -> None:
+    """Bloated count must skip dailies/, index.md, README.md, unresolved.md."""
+    vault = _make_vault(tmp_path)
+    big = "x\n" * 500
+    _write(vault / "dailies" / "2026-01-01.md", big)
+    _write(vault / "index.md", big)
+    _write(vault / "README.md", big)
+    _write(vault / "unresolved.md", big)
+    _write(vault / "research" / "real-bloat.md", big)
+    result = count_stage_c_candidates(vault)
+    assert result["bloated_notes"] == 1
+
+
+def test_stage_c_candidates_stale_dailies(tmp_path: Path) -> None:
+    vault = _make_vault(tmp_path)
+    # today=2026-05-10; 90-day cutoff = 2026-02-09.
+    today = datetime(2026, 5, 10)
+    _write(vault / "dailies" / "2025-12-01.md", "stale\n")
+    _write(vault / "dailies" / "2026-02-08.md", "also stale\n")
+    _write(vault / "dailies" / "2026-02-09.md", "edge: not stale\n")
+    _write(vault / "dailies" / "2026-05-01.md", "recent\n")
+    result = count_stage_c_candidates(vault, today=today)
+    # Two strictly older than the cutoff (2026-02-09).
+    assert result["stale_dailies"] == 2
+
+
+# ---------------------------------------------------------------------------
+# research_notes_last_night: created: == yesterday
+# ---------------------------------------------------------------------------
+
+
+def test_research_notes_created_on_matches_yesterday(tmp_path: Path) -> None:
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "yesterday.md",
+        """
+        ---
+        slug: yesterday
+        created: 2026-05-09
+        ---
+        Body.
+        """,
+    )
+    _write(
+        vault / "research" / "today.md",
+        """
+        ---
+        slug: today
+        created: 2026-05-10
+        ---
+        Body.
+        """,
+    )
+    _write(
+        vault / "research" / "old.md",
+        """
+        ---
+        slug: old
+        created: 2026-04-01
+        ---
+        Body.
+        """,
+    )
+    count = count_research_notes_created_on(vault, datetime(2026, 5, 9))
+    assert count == 1
+
+
+def test_research_notes_created_on_handles_timestamped_format(tmp_path: Path) -> None:
+    """`created: 2026-05-09 22:14 EDT` must parse as the 2026-05-09 day."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "stamped.md",
+        """
+        ---
+        slug: stamped
+        created: 2026-05-09 22:14 -0400
+        ---
+        Body.
+        """,
+    )
+    count = count_research_notes_created_on(vault, datetime(2026, 5, 9))
+    assert count == 1
+
+
+# ---------------------------------------------------------------------------
+# Surface counts
+# ---------------------------------------------------------------------------
+
+
+def test_count_surfaces_in_window_filters_by_mtime(tmp_path: Path) -> None:
+    import os
+
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    today_dir = surface / "2026-05-10"
+    today_dir.mkdir()
+
+    inside = today_dir / "in-window.md"
+    outside = today_dir / "out-of-window.md"
+    inside.write_text("x")
+    outside.write_text("x")
+
+    ws = datetime(2026, 5, 9, 23, 0, 0)
+    we = datetime(2026, 5, 10, 7, 0, 0)
+    # Set mtimes explicitly.
+    os.utime(inside, (ws.timestamp() + 1800, ws.timestamp() + 1800))  # 23:30
+    os.utime(outside, (we.timestamp() + 3600, we.timestamp() + 3600))  # 08:00
+
+    n = count_surfaces_in_window(surface, ws, we)
+    assert n == 1
+
+
+def test_count_surfaces_in_window_skips_handled_dir(tmp_path: Path) -> None:
+    """Files under `.handled/` must not count as freshly written."""
+    import os
+
+    surface = tmp_path / "surface"
+    handled = surface / ".handled" / "2026-05-10"
+    handled.mkdir(parents=True)
+    f = handled / "old.md"
+    f.write_text("x")
+
+    ws = datetime(2026, 5, 9, 23, 0, 0)
+    we = datetime(2026, 5, 10, 7, 0, 0)
+    os.utime(f, (ws.timestamp() + 100, ws.timestamp() + 100))
+
+    assert count_surfaces_in_window(surface, ws, we) == 0
+
+
+def test_count_surfaces_handled_today(tmp_path: Path) -> None:
+    surface = tmp_path / "surface"
+    today = datetime(2026, 5, 10)
+    handled = surface / ".handled" / "2026-05-10"
+    handled.mkdir(parents=True)
+    (handled / "a.md").write_text("x")
+    (handled / "b.md").write_text("x")
+    # File in a different day's handled dir must not count.
+    other = surface / ".handled" / "2026-05-09"
+    other.mkdir(parents=True)
+    (other / "c.md").write_text("x")
+
+    assert count_surfaces_handled_today(surface, today) == 2
+
+
+def test_count_surfaces_handled_today_empty(tmp_path: Path) -> None:
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    today = datetime(2026, 5, 10)
+    assert count_surfaces_handled_today(surface, today) == 0
+
+
+# ---------------------------------------------------------------------------
+# Productive wakes: did_work=true in the window
+# ---------------------------------------------------------------------------
+
+
+def test_count_productive_wakes_did_work_filter(tmp_path: Path) -> None:
+    thoughts = tmp_path / "thoughts"
+    yest = thoughts / "2026-05-09"
+    today = thoughts / "2026-05-10"
+    yest.mkdir(parents=True)
+    today.mkdir(parents=True)
+
+    def _wake(dir_path: Path, name: str, did: str) -> None:
+        _write(
+            dir_path / name,
+            f"""
+            ---
+            mode: sleep
+            stage: C
+            did_work: {did}
+            ---
+            Body.
+            """,
+        )
+
+    _wake(yest, "233000-wake.md", "true")
+    _wake(yest, "235500-wake.md", "false")
+    _wake(today, "010000-wake.md", "true")
+    _wake(today, "030000-wake.md", "true")
+    # Out of window — must be excluded.
+    _wake(today, "080000-wake.md", "true")
+
+    ws = datetime(2026, 5, 9, 23, 0, 0)
+    we = datetime(2026, 5, 10, 7, 0, 0)
+    assert count_productive_wakes(thoughts, ws, we) == 3
+
+
+# ---------------------------------------------------------------------------
+# Event-stream dedup
+# ---------------------------------------------------------------------------
+
+
+def test_vault_health_event_exists_true(tmp_path: Path) -> None:
+    import json
+
+    events = tmp_path / "events.jsonl"
+    events.write_text(
+        json.dumps({"type": "vault_health", "date": "2026-05-10"}) + "\n"
+        + json.dumps({"type": "meal", "date": "2026-05-10"}) + "\n",
+        encoding="utf-8",
+    )
+    assert vault_health_event_exists_for_date(events, "2026-05-10") is True
+    assert vault_health_event_exists_for_date(events, "2026-05-09") is False
+
+
+def test_vault_health_event_exists_missing_file(tmp_path: Path) -> None:
+    events = tmp_path / "events.jsonl"  # doesn't exist
+    assert vault_health_event_exists_for_date(events, "2026-05-10") is False
+
+
+def test_vault_health_event_exists_tolerates_garbage_lines(tmp_path: Path) -> None:
+    events = tmp_path / "events.jsonl"
+    events.write_text(
+        'not json\n{"type":"vault_health","date":"2026-05-10"}\nbroken{\n',
+        encoding="utf-8",
+    )
+    assert vault_health_event_exists_for_date(events, "2026-05-10") is True
+
+
+# ---------------------------------------------------------------------------
+# build_vault_health_event: shape contract
+# Every field the morning scan needs must appear exactly once.
+# ---------------------------------------------------------------------------
+
+
+REQUIRED_EVENT_FIELDS = {
+    "ts",
+    "type",
+    "date",
+    "time",
+    "total_notes",
+    "broken_wikilinks",
+    "orphan_notes",
+    "orphan_dailies_excluded",
+    "research_notes_last_night",
+    "surfaces_written_last_night",
+    "surfaces_handled_today",
+    "productive_wakes_last_night",
+    "stage_c_candidates",
+    "wake_type_distribution",
+    "recovery_state",
+    "research_decay_count",
+}
+
+
+def test_build_vault_health_event_has_all_required_fields(tmp_path: Path) -> None:
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    event = build_vault_health_event(
+        vault_dir=vault,
+        thoughts_dir=thoughts,
+        events_path=events,
+        surface_dir=surface,
+    )
+    missing = REQUIRED_EVENT_FIELDS - set(event.keys())
+    assert not missing, f"missing fields: {missing}"
+    assert event["type"] == "vault_health"
+    assert isinstance(event["stage_c_candidates"], dict)
+    assert set(event["stage_c_candidates"].keys()) >= {
+        "bloated_notes",
+        "stale_dailies",
+        "total",
+    }
+    assert isinstance(event["recovery_state"], dict)
+    assert "status" in event["recovery_state"]
+
+
+# ---------------------------------------------------------------------------
+# CLI: --check-existing + --append
+# These two flags are the structural fix for the field-drop bug.
+# ---------------------------------------------------------------------------
+
+
+def _cli_args(vault: Path, thoughts: Path, events: Path, surface: Path, *extra: str) -> list[str]:
+    return [
+        "--vault", str(vault),
+        "--thoughts", str(thoughts),
+        "--events", str(events),
+        "--surface", str(surface),
+        *extra,
+    ]
+
+
+def test_cli_check_existing_noops_when_event_exists(tmp_path: Path) -> None:
+    """If today's event is already in events.jsonl, --check-existing must
+    exit 0 without writing anything."""
+    import json
+
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"
+    today = datetime.now().strftime("%Y-%m-%d")
+    events.write_text(
+        json.dumps({"type": "vault_health", "date": today}) + "\n",
+        encoding="utf-8",
+    )
+    size_before = events.stat().st_size
+
+    rc = vault_health_main(_cli_args(vault, thoughts, events, surface, "--check-existing", "--append"))
+    assert rc == 0
+    # File untouched.
+    assert events.stat().st_size == size_before
+
+
+def test_cli_append_writes_full_event(tmp_path: Path) -> None:
+    """--append must write a single JSON line that has every required field."""
+    import json
+
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"  # does not exist yet
+
+    rc = vault_health_main(_cli_args(vault, thoughts, events, surface, "--check-existing", "--append"))
+    assert rc == 0
+    assert events.exists()
+    lines = events.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    evt = json.loads(lines[0])
+    missing = REQUIRED_EVENT_FIELDS - set(evt.keys())
+    assert not missing, f"appended event missing fields: {missing}"
+    assert evt["type"] == "vault_health"
+
+
+def test_cli_check_existing_continues_when_no_today_event(tmp_path: Path) -> None:
+    """events.jsonl has a vault_health event for yesterday but not today —
+    --check-existing must NOT short-circuit; --append must write today's."""
+    import json
+
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    events.write_text(
+        json.dumps({"type": "vault_health", "date": yesterday}) + "\n",
+        encoding="utf-8",
+    )
+
+    rc = vault_health_main(_cli_args(vault, thoughts, events, surface, "--check-existing", "--append"))
+    assert rc == 0
+    lines = events.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    evt = json.loads(lines[1])
+    today = datetime.now().strftime("%Y-%m-%d")
+    assert evt["date"] == today
+
+
+def test_cli_append_requires_thoughts_and_events(tmp_path: Path) -> None:
+    """--append without --thoughts/--events should error via argparse."""
+    vault = _make_vault(tmp_path)
+    with pytest.raises(SystemExit):
+        vault_health_main(["--vault", str(vault), "--append"])

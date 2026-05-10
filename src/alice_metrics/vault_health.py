@@ -32,7 +32,7 @@ import json
 import re
 import sys
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1006,6 +1006,354 @@ def count_wakes_by_stage(
 
 
 # ---------------------------------------------------------------------------
+# Stage C candidates: bloated notes + stale dailies
+# Previously computed inline in the wake template via `find | wc -l` bash.
+# Moved into Python so the morning vault scan collapses to a single command
+# (the manual JSON-assembly step kept dropping fields).
+# ---------------------------------------------------------------------------
+
+
+def count_stage_c_candidates(
+    vault_dir: Path,
+    bloated_min_lines: int = 250,
+    stale_days: int = 90,
+    today: datetime | None = None,
+) -> dict[str, int]:
+    """Stage C workload snapshot.
+
+    - ``bloated_notes``: vault ``.md`` files with > ``bloated_min_lines``
+      lines, excluding ``dailies/``, ``index.md``, ``README.md``,
+      ``unresolved.md``. Atomization candidates.
+    - ``stale_dailies``: dailies whose filename date is older than
+      ``stale_days``. Archive-eligible.
+    - ``total``: sum.
+    """
+    bloated = 0
+    if vault_dir.exists():
+        for md in vault_dir.rglob("*.md"):
+            rel_parts = md.relative_to(vault_dir).parts
+            if rel_parts and rel_parts[0] == "dailies":
+                continue
+            if md.name in EXCLUDED_NAMES:
+                continue
+            try:
+                with md.open("r", encoding="utf-8", errors="ignore") as fh:
+                    line_count = sum(1 for _ in fh)
+            except OSError:
+                continue
+            if line_count > bloated_min_lines:
+                bloated += 1
+
+    if today is None:
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff = today - timedelta(days=stale_days)
+    cutoff_str = cutoff.strftime("%Y-%m-%d")
+
+    stale = 0
+    dailies_dir = vault_dir / "dailies"
+    if dailies_dir.exists():
+        for md in dailies_dir.glob("*.md"):
+            stem = md.stem
+            # Filename date: dailies are named YYYY-MM-DD.md.
+            # Lexicographic compare works because of ISO format.
+            if len(stem) >= 10 and stem[:10] < cutoff_str:
+                stale += 1
+
+    return {"bloated_notes": bloated, "stale_dailies": stale, "total": bloated + stale}
+
+
+# ---------------------------------------------------------------------------
+# research_notes_last_night: research/ notes whose `created:` frontmatter
+# date equals yesterday. (mtime-based variants drift when notes are touched.)
+# ---------------------------------------------------------------------------
+
+
+def _parse_created_date(raw: Any) -> datetime | None:
+    """Best-effort parser for the ``created:`` frontmatter field.
+
+    Accepts ``YYYY-MM-DD``, ``YYYY-MM-DD HH:MM TZ``, or a ``datetime``
+    object already parsed by the YAML loader. Returns a naive datetime
+    at midnight on the created day, or ``None`` if unparseable.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+    s = str(raw).strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M %Z", "%Y-%m-%d %H:%M %z", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+        return dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+    # Last resort: take first 10 chars and try ISO.
+    if len(s) >= 10:
+        try:
+            dt = datetime.strptime(s[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+        return dt
+    return None
+
+
+def count_research_notes_created_on(vault_dir: Path, day: datetime) -> int:
+    """Count research/ notes whose `created:` frontmatter equals ``day``."""
+    research_dir = vault_dir / "research"
+    if not research_dir.exists():
+        return 0
+    target = day.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+    count = 0
+    for md in research_dir.rglob("*.md"):
+        if md.name in EXCLUDED_NAMES:
+            continue
+        text = _read_text(md)
+        fm, _body = split_frontmatter(text)
+        created = _parse_created_date(fm.get("created"))
+        if created is not None and created == target:
+            count += 1
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Surface counts (written / handled)
+# ---------------------------------------------------------------------------
+
+
+def count_surfaces_in_window(
+    surface_dir: Path,
+    window_start: datetime,
+    window_end: datetime,
+) -> int:
+    """Count files under ``surface_dir`` (non-recursive into ``.handled``)
+    with mtime in ``[window_start, window_end)``.
+
+    Surface dir layout: ``inner/surface/<date>/<file>.md`` plus the
+    ``.handled/`` archive. We scan every ``YYYY-MM-DD`` date dir whose
+    name could plausibly contain a file in the window, and filter by
+    mtime.
+    """
+    if not surface_dir.exists():
+        return 0
+    ws_ts = _strip_tz(window_start).timestamp()
+    we_ts = _strip_tz(window_end).timestamp()
+    count = 0
+    for child in surface_dir.iterdir():
+        if not child.is_dir():
+            continue
+        # Skip the .handled archive and any other dotfile dirs.
+        if child.name.startswith("."):
+            continue
+        # Only YYYY-MM-DD date dirs are valid sources.
+        try:
+            datetime.strptime(child.name, "%Y-%m-%d")
+        except ValueError:
+            continue
+        for f in child.rglob("*"):
+            if not f.is_file():
+                continue
+            try:
+                mtime = f.stat().st_mtime
+            except OSError:
+                continue
+            if ws_ts <= mtime < we_ts:
+                count += 1
+    return count
+
+
+def count_surfaces_handled_today(surface_dir: Path, today: datetime) -> int:
+    """Count files in ``surface_dir/.handled/<today>/``."""
+    handled = surface_dir / ".handled" / today.strftime("%Y-%m-%d")
+    if not handled.exists():
+        return 0
+    return sum(1 for f in handled.rglob("*") if f.is_file())
+
+
+# ---------------------------------------------------------------------------
+# Productive wakes last night
+# A wake file is "productive" when its frontmatter has did_work: true.
+# Filename-based timestamp puts the file in the [23:00, 07:00) window;
+# we reuse the wake-filename parser from count_wakes_by_stage.
+# ---------------------------------------------------------------------------
+
+
+def _read_did_work(path: Path) -> bool:
+    text = _read_text(path)
+    fm, _body = split_frontmatter(text)
+    val = fm.get("did_work")
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in {"true", "yes", "1"}
+    return False
+
+
+def count_productive_wakes(
+    thoughts_dir: Path, window_start: datetime, window_end: datetime
+) -> int:
+    """Count wake files in the window whose frontmatter has ``did_work: true``."""
+    if not thoughts_dir.exists():
+        return 0
+    ws = _strip_tz(window_start)
+    we = _strip_tz(window_end)
+    count = 0
+    for date_dir in _intersecting_date_dirs(thoughts_dir, ws, we):
+        try:
+            dir_date = datetime.strptime(date_dir.name, "%Y-%m-%d")
+        except ValueError:
+            continue
+        for md in date_dir.glob("*.md"):
+            ts = _parse_wake_filename(md.name, dir_date)
+            if ts is None:
+                continue
+            if not (ws <= ts < we):
+                continue
+            if _read_did_work(md):
+                count += 1
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Event-stream helpers: dedup + atomic append
+# ---------------------------------------------------------------------------
+
+
+def vault_health_event_exists_for_date(events_path: Path, date_str: str) -> bool:
+    """True iff ``events.jsonl`` already has a ``vault_health`` event whose
+    ``date`` field equals ``date_str``."""
+    if not events_path.exists():
+        return False
+    try:
+        with events_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if evt.get("type") == "vault_health" and evt.get("date") == date_str:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _append_event(events_path: Path, event: dict[str, Any]) -> None:
+    """Append ``event`` as a single JSON line. Creates parent dir if needed."""
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(event)
+    with events_path.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Local-time helpers for the morning window
+# ---------------------------------------------------------------------------
+
+
+def _local_now() -> datetime:
+    """Local naive datetime. Used for default ``today``/``yesterday``."""
+    return datetime.now()
+
+
+def _morning_window(now: datetime | None = None) -> tuple[datetime, datetime, datetime]:
+    """Return ``(yesterday_23, today_07, today_midnight)`` as naive datetimes.
+
+    The wake scan window is yesterday 23:00 through today 07:00. Both
+    endpoints are needed for surface counts and productive-wake counts.
+    """
+    if now is None:
+        now = _local_now()
+    today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_23 = today_midnight - timedelta(hours=1)
+    today_07 = today_midnight + timedelta(hours=7)
+    return yesterday_23, today_07, today_midnight
+
+
+# ---------------------------------------------------------------------------
+# Full-event assembly
+# ---------------------------------------------------------------------------
+
+
+def build_vault_health_event(
+    vault_dir: Path,
+    thoughts_dir: Path,
+    events_path: Path | None,
+    surface_dir: Path | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Assemble the complete vault_health event dict.
+
+    All fields the morning scan needs are computed here. The caller can
+    either print this (--append off) or hand it to ``_append_event``.
+    """
+    if now is None:
+        now = _local_now()
+    yesterday_23, today_07, today_midnight = _morning_window(now)
+    yesterday_midnight = today_midnight - timedelta(days=1)
+
+    if surface_dir is None:
+        # Default: sibling of thoughts_dir (inner/thoughts -> inner/surface).
+        surface_dir = thoughts_dir.parent / "surface"
+
+    # ts: ISO8601 with local offset. Use the system's local offset.
+    try:
+        local_offset = datetime.now(timezone.utc).astimezone().strftime("%z")
+        # Re-format from +HHMM to +HH:MM
+        if len(local_offset) == 5:
+            local_offset = f"{local_offset[:3]}:{local_offset[3:]}"
+    except Exception:
+        local_offset = ""
+    ts = now.strftime("%Y-%m-%dT%H:%M:%S") + local_offset
+    tzname = datetime.now().astimezone().tzname() or ""
+    time_str = f"{now.strftime('%H:%M')} {tzname}".strip()
+
+    broken_count, _ = count_broken_wikilinks(vault_dir)
+    orphan_count, _ = count_orphans(vault_dir)
+
+    event: dict[str, Any] = {
+        "ts": ts,
+        "type": "vault_health",
+        "date": now.strftime("%Y-%m-%d"),
+        "time": time_str,
+        "total_notes": count_total_notes(vault_dir),
+        "broken_wikilinks": broken_count,
+        "orphan_notes": orphan_count,
+        "orphan_dailies_excluded": True,
+        "research_notes_last_night": count_research_notes_created_on(
+            vault_dir, yesterday_midnight
+        ),
+        "surfaces_written_last_night": count_surfaces_in_window(
+            surface_dir, yesterday_23, today_07
+        ),
+        "surfaces_handled_today": count_surfaces_handled_today(surface_dir, today_midnight),
+        "productive_wakes_last_night": count_productive_wakes(
+            thoughts_dir, yesterday_23, today_07
+        ),
+        "stage_c_candidates": count_stage_c_candidates(vault_dir, today=today_midnight),
+        "wake_type_distribution": count_wakes_by_stage(
+            thoughts_dir, yesterday_23, today_07
+        ),
+        "research_decay_count": count_research_decay(vault_dir),
+    }
+
+    # Recovery state uses a 14-day rolling window ending today.
+    recovery_ws = today_midnight - timedelta(days=14)
+    event["recovery_state"] = compute_recovery_state(
+        vault_dir,
+        thoughts_dir,
+        window_start=recovery_ws,
+        window_end=today_midnight,
+        events_path=events_path,
+    )
+
+    return event
+
+
+# ---------------------------------------------------------------------------
 # CLI
 
 
@@ -1018,8 +1366,8 @@ def _parse_iso(s: str) -> datetime:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Compute the four vault-health metrics covered by "
-            "alice_metrics.vault_health and emit JSON."
+            "Compute vault-health metrics and (optionally) append a "
+            "vault_health event to memory/events.jsonl."
         )
     )
     parser.add_argument(
@@ -1033,6 +1381,15 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help="Path to inner/thoughts. Required if --window-start/end given.",
+    )
+    parser.add_argument(
+        "--surface",
+        type=Path,
+        default=None,
+        help=(
+            "Path to inner/surface. Defaults to <thoughts>/../surface. "
+            "Used for surfaces_written_last_night and surfaces_handled_today."
+        ),
     )
     parser.add_argument(
         "--window-start",
@@ -1052,8 +1409,59 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Path to memory/events.jsonl. Required for recovery_state.",
     )
+    parser.add_argument(
+        "--check-existing",
+        action="store_true",
+        help=(
+            "Read --events and exit 0 (no-op) if a vault_health event for "
+            "today already exists. Authoritative dedup; replaces the bash "
+            "grep workaround the morning scan used to run."
+        ),
+    )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help=(
+            "Append the assembled event as one JSON line to --events. "
+            "Combined with --check-existing, this is the entire morning "
+            "vault_health write path — no shell-side JSON assembly."
+        ),
+    )
     args = parser.parse_args(argv)
 
+    # Single-command morning-scan mode: when --check-existing or --append
+    # is set, the module owns the full event assembly + dedup + write.
+    if args.check_existing or args.append:
+        if args.thoughts is None:
+            parser.error("--check-existing/--append require --thoughts")
+        if args.events is None:
+            parser.error("--check-existing/--append require --events")
+
+        now = _local_now()
+        today_str = now.strftime("%Y-%m-%d")
+
+        if args.check_existing and vault_health_event_exists_for_date(
+            args.events, today_str
+        ):
+            # Today's event already on disk. Silent no-op so the morning
+            # scan can call this unconditionally.
+            return 0
+
+        event = build_vault_health_event(
+            vault_dir=args.vault,
+            thoughts_dir=args.thoughts,
+            events_path=args.events,
+            surface_dir=args.surface,
+            now=now,
+        )
+
+        if args.append:
+            _append_event(args.events, event)
+        else:
+            print(json.dumps(event))
+        return 0
+
+    # Legacy mode: emit partial-metric JSON for ad-hoc inspection.
     out: dict[str, Any] = {
         "total_notes": count_total_notes(args.vault),
     }

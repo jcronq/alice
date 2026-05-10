@@ -314,67 +314,19 @@ Full design + math: [[2026-04-26-stage-d-pair-tracking]]; quality-gate rationale
 
 ### Active mode — morning vault scan (preamble, once per day)
 
-**Before picking from the ideas queue**, check whether a `vault_health` event has been written today:
+**Before picking from the ideas queue**, run the morning scan:
 
 ```bash
-grep '"vault_health"' ~/alice-mind/memory/events.jsonl 2>/dev/null \
-  | grep "\"date\": \"$(date +%Y-%m-%d)\""
-```
-
-If no match → run the morning scan and append one `vault_health` event to `memory/events.jsonl`. Schema and example in `memory/EVENTS-SCHEMA.md §vault_health`. Start with the helper, which computes most fields for you:
-
-```bash
-yest=$(date -d 'yesterday' +%Y-%m-%d)
-today=$(date +%Y-%m-%d)
 python3 -m alice_metrics.vault_health \
   --vault ~/alice-mind/cortex-memory \
-  --thoughts ~/alice-mind/inner/thoughts \
   --events ~/alice-mind/memory/events.jsonl \
-  --window-start "${yest}T23:00:00" \
-  --window-end   "${today}T07:00:00"
+  --thoughts ~/alice-mind/inner/thoughts \
+  --check-existing --append
 ```
 
-The module emits JSON with: `total_notes`, `broken_wikilinks`, `orphan_notes`, `wake_type_distribution`, `recovery_state`, `research_decay_count`. Capture those directly into the event. The remaining fields (`research_notes_last_night`, `surfaces_written_last_night`, `surfaces_handled_today`, `productive_wakes_last_night`, `stage_c_candidates`) are computed from the bash recipes below and merged in. Final event shape:
+This checks if today's `vault_health` event already exists in `events.jsonl` and writes one if not. All fields — `total_notes`, `broken_wikilinks`, `orphan_notes`, `research_notes_last_night`, `surfaces_written_last_night`, `surfaces_handled_today`, `productive_wakes_last_night`, `stage_c_candidates`, `wake_type_distribution`, `recovery_state`, `research_decay_count` — are computed inside the module. Schema in `memory/EVENTS-SCHEMA.md §vault_health`.
 
-```json
-{
-  "ts": "YYYY-MM-DDTHH:MM:SS-04:00",
-  "type": "vault_health",
-  "date": "YYYY-MM-DD",
-  "time": "HH:MM EDT",
-  "total_notes": <from module>,
-  "broken_wikilinks": <from module>,
-  "orphan_notes": <from module>,
-  "orphan_dailies_excluded": true,
-  "research_notes_last_night": <count in research/ with created: yesterday>,
-  "surfaces_written_last_night": <count inner/surface/ files timestamped 23:00-07:00>,
-  "surfaces_handled_today": <count inner/surface/.handled/<today>/ files>,
-  "productive_wakes_last_night": <count inner/thoughts/<yesterday>/ wake files timestamped 23:00-07:00>,
-  "stage_c_candidates": {
-    "bloated_notes": <count>,
-    "stale_dailies": <count>,
-    "total": <sum>
-  },
-  "wake_type_distribution": <from module>,
-  "recovery_state": <from module>,
-  "research_decay_count": <from module>
-}
-```
-
-`stage_c_candidates` measures Stage C workload — `bloated_notes` are vault `.md` files >250 lines (atomization candidates, excluding `dailies/`, `index.md`, `README.md`, `unresolved.md`); `stale_dailies` are dailies older than 90 days (archive-eligible). Compute via:
-
-```bash
-bloated=$(find ~/alice-mind/cortex-memory -name "*.md" \
-  ! -path "*/dailies/*" ! -name "index.md" ! -name "README.md" ! -name "unresolved.md" \
-  -exec wc -l {} \; | awk '$1 > 250 {count++} END {print count+0}')
-cutoff=$(date -d '90 days ago' '+%Y-%m-%d')
-stale=$(find ~/alice-mind/cortex-memory/dailies -name "*.md" | while read f; do
-  d=$(basename "$f" .md); [[ "$d" < "$cutoff" ]] && echo "$d"; done | wc -l)
-```
-
-If `total` stays elevated or rises across consecutive days, Stage C is falling behind (debt accumulation — see [[2026-04-28-stage-c-debt-metric-design]]).
-
-If a match already exists → skip the scan entirely. This runs once per morning; don't repeat mid-day.
+Runs once per morning; the dedup is authoritative, so this command is safe to call unconditionally. If `stage_c_candidates.total` stays elevated or rises across consecutive days, Stage C is falling behind (debt accumulation — see [[2026-04-28-stage-c-debt-metric-design]]).
 
 ### Active mode — generative learning
 
