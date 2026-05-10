@@ -31,7 +31,8 @@ import argparse
 import json
 import re
 import sys
-from datetime import datetime
+from collections import defaultdict
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,22 @@ def _strip_html_comments(body: str) -> str:
     so we strip comments before calling ``extract_wikilinks``.
     """
     return _HTML_COMMENT_RE.sub("", body)
+
+
+def _extract_frontmatter_text(text: str) -> str:
+    """Return raw frontmatter text between --- fences, or empty string.
+
+    Used as a fallback when structured YAML parsing is unreliable
+    (malformed indentation, non-standard values).
+    """
+    _FENCE = "---"
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != _FENCE:
+        return ""
+    for i in range(1, len(lines)):
+        if lines[i].strip() == _FENCE:
+            return "\n".join(lines[1:i])
+    return ""
 
 
 def _iter_notes(vault_dir: Path) -> list[Path]:
@@ -258,19 +275,43 @@ def count_orphans(vault_dir: Path) -> tuple[int, list[str]]:
     by_slug, slugs_to_aliases, _alias_lower_to_slug = _build_resolution_index(vault_dir)
     # Build the referenced set: every wikilink target seen anywhere,
     # normalized and lowercased so alias-vs-slug matching works.
+    # Use _iter_resolution_targets so scaffold files (index.md, README.md,
+    # unresolved.md) are scanned for incoming links — they are legitimate
+    # reference sources even though they are excluded from the orphan
+    # candidate set itself.
     referenced_lower: set[str] = set()
-    for md in _iter_notes(vault_dir):
+    for md in _iter_resolution_targets(vault_dir):
         text = _read_text(md)
         _fm, body = split_frontmatter(text)
         for target in _extract_targets(body):
             referenced_lower.add(target.lower())
+        # Also scan frontmatter for wikilinks (e.g. in `related:` lists).
+        # Body-only scanning missed notes that are only referenced from
+        # frontmatter, inflating orphan counts. Extract from string values
+        # in the frontmatter dict (handles lists like `related: [[foo]]`).
+        for val in _fm.values():
+            if isinstance(val, str):
+                for target in _extract_targets(val):
+                    referenced_lower.add(target.lower())
+            elif isinstance(val, list):
+                for item in val:
+                    if isinstance(item, str):
+                        for target in _extract_targets(item):
+                            referenced_lower.add(target.lower())
+        # Fallback: raw frontmatter text catches malformed YAML that
+        # structured parsing misses (e.g. broken indentation in `related:`
+        # lists that causes the parser to drop items).
+        _fm_raw = _extract_frontmatter_text(text)
+        if _fm_raw:
+            for target in _extract_targets(_fm_raw):
+                referenced_lower.add(target.lower())
 
     orphans: list[str] = []
     for md in _iter_notes(vault_dir):
         rel_parts = md.relative_to(vault_dir).parts
-        # Dailies are always excluded — they're date-stamped activity
-        # logs that wouldn't normally be linked to.
-        if rel_parts and rel_parts[0] == "dailies":
+        # Dailies and archive are always excluded — they're
+        # date-stamped activity logs that wouldn't normally be linked to.
+        if rel_parts and (rel_parts[0] == "dailies" or rel_parts[0] == "archive"):
             continue
         text = _read_text(md)
         fm, _body = split_frontmatter(text)
@@ -290,6 +331,544 @@ def count_orphans(vault_dir: Path) -> tuple[int, list[str]]:
         if not (identities & referenced_lower):
             orphans.append(str(md.relative_to(vault_dir)))
     return len(orphans), orphans
+
+
+# ---------------------------------------------------------------------------
+# Research note decay
+# Design: [[2026-05-09-research-note-decay-metric]]
+# Count research/ notes older than 60 days with fewer than 2 inbound links.
+# Age determined by the `created:` frontmatter field (immutable), not mtime.
+# ---------------------------------------------------------------------------
+
+
+def count_research_decay(
+    vault_dir: Path,
+    age_days: int = 60,
+    link_threshold: int = 2,
+) -> int:
+    """Count research/ notes that have fallen out of the vault graph.
+
+    A note *decays* when it is older than ``age_days`` (based on the
+    ``created:`` frontmatter field) and has fewer than ``link_threshold``
+    inbound wikilinks from other vault notes.
+
+    Returns the count of decayed notes.
+
+    Notes younger than the age threshold are ignored — they haven't had
+    a chance to be referenced.  The threshold prevents flagging the normal
+    one-shot nature of research notes before they've had time to
+    mature into references.
+    """
+    research_dir = vault_dir / "research"
+    if not research_dir.exists():
+        return 0
+
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff = today - timedelta(days=age_days)
+
+    # Build resolution index once.
+    by_slug, slugs_to_aliases, alias_lower_to_slug = _build_resolution_index(vault_dir)
+
+    # Count inbound links per research/ note: iterate each source note,
+    # resolve its targets, and increment the counter for any research/
+    # target that resolves. This counts unique *source notes* per target,
+    # not raw link occurrences (a note that links to the same target
+    # multiple times still counts as one source).
+    research_rel_to_inbound: dict[str, int] = defaultdict(int)
+    for md in _iter_resolution_targets(vault_dir):
+        text = _read_text(md)
+        _fm, body = split_frontmatter(text)
+        # Scan body targets.
+        targets_body = _extract_targets(body)
+        # Scan frontmatter targets (related lists, etc.).
+        targets_fm: list[str] = []
+        for val in _fm.values():
+            if isinstance(val, str):
+                targets_fm.extend(_extract_targets(val))
+            elif isinstance(val, list):
+                for item in val:
+                    if isinstance(item, str):
+                        targets_fm.extend(_extract_targets(item))
+        for target in (*targets_body, *targets_fm):
+            resolved = by_slug.get(target) or by_slug.get(target.lower())
+            if resolved is None:
+                resolved_slug = alias_lower_to_slug.get(target.lower())
+                if resolved_slug:
+                    resolved = by_slug.get(resolved_slug)
+            if resolved is not None:
+                rel = str(resolved.relative_to(vault_dir))
+                if rel.startswith("research/"):
+                    research_rel_to_inbound[rel] += 1
+
+    # Now age each research note and check threshold.
+    decay_count = 0
+    for md in sorted(research_dir.rglob("*.md")):
+        if md.name in EXCLUDED_NAMES:
+            continue
+        text = _read_text(md)
+        fm, _body = split_frontmatter(text)
+        # Age from the `created:` frontmatter field.
+        created_raw = fm.get("created")
+        if created_raw is None:
+            # No `created:` field — skip to avoid false positives.
+            continue
+        created_str = str(created_raw).strip()
+        # Parse: expected formats include "YYYY-MM-DD" or "YYYY-MM-DD HH:MM EDT".
+        try:
+            # Try full timestamp first.
+            created_date = datetime.strptime(created_str, "%Y-%m-%d %H:%M %Z")
+        except ValueError:
+            try:
+                created_date = datetime.strptime(created_str, "%Y-%m-%d %H:%M %z")
+            except ValueError:
+                try:
+                    created_date = datetime.strptime(created_str, "%Y-%m-%d")
+                except ValueError:
+                    # Unparseable date — skip.
+                    continue
+        if created_date < cutoff:
+            rel = str(md.relative_to(vault_dir))
+            if research_rel_to_inbound.get(rel, 0) < link_threshold:
+                decay_count += 1
+
+    return decay_count
+
+
+# ---------------------------------------------------------------------------
+# Recovery state: post-burst recovery tracking
+# Design: [[2026-05-09-post-burst-recovery-tracking]]
+# Three signals over a 14-day rolling window:
+#   1. Tier 1 ratio (% of research notes with ≥ 10 inbound links)
+#   2. Output rate trend (slope of daily research note creation)
+#   3. Structural debt delta (change in orphan+broken over window)
+# ---------------------------------------------------------------------------
+
+
+def count_inbound_links(
+    vault_dir: Path,
+    exclude: frozenset[str] | None = None,
+) -> dict[str, int]:
+    """Count how many inbound links each note receives from the vault.
+
+    Returns ``{relpath: count}`` where *relpath* is relative to ``vault_dir``
+    and *count* is the number of other notes that reference this note via
+    a wikilink (in body or frontmatter).
+
+    ``exclude`` is an optional set of relpaths to ignore as both sources
+    and targets (useful for ignoring dailies when computing hub ratios).
+    """
+    if exclude is None:
+        exclude = frozenset()
+
+    by_slug, slugs_to_aliases, alias_lower_to_slug = _build_resolution_index(
+        vault_dir,
+    )
+
+    def _resolve(target: str) -> str | None:
+        lower = target.lower()
+        resolved = by_slug.get(lower)
+        if resolved is None:
+            resolved_slug = alias_lower_to_slug.get(lower)
+            if resolved_slug:
+                resolved = by_slug.get(resolved_slug)
+        if resolved is None:
+            return None
+        return str(resolved.relative_to(vault_dir))
+
+    # Count one inbound per wikilink occurrence per source file. Two links
+    # from different sources to the same target → 2 inbound. Multiple links
+    # from a single source to the same target collapse to 1 (a note that
+    # references hub three times shouldn't triple-count itself as a hub fan).
+    inbound: dict[str, int] = defaultdict(int)
+    for md in _iter_resolution_targets(vault_dir):
+        if str(md.relative_to(vault_dir)) in exclude:
+            continue
+        text = _read_text(md)
+        _fm, body = split_frontmatter(text)
+        per_source_targets: set[str] = set()
+        for target in _extract_targets(body):
+            per_source_targets.add(target.lower())
+        for val in _fm.values():
+            if isinstance(val, str):
+                for target in _extract_targets(val):
+                    per_source_targets.add(target.lower())
+            elif isinstance(val, list):
+                for item in val:
+                    if isinstance(item, str):
+                        for target in _extract_targets(item):
+                            per_source_targets.add(target.lower())
+        for target in per_source_targets:
+            rel = _resolve(target)
+            if rel is not None and rel not in exclude:
+                inbound[rel] += 1
+    return dict(inbound)
+
+
+def count_tier1_ratio(
+    vault_dir: Path,
+    notes_7d_cutoff: datetime | None = None,
+) -> dict[str, float | int]:
+    """Compute the Tier 1 ratio for research/ notes ≥ 7 days old.
+
+    **Tier 1 ratio** = fraction of 7-day-old research/ notes that have
+    ≥ 10 inbound links from other vault notes.
+
+    Only notes in the ``research/`` subdirectory count toward the metric.
+    Notes younger than 7 days are excluded (they haven't had time to
+    accumulate inbound links).
+
+    Returns ``{"ratio": float, "hubs": int, "total": int}`` where
+    *hubs* is the count of notes with ≥ 10 inbound links and *total*
+    is the count of research/ notes ≥ 7 days old.
+    """
+    if notes_7d_cutoff is None:
+        notes_7d_cutoff = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Collect research/ notes with mtime ≥ 7 days ago.
+    cutoff_ts = notes_7d_cutoff.timestamp()
+    old_notes: list[Path] = []
+    research_dir = vault_dir / "research"
+    if not research_dir.exists():
+        return {"ratio": 0.0, "hubs": 0, "total": 0}
+    for md in sorted(research_dir.rglob("*.md")):
+        if md.name in EXCLUDED_NAMES:
+            continue
+        try:
+            mtime = md.stat().st_mtime
+        except OSError:
+            continue
+        if mtime >= cutoff_ts:
+            continue  # too recent
+        old_notes.append(md)
+
+    if not old_notes:
+        return {"ratio": 0.0, "hubs": 0, "total": 0}
+
+    # Count inbound links (excluding dailies as sources to avoid
+    # inflating counts with activity-log references).
+    daily_rel_prefix = str(vault_dir / "dailies")
+    inbound = count_inbound_links(vault_dir, exclude=frozenset(
+        str(d.relative_to(vault_dir))
+        for d in (vault_dir / "dailies").rglob("*.md")
+        if d.is_file()
+    ) if (vault_dir / "dailies").exists() else frozenset())
+
+    hubs = 0
+    for md in old_notes:
+        rel = str(md.relative_to(vault_dir))
+        count = inbound.get(rel, 0)
+        if count >= 10:
+            hubs += 1
+
+    ratio = hubs / len(old_notes) if old_notes else 0.0
+    return {"ratio": round(ratio, 4), "hubs": hubs, "total": len(old_notes)}
+
+
+def _linear_regression_slope(x: list[float], y: list[float]) -> float:
+    """Ordinary least-squares slope for paired (x, y) data.
+
+    Returns 0.0 if fewer than 2 points or all x values are identical.
+    """
+    n = len(x)
+    if n < 2:
+        return 0.0
+    mean_x = sum(x) / n
+    # Check for zero variance in x.
+    if all(xi == mean_x for xi in x):
+        return 0.0
+    numerator = sum((xi - mean_x) * (yi - sum(y) / n) for xi, yi in zip(x, y))
+    denominator = sum((xi - mean_x) ** 2 for xi in x)
+    if denominator == 0:
+        return 0.0
+    return numerator / denominator
+
+
+def count_output_rate_slope(
+    vault_dir: Path,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
+) -> dict[str, float | int]:
+    """Compute the slope of daily research/ note creation over a window.
+
+    Counts notes in ``research/*.md`` by file mtime (in calendar-day
+    buckets), fits an OLS line, and returns the slope (notes/day/day).
+
+    Positive slope = output accelerating (burst).  Negative = output
+    declining (recovery).  Near-zero = stable.
+
+    Returns ``{"slope": float, "days": int, "counts": list[int]}``.
+    """
+    if window_start is None:
+        window_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=14)
+    if window_end is None:
+        window_end = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    ws = window_start.replace(tzinfo=None)
+    we = window_end.replace(tzinfo=None)
+
+    # Bucket notes by calendar day of mtime.
+    daily: dict[datetime, int] = defaultdict(int)
+    research_dir = vault_dir / "research"
+    if research_dir.exists():
+        for md in research_dir.rglob("*.md"):
+            if md.name in EXCLUDED_NAMES:
+                continue
+            try:
+                mtime = datetime.fromtimestamp(md.stat().st_mtime)
+            except OSError:
+                continue
+            day = mtime.replace(hour=0, minute=0, second=0, microsecond=0)
+            if ws <= day < we:
+                daily[day] += 1
+
+    if not daily:
+        return {"slope": 0.0, "days": 0, "counts": []}
+
+    # Create a full day sequence so gaps (zero-creation days) are
+    # counted — this matters for the slope.
+    days: list[datetime] = []
+    counts: list[int] = []
+    current = ws.replace(hour=0, minute=0, second=0, microsecond=0)
+    while current <= we:
+        days.append(current)
+        counts.append(daily.get(current, 0))
+        current += timedelta(days=1)
+
+    x_vals = [float(i) for i in range(len(days))]
+    y_vals = [float(c) for c in counts]
+    slope = _linear_regression_slope(x_vals, y_vals)
+    return {"slope": round(slope, 4), "days": len(days), "counts": counts}
+
+
+def _read_events_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Read and return all events from a JSONL event file."""
+    events: list[dict[str, Any]] = []
+    if not path.exists():
+        return events
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    except OSError:
+        pass
+    return events
+
+
+def _event_structural_debt(event: dict[str, Any]) -> int:
+    """Structural debt from a single vault_health event: orphans + broken."""
+    return event.get("orphan_notes", 0) + event.get("broken_wikilinks", 0)
+
+
+def compute_recovery_state(
+    vault_dir: Path,
+    thoughts_dir: Path,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
+    events_path: Path | None = None,
+) -> dict[str, Any]:
+    """Compute the full recovery_state sub-object for a vault_health event.
+
+    The 14-day rolling window metric determines whether the thinking
+    system is in recovery, stable, or deteriorating state after a
+    research burst.
+
+    **Signals:**
+    1. Tier 1 ratio (% of 7-day-old research/ notes with ≥ 10 inbound links)
+    2. Output rate slope (OLS slope of daily research note creation)
+    3. Structural debt delta (change in orphan+broken over window)
+
+    **Decision rules:**
+    - 2+ green signals → ``recovering`` (can accept more work)
+    - 2+ yellow signals → ``consolidating`` (self-correcting)
+    - 2+ red signals   → ``deteriorating`` (trigger consolidation)
+
+    **Burst detection:** If ``research_notes_last_night`` > 20 for
+    2+ consecutive days in the events log, status is ``active_burst``.
+
+    Default when no burst is active and no window data available:
+    ``{"status": "baseline", "window": "N/A"}``.
+    """
+    if window_start is None:
+        window_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=14)
+    if window_end is None:
+        window_end = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    ws = window_start.replace(tzinfo=None)
+    we = window_end.replace(tzinfo=None)
+
+    # --- Check for active burst via events.jsonl ---
+    if events_path and events_path.exists():
+        events = _read_events_jsonl(events_path)
+        last_night_counts: list[int] = []
+        for evt in reversed(events):
+            if evt.get("type") != "vault_health":
+                continue
+            rnl = evt.get("research_notes_last_night", 0)
+            if isinstance(rnl, (int, float)) and rnl > 20:
+                last_night_counts.append(int(rnl))
+            elif len(last_night_counts) > 0:
+                break  # once we hit a non-burst, stop looking back
+        if len(last_night_counts) >= 2:
+            return {
+                "status": "active_burst",
+                "tier_1_ratio": None,
+                "output_rate_slope": None,
+                "structural_debt_delta": None,
+                "estimated_recovery_tier": "R0",
+                "burst_start_date": None,
+                "day_in_window": None,
+            }
+
+    # --- Compute three signals ---
+    # 1. Tier 1 ratio
+    tier1 = count_tier1_ratio(vault_dir, notes_7d_cutoff=ws)
+    tier1_ratio = tier1.get("ratio", 0.0)
+
+    # 2. Output rate slope
+    output = count_output_rate_slope(vault_dir, window_start=ws, window_end=we)
+    slope = output.get("slope", 0.0)
+    slope_total_notes = sum(output.get("counts", []) or [])
+
+    # 3. Structural debt delta
+    debt_delta = 0
+    debt_has_data = bool(events_path and events_path.exists())
+    if events_path and events_path.exists():
+        events = _read_events_jsonl(events_path)
+        # Find vault_health events near window boundaries.
+        # Start debt: most recent event at or before window_start, or
+        #             oldest event inside the window if none precedes it.
+        # End debt: most recent event overall.
+        debt_at_start_pre = None
+        debt_at_start_in = None
+        debt_at_end = None
+        for evt in events:
+            if evt.get("type") != "vault_health":
+                continue
+            evt_date_str = evt.get("date")
+            if not evt_date_str:
+                continue
+            try:
+                evt_date = datetime.strptime(evt_date_str, "%Y-%m-%d")
+            except ValueError:
+                continue
+            evt_naive = evt_date.replace(hour=0, minute=0, second=0, microsecond=0)
+            # Pre-window candidate: most recent event <= window_start.
+            if evt_naive <= ws and (debt_at_start_pre is None or evt_date > debt_at_start_pre):
+                debt_at_start_pre = evt_date
+            # In-window candidate: oldest event > window_start.
+            if evt_naive > ws and (debt_at_start_in is None or evt_date < debt_at_start_in):
+                debt_at_start_in = evt_date
+            # End debt: most recent event overall.
+            if debt_at_end is None or evt_date > debt_at_end:
+                debt_at_end = evt_date
+        debt_at_start = debt_at_start_pre or debt_at_start_in
+        # Compute delta using the event dicts directly.
+        # Need at least two distinct events (start ≠ end) for a meaningful delta.
+        if (
+            debt_at_start is not None
+            and debt_at_end is not None
+            and debt_at_start != debt_at_end
+        ):
+            start_evt = next(
+                (e for e in events if e.get("date") == debt_at_start.strftime("%Y-%m-%d")),
+                None,
+            )
+            end_evt = next(
+                (e for e in events if e.get("date") == debt_at_end.strftime("%Y-%m-%d")),
+                None,
+            )
+            if start_evt and end_evt:
+                debt_delta = _event_structural_debt(end_evt) - _event_structural_debt(
+                    start_evt
+                )
+        # Single event in/around window → can't compute a delta. debt_has_data
+        # stays True (events.jsonl exists), but classifier treats delta=0 as
+        # green which is fine here since we genuinely have no signal of decline.
+
+    # --- Classify each signal ---
+    def _tier1_color(ratio: float) -> str:
+        if ratio >= 0.15:
+            return "green"
+        if ratio >= 0.05:
+            return "yellow"
+        return "red"
+
+    def _slope_color(s: float, total_notes: int) -> str:
+        # Positive slope = recovering (output declining from burst)
+        # Negative slope = deteriorating (output accelerating)
+        # Fewer than 3 notes total in the window → yellow (cautious unknown):
+        # OLS over a series of zeros gives a small slope that the green band
+        # would swallow, masking a genuine "no data" state.
+        if total_notes < 3:
+            return "yellow"
+        if s <= 15:
+            return "green"
+        if s <= 25:
+            return "yellow"
+        return "red"
+
+    def _debt_color(delta: int, has_data: bool) -> str:
+        # No events.jsonl available → yellow (cautious unknown).
+        if not has_data:
+            return "yellow"
+        if delta <= 5:
+            return "green"
+        if delta <= 20:
+            return "yellow"
+        return "red"
+
+    colors = {
+        "tier_1_ratio": _tier1_color(tier1_ratio),
+        "output_rate_slope": _slope_color(slope, slope_total_notes),
+        "structural_debt_delta": _debt_color(debt_delta, debt_has_data),
+    }
+
+    # --- Aggregate: 2+ green → recovering, 2+ yellow → consolidating,
+    #    2+ red → deteriorating ---
+    color_counts = defaultdict(int)
+    for c in colors.values():
+        color_counts[c] += 1
+
+    if color_counts["green"] >= 2:
+        status = "recovering"
+    elif color_counts["yellow"] >= 2:
+        status = "consolidating"
+    elif color_counts["red"] >= 2:
+        status = "deteriorating"
+    else:
+        # Mixed signals — default to consolidating (cautious).
+        status = "consolidating"
+
+    # --- Estimated recovery tier ---
+    if status == "recovering":
+        if tier1_ratio >= 0.25 and debt_delta <= 5 and slope <= 10:
+            tier_label = "R5-R6"
+        else:
+            tier_label = "R3-R4"
+    elif status == "consolidating":
+        if tier1_ratio >= 0.05:
+            tier_label = "R3-R4"
+        else:
+            tier_label = "R1-R2"
+    elif status == "deteriorating":
+        tier_label = "R0"
+    else:
+        tier_label = "N/A"
+
+    return {
+        "status": status,
+        "tier_1_ratio": tier1_ratio,
+        "output_rate_slope": slope,
+        "structural_debt_delta": debt_delta,
+        "estimated_recovery_tier": tier_label,
+        "burst_start_date": None,
+        "day_in_window": None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +1047,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="ISO timestamp; end of the wake-counting window.",
     )
+    parser.add_argument(
+        "--events",
+        type=Path,
+        default=None,
+        help="Path to memory/events.jsonl. Required for recovery_state.",
+    )
     args = parser.parse_args(argv)
 
     out: dict[str, Any] = {
@@ -478,9 +1063,24 @@ def main(argv: list[str] | None = None) -> int:
     orphan_count, _orphans = count_orphans(args.vault)
     out["orphan_notes"] = orphan_count
 
+    # Research note decay: notes older than 60 days with < 2 inbound links.
+    out["research_decay_count"] = count_research_decay(args.vault)
+
     if args.thoughts and args.window_start and args.window_end:
         out["wake_type_distribution"] = count_wakes_by_stage(
             args.thoughts, args.window_start, args.window_end
+        )
+        # Recovery state always uses a full 14-day rolling window,
+        # regardless of the short wake window used for wake counting.
+        _we = _strip_tz(args.window_end)
+        _recovery_ws = _we - timedelta(days=14)
+        _recovery_we = _we
+        out["recovery_state"] = compute_recovery_state(
+            args.vault,
+            args.thoughts,
+            window_start=_recovery_ws,
+            window_end=_recovery_we,
+            events_path=args.events,
         )
     print(json.dumps(out, indent=2, sort_keys=True))
     return 0

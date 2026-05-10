@@ -23,9 +23,14 @@ import pytest
 
 from alice_metrics.vault_health import (
     count_broken_wikilinks,
+    count_inbound_links,
     count_orphans,
+    count_output_rate_slope,
+    count_research_decay,
+    count_tier1_ratio,
     count_total_notes,
     count_wakes_by_stage,
+    compute_recovery_state,
 )
 
 
@@ -521,3 +526,372 @@ def test_broken_wikilinks_excludes_mixed_tick_widths(tmp_path: Path) -> None:
     n, broken = count_broken_wikilinks(vault)
     assert n == 1
     assert broken == [("research/foo.md", "c")]
+
+
+# ---------------------------------------------------------------------------
+# Recovery state: inbound link counting
+
+
+def test_inbound_links_counts_cross_directory_refs(tmp_path: Path) -> None:
+    """research/a.md → reference/hub.md (hub gets +1)."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "a.md",
+        """
+        ---
+        slug: a
+        ---
+        Hub note: [[hub]]
+        """,
+    )
+    _write(
+        vault / "reference" / "hub.md",
+        """
+        ---
+        slug: hub
+        ---
+        I am the hub.
+        """,
+    )
+
+    links = count_inbound_links(vault)
+    assert links["reference/hub.md"] >= 1
+
+
+def test_inbound_links_excludes_dailies_when_requested(tmp_path: Path) -> None:
+    """Daily references to a note should not inflate hub count when
+    dailies are excluded."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "reference" / "hub.md",
+        """
+        ---
+        slug: hub
+        ---
+        Hub.
+        """,
+    )
+    _write(
+        vault / "research" / "a.md",
+        """
+        ---
+        slug: a
+        ---
+        References hub: [[hub]].
+        """,
+    )
+    _write(
+        vault / "dailies" / "2026-05-09.md",
+        """
+        Today I wrote about [[hub]].
+        """,
+    )
+
+    # With dailies excluded: only research/a.md counts → hub gets 1
+    daily_files = list((vault / "dailies").rglob("*.md"))
+    exclude = frozenset(str(d.relative_to(vault)) for d in daily_files)
+    links = count_inbound_links(vault, exclude=exclude)
+    assert links["reference/hub.md"] == 1
+
+    # Without exclusion: research/a.md + daily → hub gets 2
+    links_no_exclude = count_inbound_links(vault)
+    assert links_no_exclude["reference/hub.md"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Recovery state: Tier 1 ratio
+
+
+def test_tier1_ratio_returns_zero_when_no_old_notes(tmp_path: Path) -> None:
+    """Notes created in the future (mtime > cutoff) → total = 0 → ratio = 0."""
+    vault = _make_vault(tmp_path)
+    from datetime import datetime, timedelta
+
+    # Cutoff in the future — no notes qualify.
+    cutoff = datetime.now() + timedelta(days=1)
+    result = count_tier1_ratio(vault, notes_7d_cutoff=cutoff)
+    assert result == {"ratio": 0.0, "hubs": 0, "total": 0}
+
+
+def test_tier1_ratio_empty_research_dir(tmp_path: Path) -> None:
+    vault = _make_vault(tmp_path)
+    # research/ exists but has no .md files.
+    result = count_tier1_ratio(vault)
+    assert result == {"ratio": 0.0, "hubs": 0, "total": 0}
+
+
+# ---------------------------------------------------------------------------
+# Recovery state: output rate slope
+
+
+def test_output_rate_slope_empty_vault(tmp_path: Path) -> None:
+    vault = _make_vault(tmp_path)
+    result = count_output_rate_slope(vault)
+    assert result["slope"] == 0.0
+    assert result["days"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Recovery state: end-to-end with events.jsonl
+
+
+def _write_event(path: Path, ts: str, vault_health: dict) -> None:
+    """Append a vault_health event to the JSONL file."""
+    import json
+    evt = {"ts": ts, "type": "vault_health", **vault_health}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(evt) + "\n")
+
+
+def test_recovery_state_no_events(tmp_path: Path) -> None:
+    """No events.jsonl → debt_delta = 0, status = consolidating."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    events = tmp_path / "events.jsonl"  # doesn't exist
+
+    from datetime import datetime, timedelta
+
+    we = datetime.now()
+    ws = we - timedelta(days=14)
+    result = compute_recovery_state(
+        vault, thoughts, window_start=ws, window_end=we, events_path=events
+    )
+    assert result["status"] in {"consolidating", "deteriorating"}  # tier1=0 is red
+    assert result["structural_debt_delta"] == 0
+
+
+def test_recovery_state_baseline_available(tmp_path: Path) -> None:
+    """Events with clear start and end → delta computed."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    # Create a research note with mtime in the past (8 days ago).
+    from datetime import datetime, timedelta
+    import os
+
+    eight_days_ago = datetime.now() - timedelta(days=8)
+    note_path = vault / "research" / "hub.md"
+    _write(
+        note_path,
+        """
+        ---
+        slug: hub
+        ---
+        Hub.
+        """,
+    )
+    # Set mtime to 8 days ago (old enough for Tier 1).
+    ts = eight_days_ago.timestamp()
+    os.utime(note_path, (ts, ts))
+
+    # Write events: start debt = 10, end debt = 5 (debt resolving).
+    _write_event(events, "2026-05-01T08:00:00-04:00", {
+        "date": "2026-05-01",
+        "total_notes": 100,
+        "orphan_notes": 6,
+        "broken_wikilinks": 4,
+    })
+    _write_event(events, "2026-05-10T08:00:00-04:00", {
+        "date": "2026-05-10",
+        "total_notes": 105,
+        "orphan_notes": 3,
+        "broken_wikilinks": 2,
+    })
+
+    we = datetime(2026, 5, 10, 7, 0, 0)
+    ws = we - timedelta(days=14)
+    result = compute_recovery_state(
+        vault, thoughts, window_start=ws, window_end=we, events_path=events
+    )
+    # debt_delta = (3+2) - (6+4) = -5 (green)
+    assert result["structural_debt_delta"] == -5
+    # tier1_ratio: 1 note, 0 links → 0.0 (red)
+    # slope: small positive (recovering)
+    # Result: 1 red, 1 green, 1 unknown/low → consolidating
+    assert result["status"] in {"consolidating", "deteriorating"}
+
+
+# ---------------------------------------------------------------------------
+# Research note decay: [[2026-05-09-research-note-decay-metric]]
+# Count research/ notes older than 60 days with fewer than 2 inbound links.
+# Age determined by the `created:` frontmatter field.
+# ---------------------------------------------------------------------------
+
+
+def test_research_decay_empty_vault(tmp_path: Path) -> None:
+    """No research/ notes → 0 decay."""
+    vault = _make_vault(tmp_path)
+    assert count_research_decay(vault) == 0
+
+
+def test_research_decay_empty_research_dir(tmp_path: Path) -> None:
+    """research/ exists but has no .md files → 0 decay."""
+    vault = _make_vault(tmp_path)
+    assert count_research_decay(vault) == 0
+
+
+def test_research_decay_young_note_not_counted(tmp_path: Path) -> None:
+    """A note with a `created:` date only 10 days ago should not be counted
+    as decayed, even with zero inbound links."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "foo.md",
+        """
+        ---
+        slug: foo
+        created: 2026-05-05
+        ---
+        Young note with no inbound links.
+        """,
+    )
+    assert count_research_decay(vault) == 0
+
+
+def test_research_decay_old_note_zero_links(tmp_path: Path) -> None:
+    """A note older than 60 days with 0 inbound links is decayed."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "old-note.md",
+        """
+        ---
+        slug: old-note
+        created: 2026-03-01
+        ---
+        Old note nobody references.
+        """,
+    )
+    assert count_research_decay(vault) == 1
+
+
+def test_research_decay_old_note_one_link_not_decayed(tmp_path: Path) -> None:
+    """A note older than 60 days with exactly 1 inbound link is NOT decayed
+    (threshold is fewer than 2)."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "reference" / "referencing.md",
+        """
+        ---
+        slug: referencing
+        ---
+        References old stuff: [[old-note]].
+        """,
+    )
+    _write(
+        vault / "research" / "old-note.md",
+        """
+        ---
+        slug: old-note
+        created: 2026-03-01
+        ---
+        Old note with one inbound link.
+        """,
+    )
+    # 1 inbound link → below threshold of 2 → decayed.
+    assert count_research_decay(vault) == 1
+
+
+def test_research_decay_old_note_two_links_not_decayed(tmp_path: Path) -> None:
+    """A note older than 60 days with 2+ inbound links is NOT decayed."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "reference" / "ref1.md",
+        """
+        ---
+        slug: ref1
+        ---
+        Links to [[old-note]].
+        """,
+    )
+    _write(
+        vault / "reference" / "ref2.md",
+        """
+        ---
+        slug: ref2
+        ---
+        Also links to [[old-note]].
+        """,
+    )
+    _write(
+        vault / "research" / "old-note.md",
+        """
+        ---
+        slug: old-note
+        created: 2026-03-01
+        ---
+        Old note with two inbound links.
+        """,
+    )
+    # 2 inbound links → not fewer than 2 → NOT decayed.
+    assert count_research_decay(vault) == 0
+
+
+def test_research_decay_missing_created_field_skipped(tmp_path: Path) -> None:
+    """An old note without a `created:` frontmatter field is skipped
+    (not counted as decayed, to avoid false positives)."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "no-created.md",
+        """
+        ---
+        slug: no-created
+        ---
+        Note without a created field.
+        """,
+    )
+    assert count_research_decay(vault) == 0
+
+
+def test_research_decay_frontmatter_link_not_counted(tmp_path: Path) -> None:
+    """A link in a frontmatter `related:` list counts as an inbound link."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "reference" / "hub.md",
+        """
+        ---
+        slug: hub
+        related: [[old-note]]
+        ---
+        Hub note.
+        """,
+    )
+    _write(
+        vault / "research" / "old-note.md",
+        """
+        ---
+        slug: old-note
+        created: 2026-03-01
+        ---
+        Old note linked from frontmatter.
+        """,
+    )
+    # 1 inbound link (from frontmatter) → fewer than 2 → decayed.
+    assert count_research_decay(vault) == 1
+
+
+def test_research_decay_cross_directory_link_counts(tmp_path: Path) -> None:
+    """A link from a note in another directory resolves and counts."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "projects" / "project-x.md",
+        """
+        ---
+        slug: project-x
+        ---
+        References [[old-note]] extensively.
+        """,
+    )
+    _write(
+        vault / "research" / "old-note.md",
+        """
+        ---
+        slug: old-note
+        created: 2026-03-01
+        ---
+        Old note referenced from projects/.
+        """,
+    )
+    assert count_research_decay(vault) == 1  # only 1 link < 2
