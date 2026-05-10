@@ -954,3 +954,173 @@ kbd {
 .stage-d-btn-reject { color: var(--err); }
 .stage-d-btn-unlabeled { color: var(--muted); }
 
+/* ==========================================================================
+   Responsive layout — phone, phone-landscape/small-tablet, tablet.
+   Desktop (>=1024px) is the unchanged default above. We layer in @media
+   blocks that fix:
+     - nav bar wrap (10 links jammed into one row on phone)
+     - sidebar + main two-column collapse to single column
+     - word-letter wrapping inside narrow cards
+     - form controls jammed against viewport edge
+     - stage-D side-by-side judge verdicts stacking on phone
+   The existing .context-layout @media (max-width: 900px) rule above
+   is preserved; the rules here are additive.
+   ========================================================================== */
+
+/* Tablet and below (<1024px): stack sidebar below main, drop sticky.
+   On a 768px tablet, 280px sidebar + main was always cramped — single
+   column reads better and keeps tap-targets reachable. We switch
+   .layout from grid to flex-column so the `order` property predictably
+   moves the sidebar (which is debug/metrics info) below main content. */
+@media (max-width: 1023px) {
+  .layout {
+    display: flex;
+    flex-direction: column;
+  }
+  main { order: 1; }
+  .sidebar {
+    order: 2;
+    position: static;
+    max-height: none;
+    border-right: 0;
+    border-top: 1px solid var(--border);
+  }
+}
+
+/* Phone landscape / small tablet (<768px): hide the sidebar entirely.
+   The sidebar is 5 sections of speaking/thinking/queues/directive/paths
+   metrics — not useful on a phone, and stacking it shoves real content
+   way below the fold. Tighten paddings + let the topbar nav wrap. */
+@media (max-width: 767px) {
+  .sidebar { display: none; }
+
+  /* Topbar: stack brand above nav, let nav wrap cleanly across rows. */
+  .topbar {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 8px 12px;
+    position: static; /* sticky topbar that's 5 rows tall is worse than no stick */
+  }
+  .topbar nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 4px;
+    width: 100%;
+  }
+  nav a {
+    padding: 4px 8px;
+    margin-right: 0;
+    font-size: 12px;
+  }
+
+  /* Tighten main padding so content has room to breathe. */
+  main { padding: 12px 14px; }
+  h1 { font-size: 15px; }
+
+  /* Forms: ensure inputs don't slam the viewport edge + wrap rows. */
+  .stage-d-controls {
+    gap: 10px;
+    padding-right: 4px;
+  }
+  .stage-d-controls input,
+  .stage-d-controls select {
+    max-width: 100%;
+  }
+  /* The "days" number input has inline style="width:5em" — keep it
+     compact but make sure it doesn't escape its parent. */
+  .stage-d-controls label {
+    min-width: 0;
+    flex: 0 1 auto;
+  }
+
+  /* Stage D: dual-judge verdicts side-by-side gets squished on phone.
+     Stack vertically so each verdict gets full width. */
+  .stage-d-verdicts {
+    grid-template-columns: 1fr;
+  }
+
+  /* Stage D row head: outcome + label + ts already wrap with flex-wrap,
+     but on phone the pair (slug × slug × attempt N) is the main thing
+     that overflows. Force it to wrap and break on slugs. */
+  .stage-d-pair { font-size: 11px; }
+  .stage-d-slug {
+    word-break: break-all;
+    overflow-wrap: anywhere;
+    font-size: 11px;
+  }
+  .stage-d-row { padding: 10px 12px; }
+  .stage-d-row-actions { gap: 4px; }
+  .stage-d-btn { padding: 4px 8px; }
+
+  /* Safety net: any text-heavy card that ends up narrow gets word-level
+     wrapping instead of letter-level breaks. The underlying fix is the
+     single-column stack above; this catches edge cases like very long
+     unbroken tokens in synthesis text. */
+  .stage-d-synth-body,
+  .stage-d-retry-body,
+  .stage-d-verdict-reason {
+    word-break: break-word;
+    overflow-wrap: anywhere;
+  }
+
+  /* Detail grid (used on wake/turn detail pages) — the 140px label
+     column eats half the screen on phone. Collapse to single column. */
+  .detail-grid {
+    grid-template-columns: 1fr;
+    gap: 2px 0;
+  }
+  .detail-grid .k { margin-top: 6px; }
+
+  /* Event rows: 4-column grid (140/230/140/1fr) does not fit a 375px
+     phone. Stack the ts / kind / cid / summary into a flow. */
+  .event {
+    grid-template-columns: 1fr;
+    gap: 4px;
+    padding: 8px 10px;
+  }
+  .event .summary { white-space: normal; }
+  .event .cid { white-space: normal; }
+
+  /* Trace rows: 120/140/1fr → stack to single column on phone. */
+  .trace-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+
+  /* Arc step row: 90px marker + body — keep marker but shrink. */
+  .arc-step-row {
+    grid-template-columns: 60px 1fr;
+    gap: 8px;
+  }
+
+  /* Modal: full-bleed on phone instead of 40px padding which clips. */
+  .modal-backdrop { padding: 16px 8px; }
+  .modal-head { padding: 12px 14px; }
+  .modal-body { padding: 12px 14px 18px; }
+}
+
+/* Phone portrait (<=480px): extra tightening for the smallest screens.
+   Nav links shrink, brand text hides (logo stays), summary pills wrap. */
+@media (max-width: 480px) {
+  .brand span:not(.logo) {
+    /* Keep the lunar logo, drop the "Alice Viewer" label so the topbar
+       takes one less row before nav starts wrapping. */
+    display: none;
+  }
+  nav a {
+    padding: 3px 7px;
+    font-size: 11px;
+    margin-right: 0;
+  }
+  main { padding: 10px 12px; }
+
+  .stage-d-summary-row { gap: 6px; }
+  .stage-d-pill { padding: 3px 8px; font-size: 11px; }
+  .stage-d-pill .stage-d-pill-n { font-size: 13px; }
+
+  /* Filter bar wraps already; just tighten gap. */
+  .filter-bar { gap: 6px; }
+  .filter-bar a { padding: 3px 8px; font-size: 11px; }
+}
+
