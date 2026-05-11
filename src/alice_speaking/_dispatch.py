@@ -36,6 +36,7 @@ if TYPE_CHECKING:
         SignalEvent,
         SurfaceEvent,
     )
+    from .internal.background_task import BackgroundTaskCompleteEvent
 
 
 log = logging.getLogger("alice_speaking._dispatch")
@@ -581,5 +582,91 @@ async def handle_emergency(ctx: DaemonContext, event: "EmergencyEvent") -> None:
             turn_id=turn_id,
             emergency_id=path.name,
             verdict=verdict,
+            duration_ms=int((time.time() - started) * 1000),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Background-task completion turn — synthetic event from the
+# dispatch_background_task tool's per-subagent waiter.
+
+
+async def handle_background_task_complete(
+    ctx: DaemonContext, event: "BackgroundTaskCompleteEvent"
+) -> None:
+    """Run a fresh turn that delivers a sub-agent's result to Alice.
+
+    Mirrors :func:`handle_signal` / :func:`handle_emergency` shape.
+    The synthetic event carries the originating channel + principal
+    that were live when Alice originally dispatched, so Alice's
+    ``send_message(recipient='self')`` during this turn routes back
+    to whoever originally asked.
+
+    Failure modes are surfaced in the prompt rather than swallowed —
+    Alice is the right judge of what to do with a failed sub-agent
+    (retry, redo manually, escalate, ignore).
+    """
+    turn_id = uuid.uuid4().hex[:12]
+    started = time.time()
+    ctx.events.emit(
+        "background_task_dispatch",
+        turn_id=turn_id,
+        handle=event.handle,
+        description=event.description,
+        is_error=event.is_error,
+        result_chars=len(event.result_text or ""),
+        result_preview=_short(event.result_text or "", 300),
+        principal_name=event.principal_name,
+        channel_transport=(event.channel.transport if event.channel else None),
+    )
+
+    framing = "failed" if event.is_error else "completed"
+    body = (event.result_text or "").strip() or "(sub-agent returned no text)"
+    prompt = (
+        f"Background task `{event.handle}` ({event.description!r}) "
+        f"{framing}. You dispatched it earlier on behalf of "
+        f"{event.principal_name}; here's the sub-agent's final output:\n\n"
+        f"{body}\n\n"
+        f"Decide what (if anything) to forward to "
+        f"{event.principal_name}. Use send_message(recipient='self') "
+        f"to reply on the originating channel — it's restored for "
+        f"this turn."
+    )
+
+    error: Optional[str] = None
+    prev_kind = ctx._current_turn_kind
+    prev_channel = ctx._current_reply_channel
+    prev_display_name = ctx._current_principal_display_name
+    # Treat the completion turn like its originating channel so the
+    # quiet-hours bypass + outbound routing match what the original
+    # request would have used. If channel is None (originating turn
+    # had no channel — e.g. a surface), fall through with no kind so
+    # quiet hours still apply to outbound.
+    if event.channel is not None:
+        ctx._current_reply_channel = event.channel
+        ctx._current_turn_kind = event.channel.transport
+    ctx._current_principal_display_name = event.principal_name
+    try:
+        await ctx._run_turn(
+            prompt,
+            turn_id=turn_id,
+            outbound_recipient=(event.channel.address if event.channel else None),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception(
+            "background_task completion turn failed for handle %s",
+            event.handle,
+        )
+        error = f"{type(exc).__name__}: {exc}"
+    finally:
+        ctx._current_turn_kind = prev_kind
+        ctx._current_reply_channel = prev_channel
+        ctx._current_principal_display_name = prev_display_name
+        ctx.events.emit(
+            "background_task_turn_end",
+            turn_id=turn_id,
+            handle=event.handle,
+            description=event.description,
+            error=error,
             duration_ms=int((time.time() - started) * 1000),
         )

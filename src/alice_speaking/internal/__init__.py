@@ -21,11 +21,17 @@ mapping. Phase 5 will move the producer bodies (currently
 into the wrappers' :meth:`producer` methods.
 """
 
+from .background_task import (
+    BackgroundTaskCompleteEvent,
+    BackgroundTaskCompletionSource,
+)
 from .base import InternalSource
 from .emergency import EmergencyEvent, EmergencyWatcher
 from .surfaces import SurfaceEvent, SurfaceWatcher
 
 __all__ = [
+    "BackgroundTaskCompleteEvent",
+    "BackgroundTaskCompletionSource",
     "EmergencyEvent",
     "EmergencyWatcher",
     "InternalSource",

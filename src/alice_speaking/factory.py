@@ -32,7 +32,11 @@ from alice_prompts import DEFAULTS_DIR as PROMPT_DEFAULTS_DIR
 from alice_prompts import PromptLoader
 
 from .infra.config import Config
-from .internal import EmergencyWatcher, SurfaceWatcher
+from .internal import (
+    BackgroundTaskCompletionSource,
+    EmergencyWatcher,
+    SurfaceWatcher,
+)
 from .startup import (
     CortexIndexFreshnessStartup,
     MesoStateStartup,
@@ -134,6 +138,7 @@ def build_registry(
     transports: Iterable[Optional[Transport]],
     surface_watcher: SurfaceWatcher,
     emergency_watcher: EmergencyWatcher,
+    background_task_source: Optional[BackgroundTaskCompletionSource] = None,
 ) -> SourceRegistry:
     """Assemble a :class:`SourceRegistry` for one daemon session.
 
@@ -158,6 +163,8 @@ def build_registry(
         registry.register(transport)
     registry.register_internal(surface_watcher)
     registry.register_internal(emergency_watcher)
+    if background_task_source is not None:
+        registry.register_internal(background_task_source)
     # Startup sources are individually fail-soft — register them
     # all. The dispatcher's startup phase iterates ``all_startup_sources``
     # and runs each, swallowing exceptions per-source.

@@ -22,7 +22,15 @@ from alice_core.config.personae import Personae, placeholder as placeholder_pers
 from ..domain.principals import AddressBook
 from ..infra.config import Config
 from ..infra.signal_rpc import SignalRPC as SignalClient
-from . import config_tools, deploy, fs, inner, memory, messaging
+from . import (
+    background_task,
+    config_tools,
+    deploy,
+    fs,
+    inner,
+    memory,
+    messaging,
+)
 
 
 SERVER_NAME = "alice"
@@ -91,6 +99,8 @@ def build(
     signal: Optional[SignalClient] = None,
     sender: Optional[messaging.SendCallable] = None,
     personae: Optional[Personae] = None,
+    background_dispatcher: Optional[background_task.DispatchCallable] = None,
+    background_text_sender: Optional[background_task.TextSenderCallable] = None,
 ) -> tuple[
     dict[str, McpSdkServerConfig],
     list[str],
@@ -131,6 +141,18 @@ def build(
                 address_book=address_book,
                 signal=signal,
                 sender=sender,
+                personae=personae,
+            )
+        )
+    # Background-task dispatcher is daemon-supplied (closes over the
+    # subagent registry + kernel factory). Tests / harnesses without
+    # a running daemon can omit it; the tool just isn't exposed.
+    if background_dispatcher is not None:
+        tool_list.extend(
+            background_task.build(
+                cfg,
+                dispatcher=background_dispatcher,
+                text_sender=background_text_sender,
                 personae=personae,
             )
         )

@@ -1,0 +1,37 @@
+#!/command/with-contenv bash
+# alice-embedder — local embedding HTTP service backed by Alice's
+# /state/sci-env venv (Qwen3-Embedding-4B on the GPU passed through
+# from the host, see sandbox/docker-compose.yml's worker block).
+#
+# Runs as alice. Lives under /state/sci-env (host-bind-mounted via
+# /state) so the venv + model cache survive container rebuilds and
+# alice-deploy worker swaps. If sci-env hasn't been installed yet
+# (cold deploy on a host without the embedder set up), this script
+# sleeps in place rather than crashing s6 — Alice can drop the venv
+# in place and `s6-svc -r /run/service/alice-embedder` to start it.
+#
+# Health: GET /health on $EMBED_PORT (default 8181) returns
+# {"status":"ok","model_loaded":true} once warm; "loading" while the
+# model is paging in (~2 min cold, ~5 s warm). Don't tie a docker
+# healthcheck to it without accepting "loading" as healthy.
+set -e
+
+VENV=/state/sci-env
+SERVER=$VENV/server.py
+
+if [ ! -x "$VENV/bin/python" ] || [ ! -f "$SERVER" ]; then
+    echo "alice-embedder: $VENV not installed — service idle. " \
+         "Install sci-env at $VENV (see Alice's setup notes), then " \
+         "'s6-svc -r /run/service/alice-embedder' to start." >&2
+    # Sleep forever instead of exiting — exiting trips s6's restart
+    # backoff and floods logs with respawn churn for what's a clean
+    # deferred-config state, not an error.
+    exec sleep infinity
+fi
+
+cd "$VENV"
+export HF_HOME="$VENV/hf-cache"
+
+# Run as alice (matches the venv ownership). s6 supervises us at PID 1
+# of the service; no daemonisation, no nohup.
+exec s6-setuidgid alice "$VENV/bin/python" -u "$SERVER"

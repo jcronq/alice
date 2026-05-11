@@ -40,6 +40,8 @@ import contextlib
 import logging
 import os
 import signal as _signal
+import time
+import uuid
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -47,6 +49,7 @@ if TYPE_CHECKING:
     from .transports.discord import DiscordTransport
 
 from alice_core.config.auth import ensure_auth_env
+from alice_core.kernel import KernelSpec, make_kernel
 from . import _dispatch as _dispatch_module
 from . import factory as factory_module
 from . import tools as tools_module
@@ -59,6 +62,8 @@ from .infra.config import Config
 from .infra.events import EventLogger
 from .infra.signal_rpc import SignalRPC as SignalClient
 from .internal import (
+    BackgroundTaskCompleteEvent,
+    BackgroundTaskCompletionSource,
     EmergencyEvent,
     EmergencyWatcher,
     SurfaceEvent,
@@ -203,6 +208,8 @@ class SpeakingDaemon:
                 address_book=self.address_book,
                 sender=self._send_message,
                 personae=self._personae,
+                background_dispatcher=self._dispatch_subagent,
+                background_text_sender=self._background_text_sender,
             )
         )
 
@@ -242,6 +249,17 @@ class SpeakingDaemon:
         # CLITraceHandler can wire to it.
         # One-shot consumer startup guard.
         self._consumer_started: bool = False
+        # Background-task subagent registry. Each entry is an
+        # asyncio.Task running an isolated kernel.run() for the
+        # dispatched sub-agent. Populated by :meth:`_dispatch_subagent`
+        # (called via the dispatch_background_task MCP tool); entries
+        # remove themselves on completion. Drain cancels everything
+        # still in-flight at shutdown.
+        self._subagent_tasks: dict[str, asyncio.Task] = {}
+        # Internal source for the synthetic completion event the
+        # subagent waiter pushes onto self._queue. Constructed once
+        # so the registry can route by event_type; no producer.
+        self._background_task_source = BackgroundTaskCompletionSource()
 
         # CLI transport — optional, falls back to no-op if disabled.
         # Constructed here so it shares the daemon's lifecycle and can
@@ -344,6 +362,7 @@ class SpeakingDaemon:
             ),
             surface_watcher=self._surface_watcher,
             emergency_watcher=self._emergency_watcher,
+            background_task_source=self._background_task_source,
         )
         # Phase 6a of plan 01: outbound dispatch + quiet-queue
         # routing + canonical send-event emission live in
@@ -678,6 +697,26 @@ class SpeakingDaemon:
                     with contextlib.suppress(Exception):
                         await self.signal_transport.drain()
 
+                # Background subagents: cancel everything still running.
+                # Each task's finally block pushes a completion event
+                # before exiting (now flagged is_error=True via the
+                # CancelledError path), so any in-flight handles still
+                # surface back as "didn't finish" rather than vanishing
+                # from the registry. Await with suppression — the tasks
+                # may raise CancelledError or propagate other transport
+                # errors as they tear down.
+                if self._subagent_tasks:
+                    log.info(
+                        "drain: cancelling %d in-flight subagent task(s)",
+                        len(self._subagent_tasks),
+                    )
+                    for task in list(self._subagent_tasks.values()):
+                        if not task.done():
+                            task.cancel()
+                    for task in list(self._subagent_tasks.values()):
+                        with contextlib.suppress(BaseException):
+                            await task
+
                 log.info("drain: waiting for in-flight turn + queued events")
                 drain_timeout_env = os.environ.get(
                     "ALICE_SPEAKING_DRAIN_TIMEOUT", ""
@@ -864,6 +903,140 @@ class SpeakingDaemon:
     # emergency archive live on the watcher classes
     # (``ctx._surface_watcher.archive_unresolved(...)`` /
     # ``ctx._emergency_watcher.archive(...)``).
+
+    # ------------------------------------------------------------------
+    # Background-task dispatch (closure given to tools.background_task)
+
+    async def _dispatch_subagent(
+        self, description: str, instructions: str
+    ) -> str:
+        """Spawn a sub-agent in an asyncio background task and return
+        its handle immediately.
+
+        The sub-agent runs as stock Claude — :data:`BUILTIN_TOOLS` only,
+        no MCP servers, no Alice persona, no resume of her session.
+        That deliberately walls it off: it can't recursively dispatch,
+        can't talk to Signal, can't read her notes (except via Bash /
+        Read on shared filesystem). It does the job and reports back.
+
+        The originating reply channel + principal display name are
+        captured here so the eventual completion event routes back
+        to whoever Alice was talking to when she dispatched. By the
+        time the sub-agent finishes, ``_current_reply_channel`` will
+        almost certainly point somewhere else (a different turn, or
+        nothing at all).
+
+        Returns the ``bg-<short-uuid>`` handle. Same handle appears on
+        the :class:`BackgroundTaskCompleteEvent` later, letting Alice
+        correlate "this finish → that earlier promise."
+        """
+        handle = f"bg-{uuid.uuid4().hex[:12]}"
+        channel = self._current_reply_channel
+        principal = self._current_principal_display_name or "?"
+        started = time.monotonic()
+        self.events.emit(
+            "background_task_dispatch_request",
+            handle=handle,
+            description=description,
+            principal_name=principal,
+            channel_transport=(channel.transport if channel else None),
+            channel_address=(channel.address if channel else None),
+            instruction_chars=len(instructions),
+        )
+
+        async def _run_subagent() -> None:
+            result_text = ""
+            is_error = False
+            try:
+                # Build a fresh kernel — same backend as Alice (so
+                # auth env is shared) but with no resume, no MCP,
+                # and no persona system prompt.
+                sub_kernel = make_kernel(
+                    self.turn_runner._backend,
+                    self.events,
+                    correlation_id=handle,
+                    silent=True,
+                    short_cap=4000,
+                )
+                sub_spec = KernelSpec(
+                    model=self.turn_runner._model
+                    or self.cfg.speaking.get("model"),
+                    allowed_tools=list(BUILTIN_TOOLS),
+                    mcp_servers={},
+                    cwd=self.turn_runner._skills_cwd or self.cfg.work_dir,
+                    add_dirs=(
+                        [self.turn_runner._mind_dir]
+                        if self.turn_runner._mind_dir is not None
+                        else None
+                    ),
+                    resume=None,
+                    thinking="medium",
+                    append_system_prompt=None,
+                )
+                result = await sub_kernel.run(
+                    instructions, sub_spec, handlers=[]
+                )
+                result_text = (result.text or "").strip()
+                is_error = bool(result.is_error or result.error)
+            except asyncio.CancelledError:
+                # Drain or shutdown cancelled us — propagate.
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.exception(
+                    "background subagent %s crashed", handle
+                )
+                result_text = (
+                    f"Sub-agent crashed: {type(exc).__name__}: {exc}"
+                )
+                is_error = True
+            finally:
+                self._subagent_tasks.pop(handle, None)
+                # Push completion event onto the dispatcher queue —
+                # even on cancel, so a drained subagent still surfaces
+                # back as "didn't finish" rather than vanishing.
+                try:
+                    self._queue.put_nowait(
+                        BackgroundTaskCompleteEvent(
+                            handle=handle,
+                            description=description,
+                            result_text=result_text,
+                            is_error=is_error,
+                            channel=channel,
+                            principal_name=principal,
+                        )
+                    )
+                except asyncio.QueueFull:
+                    log.warning(
+                        "queue full pushing completion for %s; "
+                        "result lost",
+                        handle,
+                    )
+                self.events.emit(
+                    "background_task_dispatch_complete",
+                    handle=handle,
+                    description=description,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    is_error=is_error,
+                    result_chars=len(result_text or ""),
+                )
+
+        task = asyncio.create_task(
+            _run_subagent(), name=f"bg-subagent-{handle}"
+        )
+        self._subagent_tasks[handle] = task
+        return handle
+
+    async def _background_text_sender(self, message: str) -> None:
+        """Deliver an optional ``user_facing_message`` from the dispatch
+        tool through the normal outbox routing on the originating
+        channel. No-op when no inbound channel is set."""
+        if self._current_reply_channel is None:
+            log.info(
+                "background_text_sender: no current_reply_channel; "
+                "dropping ack message"
+            )
+            return
+        await self._send_message(SELF_RECIPIENT, message)
 
     # ------------------------------------------------------------------
     # send_message router (closure given to tools.messaging)
