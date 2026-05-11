@@ -165,6 +165,11 @@ services:
       ALICE_STATE: "/state/worker"
       ALICE_MIND: "/home/alice/alice-mind"
       ALICE_VIEWER_CACHE_DIR: "/state/viewer-cache"
+      # Opt into LLM-derived display labels for memory-graph lobes
+      # (alice_viewer.lobe_labeler). Cached in registry.json keyed on
+      # member-set signature, so flipping this on doesn't burn tokens
+      # on every page load — only on minted/drifted lobes.
+      ALICE_LOBE_LLM_LABELS: "1"
       TZ: "${ALICE_TZ:-America/New_York}"
     volumes:
       - ${ALICE_REPO:-${HOME}/alice}:/home/alice/alice:ro

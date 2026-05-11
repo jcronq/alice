@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import os
 import pathlib
 import time
 from typing import Any
@@ -19,11 +20,70 @@ from . import (
     aggregators,
     cluster_registry,
     labels as kind_labels,
+    lobe_labeler,
     narrative as narrative_mod,
     sources,
     stage_d_store,
 )
 from .settings import Paths, load as load_paths
+
+
+def _lobe_llm_enabled() -> bool:
+    """Feature flag: LLM-derived display labels for lobes.
+
+    Off by default so test environments and cold containers without
+    google-adk installed don't hit the LAN endpoint. Set
+    ``ALICE_LOBE_LLM_LABELS=1`` (or ``true``/``yes``) to opt in.
+    """
+    val = os.environ.get("ALICE_LOBE_LLM_LABELS", "").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
+async def _refresh_llm_labels(
+    registry: dict[str, Any],
+    nodes: list[Any],
+) -> bool:
+    """Compute LLM display labels for any pending lobes, in parallel.
+
+    Pending = newly minted, or member set drifted past
+    :data:`cluster_registry.LLM_RELABEL_DRIFT_THRESHOLD` since the
+    last LLM compute. The Qwen calls run concurrently via
+    :func:`asyncio.gather`; one slow lobe doesn't serialise the
+    whole batch.
+
+    Returns ``True`` if the registry was mutated (caller saves), else
+    ``False``. Returns ``False`` immediately when the feature flag is
+    off so the LAN endpoint is never touched in disabled environments.
+    """
+    if not _lobe_llm_enabled():
+        return False
+    pending = cluster_registry.pending_llm_label_ids(registry)
+    if not pending:
+        return False
+    node_path = {n.id: n.path for n in nodes}
+    node_label = {n.id: n.label for n in nodes}
+    entries = registry.get("entries") or {}
+
+    async def _one(sid: str) -> tuple[str, str]:
+        entry = entries.get(sid) or {}
+        member_ids = entry.get("current_members") or []
+        members: list[dict[str, str]] = []
+        for nid in member_ids[: lobe_labeler.MAX_MEMBERS_FED]:
+            path = node_path.get(nid)
+            snippet = (
+                lobe_labeler.extract_first_chunk(path) if path else ""
+            )
+            members.append(
+                {"label": node_label.get(nid, nid), "snippet": snippet}
+            )
+        label = await lobe_labeler.compute_label_async(members)
+        return sid, label
+
+    results = await asyncio.gather(
+        *(_one(sid) for sid in pending), return_exceptions=False
+    )
+    labels_by_id = {sid: lbl for sid, lbl in results if lbl}
+    return cluster_registry.apply_llm_labels(registry, labels_by_id)
 
 
 BASE_DIR = pathlib.Path(__file__).parent
@@ -716,6 +776,57 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         # sources.compute_cluster_metrics.
         cluster_metrics = sources.compute_cluster_metrics(nodes, edges)
         node_cluster = cluster_metrics.get("node_cluster", {})
+
+        # Phase 2 + LLM labels: run the persistent registry against the
+        # fresh clusters so each lobe gets its stable ``cl-<slug>`` ID,
+        # then compute / refresh the LLM display label for any minted
+        # or drifted lobe. Both are decorated onto cluster_metrics so
+        # the lobe view can render ``llm_label`` primary with the
+        # stable slug as a chip.
+        clusters_list = cluster_metrics.get("clusters", [])
+        topical_clusters = [c for c in clusters_list if not c["is_misc"]]
+        registry = None
+        stable_by_cid: dict[str, str] = {}
+        if topical_clusters:
+            reg_path = cluster_registry.registry_path()
+            prev_registry = cluster_registry.load_registry(reg_path)
+            registry, _alerts = cluster_registry.rebuild(
+                cluster_members={
+                    c["id"]: c["member_ids"] for c in topical_clusters
+                },
+                cluster_top_hubs={
+                    c["id"]: [h["id"] for h in c["top_hubs"]]
+                    for c in topical_clusters
+                },
+                label_by_id={n.id: n.label for n in nodes},
+                prev_registry=prev_registry,
+            )
+            llm_mutated = await _refresh_llm_labels(registry, nodes)
+            if registry != prev_registry or llm_mutated:
+                cluster_registry.save_registry(reg_path, registry)
+            # Reverse-index by member set: every fresh cid that
+            # survived the rebuild has exactly one entry whose
+            # ``last_member_set`` matches its members.
+            members_to_stable = {
+                frozenset(e["last_member_set"]): sid
+                for sid, e in registry["entries"].items()
+                if e.get("status") == "live"
+                and e.get("last_rebuild") == registry["last_rebuild"]
+            }
+            for c in topical_clusters:
+                stable = members_to_stable.get(frozenset(c["member_ids"]))
+                if stable:
+                    stable_by_cid[c["id"]] = stable
+
+        # Decorate clusters in-place with cluster_slug + llm_label so
+        # the UI doesn't have to do the registry lookup itself.
+        entries = (registry or {}).get("entries", {})
+        for c in clusters_list:
+            stable = stable_by_cid.get(c["id"])
+            entry = entries.get(stable) if stable else None
+            c["cluster_slug"] = stable
+            c["llm_label"] = (entry or {}).get("llm_label")
+
         return JSONResponse(
             {
                 "nodes": [
@@ -839,9 +950,10 @@ def create_app(paths: Paths | None = None) -> FastAPI:
                 label_by_id={n.id: n.label for n in nodes},
                 prev_registry=prev_registry,
             )
+            llm_mutated = await _refresh_llm_labels(new_registry, nodes)
             # Persist if the registry mutated (new entries, drift updates,
-            # retirement bumps).
-            if new_registry != prev_registry:
+            # retirement bumps, or fresh LLM labels).
+            if new_registry != prev_registry or llm_mutated:
                 cluster_registry.save_registry(reg_path, new_registry)
             # Resolve fresh cid -> stable id by re-running the matching:
             # every fresh cid that survived the rebuild now has a single
@@ -990,7 +1102,8 @@ def create_app(paths: Paths | None = None) -> FastAPI:
                 label_by_id={n.id: n.label for n in nodes},
                 prev_registry=prev_registry,
             )
-            if new_registry != prev_registry:
+            llm_mutated = await _refresh_llm_labels(new_registry, nodes)
+            if new_registry != prev_registry or llm_mutated:
                 cluster_registry.save_registry(reg_path, new_registry)
         else:
             new_registry, alerts = prev_registry, []

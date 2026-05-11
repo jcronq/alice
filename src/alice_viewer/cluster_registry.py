@@ -71,6 +71,13 @@ RETIRE_AFTER_N_MISSING = 3
 MAX_LABEL_LEN = 48  # including "cl-" prefix
 SLUG_BUDGET = MAX_LABEL_LEN - len("cl-")  # 45 chars for slug body
 
+# Drift threshold for recomputing the LLM-derived display label. Same
+# magnitude as DRIFT_ALERT_THRESHOLD by design — once Alice would be
+# alerted that a lobe has drifted, the human-readable name probably
+# also needs a fresh take. Computed against ``llm_label_member_signature``
+# (members at last LLM compute), not ``birth_members``.
+LLM_RELABEL_DRIFT_THRESHOLD = 0.30
+
 _DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}-")
 
 
@@ -341,6 +348,14 @@ def rebuild(
             "retired_at": None,
             "split_children": [],
             "consecutive_misses": 0,
+            # LLM-derived display label fields. Populated out-of-band
+            # by the caller via :func:`apply_llm_labels` after rebuild
+            # because the LLM call is async and we want it parallelised
+            # across pending lobes. Cold-start: all three are None and
+            # the UI falls back to the mechanical hub name.
+            "llm_label": None,
+            "llm_label_member_signature": None,
+            "llm_label_computed_at": None,
         }
         fresh_to_stable[fresh_cid] = new_label
 
@@ -416,3 +431,84 @@ def fresh_to_stable_label_map(
 ) -> dict[str, str]:
     """Convenience: identity mapping if registry-disabled, else passthrough."""
     return dict(fresh_to_stable)
+
+
+# --- LLM-derived display label management ----------------------------
+
+
+def pending_llm_label_ids(
+    registry: dict[str, Any],
+    *,
+    threshold: float = LLM_RELABEL_DRIFT_THRESHOLD,
+) -> list[str]:
+    """Return the stable IDs whose LLM label needs computing or refreshing.
+
+    A live entry is "pending" if any of:
+
+    - It has no ``llm_label`` yet (cold-start, never labeled).
+    - Its current member set has drifted from
+      ``llm_label_member_signature`` by ``>= threshold`` (Jaccard).
+      Same magnitude as ``DRIFT_ALERT_THRESHOLD`` by default — once
+      Alice would be alerted to drift, the display label is also
+      probably stale.
+
+    Retired entries and the misc bucket (which never enters the
+    registry) are skipped. Returned IDs are sorted alphabetically for
+    deterministic ordering across calls — the caller typically schedules
+    LLM work in this order.
+    """
+    pending: list[str] = []
+    for sid, entry in (registry.get("entries") or {}).items():
+        if entry.get("status") != "live":
+            continue
+        if not entry.get("llm_label"):
+            pending.append(sid)
+            continue
+        sig = set(entry.get("llm_label_member_signature") or [])
+        current = set(entry.get("current_members") or [])
+        if not sig and current:
+            pending.append(sid)
+            continue
+        drift = 1.0 - _jaccard(sig, current)
+        if drift >= threshold:
+            pending.append(sid)
+    pending.sort()
+    return pending
+
+
+def apply_llm_labels(
+    registry: dict[str, Any],
+    labels_by_id: dict[str, str],
+    *,
+    today: str | None = None,
+) -> bool:
+    """Write computed LLM labels into the registry in place.
+
+    ``labels_by_id`` maps stable cluster id → newly-computed label.
+    Empty strings are *skipped* (treated as "LLM call failed, leave
+    cached value alone") rather than written, so a transient endpoint
+    outage doesn't wipe good cached labels.
+
+    Returns ``True`` if the registry was mutated (at least one label
+    written), ``False`` otherwise — caller uses this to decide whether
+    to ``save_registry``.
+    """
+    today_iso = today or datetime.date.today().isoformat()
+    entries = registry.get("entries") or {}
+    mutated = False
+    for sid, label in labels_by_id.items():
+        entry = entries.get(sid)
+        if entry is None or entry.get("status") != "live":
+            continue
+        if not label:
+            continue
+        members_now = sorted(entry.get("current_members") or [])
+        prev_label = entry.get("llm_label")
+        prev_sig = entry.get("llm_label_member_signature")
+        if prev_label == label and prev_sig == members_now:
+            continue
+        entry["llm_label"] = label
+        entry["llm_label_member_signature"] = members_now
+        entry["llm_label_computed_at"] = today_iso
+        mutated = True
+    return mutated

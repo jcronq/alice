@@ -84,6 +84,17 @@
       paint-order: stroke fill;
       stroke: rgba(13, 16, 21, 0.85); stroke-width: 2.5px;
     }
+    /* Stable cluster slug (cl-<slug>) shown as a small muted chip below
+       the LLM-derived display label. Lets the operator cross-reference a
+       lobe in the UI with the same id Alice uses in wakes/notes. */
+    .lobe-slug {
+      font-size: 10px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      fill: #79849a;
+      pointer-events: none;
+      paint-order: stroke fill;
+      stroke: rgba(13, 16, 21, 0.85); stroke-width: 2px;
+    }
     .lobe-bubble { cursor: pointer; }
     .lobe-bubble:hover { filter: brightness(1.15); }
   </style>
@@ -394,6 +405,13 @@
           is_misc: !!c.is_misc,
           folder: c.dominant_folder,
           top_hubs: c.top_hubs || [],
+          // LLM-derived display name (when ALICE_LOBE_LLM_LABELS is on
+          // and the lobe has been labeled). Falls back to the top-hub
+          // note title in the renderer. ``cluster_slug`` is the stable
+          // ``cl-<slug>`` from the registry — shown as a chip so the
+          // operator can map a bubble to wakes/notes that reference it.
+          llm_label: c.llm_label || null,
+          cluster_slug: c.cluster_slug || null,
           // r tuned for ~10 lobes in a typical viewport.
           r: Math.max(18, 6 * Math.sqrt(c.size)),
         }));
@@ -428,29 +446,42 @@
           .attr('fill-opacity', d => d.is_misc ? 0.4 : 0.78)
           .attr('stroke', '#0d1015').attr('stroke-width', 2);
 
-        // Primary label: the lobe's top hub note — that's what
-        // identifies a lobe to the operator at a glance. Secondary
-        // line: dominant folder + size, dimmer. "Miscellany" lobes
-        // have no meaningful hub, so they keep "miscellany" as the
-        // primary label and just show the size below.
+        // Label hierarchy (top to bottom):
+        //   1. Primary: the LLM-derived display label when present;
+        //      otherwise fall back to the top hub's note title (the
+        //      pre-LLM behaviour). "Miscellany" lobes keep their
+        //      generic name since they have no coherent topic.
+        //   2. Secondary: dominant folder + size, dimmer.
+        //   3. Slug chip: the stable ``cl-<slug>`` from the registry,
+        //      tiny + monospace, only shown when present.
         const trimLabel = (s, max) =>
           (s || '').length <= max ? s : s.slice(0, max - 1) + '…';
+        const primaryLabel = (d) => {
+          if (d.is_misc) return 'miscellany';
+          if (d.llm_label) return trimLabel(d.llm_label, 32);
+          const hub = d.top_hubs[0];
+          return trimLabel(hub ? hub.label : (d.folder || d.id), 28);
+        };
+        const tooltipFull = (d) => {
+          if (d.is_misc) return 'miscellany';
+          if (d.llm_label) {
+            const hub = d.top_hubs[0];
+            const hubName = hub ? hub.label : (d.folder || d.id);
+            return `${d.llm_label} (top hub: ${hubName})`;
+          }
+          return (d.top_hubs[0] && d.top_hubs[0].label) || d.folder || d.id;
+        };
         node.append('text')
           .attr('class', 'lobe-label')
           .attr('text-anchor', 'middle')
-          .attr('dy', '-0.45em')
-          .text(d => {
-            if (d.is_misc) return 'miscellany';
-            const hub = d.top_hubs[0];
-            const label = hub ? hub.label : (d.folder || d.id);
-            return trimLabel(label, 28);
-          })
+          .attr('dy', '-0.6em')
+          .text(primaryLabel)
           .append('title')
-            .text(d => (d.top_hubs[0] && d.top_hubs[0].label) || d.folder || d.id);
+            .text(tooltipFull);
         node.append('text')
           .attr('class', 'lobe-sublabel')
           .attr('text-anchor', 'middle')
-          .attr('dy', '1.25em')
+          .attr('dy', '0.95em')
           .text(d => {
             if (d.is_misc) return `${d.size}`;
             const f = d.folder || d.id;
@@ -459,13 +490,28 @@
               : f;
             return `${trimLabel(folder, 24)} · ${d.size}`;
           });
+        // Stable cluster slug chip — only render when the registry
+        // resolved one for this lobe (misc bubbles never get a slug).
+        node.filter(d => d.cluster_slug)
+          .append('text')
+            .attr('class', 'lobe-slug')
+            .attr('text-anchor', 'middle')
+            .attr('dy', '2.4em')
+            .text(d => trimLabel(d.cluster_slug, 28));
 
         node.on('mouseenter', (e, d) => {
           const hubLines = d.top_hubs.slice(0, 5)
             .map(h => `&nbsp;· ${h.label} <span style="color:#79849a">(in ${h.in_degree})</span>`)
             .join('<br>');
+          const headline = d.is_misc
+            ? 'miscellany'
+            : (d.llm_label || (d.folder || d.id));
+          const slugLine = d.cluster_slug
+            ? `<span style="color:#79849a">id:</span> <code>${d.cluster_slug}</code><br>`
+            : '';
           tooltip.style('display', 'block')
-            .html(`<b>${d.is_misc ? 'miscellany' : (d.folder || d.id)}</b><br>` +
+            .html(`<b>${headline}</b><br>` +
+                  slugLine +
                   `<span style="color:#79849a">${d.size} notes${d.is_misc ? ' (singletons)' : ''}</span><br>` +
                   (hubLines ? `<span style="color:#79849a">top hubs:</span><br>${hubLines}<br>` : '') +
                   `<span style="color:#79849a">click to drill in</span>`)
