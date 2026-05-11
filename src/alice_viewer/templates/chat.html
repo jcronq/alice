@@ -241,6 +241,14 @@
         case "turn_start":
           lifecycleActive = lifecycleActive || data.type === "turn_start";
           showIndicator("thinking…");
+          // Pre-create the thoughts panel on turn_start so every turn
+          // shows a visible "thoughts" tag, even when the model goes
+          // straight to send_message with no intermediate text_chunk
+          // or thinking_chunk events. Stays empty if no reasoning
+          // arrives; gets filled by appendThinking() if it does.
+          if (data.type === "turn_start") {
+            ensureThinkingPanel();
+          }
           return;
         case "tool_call_start":
           lifecycleActive = true;
