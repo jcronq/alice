@@ -1,0 +1,215 @@
+{% extends "base.html" %}
+{% block title %}chat{% endblock %}
+{% block body %}
+<section class="chat-page">
+  <header class="chat-header">
+    <h1>chat with {{ personae.agent.name }}</h1>
+    <div class="chat-status muted" id="chat-status">connecting…</div>
+  </header>
+
+  <div id="chat-log" class="chat-log" aria-live="polite">
+    <div class="chat-empty muted">Loading history…</div>
+  </div>
+
+  <form id="chat-form" class="chat-form" autocomplete="off">
+    <textarea id="chat-input"
+              placeholder="Message {{ personae.agent.name }}… (Enter to send, Shift+Enter for newline)"
+              rows="2"
+              required></textarea>
+    <button type="submit" id="chat-send">send</button>
+  </form>
+</section>
+
+<script>
+(function () {
+  const log = document.getElementById("chat-log");
+  const form = document.getElementById("chat-form");
+  const input = document.getElementById("chat-input");
+  const button = document.getElementById("chat-send");
+  const status = document.getElementById("chat-status");
+
+  // Single in-flight assistant message element so consecutive chunks
+  // accumulate into one bubble. Reset on each `done` or `error`.
+  let inflight = null;
+  let inflightBuf = "";
+
+  function setStatus(text, level) {
+    status.textContent = text;
+    status.classList.remove("ok", "warn", "muted");
+    status.classList.add(level || "muted");
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    }[c]));
+  }
+
+  function renderMarkdown(text) {
+    // marked + DOMPurify are already loaded in base.html for the rest
+    // of the viewer. Fall back to escaped plain text if either is
+    // missing (defensive).
+    if (window.marked && window.DOMPurify) {
+      try {
+        const raw = window.marked.parse(text, { breaks: true });
+        return window.DOMPurify.sanitize(raw);
+      } catch (e) {
+        // fall through to escaped
+      }
+    }
+    return escapeHtml(text).replace(/\n/g, "<br>");
+  }
+
+  function appendMessage(role, text) {
+    if (log.querySelector(".chat-empty")) {
+      log.innerHTML = "";
+    }
+    const wrap = document.createElement("div");
+    wrap.className = "chat-msg chat-msg-" + role;
+    const body = document.createElement("div");
+    body.className = "chat-msg-body";
+    body.innerHTML = renderMarkdown(text);
+    const meta = document.createElement("div");
+    meta.className = "chat-msg-meta muted";
+    meta.textContent = role === "user" ? "you" : "{{ personae.agent.name | lower }}";
+    wrap.appendChild(meta);
+    wrap.appendChild(body);
+    log.appendChild(wrap);
+    log.scrollTop = log.scrollHeight;
+    return wrap;
+  }
+
+  function startInflight() {
+    inflightBuf = "";
+    inflight = appendMessage("alice", "");
+  }
+
+  function appendInflight(chunk) {
+    if (!inflight) startInflight();
+    inflightBuf += chunk;
+    const body = inflight.querySelector(".chat-msg-body");
+    body.innerHTML = renderMarkdown(inflightBuf);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function endInflight() {
+    inflight = null;
+    inflightBuf = "";
+    button.disabled = false;
+    input.disabled = false;
+    input.focus();
+  }
+
+  async function loadHistory() {
+    try {
+      const r = await fetch("/api/chat/history?limit=50");
+      if (!r.ok) {
+        setStatus("history unavailable (" + r.status + ")", "warn");
+        log.innerHTML = '<div class="chat-empty muted">No history yet. Say something.</div>';
+        return;
+      }
+      const body = await r.json();
+      const msgs = body.messages || [];
+      if (!msgs.length) {
+        log.innerHTML = '<div class="chat-empty muted">No history yet. Say something.</div>';
+        return;
+      }
+      log.innerHTML = "";
+      for (const m of msgs) {
+        appendMessage(m.role === "alice" ? "alice" : "user", m.text || "");
+      }
+    } catch (e) {
+      setStatus("history fetch failed", "warn");
+    }
+  }
+
+  function openStream() {
+    const es = new EventSource("/api/chat/stream");
+    es.onopen = () => setStatus("connected", "ok");
+    es.onmessage = (ev) => {
+      let data;
+      try { data = JSON.parse(ev.data); } catch (e) { return; }
+      if (!data || !data.type) return;
+      if (data.type === "ack") {
+        // Ack just confirms the daemon got the message. We already
+        // appended the user bubble locally on submit — nothing to do.
+        return;
+      }
+      if (data.type === "chunk") {
+        appendInflight(data.text || "");
+        return;
+      }
+      if (data.type === "done") {
+        endInflight();
+        return;
+      }
+      if (data.type === "error") {
+        appendMessage("error", "error: " + (data.message || "(unspecified)"));
+        endInflight();
+        return;
+      }
+    };
+    es.addEventListener("error", (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
+        appendMessage("error", "stream: " + (data.message || ""));
+      } catch (e) {
+        setStatus("stream error — retrying", "warn");
+      }
+    });
+    es.onerror = () => setStatus("stream disconnected — retrying", "warn");
+    return es;
+  }
+
+  async function submitMessage(text) {
+    button.disabled = true;
+    input.disabled = true;
+    appendMessage("user", text);
+    try {
+      const r = await fetch("/api/chat/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: text }),
+      });
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        appendMessage(
+          "error",
+          "send failed (" + r.status + "): " + (body.error || "(unspecified)")
+        );
+        endInflight();
+        return;
+      }
+    } catch (e) {
+      appendMessage("error", "send failed: " + e.message);
+      endInflight();
+    }
+  }
+
+  form.addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    submitMessage(text);
+  });
+
+  input.addEventListener("keydown", (ev) => {
+    // Enter sends; Shift+Enter inserts a newline.
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      form.requestSubmit();
+    }
+  });
+
+  // Boot.
+  loadHistory();
+  openStream();
+  input.focus();
+})();
+</script>
+{% endblock %}

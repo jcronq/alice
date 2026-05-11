@@ -1219,6 +1219,107 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         s.pop("paths", None)
         return JSONResponse(s)
 
+    # ------------------------------------------------------------------
+    # Viewer chat — proxies to the speaking daemon's viewer-chat HTTP
+    # ingress. The daemon owns conversation state + identity; the viewer
+    # is a thin UI layer. See ``alice_speaking.transports.viewer_chat``
+    # for the wire shape.
+
+    @app.get("/chat", response_class=HTMLResponse)
+    async def chat_view(request: Request):
+        return templates.TemplateResponse(
+            request,
+            "chat.html",
+            {
+                "state": _state_context(),
+                "active": "chat",
+            },
+        )
+
+    @app.get("/api/chat/history")
+    async def api_chat_history(channel: str | None = None, limit: int = 100):
+        from . import chat_client
+
+        try:
+            payload = await chat_client.fetch_history(
+                channel=channel, limit=limit
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                {"error": str(exc), "kind": "daemon_error"}, status_code=502
+            )
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                {"error": str(exc), "kind": "unreachable"}, status_code=503
+            )
+        return JSONResponse(payload)
+
+    @app.post("/api/chat/send")
+    async def api_chat_send(request: Request):
+        from . import chat_client
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            return JSONResponse(
+                {"error": "expected JSON body"}, status_code=400
+            )
+        if not isinstance(body, dict):
+            return JSONResponse(
+                {"error": "expected JSON object"}, status_code=400
+            )
+        text = body.get("text")
+        channel = body.get("channel")
+        if not isinstance(text, str) or not text.strip():
+            return JSONResponse(
+                {"error": "text must be a non-empty string"}, status_code=400
+            )
+        try:
+            ack = await chat_client.send_message(
+                text=text,
+                channel=channel if isinstance(channel, str) else None,
+            )
+        except RuntimeError as exc:
+            return JSONResponse(
+                {"error": str(exc), "kind": "daemon_error"}, status_code=502
+            )
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse(
+                {"error": str(exc), "kind": "unreachable"}, status_code=503
+            )
+        return JSONResponse(ack, status_code=202)
+
+    @app.get("/api/chat/stream")
+    async def api_chat_stream(request: Request, channel: str | None = None):
+        """Proxy the daemon's SSE stream through to the browser.
+
+        Re-encodes each daemon event as an SSE ``message`` so the
+        browser's :class:`EventSource` reads ``event.data`` and parses
+        the JSON itself. Heartbeats are passed through as comments.
+        """
+        from . import chat_client
+
+        async def gen():
+            try:
+                async for event in chat_client.stream_events(channel=channel):
+                    if await request.is_disconnected():
+                        return
+                    yield {"event": "message", "data": json.dumps(event)}
+            except RuntimeError as exc:
+                yield {
+                    "event": "error",
+                    "data": json.dumps({"message": str(exc)}),
+                }
+            except Exception as exc:  # noqa: BLE001
+                yield {
+                    "event": "error",
+                    "data": json.dumps(
+                        {"message": f"stream failed: {type(exc).__name__}: {exc}"}
+                    ),
+                }
+
+        return EventSourceResponse(gen())
+
     @app.get("/api/sidebar", response_class=HTMLResponse)
     async def api_sidebar(request: Request):
         """Sidebar partial. Re-rendered on every SSE `change` event so

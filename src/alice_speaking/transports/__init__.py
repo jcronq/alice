@@ -27,6 +27,7 @@ from .base import (
 from .cli import CLITransport
 from .registry import SourceRegistry
 from .signal import SignalTransport
+from .viewer_chat import ViewerChatTransport
 
 # DiscordTransport is intentionally NOT re-exported here: ``transports.discord``
 # does ``import discord`` at module top, so importing it eagerly would crash
@@ -48,4 +49,5 @@ __all__ = [
     "SignalTransport",
     "SourceRegistry",
     "Transport",
+    "ViewerChatTransport",
 ]

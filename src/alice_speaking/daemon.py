@@ -80,6 +80,7 @@ from .transports import (
     CLITransport,
     ChannelRef,
     SignalTransport,
+    ViewerChatTransport,
 )
 
 # DiscordTransport is imported lazily below, only when the daemon is actually
@@ -97,6 +98,7 @@ from .transports.a2a import A2AEvent
 from .transports.cli import CLIEvent
 from .transports.discord import DiscordEvent
 from .transports.signal import SignalEvent
+from .transports.viewer_chat import ViewerChatEvent
 from .turn_runner import BUILTIN_TOOLS, TurnRunner
 
 
@@ -115,6 +117,7 @@ __all__ = [
     "SignalEvent",
     "SpeakingDaemon",
     "SurfaceEvent",
+    "ViewerChatEvent",
 ]
 
 
@@ -323,6 +326,19 @@ class SpeakingDaemon:
                 external_url=cfg.a2a_external_url or None,
             )
 
+        # Viewer-chat transport — local HTTP loopback ingress that the
+        # viewer's chat panel POSTs to and subscribes to via SSE.
+        # Construction here mirrors the other transports; the daemon
+        # owns the lifecycle and the registry picks it up below.
+        self.viewer_chat_transport: Optional[ViewerChatTransport] = None
+        if cfg.viewer_chat_enabled:
+            self.viewer_chat_transport = ViewerChatTransport(
+                host=cfg.viewer_chat_host,
+                port=cfg.viewer_chat_port,
+                principal_name=cfg.viewer_chat_principal,
+                principal_display_name=cfg.viewer_chat_principal_display_name,
+            )
+
         # Heterogeneous event queue: each producer pushes its own
         # event type, the registry routes by ``type(event)`` (Phase 3
         # of plan 01). No Union annotation — the closed set lives in
@@ -380,6 +396,7 @@ class SpeakingDaemon:
                 self.cli_transport,
                 self.discord_transport,
                 self.a2a_transport,
+                self.viewer_chat_transport,
             ),
             surface_watcher=self._surface_watcher,
             emergency_watcher=self._emergency_watcher,
@@ -396,6 +413,7 @@ class SpeakingDaemon:
                 "cli": self.cli_transport,
                 "discord": self.discord_transport,
                 "a2a": self.a2a_transport,
+                "viewer-chat": self.viewer_chat_transport,
             }.get(name),
             address_book=self.address_book,
             events=self.events,
@@ -842,6 +860,9 @@ class SpeakingDaemon:
             if self.a2a_transport is not None:
                 with contextlib.suppress(Exception):
                     await self.a2a_transport.stop()
+            if self.viewer_chat_transport is not None:
+                with contextlib.suppress(Exception):
+                    await self.viewer_chat_transport.stop()
             self.events.emit("shutdown")
             log.info("shutdown complete")
 
@@ -1337,11 +1358,13 @@ class SpeakingDaemon:
         emergency = getattr(self, "_emergency_bypass", False)
         # Bypass triggers: emergency-flavored turn, or we're inside an
         # inbound conversational turn whose user is waiting, or we'd have
-        # to drop attachments to queue. CLI is always-bypass (interactive).
+        # to drop attachments to queue. CLI + viewer-chat are
+        # always-bypass (operator is at a UI waiting).
         bypass_quiet = (
-            channel.transport in ("cli", "a2a")
+            channel.transport in ("cli", "a2a", "viewer-chat")
             or emergency
-            or self._current_turn_kind in ("signal", "discord", "cli", "a2a")
+            or self._current_turn_kind
+            in ("signal", "discord", "cli", "a2a", "viewer-chat")
             or bool(attachments)
         )
 

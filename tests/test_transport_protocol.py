@@ -21,6 +21,7 @@ from alice_speaking.transports import (
 )
 from alice_speaking.transports.a2a import A2ATransport
 from alice_speaking.transports.discord import DiscordTransport
+from alice_speaking.transports.viewer_chat import ViewerChatTransport
 
 
 def _all_transports():
@@ -34,6 +35,7 @@ def _all_transports():
         CLITransport(socket_path=pathlib.Path("/tmp/alice-protocol-test.sock")),
         DiscordTransport(token="x"),
         A2ATransport(port=0),
+        ViewerChatTransport(port=0),
     ]
 
 

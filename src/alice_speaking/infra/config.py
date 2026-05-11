@@ -141,6 +141,16 @@ class Config:
     anthropic_api_key: str = ""
     anthropic_auth_token: str = ""
 
+    # Viewer-chat transport — optional. Local HTTP loopback ingress
+    # that the viewer's chat panel POSTs to (and subscribes to via SSE).
+    # Defaults are on so a fresh deploy picks up the viewer chat
+    # automatically; flip ``viewer_chat_enabled`` off to revert.
+    viewer_chat_enabled: bool = True
+    viewer_chat_host: str = "127.0.0.1"
+    viewer_chat_port: int = 8181
+    viewer_chat_principal: str = "jason"
+    viewer_chat_principal_display_name: str = "Jason"
+
     # A2A transport — optional. When ``a2a_enabled`` is False the daemon
     # skips construction. A2A lets external (Google A2A protocol)
     # agents submit tasks to Alice over HTTP/JSON-RPC; the worker
@@ -254,6 +264,26 @@ def load() -> Config:
 
     discord_bot_token = (from_any("DISCORD_BOT_TOKEN", "") or "").strip()
 
+    viewer_chat_enabled_raw = (
+        from_any("ALICE_VIEWER_CHAT_ENABLED", "1") or "1"
+    ).strip().lower()
+    viewer_chat_enabled = viewer_chat_enabled_raw not in {"0", "false", "no", "off", ""}
+    viewer_chat_host = (
+        from_any("ALICE_VIEWER_CHAT_HOST", "127.0.0.1") or "127.0.0.1"
+    ).strip()
+    try:
+        viewer_chat_port = int(
+            from_any("ALICE_VIEWER_CHAT_PORT", "8181") or "8181"
+        )
+    except ValueError:
+        viewer_chat_port = 8181
+    viewer_chat_principal = (
+        from_any("ALICE_VIEWER_CHAT_PRINCIPAL", "jason") or "jason"
+    ).strip()
+    viewer_chat_principal_display_name = (
+        from_any("ALICE_VIEWER_CHAT_PRINCIPAL_DISPLAY_NAME", "Jason") or "Jason"
+    ).strip()
+
     a2a_enabled_raw = (from_any("ALICE_A2A_ENABLED", "0") or "0").strip().lower()
     a2a_enabled = a2a_enabled_raw in {"1", "true", "yes", "on"}
     try:
@@ -287,6 +317,11 @@ def load() -> Config:
         cli_enabled=cli_enabled,
         cli_socket_path=cli_socket_path,
         discord_bot_token=discord_bot_token,
+        viewer_chat_enabled=viewer_chat_enabled,
+        viewer_chat_host=viewer_chat_host,
+        viewer_chat_port=viewer_chat_port,
+        viewer_chat_principal=viewer_chat_principal,
+        viewer_chat_principal_display_name=viewer_chat_principal_display_name,
         a2a_enabled=a2a_enabled,
         a2a_port=a2a_port,
         a2a_host=a2a_host,

@@ -31,6 +31,7 @@ from alice_speaking.daemon import (
     EmergencyEvent,
     SignalEvent,
     SurfaceEvent,
+    ViewerChatEvent,
 )
 from alice_speaking.transports import SourceRegistry
 
@@ -136,14 +137,18 @@ def _make_daemon(cfg, monkeypatch):
 
 
 def test_daemon_registers_visible_event_sources(cfg, monkeypatch):
-    """Default test fixture has Signal + CLI + Owner principal but no
-    Discord / A2A. Registry should route CLI, Surface, Emergency —
-    and intentionally NOT Signal (own loop) or Discord/A2A (disabled)."""
+    """Default test fixture has Signal + CLI + viewer-chat + Owner
+    principal but no Discord / A2A. Registry should route CLI,
+    viewer-chat, Surface, Emergency — and intentionally NOT Signal
+    (own loop) or Discord/A2A (disabled)."""
     d = _make_daemon(cfg, monkeypatch)
 
     assert d._registry.lookup(CLIEvent) is not None
     assert d._registry.lookup(SurfaceEvent) is not None
     assert d._registry.lookup(EmergencyEvent) is not None
+    # viewer-chat is enabled by default — fixture inherits SPEAKING_DEFAULTS
+    # and the Config dataclass defaults ``viewer_chat_enabled=True``.
+    assert d._registry.lookup(ViewerChatEvent) is not None
 
     # Signal events go through SignalTransport's per-transport inbox,
     # never the dispatcher queue.

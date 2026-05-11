@@ -35,6 +35,7 @@ if TYPE_CHECKING:
         EmergencyEvent,
         SignalEvent,
         SurfaceEvent,
+        ViewerChatEvent,
     )
     from .internal.background_task import BackgroundTaskCompleteEvent
 
@@ -342,6 +343,95 @@ async def handle_discord(ctx: DaemonContext, event: "DiscordEvent") -> None:
             "discord_turn_end",
             turn_id=turn_id,
             principal_id=msg.principal.native_id,
+            error=error,
+            duration_ms=int((time.time() - started) * 1000),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Viewer-chat turn — local web chat surfaced inside the viewer UI.
+
+
+async def handle_viewer_chat(ctx: DaemonContext, event: "ViewerChatEvent") -> None:
+    """Run one turn for a viewer-chat message.
+
+    Mirrors :func:`handle_cli` — durable channel (the SSE subscriber
+    can disconnect and reconnect without losing the conversation), an
+    explicit ``signal_done`` at end-of-turn so the front-end can
+    re-enable its input field even when Alice never called
+    ``send_message``.
+    """
+    assert ctx.viewer_chat_transport is not None
+    msg = event.message
+    turn_id = uuid.uuid4().hex[:12]
+    started = time.time()
+
+    ctx.events.emit(
+        "viewer_chat_turn_start",
+        turn_id=turn_id,
+        principal_id=msg.principal.native_id,
+        display_name=msg.principal.display_name,
+        channel=msg.origin.address,
+        inbound_chars=len(msg.text),
+        inbound=_short(msg.text, 600),
+    )
+
+    prev_kind = ctx._current_turn_kind
+    prev_channel = ctx._current_reply_channel
+    prev_display_name = ctx._current_principal_display_name
+    ctx._current_turn_kind = "viewer-chat"
+    ctx._current_reply_channel = msg.origin
+    ctx._current_principal_display_name = msg.principal.display_name
+    # Same drain-stopper reset as signal/cli/discord — viewer-chat
+    # participates in mid-turn injection just like the other
+    # durable-channel transports.
+    ctx._current_turn_replied = False
+    error: Optional[str] = None
+    try:
+        now = datetime.datetime.now().astimezone()
+        stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
+        prompt = ctx.viewer_chat_transport.build_prompt(
+            principal_name=msg.principal.display_name,
+            stamp=stamp,
+            text=msg.text,
+        )
+        await ctx._run_turn(
+            prompt,
+            turn_id=turn_id,
+            outbound_recipient=f"viewer-chat:{msg.origin.address}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("viewer-chat turn failed for %s", msg.principal.display_name)
+        error = f"{type(exc).__name__}: {exc}"
+        with contextlib.suppress(Exception):
+            await ctx.viewer_chat_transport.signal_error(msg.origin, error)
+    finally:
+        # Always close the turn so the SSE consumer can re-enable input.
+        # Errors close above; success closes here.
+        if error is None:
+            with contextlib.suppress(Exception):
+                await ctx.viewer_chat_transport.signal_done(msg.origin)
+        # Mid-turn flush mirrors the signal handler: drained-but-unused
+        # messages roll over as the next turn's prompt.
+        with contextlib.suppress(Exception):
+            ctx._flush_mid_turn_inbox(msg.origin)
+        ctx._current_turn_kind = prev_kind
+        ctx._current_reply_channel = prev_channel
+        ctx._current_principal_display_name = prev_display_name
+        ctx.turns.append(
+            new_turn(
+                sender_number=msg.principal.native_id,
+                sender_name=msg.principal.display_name,
+                inbound=msg.text,
+                outbound=ctx._turn_last_outbound,
+                error=error,
+            )
+        )
+        ctx.events.emit(
+            "viewer_chat_turn_end",
+            turn_id=turn_id,
+            principal_id=msg.principal.native_id,
+            channel=msg.origin.address,
             error=error,
             duration_ms=int((time.time() - started) * 1000),
         )

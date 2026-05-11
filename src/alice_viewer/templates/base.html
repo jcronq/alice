@@ -19,6 +19,7 @@
       <span>{{ personae.agent.name }} Viewer</span>
     </div>
     <nav>
+      <a href="/chat"       class="{% if active == 'chat' %}on{% endif %}">chat</a>
       <a href="/"           class="{% if active == 'timeline' %}on{% endif %}">timeline</a>
       <a href="/narrative"  class="{% if active == 'narrative' %}on{% endif %}">narrative</a>
       <a href="/canvas"     class="{% if active == 'canvas' %}on{% endif %}">canvas</a>
