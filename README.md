@@ -93,7 +93,7 @@ See `docs/ARCHITECTURE.md` for the full breakdown. Short version:
 **Containers (compose):**
 
 - `alice-daemon` — singleton. Runs signal-cli in JSON-RPC mode on
-  port 8080 + cron for thinking-hemisphere wakes. No Claude here.
+  port 8080. No Claude here.
 - `alice-worker-blue` / `alice-worker-green` — blue/green worker slots.
   Exactly one is live at a time, holding an exclusive `flock` on
   `/state/worker/lease`. The other waits. `alice-deploy` swaps them.
@@ -117,11 +117,14 @@ text alone does NOT send.
 
 - **Speaking** — fires per inbound turn. Sees the user's message, decides
   what to do, replies (or doesn't). Can run subagents to build/edit/deploy.
-- **Thinking** — fires on cron (~5 min). Drains `inner/notes/`, grooms the
-  vault, runs research from `inner/ideas.md`, surfaces actionable findings
-  back to Speaking via `inner/surface/`. Two modes: **active** (07:00–23:00)
-  and **sleep / REM** (23:00–07:00, with consolidation / downscaling /
-  recombination sub-stages).
+- **Thinking** — runs as an s6 timer loop inside the worker
+  (`sandbox/worker/s6/alice-thinker/run`) with mode-aware cadence: 5 min
+  in active mode, exponential backoff (5 → 10 → 20 → 40 min) in sleep mode.
+  Interruptible early by `inotifywait` when a new note lands in
+  `inner/notes/`. Drains `inner/notes/`, grooms the vault, runs research
+  from `inner/ideas.md`, surfaces actionable findings back to Speaking via
+  `inner/surface/`. Two modes: **active** (07:00–23:00) and **sleep / REM**
+  (23:00–07:00, with consolidation / downscaling / recombination sub-stages).
 
 **Volumes (host → container):**
 
