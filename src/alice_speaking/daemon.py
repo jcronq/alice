@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 
 from alice_core.config.auth import ensure_auth_env
 from alice_core.kernel import KernelSpec, make_kernel
-from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+from claude_agent_sdk import HookMatcher
 from . import _dispatch as _dispatch_module
 from . import factory as factory_module
 from . import tools as tools_module
@@ -450,12 +450,24 @@ class SpeakingDaemon:
             # ~/alice-mind/... paths keep working.
             skills_cwd=self._skills_cwd,
             mind_dir=cfg.mind_dir,
-            # Native Task interception. The SDK fires this BEFORE every
-            # tool call; we intercept Task/Agent and detach the
-            # sub-agent into our asyncio task instead of letting the
-            # SDK's blocking implementation run. All other tools pass
-            # through with PermissionResultAllow.
-            can_use_tool=self._intercept_task,
+            # Native Task interception via PreToolUse hook. The hook
+            # fires before every Task/Agent call; we deny it (so the
+            # SDK doesn't run the blocking built-in) and dispatch the
+            # sub-agent into asyncio background work instead. The
+            # deny reason becomes the model-visible tool result.
+            #
+            # Hooks chosen over can_use_tool because the latter only
+            # fires when the CLI sends a permission request, which
+            # doesn't happen for built-in tools in default permission
+            # mode — observed empirically on the b06d2f1 deploy.
+            hooks={
+                "PreToolUse": [
+                    HookMatcher(
+                        matcher="Task|Agent",
+                        hooks=[self._pretooluse_hook],
+                    ),
+                ],
+            },
         )
         self.turn_runner.session_id = initial_session_id
         # ContextProbe — read-only snapshot of the live context
@@ -910,94 +922,84 @@ class SpeakingDaemon:
     # ``ctx._emergency_watcher.archive(...)``).
 
     # ------------------------------------------------------------------
-    # Native Task interception (passed to TurnRunner as can_use_tool)
+    # Native Task interception via PreToolUse hook
+    #
+    # The SDK's ``can_use_tool`` permission callback only fires when
+    # the CLI actually sends a permission request, which doesn't
+    # happen for built-in tools like Task in the default permission
+    # mode. PreToolUse hooks fire on every tool call regardless,
+    # which is what we need to intercept Task before it blocks the
+    # parent turn for minutes on a synchronous sub-agent run.
 
-    async def _intercept_task(
+    async def _pretooluse_hook(
         self,
-        tool_name: str,
-        tool_input: dict[str, Any],
+        input_data: dict[str, Any],
+        tool_use_id: Optional[str],
         context: Any,
-    ) -> Any:
-        """Intercept the SDK's built-in Task/Agent tool to detach
-        sub-agents into asyncio background work.
+    ) -> dict[str, Any]:
+        """PreToolUse hook callback — intercepts Task/Agent.
 
-        This is wired as ``can_use_tool`` on every Anthropic kernel
-        call Alice's TurnRunner makes. The SDK fires it BEFORE every
-        tool call. We intercept Task (and its alias Agent) by:
+        Hook input shape (per :class:`PreToolUseHookInput` in the SDK):
+        ``{"hook_event_name": "PreToolUse", "tool_name": str,
+        "tool_input": dict, "tool_use_id": str, "agent_id": str?}``.
 
-        1. Extracting ``description`` and ``prompt`` from the input
-           (Task's documented schema).
-        2. Calling :meth:`_dispatch_subagent` to spawn the sub-agent
-           in an asyncio task — same machinery the (now-removed)
-           dispatch_background_task MCP tool used.
-        3. Returning :class:`PermissionResultDeny` whose ``message``
-           tells Alice the dispatch happened, surfaces the handle for
-           correlation, and instructs her to end her turn.
-
-        The deny message becomes the model-visible tool result, so
-        Alice sees what looks like a successful (but instant) Task
-        call. Her parent turn then ends naturally; the daemon lock
-        releases. When the sub-agent completes,
-        :class:`BackgroundTaskCompleteEvent` triggers a fresh turn
-        with the result on the originating channel.
-
-        ``interrupt=False`` is critical — interrupt would CANCEL the
-        whole turn, dropping any in-flight wrap-up text Alice was
-        about to emit.
-
-        Recursive Task calls (sub-agents calling Task) can't happen
-        in v1 because sub-agents only get :data:`BUILTIN_TOOLS`
-        (which doesn't include Task), but we still pass-through any
-        request from a sub-agent context as a defensive guard.
+        Return value is a SyncHookJSONOutput dict. We use
+        ``hookSpecificOutput.permissionDecision="deny"`` with a
+        ``permissionDecisionReason`` that becomes the model-visible
+        tool result. Any other tool returns an empty dict (pass-through).
         """
-        # Tool name comes through as either "Task" (SDK capability
-        # list) or "Agent" (often what tool_use events show). Match
-        # both — they're the same underlying tool.
+        tool_name = input_data.get("tool_name") or ""
+        # Pass through anything that isn't Task. Empty dict = no
+        # decision = SDK proceeds normally.
         if tool_name not in ("Task", "Agent"):
-            return PermissionResultAllow()
+            return {}
 
         # Defensive: never intercept inside a sub-agent context.
-        if getattr(context, "agent_id", None):
-            return PermissionResultAllow()
+        # Sub-agents only get BUILTIN_TOOLS (no Task) so this can't
+        # happen today, but the guard keeps us safe if that changes.
+        if input_data.get("agent_id"):
+            return {}
 
+        tool_input = input_data.get("tool_input") or {}
         description = (tool_input.get("description") or "").strip() or "background task"
         prompt = (tool_input.get("prompt") or "").strip()
         if not prompt:
-            # Malformed Task call — let the SDK handle it (will likely
-            # fail with a clearer error from the model than ours).
             log.warning(
                 "Task interception: empty prompt; passing through to SDK"
             )
-            return PermissionResultAllow()
+            return {}
 
         try:
             handle = await self._dispatch_subagent(description, prompt)
         except Exception as exc:  # noqa: BLE001
             log.exception("Task interception: dispatch failed")
-            # If we can't dispatch, deny with a clear failure message
-            # rather than silently passing through to the blocking
-            # built-in (which would defeat the whole point).
-            return PermissionResultDeny(
-                message=(
-                    f"Task interception failed to dispatch a "
-                    f"background sub-agent: {type(exc).__name__}: "
-                    f"{exc}. Try again or do the work inline."
-                ),
-                interrupt=False,
-            )
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        f"Task interception failed to dispatch a "
+                        f"background sub-agent: {type(exc).__name__}: "
+                        f"{exc}. Try again or do the work inline."
+                    ),
+                }
+            }
 
-        return PermissionResultDeny(
-            message=(
-                f"Task intercepted — sub-agent dispatched as "
-                f"{handle} ({description!r}). It runs in the "
-                f"background; your parent turn is NOT blocked. "
-                f"You'll receive a fresh inbound turn with the "
-                f"result on the originating channel when it "
-                f"finishes. Wrap up briefly and end this turn — "
-                f"don't wait."
-            ),
-            interrupt=False,
-        )
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"Task intercepted — sub-agent dispatched as "
+                    f"{handle} ({description!r}). It runs in the "
+                    f"background; your parent turn is NOT blocked. "
+                    f"You'll receive a fresh inbound turn with the "
+                    f"result on the originating channel when it "
+                    f"finishes. Wrap up briefly and end this turn — "
+                    f"don't wait."
+                ),
+            }
+        }
 
     # ------------------------------------------------------------------
     # Background-task dispatch (used by _intercept_task above)

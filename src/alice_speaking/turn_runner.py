@@ -105,6 +105,7 @@ class TurnRunner:
         skills_cwd: Optional[pathlib.Path] = None,
         mind_dir: Optional[pathlib.Path] = None,
         can_use_tool: Optional[CanUseToolHook] = None,
+        hooks: Optional[dict] = None,
     ) -> None:
         self._cfg = cfg
         self._events = events
@@ -142,12 +143,17 @@ class TurnRunner:
         # that reference absolute paths or that the agent may need
         # to read for general operation.
         self._mind_dir = mind_dir
-        # Tool-permission callback — fires before every tool call.
-        # alice_speaking uses this to intercept the SDK's built-in
-        # Task tool and detach sub-agents into asyncio background
-        # work instead of blocking the parent turn. None keeps
-        # default-allow behaviour (no interception).
+        # Tool-permission callback — fires before every tool call,
+        # but ONLY when the CLI sends a permission request (which
+        # doesn't happen for built-in tools in default permission
+        # mode). Kept for API completeness; the daemon uses ``hooks``
+        # below for the actual Task interception.
         self._can_use_tool = can_use_tool
+        # PreToolUse / PostToolUse / etc. hooks. alice_speaking uses
+        # a PreToolUse matcher on ``Task|Agent`` to intercept the
+        # SDK's built-in sub-agent tool and detach work into asyncio
+        # background tasks instead of blocking the parent turn.
+        self._hooks = hooks
         self.session_id: Optional[str] = None
         self._pending_preamble: Optional[str] = None
 
@@ -250,6 +256,7 @@ class TurnRunner:
             thinking="medium",
             append_system_prompt=self._system_prompt,
             can_use_tool=self._can_use_tool,
+            hooks=self._hooks,
         )
 
     def _build_handlers(self, *, silent: bool) -> list:
