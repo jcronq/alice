@@ -15,16 +15,31 @@ from __future__ import annotations
 
 import pathlib
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from typing import Any, Awaitable, Callable, Literal, Optional
 
 
 __all__ = [
+    "CanUseToolHook",
     "ThinkingLevel",
     "KernelSpec",
     "KernelResult",
     "UsageInfo",
     "TurnSummary",
     "SystemEvent",
+]
+
+
+# Backend-agnostic shape of the tool-permission callback. Mirrors
+# ``claude_agent_sdk.CanUseTool`` (which AnthropicKernel adapts onto)
+# without forcing every kernel-using module to depend on the SDK
+# directly. PiKernel ignores this field today (no permission protocol).
+#
+# The tuple is (tool_name, tool_input, opaque_context). Returning the
+# result is the integration point for soft-cancel / interception:
+# returning ``deny`` short-circuits the SDK's built-in tool execution
+# and surfaces the deny ``message`` to the model as the tool result.
+CanUseToolHook = Callable[
+    [str, dict[str, Any], Any], Awaitable[Any]
 ]
 
 
@@ -84,6 +99,20 @@ class KernelSpec:
     append_system_prompt: Optional[str] = None
     mcp_servers: Optional[dict] = None  # Anthropic-specific; PiKernel ignores
     add_dirs: Optional[list[pathlib.Path]] = None
+    # Permission callback fired BEFORE every tool call. Returning a
+    # PermissionResultDeny short-circuits the SDK's tool execution and
+    # surfaces the deny message to the model as the tool result —
+    # which is how alice_speaking intercepts the built-in Task tool to
+    # detach sub-agents into asyncio background work instead of
+    # blocking the parent turn. None keeps default-allow behavior.
+    # Anthropic-specific; PiKernel ignores.
+    can_use_tool: Optional[CanUseToolHook] = None
+    # PreToolUse / PostToolUse / etc. hook registry. Same intent as
+    # ``can_use_tool`` but more flexible — supports tool-name regex
+    # matching and modifying tool inputs. Reserved for richer
+    # interception cases; can_use_tool above is sufficient for the
+    # current Task interception. Anthropic-specific.
+    hooks: Optional[dict] = None
 
 
 @dataclass

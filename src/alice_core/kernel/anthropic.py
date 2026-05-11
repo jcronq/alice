@@ -210,9 +210,23 @@ class AnthropicKernel:
         # totals.
         iter_usages: list[dict[str, int]] = []
 
+        # When can_use_tool is set, the SDK requires streaming mode —
+        # an AsyncIterable of user-message dicts rather than a plain
+        # string. Wrap our single-shot prompt into a one-element async
+        # iterator so the rest of the run() body stays unchanged.
+        if spec.can_use_tool is not None:
+            async def _prompt_stream():
+                yield {
+                    "type": "user",
+                    "message": {"role": "user", "content": prompt},
+                }
+            prompt_arg: Any = _prompt_stream()
+        else:
+            prompt_arg = prompt
+
         async def _drive() -> None:
             nonlocal session_id, usage_info, duration_ms, cost_usd, is_error, num_turns
-            async for msg in query(prompt=prompt, options=options):
+            async for msg in query(prompt=prompt_arg, options=options):
                 if isinstance(msg, AssistantMessage):
                     if getattr(msg, "error", None) == "rate_limit":
                         raise RuntimeError("claude rate_limit")
@@ -352,6 +366,14 @@ class AnthropicKernel:
                 "preset": "claude_code",
                 "append": spec.append_system_prompt,
             }
+        if spec.can_use_tool is not None:
+            # The SDK requires streaming mode (AsyncIterable prompt)
+            # when can_use_tool is set. AnthropicKernel.run() already
+            # uses query() with an AsyncIterable prompt, so this is
+            # always satisfied.
+            kwargs["can_use_tool"] = spec.can_use_tool
+        if spec.hooks is not None:
+            kwargs["hooks"] = spec.hooks
         return ClaudeAgentOptions(**kwargs)
 
 

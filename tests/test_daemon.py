@@ -429,8 +429,11 @@ def test_resume_failure_clears_and_retries(cfg, monkeypatch) -> None:
 
     calls: list[dict] = []
 
-    async def first_call_fails_then_succeeds(*, prompt: str, options: Any):
-        calls.append({"prompt": prompt, "resume": getattr(options, "resume", None)})
+    async def first_call_fails_then_succeeds(*, prompt, options: Any):
+        # See _drain_prompt — kernel uses streaming-mode prompt when
+        # can_use_tool is wired.
+        prompt_str = await _drain_prompt(prompt)
+        calls.append({"prompt": prompt_str, "resume": getattr(options, "resume", None)})
         # First call (resume=stale) raises. Second call (no resume) succeeds.
         if len(calls) == 1:
             raise SessionNotFoundError("Session not found: stale")
@@ -501,8 +504,14 @@ def test_preamble_consumed_on_next_turn(cfg, monkeypatch) -> None:
             _result("s1"),
         ]
 
-    async def fake_query(*, prompt: str, options: Any):
-        captured["prompt"] = prompt
+    async def fake_query(*, prompt, options: Any):
+        # The kernel now uses streaming-mode prompts when can_use_tool
+        # is set on the spec (the daemon wires _intercept_task as
+        # can_use_tool unconditionally), so prompt arrives as an
+        # AsyncIterable yielding {"type":"user","message":{"content":...}}
+        # rather than the bare string. Drain the first message to
+        # recover the prompt text for assertion.
+        captured["prompt"] = await _drain_prompt(prompt)
         for m in msgs():
             yield m
 
@@ -518,6 +527,16 @@ def test_preamble_consumed_on_next_turn(cfg, monkeypatch) -> None:
     assert "real body" in captured["prompt"]
     # One-shot: preamble cleared after consumption.
     assert d._pending_preamble is None
+
+
+async def _drain_prompt(prompt) -> str:
+    """Extract the user-message content from a streaming-mode prompt
+    (or pass through a bare string when can_use_tool isn't wired)."""
+    if isinstance(prompt, str):
+        return prompt
+    async for entry in prompt:
+        return entry["message"]["content"]
+    return ""
 
 
 def test_kernel_spec_model_from_model_yml(cfg, monkeypatch, tmp_path) -> None:

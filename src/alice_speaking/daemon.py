@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 
 from alice_core.config.auth import ensure_auth_env
 from alice_core.kernel import KernelSpec, make_kernel
+from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from . import _dispatch as _dispatch_module
 from . import factory as factory_module
 from . import tools as tools_module
@@ -208,8 +209,6 @@ class SpeakingDaemon:
                 address_book=self.address_book,
                 sender=self._send_message,
                 personae=self._personae,
-                background_dispatcher=self._dispatch_subagent,
-                background_text_sender=self._background_text_sender,
             )
         )
 
@@ -451,6 +450,12 @@ class SpeakingDaemon:
             # ~/alice-mind/... paths keep working.
             skills_cwd=self._skills_cwd,
             mind_dir=cfg.mind_dir,
+            # Native Task interception. The SDK fires this BEFORE every
+            # tool call; we intercept Task/Agent and detach the
+            # sub-agent into our asyncio task instead of letting the
+            # SDK's blocking implementation run. All other tools pass
+            # through with PermissionResultAllow.
+            can_use_tool=self._intercept_task,
         )
         self.turn_runner.session_id = initial_session_id
         # ContextProbe — read-only snapshot of the live context
@@ -905,7 +910,97 @@ class SpeakingDaemon:
     # ``ctx._emergency_watcher.archive(...)``).
 
     # ------------------------------------------------------------------
-    # Background-task dispatch (closure given to tools.background_task)
+    # Native Task interception (passed to TurnRunner as can_use_tool)
+
+    async def _intercept_task(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        context: Any,
+    ) -> Any:
+        """Intercept the SDK's built-in Task/Agent tool to detach
+        sub-agents into asyncio background work.
+
+        This is wired as ``can_use_tool`` on every Anthropic kernel
+        call Alice's TurnRunner makes. The SDK fires it BEFORE every
+        tool call. We intercept Task (and its alias Agent) by:
+
+        1. Extracting ``description`` and ``prompt`` from the input
+           (Task's documented schema).
+        2. Calling :meth:`_dispatch_subagent` to spawn the sub-agent
+           in an asyncio task — same machinery the (now-removed)
+           dispatch_background_task MCP tool used.
+        3. Returning :class:`PermissionResultDeny` whose ``message``
+           tells Alice the dispatch happened, surfaces the handle for
+           correlation, and instructs her to end her turn.
+
+        The deny message becomes the model-visible tool result, so
+        Alice sees what looks like a successful (but instant) Task
+        call. Her parent turn then ends naturally; the daemon lock
+        releases. When the sub-agent completes,
+        :class:`BackgroundTaskCompleteEvent` triggers a fresh turn
+        with the result on the originating channel.
+
+        ``interrupt=False`` is critical — interrupt would CANCEL the
+        whole turn, dropping any in-flight wrap-up text Alice was
+        about to emit.
+
+        Recursive Task calls (sub-agents calling Task) can't happen
+        in v1 because sub-agents only get :data:`BUILTIN_TOOLS`
+        (which doesn't include Task), but we still pass-through any
+        request from a sub-agent context as a defensive guard.
+        """
+        # Tool name comes through as either "Task" (SDK capability
+        # list) or "Agent" (often what tool_use events show). Match
+        # both — they're the same underlying tool.
+        if tool_name not in ("Task", "Agent"):
+            return PermissionResultAllow()
+
+        # Defensive: never intercept inside a sub-agent context.
+        if getattr(context, "agent_id", None):
+            return PermissionResultAllow()
+
+        description = (tool_input.get("description") or "").strip() or "background task"
+        prompt = (tool_input.get("prompt") or "").strip()
+        if not prompt:
+            # Malformed Task call — let the SDK handle it (will likely
+            # fail with a clearer error from the model than ours).
+            log.warning(
+                "Task interception: empty prompt; passing through to SDK"
+            )
+            return PermissionResultAllow()
+
+        try:
+            handle = await self._dispatch_subagent(description, prompt)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Task interception: dispatch failed")
+            # If we can't dispatch, deny with a clear failure message
+            # rather than silently passing through to the blocking
+            # built-in (which would defeat the whole point).
+            return PermissionResultDeny(
+                message=(
+                    f"Task interception failed to dispatch a "
+                    f"background sub-agent: {type(exc).__name__}: "
+                    f"{exc}. Try again or do the work inline."
+                ),
+                interrupt=False,
+            )
+
+        return PermissionResultDeny(
+            message=(
+                f"Task intercepted — sub-agent dispatched as "
+                f"{handle} ({description!r}). It runs in the "
+                f"background; your parent turn is NOT blocked. "
+                f"You'll receive a fresh inbound turn with the "
+                f"result on the originating channel when it "
+                f"finishes. Wrap up briefly and end this turn — "
+                f"don't wait."
+            ),
+            interrupt=False,
+        )
+
+    # ------------------------------------------------------------------
+    # Background-task dispatch (used by _intercept_task above)
 
     async def _dispatch_subagent(
         self, description: str, instructions: str
@@ -1025,18 +1120,6 @@ class SpeakingDaemon:
         )
         self._subagent_tasks[handle] = task
         return handle
-
-    async def _background_text_sender(self, message: str) -> None:
-        """Deliver an optional ``user_facing_message`` from the dispatch
-        tool through the normal outbox routing on the originating
-        channel. No-op when no inbound channel is set."""
-        if self._current_reply_channel is None:
-            log.info(
-                "background_text_sender: no current_reply_channel; "
-                "dropping ack message"
-            )
-            return
-        await self._send_message(SELF_RECIPIENT, message)
 
     # ------------------------------------------------------------------
     # send_message router (closure given to tools.messaging)
