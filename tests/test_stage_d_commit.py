@@ -23,8 +23,6 @@ import datetime as _dt
 import json
 import pathlib
 
-import pytest
-
 from alice_thinking.stage_d_pipeline import (
     commit_stage_d_synthesis,
 )
