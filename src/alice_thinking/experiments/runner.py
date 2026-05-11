@@ -70,7 +70,9 @@ __all__ = [
     "DEFAULT_TIMEOUT_SECONDS",
     "DispatchMetadata",
     "ExperimentDispatchError",
+    "ExperimentOutcome",
     "ExperimentRunner",
+    "UnknownExperimentError",
     "new_experiment_id",
 ]
 
@@ -109,6 +111,68 @@ class ExperimentDispatchError(RuntimeError):
     both, neither, or an unreadable method path raises before any work
     starts.
     """
+
+
+class UnknownExperimentError(LookupError):
+    """Raised by :meth:`ExperimentRunner.wait_for` for an unknown experiment_id.
+
+    "Unknown" means this runner instance never dispatched the id. Mostly a
+    safety net for the CLI: a typo at the shell shouldn't silently succeed.
+    """
+
+
+@dataclasses.dataclass(frozen=True)
+class ExperimentOutcome:
+    """Terminal state of one experiment, derived from the on-disk card.
+
+    The runner builds one of these after :meth:`ExperimentRunner.wait_for`
+    drains the asyncio task. All fields except ``experiment_id`` /
+    ``card_path`` / ``status`` are best-effort: a missing card or a card
+    written before the schema settled leaves the corresponding field as
+    ``None`` / ``""`` rather than raising. The CLI uses ``status`` to set
+    its process exit code and ``summary`` for the JSON payload it prints.
+    """
+
+    experiment_id: str
+    card_path: pathlib.Path
+    status: str  # "complete" | "incomplete" | "failed" | "missing-card"
+    summary: str  # the card's Abstract body (or stub message)
+    hypothesis: str
+    dispatched_at: Optional[datetime.datetime]
+    completed_at: Optional[datetime.datetime]
+    duration_seconds: Optional[float]
+    transcript_path: Optional[pathlib.Path]
+    failure_reason: Optional[str]
+
+    def to_json_payload(self) -> dict[str, Any]:
+        """Render the dict the CLI prints to stdout.
+
+        Strings everywhere — datetimes go ISO-8601, paths go str(), Nones
+        are kept so consumers can distinguish "no value" from "missing
+        key" without re-parsing the card frontmatter.
+        """
+        return {
+            "experiment_id": self.experiment_id,
+            "card_path": str(self.card_path),
+            "status": self.status,
+            "summary": self.summary,
+            "hypothesis": self.hypothesis,
+            "dispatched_at": _iso_or_none(self.dispatched_at),
+            "completed_at": _iso_or_none(self.completed_at),
+            "duration_seconds": self.duration_seconds,
+            "transcript_path": str(self.transcript_path)
+            if self.transcript_path is not None
+            else None,
+            "failure_reason": self.failure_reason,
+        }
+
+
+def _iso_or_none(dt: Optional[datetime.datetime]) -> Optional[str]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt.replace(microsecond=0).isoformat()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -197,6 +261,11 @@ class ExperimentRunner:
         # Track live tasks so callers can drain them at shutdown if
         # needed. Each entry removes itself on completion.
         self._tasks: dict[str, asyncio.Task] = {}
+        # Track every experiment_id this runner has dispatched so
+        # :meth:`wait_for` can tell "task already finished and was
+        # untracked" apart from "id never seen." Survives across the
+        # done-callback that prunes ``_tasks``.
+        self._dispatched: dict[str, DispatchMetadata] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -270,6 +339,7 @@ class ExperimentRunner:
             transcript_path=transcript_path,
             dispatched_at=dispatched_at,
         )
+        self._dispatched[experiment_id] = meta
 
         # Emit dispatch telemetry before scheduling so the viewer shows
         # the experiment in-flight even if the background task hasn't
@@ -333,12 +403,96 @@ class ExperimentRunner:
         self._tasks[experiment_id] = task
         return meta
 
-    async def wait_for(self, experiment_id: str, timeout: Optional[float] = None) -> None:
-        """Wait for a specific in-flight experiment task. Test helper."""
+    async def wait_for(
+        self,
+        experiment_id: str,
+        timeout: Optional[float] = None,
+    ) -> ExperimentOutcome:
+        """Await one in-flight experiment task; return its terminal outcome.
+
+        Used by the synchronous ``alice-experiment`` CLI (and by tests).
+        The MCP-tool path doesn't wait — it dispatches and ends the wake.
+
+        Behaviour:
+
+        - If the id was never dispatched through this runner, raise
+          :class:`UnknownExperimentError` so a CLI typo doesn't return a
+          fake "missing-card" outcome.
+        - If the task is still in flight, await it. ``asyncio.shield``
+          wraps the underlying task so a CLI-level cancel doesn't kill
+          the background work (the side effects must finish; the card
+          must land).
+        - If the task already completed (and was pruned from
+          ``_tasks`` by the done-callback), build the outcome straight
+          from disk — the side effects have already landed.
+
+        ``timeout`` is the wait-for timeout in seconds; on expiry
+        :class:`asyncio.TimeoutError` propagates so the caller can map it
+        to an exit code. The underlying task keeps running — the CLI
+        chooses what to do with that.
+        """
+        if experiment_id not in self._dispatched:
+            raise UnknownExperimentError(
+                f"experiment_id {experiment_id!r} was not dispatched by this runner"
+            )
         task = self._tasks.get(experiment_id)
-        if task is None:
-            return
-        await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        if task is not None:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        return self._build_outcome(experiment_id)
+
+    def _build_outcome(self, experiment_id: str) -> ExperimentOutcome:
+        """Construct an :class:`ExperimentOutcome` from the on-disk card.
+
+        Falls back to dispatch metadata when the card is missing or
+        unreadable — better to surface a ``missing-card`` outcome than
+        to crash the caller after a long wait.
+        """
+        meta = self._dispatched[experiment_id]
+        card_path = meta.card_path
+        if not card_path.is_file():
+            return ExperimentOutcome(
+                experiment_id=experiment_id,
+                card_path=card_path,
+                status="missing-card",
+                summary="",
+                hypothesis="",
+                dispatched_at=meta.dispatched_at,
+                completed_at=None,
+                duration_seconds=None,
+                transcript_path=meta.transcript_path,
+                failure_reason="card file was not written",
+            )
+        try:
+            text = card_path.read_text()
+        except OSError as exc:
+            return ExperimentOutcome(
+                experiment_id=experiment_id,
+                card_path=card_path,
+                status="missing-card",
+                summary="",
+                hypothesis="",
+                dispatched_at=meta.dispatched_at,
+                completed_at=None,
+                duration_seconds=None,
+                transcript_path=meta.transcript_path,
+                failure_reason=f"could not read card: {type(exc).__name__}: {exc}",
+            )
+        fm = _parse_frontmatter(text)
+        status = fm.get("status") or "complete"
+        summary = self._extract_abstract_from_card(card_path)
+        return ExperimentOutcome(
+            experiment_id=experiment_id,
+            card_path=card_path,
+            status=status,
+            summary=summary,
+            hypothesis=fm.get("hypothesis") or "",
+            dispatched_at=_parse_iso(fm.get("dispatched_at"))
+            or meta.dispatched_at,
+            completed_at=_parse_iso(fm.get("completed_at")),
+            duration_seconds=_parse_float(fm.get("duration_seconds")),
+            transcript_path=meta.transcript_path,
+            failure_reason=fm.get("failure_reason") or None,
+        )
 
     # ------------------------------------------------------------------
     # Background task — runs the subagent + emits side effects.
@@ -809,3 +963,59 @@ class ExperimentRunner:
         else:
             body = rest[:next_section]
         return body.strip()
+
+
+# ---------------------------------------------------------------------------
+# Frontmatter helpers used by :meth:`ExperimentRunner._build_outcome`.
+# Kept module-level (and minimal) so they're trivially unit-testable and
+# don't pull PyYAML into the runtime — the card writer hand-rolls YAML for
+# the same reason.
+
+
+def _parse_frontmatter(text: str) -> dict[str, str]:
+    """Crude single-line YAML frontmatter parser.
+
+    The card writer only emits scalar string / number / bool / null lines
+    in the frontmatter, so this strips outer double-quotes and ignores
+    list-valued lines (which the outcome doesn't need). Anything unparsed
+    returns as an empty dict — the caller has to handle missing keys
+    anyway.
+    """
+    if not text.startswith("---\n"):
+        return {}
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return {}
+    block = text[4:end]
+    out: dict[str, str] = {}
+    for line in block.splitlines():
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+            # Unescape the writer's ``\\`` and ``\"`` sequences.
+            value = value[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        out[key] = value
+    return out
+
+
+def _parse_iso(raw: Optional[str]) -> Optional[datetime.datetime]:
+    """Parse the writer's ISO-8601 timestamps; return None for ``null`` / empty."""
+    if not raw or raw == "null":
+        return None
+    try:
+        return datetime.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def _parse_float(raw: Optional[str]) -> Optional[float]:
+    """Parse a numeric frontmatter value; return None for ``null`` / empty."""
+    if not raw or raw == "null":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None

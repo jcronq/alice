@@ -25,7 +25,9 @@ from .runner import (
     DEFAULT_TIMEOUT_SECONDS,
     DispatchMetadata,
     ExperimentDispatchError,
+    ExperimentOutcome,
     ExperimentRunner,
+    UnknownExperimentError,
     new_experiment_id,
 )
 from .surface import (
@@ -40,7 +42,9 @@ __all__ = [
     "DEFAULT_TIMEOUT_SECONDS",
     "DispatchMetadata",
     "ExperimentDispatchError",
+    "ExperimentOutcome",
     "ExperimentRunner",
+    "UnknownExperimentError",
     "append_experiments_jsonl",
     "emit_completion_event",
     "generate_permission_rules",

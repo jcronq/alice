@@ -44,6 +44,12 @@ dependencies = [
 
 [project.scripts]
 alice-viewer = "alice_viewer.main:run"
+# Synchronous CLI wrapper around alice_thinking.experiments.ExperimentRunner.
+# Exists because pi-mono (the local Qwen runtime that drives thinking's
+# sleep wakes) strips mcp__-prefixed tools, so the run_experiment MCP tool
+# is invisible to thinking. The CLI is a parallel surface targeting pi-mono;
+# the MCP path still serves AnthropicKernel-driven wakes.
+alice-experiment = "alice_thinking.cli.experiment:main"
 
 [build-system]
 requires = ["hatchling"]
