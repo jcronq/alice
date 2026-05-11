@@ -108,6 +108,23 @@ x-worker-base: &worker-base
     - ${HOME}/.local/state/alice:/state:rw
   working_dir: /home/alice/alice-mind
   command: ["/usr/local/bin/entrypoint.sh", "sleep", "infinity"]
+  # NVIDIA GPU passthrough. The host has 2× RTX 3070; we expose ONE so
+  # an embedding-server workload (Qwen3-Embedding-4B served from
+  # alice's sci-env) can run on-GPU while leaving the second 3070 free
+  # for other host workloads. Requires (a) nvidia-container-toolkit on
+  # the host and (b) the nvidia runtime registered in
+  # /etc/docker/daemon.json (`nvidia-ctk runtime configure --runtime
+  # =docker` does this). If those aren't set up, this block is a
+  # silent no-op for compose v2 (engine ignores unknown runtime hint),
+  # so the worker still starts — just without /dev/nvidia*.
+  runtime: nvidia
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
 
 services:
   alice-daemon:
