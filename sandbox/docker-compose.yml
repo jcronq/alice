@@ -74,6 +74,13 @@ x-worker-base: &worker-base
     ALICE_A2A_HOST: "${ALICE_A2A_HOST:-}"
     ALICE_A2A_PRINCIPAL: "${ALICE_A2A_PRINCIPAL:-}"
     ALICE_A2A_EXTERNAL_URL: "${ALICE_A2A_EXTERNAL_URL:-}"
+    # viewer-chat transport (PR #46). Listens on 0.0.0.0 so the
+    # viewer container (on the same alice-net bridge) can reach it
+    # over the worker's hostname. Default port 8181 collides with
+    # Alice's local embedder (Qwen3-Embedding-4B on the GPU passed
+    # through earlier); shift to 8182 so both services coexist.
+    ALICE_VIEWER_CHAT_HOST: "0.0.0.0"
+    ALICE_VIEWER_CHAT_PORT: "8182"
   volumes:
     # Mind + tools default to <repo>/data/{alice-mind,alice-tools}; alice-up
     # exports ALICE_MIND / ALICE_TOOLS pointing there. Fall back to the
@@ -187,6 +194,15 @@ services:
       # member-set signature, so flipping this on doesn't burn tokens
       # on every page load — only on minted/drifted lobes.
       ALICE_LOBE_LLM_LABELS: "1"
+      # viewer-chat transport (PR #46) — points the in-browser /chat
+      # client at the worker's chat endpoint. PORT must match
+      # ALICE_VIEWER_CHAT_PORT in x-worker-base (8182, shifted off
+      # the embedder's 8181). HOST is hardcoded to the current live
+      # slot; on the next blue/green swap, this will need to flip to
+      # the new slot (TODO: dynamic network alias or alice-deploy
+      # script that rewrites it at swap time).
+      ALICE_VIEWER_CHAT_DAEMON_HOST: "${ALICE_VIEWER_CHAT_DAEMON_HOST:-alice-worker-green}"
+      ALICE_VIEWER_CHAT_DAEMON_PORT: "${ALICE_VIEWER_CHAT_DAEMON_PORT:-8182}"
       TZ: "${ALICE_TZ:-America/New_York}"
     volumes:
       - ${ALICE_REPO:-${HOME}/alice}:/home/alice/alice:ro
