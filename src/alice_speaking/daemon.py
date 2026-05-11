@@ -42,7 +42,7 @@ import os
 import signal as _signal
 import time
 import uuid
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from .transports.a2a import A2ATransport

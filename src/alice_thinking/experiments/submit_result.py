@@ -212,7 +212,7 @@ def build_submit_result_tool(
     ``on_submitted(content, status)`` if provided so the parent can break
     out of any waiting loop.
     """
-    from claude_agent_sdk import SdkMcpTool, tool
+    from claude_agent_sdk import tool
 
     target_status_dir = status_dir or card_path.parent
 

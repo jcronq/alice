@@ -51,7 +51,6 @@ from typing import Any, Callable, Optional
 from alice_core.events import EventEmitter
 
 from .card import (
-    CardContent,
     DEFAULT_VAULT_EXPERIMENTS_DIR,
     card_path_for,
     write_failed_stub_card,
