@@ -52,8 +52,13 @@ from typing import Callable, Literal, Optional
 
 __all__ = [
     "AttemptRecord",
+    "CommitResult",
+    "CommitOutcome",
     "Outcome",
     "DEFAULT_ATTEMPTS_LOG",
+    "DEFAULT_JUDGE_FAILURES_LOG",
+    "DEFAULT_VAULT_ROOT",
+    "commit_stage_d_synthesis",
     "run_dual_judge",
     "update_shipped_slug",
 ]
@@ -66,8 +71,22 @@ Outcome = Literal[
     "disagreement_pending",
 ]
 
+# Commit-level outcome adds ``fallback`` for the judge-unreachable path
+# where ``commit_stage_d_synthesis`` writes the vault note without judge
+# verdicts (and logs the failure to ``stage-d-judge-failures.jsonl``).
+CommitOutcome = Literal[
+    "shipped",
+    "dropped_agreement_reject",
+    "dropped_disagreement_exhausted",
+    "fallback",
+]
+
 
 DEFAULT_ATTEMPTS_LOG = pathlib.Path.home() / "alice-mind/inner/state/stage-d-attempts.jsonl"
+DEFAULT_JUDGE_FAILURES_LOG = (
+    pathlib.Path.home() / "alice-mind/inner/state/stage-d-judge-failures.jsonl"
+)
+DEFAULT_VAULT_ROOT = pathlib.Path.home() / "alice-mind/cortex-memory"
 
 
 @dataclass
@@ -328,3 +347,239 @@ def update_shipped_slug(
     tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
     tmp.replace(attempts_log_path)
     return True
+
+
+# ---------------------------------------------------------------------------
+# commit_stage_d_synthesis — the deterministic single-call entry point.
+#
+# Collapses the wake's old steps 5 (judge) + 6 (vault write) + 7 (pairs
+# log) into one function so thinking can't ship a Stage D synthesis
+# without going through the judge gate. The prompt-level instruction
+# was advisory and was being skipped — see the gap analysis on
+# 2026-05-11. This function is the structural fix.
+
+
+@dataclass
+class CommitResult:
+    """Outcome of one ``commit_stage_d_synthesis`` call.
+
+    Fields
+    ------
+    outcome
+        ``shipped`` — judges agreed ship; vault note written.
+        ``dropped_agreement_reject`` — judges agreed reject; no vault write.
+        ``dropped_disagreement_exhausted`` — disagreement through max_attempts; no vault write.
+        ``fallback`` — judge dispatch raised; vault note written from the
+        original draft and the failure is logged to
+        ``stage-d-judge-failures.jsonl``.
+    synthesis_slug
+        Vault slug of the written note (``research/<slug>``), or ``None``
+        when no vault note was written (both drop outcomes).
+    attempt_id
+        ``run_dual_judge`` attempt id, or ``None`` for the fallback path
+        where the judge never ran.
+    fallback_reason
+        Short error string when ``outcome == "fallback"``; ``None`` otherwise.
+    """
+
+    outcome: CommitOutcome
+    synthesis_slug: Optional[str]
+    attempt_id: Optional[str]
+    fallback_reason: Optional[str] = None
+
+
+def _today_pairs_log_path() -> pathlib.Path:
+    """Today's pairs log: ``inner/state/stage-d-pairs-YYYY-MM-DD.jsonl``."""
+    today = _dt.datetime.now().astimezone().date().isoformat()
+    return pathlib.Path.home() / f"alice-mind/inner/state/stage-d-pairs-{today}.jsonl"
+
+
+def _vault_note_path(vault_root: pathlib.Path, output_slug: str) -> pathlib.Path:
+    return vault_root / "research" / f"{output_slug}.md"
+
+
+def commit_stage_d_synthesis(
+    *,
+    slug_a: str,
+    slug_b: str,
+    source_a_text: str,
+    source_b_text: str,
+    draft_synthesis: str,
+    output_slug: str,
+    note_content: str,
+    prior_pair_synthesis: Optional[str] = None,
+    vault_root: pathlib.Path = DEFAULT_VAULT_ROOT,
+    pairs_log_path: Optional[pathlib.Path] = None,
+    attempts_log_path: pathlib.Path = DEFAULT_ATTEMPTS_LOG,
+    judge_failures_log_path: pathlib.Path = DEFAULT_JUDGE_FAILURES_LOG,
+    max_attempts: int = 3,
+    judge_qwen_fn: Optional[Callable[..., dict]] = None,
+    judge_haiku_fn: Optional[Callable[..., dict]] = None,
+) -> CommitResult:
+    """Run the dual-judge gate, write the vault note on ship-or-fallback,
+    and append the pairs log. Single-call entry point so the wake can't
+    short-circuit any of these steps.
+
+    Inputs
+    ------
+    slug_a, slug_b
+        Source-note slugs. Caller is responsible for canonical ordering
+        (alphabetically first goes in slug_a) — the pair-log dedup check
+        elsewhere is order-independent but consistent ordering keeps
+        downstream tooling simple.
+    source_a_text, source_b_text
+        Full body text of each source note, passed to both judges.
+    draft_synthesis
+        The candidate synthesis body that thinking has already drafted.
+        The pipeline uses this as the input on every judge attempt; the
+        synthesizer is thinking herself, so for the v1 pipeline we don't
+        re-invoke a model — the 3-attempt loop will burn through and the
+        disagreement will be visible in the JSONL log if the judges
+        can't agree on the unchanged draft.
+    output_slug
+        Slug the vault note will be written under. Convention is
+        ``YYYY-MM-DD-<short-slug>``; the file lands at
+        ``<vault_root>/research/<output_slug>.md``. Caller picks.
+    note_content
+        Full markdown body (including frontmatter) that will be written
+        to the vault file. Caller's responsibility to include the
+        ``source: stage-d``, ``note_a``, and ``note_b`` frontmatter
+        fields — see the wake prompt for the convention. The invariant
+        check (separate utility) verifies these on read.
+    prior_pair_synthesis
+        Body of any previously-shipped synthesis on this exact pair, for
+        the judges' novelty check. ``None`` for a fresh pair.
+    vault_root
+        Root of the cortex-memory vault. Defaults to ``~/alice-mind/cortex-memory``.
+    pairs_log_path
+        Override for the pairs log. Default: today's
+        ``inner/state/stage-d-pairs-YYYY-MM-DD.jsonl`` (created on first
+        append).
+    attempts_log_path
+        Forwarded to ``run_dual_judge`` (firehose attempt log).
+    judge_failures_log_path
+        Append target for the fallback path. One JSONL line per failure.
+    max_attempts
+        Forwarded to ``run_dual_judge``. Spec default 3.
+    judge_qwen_fn, judge_haiku_fn
+        Test-injection seams. ``None`` (default) → production callables
+        from :mod:`alice_thinking.stage_d_judges`.
+
+    Returns
+    -------
+    CommitResult
+        See class docstring for field semantics.
+
+    Side effects (in order)
+    -----------------------
+    1. Per-attempt JSONL lines appended to ``attempts_log_path`` (via
+       ``run_dual_judge``).
+    2. On judge-dispatch failure: one JSONL line appended to
+       ``judge_failures_log_path``. No attempt lines (judge never ran).
+    3. Vault note written to ``<vault_root>/research/<output_slug>.md``
+       on ``shipped`` and ``fallback``. NOT written on drop outcomes.
+    4. On ``shipped``: ``update_shipped_slug`` rewrites the most recent
+       attempt JSONL line with the slug.
+    5. One JSONL line appended to ``pairs_log_path`` with
+       ``{"ts": ..., "note_a": slug_a, "note_b": slug_b, "synthesis": <slug-or-null>}``.
+       The pairs log line is appended on EVERY commit (including drops)
+       so the nightly cap and dedup logic stays consistent.
+    """
+    pairs_path = pairs_log_path or _today_pairs_log_path()
+    vault_path = _vault_note_path(vault_root, output_slug)
+    pair_slug = f"research/{output_slug}"
+
+    # 1. Run the judge gate. Catch any exception as a fallback signal so
+    # the buggy-judge-layer failure mode doesn't take Stage D offline.
+    rec: Optional[AttemptRecord] = None
+    fallback_reason: Optional[str] = None
+    try:
+        rec = run_dual_judge(
+            slug_a=slug_a,
+            slug_b=slug_b,
+            source_a_text=source_a_text,
+            source_b_text=source_b_text,
+            draft_synthesis_fn=lambda _prior: draft_synthesis,
+            prior_pair_synthesis=prior_pair_synthesis,
+            attempts_log_path=attempts_log_path,
+            max_attempts=max_attempts,
+            judge_qwen_fn=judge_qwen_fn,
+            judge_haiku_fn=judge_haiku_fn,
+        )
+    except Exception as exc:  # noqa: BLE001 — fallback intentionally catches anything
+        fallback_reason = f"{type(exc).__name__}: {exc}"
+        _atomic_append_jsonl(
+            judge_failures_log_path,
+            {
+                "ts": _now_iso(),
+                "slug_a": slug_a,
+                "slug_b": slug_b,
+                "reason": fallback_reason,
+            },
+        )
+
+    # 2. Decide whether to write the vault note.
+    commit_outcome: CommitOutcome
+    synthesis_slug: Optional[str]
+    attempt_id: Optional[str]
+
+    if rec is None:
+        commit_outcome = "fallback"
+        synthesis_slug = pair_slug
+        attempt_id = None
+        _write_vault_note(vault_path, note_content)
+    elif rec.outcome == "shipped":
+        commit_outcome = "shipped"
+        synthesis_slug = pair_slug
+        attempt_id = rec.id
+        _write_vault_note(vault_path, note_content)
+        update_shipped_slug(
+            attempt_id=rec.id,
+            shipped_slug=pair_slug,
+            attempts_log_path=attempts_log_path,
+        )
+    elif rec.outcome == "dropped_agreement_reject":
+        commit_outcome = "dropped_agreement_reject"
+        synthesis_slug = None
+        attempt_id = rec.id
+    elif rec.outcome == "dropped_disagreement_exhausted":
+        commit_outcome = "dropped_disagreement_exhausted"
+        synthesis_slug = None
+        attempt_id = rec.id
+    else:
+        # ``disagreement_pending`` is an in-flight state that should
+        # never be the final ``run_dual_judge`` return value. Treat as
+        # exhausted so the caller has a terminal outcome.
+        commit_outcome = "dropped_disagreement_exhausted"
+        synthesis_slug = None
+        attempt_id = rec.id
+
+    # 3. Pairs log line — every commit, ship or drop.
+    _atomic_append_jsonl(
+        pairs_path,
+        {
+            "ts": _now_iso(),
+            "note_a": slug_a,
+            "note_b": slug_b,
+            "synthesis": synthesis_slug,
+        },
+    )
+
+    return CommitResult(
+        outcome=commit_outcome,
+        synthesis_slug=synthesis_slug,
+        attempt_id=attempt_id,
+        fallback_reason=fallback_reason,
+    )
+
+
+def _write_vault_note(path: pathlib.Path, content: str) -> None:
+    """Write ``content`` to ``path`` atomically (temp + rename) so a
+    crashed write can't leave a half-file in the vault. Parent dir is
+    created on demand."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not content.endswith("\n"):
+        content = content + "\n"
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)

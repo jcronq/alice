@@ -15,7 +15,65 @@ Design source of truth:
 | Module | Purpose |
 | --- | --- |
 | `alice_thinking.stage_d_judges` | One-shot judge calls (Qwen, Haiku) with bias-compensated prompts. |
-| `alice_thinking.stage_d_pipeline` | Agreement + reassess protocol, JSONL firehose writer. |
+| `alice_thinking.stage_d_pipeline` | Agreement + reassess protocol, JSONL firehose writer, **deterministic commit** entry point. |
+| `alice_thinking.stage_d_invariant` | Post-wake audit: scan vault for `source: stage-d` notes that lack an attempts.jsonl ship line or judge-failures.jsonl fallback line. Belt + suspenders against end-runs around the gate. |
+
+## Entry point: `commit_stage_d_synthesis` (preferred)
+
+This is the **single call** that owns judge dispatch, the firehose log,
+the vault note write, the shipped-slug update, the judge-failure
+fallback, and the pairs-log append. The wake prompt should call this
+once per pair — there is no way to ship a Stage D synthesis except
+through it.
+
+```python
+from alice_thinking.stage_d_pipeline import commit_stage_d_synthesis
+
+result = commit_stage_d_synthesis(
+    slug_a="research/foo",
+    slug_b="people/jason",
+    source_a_text=open("cortex-memory/research/foo.md").read(),
+    source_b_text=open("cortex-memory/people/jason.md").read(),
+    draft_synthesis="<3-6 sentence body>",
+    output_slug="2026-05-11-foo-x-jason-creativity",
+    note_content="<full markdown including frontmatter with source: stage-d, note_a, note_b>",
+    prior_pair_synthesis=None,
+)
+# result.outcome ∈ {"shipped", "dropped_agreement_reject",
+#                   "dropped_disagreement_exhausted", "fallback"}
+# result.synthesis_slug      — "research/<output_slug>" on ship/fallback, None on drop
+# result.attempt_id          — from run_dual_judge, None when fallback
+# result.fallback_reason     — short error string, populated only when fallback
+```
+
+Side effects, in order:
+
+1. Per-attempt JSONL lines appended to `stage-d-attempts.jsonl` (firehose).
+2. If judges raise: one JSONL line appended to `stage-d-judge-failures.jsonl`; **no** attempts log entry.
+3. Vault note written atomically (temp + rename) to `<vault_root>/research/<output_slug>.md` on `shipped` or `fallback`. NOT written on drop outcomes.
+4. On `shipped`: `update_shipped_slug` rewrites the most recent attempt line with the slug.
+5. One JSONL line appended to today's `stage-d-pairs-YYYY-MM-DD.jsonl` with `{ts, note_a, note_b, synthesis: <slug-or-null>}`. Appended on every commit including drops.
+
+The caller picks the `output_slug` and is responsible for the vault
+note's full markdown content (including frontmatter). The pipeline does
+not validate frontmatter — that's the invariant check's job (below).
+
+## Invariant check: `find_unaudited_stage_d_notes`
+
+```python
+from alice_thinking.stage_d_invariant import find_unaudited_stage_d_notes
+import datetime
+
+bad = find_unaudited_stage_d_notes(date=datetime.date.today())
+# bad is a list[dict]; empty when every source: stage-d note created today
+# has either a matching attempts.jsonl ship line or a matching
+# judge-failures.jsonl fallback line.
+```
+
+Stage D wakes run this at close-clean. If `bad` is non-empty, the wake
+files a surface under `inner/surface/` listing each unaudited note.
+This catches any future regression (or hand-edit) that bypasses
+`commit_stage_d_synthesis`.
 
 ## `judge_qwen` / `judge_haiku`
 
@@ -102,15 +160,22 @@ slug filled in. Idempotent; no-op if the id isn't found.
   proxy. Reachable from worker containers; not always reachable from
   test harnesses (tests mock both call sites).
 
-## Failure mode in the wake prompt
+## Failure mode
 
 If the python pipeline raises (module import error, env var missing,
-LAN endpoint unreachable, OOM, etc.) the wake prompt falls back to the
-old single-attempt vault write so a buggy judge layer doesn't tank
-Stage D entirely. The fallback is logged to
-`~/alice-mind/inner/state/stage-d-judge-failures.jsonl` with `ts`,
-`slug_a`, `slug_b`, `reason`. Review this file when investigating
-"Stage D went silent" — it's the breadcrumb trail.
+LAN endpoint unreachable, OOM, etc.), `commit_stage_d_synthesis`
+catches the exception, appends one JSONL line to
+`~/alice-mind/inner/state/stage-d-judge-failures.jsonl` (with `ts`,
+`slug_a`, `slug_b`, `reason`), and falls back to writing the vault
+note from the unchanged draft. The returned `CommitResult.outcome` is
+`"fallback"`; `result.fallback_reason` carries the short error.
+
+Review the failures log when investigating "Stage D went silent" —
+it's the breadcrumb trail.
+
+The wake prompt does NOT have its own fallback code path. The pipeline
+owns the fallback so callers can't accidentally diverge from the
+documented contract.
 
 ## Test-time mocking
 
@@ -123,6 +188,9 @@ Both modules expose injection seams:
 - `run_dual_judge(..., judge_qwen_fn=..., judge_haiku_fn=...)` — pass
   callables that return pre-built verdict dicts to skip prompting
   entirely.
+- `commit_stage_d_synthesis(..., judge_qwen_fn=..., judge_haiku_fn=...)` —
+  same seam, forwarded through to the underlying `run_dual_judge`. To
+  exercise the fallback path, pass a callable that raises.
 
-Tests live in `tests/test_stage_d_judges.py` and `tests/test_stage_d_pipeline.py`.
-Neither file makes any live LLM calls.
+Tests live in `tests/test_stage_d_judges.py`, `tests/test_stage_d_pipeline.py`,
+and `tests/test_stage_d_commit.py`. None of them make live LLM calls.
