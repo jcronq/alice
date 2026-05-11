@@ -382,6 +382,13 @@ class A2ATransport:
         if q is not None:
             q.put_nowait({"kind": "error", "message": message})
 
+    async def push_lifecycle_event(self, channel: ChannelRef, event: dict) -> None:
+        """No-op: A2A clients consume the SDK's structured task-status
+        and artifact events, not raw lifecycle chunks. ``A2A_CAPS.lifecycle_events``
+        is False so the handler short-circuits before this is reached
+        — stub kept for protocol conformance."""
+        return None
+
     # ------------------------------------------------------------------
     # Internals shared with _AliceExecutor
 

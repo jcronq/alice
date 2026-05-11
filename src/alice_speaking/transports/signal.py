@@ -397,6 +397,13 @@ class SignalTransport:
         else:
             await self._signal.stop_typing(channel.address)
 
+    async def push_lifecycle_event(self, channel: ChannelRef, event: dict) -> None:
+        """No-op: Signal has no streaming channel. ``SIGNAL_CAPS.lifecycle_events``
+        is False so the bridge handler short-circuits before reaching
+        here; this stub exists so the runtime-checkable ``Transport``
+        protocol is still satisfied structurally."""
+        return None
+
     async def set_message_state(
         self,
         channel: ChannelRef,

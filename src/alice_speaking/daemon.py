@@ -466,6 +466,17 @@ class SpeakingDaemon:
             cli_transport=self.cli_transport,
             turn_did_send_getter=lambda: self._turn_did_send,
             current_reply_channel_getter=lambda: self._current_reply_channel,
+            # Resolve transport name → instance for the lifecycle handler.
+            # Same registry shape as the OutboxRouter above, evaluated
+            # at call time so transports added later (or replaced during
+            # a hot reload) are picked up.
+            transport_for=lambda name: {
+                "signal": self.signal_transport,
+                "cli": self.cli_transport,
+                "discord": self.discord_transport,
+                "a2a": self.a2a_transport,
+                "viewer-chat": self.viewer_chat_transport,
+            }.get(name),
             system_prompt=self._system_prompt,
             # Plan 06 Phase 3: model.yml's speaking.model wins over
             # alice.config.json's speaking.model when set; back-compat

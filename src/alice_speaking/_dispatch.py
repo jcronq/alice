@@ -223,6 +223,15 @@ async def handle_cli(ctx: DaemonContext, event: "CLIEvent") -> None:
     ctx._current_principal_display_name = msg.principal.display_name
     error: Optional[str] = None
     try:
+        # Lifecycle: notify the client the turn has been dispatched.
+        # Bracketed by ``turn_end`` from the lifecycle handler's
+        # ``on_result``. No-op when ``CLI_CAPS.lifecycle_events`` is
+        # False (it isn't, but the call site stays defensive).
+        if ctx.cli_transport.caps.lifecycle_events:
+            with contextlib.suppress(Exception):
+                await ctx.cli_transport.push_lifecycle_event(
+                    msg.origin, {"type": "turn_start", "turn_id": turn_id}
+                )
         now = datetime.datetime.now().astimezone()
         stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
         prompt = ctx.cli_transport.build_prompt(
@@ -388,6 +397,14 @@ async def handle_viewer_chat(ctx: DaemonContext, event: "ViewerChatEvent") -> No
     ctx._current_turn_replied = False
     error: Optional[str] = None
     try:
+        # Lifecycle: notify subscribers the turn has been dispatched
+        # — covers the "ack → first chunk" silence that previously
+        # left the UI looking frozen for the whole reasoning span.
+        if ctx.viewer_chat_transport.caps.lifecycle_events:
+            with contextlib.suppress(Exception):
+                await ctx.viewer_chat_transport.push_lifecycle_event(
+                    msg.origin, {"type": "turn_start", "turn_id": turn_id}
+                )
         now = datetime.datetime.now().astimezone()
         stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
         prompt = ctx.viewer_chat_transport.build_prompt(

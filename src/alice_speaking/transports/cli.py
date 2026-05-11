@@ -322,6 +322,20 @@ class CLITransport:
             return
         await self._write_event(writer, event)
 
+    async def push_lifecycle_event(self, channel: ChannelRef, event: dict) -> None:
+        """Forward a turn-lifecycle event to a connected CLI client.
+
+        Same wire path as :meth:`push_trace` — line-delimited JSON over
+        the per-connection writer. The lifecycle handler emits these
+        during ``kernel.run()``; rendered ``chunk`` events still fire
+        from :meth:`send` afterward (they're additive on the wire so
+        old TUIs that don't know about lifecycle events keep working).
+        """
+        writer = self._writers.get(channel.address)
+        if writer is None:
+            return
+        await self._write_event(writer, event)
+
     # ------------------------------------------------------------------
     # Internals
 

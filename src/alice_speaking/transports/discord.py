@@ -353,6 +353,14 @@ class DiscordTransport:
         except Exception as exc:  # noqa: BLE001
             log.debug("discord typing indicator failed: %s", exc)
 
+    async def push_lifecycle_event(self, channel: ChannelRef, event: dict) -> None:
+        """No-op: Discord delivery is fire-and-forget; lifecycle events
+        only matter for streaming transports (CLI, viewer-chat). The
+        :class:`TurnLifecycleHandler` short-circuits on
+        ``DISCORD_CAPS.lifecycle_events=False`` so this is never
+        called in practice — stub kept for protocol conformance."""
+        return None
+
     # ------------------------------------------------------------------
     # Prompt assembly (Phase 6c of plan 01)
 

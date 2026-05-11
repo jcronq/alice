@@ -54,7 +54,12 @@ from .domain.turn_log import TurnLog
 from .infra.config import Config
 from .infra.events import EventLogger
 from .pipeline import compaction as compaction_module
-from .pipeline.handlers import CLITraceHandler, CompactionArmer, SessionHandler
+from .pipeline.handlers import (
+    CLITraceHandler,
+    CompactionArmer,
+    SessionHandler,
+    TurnLifecycleHandler,
+)
 from .retrieval import build_cue_packet
 from .transports import ChannelRef
 
@@ -97,6 +102,12 @@ class TurnRunner:
         # Borrowed callables — see module docstring.
         turn_did_send_getter: Callable[[], bool],
         current_reply_channel_getter: Callable[[], Optional[ChannelRef]],
+        # Resolve a transport name (e.g. "cli", "viewer-chat") to its
+        # live transport instance. Used by the lifecycle handler so it
+        # can push events to whichever streaming transport carried the
+        # active turn. Optional — when ``None`` the lifecycle handler
+        # is skipped.
+        transport_for: Optional[Callable[[str], Any]] = None,
         system_prompt: Optional[str] = None,
         model: Optional[str] = None,
         backend: Optional[BackendSpec] = None,
@@ -116,6 +127,7 @@ class TurnRunner:
         self._cli_transport = cli_transport
         self._turn_did_send_getter = turn_did_send_getter
         self._current_reply_channel_getter = current_reply_channel_getter
+        self._transport_for = transport_for
         # Plan 05 Phase 3: persona system-prompt fragment, rendered
         # once by the daemon factory and threaded into every kernel
         # call via KernelSpec.append_system_prompt. None keeps today's
@@ -289,6 +301,19 @@ class TurnRunner:
             handlers.append(
                 CLITraceHandler(
                     transport=self._cli_transport,
+                    get_channel=self._current_reply_channel_getter,
+                )
+            )
+        # Turn-lifecycle event bridge. No-op when the active channel's
+        # transport doesn't advertise ``caps.lifecycle_events=True``
+        # (Signal, Discord, A2A) — so installing for every turn is
+        # safe. Streaming transports (CLI, viewer-chat) get
+        # ``tool_call_start``, ``text_*``, ``thinking_*``, ``turn_end``
+        # events bridged from the kernel block stream.
+        if self._transport_for is not None:
+            handlers.append(
+                TurnLifecycleHandler(
+                    transport_for=self._transport_for,
                     get_channel=self._current_reply_channel_getter,
                 )
             )

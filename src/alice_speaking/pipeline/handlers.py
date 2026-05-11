@@ -226,4 +226,116 @@ class CLITraceHandler(NullHandler):
         await self._transport.push_trace(ch, evt)
 
 
-__all__ = ["SessionHandler", "CompactionArmer", "CLITraceHandler"]
+class TurnLifecycleHandler(NullHandler):
+    """Bridge kernel block events to per-transport lifecycle broadcasts.
+
+    Emits an additive event vocabulary that complements the existing
+    ``ack`` / ``chunk`` / ``done`` wire so streaming clients (CLI TUI,
+    viewer-chat SSE) can render the in-flight state of a turn —
+    "Alice is thinking…", "Calling Read…", progressive text — instead
+    of staring at a frozen UI for the whole reasoning + tool span.
+
+    Wire vocabulary (per `2026-05-11-turn-lifecycle-and-token-streaming-design`):
+
+    - ``turn_start`` (emitted by ``_dispatch``, not this handler)
+    - ``tool_call_start`` / ``tool_call_end`` — bracket each tool block
+    - ``text_start`` / ``text_chunk`` / ``text_end`` — bracket the
+      assistant's visible text across the whole turn
+    - ``thinking_start`` / ``thinking_chunk`` / ``thinking_end`` —
+      bracket reasoning text across the whole turn
+    - ``turn_end`` — fires after ``on_result``
+
+    The handler is a no-op when the active reply channel's transport
+    doesn't advertise ``caps.lifecycle_events=True`` (Signal, Discord,
+    A2A), so installing unconditionally is safe.
+
+    Note on tool boundaries: ``on_tool_use`` fires when the SDK reports
+    a tool block; the corresponding ``tool_call_end`` is best-effort
+    derived from ``on_user_message`` (the tool-result block lands as a
+    user-message content item) and the next ``on_text`` or
+    ``on_result``. To keep this handler simple we emit
+    ``tool_call_start`` only — the end is implied by the next event
+    after it. A future phase can wire a richer tool-result hook.
+    """
+
+    def __init__(
+        self,
+        *,
+        transport_for: Callable[[str], object],
+        get_channel: Callable[[], object],
+    ) -> None:
+        self._transport_for = transport_for
+        self._get_channel = get_channel
+        self._text_open = False
+        self._thinking_open = False
+
+    def _active_transport(self):
+        """Return the transport for the active channel iff it opts into
+        lifecycle events, else ``None``."""
+        ch = self._get_channel()
+        if ch is None:
+            return None, None
+        transport = self._transport_for(getattr(ch, "transport", None))
+        if transport is None:
+            return None, None
+        caps = getattr(transport, "caps", None)
+        if not getattr(caps, "lifecycle_events", False):
+            return None, None
+        return transport, ch
+
+    async def _push(self, event: dict) -> None:
+        transport, ch = self._active_transport()
+        if transport is None or ch is None:
+            return
+        push = getattr(transport, "push_lifecycle_event", None)
+        if push is None:
+            return
+        try:
+            await push(ch, event)
+        except Exception:  # noqa: BLE001
+            # Don't let a transport hiccup break the kernel loop — the
+            # lifecycle stream is UX gravy, not a correctness contract.
+            log.exception("push_lifecycle_event failed")
+
+    async def on_text(self, text: str) -> None:
+        if not text:
+            return
+        if not self._text_open:
+            self._text_open = True
+            await self._push({"type": "text_start"})
+        await self._push({"type": "text_chunk", "text": text})
+
+    async def on_tool_use(self, name: str, input, id: str) -> None:
+        await self._push(
+            {
+                "type": "tool_call_start",
+                "tool_use_id": id,
+                "name": name,
+                "input": _trim_input(name, input),
+            }
+        )
+
+    async def on_thinking(self, text: str) -> None:
+        if not text:
+            return
+        if not self._thinking_open:
+            self._thinking_open = True
+            await self._push({"type": "thinking_start"})
+        await self._push({"type": "thinking_chunk", "text": text})
+
+    async def on_result(self, summary: TurnSummary) -> None:
+        if self._thinking_open:
+            await self._push({"type": "thinking_end"})
+            self._thinking_open = False
+        if self._text_open:
+            await self._push({"type": "text_end"})
+            self._text_open = False
+        await self._push({"type": "turn_end"})
+
+
+__all__ = [
+    "SessionHandler",
+    "CompactionArmer",
+    "CLITraceHandler",
+    "TurnLifecycleHandler",
+]

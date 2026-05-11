@@ -32,6 +32,21 @@
   // accumulate into one bubble. Reset on each `done` or `error`.
   let inflight = null;
   let inflightBuf = "";
+  // When the lifecycle wire is active, the daemon emits text_chunk
+  // events during kernel.run() AND batched `chunk` events after
+  // transport.send(). They carry the same text — we render lifecycle
+  // (live, granular) and ignore `chunk` to avoid duplication. Detected
+  // on the first text_start / tool_call_start / thinking_start.
+  let lifecycleActive = false;
+  // Transient indicator element (spinner + status line) — shows what
+  // Alice is doing between turn_start and the first visible text.
+  let indicator = null;
+  // Currently-shown tool call. Cleared on tool_call_end or next event.
+  let activeToolCall = null;
+  // Per-turn thinking buffer. Rendered in a collapsible panel under
+  // the assistant bubble. Reset on turn_start.
+  let thinkingBuf = "";
+  let thinkingPanel = null;
 
   function setStatus(text, level) {
     status.textContent = text;
@@ -99,9 +114,82 @@
   function endInflight() {
     inflight = null;
     inflightBuf = "";
+    clearIndicator();
+    activeToolCall = null;
+    thinkingPanel = null;
+    thinkingBuf = "";
+    lifecycleActive = false;
     button.disabled = false;
     input.disabled = false;
     input.focus();
+  }
+
+  // Transient indicator (spinner row) — shown while Alice is working
+  // but no visible text has arrived yet. Replaced by tool-call lines
+  // or removed once text_start fires.
+  function showIndicator(text) {
+    if (log.querySelector(".chat-empty")) {
+      log.innerHTML = "";
+    }
+    if (!indicator) {
+      indicator = document.createElement("div");
+      indicator.className = "chat-indicator muted";
+      log.appendChild(indicator);
+    }
+    indicator.innerHTML =
+      '<span class="chat-indicator-dot"></span>' +
+      '<span class="chat-indicator-text"></span>';
+    indicator.querySelector(".chat-indicator-text").textContent = text;
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function clearIndicator() {
+    if (indicator && indicator.parentNode) {
+      indicator.parentNode.removeChild(indicator);
+    }
+    indicator = null;
+  }
+
+  function setToolCall(name) {
+    activeToolCall = name;
+    showIndicator("calling " + name + "…");
+  }
+
+  function endToolCall() {
+    // Don't clear the indicator outright — keep showing "thinking"
+    // until the next event arrives. Empirically this avoids a
+    // flicker between tool calls.
+    if (activeToolCall) {
+      showIndicator("thinking…");
+      activeToolCall = null;
+    }
+  }
+
+  // Collapsible thinking panel attached to the in-flight bubble. The
+  // panel header summarises ("3 thoughts") and toggles a body with
+  // the full reasoning text. Rendered as muted markdown.
+  function ensureThinkingPanel() {
+    if (thinkingPanel) return thinkingPanel;
+    if (!inflight) startInflight();
+    thinkingPanel = document.createElement("details");
+    thinkingPanel.className = "chat-thinking";
+    const summary = document.createElement("summary");
+    summary.className = "chat-thinking-summary muted";
+    summary.textContent = "thoughts";
+    const body = document.createElement("div");
+    body.className = "chat-thinking-body muted";
+    thinkingPanel.appendChild(summary);
+    thinkingPanel.appendChild(body);
+    inflight.appendChild(thinkingPanel);
+    return thinkingPanel;
+  }
+
+  function appendThinking(text) {
+    ensureThinkingPanel();
+    thinkingBuf += (thinkingBuf ? "\n\n" : "") + text;
+    const body = thinkingPanel.querySelector(".chat-thinking-body");
+    body.innerHTML = renderMarkdown(thinkingBuf);
+    log.scrollTop = log.scrollHeight;
   }
 
   async function loadHistory() {
@@ -134,23 +222,72 @@
       let data;
       try { data = JSON.parse(ev.data); } catch (e) { return; }
       if (!data || !data.type) return;
-      if (data.type === "ack") {
-        // Ack just confirms the daemon got the message. We already
-        // appended the user bubble locally on submit — nothing to do.
-        return;
-      }
-      if (data.type === "chunk") {
-        appendInflight(data.text || "");
-        return;
-      }
-      if (data.type === "done") {
-        endInflight();
-        return;
-      }
-      if (data.type === "error") {
-        appendMessage("error", "error: " + (data.message || "(unspecified)"));
-        endInflight();
-        return;
+      // Wire model for Alice's flow:
+      //   `chunk` events come from `transport.send()` which fires when
+      //   Alice calls the `send_message` MCP tool — that text IS the
+      //   user-visible reply, so it lands in the main bubble.
+      //   `text_chunk` / `thinking_chunk` are lifecycle events for
+      //   the assistant's reasoning between tool calls; they go in
+      //   the collapsible thoughts panel so they don't drown the
+      //   answer. `tool_call_start` drives the transient indicator.
+      switch (data.type) {
+        case "ack":
+        case "turn_start":
+          lifecycleActive = lifecycleActive || data.type === "turn_start";
+          showIndicator("thinking…");
+          return;
+        case "tool_call_start":
+          lifecycleActive = true;
+          // send_message is Alice's "reply" tool, not a worth-showing
+          // tool. The chunks it produces will populate the bubble.
+          if (data.name && data.name.indexOf("send_message") === -1) {
+            setToolCall(data.name);
+          }
+          return;
+        case "tool_call_end":
+          endToolCall();
+          return;
+        case "text_start":
+        case "thinking_start":
+          lifecycleActive = true;
+          ensureThinkingPanel();
+          return;
+        case "text_chunk":
+        case "thinking_chunk":
+          lifecycleActive = true;
+          if (data.text) appendThinking(data.text);
+          // If a tool call was active, the model is now narrating
+          // again — the tool has effectively completed. Revert the
+          // indicator from "calling X…" back to "thinking…".
+          if (activeToolCall) {
+            activeToolCall = null;
+            showIndicator("thinking…");
+          }
+          return;
+        case "text_end":
+        case "thinking_end":
+          return;
+        case "chunk":
+          // The actual reply text. Clear the transient indicator and
+          // accumulate into the main bubble.
+          clearIndicator();
+          activeToolCall = null;
+          appendInflight(data.text || "");
+          return;
+        case "turn_end":
+          // Lifecycle says the kernel turn is done — but final
+          // `chunk` events may still be in flight from the send path.
+          // Just clear transient indicators; let `done` close out.
+          clearIndicator();
+          activeToolCall = null;
+          return;
+        case "done":
+          endInflight();
+          return;
+        case "error":
+          appendMessage("error", "error: " + (data.message || "(unspecified)"));
+          endInflight();
+          return;
       }
     };
     es.addEventListener("error", (ev) => {

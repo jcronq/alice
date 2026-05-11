@@ -107,6 +107,7 @@ VIEWER_CHAT_CAPS = Capabilities(
     typing_indicator=False,
     reactions=False,
     interactive=True,
+    lifecycle_events=True,
 )
 
 
@@ -284,6 +285,17 @@ class ViewerChatTransport:
 
     async def signal_error(self, channel: ChannelRef, message: str) -> None:
         self._broadcast(channel.address, {"type": "error", "message": message})
+
+    async def push_lifecycle_event(self, channel: ChannelRef, event: dict) -> None:
+        """Forward a turn-lifecycle event to viewer-chat subscribers.
+
+        Reuses the existing :meth:`_broadcast` fan-out so lifecycle
+        events ride the same per-channel SSE queue as ``ack`` /
+        ``chunk`` / ``done``. Buffer-on-no-subscriber semantics carry
+        over for free — a brief disconnect during an active turn
+        replays lifecycle events on reconnect just like normal chunks.
+        """
+        self._broadcast(channel.address, event)
 
     # ------------------------------------------------------------------
     # Prompt assembly — reuses CLI templates. Phase 6c of plan 01 puts

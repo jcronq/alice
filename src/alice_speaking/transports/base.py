@@ -99,6 +99,14 @@ class Capabilities:
     typing_indicator: bool
     reactions: bool
     interactive: bool
+    # Streaming lifecycle: when True, the transport implements
+    # ``push_lifecycle_event`` and the daemon installs a
+    # :class:`TurnLifecycleHandler` that bridges kernel block events
+    # (text, tool_use, thinking, result) to the wire as additive
+    # ``{"type":"turn_start"|"tool_call_*"|"text_*"|"thinking_*"|"turn_end"}``
+    # events. Non-streaming transports (Signal, Discord, A2A) leave it
+    # False — the handler short-circuits and the wire stays unchanged.
+    lifecycle_events: bool = False
 
 
 # Concrete capability profiles. SIGNAL_CAPS and DISCORD_CAPS are scaffolding
@@ -114,6 +122,7 @@ CLI_CAPS = Capabilities(
     typing_indicator=False,
     reactions=False,
     interactive=True,
+    lifecycle_events=True,
 )
 
 SIGNAL_CAPS = Capabilities(
@@ -286,6 +295,19 @@ class Transport(Protocol):
         ...
 
     async def typing(self, channel: ChannelRef, on: bool) -> None: ...
+
+    async def push_lifecycle_event(self, channel: ChannelRef, event: dict) -> None:
+        """Forward a lifecycle event to a live client without blocking
+        the kernel. Implementations must be non-blocking (queue
+        ``put_nowait`` or fire-and-forget write); the kernel's async
+        generator should not stall waiting for network I/O.
+
+        Only meaningful when ``caps.lifecycle_events`` is ``True``.
+        Non-streaming transports may leave this as a no-op — the
+        :class:`TurnLifecycleHandler` gates on the capability flag
+        before calling.
+        """
+        ...
 
     def producer(self, ctx: DaemonContext) -> Optional[asyncio.Task]:
         """Schedule a long-running task that pushes events onto

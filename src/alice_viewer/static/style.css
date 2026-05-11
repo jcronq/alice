@@ -1164,3 +1164,36 @@ kbd {
   padding: 0 16px; font-family: var(--mono); font-weight: 600; cursor: pointer;
 }
 .chat-form button:disabled { background: var(--panel-2); color: var(--muted); cursor: not-allowed; }
+
+/* Transient lifecycle indicator: shows "thinking…" / "calling X…"
+   between turn_start and the first text_chunk so the user knows
+   Alice is working. */
+.chat-indicator {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 12px; font-size: 12px;
+  align-self: flex-start; max-width: 720px;
+}
+.chat-indicator-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent); opacity: 0.6;
+  animation: chat-pulse 1.2s ease-in-out infinite;
+}
+@keyframes chat-pulse {
+  0%, 100% { opacity: 0.25; transform: scale(0.85); }
+  50%      { opacity: 0.8;  transform: scale(1.05); }
+}
+.chat-indicator-text { font-style: italic; }
+
+/* Collapsible thinking panel under the assistant bubble. Carries the
+   reasoning text (thinking_chunk events) without crowding the answer. */
+.chat-thinking {
+  margin-top: 8px; padding: 6px 8px;
+  border-left: 2px solid var(--border);
+  font-size: 12px;
+}
+.chat-thinking-summary { cursor: pointer; user-select: none; }
+.chat-thinking-summary:hover { color: var(--text); }
+.chat-thinking[open] .chat-thinking-summary { margin-bottom: 4px; }
+.chat-thinking-body { line-height: 1.4; opacity: 0.85; }
+.chat-thinking-body p:first-child { margin-top: 0; }
+.chat-thinking-body p:last-child { margin-bottom: 0; }
