@@ -258,6 +258,8 @@ class SignalTransport:
         per-source state that used to live in
         ``SpeakingDaemon._signal_producer``.
         """
+        from .base import ChannelRef
+
         async for env in self._signal.receive():
             if not ctx.address_book.is_allowed("signal", env.source):
                 log.info("ignoring envelope from %s", env.source)
@@ -267,7 +269,19 @@ class SignalTransport:
                 continue
             ctx.dedup.mark(env.timestamp)
             sender_name = ctx.address_book.display_name_for("signal", env.source)
-            await self._inbox.put(SignalEvent(envelope=env, sender_name=sender_name))
+            event = SignalEvent(envelope=env, sender_name=sender_name)
+            # Mid-turn context injection: if Alice is currently in a
+            # turn for THIS same Signal channel, divert the message
+            # into her active-turn inbox so the PostToolUse hook can
+            # surface it as additionalContext at the next tool
+            # boundary. ``divert_to_mid_turn`` returns False when no
+            # in-flight turn matches — fall through to the normal
+            # per-transport inbox in that case.
+            channel = ChannelRef(transport="signal", address=env.source, durable=True)
+            divert = getattr(ctx, "divert_to_mid_turn", None)
+            if divert is not None and divert(channel, env.body or "", event):
+                continue
+            await self._inbox.put(event)
 
     async def _consume(self, ctx: DaemonContext) -> None:
         """Drain the inbox in same-sender bursts and run one turn per burst."""

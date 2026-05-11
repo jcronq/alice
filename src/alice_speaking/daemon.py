@@ -259,6 +259,28 @@ class SpeakingDaemon:
         # subagent waiter pushes onto self._queue. Constructed once
         # so the registry can route by event_type; no producer.
         self._background_task_source = BackgroundTaskCompletionSource()
+        # Mid-turn context injection inbox. Keyed by canonical channel
+        # key (``<transport>:<address>``). When a new inbound message
+        # arrives while Alice is mid-turn FOR THAT SAME CHANNEL,
+        # producers divert the message here instead of queueing it as
+        # the next turn. The PostToolUse hook drains the per-channel
+        # list at every tool boundary and injects the messages into
+        # Alice's context as ``additionalContext`` so the next LLM
+        # round sees them.
+        #
+        # Each entry is a tuple ``(text_for_context, original_event)``:
+        # the text is what the hook surfaces; the event is what gets
+        # pushed back onto the per-transport queue at turn-end if the
+        # drain didn't run (e.g., a tool-less turn).
+        self._mid_turn_inbox: dict[str, list[tuple[str, Any]]] = {}
+        # Drain-stopper flag — flipped True by ``_send_message`` when
+        # Alice replies on the inbound channel. Once she's emitted the
+        # user-visible reply, further mid-turn injections would land
+        # context the model can't act on ("here's a follow-up" after
+        # the conversation already rolled). So once replied, producers
+        # stop diverting and the hook stops injecting for this turn.
+        # Reset to False on turn entry.
+        self._current_turn_replied: bool = False
 
         # CLI transport — optional, falls back to no-op if disabled.
         # Constructed here so it shares the daemon's lifecycle and can
@@ -465,6 +487,16 @@ class SpeakingDaemon:
                     HookMatcher(
                         matcher="Task|Agent",
                         hooks=[self._pretooluse_hook],
+                    ),
+                ],
+                # PostToolUse fires after every tool result. We use
+                # it as the "next convenient point" for injecting
+                # mid-turn inbound messages into Alice's context.
+                # Matcher None == match every tool.
+                "PostToolUse": [
+                    HookMatcher(
+                        matcher=None,
+                        hooks=[self._posttooluse_hook],
                     ),
                 ],
             },
@@ -922,6 +954,77 @@ class SpeakingDaemon:
     # ``ctx._emergency_watcher.archive(...)``).
 
     # ------------------------------------------------------------------
+    # Mid-turn context injection — producer-side routing + drain helpers
+
+    @staticmethod
+    def _channel_key(channel: "ChannelRef") -> str:
+        return f"{channel.transport}:{channel.address}"
+
+    def divert_to_mid_turn(
+        self, channel: "ChannelRef", text: str, original_event: Any
+    ) -> bool:
+        """Producer entry point. Returns True when the inbound is
+        diverted into the mid-turn inbox; False when the caller should
+        proceed with normal queueing (start a new turn after the
+        current one finishes).
+
+        Producers (Signal ``_produce``, CLI accept loop, etc.) call
+        this with the inbound's canonical channel + display text +
+        the transport's original event object. The event is what we
+        push back onto the per-transport queue at turn-end if the
+        drain hook didn't fire (so a tool-less turn doesn't black-hole
+        the message).
+        """
+        # No in-flight turn, no channel to inject into.
+        if self._current_reply_channel is None:
+            return False
+        # Once Alice has replied on the channel, the conversation has
+        # logically rolled — drained messages would be acting on a
+        # finished thread. Queue as a new turn instead.
+        if self._current_turn_replied:
+            return False
+        cur_key = self._channel_key(self._current_reply_channel)
+        new_key = self._channel_key(channel)
+        if cur_key != new_key:
+            return False
+        self._mid_turn_inbox.setdefault(cur_key, []).append((text, original_event))
+        self.events.emit(
+            "mid_turn_inbound_diverted",
+            channel=cur_key,
+            text_chars=len(text or ""),
+            pending=len(self._mid_turn_inbox[cur_key]),
+        )
+        return True
+
+    def _flush_mid_turn_inbox(self, channel: "ChannelRef") -> None:
+        """Called at turn-end. Any messages still in the mid-turn inbox
+        for this channel didn't get drained by the PostToolUse hook
+        (probably a tool-less turn) — push them back into normal
+        circulation so they become the next turn's prompt.
+
+        The original transport events are stashed in the inbox tuples
+        for exactly this purpose; each transport knows how to handle
+        its own event type via the registry.
+        """
+        key = self._channel_key(channel)
+        pending = self._mid_turn_inbox.pop(key, [])
+        if not pending:
+            return
+        for _text, event in pending:
+            try:
+                self._queue.put_nowait(event)
+            except asyncio.QueueFull:
+                log.warning(
+                    "mid_turn flush: queue full; dropping message on %s",
+                    key,
+                )
+        self.events.emit(
+            "mid_turn_inbox_flushed",
+            channel=key,
+            message_count=len(pending),
+        )
+
+    # ------------------------------------------------------------------
     # Native Task interception via PreToolUse hook
     #
     # The SDK's ``can_use_tool`` permission callback only fires when
@@ -998,6 +1101,64 @@ class SpeakingDaemon:
                     f"finishes. Wrap up briefly and end this turn — "
                     f"don't wait."
                 ),
+            }
+        }
+
+    async def _posttooluse_hook(
+        self,
+        input_data: dict[str, Any],
+        tool_use_id: Optional[str],
+        context: Any,
+    ) -> dict[str, Any]:
+        """Drain the mid-turn inbox for the current channel and inject
+        pending user messages as ``additionalContext`` for the next
+        LLM round.
+
+        Fires after every tool result. Most of the time the inbox is
+        empty and we return ``{}`` (no-op). When there's pending
+        inbound (a same-channel message arrived while Alice was
+        working), the next round of the model sees a synthesised user
+        block describing what showed up.
+
+        Stops draining once Alice has replied on the channel for this
+        turn (``_current_turn_replied`` set by ``_send_message``).
+        Drained-but-too-late messages would land in context that the
+        model can't act on; better to let them queue as the next turn
+        from the user's POV. (Alice's design call.)
+        """
+        if self._current_reply_channel is None:
+            return {}
+        if self._current_turn_replied:
+            return {}
+        key = self._channel_key(self._current_reply_channel)
+        pending = self._mid_turn_inbox.pop(key, [])
+        if not pending:
+            return {}
+
+        principal = self._current_principal_display_name or "the user"
+        if len(pending) == 1:
+            header = (
+                f"--- {principal} sent a follow-up message while you "
+                "were working on this turn ---"
+            )
+        else:
+            header = (
+                f"--- {principal} sent {len(pending)} follow-up messages "
+                "while you were working on this turn ---"
+            )
+        body_lines = [f"{principal}: {text}" for text, _evt in pending]
+        additional_context = "\n".join([header, *body_lines])
+
+        self.events.emit(
+            "mid_turn_context_injected",
+            channel=key,
+            message_count=len(pending),
+            chars=len(additional_context),
+        )
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": additional_context,
             }
         }
 
@@ -1193,6 +1354,12 @@ class SpeakingDaemon:
         )
         self._turn_last_outbound = text
         self._turn_did_send = True
+        # Drain-stopper for mid-turn injection. Once the user-visible
+        # reply has landed, further mid-turn injections would surface
+        # context the model can't act on (conversation has rolled).
+        # Producers stop diverting and the PostToolUse hook stops
+        # draining once this flips. Reset to False on turn entry.
+        self._current_turn_replied = True
 
     # ------------------------------------------------------------------
     # Unified outbound dispatch — Phase 6a of plan 01 lifted the

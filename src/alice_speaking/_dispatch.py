@@ -108,6 +108,10 @@ async def handle_signal(ctx: DaemonContext, batch: list["SignalEvent"]) -> None:
     channel = ChannelRef(transport="signal", address=source, durable=True)
     ctx._current_reply_channel = channel
     ctx._current_principal_display_name = sender_name
+    # Reset the drain-stopper for this turn — Alice hasn't replied
+    # yet, so mid-turn injection is open. Flips True once she fires
+    # send_message; reset here for the NEXT turn's allow-window.
+    ctx._current_turn_replied = False
     # Replies to inbound bypass quiet hours — the user expects an
     # answer when they ask something, regardless of the clock. Typing
     # indicator fires too so they see Alice working.
@@ -144,6 +148,11 @@ async def handle_signal(ctx: DaemonContext, batch: list["SignalEvent"]) -> None:
                 )
             )
     finally:
+        # Drain any messages that arrived for this channel mid-turn
+        # but didn't get injected (tool-less turn). They go back onto
+        # the dispatcher queue so they become the next turn's prompt.
+        with contextlib.suppress(Exception):
+            ctx._flush_mid_turn_inbox(channel)
         ctx._current_turn_kind = prev_kind
         ctx._current_reply_channel = prev_channel
         ctx._current_principal_display_name = prev_display_name
