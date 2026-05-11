@@ -45,7 +45,6 @@ from typing import Any, Awaitable, Callable, Optional
 
 from alice_core.config.model import BackendSpec
 from alice_core.kernel import KernelSpec, NullHandler, make_kernel
-from alice_core.kernel.types import CanUseToolHook
 from alice_core.sdk_compat import (
     looks_like_missing_session as _looks_like_missing_session,
 )
@@ -104,7 +103,6 @@ class TurnRunner:
         pi_send_message: Optional[Callable[[dict], Awaitable[dict]]] = None,
         skills_cwd: Optional[pathlib.Path] = None,
         mind_dir: Optional[pathlib.Path] = None,
-        can_use_tool: Optional[CanUseToolHook] = None,
         hooks: Optional[dict] = None,
     ) -> None:
         self._cfg = cfg
@@ -143,12 +141,6 @@ class TurnRunner:
         # that reference absolute paths or that the agent may need
         # to read for general operation.
         self._mind_dir = mind_dir
-        # Tool-permission callback — fires before every tool call,
-        # but ONLY when the CLI sends a permission request (which
-        # doesn't happen for built-in tools in default permission
-        # mode). Kept for API completeness; the daemon uses ``hooks``
-        # below for the actual Task interception.
-        self._can_use_tool = can_use_tool
         # PreToolUse / PostToolUse / etc. hooks. alice_speaking uses
         # a PreToolUse matcher on ``Task|Agent`` to intercept the
         # SDK's built-in sub-agent tool and detach work into asyncio
@@ -255,7 +247,6 @@ class TurnRunner:
             # AnthropicKernel — see _thinking_to_sdk_dict.
             thinking="medium",
             append_system_prompt=self._system_prompt,
-            can_use_tool=self._can_use_tool,
             hooks=self._hooks,
         )
 

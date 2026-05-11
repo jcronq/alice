@@ -477,11 +477,10 @@ class SpeakingDaemon:
             # SDK doesn't run the blocking built-in) and dispatch the
             # sub-agent into asyncio background work instead. The
             # deny reason becomes the model-visible tool result.
-            #
-            # Hooks chosen over can_use_tool because the latter only
-            # fires when the CLI sends a permission request, which
-            # doesn't happen for built-in tools in default permission
-            # mode — observed empirically on the b06d2f1 deploy.
+            # (PreToolUse rather than the SDK's can_use_tool callback,
+            # which only fires when the CLI sends a permission request
+            # — built-in tools in default mode never do — observed
+            # empirically on the b06d2f1 deploy.)
             hooks={
                 "PreToolUse": [
                     HookMatcher(

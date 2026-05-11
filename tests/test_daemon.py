@@ -430,8 +430,8 @@ def test_resume_failure_clears_and_retries(cfg, monkeypatch) -> None:
     calls: list[dict] = []
 
     async def first_call_fails_then_succeeds(*, prompt, options: Any):
-        # See _drain_prompt — kernel uses streaming-mode prompt when
-        # can_use_tool is wired.
+        # See _drain_prompt — handles both bare-string and (legacy)
+        # streaming-mode prompts so the assertion site stays stable.
         prompt_str = await _drain_prompt(prompt)
         calls.append({"prompt": prompt_str, "resume": getattr(options, "resume", None)})
         # First call (resume=stale) raises. Second call (no resume) succeeds.
@@ -505,12 +505,10 @@ def test_preamble_consumed_on_next_turn(cfg, monkeypatch) -> None:
         ]
 
     async def fake_query(*, prompt, options: Any):
-        # The kernel now uses streaming-mode prompts when can_use_tool
-        # is set on the spec (the daemon wires _intercept_task as
-        # can_use_tool unconditionally), so prompt arrives as an
-        # AsyncIterable yielding {"type":"user","message":{"content":...}}
-        # rather than the bare string. Drain the first message to
-        # recover the prompt text for assertion.
+        # ``prompt`` arrives as a plain string (kernel passes
+        # ``query(prompt=str, ...)`` directly). _drain_prompt also
+        # accepts the legacy streaming-mode shape as a defensive
+        # fallback so the assertion site doesn't care.
         captured["prompt"] = await _drain_prompt(prompt)
         for m in msgs():
             yield m
@@ -530,8 +528,9 @@ def test_preamble_consumed_on_next_turn(cfg, monkeypatch) -> None:
 
 
 async def _drain_prompt(prompt) -> str:
-    """Extract the user-message content from a streaming-mode prompt
-    (or pass through a bare string when can_use_tool isn't wired)."""
+    """Extract the user-message content from a prompt arg. Accepts a
+    bare string (current kernel behaviour) or a streaming-mode
+    AsyncIterable (legacy shape kept for defensiveness)."""
     if isinstance(prompt, str):
         return prompt
     async for entry in prompt:

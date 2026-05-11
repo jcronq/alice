@@ -88,6 +88,29 @@ _PI_TOOL_NAME_MAP: dict[str, Optional[str]] = {
 }
 
 
+# KernelSpec fields PiKernel cannot honor (Anthropic-SDK-only) and
+# silently drops at argv-construction time. Listed here so the
+# preflight check in :meth:`PiKernel.run` can warn the operator
+# whenever a caller actually populates one — masking these on the
+# pi backend is exactly the trap that hid the ``run_experiment``
+# MCP-tool wiring bug from us for days. New Anthropic-only fields
+# added to :class:`KernelSpec` should be appended here.
+_PI_UNSUPPORTED_SPEC_FIELDS: tuple[str, ...] = ("mcp_servers", "hooks")
+
+
+def _summarize_dropped_value(value: Any) -> str:
+    """Cheap, log-safe summary of a dropped field's value.
+
+    Goal is "enough to identify what the operator passed" without
+    dumping a 50KB hook table or an MCP server config into the event
+    log. Collections report their length; everything else reports its
+    type name.
+    """
+    if isinstance(value, (dict, list, tuple, set)):
+        return f"{type(value).__name__}(len={len(value)})"
+    return type(value).__name__
+
+
 def _translate_tools(allowed: list[str]) -> list[str]:
     """Translate Claude tool names to pi names. Unknown names pass
     through lowercased so custom/extension tools (which the
@@ -133,12 +156,40 @@ class PiKernel:
             fields.setdefault("turn_id", self.correlation_id)
         self.emitter.emit(event, **fields)
 
+    def _warn_unsupported_fields(self, spec: KernelSpec) -> None:
+        """Emit ``pi_spec_field_dropped`` once per Anthropic-only field
+        the caller populated.
+
+        PiKernel silently ignores fields like ``mcp_servers`` and
+        ``hooks`` because pi has no equivalent — but "silently" is
+        the trap. The ``run_experiment`` MCP tool was wired into
+        ``mcp_servers``, PiKernel ignored it, no signal surfaced, and
+        thinking failed to call the tool for days. One event per
+        populated drop-field gives the next victim something to grep
+        for. See also :data:`_PI_UNSUPPORTED_SPEC_FIELDS`.
+        """
+        for field_name in _PI_UNSUPPORTED_SPEC_FIELDS:
+            value = getattr(spec, field_name, None)
+            if value is None or value == {} or value == [] or value == ():
+                continue
+            self._emit(
+                "pi_spec_field_dropped",
+                field=field_name,
+                value_summary=_summarize_dropped_value(value),
+            )
+
     async def run(
         self,
         prompt: str,
         spec: KernelSpec,
         handlers: Optional[list[BlockHandler]] = None,
     ) -> KernelResult:
+        # Warn loudly about KernelSpec fields PiKernel cannot honor.
+        # Must fire BEFORE argv translation (and before the model
+        # registry stage) so an operator who passed e.g. an MCP tool
+        # config sees the drop event even if a subsequent stage
+        # raises.
+        self._warn_unsupported_fields(spec)
         # Stage the alice-managed pi model registry before pi reads
         # ``~/.pi/agent/models.json``. Idempotent + fail-soft — never
         # blocks the run, just emits a warning event on failure.
@@ -216,8 +267,12 @@ class PiKernel:
         # default to whole-filesystem read access from the user
         # account, so skill bodies referencing absolute paths
         # (e.g. ~/alice-mind/...) still resolve via Read/Bash.
-        # mcp_servers (Anthropic-only): also silently ignored — pi
-        # has no built-in MCP. Documented in the spike report.
+        # mcp_servers + hooks (Anthropic-only): also dropped, but
+        # NOT silently — PiKernel.run emits one
+        # ``pi_spec_field_dropped`` event per populated field so the
+        # operator notices the trap (see
+        # :meth:`_warn_unsupported_fields` and
+        # :data:`_PI_UNSUPPORTED_SPEC_FIELDS`).
         return argv
 
 

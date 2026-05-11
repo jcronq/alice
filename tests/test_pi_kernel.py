@@ -281,6 +281,144 @@ def test_pi_kernel_argv_maps_send_message_mcp_tool_to_extension() -> None:
     assert ext.endswith("alice_pi/extensions/send-message.js")
 
 
+@pytest.mark.asyncio
+async def test_pi_kernel_emits_drop_event_for_mcp_servers(fake_pi_env) -> None:
+    """KernelSpec.mcp_servers is Anthropic-only — pi has no MCP
+    client. PiKernel must surface a ``pi_spec_field_dropped`` event
+    when a caller actually populates it, so the next operator who
+    wires an MCP tool into pi notices the drop instead of hunting a
+    silent failure for days."""
+    fake_pi_env(
+        [
+            '{"type":"session","version":3,"id":"s","cwd":"/tmp"}',
+            '{"type":"agent_end","messages":[]}',
+        ]
+    )
+    cap = CapturingEmitter()
+    kernel = PiKernel(cap, correlation_id="t-drop")
+
+    await kernel.run(
+        "hi",
+        KernelSpec(
+            model="gpt-5.3-codex",
+            mcp_servers={"alice": {"command": "node", "args": ["server.js"]}},
+        ),
+    )
+
+    drops = [e for e in cap.events if e["event"] == "pi_spec_field_dropped"]
+    assert len(drops) == 1
+    assert drops[0]["field"] == "mcp_servers"
+    # Summary identifies the value shape without dumping the whole
+    # config — collection types report length.
+    assert drops[0]["value_summary"] == "dict(len=1)"
+    # Correlation id threads through like every other PiKernel event.
+    assert drops[0]["turn_id"] == "t-drop"
+
+
+@pytest.mark.asyncio
+async def test_pi_kernel_emits_drop_event_for_hooks(fake_pi_env) -> None:
+    fake_pi_env(
+        [
+            '{"type":"session","version":3,"id":"s","cwd":"/tmp"}',
+            '{"type":"agent_end","messages":[]}',
+        ]
+    )
+    cap = CapturingEmitter()
+    kernel = PiKernel(cap)
+
+    await kernel.run(
+        "hi",
+        KernelSpec(
+            model="gpt-5.3-codex",
+            hooks={"PreToolUse": [object(), object()]},
+        ),
+    )
+
+    drops = [e for e in cap.events if e["event"] == "pi_spec_field_dropped"]
+    assert len(drops) == 1
+    assert drops[0]["field"] == "hooks"
+    assert drops[0]["value_summary"] == "dict(len=1)"
+
+
+@pytest.mark.asyncio
+async def test_pi_kernel_emits_one_drop_event_per_populated_field(
+    fake_pi_env,
+) -> None:
+    """Both Anthropic-only fields populated → one event per field,
+    not a merged event. Lets ``grep pi_spec_field_dropped`` give the
+    operator a per-field hit count."""
+    fake_pi_env(
+        [
+            '{"type":"session","version":3,"id":"s","cwd":"/tmp"}',
+            '{"type":"agent_end","messages":[]}',
+        ]
+    )
+    cap = CapturingEmitter()
+    kernel = PiKernel(cap)
+
+    await kernel.run(
+        "hi",
+        KernelSpec(
+            model="gpt-5.3-codex",
+            mcp_servers={"alice": {}},
+            hooks={"PreToolUse": []},
+        ),
+    )
+
+    dropped_fields = sorted(
+        e["field"] for e in cap.events if e["event"] == "pi_spec_field_dropped"
+    )
+    assert dropped_fields == ["hooks", "mcp_servers"]
+
+
+@pytest.mark.asyncio
+async def test_pi_kernel_does_not_warn_for_none_or_empty_fields(
+    fake_pi_env,
+) -> None:
+    """Empty / None values aren't actually being dropped — the
+    operator never set them. Don't spam the event log."""
+    fake_pi_env(
+        [
+            '{"type":"session","version":3,"id":"s","cwd":"/tmp"}',
+            '{"type":"agent_end","messages":[]}',
+        ]
+    )
+    cap = CapturingEmitter()
+    kernel = PiKernel(cap)
+
+    # All defaults — nothing populated.
+    await kernel.run("hi", KernelSpec(model="gpt-5.3-codex"))
+    # Empty containers — populated but no content.
+    await kernel.run(
+        "hi",
+        KernelSpec(model="gpt-5.3-codex", mcp_servers={}, hooks={}),
+    )
+
+    drops = [e for e in cap.events if e["event"] == "pi_spec_field_dropped"]
+    assert drops == []
+
+
+@pytest.mark.asyncio
+async def test_pi_kernel_silent_suppresses_drop_event(fake_pi_env) -> None:
+    """Silent kernels (used for internal bootstrap/compaction turns)
+    swallow every emit — including the drop warning. The next public
+    turn re-runs the check with full event visibility."""
+    fake_pi_env(
+        [
+            '{"type":"session","version":3,"id":"s","cwd":"/tmp"}',
+            '{"type":"agent_end","messages":[]}',
+        ]
+    )
+    cap = CapturingEmitter()
+    kernel = PiKernel(cap, silent=True)
+
+    await kernel.run(
+        "hi",
+        KernelSpec(model="gpt-5.3-codex", mcp_servers={"alice": {}}),
+    )
+    assert cap.events == []
+
+
 def test_pi_kernel_argv_drops_tools_without_pi_equivalent() -> None:
     """WebFetch and WebSearch have no pi built-in; they drop
     silently. If the operator's allowlist is ALL drops, --tools is
