@@ -201,7 +201,7 @@ services:
       # slot; on the next blue/green swap, this will need to flip to
       # the new slot (TODO: dynamic network alias or alice-deploy
       # script that rewrites it at swap time).
-      ALICE_VIEWER_CHAT_DAEMON_HOST: "${ALICE_VIEWER_CHAT_DAEMON_HOST:-alice-worker-green}"
+      ALICE_VIEWER_CHAT_DAEMON_HOST: "${ALICE_VIEWER_CHAT_DAEMON_HOST:-alice-worker-blue}"
       ALICE_VIEWER_CHAT_DAEMON_PORT: "${ALICE_VIEWER_CHAT_DAEMON_PORT:-8182}"
       TZ: "${ALICE_TZ:-America/New_York}"
     volumes:
