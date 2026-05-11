@@ -112,6 +112,9 @@
   }
 
   function endInflight() {
+    if (thinkingPanel) {
+      thinkingPanel.open = false;
+    }
     inflight = null;
     inflightBuf = "";
     clearIndicator();
@@ -173,6 +176,9 @@
     if (!inflight) startInflight();
     thinkingPanel = document.createElement("details");
     thinkingPanel.className = "chat-thinking";
+    // Open during the turn so the user sees reasoning stream live.
+    // Collapsed back to a clickable summary by endInflight().
+    thinkingPanel.open = true;
     const summary = document.createElement("summary");
     summary.className = "chat-thinking-summary muted";
     summary.textContent = "thoughts";
