@@ -16,7 +16,7 @@ the chosen phase from the snapshot — but that's caller territory;
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from ..base import WakeContext, _NullPostRun
 from ...phase import Phase, PhaseConfig
@@ -37,6 +37,11 @@ class SleepMode(_NullPostRun):
     the sub-stage choice into :func:`select_phase`; callers that need
     B/C/D dispatch should consume the phase directly via
     :class:`PhaseRunner`.
+
+    ``mcp_servers`` mirrors :class:`ActiveMode` — wake.py builds the
+    thinking-side MCP server once and threads the dict through both
+    mode constructors so ``run_experiment`` is reachable from any
+    real phase.
     """
 
     name = "sleep"
@@ -46,9 +51,12 @@ class SleepMode(_NullPostRun):
         runner: Optional[PhaseRunner] = None,
         config: Optional[PhaseConfig] = None,
         phase: Phase = Phase.SLEEP_B,
+        *,
+        mcp_servers: Optional[dict[str, Any]] = None,
     ) -> None:
         self._runner = runner or PhaseRunner(config=config)
         self._phase = phase
+        self._mcp_servers = mcp_servers
 
     @property
     def phase(self) -> Phase:
@@ -64,7 +72,9 @@ class SleepMode(_NullPostRun):
         return self._phase.value
 
     def kernel_spec(self, ctx: WakeContext) -> "KernelSpec":
-        return self._runner.kernel_spec(self._phase, ctx)
+        return self._runner.kernel_spec(
+            self._phase, ctx, mcp_servers=self._mcp_servers
+        )
 
     async def build_prompt(self, ctx: WakeContext) -> str:
         return self._runner.build_prompt(self._phase, ctx)

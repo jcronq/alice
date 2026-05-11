@@ -73,6 +73,12 @@ __all__ = [
 # Claude-style (matching ``WakeContext.tools``); PiKernel's
 # ``_PI_TOOL_NAME_MAP`` translates them to pi-native names
 # downstream.
+#
+# ``mcp__alice__run_experiment`` (2026-05-11): thinking-only tool that
+# dispatches a sandboxed claude-CLI subagent. Wired in here so the
+# kernel allowlist routes it through; the MCP server itself is
+# composed in ``wake.py`` (it needs the emitter + auth from the wake
+# context) and threaded onto the ``KernelSpec.mcp_servers`` field.
 _FULL_TOOL_ALLOWLIST: tuple[str, ...] = (
     "Bash",
     "Read",
@@ -83,6 +89,7 @@ _FULL_TOOL_ALLOWLIST: tuple[str, ...] = (
     "WebFetch",
     "WebSearch",
     "mcp__alice__send_message",
+    "mcp__alice__run_experiment",
 )
 
 
@@ -205,7 +212,13 @@ class PhaseRunner:
             phase, timestamp_header=header, injected_content=injected_content
         )
 
-    def kernel_spec(self, phase: Phase, ctx: "WakeContext") -> KernelSpec:
+    def kernel_spec(
+        self,
+        phase: Phase,
+        ctx: "WakeContext",
+        *,
+        mcp_servers: Optional[dict[str, Any]] = None,
+    ) -> KernelSpec:
         """Build a :class:`KernelSpec` for this phase + context.
 
         Tool allowlist + ``max_seconds`` resolve in this precedence
@@ -220,6 +233,10 @@ class PhaseRunner:
         Quick mode short-circuits to its own (tools=[],
         max_seconds=30) so smoke-test wakes don't accidentally pick
         up the full allowlist.
+
+        ``mcp_servers`` threads the thinking-side MCP server (built by
+        :mod:`alice_thinking.tools`) into the spec. Quick mode skips
+        MCP so smoke-test wakes stay minimal.
         """
         if phase == Phase.QUICK or ctx.quick:
             return KernelSpec(
@@ -240,6 +257,7 @@ class PhaseRunner:
             max_seconds=self._resolve_max_seconds(ctx),
             thinking="medium",
             append_system_prompt=ctx.system_prompt or None,
+            mcp_servers=mcp_servers,
         )
 
     def _resolve_tools(self, phase: Phase, ctx: "WakeContext") -> list[str]:
@@ -272,12 +290,18 @@ class PhaseRunner:
         ctx: "WakeContext",
         *,
         injected_content: Optional[str] = None,
+        mcp_servers: Optional[dict[str, Any]] = None,
     ) -> tuple[str, KernelSpec]:
-        """Return ``(prompt_text, KernelSpec)`` for this phase + context."""
+        """Return ``(prompt_text, KernelSpec)`` for this phase + context.
+
+        ``mcp_servers`` lets the wake-side glue inject thinking's
+        per-wake MCP server (carrying the dispatch-time emitter + auth).
+        Passed through to :meth:`kernel_spec`.
+        """
         prompt_text = self.build_prompt(
             phase, ctx, injected_content=injected_content
         )
-        spec = self.kernel_spec(phase, ctx)
+        spec = self.kernel_spec(phase, ctx, mcp_servers=mcp_servers)
         return prompt_text, spec
 
     # ------------------------------------------------------------------ #

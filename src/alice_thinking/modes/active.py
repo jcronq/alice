@@ -10,7 +10,7 @@ forwards to :class:`PhaseRunner` with :attr:`Phase.ACTIVE`.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from alice_core.kernel import KernelSpec
 
@@ -28,6 +28,11 @@ class ActiveMode(_NullPostRun):
 
     Delegates to :class:`PhaseRunner` — both methods compose the
     same prompt + spec the runner produces for :attr:`Phase.ACTIVE`.
+
+    ``mcp_servers`` (optional) is threaded onto the KernelSpec for
+    every wake driven by this mode. wake.py builds the thinking-side
+    MCP server (``mcp__alice__run_experiment`` et al.) once per wake
+    and hands the dict in here.
     """
 
     name = "active"
@@ -36,11 +41,16 @@ class ActiveMode(_NullPostRun):
         self,
         runner: Optional[PhaseRunner] = None,
         config: Optional[PhaseConfig] = None,
+        *,
+        mcp_servers: Optional[dict[str, Any]] = None,
     ) -> None:
         self._runner = runner or PhaseRunner(config=config)
+        self._mcp_servers = mcp_servers
 
     def kernel_spec(self, ctx: WakeContext) -> KernelSpec:
-        return self._runner.kernel_spec(Phase.ACTIVE, ctx)
+        return self._runner.kernel_spec(
+            Phase.ACTIVE, ctx, mcp_servers=self._mcp_servers
+        )
 
     async def build_prompt(self, ctx: WakeContext) -> str:
         return self._runner.build_prompt(Phase.ACTIVE, ctx)

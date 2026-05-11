@@ -23,11 +23,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import pathlib
 import sys
 import time
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from alice_core.config.auth import ensure_auth_env
 from alice_core.config.model import load as load_model_config
@@ -626,14 +627,57 @@ def main() -> int:
         return rc
 
     runner = PhaseRunner(config=phase_cfg)
+
+    # Build the thinking-side MCP server (today: run_experiment only).
+    # Quick wakes skip MCP entirely so the smoke test stays minimal.
+    # See ``alice_thinking.tools.build`` for the server composition.
+    mcp_servers: dict[str, Any] | None
+    if args.quick:
+        mcp_servers = None
+    else:
+        from alice_thinking.tools import build as build_thinking_tools
+
+        # ``anthropic_api_key_subagent`` is the spec'd config knob for
+        # the subagent's scoped auth. Falls back to the speaking-side
+        # anthropic_api_key if the dedicated key is unset (and warns —
+        # the operator should set the dedicated key for production).
+        try:
+            blob = json.loads(
+                (mind / "config" / "alice.config.json").read_text()
+            )
+        except (OSError, json.JSONDecodeError):
+            blob = {}
+        think_block = (blob or {}).get("thinking") or {}
+        subagent_key = (
+            think_block.get("anthropic_api_key_subagent")
+            or os.environ.get("ANTHROPIC_API_KEY_SUBAGENT")
+            or os.environ.get("ANTHROPIC_API_KEY")
+            or ""
+        )
+        subagent_base_url = (
+            think_block.get("anthropic_base_url_subagent")
+            or os.environ.get("ANTHROPIC_BASE_URL_SUBAGENT")
+            or os.environ.get("ANTHROPIC_BASE_URL")
+            or ""
+        )
+        mcp_servers, _allowed = build_thinking_tools(
+            emitter=emitter,
+            api_key=subagent_key or None,
+            api_base_url=subagent_base_url or None,
+        )
+
     if phase == Phase.ACTIVE:
-        mode_obj = ActiveMode(runner=runner)
+        mode_obj = ActiveMode(runner=runner, mcp_servers=mcp_servers)
     elif phase in (Phase.SLEEP_B, Phase.SLEEP_C, Phase.SLEEP_D):
-        mode_obj = SleepMode(runner=runner, phase=phase)
+        mode_obj = SleepMode(
+            runner=runner, phase=phase, mcp_servers=mcp_servers
+        )
     else:
         # QUICK / DESIGN_COMMISSION fall back to the active wrapper —
         # the runner handles ``ctx.quick`` / inline_prompt internally.
-        mode_obj = ActiveMode(runner=runner)
+        # MCP servers are still threaded so a design-commission wake
+        # can dispatch experiments if needed (today: rare).
+        mode_obj = ActiveMode(runner=runner, mcp_servers=mcp_servers)
 
     # ``vault`` is still computed for backoff (existing contract) —
     # build_vault_snapshot doesn't replace VaultState's frontmatter

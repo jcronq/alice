@@ -136,6 +136,9 @@ _FULL_SET = {
     "WebFetch",
     "WebSearch",
     "mcp__alice__send_message",
+    # Added 2026-05-11 — thinking-side async experiment dispatch tool.
+    # The MCP server is composed in wake.py and threaded onto KernelSpec.
+    "mcp__alice__run_experiment",
 }
 
 
