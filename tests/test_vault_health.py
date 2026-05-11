@@ -23,6 +23,7 @@ import pytest
 
 from alice_metrics.vault_health import (
     build_vault_health_event,
+    compute_decay_coverage,
     count_broken_wikilinks,
     count_inbound_links,
     count_orphans,
@@ -1167,6 +1168,7 @@ REQUIRED_EVENT_FIELDS = {
     "wake_type_distribution",
     "recovery_state",
     "research_decay_count",
+    "decay_coverage",
 }
 
 
@@ -1290,3 +1292,303 @@ def test_cli_append_requires_thoughts_and_events(tmp_path: Path) -> None:
     vault = _make_vault(tmp_path)
     with pytest.raises(SystemExit):
         vault_health_main(["--vault", str(vault), "--append"])
+
+
+# ---------------------------------------------------------------------------
+# Decay coverage (Layer 1 blind-spot detection)
+# Design: [[2026-05-10-decay-blind-spot-detection-design]]
+# Pool: notes that were access_count == 0 and age >= 5 at activation.
+# Coverage: fraction of pool with last_accessed >= window_floor.
+# ---------------------------------------------------------------------------
+
+
+_TODAY = datetime(2026, 5, 10)
+_ACTIVATION = "2026-05-06"
+
+
+def test_decay_coverage_empty_pool_returns_one_hundred(tmp_path: Path) -> None:
+    """No qualifying notes → vacuous 100% coverage (nothing to rescue)."""
+    vault = _make_vault(tmp_path)
+    result = compute_decay_coverage(vault, today=_TODAY, activation_date=_ACTIVATION)
+    assert result["total_decayed_notes"] == 0
+    assert result["decayed_accessed_in_window"] == 0
+    assert result["decay_coverage_pct"] == 100.0
+    assert result["activation_date"] == _ACTIVATION
+    assert result["window_days"] == 7
+    assert result["by_domain"] == {}
+
+
+def test_decay_coverage_all_decayed_returns_zero(tmp_path: Path) -> None:
+    """Every pool note still untouched → 0% coverage."""
+    vault = _make_vault(tmp_path)
+    for name in ("a", "b", "c"):
+        _write(
+            vault / "research" / f"{name}.md",
+            f"""
+            ---
+            slug: {name}
+            created: 2026-04-25
+            access_count: 0
+            domain: fitness
+            ---
+            Body.
+            """,
+        )
+    result = compute_decay_coverage(vault, today=_TODAY, activation_date=_ACTIVATION)
+    assert result["total_decayed_notes"] == 3
+    assert result["decayed_accessed_in_window"] == 0
+    assert result["decay_coverage_pct"] == 0.0
+    assert result["by_domain"]["fitness"] == {
+        "decayed": 3,
+        "accessed": 0,
+        "coverage_pct": 0.0,
+    }
+
+
+def test_decay_coverage_partial_access(tmp_path: Path) -> None:
+    """Two of four pool notes touched post-activation → 50% coverage.
+
+    The accessed notes are still in the pool — that's the whole point:
+    pool membership is determined at activation, coverage measures what
+    fraction has since been recovered.
+    """
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "untouched-1.md",
+        """
+        ---
+        slug: untouched-1
+        created: 2026-04-25
+        access_count: 0
+        domain: fitness
+        ---
+        """,
+    )
+    _write(
+        vault / "research" / "untouched-2.md",
+        """
+        ---
+        slug: untouched-2
+        created: 2026-04-25
+        access_count: 0
+        domain: fitness
+        ---
+        """,
+    )
+    _write(
+        vault / "research" / "rescued-1.md",
+        """
+        ---
+        slug: rescued-1
+        created: 2026-04-25
+        access_count: 1
+        last_accessed: 2026-05-08
+        domain: fitness
+        ---
+        """,
+    )
+    _write(
+        vault / "research" / "rescued-2.md",
+        """
+        ---
+        slug: rescued-2
+        created: 2026-04-25
+        access_count: 2
+        last_accessed: 2026-05-09
+        domain: alice-architecture
+        ---
+        """,
+    )
+
+    result = compute_decay_coverage(vault, today=_TODAY, activation_date=_ACTIVATION)
+    assert result["total_decayed_notes"] == 4
+    assert result["decayed_accessed_in_window"] == 2
+    assert result["decay_coverage_pct"] == 50.0
+    assert result["by_domain"]["fitness"]["decayed"] == 3
+    assert result["by_domain"]["fitness"]["accessed"] == 1
+    assert result["by_domain"]["alice-architecture"]["accessed"] == 1
+
+
+def test_decay_coverage_activation_boundary_respected(tmp_path: Path) -> None:
+    """A note created on activation-day is too young — not in pool.
+
+    With activation 2026-05-06 and cutoff_days=5, the age cutoff is
+    2026-05-01. A note created 2026-05-06 is post-activation and didn't
+    sit in a decayed state.
+    """
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "young.md",
+        """
+        ---
+        slug: young
+        created: 2026-05-06
+        access_count: 0
+        ---
+        """,
+    )
+    _write(
+        vault / "research" / "borderline.md",
+        """
+        ---
+        slug: borderline
+        created: 2026-05-02
+        access_count: 0
+        ---
+        """,
+    )
+    _write(
+        vault / "research" / "ancient.md",
+        """
+        ---
+        slug: ancient
+        created: 2026-04-01
+        access_count: 0
+        ---
+        """,
+    )
+    result = compute_decay_coverage(vault, today=_TODAY, activation_date=_ACTIVATION)
+    # Only `ancient.md` qualifies (created <= 2026-05-01).
+    assert result["total_decayed_notes"] == 1
+
+
+def test_decay_coverage_excludes_pre_activation_access(tmp_path: Path) -> None:
+    """A note with access_count > 0 whose last_accessed predates activation
+    was already in active circulation — not a decay case."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "active.md",
+        """
+        ---
+        slug: active
+        created: 2026-03-01
+        access_count: 5
+        last_accessed: 2026-04-15
+        ---
+        """,
+    )
+    result = compute_decay_coverage(vault, today=_TODAY, activation_date=_ACTIVATION)
+    assert result["total_decayed_notes"] == 0
+
+
+def test_decay_coverage_excludes_dailies_and_archive(tmp_path: Path) -> None:
+    """Activity logs and cold storage are not part of the retrievable pool."""
+    vault = _make_vault(tmp_path)
+    (vault / "archive").mkdir()
+    for folder in ("dailies", "archive"):
+        _write(
+            vault / folder / "old.md",
+            """
+            ---
+            slug: old
+            created: 2026-04-01
+            access_count: 0
+            ---
+            """,
+        )
+    _write(
+        vault / "research" / "real.md",
+        """
+        ---
+        slug: real
+        created: 2026-04-01
+        access_count: 0
+        ---
+        """,
+    )
+    result = compute_decay_coverage(vault, today=_TODAY, activation_date=_ACTIVATION)
+    assert result["total_decayed_notes"] == 1
+    assert "dailies" not in result["by_domain"]
+    assert "archive" not in result["by_domain"]
+
+
+def test_decay_coverage_window_floor_caps_at_activation(tmp_path: Path) -> None:
+    """In week 1, today - window_days predates activation. The activation
+    date must floor the window so pre-cue ``last_accessed`` values don't
+    leak into the accessed count."""
+    vault = _make_vault(tmp_path)
+    # last_accessed 2026-05-04 is within 7 days of 2026-05-10 BUT predates
+    # activation 2026-05-06 — must NOT count as accessed-in-window.
+    _write(
+        vault / "research" / "pre-cue-touch.md",
+        """
+        ---
+        slug: pre-cue-touch
+        created: 2026-04-15
+        access_count: 1
+        last_accessed: 2026-05-04
+        ---
+        """,
+    )
+    result = compute_decay_coverage(
+        vault, today=_TODAY, activation_date=_ACTIVATION, window_days=7
+    )
+    # Note isn't even in the pool: last_accessed < activation means it
+    # was active pre-cue. Pool is empty.
+    assert result["total_decayed_notes"] == 0
+
+
+def test_decay_coverage_domain_fallback_to_folder(tmp_path: Path) -> None:
+    """Notes without a ``domain:`` frontmatter bucket under their folder."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "no-domain.md",
+        """
+        ---
+        slug: no-domain
+        created: 2026-04-01
+        access_count: 0
+        ---
+        """,
+    )
+    result = compute_decay_coverage(vault, today=_TODAY, activation_date=_ACTIVATION)
+    assert "research" in result["by_domain"]
+    assert result["by_domain"]["research"]["decayed"] == 1
+
+
+def test_decay_coverage_window_days_parameter(tmp_path: Path) -> None:
+    """A larger window includes accesses that a smaller window misses."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "rescued-yesterday.md",
+        """
+        ---
+        slug: rescued-yesterday
+        created: 2026-04-01
+        access_count: 1
+        last_accessed: 2026-05-09
+        ---
+        """,
+    )
+    # 1-day window covers 2026-05-09 only (today-1) given _TODAY = 2026-05-10.
+    # With activation floor in play, that's still inside the floor.
+    r1 = compute_decay_coverage(
+        vault, today=_TODAY, activation_date=_ACTIVATION, window_days=1
+    )
+    assert r1["decayed_accessed_in_window"] == 1
+    # 0-day window: today - 0 = today (2026-05-10); 2026-05-09 falls
+    # outside → coverage 0 even though pool has 1 entry.
+    r0 = compute_decay_coverage(
+        vault, today=_TODAY, activation_date=_ACTIVATION, window_days=0
+    )
+    assert r0["total_decayed_notes"] == 1
+    assert r0["decayed_accessed_in_window"] == 0
+    assert r0["decay_coverage_pct"] == 0.0
+
+
+def test_decay_coverage_missing_access_count_skipped(tmp_path: Path) -> None:
+    """Notes without an ``access_count:`` field can't be classified —
+    skip them so we don't inflate either the pool or the coverage count."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "no-count.md",
+        """
+        ---
+        slug: no-count
+        created: 2026-04-01
+        ---
+        Body without access_count.
+        """,
+    )
+    result = compute_decay_coverage(vault, today=_TODAY, activation_date=_ACTIVATION)
+    assert result["total_decayed_notes"] == 0
