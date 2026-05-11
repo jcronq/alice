@@ -695,6 +695,9 @@ def main() -> int:
     # can compare outputs against the live writes. Shadow telemetry is
     # tagged ``stage_b_shadow_*`` so the viewer can filter it from real
     # ``stage_b_*`` events.
+    #
+    # (Stage D post-wake invariant hook is wired below in the try/finally
+    # around ``run_wake``; see :func:`alice_thinking.wake_hooks.post_stage_d_invariant_check`.)
     if (
         not args.quick
         and shadow_enabled
@@ -723,15 +726,30 @@ def main() -> int:
             )
             # Shadow failures must NEVER take down the live wake.
 
-    rc = asyncio.run(
-        run_wake(
-            ctx=ctx,
-            mode=mode_obj,
-            emitter=emitter,
-            backend=thinking_spec,
-            phase=phase.value,
+    try:
+        rc = asyncio.run(
+            run_wake(
+                ctx=ctx,
+                mode=mode_obj,
+                emitter=emitter,
+                backend=thinking_spec,
+                phase=phase.value,
+            )
         )
-    )
+    finally:
+        # Stage D post-wake invariant hook — ALWAYS fires on SLEEP_D,
+        # even if the wake body raised. Closes the "LLM forgot to call
+        # the invariant check" loophole that PR #40's prompt-only
+        # instruction left open. Audit-report mode: scan + per-note
+        # events + single surface; never mutates the vault. Errors
+        # inside the hook are absorbed (see ``wake_hooks`` module).
+        from .wake_hooks import post_stage_d_invariant_check
+
+        post_stage_d_invariant_check(
+            mind=mind,
+            emitter=emitter,
+            phase=phase,
+        )
 
     # Sleep-mode exponential backoff: write the next wake-to-wake
     # interval for the s6 supervisor. Skipped for --quick (a smoke

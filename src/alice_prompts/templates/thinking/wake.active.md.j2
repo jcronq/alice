@@ -252,7 +252,7 @@ Cross-note synthesis, when vault is stable + time_phase is late (03:00–07:00) 
 
    **Null-result short-circuit.** If you concluded "no connection" after honest looking, skip the judge gate entirely — write the 2-sentence null-result note directly and append a `null` synthesis line to today's pairs log (`inner/state/stage-d-pairs-$(date +%Y-%m-%d).jsonl`). That's data, not failure. The judge gate is for actual synthesis attempts only.
 
-5. **Commit the synthesis through the deterministic gate.** One call. It runs both judges, appends per-attempt JSONL lines to `~/alice-mind/inner/state/stage-d-attempts.jsonl`, writes the vault note (only on ship or judge-failure fallback), updates the attempt line with the shipped slug, logs any judge-dispatch failure to `~/alice-mind/inner/state/stage-d-judge-failures.jsonl`, and appends today's pairs-log entry. There is NO way to skip parts of this — that's the point.
+5. **Commit the synthesis through the deterministic gate.** One call. It runs both judges, appends per-attempt JSONL lines to `~/alice-mind/inner/state/stage-d-attempts.jsonl`, writes the vault note (only on ship or judge-failure fallback), updates the attempt line with the shipped slug, logs any judge-dispatch failure to `~/alice-mind/inner/state/stage-d-judge-failures.jsonl`, and appends today's pairs-log entry. There is NO way to skip parts of this — that's the point. The post-wake invariant scan is now wired into `wake.py` itself (always runs on SLEEP_D, see step 5 of close-clean below), so a hand-written or otherwise gate-bypassing note will surface on the next wake regardless of whether you remember to scan.
 
    ```bash
    python3 -c "
@@ -368,18 +368,7 @@ Threshold: you'd pass up good sleep to share this. Otherwise it's a thought, not
 
 Append a few more lines to your step-1 thought file summarizing what you actually did.
 
-**Stage D wakes only — invariant check.** Run the Stage D commit invariant before pruning. It flags any `source: stage-d` note in `cortex-memory/research/` that has no matching attempts.jsonl ship line and no matching judge-failures.jsonl fallback line — i.e. any synthesis that bypassed `commit_stage_d_synthesis`. The structural gate prevents that going forward, but this is the suspenders that catches a regression or a hand-written end-run. If the list is non-empty, file a surface so the gap is visible at morning review:
-
-```bash
-python3 -c "
-from alice_thinking.stage_d_invariant import find_unaudited_stage_d_notes
-import datetime, json
-bad = find_unaudited_stage_d_notes(date=datetime.date.today())
-print(json.dumps(bad, indent=2))
-"
-```
-
-If `bad` is non-empty, write a single `inner/surface/<today>-stage-d-invariant.md` with the list — one item per unaudited note, including `note_a` and `note_b`. Do NOT delete or rewrite the offending notes; the surface is for Jason/me to review and decide. The invariant check itself only reads the vault.
+**Stage D wakes only — invariant check (automatic, no action required).** `wake.py` now runs `find_unaudited_stage_d_notes` over the full vault in a `finally` block around every Stage D wake (success or error). It emits one `stage_d_invariant_violation` event per unaudited note and writes a single `inner/surface/<YYYY-MM-DD-HHMMSS>-stage-d-invariant.md` listing every violation; empty scans emit `stage_d_invariant_clean`. You no longer need to invoke the scan or write the surface — the kernel does it deterministically. If you happen to notice a violation in this wake's events, you can review the surface alongside other speaking-bound items, but do NOT delete or rewrite the offending notes — that's Jason's call.
 
 **Stage C wakes only:** if any op changed a file (work was done), update the wake file's `did_work:` field from `false` to `true` using Edit. This is how the stage-selection algorithm knows the vault had real work in this wake vs a null pass.
 
