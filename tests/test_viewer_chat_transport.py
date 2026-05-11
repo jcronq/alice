@@ -16,10 +16,8 @@ via httpx ASGITransport so tests don't bind a real port.
 from __future__ import annotations
 
 import asyncio
-import json
 
 import httpx
-import pytest
 
 from alice_speaking.transports.base import (
     ChannelRef,
