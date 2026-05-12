@@ -791,11 +791,121 @@ def _canvas_source_dirs(
 
     ``canvas`` (authored) is first so a hand-authored slug wins over
     an auto-promoted experiment card if they happen to collide.
+
+    Research notes are picked up by a separate path (``_list_research_papers``
+    / ``_find_research_paper``) because we only want the ones explicitly
+    flagged with ``canvas_paper: true`` in frontmatter — scanning every
+    research note on every render would be wasteful and noisy.
     """
     out: list[tuple[str, pathlib.Path]] = [("canvas", _canvas_dir(inner))]
     if mind_dir is not None:
         out.append(("experiment", _experiment_card_dir(mind_dir)))
     return out
+
+
+def _research_dir(mind_dir: pathlib.Path) -> pathlib.Path:
+    return mind_dir / "cortex-memory" / "research"
+
+
+def _list_research_papers(
+    mind_dir: pathlib.Path,
+    skip_slugs: set[str],
+) -> list[dict[str, Any]]:
+    """Scan ``cortex-memory/research/`` for notes carrying
+    ``canvas_paper: true`` in frontmatter. Returns the same entry shape
+    as ``list_canvases``. ``skip_slugs`` is the set of slugs already
+    claimed by the canvas/experiment scans — those win on collision.
+    """
+    rdir = _research_dir(mind_dir)
+    if not rdir.is_dir():
+        return []
+    out: list[dict[str, Any]] = []
+    for path in rdir.glob("*.md"):
+        slug = path.stem
+        if not _CANVAS_SLUG_RE.match(slug):
+            continue
+        if slug in skip_slugs:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fm = _parse_frontmatter(text)
+        if not fm:
+            continue
+        # ``canvas_paper: true`` (or ``True``); strip whitespace.
+        flag = (fm.get("canvas_paper") or "").strip().lower()
+        if flag not in ("true", "yes", "1"):
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        title = fm.get("title", "").strip() or slug
+        # Override with first H1 if present (matches behaviour of the
+        # canvas + experiment scans).
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("# "):
+                title = stripped[2:].strip()
+                break
+            if stripped.startswith("---") or stripped == "":
+                continue
+        out.append(
+            {
+                "slug": slug,
+                "title": title,
+                "mtime": stat.st_mtime,
+                "size": stat.st_size,
+                "path": str(path),
+                "source": "research",
+            }
+        )
+    return out
+
+
+def _find_research_paper(
+    mind_dir: pathlib.Path, slug: str
+) -> dict[str, Any] | None:
+    """Look up a single flagged research paper by slug. Mirrors
+    ``read_canvas`` but only returns notes that explicitly opted in
+    via ``canvas_paper: true``."""
+    rdir = _research_dir(mind_dir)
+    path = rdir / f"{slug}.md"
+    try:
+        path_resolved = path.resolve()
+        rdir_resolved = rdir.resolve()
+    except OSError:
+        return None
+    if not str(path_resolved).startswith(str(rdir_resolved) + "/"):
+        return None
+    if not path_resolved.is_file():
+        return None
+    text = path_resolved.read_text(encoding="utf-8")
+    fm = _parse_frontmatter(text)
+    if not fm:
+        return None
+    flag = (fm.get("canvas_paper") or "").strip().lower()
+    if flag not in ("true", "yes", "1"):
+        return None
+    body = text
+    title = slug
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end != -1:
+            body = text[end + 5 :]
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            title = stripped[2:].strip()
+            break
+    return {
+        "slug": slug,
+        "title": title,
+        "body": body,
+        "path": str(path_resolved),
+        "source": "research",
+    }
 
 
 def list_canvases(
@@ -849,6 +959,11 @@ def list_canvases(
                     "source": source_label,
                 }
             )
+    # Research notes flagged ``canvas_paper: true`` join the index too.
+    # Skip slugs already claimed by the canvas/experiment dirs — same
+    # collision rule (canvas wins over experiment wins over research).
+    if mind_dir is not None:
+        out.extend(_list_research_papers(mind_dir, skip_slugs=seen_slugs))
     out.sort(key=lambda d: d["mtime"], reverse=True)
     return out
 
@@ -898,6 +1013,12 @@ def read_canvas(
             "path": str(path),
             "source": source_label,
         }
+    # Fall through to flagged research notes — only those that opted in
+    # via ``canvas_paper: true``. Unflagged research notes return None
+    # even if their slug matches, so this path can't be abused to read
+    # arbitrary vault content.
+    if mind_dir is not None:
+        return _find_research_paper(mind_dir, slug)
     return None
 
 

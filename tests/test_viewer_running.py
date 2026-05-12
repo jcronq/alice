@@ -308,3 +308,97 @@ def test_read_canvas_without_mind_dir_only_scans_inner(tmp_path):
     (exp_dir / "exp-invisible.md").write_text("# Invisible\n")
     out = sources.read_canvas(p.inner, "exp-invisible")  # no mind_dir
     assert out is None
+
+
+# ---------------------------------------------------------------------------
+# Research-paper bypass path (canvas_paper: true in frontmatter)
+
+
+def _make_research(p, slug: str, body: str) -> None:
+    rdir = p.mind_dir / "cortex-memory" / "research"
+    rdir.mkdir(parents=True, exist_ok=True)
+    (rdir / f"{slug}.md").write_text(body)
+
+
+def test_list_canvases_includes_flagged_research(tmp_path):
+    p = _paths(tmp_path)
+    _make_research(
+        p,
+        "2026-05-11-flagged",
+        "---\ncanvas_paper: true\n---\n# Flagged\nbody\n",
+    )
+    out = sources.list_canvases(p.inner, p.mind_dir)
+    rows = [c for c in out if c["source"] == "research"]
+    assert len(rows) == 1
+    assert rows[0]["slug"] == "2026-05-11-flagged"
+    assert rows[0]["title"] == "Flagged"
+
+
+def test_list_canvases_excludes_unflagged_research(tmp_path):
+    p = _paths(tmp_path)
+    _make_research(p, "2026-05-11-noisy", "---\ntitle: Hidden\n---\n# Hidden\n")
+    _make_research(p, "2026-05-11-noflag", "# No frontmatter\nbody\n")
+    out = sources.list_canvases(p.inner, p.mind_dir)
+    assert [c for c in out if c["source"] == "research"] == []
+
+
+def test_list_canvases_research_flag_variants(tmp_path):
+    """Accept ``true`` / ``yes`` / ``1`` (case-insensitively) as truthy;
+    reject everything else. Slug regex is lowercase-only by separate
+    constraint (see _CANVAS_SLUG_RE), so the truthy cases all use
+    lowercase slugs."""
+    p = _paths(tmp_path)
+    for slug, value in [
+        ("rp-true", "true"),
+        ("rp-yes", "yes"),
+        ("rp-one", "1"),
+        ("rp-true-caps", "True"),  # value case-insensitive
+    ]:
+        _make_research(p, slug, f"---\ncanvas_paper: {value}\n---\n# {slug}\n")
+    for slug, value in [
+        ("rp-false", "false"),
+        ("rp-no", "no"),
+        ("rp-nope", "nope"),
+    ]:
+        _make_research(p, slug, f"---\ncanvas_paper: {value}\n---\n# {slug}\n")
+    out = sources.list_canvases(p.inner, p.mind_dir)
+    research_slugs = {c["slug"] for c in out if c["source"] == "research"}
+    assert research_slugs == {"rp-true", "rp-yes", "rp-one", "rp-true-caps"}
+
+
+def test_read_canvas_finds_flagged_research_paper(tmp_path):
+    p = _paths(tmp_path)
+    _make_research(
+        p,
+        "2026-05-11-readable-paper",
+        "---\ncanvas_paper: true\n---\n# Paper\nbody body\n",
+    )
+    out = sources.read_canvas(p.inner, "2026-05-11-readable-paper", p.mind_dir)
+    assert out is not None
+    assert out["source"] == "research"
+    assert out["title"] == "Paper"
+    assert "body body" in out["body"]
+
+
+def test_read_canvas_rejects_unflagged_research_paper(tmp_path):
+    """An unflagged research note must NOT be readable via /canvas/<slug>
+    even if the slug matches — path-traversal-style protection so the
+    canvas pane can't be used to read arbitrary vault content."""
+    p = _paths(tmp_path)
+    _make_research(p, "2026-05-11-private", "---\ntitle: Private\n---\n# X\n")
+    out = sources.read_canvas(p.inner, "2026-05-11-private", p.mind_dir)
+    assert out is None
+
+
+def test_canvas_wins_over_research_on_slug_collision(tmp_path):
+    """Same precedence rule as the canvas/experiment collision."""
+    p = _paths(tmp_path)
+    (p.inner / "canvas").mkdir(parents=True)
+    (p.inner / "canvas" / "shared.md").write_text("# Canvas wins\n")
+    _make_research(
+        p, "shared", "---\ncanvas_paper: true\n---\n# Research loses\n"
+    )
+    out = sources.list_canvases(p.inner, p.mind_dir)
+    rows = [c for c in out if c["slug"] == "shared"]
+    assert len(rows) == 1
+    assert rows[0]["source"] == "canvas"
