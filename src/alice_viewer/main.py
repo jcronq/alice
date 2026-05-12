@@ -176,7 +176,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         """
         p: Paths = app.state.paths
         events = sources.load_all(p)
-        runs = aggregators.group_runs(events)
+        runs = aggregators.group_runs(events, paths=p)
         if hemisphere:
             runs = [r for r in runs if r.hemisphere == hemisphere]
         total = len(runs)
@@ -208,7 +208,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         sentinel scrolls into view."""
         p: Paths = app.state.paths
         events = sources.load_all(p)
-        runs = aggregators.group_runs(events)
+        runs = aggregators.group_runs(events, paths=p)
         if hemisphere:
             runs = [r for r in runs if r.hemisphere == hemisphere]
         page = runs[offset : offset + limit]
@@ -230,7 +230,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         """Return one run + its event trace as JSON for the timeline modal."""
         p: Paths = app.state.paths
         events = sources.load_all(p)
-        runs = aggregators.group_runs(events)
+        runs = aggregators.group_runs(events, paths=p)
         match = next((r for r in runs if r.run_id == run_id), None)
         if match is None:
             return JSONResponse({"error": "not found"}, status_code=404)
@@ -247,7 +247,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         live refresh; also handy for ad-hoc inspection via curl."""
         p: Paths = app.state.paths
         events = sources.load_all(p)
-        runs = aggregators.group_runs(events)
+        runs = aggregators.group_runs(events, paths=p)
         if hemisphere:
             runs = [r for r in runs if r.hemisphere == hemisphere]
         return JSONResponse([r.to_dict() for r in runs[:limit]])

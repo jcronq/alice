@@ -6,6 +6,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import sources as _sources
+from .settings import Paths
 from .sources import UnifiedEvent
 
 
@@ -134,7 +136,9 @@ class Run:
         }
 
 
-def group_runs(events: list[UnifiedEvent]) -> list[Run]:
+def group_runs(
+    events: list[UnifiedEvent], paths: Paths | None = None
+) -> list[Run]:
     """Build a unified, newest-first list of Runs.
 
     Each thinking Wake and each speaking Turn becomes one Run. Click-
@@ -144,6 +148,11 @@ def group_runs(events: list[UnifiedEvent]) -> list[Run]:
     For ended thinking wakes, prefers the cached Haiku-generated single-
     sentence summary; on cache miss, kicks off background generation
     and returns a fallback this iteration.
+
+    When ``paths`` is provided, finished SM-dispatcher spawns under
+    ``<state>/sm-dispatcher-spawns/.finished/`` are also included so a
+    completed worker run shows up on history (#116). Live spawns belong
+    on /running, not here.
     """
     # Lazy import — keeps the aggregator pure (testable without the
     # viewer's run_summary side effects).
@@ -197,6 +206,38 @@ def group_runs(events: list[UnifiedEvent]) -> list[Run]:
                 events=list(t.events),
             )
         )
+    if paths is not None:
+        for fs in _sources._history_sm_spawns(
+            paths.state_dir / "sm-dispatcher-spawns"
+        ):
+            duration_ms = max(0, int((fs.ended_at - fs.started_at) * 1000))
+            if fs.outcome_hint:
+                summary = f"{fs.art_label} · {fs.outcome_hint[:140]}"
+            else:
+                summary = fs.art_label
+            runs.append(
+                Run(
+                    run_id=fs.spawn_id,
+                    kind="sm_spawn",
+                    hemisphere="sm",
+                    start_ts=fs.started_at,
+                    end_ts=fs.ended_at,
+                    status="ended",
+                    summary=summary,
+                    duration_ms=duration_ms,
+                    cost_usd=None,
+                    model=None,
+                    tools=[],
+                    sender_name=f"#{fs.issue_number}",
+                    inbound=None,
+                    outbound=None,
+                    error=None,
+                    detail_url=(
+                        f"https://github.com/jcronq/alice/issues/{fs.issue_number}"
+                    ),
+                    events=[],
+                )
+            )
     runs.sort(key=lambda r: r.start_ts, reverse=True)
     return runs
 

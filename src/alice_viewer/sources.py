@@ -2236,6 +2236,10 @@ def _open_experiments(
 # spawns into ``.finished/``; the running tab only ever needs the live
 # (top-level) entries.
 _SM_SPAWN_NAME_RE = re.compile(r"^spawn-(\d+)-(\d+)$")
+# Finished dirs may have a ``.<n>`` collision-dedup suffix appended by
+# ``count_running_spawns`` when two spawns for the same issue at the
+# same unix-second land in ``.finished/`` back-to-back.
+_SM_SPAWN_FINISHED_NAME_RE = re.compile(r"^spawn-(\d+)-(\d+)(?:\.\d+)?$")
 _SM_SPAWN_ART_RE = re.compile(r"^Artifact type:\s*(art:\S+)", re.MULTILINE)
 
 
@@ -2343,6 +2347,90 @@ def _open_sm_spawns(
                 },
             )
         )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Finished SM-dispatcher spawns (the timeline / history view)
+#
+# Once a spawn's process exits, ``count_running_spawns`` reaps its dir
+# into ``<spawn_dir>/.finished/<spawn_id>/``. The finished history is
+# whatever's currently in that subtree — we don't try to reconstruct
+# state for spawn dirs that were cleaned up further.
+
+
+@dataclass
+class FinishedSmSpawn:
+    """One reaped SM-dispatcher spawn — the historical analogue of the
+    live ``RunningJob(kind="sm_spawn")``. Surfaced on the timeline /
+    history view so finished SM runs are visible after the worker exits.
+    """
+
+    spawn_id: str
+    issue_number: int
+    art_label: str
+    started_at: float  # unix ts parsed from the spawn dir name
+    ended_at: float  # mtime of the reaped dir (close enough to exit ts)
+    outcome_hint: str  # last non-blank line of stdout.log, or ""
+    spawn_dir: str  # absolute path, for debug
+
+
+def _history_sm_spawns(
+    spawn_dir: pathlib.Path,
+) -> list[FinishedSmSpawn]:
+    """Walk ``<spawn_dir>/.finished/spawn-*/`` and return one record per
+    reaped spawn, sorted newest-mtime first.
+
+    Active (live) spawns live one level up under ``<spawn_dir>/spawn-*/``
+    and are intentionally excluded — those belong on /running, not in
+    history. Dirs whose name doesn't match the spawn naming convention
+    are skipped silently (defensive: foreign files in ``.finished/``
+    shouldn't poison the listing).
+
+    A missing or unparseable ``prompt.txt`` is non-fatal: the row is
+    still included with ``art_label="art:unknown"``. The dispatcher
+    writes ``prompt.txt`` before launching ``claude``, so its absence
+    here is rare but possible (crash during launch, manual cleanup).
+    """
+    finished_root = spawn_dir / ".finished"
+    if not finished_root.is_dir():
+        return []
+    out: list[FinishedSmSpawn] = []
+    for child in finished_root.iterdir():
+        if not child.is_dir():
+            continue
+        m = _SM_SPAWN_FINISHED_NAME_RE.match(child.name)
+        if not m:
+            continue
+        issue_number = int(m.group(1))
+        started_at = float(m.group(2))
+        try:
+            ended_at = child.stat().st_mtime
+        except OSError:
+            continue
+        art_label = "art:unknown"
+        prompt_path = child / "prompt.txt"
+        if prompt_path.is_file():
+            try:
+                text = prompt_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+            am = _SM_SPAWN_ART_RE.search(text)
+            if am:
+                art_label = am.group(1)
+        outcome_hint = _read_last_line(child / "stdout.log")
+        out.append(
+            FinishedSmSpawn(
+                spawn_id=child.name,
+                issue_number=issue_number,
+                art_label=art_label,
+                started_at=started_at,
+                ended_at=ended_at,
+                outcome_hint=outcome_hint,
+                spawn_dir=str(child),
+            )
+        )
+    out.sort(key=lambda r: r.ended_at, reverse=True)
     return out
 
 

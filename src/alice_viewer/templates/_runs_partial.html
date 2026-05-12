@@ -6,11 +6,13 @@
   {% set fam = 'tool' if r.kind == 'thinking-wake' else
                 ('emergency' if r.kind == 'emergency-turn' else
                 ('artifact' if r.kind == 'surface-turn' else
-                ('meta' if r.kind == 'compaction-turn' else 'turn'))) %}
+                ('sm' if r.kind == 'sm_spawn' else
+                ('meta' if r.kind == 'compaction-turn' else 'turn')))) %}
   {% set status_class = 'status-' + r.status %}
   {% set short_model = r.model | replace('claude-', '') | replace('-', '.') if r.model else '' %}
   <div class="run hemi-{{ r.hemisphere }} kind-{{ r.kind }} {{ status_class }}{% if r.is_running %} running{% endif %}"
-       data-run-id="{{ r.run_id }}">
+       data-run-id="{{ r.run_id }}"
+       {% if r.kind == 'sm_spawn' %}data-external-url="{{ r.detail_url }}"{% endif %}>
     <span class="ts">
       {{ r.start_ts | localtime }}
       {% if r.end_ts %}<br><span class="muted">{{ r.start_ts | ago }}</span>{% endif %}
@@ -19,7 +21,8 @@
       <span class="kind-chip fam-{{ fam }}">{{ r.kind }}</span>
     </span>
     <span class="who">
-      {% if r.sender_name %}{{ r.sender_name }}
+      {% if r.kind == 'sm_spawn' %}<a href="{{ r.detail_url }}" target="_blank" rel="noopener">{{ r.sender_name }}</a>
+      {% elif r.sender_name %}{{ r.sender_name }}
       {% elif short_model %}<span class="muted">{{ short_model }}</span>
       {% else %}<span class="muted">—</span>{% endif %}
     </span>

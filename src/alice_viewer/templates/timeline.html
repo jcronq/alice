@@ -15,6 +15,7 @@
     <span><span class="sw" style="background:var(--accent)"></span>signal-turn</span>
     <span><span class="sw" style="background:var(--accent-3)"></span>surface-turn</span>
     <span><span class="sw" style="background:var(--warn)"></span>emergency-turn</span>
+    <span><span class="sw" style="background:#8e3b3b"></span>sm_spawn</span>
     <span><span class="sw" style="background:var(--err)"></span>error / timeout</span>
   </div>
 
@@ -54,6 +55,13 @@
     .run:hover .summary { color: var(--accent); }
     .run.hemi-thinking { border-left-color: var(--accent-2); }
     .run.hemi-speaking { border-left-color: var(--accent); }
+    .run.hemi-sm { border-left-color: #8e3b3b; }
+    .run.kind-sm_spawn .kind-chip {
+      background: #8e3b3b; color: #ffe8e8;
+      padding: 2px 6px; border-radius: 3px;
+      font-family: var(--mono, monospace); font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.05em;
+    }
     .run.kind-emergency-turn { background: #2f1414; border-left-color: var(--warn); }
     .run.status-errored { border-left-color: var(--err); }
     .run.status-timeout { border-left-color: var(--err); }
@@ -152,6 +160,14 @@
         if (e.target.tagName === 'A') return;
         const row = e.target.closest('.run');
         if (!row) return;
+        // SM-dispatcher spawn rows have no captured event trace —
+        // route the click to the linked GH issue instead of opening
+        // an empty modal.
+        const externalUrl = row.getAttribute('data-external-url');
+        if (externalUrl) {
+          window.open(externalUrl, '_blank', 'noopener');
+          return;
+        }
         const id = row.getAttribute('data-run-id');
         if (!id) return;
         await window.openRunModal(id);
