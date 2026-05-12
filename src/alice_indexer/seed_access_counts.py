@@ -1,46 +1,17 @@
 #!/usr/bin/env python3
-"""One-time seed: copy ``access_count`` from vault frontmatter into the
-``note_metrics`` table in ``cortex-index.db``.
+"""One-time seed for note_metrics.access_count from existing frontmatter.
 
-Why this exists
----------------
+Walks every note in the vault (~/alice-mind/cortex-memory/), parses the
+``access_count: N`` value out of each frontmatter, and writes N into the
+``note_metrics.access_count`` row keyed by slug.
 
-The cortex-index indexer treats ``note_metrics`` as Class B operational
-telemetry and resets it on every rebuild (each row inserted with
-``access_count = 0``). Historical access counts live only in the
-markdown frontmatter (``access_count: N``). Until the cue runner
-started writing through to the DB (see
-``cortex-memory/research/2026-05-11-note-metrics-data-pipeline-design.md``
-and the companion critical-finding note), the DB column was
-permanently zero for every note — neutralising every retrieval boost
-that uses access frequency.
+Idempotency contract: SET, not INCREMENT. Re-running the seed against an
+already-seeded vault is a no-op — each note's row ends up at exactly the
+frontmatter value, regardless of how many times the script has run.
 
-This script reconciles the DB against the frontmatter, restoring the
-accumulated signal in one pass. After running it, the cue runner's
-per-query increment keeps both stores in step.
-
-Behaviour
----------
-
-For each row in ``notes`` (slug → relative path), the script reads the
-vault file's frontmatter, extracts ``access_count`` (defaulting to 0
-when absent), and writes that value into
-``note_metrics.access_count`` for the matching slug. The script SETs
-rather than increments, so it is idempotent: rerunning against an
-already-seeded DB produces the same result.
-
-Usage
------
-
-::
-
-    python3 -m alice_indexer.seed_access_counts            # default paths
-    python3 -m alice_indexer.seed_access_counts --db PATH
-    python3 -m alice_indexer.seed_access_counts --vault PATH --db PATH
-    python3 -m alice_indexer.seed_access_counts --dry-run  # report only
-
-The console entry ``alice-seed-access-counts`` wires the same ``main``
-into ``pyproject.toml``.
+When to run: once, at deploy of PR #90 (the cue-runner SQLite-write
+change). Not part of regular maintenance — after the seed, the cue
+runner keeps the column live on its own.
 """
 
 from __future__ import annotations
