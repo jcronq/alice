@@ -217,7 +217,11 @@ def test_id_dedup_first_occurrence_records_and_falls_through(
 
     log_path = _dedup_log(watcher)
     assert log_path.is_file()
-    lines = [json.loads(l) for l in log_path.read_text().splitlines() if l.strip()]
+    lines = [
+        json.loads(line)
+        for line in log_path.read_text().splitlines()
+        if line.strip()
+    ]
     assert len(lines) == 1
     assert lines[0]["key"] == "issue-dispatch-alice-115|2026-05-12"
     assert lines[0]["filename"] == path.name
