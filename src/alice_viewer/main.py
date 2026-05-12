@@ -689,7 +689,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
     @app.get("/canvas", response_class=HTMLResponse)
     async def canvas_index(request: Request):
         p: Paths = app.state.paths
-        canvases = sources.list_canvases(p.inner)
+        canvases = sources.list_canvases(p.inner, p.mind_dir)
         return templates.TemplateResponse(
             request,
             "canvas_index.html",
@@ -703,7 +703,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
     @app.get("/canvas/{slug}", response_class=HTMLResponse)
     async def canvas_view(request: Request, slug: str):
         p: Paths = app.state.paths
-        canvas = sources.read_canvas(p.inner, slug)
+        canvas = sources.read_canvas(p.inner, slug, p.mind_dir)
         if canvas is None:
             return HTMLResponse(
                 f"<h1>canvas not found: {slug}</h1>"
@@ -743,6 +743,26 @@ def create_app(paths: Paths | None = None) -> FastAPI:
                 "active": "activity",
             },
         )
+
+    @app.get("/running", response_class=HTMLResponse)
+    async def running_view(request: Request):
+        p: Paths = app.state.paths
+        jobs = sources.list_running_jobs(p)
+        return templates.TemplateResponse(
+            request,
+            "running.html",
+            {
+                "jobs": [j.to_dict() for j in jobs],
+                "state": _state_context(),
+                "active": "running",
+            },
+        )
+
+    @app.get("/api/running")
+    async def api_running() -> JSONResponse:
+        p: Paths = app.state.paths
+        jobs = sources.list_running_jobs(p)
+        return JSONResponse([j.to_dict() for j in jobs])
 
     # ------------------------------------------------------------------
     # JSON APIs (fuel for d3)

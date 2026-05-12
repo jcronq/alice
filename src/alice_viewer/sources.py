@@ -677,77 +677,125 @@ def _canvas_dir(inner: pathlib.Path) -> pathlib.Path:
     return inner / "canvas"
 
 
-def list_canvases(inner: pathlib.Path) -> list[dict[str, Any]]:
+def _experiment_card_dir(mind_dir: pathlib.Path) -> pathlib.Path:
+    return mind_dir / "cortex-memory" / "experiments"
+
+
+def _canvas_source_dirs(
+    inner: pathlib.Path, mind_dir: pathlib.Path | None
+) -> list[tuple[str, pathlib.Path]]:
+    """Ordered list of ``(source_label, dir)`` for canvas scanning.
+
+    ``canvas`` (authored) is first so a hand-authored slug wins over
+    an auto-promoted experiment card if they happen to collide.
+    """
+    out: list[tuple[str, pathlib.Path]] = [("canvas", _canvas_dir(inner))]
+    if mind_dir is not None:
+        out.append(("experiment", _experiment_card_dir(mind_dir)))
+    return out
+
+
+def list_canvases(
+    inner: pathlib.Path,
+    mind_dir: pathlib.Path | None = None,
+) -> list[dict[str, Any]]:
     """Return canvas index entries sorted by mtime descending.
 
-    Each entry: {slug, title, mtime, size, path}. Title is parsed
-    from the first ``# H1`` line if present, else derived from the
-    slug. Missing canvas dir → empty list.
+    Each entry: {slug, title, mtime, size, path, source}. ``source`` is
+    ``"canvas"`` for hand-authored decks under ``inner/canvas/`` or
+    ``"experiment"`` for auto-promoted experiment cards under
+    ``cortex-memory/experiments/`` (when ``mind_dir`` is provided).
+
+    Title is parsed from the first ``# H1`` line if present, else
+    derived from the slug. Missing source dirs are skipped silently.
+    Slug collisions are resolved by the order returned from
+    ``_canvas_source_dirs`` (canvas wins over experiment).
     """
-    cdir = _canvas_dir(inner)
-    if not cdir.is_dir():
-        return []
     out: list[dict[str, Any]] = []
-    for path in cdir.glob("*.md"):
-        slug = path.stem
-        if not _CANVAS_SLUG_RE.match(slug):
+    seen_slugs: set[str] = set()
+    for source_label, cdir in _canvas_source_dirs(inner, mind_dir):
+        if not cdir.is_dir():
             continue
-        try:
-            text = path.read_text(encoding="utf-8")
-            stat = path.stat()
-        except OSError:
-            continue
-        title = slug
-        for line in text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("# "):
-                title = stripped[2:].strip()
-                break
-            if stripped.startswith("---") or stripped == "":
+        for path in cdir.glob("*.md"):
+            slug = path.stem
+            if not _CANVAS_SLUG_RE.match(slug):
                 continue
-        out.append(
-            {
-                "slug": slug,
-                "title": title,
-                "mtime": stat.st_mtime,
-                "size": stat.st_size,
-                "path": str(path),
-            }
-        )
+            if slug in seen_slugs:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+                stat = path.stat()
+            except OSError:
+                continue
+            title = slug
+            for line in text.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("# "):
+                    title = stripped[2:].strip()
+                    break
+                if stripped.startswith("---") or stripped == "":
+                    continue
+            seen_slugs.add(slug)
+            out.append(
+                {
+                    "slug": slug,
+                    "title": title,
+                    "mtime": stat.st_mtime,
+                    "size": stat.st_size,
+                    "path": str(path),
+                    "source": source_label,
+                }
+            )
     out.sort(key=lambda d: d["mtime"], reverse=True)
     return out
 
 
-def read_canvas(inner: pathlib.Path, slug: str) -> dict[str, Any] | None:
+def read_canvas(
+    inner: pathlib.Path,
+    slug: str,
+    mind_dir: pathlib.Path | None = None,
+) -> dict[str, Any] | None:
     """Read a single canvas by slug. Returns None if slug is invalid
-    or the file doesn't exist. Strips YAML frontmatter from body if
-    present (between leading ``---`` lines)."""
+    or the file doesn't exist in any configured source dir. Strips YAML
+    frontmatter from body if present (between leading ``---`` lines).
+
+    When ``mind_dir`` is provided, auto-promoted experiment cards under
+    ``cortex-memory/experiments/`` become readable too. Authored canvas
+    decks win on slug collision (same order as ``list_canvases``).
+    """
     if not _CANVAS_SLUG_RE.match(slug):
         return None
-    cdir = _canvas_dir(inner)
-    path = cdir / f"{slug}.md"
-    try:
-        path = path.resolve()
-        cdir = cdir.resolve()
-    except OSError:
-        return None
-    if not str(path).startswith(str(cdir) + "/"):
-        return None
-    if not path.is_file():
-        return None
-    text = path.read_text(encoding="utf-8")
-    body = text
-    title = slug
-    if text.startswith("---\n"):
-        end = text.find("\n---\n", 4)
-        if end != -1:
-            body = text[end + 5 :]
-    for line in body.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("# "):
-            title = stripped[2:].strip()
-            break
-    return {"slug": slug, "title": title, "body": body, "path": str(path)}
+    for source_label, cdir in _canvas_source_dirs(inner, mind_dir):
+        path = cdir / f"{slug}.md"
+        try:
+            path = path.resolve()
+            cdir_resolved = cdir.resolve()
+        except OSError:
+            continue
+        if not str(path).startswith(str(cdir_resolved) + "/"):
+            continue
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        body = text
+        title = slug
+        if text.startswith("---\n"):
+            end = text.find("\n---\n", 4)
+            if end != -1:
+                body = text[end + 5 :]
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("# "):
+                title = stripped[2:].strip()
+                break
+        return {
+            "slug": slug,
+            "title": title,
+            "body": body,
+            "path": str(path),
+            "source": source_label,
+        }
+    return None
 
 
 def find_wake_thought(
@@ -1645,3 +1693,208 @@ def load_all(paths: Paths) -> list[UnifiedEvent]:
 
 def now() -> float:
     return time.time()
+
+
+# ---------------------------------------------------------------------------
+# Currently-running jobs (the /running tab)
+#
+# A "job" is anything observable that has a start signal but no matching
+# completion signal yet. Three kinds:
+#   - wake:      thinking wake (one at a time, serial)
+#   - experiment: alice-experiment dispatch (multiple possible)
+#   - subagent:  speaking background_task_dispatch_request (multiple possible)
+# Jobs older than ``stale_threshold_s`` are dropped — they're zombies
+# from crashed runtimes, not actually-running work.
+
+
+@dataclass
+class RunningJob:
+    kind: str  # "wake" | "experiment" | "subagent"
+    job_id: str
+    started_at: float  # unix ts
+    elapsed_s: float
+    what: str  # one-line description
+    detail: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "job_id": self.job_id,
+            "started_at": self.started_at,
+            "elapsed_s": self.elapsed_s,
+            "what": self.what,
+            "detail": self.detail,
+        }
+
+
+def _open_wakes(
+    thinking_log: pathlib.Path,
+    cutoff_ts: float,
+    now_ts: float,
+) -> list[RunningJob]:
+    """Thinking is serial — at most one wake open at a time. Walk the
+    log and track the last unmatched wake_start. If a closing event
+    (wake_end / timeout / exception) follows it, the wake is done.
+    """
+    open_start: dict[str, Any] | None = None
+    for rec in _read_jsonl(thinking_log):
+        event = rec.get("event") or ""
+        if event == "wake_start":
+            open_start = rec
+        elif event in ("wake_end", "timeout", "exception"):
+            open_start = None
+    if open_start is None:
+        return []
+    ts = float(open_start.get("ts") or 0.0)
+    if ts < cutoff_ts:
+        return []
+    model = open_start.get("model") or "?"
+    budget = open_start.get("max_seconds")
+    what = f"thinking wake · model={model}"
+    if budget:
+        what += f" · budget={budget}s"
+    return [
+        RunningJob(
+            kind="wake",
+            job_id=f"wake-{int(ts)}",
+            started_at=ts,
+            elapsed_s=max(0.0, now_ts - ts),
+            what=what,
+            detail={"model": model, "max_seconds": budget},
+        )
+    ]
+
+
+def _open_subagents(
+    speaking_log: pathlib.Path,
+    cutoff_ts: float,
+    now_ts: float,
+) -> list[RunningJob]:
+    """Track ``background_task_dispatch_request`` events by handle;
+    remove on ``background_task_dispatch_complete``. Surviving handles
+    above ``cutoff_ts`` are still running."""
+    open_by_handle: dict[str, dict[str, Any]] = {}
+    for rec in _read_jsonl(speaking_log):
+        event = rec.get("event") or ""
+        handle = rec.get("handle")
+        if not handle:
+            continue
+        if event == "background_task_dispatch_request":
+            open_by_handle[handle] = rec
+        elif event == "background_task_dispatch_complete":
+            open_by_handle.pop(handle, None)
+    out: list[RunningJob] = []
+    for handle, rec in open_by_handle.items():
+        ts = float(rec.get("ts") or 0.0)
+        if ts < cutoff_ts:
+            continue
+        desc = rec.get("description") or "(no description)"
+        principal = rec.get("principal_name") or "?"
+        out.append(
+            RunningJob(
+                kind="subagent",
+                job_id=handle,
+                started_at=ts,
+                elapsed_s=max(0.0, now_ts - ts),
+                what=f"{desc} · for {principal}",
+                detail={
+                    "description": desc,
+                    "principal_name": principal,
+                    "channel_transport": rec.get("channel_transport"),
+                },
+            )
+        )
+    return out
+
+
+def _open_experiments(
+    mind_dir: pathlib.Path,
+    cutoff_ts: float,
+    now_ts: float,
+) -> list[RunningJob]:
+    """An experiment is "open" if its state dir exists under
+    ``inner/state/experiments/<id>/`` and no completion line exists for
+    that id in ``inner/state/experiments.jsonl``. The runner appends to
+    the jsonl only at completion, so jsonl presence = done.
+    """
+    state_dir = mind_dir / "inner/state/experiments"
+    if not state_dir.is_dir():
+        return []
+    jsonl_path = mind_dir / "inner/state/experiments.jsonl"
+    completed_ids: set[str] = set()
+    if jsonl_path.is_file():
+        for rec in _read_jsonl(jsonl_path):
+            xid = rec.get("experiment_id")
+            if xid:
+                completed_ids.add(xid)
+    out: list[RunningJob] = []
+    for child in state_dir.iterdir():
+        if not child.is_dir():
+            continue
+        xid = child.name
+        if xid in completed_ids:
+            continue
+        # Use the state dir's mtime as the dispatch time — close enough
+        # for the running view; the formal dispatched_at is only in the
+        # card / jsonl, neither of which is written for in-flight runs.
+        try:
+            ts = child.stat().st_mtime
+        except OSError:
+            continue
+        if ts < cutoff_ts:
+            continue
+        # Parse settings.json for hypothesis if available.
+        what = f"experiment {xid}"
+        settings_path = child / "settings.json"
+        if settings_path.is_file():
+            try:
+                settings = json.loads(
+                    settings_path.read_text(encoding="utf-8", errors="replace")
+                )
+                hypothesis = settings.get("hypothesis") or ""
+                if hypothesis:
+                    what = _trim(hypothesis, 140)
+            except (OSError, json.JSONDecodeError):
+                pass
+        out.append(
+            RunningJob(
+                kind="experiment",
+                job_id=xid,
+                started_at=ts,
+                elapsed_s=max(0.0, now_ts - ts),
+                what=what,
+                detail={"state_dir": str(child)},
+            )
+        )
+    return out
+
+
+def list_running_jobs(
+    paths: Paths,
+    now_ts: float | None = None,
+    stale_threshold_s: int = 7200,
+) -> list[RunningJob]:
+    """Return all jobs currently in flight, sorted newest start first.
+
+    Jobs are detected by absence of a completion signal:
+      - thinking wakes: ``wake_start`` without matching ``wake_end`` /
+        ``timeout`` / ``exception``
+      - experiments: state dir under ``inner/state/experiments/<id>/``
+        without a completion line in ``experiments.jsonl``
+      - speaking sub-agents: ``background_task_dispatch_request``
+        without matching ``background_task_dispatch_complete`` by handle
+
+    Jobs whose start signal is older than ``stale_threshold_s`` are
+    treated as zombies (crashed runtime, never completed) and dropped.
+    The default of two hours is generous enough to catch a 30-minute
+    experiment timeout plus normal queueing, but cuts off forgotten state.
+    """
+    if now_ts is None:
+        now_ts = time.time()
+    cutoff = now_ts - stale_threshold_s
+    jobs: list[RunningJob] = []
+    jobs.extend(_open_wakes(paths.thinking_log, cutoff, now_ts))
+    jobs.extend(_open_experiments(paths.mind_dir, cutoff, now_ts))
+    jobs.extend(_open_subagents(paths.speaking_log, cutoff, now_ts))
+    jobs.sort(key=lambda j: j.started_at, reverse=True)
+    return jobs
