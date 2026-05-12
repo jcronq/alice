@@ -87,6 +87,7 @@ COPY --chown=alice:alice bin/alice-think             /usr/local/bin/alice-think
 COPY --chown=alice:alice bin/alice-thinker-watchdog  /usr/local/bin/alice-thinker-watchdog
 COPY --chown=alice:alice bin/alice-client            /usr/local/bin/alice-client
 COPY --chown=alice:alice bin/alice-gh-watcher        /usr/local/bin/alice-gh-watcher
+COPY --chown=alice:alice bin/alice-sm-dispatcher     /usr/local/bin/alice-sm-dispatcher
 
 RUN chmod +x /usr/local/bin/entrypoint.sh \
         /usr/local/bin/alice-mind-autopush \
@@ -95,6 +96,7 @@ RUN chmod +x /usr/local/bin/entrypoint.sh \
         /usr/local/bin/alice-thinker-watchdog \
         /usr/local/bin/alice-client \
         /usr/local/bin/alice-gh-watcher \
+        /usr/local/bin/alice-sm-dispatcher \
     && find /etc/s6-overlay/s6-rc.d \( -name 'run' -o -name 'up' -o -name 'finish' \) | xargs -r chmod +x
 
 ENV HOME=/home/alice
