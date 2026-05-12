@@ -618,3 +618,116 @@ async def test_bump_access_no_frontmatter_is_noop(tmp_path: pathlib.Path):
 async def test_bump_access_missing_file_is_noop(tmp_path: pathlib.Path):
     # Should not raise.
     await _bump_access(tmp_path, "does-not-exist.md")
+
+
+# ---------------------------------------------------------------------------
+# access_count DB write path
+#
+# The cue runner's bump must update BOTH the markdown frontmatter and
+# the note_metrics row keyed by slug. Without the DB write the SQL
+# retrieval boost based on access_count cannot fire — see
+# cortex-memory/research/2026-05-11-retrieval-data-pipeline-critical.md.
+
+
+def _make_metrics_db(path: pathlib.Path, slugs: list[str]) -> None:
+    """Create a minimal cortex-index-shaped DB with a seeded
+    ``note_metrics`` table. Only the columns the bump touches are
+    declared — keeps the fixture self-contained without dragging in
+    the full indexer schema. The bump uses INSERT ... ON CONFLICT, so
+    a pre-existing row exercises the UPDATE branch and a missing slug
+    exercises the INSERT branch."""
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE note_metrics (
+                slug TEXT PRIMARY KEY,
+                access_count INTEGER NOT NULL DEFAULT 0,
+                last_queried TEXT,
+                speaking_accessed_at TEXT
+            )
+            """
+        )
+        for slug in slugs:
+            conn.execute(
+                "INSERT INTO note_metrics(slug, access_count) VALUES(?, 0)",
+                (slug,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _read_db_count(db: pathlib.Path, slug: str) -> int | None:
+    conn = sqlite3.connect(str(db))
+    try:
+        row = conn.execute(
+            "SELECT access_count FROM note_metrics WHERE slug = ?", (slug,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return None if row is None else int(row[0])
+
+
+@pytest.mark.asyncio
+async def test_bump_access_updates_db_when_db_path_given(tmp_path: pathlib.Path):
+    """The bump must increment note_metrics.access_count alongside the
+    frontmatter when ``db_path`` is supplied."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    note = vault / "n.md"
+    note.write_text("---\ntitle: N\naccess_count: 4\n---\nbody\n")
+    db = tmp_path / "cortex-index.db"
+    _make_metrics_db(db, ["n"])
+
+    await _bump_access(vault, "n.md", db_path=db, slug="n")
+
+    assert "access_count: 5" in note.read_text()
+    assert _read_db_count(db, "n") == 1  # was 0, now +1
+
+
+@pytest.mark.asyncio
+async def test_bump_access_db_upserts_missing_row(tmp_path: pathlib.Path):
+    """If the DB has no row for the slug (defensive — the indexer
+    should always seed one), the bump inserts a fresh row at 1 rather
+    than silently swallowing the write."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    note = vault / "fresh.md"
+    note.write_text("---\ntitle: Fresh\naccess_count: 0\n---\nbody\n")
+    db = tmp_path / "cortex-index.db"
+    _make_metrics_db(db, [])  # empty table — no row for "fresh"
+
+    await _bump_access(vault, "fresh.md", db_path=db, slug="fresh")
+
+    assert _read_db_count(db, "fresh") == 1
+
+
+@pytest.mark.asyncio
+async def test_bump_access_skips_db_when_db_path_none(tmp_path: pathlib.Path):
+    """The legacy call shape (no db_path) must continue to update only
+    the frontmatter — no DB connection attempted."""
+    note = tmp_path / "n.md"
+    note.write_text("---\ntitle: N\naccess_count: 2\n---\nbody\n")
+    # No DB exists; if the bump tried to open one it would error.
+    await _bump_access(tmp_path, "n.md")
+    assert "access_count: 3" in note.read_text()
+
+
+@pytest.mark.asyncio
+async def test_bump_access_db_write_failure_does_not_block_frontmatter(
+    tmp_path: pathlib.Path,
+):
+    """If the DB path is invalid (e.g. pointing at a non-DB file), the
+    frontmatter bump must still succeed. Persistence to either store
+    is recoverable from the other."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    note = vault / "n.md"
+    note.write_text("---\ntitle: N\naccess_count: 1\n---\nbody\n")
+    bogus_db = tmp_path / "not-a-db.txt"
+    bogus_db.write_text("definitely not sqlite")
+
+    # Should not raise; should still update frontmatter.
+    await _bump_access(vault, "n.md", db_path=bogus_db, slug="n")
+    assert "access_count: 2" in note.read_text()

@@ -309,14 +309,29 @@ def _read_trigger_keywords(vault_root: pathlib.Path, rel_path: str) -> list[str]
     return out
 
 
-async def _bump_access(vault_root: pathlib.Path, rel_path: str) -> None:
+async def _bump_access(
+    vault_root: pathlib.Path,
+    rel_path: str,
+    *,
+    db_path: pathlib.Path | None = None,
+    slug: str | None = None,
+) -> None:
     """Fire-and-forget bump of ``access_count`` + ``last_accessed`` in
-    a note's frontmatter.
+    a note's frontmatter AND (when ``db_path`` is provided) in the
+    cortex-index ``note_metrics`` table.
 
-    Best-effort: a missing frontmatter, a permissions error, or a race
-    with another writer all silently no-op. Mirrors the logic in
-    :func:`alice_speaking.tools.memory._bump_access` but lives here so
-    the cue runner doesn't import a sibling tools module.
+    Best-effort across both writes: a missing frontmatter, a permissions
+    error, or a race with another writer all silently no-op. The two
+    writes are independent — if one succeeds and the other fails, we
+    log a debug warning but never raise. Both stores are recoverable
+    from each other (the seed script reconciles the DB from the
+    markdown source of truth on demand). See
+    ``cortex-memory/research/2026-05-11-note-metrics-data-pipeline-design.md``
+    for the rationale.
+
+    Mirrors the logic in :func:`alice_speaking.tools.memory._bump_access`
+    but lives here so the cue runner doesn't import a sibling tools
+    module.
     """
 
     def _do_bump() -> None:
@@ -348,12 +363,53 @@ async def _bump_access(vault_root: pathlib.Path, rel_path: str) -> None:
         except OSError:
             return
 
+    def _do_db_bump() -> None:
+        # Resolve the slug we should target. Prefer the explicit slug
+        # passed in (matches what the cue runner saw in the FTS row).
+        # Fall back to filename stem — matches build_index.slug_for's
+        # common case (the disambiguated-collision case only kicks in
+        # for the handful of duplicate stems in the vault, and we'd
+        # rather miss those than incorrectly bump a sibling note).
+        target_slug = slug or pathlib.Path(rel_path).stem
+        if not target_slug or db_path is None:
+            return
+        conn = sqlite3.connect(str(db_path))
+        try:
+            # Upsert so we tolerate a row that hasn't been seeded yet
+            # (rare — the indexer seeds every slug — but defensive).
+            conn.execute(
+                """
+                INSERT INTO note_metrics(slug, access_count)
+                VALUES(?, 1)
+                ON CONFLICT(slug) DO UPDATE SET
+                    access_count = access_count + 1
+                """,
+                (target_slug,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     try:
         await asyncio.to_thread(_do_bump)
     except Exception:  # noqa: BLE001
         # Truly best-effort. We don't want a stray FS error to leak
         # into the turn loop via an uncaught task exception.
         log.debug("access_count bump failed for %s", rel_path, exc_info=True)
+
+    if db_path is not None:
+        try:
+            await asyncio.to_thread(_do_db_bump)
+        except Exception:  # noqa: BLE001
+            # DB write failures are independently best-effort. The
+            # frontmatter is the source of truth; the seed script can
+            # reconcile any drift.
+            log.debug(
+                "note_metrics bump failed for slug=%s db=%s",
+                slug or rel_path,
+                db_path,
+                exc_info=True,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -699,10 +755,14 @@ async def build_cue_packet(
 
         # Fire-and-forget access_count bumps. Don't await — the bumps
         # don't block the turn. Wrap each in a logged background task
-        # so an exception in one doesn't poison the others.
+        # so an exception in one doesn't poison the others. Slug + DB
+        # path are passed through so the bump also updates the
+        # note_metrics table — without this the SQL recency boost
+        # cannot fire (see
+        # cortex-memory/research/2026-05-11-retrieval-data-pipeline-critical.md).
         for c in final:
             if c.path:
-                _spawn_bump(resolved_vault, c.path)
+                _spawn_bump(resolved_vault, c.path, db_path=resolved_db, slug=c.slug)
 
         return packet
     except Exception:  # noqa: BLE001
@@ -731,7 +791,13 @@ def _resolve_vault_root(explicit: pathlib.Path | None) -> pathlib.Path:
     return pathlib.Path.home() / "alice-mind" / "cortex-memory"
 
 
-def _spawn_bump(vault_root: pathlib.Path, rel_path: str) -> None:
+def _spawn_bump(
+    vault_root: pathlib.Path,
+    rel_path: str,
+    *,
+    db_path: pathlib.Path | None = None,
+    slug: str | None = None,
+) -> None:
     """Schedule a fire-and-forget access_count bump.
 
     No-ops cleanly when there's no running event loop (e.g. during
@@ -741,7 +807,9 @@ def _spawn_bump(vault_root: pathlib.Path, rel_path: str) -> None:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    task = loop.create_task(_bump_access(vault_root, rel_path))
+    task = loop.create_task(
+        _bump_access(vault_root, rel_path, db_path=db_path, slug=slug)
+    )
     # Swallow any exception from the background task so it doesn't
     # surface as an "unhandled exception" warning.
     task.add_done_callback(_log_bump_failure)

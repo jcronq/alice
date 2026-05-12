@@ -54,6 +54,10 @@ alice-experiment = "alice_thinking.cli.experiment:main"
 # issues, trust-filters them, and posts a dispatcher-hello comment. Invoke
 # on a cadence (later: s6 supervisor); for now it's manual.
 alice-sm = "alice_sm.dispatcher:main"
+# One-shot reconciliation: copy access_count from vault frontmatter into
+# the cortex-index note_metrics table. Used to bootstrap historical
+# counts after wiring the cue runner's DB write path.
+alice-seed-access-counts = "alice_indexer.seed_access_counts:main"
 
 [build-system]
 requires = ["hatchling"]
