@@ -55,9 +55,8 @@ nav a:hover { color: var(--text); text-decoration: none; background: var(--panel
 .metric .k { color: var(--muted); }
 .metric .v { color: var(--text); }
 .metric .v.warn { color: var(--warn); }
-.directive { background: var(--panel-2); padding: 8px; border-radius: 4px; white-space: pre-wrap; font-size: 11px; max-height: 180px; overflow: auto; margin: 0; }
-.path-item { font-size: 11px; margin-bottom: 6px; color: var(--muted); }
-.path-item code { display: block; color: var(--text); word-break: break-all; }
+.objective-topic { font-size: 12px; color: var(--text); margin-bottom: 4px; line-height: 1.35; }
+.objective-detail { font-size: 11px; line-height: 1.4; }
 
 main { padding: 20px 24px; max-width: 100%; overflow-x: hidden; }
 

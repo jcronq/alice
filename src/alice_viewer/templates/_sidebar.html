@@ -50,13 +50,18 @@
     <div class="metric"><span class="k">pending emergencies</span><span class="v{% if state.pending_emergencies %} warn{% endif %}">{{ state.pending_emergencies }}</span></div>
   </section>
   <section>
-    <h3>directive.md</h3>
-    <pre class="directive">{{ state.directive }}</pre>
-  </section>
-  <section>
-    <h3>paths</h3>
-    <div class="path-item"><span>thinking</span><code>{{ state.paths.thinking_log }}</code></div>
-    <div class="path-item"><span>speaking</span><code>{{ state.paths.speaking_log }}</code></div>
-    <div class="path-item"><span>mind</span><code>{{ state.paths.mind_dir }}</code></div>
+    <h3>current objective
+      {% if state.current_objective %}
+        <span class="muted">({{ state.current_objective.source }})</span>
+      {% endif %}
+    </h3>
+    {% if state.current_objective %}
+      <div class="objective-topic">{{ state.current_objective.topic }}</div>
+      {% if state.current_objective.detail %}
+        <div class="objective-detail muted">{{ state.current_objective.detail }}</div>
+      {% endif %}
+    {% else %}
+      <div class="metric muted">no objective set</div>
+    {% endif %}
   </section>
 </aside>
