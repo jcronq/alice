@@ -390,6 +390,17 @@ def _run_gh(args: list[str], *, timeout: int = 60) -> str:
     return result.stdout
 
 
+def _sort_oldest_first(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # FIFO: oldest createdAt first so the concurrency cap is fair and
+    # new arrivals don't starve queued tasks. Issues without a
+    # createdAt sort last (treated as "newer than any timestamped
+    # peer") so a malformed payload can't silently jump the queue.
+    return sorted(
+        issues,
+        key=lambda i: (i.get("createdAt") or "9999-12-31T23:59:59Z", i.get("number", 0)),
+    )
+
+
 def gh_list_selected_issues(repo: str, *, gh_bin: str = "gh") -> list[dict[str, Any]]:
     """Return open ``sm:selected`` issues. v0 helper, retained for compat.
 
@@ -418,7 +429,7 @@ def gh_list_selected_issues(repo: str, *, gh_bin: str = "gh") -> list[dict[str, 
     payload = json.loads(stdout)
     if not isinstance(payload, list):
         return []
-    return payload
+    return _sort_oldest_first(payload)
 
 
 def gh_list_sm_issues(repo: str, *, gh_bin: str = "gh") -> list[dict[str, Any]]:
@@ -454,11 +465,12 @@ def gh_list_sm_issues(repo: str, *, gh_bin: str = "gh") -> list[dict[str, Any]]:
     # Defensive client-side filter: the search qualifier above is OR
     # across the listed labels, but if gh ever loosens parsing we still
     # only act on issues with at least one whitelisted ``sm:*`` label.
-    return [
+    filtered = [
         issue
         for issue in payload
         if any(n in SM_LABEL_WHITELIST for n in _label_names(issue))
     ]
+    return _sort_oldest_first(filtered)
 
 
 def gh_list_stale_closed_sm_issues(

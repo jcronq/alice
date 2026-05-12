@@ -1800,3 +1800,46 @@ def test_phase2_gh_find_unspawned_selected_issues_filters_by_trusted_author(
         list_comments=list_comments,
     )
     assert sorted(i["number"] for i in unspawned) == [702, 703]
+
+
+# ---------------------------------------------------------------------------
+# Selection order — issues should come back oldest-first so the
+# concurrency cap can't starve older tasks behind a stream of newer
+# arrivals.
+# ---------------------------------------------------------------------------
+
+
+def test_sort_oldest_first_orders_by_created_at() -> None:
+    payload = [
+        {"number": 107, "createdAt": "2026-05-12T11:30:00Z"},
+        {"number": 102, "createdAt": "2026-05-12T09:00:00Z"},
+        {"number": 105, "createdAt": "2026-05-12T11:00:00Z"},
+        {"number": 104, "createdAt": "2026-05-12T10:00:00Z"},
+    ]
+    ordered = sm._sort_oldest_first(payload)
+    assert [i["number"] for i in ordered] == [102, 104, 105, 107]
+
+
+def test_sort_oldest_first_breaks_tie_by_issue_number() -> None:
+    # Same timestamp → fall back to issue number ascending so order is
+    # deterministic across passes.
+    payload = [
+        {"number": 50, "createdAt": "2026-05-12T10:00:00Z"},
+        {"number": 30, "createdAt": "2026-05-12T10:00:00Z"},
+        {"number": 40, "createdAt": "2026-05-12T10:00:00Z"},
+    ]
+    ordered = sm._sort_oldest_first(payload)
+    assert [i["number"] for i in ordered] == [30, 40, 50]
+
+
+def test_sort_oldest_first_missing_created_at_sorts_last() -> None:
+    # A malformed payload entry without createdAt must NOT jump the
+    # queue; it sorts after all timestamped peers so well-formed tasks
+    # win the cap.
+    payload = [
+        {"number": 1, "createdAt": "2026-05-12T10:00:00Z"},
+        {"number": 2},
+        {"number": 3, "createdAt": "2026-05-12T09:00:00Z"},
+    ]
+    ordered = sm._sort_oldest_first(payload)
+    assert [i["number"] for i in ordered] == [3, 1, 2]
