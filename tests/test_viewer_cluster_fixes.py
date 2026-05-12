@@ -11,10 +11,6 @@
 
 from __future__ import annotations
 
-import pathlib
-
-import pytest
-
 from alice_viewer import aggregators, sources
 from alice_viewer.sources import UnifiedEvent
 
