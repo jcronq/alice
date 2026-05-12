@@ -22,6 +22,7 @@ import asyncio
 import datetime
 import logging
 import pathlib
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -36,6 +37,21 @@ log = logging.getLogger(__name__)
 # in human-perceivable time, long enough that an idle daemon doesn't
 # burn cycles on `glob("*.md")` every loop.
 POLL_SECONDS = 5.0
+
+
+# Surface types that are produced by automated, cron-driven scans
+# (not LLM judgment) and tend to re-fire identical signal multiple
+# times per day. The first occurrence of each type per day dispatches
+# normally; subsequent same-type surfaces on the same day are
+# auto-archived without dispatching. Add a type here when it has
+# demonstrated noise: re-firing the same payload more than ~3 times
+# in a day with no new action for me to take.
+DEDUPE_BY_TYPE_PER_DAY: frozenset[str] = frozenset({
+    "stage-d-invariant",
+})
+
+
+_SURFACE_TYPE_RE = re.compile(r"^surface_type:\s*(\S+)\s*$", re.MULTILINE)
 
 
 @dataclass
@@ -112,12 +128,72 @@ class SurfaceWatcher:
                 for path in sorted(self._surface_dir.glob("*.md")):
                     if path.name.startswith(".") or path.name in self._dispatched:
                         continue
+                    if self._suppress_as_duplicate(path):
+                        continue
                     self._dispatched.add(path.name)
                     log.info("surface detected: %s", path.name)
                     await ctx._queue.put(SurfaceEvent(path=path))
             except OSError as exc:
                 log.warning("surface poll error: %s", exc)
             await asyncio.sleep(POLL_SECONDS)
+
+    def _suppress_as_duplicate(self, path: pathlib.Path) -> bool:
+        """Auto-archive same-type-same-day duplicates of automated
+        cron-driven surfaces without dispatching.
+
+        Returns True iff the surface was suppressed. The first
+        occurrence of a dedupe-eligible type on a given day still
+        dispatches normally — only later same-type surfaces on the
+        same day get archived with a duplicate-suppressed verdict.
+
+        A surface is dedupe-eligible when its ``surface_type``
+        frontmatter value is in :data:`DEDUPE_BY_TYPE_PER_DAY`.
+        Missing or unparseable frontmatter → not eligible → falls
+        through to normal dispatch.
+        """
+        surface_type = _read_surface_type(path)
+        if surface_type is None or surface_type not in DEDUPE_BY_TYPE_PER_DAY:
+            return False
+        today = datetime.date.today().isoformat()
+        dest_dir = self._handled_dir / today
+        if not dest_dir.is_dir():
+            return False
+        for prior in dest_dir.glob("*.md"):
+            if prior.name == path.name:
+                continue
+            prior_type = _read_surface_type(prior)
+            if prior_type == surface_type:
+                self._archive_duplicate(path, surface_type, prior.name)
+                return True
+        return False
+
+    def _archive_duplicate(
+        self,
+        path: pathlib.Path,
+        surface_type: str,
+        prior_name: str,
+    ) -> None:
+        """Move a same-type-same-day duplicate into the handled dir
+        with a verdict naming the prior occurrence."""
+        today = datetime.date.today().isoformat()
+        dest_dir = self._handled_dir / today
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / path.name
+        body = path.read_text()
+        trailer = (
+            "\n\n---\n"
+            + f"resolved: {datetime.datetime.now().astimezone().isoformat(timespec='seconds')}\n"
+            + f"verdict: duplicate-suppressed-by-intake — surface_type '{surface_type}' already dispatched today ({prior_name})\n"
+            + "action_taken: auto-archived by intake dedupe filter\n"
+        )
+        dest.write_text(body + trailer)
+        path.unlink()
+        log.info(
+            "surface dedupe: suppressed %s (surface_type=%s, prior=%s)",
+            path.name,
+            surface_type,
+            prior_name,
+        )
 
     async def handle(self, ctx: DaemonContext, event: SurfaceEvent) -> None:
         """Run one surface turn, then release the dispatched-set
@@ -153,3 +229,21 @@ class SurfaceWatcher:
         dest.write_text(body + trailer)
         path.unlink()
         log.info("auto-archived unresolved surface: %s", path.name)
+
+
+def _read_surface_type(path: pathlib.Path) -> Optional[str]:
+    """Extract ``surface_type`` from a surface file's YAML frontmatter.
+
+    Returns ``None`` when the file is missing, unreadable, or the
+    frontmatter lacks a ``surface_type:`` line. Reads only the first
+    ~2 KiB so a malformed body can't stall the watcher.
+    """
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            head = fh.read(2048)
+    except OSError:
+        return None
+    match = _SURFACE_TYPE_RE.search(head)
+    if match is None:
+        return None
+    return match.group(1).strip().strip("\"'")
