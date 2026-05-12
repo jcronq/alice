@@ -1269,7 +1269,6 @@ def test_phase2_spawn_fires_on_code_artifact_with_no_prior_spawn(
         state_path=state_path,
         list_issues=lambda _r: issues,
         list_stale_closed=lambda _r: [],
-        list_comments=lambda _r, _n: [],  # no prior spawn-started
         post_comment=recorder,
         edit_labels=LabelRecorder(),
         close_issue=CloseRecorder(),
@@ -1353,7 +1352,6 @@ def test_phase2_spawn_fires_on_research_note_with_writer_template(
         state_path=state_path,
         list_issues=lambda _r: issues,
         list_stale_closed=lambda _r: [],
-        list_comments=lambda _r, _n: [],
         post_comment=recorder,
         edit_labels=LabelRecorder(),
         close_issue=CloseRecorder(),
@@ -1382,13 +1380,27 @@ def test_phase2_spawn_fires_on_research_note_with_writer_template(
     assert "artifact=art:research_note" in started
 
 
-def test_phase2_already_spawned_marker_skips_new_spawn(
+def test_phase2_live_spawn_dir_skips_new_spawn(
     state_path,
     tmp_path,
 ) -> None:
-    """Issue with a prior [SM] spawn-started from jcronq → no second spawn."""
+    """Issue with a live spawn-<n>-* dir → no second spawn.
+
+    Issue #115: the previous contract dedup-ed on the
+    ``[SM] spawn-started`` audit comment alone. The new contract is
+    that the live spawn dir is ground truth — a comment alone is not
+    enough to skip.
+    """
+    import os as _os
+
     spawn_dir = tmp_path / "spawns"
     spawn_dir.mkdir()
+    # Pre-create a live spawn dir for #202, pidfile pointing at this
+    # very process (guaranteed alive for the duration of the test).
+    live_spawn = spawn_dir / "spawn-202-1778600000"
+    live_spawn.mkdir()
+    (live_spawn / "pidfile").write_text(str(_os.getpid()))
+
     recorder = Recorder()
     popens: list[FakePopen] = []
 
@@ -1410,15 +1422,6 @@ def test_phase2_already_spawned_marker_skips_new_spawn(
         )
 
     issues = [_make_issue(202, sm_labels=("sm:selected",), art_labels=("art:code",))]
-    existing = [
-        {
-            "body": (
-                "[SM] spawn-started task=#202 artifact=art:code "
-                "runtime=claude-cli spawn_id=spawn-202-1 ts=2026-05-12T11:00:00+00:00"
-            ),
-            "author": {"login": "jcronq"},
-        }
-    ]
 
     # Pre-seed dedup so the hello doesn't post either; we're testing
     # spawn dedup, not hello dedup.
@@ -1432,14 +1435,14 @@ def test_phase2_already_spawned_marker_skips_new_spawn(
         state_path=state_path,
         list_issues=lambda _r: issues,
         list_stale_closed=lambda _r: [],
-        list_comments=lambda _r, _n: existing,
         post_comment=recorder,
         edit_labels=LabelRecorder(),
         close_issue=CloseRecorder(),
         find_linked_pr=_no_pr,
         pr_merge_status=_no_call,
         master_ci_status=_no_call,
-        count_running=lambda: 0,
+        has_live_spawn=lambda n: sm.has_live_spawn_for_issue(n, spawn_dir),
+        count_running=lambda: 1,
         spawn=spawn,
         now_iso=_frozen_now,
         log=lambda _m: None,
@@ -1451,6 +1454,85 @@ def test_phase2_already_spawned_marker_skips_new_spawn(
     # No new [SM] spawn-started comment posted.
     new_starts = [b for _r, _n, b in recorder.posted if "spawn-started" in b]
     assert new_starts == []
+    # Live dir was not reaped.
+    assert live_spawn.exists()
+
+
+def test_phase2_stale_spawn_dir_falls_through_and_respawns(
+    state_path,
+    tmp_path,
+) -> None:
+    """Issue with only a dead-pidfile spawn-<n>-* dir → reap + new spawn.
+
+    Issue #115: this is the worker-died-mid-flight recovery case.
+    The historic ``[SM] spawn-started`` audit comment is irrelevant —
+    the dispatcher checks the spawn dir, finds a dead PID, moves the
+    stale dir to ``.finished/``, and proceeds to spawn.
+    """
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    # Pre-create a stale spawn dir for #203 with a PID that's
+    # effectively guaranteed dead (kernel pid_max + 1).
+    stale_spawn = spawn_dir / "spawn-203-1778500000"
+    stale_spawn.mkdir()
+    (stale_spawn / "pidfile").write_text("99999999")
+
+    recorder = Recorder()
+    popens: list[FakePopen] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    def spawn(issue, art_label, repo):
+        return sm.spawn_agent(
+            issue,
+            art_label,
+            repo,
+            spawn_dir=spawn_dir,
+            popen=popen,
+            post_comment=recorder,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+
+    issues = [_make_issue(203, sm_labels=("sm:selected",), art_labels=("art:code",))]
+
+    # Pre-seed dedup so the hello doesn't post either.
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({"version": sm.STATE_VERSION, "hello_commented": [203]})
+    )
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        post_comment=recorder,
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        has_live_spawn=lambda n: sm.has_live_spawn_for_issue(n, spawn_dir),
+        count_running=lambda: 0,
+        spawn=spawn,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 1
+    assert len(popens) == 1
+    # Stale dir was reaped into .finished/.
+    assert not stale_spawn.exists()
+    assert (spawn_dir / ".finished" / stale_spawn.name).exists()
+    # A fresh spawn-started comment was posted by the new worker spawn.
+    new_starts = [b for _r, _n, b in recorder.posted if "spawn-started" in b]
+    assert len(new_starts) == 1
+    assert "task=#203" in new_starts[0]
 
 
 def test_phase2_concurrency_cap_queues_excess_spawns(
@@ -1496,7 +1578,6 @@ def test_phase2_concurrency_cap_queues_excess_spawns(
         state_path=state_path,
         list_issues=lambda _r: issues,
         list_stale_closed=lambda _r: [],
-        list_comments=lambda _r, _n: [],
         post_comment=recorder,
         edit_labels=LabelRecorder(),
         close_issue=CloseRecorder(),
@@ -1559,7 +1640,6 @@ def test_phase2_untrusted_author_skipped_before_spawn(
         state_path=state_path,
         list_issues=lambda _r: issues,
         list_stale_closed=lambda _r: [],
-        list_comments=lambda _r, _n: [],
         post_comment=recorder,
         edit_labels=LabelRecorder(),
         close_issue=CloseRecorder(),
@@ -1628,7 +1708,6 @@ def test_phase2_unrecognized_artifact_label_skips_spawn(
             state_path=state_path,
             list_issues=lambda _r: issues,
             list_stale_closed=lambda _r: [],
-            list_comments=lambda _r, _n: [],
             post_comment=recorder,
             edit_labels=LabelRecorder(),
             close_issue=CloseRecorder(),
@@ -1686,7 +1765,6 @@ def test_phase2_dry_run_logs_spawn_intent_without_popen(
         state_path=state_path,
         list_issues=lambda _r: issues,
         list_stale_closed=lambda _r: [],
-        list_comments=lambda _r, _n: [],
         post_comment=recorder,
         edit_labels=LabelRecorder(),
         close_issue=CloseRecorder(),
@@ -1755,6 +1833,52 @@ def test_phase2_count_running_spawns_reaps_dead_pidfiles(tmp_path) -> None:
     assert not dead.exists()
     finished = spawn_dir / ".finished" / "spawn-dead"
     assert finished.exists()
+
+
+def test_phase2_has_live_spawn_for_issue_matches_by_issue_number(
+    tmp_path,
+) -> None:
+    """has_live_spawn_for_issue is scoped to ``spawn-<N>-*`` dirs and
+    reaps stale matches into ``.finished/``.
+
+    Issue #115 contract: a live spawn dir for the issue → True
+    (dedup). Only-stale matches → False, and the stale dirs are reaped.
+    A live dir for an unrelated issue must not satisfy a check for
+    this issue.
+    """
+    import os as _os
+
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+
+    # #100: live dir (this process) — should dedup.
+    live_100 = spawn_dir / "spawn-100-1"
+    live_100.mkdir()
+    (live_100 / "pidfile").write_text(str(_os.getpid()))
+
+    # #200: stale dir (impossible PID) — should not dedup.
+    stale_200 = spawn_dir / "spawn-200-1"
+    stale_200.mkdir()
+    (stale_200 / "pidfile").write_text("99999999")
+
+    # #300: no spawn dir at all — should not dedup.
+
+    assert sm.has_live_spawn_for_issue(100, spawn_dir) is True
+    # #100's live dir is preserved.
+    assert live_100.exists()
+
+    assert sm.has_live_spawn_for_issue(200, spawn_dir) is False
+    # #200's stale dir was reaped into .finished/.
+    assert not stale_200.exists()
+    assert (spawn_dir / ".finished" / "spawn-200-1").exists()
+
+    assert sm.has_live_spawn_for_issue(300, spawn_dir) is False
+
+    # Per-issue scoping: the live dir for #100 must not satisfy a
+    # liveness check for an unrelated issue number whose digits
+    # happen to overlap.
+    assert sm.has_live_spawn_for_issue(101, spawn_dir) is False
+    assert sm.has_live_spawn_for_issue(1, spawn_dir) is False
 
 
 def test_phase2_gh_find_unspawned_selected_issues_filters_by_trusted_author(

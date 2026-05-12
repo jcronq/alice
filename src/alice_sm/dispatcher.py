@@ -829,6 +829,61 @@ def resolve_claude_bin(
     return fallback
 
 
+def _spawn_dir_is_alive(child: pathlib.Path) -> bool:
+    """Return True iff ``child`` has a pidfile whose PID is still live.
+
+    Missing/unreadable pidfile → False. ``ProcessLookupError`` or
+    ``PermissionError`` from ``os.kill(pid, 0)`` → False (PID recycled
+    or no longer ours). Unexpected ``OSError`` → True (be conservative
+    rather than reaping a possibly-live spawn).
+    """
+    pidfile = child / "pidfile"
+    if not pidfile.is_file():
+        return False
+    try:
+        pid = int(pidfile.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _reap_spawn_dir(
+    child: pathlib.Path,
+    finished_root: pathlib.Path,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> None:
+    """Move a dead spawn dir into ``finished_root/<name>``.
+
+    On name collision, suffix ``.1``, ``.2``, ... so a previous reap
+    isn't clobbered. ``OSError`` is swallowed and logged — the next
+    pass will retry.
+    """
+    try:
+        finished_root.mkdir(parents=True, exist_ok=True)
+        target = finished_root / child.name
+        if target.exists():
+            i = 1
+            while (finished_root / f"{child.name}.{i}").exists():
+                i += 1
+            target = finished_root / f"{child.name}.{i}"
+        child.rename(target)
+    except OSError as exc:
+        if log is not None:
+            log(
+                f"[sm-dispatcher] could not reap dead spawn "
+                f"{child}: {exc}"
+            )
+
+
 def count_running_spawns(
     spawn_dir: pathlib.Path = SPAWN_DIR,
     *,
@@ -836,14 +891,9 @@ def count_running_spawns(
 ) -> int:
     """Return the number of live spawned subprocesses.
 
-    Walks ``spawn_dir/*/pidfile``. For each pidfile, sends signal 0 to
-    the pid; ``ProcessLookupError`` (or ``PermissionError`` for a
-    re-used pid we no longer own) marks the spawn dead. Dead spawn
-    directories are moved to ``spawn_dir/.finished/<id>/`` so a future
-    pass doesn't keep re-checking them.
-
-    On a missing or unreadable pidfile, the spawn dir is treated as
-    dead and moved to ``.finished/``.
+    Walks ``spawn_dir/*/pidfile``. Live spawns count toward the
+    returned total; dead spawns are moved to ``spawn_dir/.finished/``
+    so a future pass doesn't keep re-checking them.
     """
     if not spawn_dir.is_dir():
         return 0
@@ -854,50 +904,51 @@ def count_running_spawns(
             continue
         if child.name == ".finished":
             continue
-        pidfile = child / "pidfile"
-        is_alive = False
-        if pidfile.is_file():
-            try:
-                pid_text = pidfile.read_text().strip()
-                pid = int(pid_text)
-            except (OSError, ValueError):
-                pid = None
-            if pid is not None:
-                try:
-                    os.kill(pid, 0)
-                    is_alive = True
-                except ProcessLookupError:
-                    is_alive = False
-                except PermissionError:
-                    # PID exists but is owned by someone else — treat
-                    # as not-our-spawn-anymore; the original spawn
-                    # exited and the OS recycled the pid.
-                    is_alive = False
-                except OSError:
-                    # Some other unexpected error; be conservative and
-                    # don't claim it dead.
-                    is_alive = True
-        if is_alive:
+        if _spawn_dir_is_alive(child):
             live += 1
         else:
-            try:
-                finished_root.mkdir(parents=True, exist_ok=True)
-                target = finished_root / child.name
-                if target.exists():
-                    # Collision: append a counter so we don't clobber
-                    # the previous reap.
-                    i = 1
-                    while (finished_root / f"{child.name}.{i}").exists():
-                        i += 1
-                    target = finished_root / f"{child.name}.{i}"
-                child.rename(target)
-            except OSError as exc:
-                if log is not None:
-                    log(
-                        f"[sm-dispatcher] could not reap dead spawn "
-                        f"{child}: {exc}"
-                    )
+            _reap_spawn_dir(child, finished_root, log=log)
     return live
+
+
+def has_live_spawn_for_issue(
+    issue_number: int,
+    spawn_dir: pathlib.Path = SPAWN_DIR,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> bool:
+    """Return True iff a live spawn dir exists for ``issue_number``.
+
+    Scans ``spawn_dir/spawn-<issue_number>-*/`` (active dir only —
+    ``.finished/`` is excluded). If any matching dir has a pidfile
+    pointing at a live PID, returns True. Any matching dir whose
+    pidfile is missing or points at a dead PID is moved into
+    ``spawn_dir/.finished/`` so it doesn't clutter future passes.
+
+    Issue #115: previously the dispatcher dedup-ed on the
+    ``[SM] spawn-started`` audit comment alone, which made the comment
+    a permanent gate — a worker that died after posting the comment
+    but before opening a PR could not be replaced without manual
+    intervention. The comment is now an audit trail only; ground truth
+    is the live spawn dir.
+    """
+    if not spawn_dir.is_dir():
+        return False
+    finished_root = spawn_dir / ".finished"
+    prefix = f"spawn-{issue_number}-"
+    alive = False
+    for child in spawn_dir.iterdir():
+        if not child.is_dir():
+            continue
+        if child.name == ".finished":
+            continue
+        if not child.name.startswith(prefix):
+            continue
+        if _spawn_dir_is_alive(child):
+            alive = True
+        else:
+            _reap_spawn_dir(child, finished_root, log=log)
+    return alive
 
 
 def compose_spawn_prompt(
@@ -1282,7 +1333,7 @@ def _process_selected(
     post_comment: PostCommentFn,
     edit_labels: EditLabelsFn,
     find_linked_pr: FindLinkedPRFn,
-    list_comments: ListCommentsFn | None,
+    has_live_spawn: Callable[[int], bool] | None,
     count_running: Callable[[], int] | None,
     spawn: Callable[[dict[str, Any], str, str], str | None] | None,
     max_concurrent_spawns: int,
@@ -1295,8 +1346,8 @@ def _process_selected(
 
     Order matters: trust filter → hello (idempotent) → T1 if linked PR
     exists (terminating, since work is already in flight) → otherwise
-    Phase 2 spawn (gated by concurrency cap + dedup on
-    ``[SM] spawn-started`` audit comments).
+    Phase 2 spawn (gated by concurrency cap + dedup on a live spawn
+    dir for the issue — see :func:`has_live_spawn_for_issue`).
     """
     number = issue["number"]
     decision = evaluate_trust(issue)
@@ -1383,9 +1434,9 @@ def _process_selected(
         return
 
     # No linked PR yet — Phase 2 spawn path. Caller passes
-    # spawn/count_running/list_comments=None to disable (tests that
+    # spawn/count_running/has_live_spawn=None to disable (tests that
     # only care about hello/T1 paths can leave these out).
-    if spawn is None or count_running is None or list_comments is None:
+    if spawn is None or count_running is None or has_live_spawn is None:
         return
 
     if (ACTIVE_SM_LABEL, art_label) not in SPAWN_MAP:
@@ -1395,37 +1446,17 @@ def _process_selected(
         )
         return
 
-    # Dedup: do we already have an [SM] spawn-started audit comment?
-    try:
-        comments = list_comments(repo, number)
-    except GHCommandError as exc:
+    # Dedup on a live spawn dir (issue #115). The historic
+    # [SM] spawn-started audit comment is NOT consulted — if the
+    # worker died after posting the comment but before opening a PR,
+    # we want the next pass to retry, not be permanently gated by the
+    # comment. ``has_live_spawn`` also reaps any stale spawn-<N>-* dirs
+    # into ``.finished/`` so they don't keep getting re-checked.
+    if has_live_spawn(number):
         log(
-            f"[sm-dispatcher] failed to list comments for #{number}: {exc}"
+            f"[sm-dispatcher] spawn skip #{number}: live spawn dir "
+            f"already running"
         )
-        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
-            raise
-        return
-    already_spawned = False
-    for c in comments:
-        if not isinstance(c, dict):
-            continue
-        cb = c.get("body")
-        ca = c.get("author")
-        if isinstance(ca, dict):
-            login = ca.get("login")
-        elif isinstance(ca, str):
-            login = ca
-        else:
-            login = None
-        if (
-            isinstance(cb, str)
-            and cb.startswith(SPAWN_STARTED_PREFIX)
-            and isinstance(login, str)
-            and login in TRUSTED_AUTHORS
-        ):
-            already_spawned = True
-            break
-    if already_spawned:
         return
 
     live = count_running()
@@ -1774,13 +1805,13 @@ def run(
     state_path: pathlib.Path,
     list_issues: ListIssuesFn | None = None,
     list_stale_closed: ListIssuesFn | None = None,
-    list_comments: ListCommentsFn | None = None,
     post_comment: PostCommentFn = gh_post_comment,
     edit_labels: EditLabelsFn = gh_edit_labels,
     close_issue: CloseIssueFn = gh_close_issue,
     find_linked_pr: FindLinkedPRFn = gh_find_linked_pr,
     pr_merge_status: PRMergeStatusFn = gh_get_pr_merge_status,
     master_ci_status: MasterCIStatusFn = gh_get_master_ci_status,
+    has_live_spawn: Callable[[int], bool] | None = None,
     count_running: Callable[[], int] | None = None,
     spawn: Callable[[dict[str, Any], str, str], str | None] | None = None,
     enable_spawn: bool = True,
@@ -1804,10 +1835,12 @@ def run(
     if enable_spawn:
         # Default to live production wiring when the caller hasn't
         # provided test fixtures. enable_spawn=False is the test escape
-        # hatch — leaves list_comments / count_running / spawn as None,
-        # so :func:`_process_selected` short-circuits the spawn branch.
-        if list_comments is None:
-            list_comments = gh_list_issue_comments
+        # hatch — leaves has_live_spawn / count_running / spawn as
+        # None, so :func:`_process_selected` short-circuits the spawn
+        # branch.
+        if has_live_spawn is None:
+            def has_live_spawn(number: int) -> bool:
+                return has_live_spawn_for_issue(number, SPAWN_DIR, log=log)
         if count_running is None:
             def count_running() -> int:
                 return count_running_spawns(SPAWN_DIR, log=log)
@@ -1872,7 +1905,7 @@ def run(
                     post_comment=post_comment,
                     edit_labels=edit_labels,
                     find_linked_pr=find_linked_pr,
-                    list_comments=list_comments,
+                    has_live_spawn=has_live_spawn,
                     count_running=count_running,
                     spawn=spawn,
                     max_concurrent_spawns=max_concurrent_spawns,
