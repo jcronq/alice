@@ -225,6 +225,87 @@ def test_multiple_open_subagents(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# SM-dispatcher spawns
+
+
+def _spawn_dir(p: Paths, name: str) -> pathlib.Path:
+    d = p.state_dir / "sm-dispatcher-spawns" / name
+    d.mkdir(parents=True)
+    return d
+
+
+def test_open_sm_spawn_detected(tmp_path):
+    p = _paths(tmp_path)
+    now = time.time()
+    d = _spawn_dir(p, "spawn-107-1778600000")
+    # Use our own PID — guaranteed alive for the duration of the test.
+    (d / "pidfile").write_text(str(__import__("os").getpid()))
+    (d / "prompt.txt").write_text(
+        "You are a code-worker agent ...\n"
+        "Artifact type: art:code\n\nIssue body:\n..."
+    )
+    (d / "stdout.log").write_text("first line\nlast status line\n")
+    jobs = sources.list_running_jobs(p, now_ts=now)
+    spawns = [j for j in jobs if j.kind == "sm_spawn"]
+    assert len(spawns) == 1
+    s = spawns[0]
+    assert s.job_id == "spawn-107-1778600000"
+    assert s.detail["issue_number"] == 107
+    assert s.detail["art_label"] == "art:code"
+    assert "#107" in s.what
+    assert "last status line" in s.what
+
+
+def test_sm_spawn_dead_pid_not_listed(tmp_path):
+    p = _paths(tmp_path)
+    now = time.time()
+    d = _spawn_dir(p, "spawn-200-1778600001")
+    # PID 0 never refers to a real process; os.kill(0, 0) signals the
+    # current process group, so we use a high impossible PID instead.
+    # 2**31 - 1 is the max PID and is reliably unused on a normal box.
+    (d / "pidfile").write_text(str(2**31 - 1))
+    (d / "prompt.txt").write_text("Artifact type: art:research\n")
+    jobs = sources.list_running_jobs(p, now_ts=now)
+    assert [j for j in jobs if j.kind == "sm_spawn"] == []
+
+
+def test_sm_spawn_missing_pidfile_skipped(tmp_path):
+    p = _paths(tmp_path)
+    now = time.time()
+    _spawn_dir(p, "spawn-300-1778600002")  # no pidfile written
+    jobs = sources.list_running_jobs(p, now_ts=now)
+    assert [j for j in jobs if j.kind == "sm_spawn"] == []
+
+
+def test_sm_spawn_finished_dir_skipped(tmp_path):
+    """``.finished/`` holds dead-reaped spawns; the running view must
+    not surface them even if a stale pidfile inside happens to match a
+    live PID."""
+    p = _paths(tmp_path)
+    now = time.time()
+    finished = p.state_dir / "sm-dispatcher-spawns" / ".finished" / "spawn-400-1"
+    finished.mkdir(parents=True)
+    (finished / "pidfile").write_text(str(__import__("os").getpid()))
+    (finished / "prompt.txt").write_text("Artifact type: art:code\n")
+    jobs = sources.list_running_jobs(p, now_ts=now)
+    assert [j for j in jobs if j.kind == "sm_spawn"] == []
+
+
+def test_sm_spawn_stale_dropped(tmp_path):
+    p = _paths(tmp_path)
+    now = time.time()
+    d = _spawn_dir(p, "spawn-500-1778500000")
+    (d / "pidfile").write_text(str(__import__("os").getpid()))
+    (d / "prompt.txt").write_text("Artifact type: art:code\n")
+    import os as _os
+
+    old = now - 10800  # 3h ago
+    _os.utime(d, (old, old))
+    jobs = sources.list_running_jobs(p, now_ts=now, stale_threshold_s=7200)
+    assert [j for j in jobs if j.kind == "sm_spawn"] == []
+
+
+# ---------------------------------------------------------------------------
 # Sort order
 
 

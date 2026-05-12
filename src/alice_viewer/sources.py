@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import pathlib
 import re
 import time
@@ -1951,17 +1952,19 @@ def now() -> float:
 # Currently-running jobs (the /running tab)
 #
 # A "job" is anything observable that has a start signal but no matching
-# completion signal yet. Three kinds:
-#   - wake:      thinking wake (one at a time, serial)
+# completion signal yet. Kinds:
+#   - wake:       thinking wake (one at a time, serial)
 #   - experiment: alice-experiment dispatch (multiple possible)
-#   - subagent:  speaking background_task_dispatch_request (multiple possible)
+#   - subagent:   speaking background_task_dispatch_request (multiple possible)
+#   - talking:    speaking turn (signal/cli/discord/viewer-chat/...)
+#   - sm_spawn:   SM-dispatcher claude worker spawned for an sm:selected issue
 # Jobs older than ``stale_threshold_s`` are dropped — they're zombies
 # from crashed runtimes, not actually-running work.
 
 
 @dataclass
 class RunningJob:
-    kind: str  # "wake" | "experiment" | "subagent" | "talking"
+    kind: str  # "wake" | "experiment" | "subagent" | "talking" | "sm_spawn"
     job_id: str
     started_at: float  # unix ts
     elapsed_s: float
@@ -2228,6 +2231,121 @@ def _open_experiments(
     return out
 
 
+# spawn dir layout: ``<spawn_dir>/spawn-<issue>-<unix_ts>/{pidfile,
+# prompt.txt, stdout.log, stderr.log}``. The dispatcher reaps dead
+# spawns into ``.finished/``; the running tab only ever needs the live
+# (top-level) entries.
+_SM_SPAWN_NAME_RE = re.compile(r"^spawn-(\d+)-(\d+)$")
+_SM_SPAWN_ART_RE = re.compile(r"^Artifact type:\s*(art:\S+)", re.MULTILINE)
+
+
+def _read_last_line(path: pathlib.Path, max_bytes: int = 16 * 1024) -> str:
+    """Return the last non-blank line of ``path`` (or ``""``). Reads at
+    most ``max_bytes`` from the tail, so it's safe on a streaming log
+    that grows without bound."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return ""
+    if size == 0:
+        return ""
+    try:
+        with path.open("rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+                f.readline()  # drop probable partial leading line
+            tail = f.read()
+    except OSError:
+        return ""
+    for raw in reversed(tail.splitlines()):
+        line = raw.decode("utf-8", errors="replace").strip()
+        if line:
+            return line
+    return ""
+
+
+def _open_sm_spawns(
+    spawn_dir: pathlib.Path,
+    cutoff_ts: float,
+    now_ts: float,
+) -> list[RunningJob]:
+    """A SM-dispatcher spawn is "open" if its ``pidfile`` points at a
+    live PID. The dispatcher reaps dead spawns into ``.finished/`` on
+    its next pass, but we also liveness-check here so a spawn that died
+    between dispatcher passes doesn't linger on /running.
+    """
+    if not spawn_dir.is_dir():
+        return []
+    out: list[RunningJob] = []
+    for child in spawn_dir.iterdir():
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        m = _SM_SPAWN_NAME_RE.match(child.name)
+        if not m:
+            continue
+        issue_number = int(m.group(1))
+        pidfile = child / "pidfile"
+        if not pidfile.is_file():
+            continue
+        try:
+            pid = int(pidfile.read_text().strip())
+        except (OSError, ValueError):
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            # PID was recycled by the OS — original spawn is gone.
+            continue
+        except OSError:
+            # Unexpected; be conservative and skip (rather than
+            # mis-listing a possibly-dead spawn).
+            continue
+        try:
+            ts = child.stat().st_mtime
+        except OSError:
+            try:
+                ts = pidfile.stat().st_mtime
+            except OSError:
+                continue
+        if ts < cutoff_ts:
+            continue
+        # Parse the artifact label out of prompt.txt — dispatcher writes
+        # it as a literal ``Artifact type: art:<kind>`` line.
+        art_label = "art:unknown"
+        prompt_path = child / "prompt.txt"
+        if prompt_path.is_file():
+            try:
+                text = prompt_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+            am = _SM_SPAWN_ART_RE.search(text)
+            if am:
+                art_label = am.group(1)
+        tail = _read_last_line(child / "stdout.log")
+        if tail:
+            what = f"#{issue_number} · {art_label} · {_trim(tail, 140)}"
+        else:
+            what = f"#{issue_number} · {art_label}"
+        out.append(
+            RunningJob(
+                kind="sm_spawn",
+                job_id=child.name,
+                started_at=ts,
+                elapsed_s=max(0.0, now_ts - ts),
+                what=what,
+                detail={
+                    "issue_number": issue_number,
+                    "art_label": art_label,
+                    "pid": pid,
+                    "spawn_dir": str(child),
+                },
+            )
+        )
+    return out
+
+
 def list_running_jobs(
     paths: Paths,
     now_ts: float | None = None,
@@ -2242,6 +2360,8 @@ def list_running_jobs(
         without a completion line in ``experiments.jsonl``
       - speaking sub-agents: ``background_task_dispatch_request``
         without matching ``background_task_dispatch_complete`` by handle
+      - SM-dispatcher spawns: ``<state>/sm-dispatcher-spawns/spawn-*/``
+        whose ``pidfile`` points to a live PID
 
     Jobs whose start signal is older than ``stale_threshold_s`` are
     treated as zombies (crashed runtime, never completed) and dropped.
@@ -2256,5 +2376,10 @@ def list_running_jobs(
     jobs.extend(_open_experiments(paths.mind_dir, cutoff, now_ts))
     jobs.extend(_open_subagents(paths.speaking_log, cutoff, now_ts))
     jobs.extend(_open_speaking_turns(paths.speaking_log, cutoff, now_ts))
+    jobs.extend(
+        _open_sm_spawns(
+            paths.state_dir / "sm-dispatcher-spawns", cutoff, now_ts
+        )
+    )
     jobs.sort(key=lambda j: j.started_at, reverse=True)
     return jobs

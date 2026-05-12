@@ -4,10 +4,10 @@
   <h1>running</h1>
   <p class="muted">
     What's in flight right now. Talking turns (signal/cli/discord/
-    viewer-chat/etc.), thinking wakes, experiments, and background
-    sub-agents — anything with a start signal but no completion yet.
-    Auto-refreshes every 5s via partial swap. Jobs older than 2h are
-    treated as zombies and dropped.
+    viewer-chat/etc.), thinking wakes, experiments, background
+    sub-agents, and SM-dispatcher spawns — anything with a start
+    signal but no completion yet. Auto-refreshes every 5s via partial
+    swap. Jobs older than 2h are treated as zombies and dropped.
   </p>
 
   <div id="running-list"
@@ -35,6 +35,7 @@
     .running-wake .running-kind       { background: #3b5e8e; color: #e8f0ff; }
     .running-experiment .running-kind { background: #5e3b8e; color: #f0e8ff; }
     .running-subagent .running-kind   { background: #3b8e5e; color: #e8ffe8; }
+    .running-sm_spawn .running-kind   { background: #8e3b3b; color: #ffe8e8; }
     .running-what {
       grid-column: 2; grid-row: 1; font-size: 14px; color: var(--text);
       overflow: hidden; text-overflow: ellipsis;
