@@ -50,6 +50,10 @@ alice-viewer = "alice_viewer.main:run"
 # is invisible to thinking. The CLI is a parallel surface targeting pi-mono;
 # the MCP path still serves AnthropicKernel-driven wakes.
 alice-experiment = "alice_thinking.cli.experiment:main"
+# One-shot State Machine v0 dispatcher — polls jcronq/alice for sm:selected
+# issues, trust-filters them, and posts a dispatcher-hello comment. Invoke
+# on a cadence (later: s6 supervisor); for now it's manual.
+alice-sm = "alice_sm.dispatcher:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -62,6 +66,7 @@ build-backend = "hatchling.build"
 #   alice_pi        — Kernel impl backed by pi-coding-agent subprocess
 #   alice_prompts   — Jinja2 templates the runtime renders into model prompts
 #   alice_skills    — registry over .claude/skills/ markdown (plan 07)
+#   alice_sm        — State Machine dispatcher (poll → trust-filter → comment)
 #   alice_speaking  — Signal daemon (composes kernel with producers/handlers/outbox)
 #   alice_thinking  — one-shot wake (python -m alice_thinking)
 #   alice_viewer    — FastAPI observability UI (serves /state logs)
@@ -74,6 +79,7 @@ packages = [
     "src/alice_pi",
     "src/alice_prompts",
     "src/alice_skills",
+    "src/alice_sm",
     "src/alice_speaking",
     "src/alice_thinking",
     "src/alice_viewer",
