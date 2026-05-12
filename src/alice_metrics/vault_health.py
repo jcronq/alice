@@ -222,12 +222,19 @@ def _build_resolution_index(
     return by_slug, slugs_to_aliases, alias_lower_to_slug
 
 
-def _extract_targets(body: str) -> list[str]:
+def _extract_targets(body: str, *, rescue_inline: bool = True) -> list[str]:
     """Extract ``[[target]]`` / ``[[target|alias]]`` wikilink targets,
     excluding code spans / fences / HTML comments. Returns normalized
-    targets (anchors stripped, basename only)."""
+    targets (anchors stripped, basename only).
+
+    ``rescue_inline`` is forwarded to ``extract_wikilinks``. The default
+    preserves orphan / inbound-link semantics (a slug-shaped wikilink in
+    a backtick span still counts as a reference); the broken-link metric
+    overrides it to ``False`` because documentation snippets must not
+    contribute to the broken-link count.
+    """
     body_no_comments = _strip_html_comments(body)
-    raw = extract_wikilinks(body_no_comments)
+    raw = extract_wikilinks(body_no_comments, rescue_inline=rescue_inline)
     return [_normalize_target(t) for t in raw if _normalize_target(t)]
 
 
@@ -263,7 +270,12 @@ def count_broken_wikilinks(
     for md in _iter_notes(vault_dir):
         text = _read_text(md)
         _fm, body = split_frontmatter(text)
-        targets = _extract_targets(body)
+        # Strict mode: a slug-shaped wikilink that appears only inside a
+        # backtick code span is documentation, not a real reference, so we
+        # don't rescue it. Otherwise notes that document the wikilink
+        # syntax (``[[example-target]]``) would inflate the broken-link
+        # count with synthetic targets.
+        targets = _extract_targets(body, rescue_inline=False)
         rel = str(md.relative_to(vault_dir))
         for target in targets:
             if not _resolve(target, by_slug, alias_lower_to_slug):

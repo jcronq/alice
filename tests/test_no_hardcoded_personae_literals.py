@@ -50,6 +50,13 @@ ALLOWLIST_FILES: frozenset[str] = frozenset(
         # it from personae in production, but the SDK-side default must
         # remain a literal string.
         "alice_speaking/transports/a2a.py",
+        # Haiku-tier run-summary prompt template: names the agent
+        # descriptively inside the system prompt ("the agent (named
+        # Alice)…", "Write the summary in third person ('Alice did X')").
+        # These are descriptive prose for the summariser model, not
+        # config defaults — substituting from personae would hurt prompt
+        # quality without changing behaviour.
+        "alice_viewer/run_summary.py",
     }
 )
 

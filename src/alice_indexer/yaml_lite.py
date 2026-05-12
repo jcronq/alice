@@ -239,8 +239,20 @@ def _rescue_backtick_wikilinks(body: str) -> list[str]:
     return targets
 
 
-def extract_wikilinks(body: str) -> list[str]:
-    """Return raw wikilink targets (display alias stripped). May contain folder/ prefixes."""
+def extract_wikilinks(body: str, *, rescue_inline: bool = True) -> list[str]:
+    """Return raw wikilink targets (display alias stripped). May contain folder/ prefixes.
+
+    ``rescue_inline`` controls whether slug-shaped wikilinks that live inside
+    inline backtick spans are recovered. The default (``True``) preserves the
+    behaviour the indexer + orphan/inbound-link metrics rely on: a daily entry
+    that references `` `[[note-slug]]` `` should still count as an inbound
+    link, so the target isn't falsely flagged as orphaned.
+
+    The broken-wikilink metric passes ``rescue_inline=False`` because the
+    contract there is stricter — ``[[foo]]`` inside any code span (single
+    backtick, double backtick, or a fenced block) is documentation, not a
+    real reference, and must not contribute to the broken-link count.
+    """
     cleaned = _strip_code(body)
     targets = []
     for m in _WIKILINK_RE.finditer(cleaned):
@@ -250,8 +262,9 @@ def extract_wikilinks(body: str) -> list[str]:
             target = target.split("#", 1)[0].strip()
         if target:
             targets.append(target)
-    # Rescue slug-shaped wikilinks that lived inside inline code spans
-    # (e.g. `` `[[note-slug]]` `` in daily entries). Without this, those
-    # references go missing and target notes appear orphaned.
-    targets.extend(_rescue_backtick_wikilinks(body))
+    if rescue_inline:
+        # Rescue slug-shaped wikilinks that lived inside inline code spans
+        # (e.g. `` `[[note-slug]]` `` in daily entries). Without this, those
+        # references go missing and target notes appear orphaned.
+        targets.extend(_rescue_backtick_wikilinks(body))
     return targets
