@@ -323,3 +323,405 @@ def test_multiple_mixed_issues_in_one_pass(state_path: pathlib.Path) -> None:
     assert report.skipped_trust == 4
     state = json.loads(state_path.read_text())
     assert sorted(state["hello_commented"]) == [20, 25]
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.5 — label transitions on PR + CI events
+# ---------------------------------------------------------------------------
+
+
+class LabelRecorder:
+    """Captures gh_edit_labels invocations."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def __call__(
+        self,
+        repo: str,
+        number: int,
+        *,
+        add: tuple = (),
+        remove: tuple = (),
+    ) -> None:
+        self.calls.append(
+            {
+                "repo": repo,
+                "number": number,
+                "add": list(add),
+                "remove": list(remove),
+            }
+        )
+
+
+class CloseRecorder:
+    """Captures gh_close_issue invocations."""
+
+    def __init__(self) -> None:
+        self.closed: list[tuple[str, int]] = []
+
+    def __call__(self, repo: str, number: int) -> None:
+        self.closed.append((repo, number))
+
+
+def _no_pr(_repo: str, _n: int) -> dict | None:
+    return None
+
+
+def _no_call(*_a, **_kw) -> dict:
+    raise AssertionError("should not be called")
+
+
+def test_t1_selected_with_linked_pr_transitions_to_reviewing(
+    state_path: pathlib.Path,
+) -> None:
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    issues = [_make_issue(50)]
+
+    def find_pr(_repo: str, n: int) -> dict | None:
+        if n == 50:
+            return {"number": 99, "url": "https://github.com/jcronq/alice/pull/99"}
+        return None
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda repo: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        now_iso=_frozen_now,
+        log=lambda _msg: None,
+    )
+
+    assert exit_code == 0
+    # Two comments: hello + transition.
+    bodies = [body for _r, _n, body in recorder.posted]
+    assert any("dispatcher-hello task=#50" in b for b in bodies)
+    assert any(
+        '[SM] transition from=selected to=reviewing reason="PR opened: '
+        'https://github.com/jcronq/alice/pull/99"' in b
+        for b in bodies
+    )
+    # Label edit: add reviewing, remove selected.
+    assert len(label_rec.calls) == 1
+    edit = label_rec.calls[0]
+    assert edit["number"] == 50
+    assert edit["add"] == ["sm:reviewing"]
+    assert edit["remove"] == ["sm:selected"]
+    # Issue NOT closed.
+    assert close_rec.closed == []
+    assert report.transitioned == 1
+    assert (50, "sm:selected", "sm:reviewing") in report.transitions
+
+
+def test_t1_selected_without_linked_pr_stays(state_path: pathlib.Path) -> None:
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    issues = [_make_issue(51)]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda repo: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        now_iso=_frozen_now,
+        log=lambda _msg: None,
+    )
+
+    assert exit_code == 0
+    # Hello posted, no transition.
+    assert len(recorder.posted) == 1
+    assert "dispatcher-hello" in recorder.posted[0][2]
+    assert label_rec.calls == []
+    assert close_rec.closed == []
+    assert report.transitioned == 0
+
+
+def test_t2_reviewing_merged_green_ci_transitions_to_done_and_closes(
+    state_path: pathlib.Path,
+) -> None:
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    issues = [_make_issue(60, sm_labels=("sm:reviewing",))]
+
+    def find_pr(_repo: str, n: int) -> dict | None:
+        if n == 60:
+            return {"number": 110, "url": "https://github.com/jcronq/alice/pull/110"}
+        return None
+
+    def merge_status(_repo: str, pr_number: int) -> dict:
+        assert pr_number == 110
+        return {
+            "merged": True,
+            "merge_commit_oid": "abc123def456",
+            "pr_url": "https://github.com/jcronq/alice/pull/110",
+        }
+
+    def ci(_repo: str, sha: str) -> dict:
+        assert sha == "abc123def456"
+        return {
+            "conclusion": "success",
+            "run_url": "https://github.com/jcronq/alice/actions/runs/777",
+        }
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda repo: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=ci,
+        now_iso=_frozen_now,
+        log=lambda _msg: None,
+    )
+
+    assert exit_code == 0
+    assert close_rec.closed == [("jcronq/alice", 60)]
+    assert len(label_rec.calls) == 1
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:done"]
+    assert edit["remove"] == ["sm:reviewing"]
+    bodies = [body for _r, _n, body in recorder.posted]
+    assert any(
+        '[SM] transition from=reviewing to=done reason="PR merged: '
+        'https://github.com/jcronq/alice/pull/110, CI green on abc123def456"' in b
+        for b in bodies
+    )
+    assert report.transitioned == 1
+    assert (60, "sm:reviewing", "sm:done") in report.transitions
+
+
+def test_t3_reviewing_merged_red_ci_transitions_to_building_no_close(
+    state_path: pathlib.Path,
+) -> None:
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    issues = [_make_issue(61, sm_labels=("sm:reviewing",))]
+
+    def find_pr(_repo: str, n: int) -> dict | None:
+        return {"number": 111, "url": "https://github.com/jcronq/alice/pull/111"}
+
+    def merge_status(_repo: str, _pr: int) -> dict:
+        return {
+            "merged": True,
+            "merge_commit_oid": "deadbeef",
+            "pr_url": "https://github.com/jcronq/alice/pull/111",
+        }
+
+    def ci(_repo: str, _sha: str) -> dict:
+        return {
+            "conclusion": "failure",
+            "run_url": "https://github.com/jcronq/alice/actions/runs/888",
+        }
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda repo: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=ci,
+        now_iso=_frozen_now,
+        log=lambda _msg: None,
+    )
+
+    assert exit_code == 0
+    # NOT closed.
+    assert close_rec.closed == []
+    assert len(label_rec.calls) == 1
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:building"]
+    assert edit["remove"] == ["sm:reviewing"]
+    bodies = [body for _r, _n, body in recorder.posted]
+    assert any(
+        '[SM] transition from=reviewing to=building reason="CI red on merge: '
+        'https://github.com/jcronq/alice/actions/runs/888"' in b
+        for b in bodies
+    )
+    assert report.transitioned == 1
+    assert (61, "sm:reviewing", "sm:building") in report.transitions
+
+
+def test_t2_t3_reviewing_merged_pending_ci_stays(state_path: pathlib.Path) -> None:
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    issues = [_make_issue(62, sm_labels=("sm:reviewing",))]
+
+    def find_pr(_repo: str, _n: int) -> dict | None:
+        return {"number": 112, "url": "https://example/pr/112"}
+
+    def merge_status(_repo: str, _pr: int) -> dict:
+        return {
+            "merged": True,
+            "merge_commit_oid": "1234",
+            "pr_url": "https://example/pr/112",
+        }
+
+    def ci(_repo: str, _sha: str) -> dict:
+        return {"conclusion": "pending", "run_url": None}
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda repo: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=ci,
+        now_iso=_frozen_now,
+        log=lambda _msg: None,
+    )
+
+    assert exit_code == 0
+    assert recorder.posted == []
+    assert label_rec.calls == []
+    assert close_rec.closed == []
+    assert report.transitioned == 0
+
+
+def test_t2_t3_reviewing_pr_still_open_stays(state_path: pathlib.Path) -> None:
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    issues = [_make_issue(63, sm_labels=("sm:reviewing",))]
+
+    def find_pr(_repo: str, _n: int) -> dict | None:
+        return {"number": 113, "url": "https://example/pr/113"}
+
+    def merge_status(_repo: str, _pr: int) -> dict:
+        return {"merged": False, "merge_commit_oid": None, "pr_url": None}
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda repo: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=_no_call,
+        now_iso=_frozen_now,
+        log=lambda _msg: None,
+    )
+
+    assert exit_code == 0
+    assert recorder.posted == []
+    assert label_rec.calls == []
+    assert close_rec.closed == []
+    assert report.transitioned == 0
+
+
+def test_phase_1_5_no_action_on_building_label(state_path: pathlib.Path) -> None:
+    """Phase 1.5 doesn't act on sm:building, even with a linked PR."""
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    issues = [_make_issue(70, sm_labels=("sm:building",))]
+
+    def find_pr(_repo: str, _n: int) -> dict | None:
+        return {"number": 114, "url": "https://example/pr/114"}
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda repo: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        now_iso=_frozen_now,
+        log=lambda _msg: None,
+    )
+
+    assert exit_code == 0
+    assert recorder.posted == []
+    assert label_rec.calls == []
+    assert close_rec.closed == []
+    assert report.transitioned == 0
+
+
+def test_v0_hello_dedup_still_works_alongside_phase_1_5(
+    state_path: pathlib.Path,
+) -> None:
+    """Mixed state: a previously-helloed sm:selected issue with a fresh
+    linked PR still transitions, but does NOT re-post the hello."""
+    # Pre-seed state file with #80 already helloed.
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({"version": sm.STATE_VERSION, "hello_commented": [80]})
+    )
+
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    issues = [
+        _make_issue(80),  # already helloed → skip hello, but transition T1
+        _make_issue(81),  # fresh → hello + (no PR) stay
+    ]
+
+    def find_pr(_repo: str, n: int) -> dict | None:
+        if n == 80:
+            return {"number": 200, "url": "https://example/pr/200"}
+        return None
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda repo: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        now_iso=_frozen_now,
+        log=lambda _msg: None,
+    )
+
+    assert exit_code == 0
+    # #80: no hello (dedup), but T1 transition comment posted.
+    # #81: hello posted, no transition (no PR).
+    bodies_by_number: dict[int, list[str]] = {}
+    for _r, n, body in recorder.posted:
+        bodies_by_number.setdefault(n, []).append(body)
+    assert 80 in bodies_by_number
+    assert all("dispatcher-hello" not in b for b in bodies_by_number[80])
+    assert any(
+        "transition from=selected to=reviewing" in b for b in bodies_by_number[80]
+    )
+    assert 81 in bodies_by_number
+    assert any("dispatcher-hello task=#81" in b for b in bodies_by_number[81])
+    # Skipped dedup count for #80.
+    assert report.skipped_dedup == 1
+    # T1 fired exactly once (for #80).
+    assert report.transitioned == 1
+    assert (80, "sm:selected", "sm:reviewing") in report.transitions
+    # State file: #81 added; #80 retained.
+    state = json.loads(state_path.read_text())
+    assert sorted(state["hello_commented"]) == [80, 81]
