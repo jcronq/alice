@@ -102,7 +102,13 @@ _inflight: set[asyncio.Task] = set()
 # the schema 2 → 3 bump). The semaphore queues schedules without
 # blocking the FastAPI request, so the timeline still paints
 # instantly; summaries fill in serially behind the scenes.
-_MAX_CONCURRENT = int(os.environ.get("ALICE_RUN_SUMMARY_CONCURRENCY", "2"))
+# Concurrency cap. Without this, a CACHE_SCHEMA bump (or a fresh
+# /wakes page render after a viewer recreate) fires a stampede of
+# Haiku calls — bounded but pointless. Was 2; bumped to 8 because at
+# 2, a 50-row page took ~2 min to fully populate ("all summarising…"
+# for the operator). 8 fills a page in ~15-30s, and the Anthropic
+# Haiku endpoint is rate-limit-tolerant + cheap.
+_MAX_CONCURRENT = int(os.environ.get("ALICE_RUN_SUMMARY_CONCURRENCY", "8"))
 _semaphore: asyncio.Semaphore | None = None
 
 
