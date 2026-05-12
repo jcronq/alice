@@ -4,7 +4,8 @@
   <h1>narrative · what's been happening</h1>
   <p class="muted">
     Claude (sonnet-4-6) reads a digest of recent wakes, turns, surfaces, notes, emergencies,
-    and thoughts and writes a short story about what {{ personae.agent.name }} has been up to. Cached for 5 minutes.
+    and thoughts and writes a structured report — TL;DR, what happened, key facts, timeline —
+    on what {{ personae.agent.name }} has been up to. Cached for 5 minutes.
   </p>
 
   <div class="filter-bar">
@@ -28,9 +29,38 @@
       max-width: 820px; min-height: 200px;
     }
     .narrative-body p { margin: 0 0 1em; }
-    .narrative-body code { background: var(--panel-2); padding: 1px 5px; border-radius: 3px; font-size: 13px; }
+    .narrative-body code { background: var(--panel-2); padding: 1px 5px; border-radius: 3px; font-size: 13px; font-family: var(--mono, monospace); }
     .narrative-body em { color: var(--muted); }
     .narrative-body strong { color: var(--accent); }
+    .narrative-body h2 {
+      font-family: var(--mono, monospace); font-size: 13px; color: var(--accent);
+      text-transform: uppercase; letter-spacing: 0.06em; margin: 1.5em 0 0.6em;
+      padding-bottom: 4px; border-bottom: 1px solid var(--border); font-weight: 600;
+    }
+    .narrative-body h2:first-child { margin-top: 0; }
+    .narrative-body h3 {
+      font-family: var(--mono, monospace); font-size: 12px; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.04em; margin: 1.2em 0 0.4em; font-weight: 600;
+    }
+    .narrative-body table {
+      border-collapse: collapse; margin: 0.4em 0 1.2em; width: 100%;
+      font-family: var(--mono, monospace); font-size: 13px;
+    }
+    .narrative-body th, .narrative-body td {
+      text-align: left; padding: 6px 12px 6px 0; border-bottom: 1px solid var(--border);
+      line-height: 1.4; vertical-align: top;
+    }
+    .narrative-body th {
+      color: var(--muted); font-weight: 600; font-size: 11px;
+      text-transform: uppercase; letter-spacing: 0.05em;
+    }
+    .narrative-body ul, .narrative-body ol { margin: 0.4em 0 1.2em; padding-left: 1.4em; }
+    .narrative-body li { margin: 0.2em 0; line-height: 1.5; }
+    .narrative-body hr { border: none; border-top: 1px solid var(--border); margin: 1.5em 0; }
+    .narrative-body blockquote {
+      border-left: 3px solid var(--border); margin: 0.5em 0 1em; padding: 0.2em 0 0.2em 1em;
+      color: var(--muted); font-style: italic;
+    }
     .filter-btn {
       background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
       padding: 4px 12px; border-radius: 4px; cursor: pointer; font-family: var(--mono);
@@ -59,16 +89,14 @@
       let es = null;
 
       function render() {
-        // Tiny inline markdown: **bold**, *italic*/_italic_, `code`, paragraphs.
-        const escaped = buf.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-        let html = escaped
-          .replace(/`([^`]+)`/g, '<code>$1</code>')
-          .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-          .replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>')
-          .replace(/(^|[\s(])_([^_\n]+)_/g, '$1<em>$2</em>');
-        html = '<p>' + html.split(/\n\s*\n/).join('</p><p>') + '</p>';
-        html = html.replace(/\n/g, '<br>');
-        narrativeEl.innerHTML = html + '<span class="cursor"></span>';
+        // Full markdown via marked + DOMPurify (loaded in base.html).
+        // GFM enabled for tables; breaks=false so single newlines stay inside paragraphs.
+        const raw = marked.parse(buf, { breaks: false, gfm: true });
+        const clean = DOMPurify.sanitize(raw);
+        narrativeEl.innerHTML = clean;
+        const cursor = document.createElement('span');
+        cursor.className = 'cursor';
+        narrativeEl.appendChild(cursor);
       }
 
       function finalize() {

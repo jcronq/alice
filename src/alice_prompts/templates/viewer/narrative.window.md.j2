@@ -1,4 +1,4 @@
-You are writing a short narrative summary of what {{ agent.name }} has been doing.
+You are writing a structured report on what {{ agent.name }} did during a period.
 
 {{ agent.name }} has two hemispheres:
 - **Speaking {{ agent.name }}** (Opus, the voice that talks to {{ user.name }} and their trusted contacts over Signal).
@@ -6,16 +6,41 @@ You are writing a short narrative summary of what {{ agent.name }} has been doin
 
 They pass files between each other: *surfaces* (thinking → speaking: an insight sharp enough to voice), *notes* (speaking → thinking: fleeting thoughts filed for later grooming), *emergencies* (external monitors → speaking, bypassing quiet hours), *thoughts* (thinking's own wake journal).
 
-Below is a machine-generated digest of what happened over the last {{ window_label }}. Write a short narrative (aim for 250–400 words, markdown, no headers, no bullet walls) that:
+Below is a machine-generated digest of what happened over the last {{ window_label }}. Produce a four-section markdown report in this exact order, using the exact ## headings shown.
 
-1. Tells the story of what {{ agent.name }} did, in natural prose. Weave thinking wakes, signal turns, and cross-hemisphere artifacts into one thread — don't list them.
-2. Calls out anything notable: errors, timeouts, emergencies voiced or downgraded, repeated themes, unusual tool patterns, gaps of silence, the latest direction of {{ agent.name }}'s grooming.
-3. Refers to {{ agent.name }} in third person. {{ user.name }} and their trusted contacts are the people she talks to — but use the actual names from the digest whenever they're present rather than these generic labels. Be specific — use actual topic keywords you see in the digest rather than generic words like "conversation" or "tasks."
-4. If almost nothing happened, say so plainly in one or two sentences.
+## TL;DR
 
-Write only the narrative, nothing else. No preamble. No conclusion section. No bullet points unless the digest is genuinely a list of discrete items.
+One or two sentences capturing the highest-impact thing(s) that happened in the period. If almost nothing happened, say so here in one sentence and stop — skip the other three sections entirely.
 
-## Digest
+## What happened
+
+200–300 words of connected prose covering only the impactful events — judgement call on what's worth including, not an exhaustive log. Group related events into paragraphs by topic or thread (one thread per paragraph), not wake-by-wake. Refer to {{ agent.name }} in third person. Use the actual names from the digest (not generic labels like "the operator" or "trusted contacts"). Use the real topic keywords from the digest, not vague stand-ins like "conversation," "tasks," or "work."
+
+Write a status report, not fiction:
+- No dramatic temporal openers ("The hour opened with...", "By 20:32, Jason had surfaced...", "Friday evening closed quietly...").
+- No narrator transitions ("Alice then turned to...", "Meanwhile...", "With the cycle restored...").
+- No editorializing ("the fix was surgical", "fell silent", "the good news"). Just report what happened.
+- No cinematic closers. Stop when the events stop; do not summarize the system's emotional state.
+- Prefer plain verbs (sent, fixed, merged, ran) over dramatic ones (delivered, restored, shipped).
+- Past tense, neutral voice. Lead paragraphs with the subject and event, not a time-of-day flourish.
+
+## Key facts
+
+A two-column markdown table (Metric | Value) of 5–10 quantitative or categorical facts that matter for this period. Pick from what the digest actually supports — examples: PRs merged (with numbers), tests added, code commits, wake outages, errors/timeouts, surfaces voiced vs downgraded, vault deltas (orphan count change, broken-wikilink count, total notes change), thinking-wake counts split by mode (active / sleep B/C/D), signal turn count, longest gap of silence, dominant grooming theme, total cost or token usage if present. Use concrete numbers, not adjectives. Omit facts the digest can't ground.
+
+| Metric | Value |
+|---|---|
+| Example metric | concrete value with numbers |
+
+## Timeline
+
+A bullet list of timestamped events in chronological order, one short line per entry: `- HH:MM — actor and action`. Use 24-hour local time. Cap at ~15 entries; collapse runs of routine activity into a single entry like `- 20:50–21:00 — 8 Stage B grooming wakes, inbox empty`. Include: errors, signal turns, code merges, surfaces voiced, emergencies, vault state changes, mode transitions, conversation starts. Skip routine empty-inbox wakes unless they're the only thing that happened.
+
+Output only the four-section report. No preamble. No closing remarks. No extra sections. No code-fence wrapper around the whole thing.
+
+---
+
+Input digest:
 
 ```json
 {{ digest_json }}
