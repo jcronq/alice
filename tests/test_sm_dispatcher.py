@@ -382,7 +382,11 @@ def test_t1_selected_with_linked_pr_transitions_to_reviewing(
 
     def find_pr(_repo: str, n: int) -> dict | None:
         if n == 50:
-            return {"number": 99, "url": "https://github.com/jcronq/alice/pull/99"}
+            return {
+                "number": 99,
+                "url": "https://github.com/jcronq/alice/pull/99",
+                "state": "OPEN",
+            }
         return None
 
     exit_code, report = sm.run(
@@ -687,7 +691,11 @@ def test_v0_hello_dedup_still_works_alongside_phase_1_5(
 
     def find_pr(_repo: str, n: int) -> dict | None:
         if n == 80:
-            return {"number": 200, "url": "https://example/pr/200"}
+            return {
+                "number": 200,
+                "url": "https://example/pr/200",
+                "state": "OPEN",
+            }
         return None
 
     exit_code, report = sm.run(
@@ -725,3 +733,86 @@ def test_v0_hello_dedup_still_works_alongside_phase_1_5(
     # State file: #81 added; #80 retained.
     state = json.loads(state_path.read_text())
     assert sorted(state["hello_commented"]) == [80, 81]
+
+
+def test_reviewing_merged_pr_with_green_ci_transitions_to_done_via_real_finder(
+    state_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end on the real gh_find_linked_pr: a MERGED PR linked to an
+    sm:reviewing issue must be discoverable so T2 can fire.
+
+    This test would have failed before the ``--state all`` fix:
+    ``gh_find_linked_pr`` previously queried ``--state open``, so a
+    merged PR was invisible, _process_reviewing logged
+    "no linked PR found — staying", and the issue was stuck at
+    sm:reviewing forever (the live #86/#85 repro on jcronq/alice).
+    """
+    captured_args: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], *, timeout: int = 60) -> str:
+        captured_args.append(args)
+        # gh pr list — return a merged PR linking the issue.
+        if "pr" in args and "list" in args:
+            return json.dumps(
+                [
+                    {
+                        "number": 85,
+                        "url": "https://github.com/jcronq/alice/pull/85",
+                        "state": "MERGED",
+                        "closingIssuesReferences": [{"number": 86}],
+                    }
+                ]
+            )
+        raise AssertionError(f"unexpected gh invocation: {args!r}")
+
+    monkeypatch.setattr(sm, "_run_gh", fake_run_gh)
+
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    issues = [_make_issue(86, sm_labels=("sm:reviewing",))]
+
+    def merge_status(_repo: str, pr_number: int) -> dict:
+        assert pr_number == 85
+        return {
+            "merged": True,
+            "merge_commit_oid": "e434e93",
+            "pr_url": "https://github.com/jcronq/alice/pull/85",
+        }
+
+    def ci(_repo: str, sha: str) -> dict:
+        assert sha == "e434e93"
+        return {
+            "conclusion": "success",
+            "run_url": "https://github.com/jcronq/alice/actions/runs/999",
+        }
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda repo: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        # Use the real gh_find_linked_pr — _run_gh is monkeypatched.
+        find_linked_pr=sm.gh_find_linked_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=ci,
+        now_iso=_frozen_now,
+        log=lambda _msg: None,
+    )
+
+    assert exit_code == 0
+    # The fix: gh_find_linked_pr must use --state all.
+    pr_list_args = captured_args[0]
+    state_idx = pr_list_args.index("--state")
+    assert pr_list_args[state_idx + 1] == "all"
+    # End-to-end: issue transitioned to sm:done and closed.
+    assert close_rec.closed == [("jcronq/alice", 86)]
+    assert len(label_rec.calls) == 1
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:done"]
+    assert edit["remove"] == ["sm:reviewing"]
+    assert report.transitioned == 1
+    assert (86, "sm:reviewing", "sm:done") in report.transitions

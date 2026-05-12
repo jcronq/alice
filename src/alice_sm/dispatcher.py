@@ -378,12 +378,17 @@ def gh_close_issue(repo: str, number: int, *, gh_bin: str = "gh") -> None:
 def gh_find_linked_pr(
     repo: str, issue_number: int, *, gh_bin: str = "gh"
 ) -> dict[str, Any] | None:
-    """Return the first open PR referencing this issue, or None.
+    """Return the first PR referencing this issue, or None.
 
     Uses ``gh pr list --search "linked:issue"`` (which returns PRs that
     have a "Closes #N"-style link) and filters by
     ``closingIssuesReferences`` containing the issue number. First
     match wins; later phases may need ordering rules.
+
+    Queries ``--state all`` so callers in the T2/T3 path can find the
+    linked PR after it has merged. Callers in the T1 path (sm:selected
+    → sm:reviewing) must filter by the returned ``state`` field — T1
+    should only fire when the linked PR is still ``OPEN``.
     """
     args = [
         gh_bin,
@@ -392,11 +397,11 @@ def gh_find_linked_pr(
         "--repo",
         repo,
         "--state",
-        "open",
+        "all",
         "--search",
         "linked:issue",
         "--json",
-        "number,url,closingIssuesReferences",
+        "number,url,state,closingIssuesReferences",
         "--limit",
         "100",
     ]
@@ -410,7 +415,11 @@ def gh_find_linked_pr(
         refs = pr.get("closingIssuesReferences") or []
         for ref in refs:
             if isinstance(ref, dict) and ref.get("number") == issue_number:
-                return {"number": pr.get("number"), "url": pr.get("url")}
+                return {
+                    "number": pr.get("number"),
+                    "url": pr.get("url"),
+                    "state": pr.get("state"),
+                }
     return None
 
 
@@ -726,6 +735,18 @@ def _process_selected(
         return
     if pr is None:
         return
+    # T1 fires only when the linked PR is still OPEN. ``gh_find_linked_pr``
+    # queries ``--state all`` (so the T2/T3 path can find merged PRs); we
+    # filter here so an sm:selected issue whose PR has already merged or
+    # closed doesn't get bounced to sm:reviewing — that lifecycle stage
+    # is past.
+    pr_state = (pr.get("state") or "").upper()
+    if pr_state != "OPEN":
+        log(
+            f"[sm-dispatcher] #{number} selected but linked PR is {pr_state!r} "
+            f"(not OPEN) — not transitioning to reviewing"
+        )
+        return
     pr_url = pr.get("url") or "<unknown>"
     transition_body = render_transition_comment(
         ACTIVE_SM_LABEL, REVIEWING_SM_LABEL, f"PR opened: {pr_url}"
@@ -779,17 +800,11 @@ def _process_reviewing(
         if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
             raise
         return
-    # If no open PR, the PR may have been merged already — look up by
-    # querying merge status against any historic linked PR. find_linked_pr
-    # only returns OPEN PRs; for merged PRs we need a different path.
-    # In Phase 1.5 we assume the orchestrator records the PR via the
-    # T1 transition comment. For now, if no open PR, we attempt to find
-    # a recently-merged PR via the same search (with state filter).
     if pr is None:
-        pr = _find_any_linked_pr(repo, number, find_linked_pr_open=find_linked_pr)
-    if pr is None:
-        # No PR found at all — stay at reviewing. Could happen if the
-        # PR was deleted or never existed; surfaces are escalation-only.
+        # No PR found at all — stay at reviewing. ``find_linked_pr``
+        # queries ``--state all``, so this branch only fires when there
+        # is genuinely no linked PR (deleted or never existed).
+        # Surfaces are escalation-only.
         log(f"[sm-dispatcher] #{number} reviewing but no linked PR found — staying")
         return
 
@@ -886,25 +901,6 @@ def _process_reviewing(
         report.transitions.append((number, REVIEWING_SM_LABEL, BUILDING_SM_LABEL))
         log(f"[sm-dispatcher] transitioned #{number}: reviewing → building (CI red)")
         return
-
-
-def _find_any_linked_pr(
-    repo: str,
-    issue_number: int,
-    *,
-    find_linked_pr_open: FindLinkedPRFn,
-) -> dict[str, Any] | None:
-    """Look for a PR linked to the issue, including merged ones.
-
-    The injected ``find_linked_pr`` only returns open PRs. For
-    reviewing-state issues whose PR is already merged, we can't find an
-    open PR. The clean fix is a separate ``--state all`` query on the
-    PR list. We don't have that as a separate injectable yet, so this
-    helper exists as the seam — for now it just delegates and returns
-    None on miss. Tests exercise the merged-PR path via the
-    ``pr_merge_status`` shim returning merged=True regardless.
-    """
-    return find_linked_pr_open(repo, issue_number)
 
 
 def run(
