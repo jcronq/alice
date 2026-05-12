@@ -132,8 +132,8 @@ def _now_iso() -> str:
 # Phase 2 — agent spawn constants
 # ---------------------------------------------------------------------------
 
-# Per-artifact spawn config. Each entry tells the dispatcher how to
-# frame the spawn prompt for an artifact type:
+# Per-(state, artifact) spawn config. Each entry tells the dispatcher
+# how to frame the spawn prompt for one ``(sm:*, art:*)`` combination:
 #
 #   * ``system_prompt_role`` — short role label rendered into the
 #     prompt header (Claude doesn't actually get a separate system
@@ -141,26 +141,34 @@ def _now_iso() -> str:
 #     the in-prompt persona framing.
 #   * ``instruction_trailer`` — final instructions appended after the
 #     issue body. ``{issue_number}`` is the substitution token.
+#   * ``system_prompt_module`` (optional) — dotted path to a system
+#     prompt constant when the agent is a structured-output sub-agent
+#     (e.g., the code reviewer). The future
+#     ``(sm:reviewing, *)`` integration consumes this; v1
+#     ``(sm:selected, *)`` workers ignore it and rely on the claude
+#     CLI's default system prompt.
 #
 # Out of scope for v1: the (persona × runtime) matrix from the design
-# doc. v1 spawns Claude for every artifact; the spawn map is the
-# extension point for later phases.
-SPAWN_MAP: dict[str, dict[str, str]] = {
-    "art:code": {
+# doc. v1 spawns Claude for every ``(sm:selected, art:*)`` row; the
+# spawn map is the extension point for later phases. Issue #107 adds
+# the first ``(sm:reviewing, art:code)`` row — the dispatcher path
+# that consumes it is wired separately.
+SPAWN_MAP: dict[tuple[str, str], dict[str, str]] = {
+    ("sm:selected", "art:code"): {
         "system_prompt_role": "code-worker",
         "instruction_trailer": (
             "Open a PR titled appropriately with `Closes #{issue_number}` "
             "in the body. Self-merge once CI is green. Do not --no-verify."
         ),
     },
-    "art:config_change": {
+    ("sm:selected", "art:config_change"): {
         "system_prompt_role": "code-worker",
         "instruction_trailer": (
             "Open a PR titled appropriately with `Closes #{issue_number}` "
             "in the body. Self-merge once CI is green. Do not --no-verify."
         ),
     },
-    "art:research_note": {
+    ("sm:selected", "art:research_note"): {
         "system_prompt_role": "research-writer",
         "instruction_trailer": (
             "Produce a research note at "
@@ -171,12 +179,34 @@ SPAWN_MAP: dict[str, dict[str, str]] = {
             "note at <path>\"` comment."
         ),
     },
-    "art:experiment": {
+    ("sm:selected", "art:experiment"): {
         "system_prompt_role": "research-writer",
         "instruction_trailer": (
             "Same as research_note for v1. Produce a note with "
             "hypothesis/null/verdict frontmatter; transition to done "
             "when complete."
+        ),
+    },
+    # Issue #107 — code-quality reviewer for PRs at sm:reviewing. The
+    # ``system_prompt_module`` is the dotted import path to
+    # :data:`alice_speaking.review.code_reviewer.CODE_REVIEWER_SYSTEM_PROMPT`;
+    # the dispatcher's future ``(sm:reviewing, art:code)`` path will
+    # load it and drive a Sonnet sub-agent that returns the structured
+    # JSON verdict defined in that module. v1 dispatcher does NOT yet
+    # consume this entry from ``_process_reviewing`` — it sits here as
+    # the integration point for the follow-up wiring.
+    ("sm:reviewing", "art:code"): {
+        "system_prompt_role": "code-reviewer",
+        "system_prompt_module": (
+            "alice_speaking.review.code_reviewer:CODE_REVIEWER_SYSTEM_PROMPT"
+        ),
+        "instruction_trailer": (
+            "Review the PR linked from issue #{issue_number}. Return a "
+            "single STRICT JSON object matching the schema in your system "
+            "prompt — no markdown fences, no prose. ``verdict: approved`` "
+            "means the dispatcher will close the issue at "
+            "sm:reviewing → sm:done; ``verdict: needs_revision`` means "
+            "sm:reviewing → sm:building."
         ),
     },
 }
@@ -944,6 +974,7 @@ def spawn_agent(
     art_label: str,
     repo: str,
     *,
+    sm_state: str = ACTIVE_SM_LABEL,
     spawn_dir: pathlib.Path = SPAWN_DIR,
     claude_bin: str | None = None,
     post_comment: PostCommentFn = gh_post_comment,
@@ -952,7 +983,7 @@ def spawn_agent(
     log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
     clock: Callable[[], float] = None,  # type: ignore[assignment]
 ) -> str | None:
-    """Spawn a detached ``claude`` agent for an ``sm:selected`` issue.
+    """Spawn a detached ``claude`` agent for an SM issue.
 
     Steps (per issue #101 spec):
 
@@ -968,18 +999,23 @@ def spawn_agent(
          dispatcher exiting.
       6. Write PID to ``pidfile``.
 
+    ``sm_state`` selects which SPAWN_MAP row to use; defaults to
+    ``sm:selected`` (the v1 worker-spawn path). Issue #107 added the
+    ``(sm:reviewing, art:code)`` row, which a later dispatcher change
+    will route here with ``sm_state="sm:reviewing"``.
+
     Returns the ``spawn_id`` on success, or ``None`` if the spawn
-    config is missing (unknown ``art:*`` label). Does NOT wait for the
-    spawned subprocess to complete — the dispatcher exits immediately
-    after the Popen returns.
+    config is missing (unknown ``(sm_state, art:*)`` combination).
+    Does NOT wait for the spawned subprocess to complete — the
+    dispatcher exits immediately after the Popen returns.
     """
     if clock is None:
         clock = time.time
-    spawn_config = SPAWN_MAP.get(art_label)
+    spawn_config = SPAWN_MAP.get((sm_state, art_label))
     if spawn_config is None:
         log(
             f"[sm-dispatcher] no spawn config for artifact {art_label!r} "
-            f"on #{issue.get('number')} — skipping spawn"
+            f"at state {sm_state!r} on #{issue.get('number')} — skipping spawn"
         )
         return None
 
@@ -1340,7 +1376,7 @@ def _process_selected(
     if spawn is None or count_running is None or list_comments is None:
         return
 
-    if art_label not in SPAWN_MAP:
+    if (ACTIVE_SM_LABEL, art_label) not in SPAWN_MAP:
         log(
             f"[sm-dispatcher] spawn skip #{number}: "
             f"unrecognized artifact {art_label!r}"
@@ -1390,7 +1426,9 @@ def _process_selected(
         return
 
     if dry_run:
-        preview = compose_spawn_prompt(issue, SPAWN_MAP[art_label])[:240]
+        preview = compose_spawn_prompt(
+            issue, SPAWN_MAP[(ACTIVE_SM_LABEL, art_label)]
+        )[:240]
         log(
             f"[sm-dispatcher] DRY-RUN would spawn on #{number} "
             f"art={art_label} (running={live}/{max_concurrent_spawns})"
