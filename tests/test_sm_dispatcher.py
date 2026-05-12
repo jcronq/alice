@@ -47,7 +47,6 @@ def _make_issue(
         "title": title,
         "labels": labels,
         "author": {"login": author},
-        "authorAssociation": "OWNER",
         "createdAt": "2026-05-12T10:00:00Z",
     }
 

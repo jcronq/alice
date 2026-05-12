@@ -248,7 +248,7 @@ def gh_list_selected_issues(repo: str, *, gh_bin: str = "gh") -> list[dict[str, 
         "--label",
         ACTIVE_SM_LABEL,
         "--json",
-        "number,title,labels,author,createdAt,authorAssociation",
+        "number,title,labels,author,createdAt",
         "--limit",
         str(RECENT_ISSUE_LIMIT),
     ]
