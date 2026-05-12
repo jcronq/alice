@@ -1,236 +1,242 @@
 # alice
 
-A personal AI agent that lives in Docker, talks to you over Signal / a CLI
-socket / Discord, remembers things in a git repo, and can ship code to her own
-repos.
+Alice is a personal AI agent who lives on your home server, talks to you over
+Signal, remembers things in a git repo, and ships code to her own repos. She
+runs as two cooperating "hemispheres" — a fast conversational front-end and a
+slow background thinker — that share an Obsidian-compatible vault as long-term
+memory. Unlike a chat app, she keeps working when you're not talking to her:
+grooming her notes, watching repos you care about, and turning issues into
+draft PRs while you sleep.
 
-This repo is the **runtime** — the sandbox, the transport bridges, the
-speaking + thinking hemispheres, the viewer, and the CLI wrappers. Your
-agent's personality, memories, and skills live in a separate **mind repo**
-(your own; created by `alice-init`).
+This repo is her **runtime** — the sandbox, transports, hemispheres, viewer,
+CLI. Her personality, memories, and skills live in a separate **mind repo**
+that gets scaffolded on first run. The runtime stays generic; the mind is
+yours.
 
-## What's here
+---
+
+## What makes Alice different
+
+### Two hemispheres with constitutional boundaries
+
+Most assistants are one process: a prompt comes in, a reply goes out. Alice
+splits the work in two:
+
+- **Speaking** handles every inbound message. She decides what to do, replies
+  in seconds, and dispatches longer work to subagents.
+- **Thinking** runs on a wake timer (5-minute cadence when active, longer at
+  night). She drains an inbox of notes Speaking left her, grooms the vault,
+  runs research from a priority queue, and surfaces actionable findings back.
+
+The split is enforced, not aspirational. Thinking *cannot* touch the runtime
+repo or the outside world — she reads and writes inside the mind. Speaking
+does the building and the talking; Thinking does the design and the memory.
+When Speaking notices a smell — "this skill keeps failing on edge cases" —
+she writes a note to Thinking rather than chewing on it mid-conversation.
+
+> Source: `src/alice_speaking/`, `src/alice_thinking/`. Design notes:
+> [`templates/mind-scaffold/HEMISPHERES.md`](templates/mind-scaffold/HEMISPHERES.md),
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+### A real memory, not a context buffer
+
+Long-term memory lives in `cortex-memory/` inside the mind repo — an
+Obsidian-compatible vault of atomic markdown notes with `created` / `updated`
+/ `last_accessed` frontmatter, wikilinks between concepts, dated dailies, and
+an explicit `conflicts/` folder for facts that contradict.
+
+Thinking grooms continuously: drains the inbox, atomizes oversized notes,
+links orphans, archives stale dailies, merges duplicates. Speaking pulls from
+it via a small retrieval pipeline before answering anything that might
+already be known — so claims cite a vault note by file:line, not just model
+recall.
+
+A typical note:
+
+```markdown
+---
+name: feedback_no_walls_of_text
+type: feedback
+created: 2026-05-09
+updated: 2026-05-11
+---
+No walls of text to Jason — terse status, queue work, act.
+
+**Why:** Long narratives crowd out actionable replies.
+**How to apply:** Signal replies ≤ 3 sentences; if work needs attention,
+dispatch it rather than report on it.
+```
+
+### Ideas → draft PRs, dispatched on label state
+
+Alice has an internal state machine (SM v2) for turning ideas into shipped
+code. State lives on GitHub itself as labels — `sm:draft`, `sm:selected`,
+`sm:building`, `sm:reviewing`, `sm:done` — so the dispatcher is stateless and
+crash-safe: pick up where you left off by reading the labels.
+
+A typical run:
+
+1. Speaking files an idea as a GitHub issue with `sm:draft`.
+2. Thinking reviews drafts on her own cadence and promotes the good ones to
+   `sm:selected`.
+3. The dispatcher (`alice_sm.dispatcher`) sees `sm:selected`, spawns a
+   detached `claude` agent in the worker, and posts a "spawn-started" audit
+   comment.
+4. The agent writes the diff, opens a **draft PR**, transitions the issue to
+   `sm:reviewing`.
+5. A reviewer agent inspects the PR; on green it self-merges and the issue
+   closes to `sm:done`.
+
+Jason is escalation-only. The pipeline runs without him.
+
+> Source: [`src/alice_sm/dispatcher.py`](src/alice_sm/dispatcher.py).
+
+### Signal as the surface, not a chat window
+
+Alice's primary transport is Signal — encrypted, async, ambient, and already
+on every device you carry. You text her like you'd text a coworker; she
+replies when she's ready. She also sends unprompted, quiet-hours aware (no
+pings 23:00–08:00 by default).
+
+CLI (Unix-socket) and Discord transports are also wired. All three feed one
+inbound pipeline (`alice_speaking`); outbound is always explicit (the agent
+must call `send_message` — returning text alone does not reach the user).
+
+### Sleep-mode synthesis
+
+Between 23:00 and 07:00 Thinking shifts into a sleep cycle modeled on
+NREM/REM stages:
+
+- **Stage B (Consolidation)** — any time. Inbox drain, link audit, frontmatter
+  normalization, orphan linking.
+- **Stage C (Downscaling, NREM-3 analog)** — vault stable, prefers 23:00–03:00.
+  Atomize large notes, archive stale dailies, merge duplicate facts.
+- **Stage D (Recombination, REM analog)** — vault stable, prefers 03:00–07:00.
+  Pick two recent research notes from different domains → look for unexpected
+  connections → write a synthesis note (or a null-result note if nothing
+  landed).
+
+This isn't a metaphor for tidying the file system. Stage D actively generates
+new ideas via random-walk pair-selection across the vault graph, and the
+resulting syntheses become first-class notes Speaking can cite. Some are
+wrong; some are interesting. The null-result discipline keeps it honest.
+
+> Source: `src/alice_thinking/`; mode-aware cadence in
+> `sandbox/worker/s6/alice-thinker/run`.
+
+### Evaluation-first culture
+
+Anything that claims to improve retrieval or response quality is gated behind
+an eval. The current cortex retrieval pipeline was promoted from "vibes" to
+"shipped" only after beating its baseline on a 54-query ground-truth set. If
+you want to add a re-ranker, you label more ground truth and re-run the
+harness — you don't ship a hunch. This is a project value, enforced in code
+review and by self-reviewer agents, not a feature flag.
+
+---
+
+## A day in the life
+
+A representative slice of `cortex-memory/dailies/2026-05-11.md`:
 
 ```
-alice/
-├── sandbox/               # Docker images + compose + entrypoint
-│   ├── daemon/            # alice-daemon (signal-cli JSON-RPC, cron)
-│   ├── worker/            # alice-worker (blue/green; runs Claude turns)
-│   ├── viewer/            # alice-viewer (introspection UI on :7777)
-│   ├── docker-compose.yml
-│   └── entrypoint.sh
-├── src/                   # Python source for the runtime
-│   ├── alice_core/        # auth, paths, config helpers
-│   ├── alice_speaking/    # inbound turn pipeline (per transport)
-│   ├── alice_thinking/    # wake-cycle pipeline (active + sleep modes)
-│   ├── alice_viewer/      # introspection UI
-│   └── alice_watchers/    # background pollers feeding inner/notes/ (github)
-├── speaking/              # transport implementations (signal, cli, discord)
-├── viewer/                # viewer static assets
-├── bin/                   # CLI wrappers (alice, alice-up, alice-init, …)
-├── templates/
-│   └── mind-scaffold/     # starter files for a fresh mind
-├── config/
-│   └── alice.env.example
-└── docs/
+06:48  Stage D synthesis: "system reverse-diet isomorphism" — links
+       Zone-2 adaptation research (2026-04-27) to a fitness program
+       observation (2026-05-09). Null-result follow-up queued.
+08:02  Jason: "had breakfast — yogurt, granola, shake"
+       → log-meal skill → events.jsonl + Google Sheet + daily.
+09:15  GitHub watcher: new issue jcronq/alice#103 from @jcronq
+       (trusted author) → note for Thinking.
+09:18  Thinking opens 103, drafts an analysis, surfaces
+       "attempt-fix?" to Speaking.
+09:19  Speaking acks Jason on Signal, spawns subagent with the
+       auto-fix template.
+09:34  Draft PR #104 opened; issue transitions sm:building → sm:reviewing.
+10:01  Reviewer agent: 1 issue found (missing test), comment posted.
+10:42  Agent addresses comment, CI green, self-merge, sm:done.
 ```
 
-## Quickstart
+This whole sequence happens whether Jason is at his desk or on a run.
 
-You'll need Docker (or Docker Desktop on macOS), `git`, and the Claude
-Code CLI (`npm install -g @anthropic-ai/claude-code`). `gh` is optional —
-only needed if you want her mind pushed to GitHub.
+---
+
+## How the pieces fit
+
+```
+┌───────────────────────────┐  ┌──────────────────────┐  ┌──────────────┐
+│ alice (this repo)         │  │ <user>-mind          │  │ <user>-tools │
+│   runtime                 │  │   personality        │  │   sidecars   │
+│                           │◄─┤   cortex-memory/     │  │   (optional) │
+│   sandbox/  containers    │rw│   .claude/skills/    │  │              │
+│   src/      hemispheres   │  │   inner/             │  │              │
+│   bin/      host CLIs     │  │   memory/            │  │              │
+│   speaking/ transports    │  │                      │  │              │
+└───────────────────────────┘  └──────────────────────┘  └──────────────┘
+```
+
+Three containers, supervised by s6 inside Docker:
+
+- **`alice-daemon`** — singleton. Runs signal-cli in JSON-RPC mode on :8080.
+  No Claude here.
+- **`alice-worker-blue` / `alice-worker-green`** — blue/green worker slots,
+  exactly one live at a time, holding an exclusive `flock` on the worker
+  lease. `alice-deploy` swaps them.
+- **`alice-viewer`** — read-only introspection UI on
+  [http://localhost:7777](http://localhost:7777). Shows turns, surfaces,
+  notes, vault state, recent Stage D syntheses.
+
+Full breakdown: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+---
+
+## Running your own copy
+
+The full walkthrough lives in [`docs/QUICKSTART.md`](docs/QUICKSTART.md).
+Short version:
 
 ```bash
-# 1. Clone this repo (any path works — alice-up auto-detects)
 git clone https://github.com/jcronq/alice.git ~/alice
 cd ~/alice
-
-# 2. Run the interactive installer — it walks you through everything:
-#      • prereq check
-#      • mind scaffold
-#      • Claude long-lived OAuth token (via `claude setup-token`)
-#      • optional Signal config
-#      • container build + bring-up
-#      • smoke test (alice -p "...")
-./install.sh
-
-# 3. Add the CLI to your PATH (the installer prints this too)
-export PATH="$HOME/alice/bin:$PATH"     # persist in your shell rc
-
-# 4. Talk to her
-alice                 # interactive (CLI transport, Unix-socket)
-alice -p "ping"       # one-shot
+./install.sh                      # interactive: prereqs → mind scaffold →
+                                  # Claude OAuth → optional Signal → build → smoke test
+export PATH="$HOME/alice/bin:$PATH"
+alice -p "ping"                   # one-shot
+alice                             # interactive CLI
 ```
 
-If you'd rather wire things by hand, the installer's steps each map to
-a single `bin/alice-*` script — read `install.sh` for the order and
-skip what you've already done.
+**You'll need:** Docker, `git`, the Claude Code CLI
+(`npm install -g @anthropic-ai/claude-code`). `gh` is optional. Signal is
+optional — the CLI transport works without it; you can wire Signal and
+Discord later by editing `~/.config/alice/alice.env`.
 
-### Adding Signal later
+Bin wrappers (all in `bin/`): `alice`, `alice-up`, `alice-down`,
+`alice-deploy`, `alice-shell`, `alice-think`, `alice-init`,
+`alice-mind-autopush`, `alice-gh-watcher`, `event-log`. Each maps to a single
+shell script — open `install.sh` to see the order.
 
-Edit `~/.config/alice/alice.env`, set `SIGNAL_ACCOUNT` (E.164) and
-`ALLOWED_SENDERS`, then:
-
-```bash
-alice-up
-docker exec -it alice-daemon signal-cli \
-    -a "$(. ~/.config/alice/alice.env; echo "$SIGNAL_ACCOUNT")" link -n "Alice"
-# Scan the QR code with your phone's Signal app.
-docker restart alice-daemon
-```
-
-### Adding Discord later
-
-Set `DISCORD_BOT_TOKEN` in `~/.config/alice/alice.env`, restart the
-worker. See the comments in `config/alice.env.example` for the bot
-permissions/intents.
-
-## Architecture
-
-See `docs/ARCHITECTURE.md` for the full breakdown. Short version:
-
-**Containers (compose):**
-
-- `alice-daemon` — singleton. Runs signal-cli in JSON-RPC mode on
-  port 8080. No Claude here.
-- `alice-worker-blue` / `alice-worker-green` — blue/green worker slots.
-  Exactly one is live at a time, holding an exclusive `flock` on
-  `/state/worker/lease`. The other waits. `alice-deploy` swaps them.
-- `alice-viewer` — read-only introspection UI on `localhost:7777`. Shows
-  turns, surfaces, notes, and vault state.
-
-**Transports (pluggable, in `speaking/`):**
-
-- **Signal** — inbound via signal-cli daemon JSON-RPC; outbound via the
-  same. Allowlisted senders.
-- **CLI** — Unix-socket transport at `/state/alice.sock`. `alice-client`
-  speaks it. Used for interactive shell sessions and smoke tests.
-- **Discord** — DM + guild support. Mention or DM the bot.
-
-All transports share one inbound pipeline (`alice_speaking`). Outbound
-replies are explicit: the agent calls the `send_message` MCP tool with
-`recipient='self'` (reply on same channel) or a named recipient. Returning
-text alone does NOT send.
-
-**Hemispheres:**
-
-- **Speaking** — fires per inbound turn. Sees the user's message, decides
-  what to do, replies (or doesn't). Can run subagents to build/edit/deploy.
-- **Thinking** — runs as an s6 timer loop inside the worker
-  (`sandbox/worker/s6/alice-thinker/run`) with mode-aware cadence: 5 min
-  in active mode, exponential backoff (5 → 10 → 20 → 40 min) in sleep mode.
-  Interruptible early by `inotifywait` when a new note lands in
-  `inner/notes/`. Drains `inner/notes/`, grooms the vault, runs research
-  from `inner/ideas.md`, surfaces actionable findings back to Speaking via
-  `inner/surface/`. Two modes: **active** (07:00–23:00) and **sleep / REM**
-  (23:00–07:00, with consolidation / downscaling / recombination sub-stages).
-
-**Volumes (host → container):**
-
-- `<repo>/data/alice-mind` rw — her mind (memory, skills, identity).
-  Its own git repo; the parent `data/` is gitignored from this repo.
-  Override with `ALICE_MIND=…` if you want it elsewhere.
-- `<repo>/data/alice-tools` rw — your sidecars (smart home, AV, repo
-  helpers, …). Override with `ALICE_TOOLS=…`.
-- `~/alice` rw — this repo, mounted live so subagents can self-improve.
-  Hemisphere boundary: thinking MUST NOT write here.
-- `~/.claude` ro — host Claude config (directory-mounted so atomic
-  credential refreshes propagate; entrypoint symlinks the right files).
-- `~/.local/state/alice` rw → `/state` — runtime state (worker lease,
-  daemon logs, viewer cache, transport sockets).
-
-## Mind repo
-
-Every Alice has her own mind. By default `alice-init` scaffolds one at
-`<repo>/data/alice-mind/` (the parent `data/` directory is gitignored
-from this runtime repo). You can instead:
-
-- Clone an existing mind: `alice-init` → option 1 → paste the URL
-- Point at an existing directory: `alice-init` → option 2 → enter the path
-
-The mind is a regular git repo. The `alice-mind-autopush` service commits
-and pushes every 15 minutes if there are changes, so her memory is
-versioned on whatever remote you configure (if any).
-
-**Personalize:**
-
-- `IDENTITY.md` — what kind of entity she is
-- `CLAUDE.md` — operating rules, memory protocol, skills index
-- `USER.md` — about you
-- `HEARTBEAT.md` — scheduled proactive checks (cron-style prompts)
-- `.claude/skills/` — deterministic workflows she auto-invokes
-- `cortex-memory/` — the groomed Obsidian-compatible vault she builds
-  over time (atomic notes, wikilinks, dated dailies, conflicts log)
-- `inner/notes/`, `inner/surface/` — the messaging buses between
-  hemispheres (notes Speaking → Thinking, surfaces Thinking → Speaking)
-- `memory/events.jsonl` — structured event stream (meals, workouts,
-  weight changes, errors) for queryable history
-
-## Bin wrappers
-
-```
-alice              # interactive CLI client (Unix-socket transport)
-alice -p "..."     # one-shot CLI prompt
-alice-client       # raw socket client (used by alice)
-alice-up           # bring up daemon + active worker slot + viewer
-alice-down         # tear it all down
-alice-deploy       # blue/green swap (build new image, swap live slot)
-alice-shell        # docker exec into the live worker
-alice-think        # manually trigger a thinking wake
-alice-init         # first-run scaffold (creates / clones mind, writes env)
-alice-mind-autopush  # autopush daemon (runs inside the worker)
-alice-gh-watcher   # one pass of the GitHub repo watcher (runs inside the worker)
-event-log          # tail / query memory/events.jsonl
-```
+---
 
 ## Watching GitHub repos
 
-To have Alice notice PR/review/comment activity between turns, list the
-repos in your mind's `config/alice.config.json`:
+Alice can subscribe to PR/review/issue activity on repos you list in your
+mind's `config/alice.config.json`. The watcher polls each repo on a cadence
+and drops one note per unseen event into `inner/notes/` for Thinking to
+drain. Trust-gated by GitHub's `author_association` — randos stay silent
+unless you opt them in. Captured events include PR reviews (approved /
+changes_requested / dismissed), inline review comments, new PRs, merges,
+check-run failures, and standalone-issue activity. Configuration details:
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-```json
-{
-  "github_watcher": {
-    "enabled": true,
-    "repos": ["owner/repo", "owner/other-repo"],
-    "poll_interval_seconds": 300
-  }
-}
-```
-
-The `alice-gh-watcher` s6 service inside the worker polls each repo on
-the configured cadence (default 5 min, floor 60 s) and drops one note
-per unseen event into `inner/notes/` for thinking to drain. Captured
-events: PR reviews (approved / changes_requested / dismissed), inline
-review comments, PR conversation comments, new PRs, open → merged /
-closed transitions, check-run failures, plus standalone-issue activity
-(new issue, state change, comment).
-
-**Rando filter.** Issue activity, PR conversation comments, and
-standalone-issue comments are trust-gated by GitHub's `author_association`
-field. By default only `OWNER` / `COLLABORATOR` / `MEMBER` produce notes
-— i.e. people deliberately added to the repo or the owning org. Randos
-on the internet stay silent. PR reviews, inline review comments, and CI
-failures always fire regardless of association (rare and high-signal).
-Override the trust set with `trusted_associations` in the config block,
-e.g. `["OWNER", "COLLABORATOR", "MEMBER", "CONTRIBUTOR"]` to also trust
-anyone whose patch has been merged.
-
-The watcher is a no-op when `repos` is empty, so it's safe to leave
-running. Auth uses the worker's `GH_TOKEN` (or mounted `~/.config/gh/`
-OAuth, same as `gh` on the host); a 401/403 emits a single loud note
-tagged `github-watcher-error` and backs off until the next poll. Per-repo
-"already seen" markers persist at `~/.local/state/alice/worker/gh-watcher-state.json`,
-so a restart doesn't re-flood the inbox.
+---
 
 ## Sidecars
 
-If you want Alice to control your smart home, your AV stack, your repos,
-whatever — drop those scripts in `<repo>/data/alice-tools/`. They're
-mounted at `/home/alice/alice-tools/` inside the worker and on PATH. Or
-extend the container further via a `docker-compose.override.yml` in
-`sandbox/`.
+Drop scripts in `<repo>/data/alice-tools/` — they're mounted at
+`/home/alice/alice-tools/` and on PATH inside the worker. Smart-home
+controllers, AV adapters, repo helpers — anything you want Alice to reach.
+Extend the container further via `docker-compose.override.yml` in `sandbox/`.
+
+---
 
 ## License
 
@@ -240,5 +246,5 @@ MIT — see [LICENSE](LICENSE).
 
 This project is not currently accepting external contributions; please open
 an issue rather than a PR. If contributions are opened up later, contributors
-will be asked to sign a [CLA](CLA.md). See [CONTRIBUTING.md](CONTRIBUTING.md)
-for details.
+will be asked to sign a [CLA](CLA.md). See
+[CONTRIBUTING.md](CONTRIBUTING.md) for details.
