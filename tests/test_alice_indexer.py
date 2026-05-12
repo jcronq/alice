@@ -53,6 +53,31 @@ def test_extract_wikilinks_finds_targets():
     assert any("bar/baz" in link for link in links)
 
 
+def test_extract_wikilinks_rescues_backtick_wrapped():
+    """Slug-shaped wikilinks inside inline code spans should still count
+    as references — daily entries commonly format them as
+    `` `[[slug]]` `` and without rescue the target note would appear
+    orphaned in vault_health metrics."""
+    body = "Daily: see `[[2026-05-11-foo]]` and ``[[bar-note]]``."
+    links = extract_wikilinks(body)
+    assert "2026-05-11-foo" in links
+    assert "bar-note" in links
+
+
+def test_extract_wikilinks_still_suppresses_bash_expressions():
+    """Bash test expressions like ``[[ -d "$x" ]]`` inside backticks
+    must NOT trigger a wikilink match — they have spaces and ``$``,
+    which the slug-like filter rejects. Same guard applies to fenced
+    code blocks (multi-line)."""
+    body = (
+        "Inline: `if [[ -d \"$x\" ]]; then echo x; fi`.\n"
+        "Fenced:\n```bash\nif [[ -z \"$VAR\" ]]; then echo no; fi\n```\n"
+        "Real link: [[real-note]]."
+    )
+    links = extract_wikilinks(body)
+    assert links == ["real-note"]
+
+
 # ---------------------------------------------------------------------------
 # build_index
 

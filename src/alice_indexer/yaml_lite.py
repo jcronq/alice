@@ -174,6 +174,14 @@ _FENCE_RE = re.compile(r"^(```|~~~)", re.MULTILINE)
 _DOUBLE_BACKTICK_RE = re.compile(r"``[^\n]*?``")
 _INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 
+# A wikilink target that "looks like a slug" — lowercase alphanumerics,
+# dashes, underscores. Optional folder prefix. Crucially excludes spaces
+# and quotes, which is what differentiates a real wikilink reference
+# (``[[2026-05-11-foo]]``) from a bash test expression
+# (``[[ -d "$x" ]]``). Used to rescue backtick-wrapped wikilinks from
+# the strip pass without re-admitting bash false positives.
+_SLUG_LIKE_RE = re.compile(r"^[a-z0-9][a-z0-9_/-]*$")
+
 
 def _strip_code(body: str) -> str:
     """Remove fenced code blocks and inline code so [[..]] inside them isn't
@@ -201,6 +209,36 @@ def _strip_code(body: str) -> str:
     return cleaned
 
 
+def _rescue_backtick_wikilinks(body: str) -> list[str]:
+    """Recover ``[[slug]]`` references that live inside inline backtick
+    spans. ``_strip_code`` removes the entire span body — necessary for
+    suppressing bash ``[[ -d ]]`` test expressions, but it also drops
+    legitimate slug references that daily entries commonly format as
+    `` `[[note-slug]]` ``. Those references should count toward the
+    target note's inbound link total.
+
+    Strategy: scan the body's backtick-span contents (before they get
+    stripped) for ``[[..]]`` patterns, but only yield targets that look
+    like slugs (lowercase alphanumerics + dashes + underscores + slash;
+    no spaces, no quotes). The slug-like filter is what keeps bash
+    expressions out — ``[[ -d $x ]]`` contains spaces and ``$``, so it
+    never matches ``_SLUG_LIKE_RE``. Targets are still cross-validated
+    against ``by_slug`` by the caller, so any non-existent slug-shaped
+    target is harmless.
+    """
+    targets: list[str] = []
+    for span_re in (_DOUBLE_BACKTICK_RE, _INLINE_CODE_RE):
+        for span in span_re.findall(body):
+            for m in _WIKILINK_RE.finditer(span):
+                target = m.group(1).strip()
+                # strip section anchors
+                if "#" in target:
+                    target = target.split("#", 1)[0].strip()
+                if target and _SLUG_LIKE_RE.match(target):
+                    targets.append(target)
+    return targets
+
+
 def extract_wikilinks(body: str) -> list[str]:
     """Return raw wikilink targets (display alias stripped). May contain folder/ prefixes."""
     cleaned = _strip_code(body)
@@ -212,4 +250,8 @@ def extract_wikilinks(body: str) -> list[str]:
             target = target.split("#", 1)[0].strip()
         if target:
             targets.append(target)
+    # Rescue slug-shaped wikilinks that lived inside inline code spans
+    # (e.g. `` `[[note-slug]]` `` in daily entries). Without this, those
+    # references go missing and target notes appear orphaned.
+    targets.extend(_rescue_backtick_wikilinks(body))
     return targets
