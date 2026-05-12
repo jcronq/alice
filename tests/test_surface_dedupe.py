@@ -22,9 +22,11 @@ import pytest
 from alice_speaking.internal.surfaces import (
     DEDUPE_BY_TYPE_PER_DAY,
     ID_DEDUP_WINDOW_HOURS,
+    STAGE_D_INVARIANT_DELTA_FLOOR,
     SurfaceWatcher,
     _dedup_key,
     _read_surface_type,
+    _read_violation_count,
 )
 
 
@@ -339,3 +341,193 @@ def test_id_dedup_state_survives_restart(tmp_path: pathlib.Path):
     assert archived.exists()
     contents = archived.read_text()
     assert "let-pass (intake-side dedup)" in contents
+
+
+# ---------------------------------------------------------------------------
+# Stage D invariant count-delta dedup (issue #122)
+# ---------------------------------------------------------------------------
+
+
+def _write_stage_d_surface(
+    surface_dir: pathlib.Path,
+    *,
+    timestamp: str,
+    violation_count: int,
+    body: str = "stage d body",
+) -> pathlib.Path:
+    name = f"2026-05-12-{timestamp}-stage-d-invariant.md"
+    path = surface_dir / name
+    path.write_text(
+        textwrap.dedent(
+            f"""\
+            ---
+            priority: insight
+            surface_type: stage-d-invariant
+            violation_count: {violation_count}
+            reply_expected: false
+            ---
+
+            {body}
+            """
+        )
+    )
+    return path
+
+
+def _seed_handled_stage_d(
+    watcher: SurfaceWatcher,
+    *,
+    timestamp: str,
+    violation_count: int,
+) -> pathlib.Path:
+    today = datetime.date.today().isoformat()
+    handled = watcher.handled_dir / today
+    handled.mkdir(parents=True, exist_ok=True)
+    name = f"2026-05-12-{timestamp}-stage-d-invariant.md"
+    path = handled / name
+    path.write_text(
+        textwrap.dedent(
+            f"""\
+            ---
+            priority: insight
+            surface_type: stage-d-invariant
+            violation_count: {violation_count}
+            reply_expected: false
+            ---
+
+            seeded prior
+            """
+        )
+    )
+    return path
+
+
+def test_read_violation_count_parses_integer(tmp_path: pathlib.Path):
+    path = tmp_path / "s.md"
+    path.write_text(
+        "---\nsurface_type: stage-d-invariant\nviolation_count: 183\n---\nbody\n"
+    )
+    assert _read_violation_count(path) == 183
+
+
+def test_read_violation_count_returns_none_when_missing(tmp_path: pathlib.Path):
+    path = tmp_path / "s.md"
+    path.write_text("---\nsurface_type: stage-d-invariant\n---\nbody\n")
+    assert _read_violation_count(path) is None
+
+
+def test_count_delta_zero_is_suppressed(watcher: SurfaceWatcher):
+    _seed_handled_stage_d(watcher, timestamp="010000", violation_count=183)
+    new = _write_stage_d_surface(
+        watcher.surface_dir, timestamp="030000", violation_count=183
+    )
+    assert watcher._suppress_as_duplicate(new) is True
+    assert not new.exists()
+    today = datetime.date.today().isoformat()
+    archived = watcher.handled_dir / today / new.name
+    contents = archived.read_text()
+    assert "let-pass (count-delta below floor)" in contents
+    assert "183 → 183" in contents
+    assert "delta 0" in contents
+
+
+def test_count_delta_below_floor_is_suppressed(watcher: SurfaceWatcher):
+    _seed_handled_stage_d(watcher, timestamp="010000", violation_count=183)
+    new = _write_stage_d_surface(
+        watcher.surface_dir, timestamp="030000", violation_count=187
+    )
+    # Sanity check the test setup against the configured floor.
+    assert 4 < STAGE_D_INVARIANT_DELTA_FLOOR
+    assert watcher._suppress_as_duplicate(new) is True
+    assert not new.exists()
+    today = datetime.date.today().isoformat()
+    archived = watcher.handled_dir / today / new.name
+    contents = archived.read_text()
+    assert "let-pass (count-delta below floor)" in contents
+    assert "183 → 187" in contents
+    assert "delta 4" in contents
+
+
+def test_count_delta_at_or_above_floor_passes_through(watcher: SurfaceWatcher):
+    _seed_handled_stage_d(watcher, timestamp="010000", violation_count=183)
+    new = _write_stage_d_surface(
+        watcher.surface_dir, timestamp="030000", violation_count=193
+    )
+    # 10 >= floor → real signal, must dispatch.
+    assert 10 >= STAGE_D_INVARIANT_DELTA_FLOOR
+    assert watcher._suppress_as_duplicate(new) is False
+    assert new.exists()
+
+
+def test_count_delta_exactly_at_floor_passes_through(watcher: SurfaceWatcher):
+    """The floor is a strict-less-than gate: delta == floor → pass."""
+    _seed_handled_stage_d(watcher, timestamp="010000", violation_count=183)
+    new = _write_stage_d_surface(
+        watcher.surface_dir,
+        timestamp="030000",
+        violation_count=183 + STAGE_D_INVARIANT_DELTA_FLOOR,
+    )
+    assert watcher._suppress_as_duplicate(new) is False
+    assert new.exists()
+
+
+def test_count_delta_compares_against_latest_prior(watcher: SurfaceWatcher):
+    # An older prior (003000) with count 100 is shadowed by a newer
+    # prior (020000) with count 200; the new surface (count 202) should
+    # compare against 200, not 100, and be suppressed as below-floor.
+    _seed_handled_stage_d(watcher, timestamp="003000", violation_count=100)
+    _seed_handled_stage_d(watcher, timestamp="020000", violation_count=200)
+    new = _write_stage_d_surface(
+        watcher.surface_dir, timestamp="040000", violation_count=202
+    )
+    assert watcher._suppress_as_duplicate(new) is True
+    today = datetime.date.today().isoformat()
+    contents = (watcher.handled_dir / today / new.name).read_text()
+    assert "200 → 202" in contents
+
+
+def test_no_surface_type_falls_through_to_id_dedup(watcher: SurfaceWatcher):
+    """No `surface_type` frontmatter → type-based filter no-ops so the
+    next ring (id-based dedup) can decide. The type filter must NOT
+    swallow the surface."""
+    _seed_handled_stage_d(watcher, timestamp="010000", violation_count=183)
+    path = watcher.surface_dir / "2026-05-12-030000-no-type.md"
+    path.write_text("---\npriority: insight\n---\nno surface_type here\n")
+    assert watcher._suppress_as_duplicate(path) is False
+    assert path.exists()
+
+
+def test_count_delta_across_day_boundary_does_not_dedup(watcher: SurfaceWatcher):
+    # Prior in yesterday's handled dir, not today's.
+    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+    other_dir = watcher.handled_dir / yesterday
+    other_dir.mkdir(parents=True, exist_ok=True)
+    (other_dir / "2026-05-11-010000-stage-d-invariant.md").write_text(
+        "---\nsurface_type: stage-d-invariant\nviolation_count: 183\n---\nold\n"
+    )
+    new = _write_stage_d_surface(
+        watcher.surface_dir, timestamp="030000", violation_count=184
+    )
+    assert watcher._suppress_as_duplicate(new) is False
+    assert new.exists()
+
+
+def test_count_delta_missing_count_falls_back_to_always_suppress(
+    watcher: SurfaceWatcher,
+):
+    """When neither the new surface nor the prior carries a
+    violation_count, there's no scalar to gate on — the pre-#122
+    always-suppress behaviour still wins so we don't regress #79."""
+    today = datetime.date.today().isoformat()
+    handled = watcher.handled_dir / today
+    handled.mkdir(parents=True, exist_ok=True)
+    prior = handled / "2026-05-12-010000-stage-d-invariant.md"
+    prior.write_text("---\nsurface_type: stage-d-invariant\n---\nno count\n")
+
+    new = watcher.surface_dir / "2026-05-12-030000-stage-d-invariant.md"
+    new.write_text("---\nsurface_type: stage-d-invariant\n---\nstill no count\n")
+
+    assert watcher._suppress_as_duplicate(new) is True
+    archived = handled / new.name
+    contents = archived.read_text()
+    assert "duplicate-suppressed-by-intake" in contents

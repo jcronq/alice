@@ -56,10 +56,20 @@ _SURFACE_TYPE_RE = re.compile(r"^surface_type:\s*(\S+)\s*$", re.MULTILINE)
 _SOURCE_ID_RE = re.compile(r"^source-id:\s*(.+?)\s*$", re.MULTILINE)
 _FRONTMATTER_DATE_RE = re.compile(r"^date:\s*(\S+)\s*$", re.MULTILINE)
 _FILENAME_DATE_SLUG_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-\d{6}-(.+)$")
+_VIOLATION_COUNT_RE = re.compile(r"^violation_count:\s*(\d+)\s*$", re.MULTILINE)
 
 # Rolling window for id-based intake dedup: if the same key appears
 # within this many hours, the second occurrence is suppressed.
 ID_DEDUP_WINDOW_HOURS = 24
+
+# Floor on the |violation_count delta| between a new stage-d-invariant
+# surface and the most recent prior of the same type on the same day.
+# Below this floor the new surface is auto-archived as noise; at or
+# above it the surface dispatches normally so the operator sees the
+# meaningful change. 5 is empirically chosen — a Stage D scan
+# incrementing by 1-2 unaudited notes since the last firing is grooming
+# churn; 5+ likely represents a real burst worth surfacing.
+STAGE_D_INVARIANT_DELTA_FLOOR = 5
 
 
 @dataclass
@@ -163,6 +173,17 @@ class SurfaceWatcher:
         frontmatter value is in :data:`DEDUPE_BY_TYPE_PER_DAY`.
         Missing or unparseable frontmatter → not eligible → falls
         through to normal dispatch.
+
+        When both the new surface and the most recent same-type prior
+        carry a ``violation_count`` frontmatter field, the
+        :data:`STAGE_D_INVARIANT_DELTA_FLOOR` gate decides: deltas
+        below the floor are noise (auto-archive with a
+        ``let-pass (count-delta below floor)`` verdict), deltas at or
+        above the floor are real signal and dispatch normally.
+        Without a count on either side the surface falls back to the
+        unconditional same-type-same-day suppression — that's the
+        behaviour added in #79, preserved for any type where we have
+        no scalar to read.
         """
         surface_type = _read_surface_type(path)
         if surface_type is None or surface_type not in DEDUPE_BY_TYPE_PER_DAY:
@@ -171,14 +192,40 @@ class SurfaceWatcher:
         dest_dir = self._handled_dir / today
         if not dest_dir.is_dir():
             return False
-        for prior in dest_dir.glob("*.md"):
-            if prior.name == path.name:
+        prior = self._latest_same_type_prior(dest_dir, surface_type, path.name)
+        if prior is None:
+            return False
+        new_count = _read_violation_count(path)
+        prior_count = _read_violation_count(prior)
+        if new_count is not None and prior_count is not None:
+            delta = abs(new_count - prior_count)
+            if delta >= STAGE_D_INVARIANT_DELTA_FLOOR:
+                return False
+            self._archive_count_delta_duplicate(
+                path, surface_type, prior.name, delta, new_count, prior_count
+            )
+            return True
+        self._archive_duplicate(path, surface_type, prior.name)
+        return True
+
+    def _latest_same_type_prior(
+        self,
+        dest_dir: pathlib.Path,
+        surface_type: str,
+        exclude_name: str,
+    ) -> Optional[pathlib.Path]:
+        """Return the alphabetically-latest same-type prior in
+        ``dest_dir`` (filenames embed ``HHMMSS`` so lex order == time
+        order for a given day), or ``None`` if no prior matches."""
+        latest: Optional[pathlib.Path] = None
+        for candidate in dest_dir.glob("*.md"):
+            if candidate.name == exclude_name:
                 continue
-            prior_type = _read_surface_type(prior)
-            if prior_type == surface_type:
-                self._archive_duplicate(path, surface_type, prior.name)
-                return True
-        return False
+            if _read_surface_type(candidate) != surface_type:
+                continue
+            if latest is None or candidate.name > latest.name:
+                latest = candidate
+        return latest
 
     def _archive_duplicate(
         self,
@@ -206,6 +253,46 @@ class SurfaceWatcher:
             path.name,
             surface_type,
             prior_name,
+        )
+
+    def _archive_count_delta_duplicate(
+        self,
+        path: pathlib.Path,
+        surface_type: str,
+        prior_name: str,
+        delta: int,
+        new_count: int,
+        prior_count: int,
+    ) -> None:
+        """Archive a same-type-same-day surface whose violation_count
+        moved less than :data:`STAGE_D_INVARIANT_DELTA_FLOOR` since the
+        prior dispatch — too small to bother surfacing."""
+        today = datetime.date.today().isoformat()
+        dest_dir = self._handled_dir / today
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / path.name
+        body = path.read_text()
+        verdict = (
+            "let-pass (count-delta below floor) — "
+            f"surface_type '{surface_type}' violation_count "
+            f"{prior_count} → {new_count} (delta {delta} < "
+            f"{STAGE_D_INVARIANT_DELTA_FLOOR}); prior: {prior_name}"
+        )
+        trailer = (
+            "\n\n---\n"
+            + f"resolved: {datetime.datetime.now().astimezone().isoformat(timespec='seconds')}\n"
+            + f"verdict: {verdict}\n"
+            + "action_taken: auto-archived by intake count-delta filter\n"
+        )
+        dest.write_text(body + trailer)
+        path.unlink()
+        log.info(
+            "surface count-delta dedupe: suppressed %s "
+            "(surface_type=%s, prior=%s, delta=%d)",
+            path.name,
+            surface_type,
+            prior_name,
+            delta,
         )
 
     def _suppress_as_id_duplicate(self, path: pathlib.Path) -> bool:
@@ -426,6 +513,26 @@ def _read_surface_type(path: pathlib.Path) -> Optional[str]:
     if match is None:
         return None
     return match.group(1).strip().strip("\"'")
+
+
+def _read_violation_count(path: pathlib.Path) -> Optional[int]:
+    """Extract ``violation_count`` from a surface file's YAML frontmatter.
+
+    Returns ``None`` when the file is missing/unreadable, the
+    frontmatter lacks a ``violation_count:`` line, or the value isn't
+    a non-negative integer. Reads only the first ~2 KiB so a malformed
+    body can't stall the watcher.
+    """
+    head = _read_frontmatter_head(path)
+    if head is None:
+        return None
+    match = _VIOLATION_COUNT_RE.search(head)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
 
 
 def _read_frontmatter_head(path: pathlib.Path) -> Optional[str]:
