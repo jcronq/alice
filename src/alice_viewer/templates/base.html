@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>{{ personae.agent.name }} Viewer · {% block title %}{% endblock %}</title>
-  <link rel="stylesheet" href="/static/style.css?v=context-blocks-3-lobe-labels-stage-d-1-responsive-llm-lobe-1" />
+  <link rel="stylesheet" href="/static/style.css?v=context-blocks-3-lobe-labels-stage-d-1-responsive-llm-lobe-1-history-dropdown" />
   <script src="https://unpkg.com/htmx.org@1.9.12"></script>
   <script src="https://unpkg.com/htmx.org@1.9.12/dist/ext/sse.js"></script>
   <script src="https://d3js.org/d3.v7.min.js"></script>
@@ -18,14 +18,20 @@
       <span class="logo">◑</span>
       <span>{{ personae.agent.name }} Viewer</span>
     </div>
+    {% set history_active = active in ('timeline', 'wakes', 'turns', 'interactions') %}
     <nav>
       <a href="/chat"       class="{% if active == 'chat' %}on{% endif %}">chat</a>
-      <a href="/"           class="{% if active == 'timeline' %}on{% endif %}">timeline</a>
+      <details class="nav-dropdown {% if history_active %}on{% endif %}">
+        <summary>history{% if history_active %} · {{ active }}{% endif %} ▾</summary>
+        <div class="nav-dropdown-menu">
+          <a href="/"             class="{% if active == 'timeline' %}on{% endif %}">timeline</a>
+          <a href="/wakes"        class="{% if active == 'wakes' %}on{% endif %}">wakes</a>
+          <a href="/turns"        class="{% if active == 'turns' %}on{% endif %}">turns</a>
+          <a href="/interactions" class="{% if active == 'interactions' %}on{% endif %}">interactions</a>
+        </div>
+      </details>
       <a href="/narrative"  class="{% if active == 'narrative' %}on{% endif %}">narrative</a>
       <a href="/canvas"     class="{% if active == 'canvas' %}on{% endif %}">canvas</a>
-      <a href="/wakes"      class="{% if active == 'wakes' %}on{% endif %}">wakes</a>
-      <a href="/turns"      class="{% if active == 'turns' %}on{% endif %}">turns</a>
-      <a href="/interactions" class="{% if active == 'interactions' %}on{% endif %}">interactions</a>
       <a href="/graph"      class="{% if active == 'graph' %}on{% endif %}">flow graph</a>
       <a href="/memory"     class="{% if active == 'memory' %}on{% endif %}">memory graph</a>
       <a href="/activity"   class="{% if active == 'activity' %}on{% endif %}">activity</a>

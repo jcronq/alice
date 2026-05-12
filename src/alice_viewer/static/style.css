@@ -37,6 +37,38 @@ nav a {
 nav a.on { color: var(--text); background: var(--panel-2); }
 nav a:hover { color: var(--text); text-decoration: none; background: var(--panel-2); }
 
+/* History dropdown — uses native <details>/<summary> so it works
+   with both click (touch) and keyboard. The summary cell looks like
+   a normal nav link; the menu hangs absolute below it. */
+.nav-dropdown {
+  display: inline-block; position: relative;
+  margin-right: 4px; vertical-align: middle;
+}
+.nav-dropdown > summary {
+  list-style: none; cursor: pointer; user-select: none;
+  padding: 4px 10px; color: var(--muted); border-radius: 4px;
+}
+.nav-dropdown > summary::-webkit-details-marker { display: none; }
+.nav-dropdown > summary:hover { color: var(--text); background: var(--panel-2); }
+.nav-dropdown.on > summary { color: var(--text); background: var(--panel-2); }
+.nav-dropdown[open] > summary { color: var(--text); background: var(--panel-2); }
+.nav-dropdown-menu {
+  position: absolute; top: 100%; left: 0; z-index: 11;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 4px; padding: 4px; margin-top: 4px;
+  min-width: 160px;
+  display: flex; flex-direction: column;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+}
+.nav-dropdown-menu a {
+  display: block; padding: 6px 12px; margin: 0;
+  border-radius: 3px; color: var(--muted); white-space: nowrap;
+}
+.nav-dropdown-menu a:hover,
+.nav-dropdown-menu a.on {
+  color: var(--text); background: var(--panel-2);
+}
+
 /* minmax(0, 1fr) (not bare 1fr) lets <main> shrink below its content's
    intrinsic min-width — without it, a long unbreakable string inside
    any descendant (e.g. a wake_id link in a table cell) blows the
