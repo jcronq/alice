@@ -764,6 +764,11 @@ def test_reviewing_merged_pr_with_green_ci_transitions_to_done_via_real_finder(
                     }
                 ]
             )
+        # gh issue list — used by the Phase 1.6 sweep pass to find
+        # closed-with-stale-sm:* issues. Not the focus of this test;
+        # return an empty list so the sweep is a no-op.
+        if "issue" in args and "list" in args:
+            return json.dumps([])
         raise AssertionError(f"unexpected gh invocation: {args!r}")
 
     monkeypatch.setattr(sm, "_run_gh", fake_run_gh)
@@ -816,3 +821,362 @@ def test_reviewing_merged_pr_with_green_ci_transitions_to_done_via_real_finder(
     assert edit["remove"] == ["sm:reviewing"]
     assert report.transitioned == 1
     assert (86, "sm:reviewing", "sm:done") in report.transitions
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.6 — sweep stale closed issues with non-terminal sm:* labels
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_closed_selected_merged_green_ci_to_done(
+    state_path: pathlib.Path,
+) -> None:
+    """Closed issue stuck at sm:selected with a merged PR + green CI →
+    sm:done. The issue stays closed (no re-open, no re-close).
+    """
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    stale = [_make_issue(86, sm_labels=("sm:selected",))]
+
+    def find_pr(_repo: str, n: int) -> dict | None:
+        assert n == 86
+        return {
+            "number": 85,
+            "url": "https://github.com/jcronq/alice/pull/85",
+            "state": "MERGED",
+        }
+
+    def merge_status(_repo: str, pr_number: int) -> dict:
+        assert pr_number == 85
+        return {
+            "merged": True,
+            "merge_commit_oid": "e434e93cafef00d",
+            "pr_url": "https://github.com/jcronq/alice/pull/85",
+        }
+
+    def ci(_repo: str, sha: str) -> dict:
+        assert sha == "e434e93cafef00d"
+        return {
+            "conclusion": "success",
+            "run_url": "https://github.com/jcronq/alice/actions/runs/999",
+        }
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: stale,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=ci,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # Label flipped: selected → done.
+    assert len(label_rec.calls) == 1
+    edit = label_rec.calls[0]
+    assert edit["number"] == 86
+    assert edit["add"] == ["sm:done"]
+    assert edit["remove"] == ["sm:selected"]
+    # Issue stays closed — never call close_issue from the sweep.
+    assert close_rec.closed == []
+    # Audit comment posted.
+    bodies = [b for _r, _n, b in recorder.posted]
+    assert any("[SM] transition from=selected to=done" in b for b in bodies)
+    assert any("closed-by-merge sweep" in b for b in bodies)
+    assert any("PR #85 merged at e434e93cafef00d" in b for b in bodies)
+    # Counters.
+    assert report.swept == 1
+    assert report.transitioned == 0  # sweep counted separately
+    assert (86, "sm:selected", "sm:done") in report.transitions
+
+
+def test_sweep_closed_reviewing_merged_green_ci_to_done(
+    state_path: pathlib.Path,
+) -> None:
+    """Same path, different starting label (sm:reviewing → sm:done).
+
+    Exercises the helper's non-terminal-label scoping: reviewing is
+    just as eligible for sweep as selected when the issue is closed.
+    """
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    stale = [_make_issue(88, sm_labels=("sm:reviewing",))]
+
+    def find_pr(_repo: str, _n: int) -> dict | None:
+        return {
+            "number": 87,
+            "url": "https://github.com/jcronq/alice/pull/87",
+            "state": "MERGED",
+        }
+
+    def merge_status(_repo: str, _pr: int) -> dict:
+        return {
+            "merged": True,
+            "merge_commit_oid": "feedface",
+            "pr_url": "https://github.com/jcronq/alice/pull/87",
+        }
+
+    def ci(_repo: str, _sha: str) -> dict:
+        return {"conclusion": "success", "run_url": "https://example/ci"}
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: stale,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=ci,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert len(label_rec.calls) == 1
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:done"]
+    assert edit["remove"] == ["sm:reviewing"]
+    assert close_rec.closed == []
+    assert report.swept == 1
+    assert (88, "sm:reviewing", "sm:done") in report.transitions
+
+
+def test_sweep_closed_selected_pr_closed_unmerged_to_rejected(
+    state_path: pathlib.Path,
+) -> None:
+    """Closed issue + sm:selected + linked PR closed without merge → sm:rejected."""
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    stale = [_make_issue(91, sm_labels=("sm:selected",))]
+
+    def find_pr(_repo: str, _n: int) -> dict | None:
+        return {
+            "number": 90,
+            "url": "https://github.com/jcronq/alice/pull/90",
+            "state": "CLOSED",
+        }
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: stale,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        # merge_status / master_ci_status must not be touched when the
+        # PR is closed-unmerged; assert that with _no_call.
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert len(label_rec.calls) == 1
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:rejected"]
+    assert edit["remove"] == ["sm:selected"]
+    assert close_rec.closed == []
+    bodies = [b for _r, _n, b in recorder.posted]
+    assert any("[SM] transition from=selected to=rejected" in b for b in bodies)
+    assert any("PR #90 closed without merge" in b for b in bodies)
+    assert report.swept == 1
+
+
+def test_sweep_closed_selected_no_linked_pr_to_rejected(
+    state_path: pathlib.Path,
+) -> None:
+    """Closed issue + sm:selected + no linked PR → sm:rejected (manual close)."""
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    stale = [_make_issue(92, sm_labels=("sm:selected",))]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: stale,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert len(label_rec.calls) == 1
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:rejected"]
+    assert edit["remove"] == ["sm:selected"]
+    assert close_rec.closed == []
+    bodies = [b for _r, _n, b in recorder.posted]
+    assert any(
+        "issue closed without linked PR (manual close or supersession)" in b
+        for b in bodies
+    )
+    assert report.swept == 1
+
+
+def test_sweep_closed_selected_merged_red_ci_to_rejected(
+    state_path: pathlib.Path,
+) -> None:
+    """Merged PR with red master CI on a closed sm:selected issue is rejected.
+
+    Rationale: the work shipped but broke master. The merge artifact
+    exists, but downstream tracking should treat it as needing
+    follow-up — we don't have the Phase 2 quality-gate plumbing yet,
+    so the safest terminal is rejected rather than done.
+    """
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    stale = [_make_issue(93, sm_labels=("sm:selected",))]
+
+    def find_pr(_repo: str, _n: int) -> dict | None:
+        return {
+            "number": 100,
+            "url": "https://github.com/jcronq/alice/pull/100",
+            "state": "MERGED",
+        }
+
+    def merge_status(_repo: str, _pr: int) -> dict:
+        return {
+            "merged": True,
+            "merge_commit_oid": "badbadbad",
+            "pr_url": "https://github.com/jcronq/alice/pull/100",
+        }
+
+    def ci(_repo: str, _sha: str) -> dict:
+        return {
+            "conclusion": "failure",
+            "run_url": "https://github.com/jcronq/alice/actions/runs/777",
+        }
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: stale,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=ci,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert len(label_rec.calls) == 1
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:rejected"]
+    assert edit["remove"] == ["sm:selected"]
+    assert close_rec.closed == []
+    bodies = [b for _r, _n, b in recorder.posted]
+    assert any("[SM] transition from=selected to=rejected" in b for b in bodies)
+    assert any("master CI failure" in b for b in bodies)
+    assert report.swept == 1
+
+
+def test_sweep_helper_filters_terminal_labels_defensively() -> None:
+    """Even if a closed issue already at sm:done leaks into the listing
+    payload, the client-side filter in gh_list_stale_closed_sm_issues
+    must drop it. This is a defense-in-depth check — the GitHub search
+    qualifier should never return a terminal-labeled issue, but if it
+    does we never process it.
+    """
+    payload = [
+        # Terminal — must be dropped.
+        {
+            "number": 86,
+            "title": "already done",
+            "labels": [{"name": "sm:done"}, {"name": "art:code"}],
+            "author": {"login": "jcronq"},
+            "createdAt": "2026-05-12T10:00:00Z",
+        },
+        # Terminal — must be dropped.
+        {
+            "number": 87,
+            "title": "already rejected",
+            "labels": [{"name": "sm:rejected"}, {"name": "art:code"}],
+            "author": {"login": "jcronq"},
+            "createdAt": "2026-05-12T10:00:00Z",
+        },
+        # Non-terminal — must be kept.
+        {
+            "number": 91,
+            "title": "stuck",
+            "labels": [{"name": "sm:selected"}, {"name": "art:code"}],
+            "author": {"login": "jcronq"},
+            "createdAt": "2026-05-12T10:00:00Z",
+        },
+    ]
+
+    captured: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], *, timeout: int = 60) -> str:
+        captured.append(args)
+        return json.dumps(payload)
+
+    import unittest.mock as _mock
+
+    with _mock.patch.object(sm, "_run_gh", fake_run_gh):
+        result = sm.gh_list_stale_closed_sm_issues("jcronq/alice")
+
+    # Only the non-terminal issue survives.
+    assert [i["number"] for i in result] == [91]
+    # Verify the query was scoped to --state closed with the correct
+    # non-terminal label set.
+    args = captured[0]
+    assert "--state" in args and args[args.index("--state") + 1] == "closed"
+    search_idx = args.index("--search")
+    search_str = args[search_idx + 1]
+    assert search_str.startswith("label:")
+    # The label list must be exactly the non-terminal set, comma-joined,
+    # sorted (deterministic for testability).
+    expected_terms = ",".join(sorted(sm.NON_TERMINAL_SM_LABELS))
+    assert search_str == f"label:{expected_terms}"
+    # And the terminals must NOT appear.
+    assert "sm:done" not in search_str
+    assert "sm:rejected" not in search_str
+
+
+def test_sweep_done_line_includes_swept_counter(state_path: pathlib.Path) -> None:
+    """The done log line must include ``swept=N`` — Phase 1.6 contract."""
+    logged: list[str] = []
+    sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: [],
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+    done_line = [line for line in logged if line.startswith("[sm-dispatcher] done")]
+    assert done_line, f"expected a done line in: {logged!r}"
+    assert "swept=0" in done_line[0]

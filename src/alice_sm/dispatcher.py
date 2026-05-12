@@ -103,6 +103,13 @@ ACTIVE_SM_LABEL = "sm:selected"
 REVIEWING_SM_LABEL = "sm:reviewing"
 BUILDING_SM_LABEL = "sm:building"
 DONE_SM_LABEL = "sm:done"
+REJECTED_SM_LABEL = "sm:rejected"
+
+# Terminal ``sm:*`` states — the dispatcher's sweep pass leaves these
+# alone. Non-terminal labels on a *closed* issue indicate a missed
+# transition (Phase 1.6 sweep target).
+TERMINAL_SM_LABELS: frozenset[str] = frozenset({DONE_SM_LABEL, REJECTED_SM_LABEL})
+NON_TERMINAL_SM_LABELS: frozenset[str] = SM_LABEL_WHITELIST - TERMINAL_SM_LABELS
 
 # Schema version of the state file. Bump if the structure changes
 # incompatibly.
@@ -331,6 +338,58 @@ def gh_list_sm_issues(repo: str, *, gh_bin: str = "gh") -> list[dict[str, Any]]:
         issue
         for issue in payload
         if any(n in SM_LABEL_WHITELIST for n in _label_names(issue))
+    ]
+
+
+def gh_list_stale_closed_sm_issues(
+    repo: str, *, gh_bin: str = "gh"
+) -> list[dict[str, Any]]:
+    """Return closed issues that still carry a non-terminal ``sm:*`` label.
+
+    Phase 1.6 sweep target: when a PR with ``Closes #N`` merges fast
+    enough that the dispatcher's open-PR window is missed, GitHub
+    auto-closes the issue but leaves its ``sm:*`` label at whatever it
+    was (typically ``sm:selected``). The main poll filters ``--state
+    open`` and never sees the closed issue. This helper finds those
+    strays so :func:`_process_stale_closed` can route them to the
+    correct terminal state.
+
+    Same ``--search`` OR-syntax trick as :func:`gh_list_sm_issues`,
+    scoped to ``--state closed`` and to non-terminal ``sm:*`` labels.
+    Defense-in-depth: also filters client-side, so a relaxed gh parse
+    or stale label cache can't pull a terminal-labeled issue into the
+    sweep.
+    """
+    search_terms = ",".join(sorted(NON_TERMINAL_SM_LABELS))
+    args = [
+        gh_bin,
+        "issue",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "closed",
+        "--search",
+        f"label:{search_terms}",
+        "--json",
+        "number,title,labels,author,createdAt",
+        "--limit",
+        str(RECENT_ISSUE_LIMIT),
+    ]
+    stdout = _run_gh(args)
+    if not stdout.strip():
+        return []
+    payload = json.loads(stdout)
+    if not isinstance(payload, list):
+        return []
+    # Client-side defense: only keep issues whose label set contains at
+    # least one *non-terminal* whitelisted ``sm:*`` label. A closed
+    # issue at ``sm:done`` must never appear here even if the search
+    # qualifier loosens upstream.
+    return [
+        issue
+        for issue in payload
+        if any(n in NON_TERMINAL_SM_LABELS for n in _label_names(issue))
     ]
 
 
@@ -678,6 +737,10 @@ class RunReport:
     transitions: list[tuple[int, str, str]] = field(
         default_factory=list
     )  # (issue_number, from, to)
+    # Phase 1.6 — count of stale-closed-issue sweep transitions. Counted
+    # separately from ``transitioned`` so the done-line tells you at a
+    # glance whether the missed-window sweep is firing.
+    swept: int = 0
 
 
 def _process_selected(
@@ -903,11 +966,188 @@ def _process_reviewing(
         return
 
 
+def _process_stale_closed(
+    *,
+    issue: dict[str, Any],
+    repo: str,
+    report: RunReport,
+    post_comment: PostCommentFn,
+    edit_labels: EditLabelsFn,
+    find_linked_pr: FindLinkedPRFn,
+    pr_merge_status: PRMergeStatusFn,
+    master_ci_status: MasterCIStatusFn,
+    dry_run: bool,
+    log: Callable[[str], None],
+) -> None:
+    """Phase 1.6 sweep: route a closed issue with a non-terminal ``sm:*``
+    label to its correct terminal state.
+
+    The issue is already closed — we never re-open and we never close
+    further; only labels and the ``[SM] transition`` audit comment are
+    written. Decision tree:
+
+      * linked PR merged + master CI green → ``sm:done``
+      * linked PR merged + master CI red   → ``sm:rejected``
+        (the merge happened but broke master; the work shipped-but-bad
+        and downstream tracking should treat it as rejected pending
+        follow-up.)
+      * linked PR closed-unmerged          → ``sm:rejected``
+      * no linked PR at all                → ``sm:rejected``
+        (manual close or supersession — there's no merge artifact, so
+        the safe terminal state is rejected.)
+
+    A pending master CI verdict is treated as "wait" — we stay at the
+    stale label and let the next pass re-evaluate. This keeps the
+    sweep idempotent under flaky CI: we'd rather leave a stale label
+    one more cadence than commit to ``sm:done`` before the build is
+    actually green.
+    """
+    number = issue["number"]
+    stale_label = _current_sm_label(issue)
+    if stale_label is None:
+        # Defensive: the helper already filters to non-terminal sm:*,
+        # but if some odd label set sneaks through (multi-sm, typo),
+        # don't guess.
+        names = _label_names(issue)
+        sm_labels_seen = [n for n in names if n.startswith("sm:")]
+        log(
+            f"[sm-dispatcher] sweep skip #{number}: "
+            f"ambiguous sm:* label set {sm_labels_seen!r}"
+        )
+        return
+    if stale_label in TERMINAL_SM_LABELS:
+        # Belt-and-suspenders: helper's client-side filter should have
+        # excluded this. If we got here anyway, do nothing.
+        return
+
+    # Resolve linked PR + outcome.
+    try:
+        pr = find_linked_pr(repo, number)
+    except GHCommandError as exc:
+        log(f"[sm-dispatcher] sweep: failed PR lookup for #{number}: {exc}")
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+
+    target_label: str
+    reason: str
+    if pr is None:
+        # Closed with no PR linkage: manual close, supersession, or
+        # a bot that closed without a "Closes #" reference. Without a
+        # merge artifact the safe terminal is rejected.
+        target_label = REJECTED_SM_LABEL
+        reason = "issue closed without linked PR (manual close or supersession)"
+    else:
+        pr_number = pr.get("number")
+        pr_state = (pr.get("state") or "").upper()
+        if not isinstance(pr_number, int):
+            log(
+                f"[sm-dispatcher] sweep skip #{number}: "
+                f"linked PR payload missing number ({pr!r})"
+            )
+            return
+        if pr_state == "MERGED":
+            try:
+                merge_info = pr_merge_status(repo, pr_number)
+            except GHCommandError as exc:
+                log(
+                    f"[sm-dispatcher] sweep: merge-status failed for "
+                    f"PR #{pr_number}: {exc}"
+                )
+                if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+                    raise
+                return
+            sha = merge_info.get("merge_commit_oid")
+            pr_url = merge_info.get("pr_url") or pr.get("url") or "<unknown>"
+            if not sha:
+                log(
+                    f"[sm-dispatcher] sweep skip #{number}: "
+                    f"PR #{pr_number} reports MERGED but no merge_commit_oid"
+                )
+                return
+            try:
+                ci = master_ci_status(repo, sha)
+            except GHCommandError as exc:
+                log(f"[sm-dispatcher] sweep: CI lookup failed for {sha[:8]}: {exc}")
+                if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+                    raise
+                return
+            conclusion = ci.get("conclusion")
+            if conclusion is None or conclusion == "pending":
+                # Hold the stale label one more cadence rather than
+                # commit to a terminal before CI returns a verdict.
+                log(
+                    f"[sm-dispatcher] sweep wait #{number}: "
+                    f"PR #{pr_number} merged but master CI is {conclusion!r}"
+                )
+                return
+            if conclusion == "success":
+                target_label = DONE_SM_LABEL
+                reason = (
+                    f"closed-by-merge sweep: PR #{pr_number} merged at {sha}, "
+                    f"master CI success ({pr_url})"
+                )
+            else:
+                # CI red post-merge: the work shipped but broke master.
+                # Downgrade to rejected so a human picks up the follow-up;
+                # we don't have the Phase 2 quality-gate plumbing yet.
+                run_url = ci.get("run_url") or "<unknown>"
+                target_label = REJECTED_SM_LABEL
+                reason = (
+                    f"closed-by-merge sweep: PR #{pr_number} merged at {sha} "
+                    f"but master CI failure ({run_url})"
+                )
+        elif pr_state == "CLOSED":
+            target_label = REJECTED_SM_LABEL
+            reason = f"PR #{pr_number} closed without merge"
+        else:
+            # PR is still OPEN (or some state we don't recognise) and
+            # the issue is closed. Possible scenarios: the PR was
+            # un-merged after the fact, or the issue was hand-closed
+            # while a PR still exists. Either way, don't sweep — let a
+            # human (or a later phase) decide.
+            log(
+                f"[sm-dispatcher] sweep skip #{number}: "
+                f"issue closed but linked PR #{pr_number} is {pr_state!r}"
+            )
+            return
+
+    body = render_transition_comment(stale_label, target_label, reason)
+    if dry_run:
+        log(
+            f"[sm-dispatcher] DRY-RUN would sweep #{number}: "
+            f"{stale_label} → {target_label} ({reason})"
+        )
+        report.swept += 1
+        report.transitions.append((number, stale_label, target_label))
+        return
+    try:
+        edit_labels(
+            repo,
+            number,
+            add=[target_label],
+            remove=[stale_label],
+        )
+        post_comment(repo, number, body)
+    except GHCommandError as exc:
+        log(f"[sm-dispatcher] sweep failed to transition #{number}: {exc}")
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+    report.swept += 1
+    report.transitions.append((number, stale_label, target_label))
+    log(
+        f"[sm-dispatcher] swept #{number}: "
+        f"{stale_label} → {target_label} (issue stays closed)"
+    )
+
+
 def run(
     *,
     repo: str = DEFAULT_REPO,
     state_path: pathlib.Path,
     list_issues: ListIssuesFn | None = None,
+    list_stale_closed: ListIssuesFn | None = None,
     post_comment: PostCommentFn = gh_post_comment,
     edit_labels: EditLabelsFn = gh_edit_labels,
     close_issue: CloseIssueFn = gh_close_issue,
@@ -928,6 +1168,8 @@ def run(
     """
     if list_issues is None:
         list_issues = gh_list_sm_issues
+    if list_stale_closed is None:
+        list_stale_closed = gh_list_stale_closed_sm_issues
 
     report = RunReport()
     try:
@@ -1006,6 +1248,53 @@ def run(
             log(f"[sm-dispatcher] fatal gh error: {exc}")
             break
 
+    # Phase 1.6 — sweep pass: catch closed issues that still carry a
+    # non-terminal ``sm:*`` label and route them to a terminal state.
+    # Runs only if the open-issue pass didn't bail with a fatal gh
+    # error; the sweep is best-effort and shouldn't override a fatal
+    # signal from the primary poll.
+    if not fatal_exit:
+        try:
+            stale_issues = list_stale_closed(repo)
+        except GHCommandError as exc:
+            # The sweep is a defense-in-depth pass; failing to list
+            # closed issues is not fatal to the primary loop. Log and
+            # continue so dedup state still saves.
+            if exc.looks_like_auth_failure:
+                log(f"[sm-dispatcher] sweep auth failure listing {repo}: {exc}")
+                fatal_exit = True
+            elif exc.looks_like_rate_limit:
+                log(f"[sm-dispatcher] sweep rate-limited listing {repo}: {exc}")
+                fatal_exit = True
+            else:
+                log(f"[sm-dispatcher] sweep failed to list closed {repo}: {exc}")
+            stale_issues = []
+        for issue in stale_issues:
+            number = issue.get("number")
+            if not isinstance(number, int):
+                log(
+                    f"[sm-dispatcher] sweep skip issue with non-integer "
+                    f"number: {number!r}"
+                )
+                continue
+            try:
+                _process_stale_closed(
+                    issue=issue,
+                    repo=repo,
+                    report=report,
+                    post_comment=post_comment,
+                    edit_labels=edit_labels,
+                    find_linked_pr=find_linked_pr,
+                    pr_merge_status=pr_merge_status,
+                    master_ci_status=master_ci_status,
+                    dry_run=dry_run,
+                    log=log,
+                )
+            except GHCommandError as exc:
+                fatal_exit = True
+                log(f"[sm-dispatcher] fatal gh error during sweep: {exc}")
+                break
+
     if fatal_exit:
         # Persist what we did manage so dedup state for any successful
         # hello posts isn't lost.
@@ -1020,6 +1309,7 @@ def run(
         f"[sm-dispatcher] done — polled={report.polled} "
         f"posted={report.posted} "
         f"transitioned={report.transitioned} "
+        f"swept={report.swept} "
         f"skipped_dedup={report.skipped_dedup} "
         f"skipped_trust={report.skipped_trust}"
     )
