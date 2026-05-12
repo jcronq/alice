@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import pathlib
 import time
 from dataclasses import dataclass
 from typing import AsyncIterator
@@ -22,7 +24,11 @@ from .settings import Paths
 DEFAULT_MODEL = "claude-sonnet-4-6"
 BUCKET_MODEL = "claude-haiku-4-5"  # one-shot bucket summaries — Haiku is plenty
 DEFAULT_MAX_SECONDS = 90
-CACHE_TTL_SECONDS = 300  # 5 min — refresh if window content changed recently
+# Final-merge cache TTL. Was 5 min when the cache was in-memory only;
+# bumped to 7d now that it's disk-persisted (mirrors bucket_cache).
+# Content-hash invalidation already handles "new events landed in the
+# window" correctly; TTL is just a safety net for cache-dir bloat.
+CACHE_TTL_SECONDS = 7 * 86400
 
 
 @dataclass
@@ -155,7 +161,41 @@ def cache_key(digest: dict) -> str:
     return hashlib.sha256(blob).hexdigest()[:16]
 
 
+def _merge_cache_dir() -> pathlib.Path:
+    """Disk location for final-merge narrative cache.
+
+    Sibling of the bucket cache under ``$ALICE_VIEWER_CACHE_DIR``
+    (default ``~/.local/state/alice/viewer-cache/merges/``). The
+    bind-mounted state dir survives viewer container recreates so a
+    cached narrative outlives every deploy.
+    """
+    override = os.environ.get("ALICE_VIEWER_CACHE_DIR")
+    if override:
+        return pathlib.Path(override) / "merges"
+    return pathlib.Path.home() / ".local/state/alice/viewer-cache/merges"
+
+
+def _merge_cache_path(key: str) -> pathlib.Path:
+    safe = key.replace("/", "_").replace("..", "__")
+    return _merge_cache_dir() / f"{safe}.json"
+
+
 def cache_get(key: str) -> str | None:
+    """Return the cached merged narrative for ``key``, or None.
+
+    Reads from the disk cache (survives viewer recreate). Falls back
+    to the legacy in-memory cache for backwards compat with anything
+    that wrote there pre-deploy.
+    """
+    path = _merge_cache_path(key)
+    if path.is_file():
+        try:
+            raw = json.loads(path.read_text())
+            if time.time() - (raw.get("saved_at") or 0) <= CACHE_TTL_SECONDS:
+                return raw.get("text")
+        except (OSError, json.JSONDecodeError):
+            pass
+    # Legacy in-memory fallback (still served until process restarts).
     entry = _CACHE.get(key)
     if entry is None:
         return None
@@ -167,7 +207,26 @@ def cache_get(key: str) -> str | None:
 
 
 def cache_put(key: str, text: str) -> None:
-    _CACHE[key] = (time.time(), text)
+    """Persist the merged narrative to disk + in-memory cache.
+
+    Disk write is atomic (tmp + rename) to avoid serving a half-
+    written file on concurrent reads. In-memory cache is kept
+    populated as a fast path for hot keys within the same process.
+    """
+    saved_at = time.time()
+    _CACHE[key] = (saved_at, text)
+    path = _merge_cache_path(key)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps({"saved_at": saved_at, "text": text}, ensure_ascii=False)
+        )
+        tmp.replace(path)
+    except OSError:
+        # Disk failure shouldn't break the streaming response — the
+        # caller already has the text and the in-memory cache is set.
+        pass
 
 
 # ---------------------------------------------------------------------------
