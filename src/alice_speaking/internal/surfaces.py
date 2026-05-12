@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json
 import logging
 import pathlib
 import re
@@ -52,6 +53,13 @@ DEDUPE_BY_TYPE_PER_DAY: frozenset[str] = frozenset({
 
 
 _SURFACE_TYPE_RE = re.compile(r"^surface_type:\s*(\S+)\s*$", re.MULTILINE)
+_SOURCE_ID_RE = re.compile(r"^source-id:\s*(.+?)\s*$", re.MULTILINE)
+_FRONTMATTER_DATE_RE = re.compile(r"^date:\s*(\S+)\s*$", re.MULTILINE)
+_FILENAME_DATE_SLUG_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-\d{6}-(.+)$")
+
+# Rolling window for id-based intake dedup: if the same key appears
+# within this many hours, the second occurrence is suppressed.
+ID_DEDUP_WINDOW_HOURS = 24
 
 
 @dataclass
@@ -82,6 +90,9 @@ class SurfaceWatcher:
     def __init__(self, mind_dir: pathlib.Path) -> None:
         self._surface_dir = mind_dir / "inner" / "surface"
         self._handled_dir = self._surface_dir / ".handled"
+        self._dedup_log_path = (
+            mind_dir / "inner" / "state" / "surface-intake-dedup.jsonl"
+        )
         self._dispatched: set[str] = set()
 
     @property
@@ -129,6 +140,8 @@ class SurfaceWatcher:
                     if path.name.startswith(".") or path.name in self._dispatched:
                         continue
                     if self._suppress_as_duplicate(path):
+                        continue
+                    if self._suppress_as_id_duplicate(path):
                         continue
                     self._dispatched.add(path.name)
                     log.info("surface detected: %s", path.name)
@@ -195,6 +208,174 @@ class SurfaceWatcher:
             prior_name,
         )
 
+    def _suppress_as_id_duplicate(self, path: pathlib.Path) -> bool:
+        """Suppress same-id same-day re-issues using a JSONL state log.
+
+        Computes a dedup key (``source-id`` or filename slug, plus the
+        date) and consults ``inner/state/surface-intake-dedup.jsonl``
+        for a prior occurrence within the last
+        :data:`ID_DEDUP_WINDOW_HOURS`. If the prior is already in
+        ``.handled/`` the new surface is auto-resolved with a
+        ``let-pass (intake-side dedup)`` verdict pointing at the prior.
+        If the prior is still pending the new surface is deferred —
+        archived with a ``deferred-pending-prior`` verdict so it doesn't
+        spawn duplicate work.
+
+        Surfaces with no extractable key (no frontmatter id and an
+        unrecognised filename pattern) fall through to no-dedup.
+
+        Returns True iff the surface was suppressed.
+        """
+        key = _dedup_key(path)
+        if key is None:
+            return False
+        now = datetime.datetime.now().astimezone()
+        prior = self._lookup_prior_entry(key, now)
+        if prior is None:
+            self._record_dedup_entry(key, path.name, now)
+            return False
+        prior_filename = str(prior.get("filename") or "<unknown>")
+        handled_path = self._find_in_handled(prior_filename)
+        if handled_path is not None:
+            self._archive_id_duplicate(
+                path,
+                key=key,
+                prior_filename=prior_filename,
+                handled_path=handled_path,
+                deferred=False,
+            )
+        else:
+            self._archive_id_duplicate(
+                path,
+                key=key,
+                prior_filename=prior_filename,
+                handled_path=None,
+                deferred=True,
+            )
+        return True
+
+    def _lookup_prior_entry(
+        self, key: str, now: datetime.datetime
+    ) -> Optional[dict]:
+        """Return the most recent dedup-log entry with this key within
+        the rolling window, or None if nothing matches."""
+        if not self._dedup_log_path.is_file():
+            return None
+        cutoff = now - datetime.timedelta(hours=ID_DEDUP_WINDOW_HOURS)
+        latest: Optional[dict] = None
+        try:
+            with self._dedup_log_path.open("r", encoding="utf-8") as fh:
+                for raw in fh:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if entry.get("key") != key:
+                        continue
+                    ts_raw = entry.get("ts")
+                    if not isinstance(ts_raw, str):
+                        continue
+                    try:
+                        ts = datetime.datetime.fromisoformat(ts_raw)
+                    except ValueError:
+                        continue
+                    if ts.tzinfo is None:
+                        ts = ts.astimezone()
+                    if ts < cutoff:
+                        continue
+                    latest = entry
+        except OSError as exc:
+            log.warning("dedup log read failed: %s", exc)
+            return None
+        return latest
+
+    def _record_dedup_entry(
+        self, key: str, filename: str, now: datetime.datetime
+    ) -> None:
+        """Append a new dedup-log entry for a surface that passed both
+        intake filters. Survives daemon restart because the log lives
+        on disk."""
+        record = {
+            "ts": now.isoformat(timespec="seconds"),
+            "key": key,
+            "filename": filename,
+        }
+        try:
+            self._dedup_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._dedup_log_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record) + "\n")
+        except OSError as exc:
+            log.warning("dedup log write failed: %s", exc)
+
+    def _find_in_handled(self, filename: str) -> Optional[pathlib.Path]:
+        """Look for ``filename`` under any dated ``.handled/`` subdir.
+        Returns the path if found, else None."""
+        if not self._handled_dir.is_dir():
+            return None
+        try:
+            for entry in self._handled_dir.iterdir():
+                if not entry.is_dir():
+                    continue
+                candidate = entry / filename
+                if candidate.exists():
+                    return candidate
+        except OSError as exc:
+            log.warning("handled-dir scan failed: %s", exc)
+            return None
+        return None
+
+    def _archive_id_duplicate(
+        self,
+        path: pathlib.Path,
+        *,
+        key: str,
+        prior_filename: str,
+        handled_path: Optional[pathlib.Path],
+        deferred: bool,
+    ) -> None:
+        """Archive an id-dedup duplicate under today's handled dir with
+        a verdict line referencing the prior occurrence."""
+        today = datetime.date.today().isoformat()
+        dest_dir = self._handled_dir / today
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / path.name
+        body = path.read_text()
+        if deferred:
+            verdict = (
+                "deferred-pending-prior (intake-side dedup) — "
+                f"key '{key}' prior surface {prior_filename} still pending"
+            )
+            action = (
+                "auto-archived by intake id-dedup filter; prior surface "
+                f"{prior_filename} is still pending dispatch"
+            )
+        else:
+            assert handled_path is not None
+            handled_ref = f".handled/{handled_path.parent.name}/{handled_path.name}"
+            verdict = (
+                "let-pass (intake-side dedup) — "
+                f"key '{key}' already resolved at {handled_ref}"
+            )
+            action = f"auto-archived by intake id-dedup filter; prior at {handled_ref}"
+        trailer = (
+            "\n\n---\n"
+            + f"resolved: {datetime.datetime.now().astimezone().isoformat(timespec='seconds')}\n"
+            + f"verdict: {verdict}\n"
+            + f"action_taken: {action}\n"
+        )
+        dest.write_text(body + trailer)
+        path.unlink()
+        log.info(
+            "surface id-dedup: suppressed %s (key=%s, prior=%s, deferred=%s)",
+            path.name,
+            key,
+            prior_filename,
+            deferred,
+        )
+
     async def handle(self, ctx: DaemonContext, event: SurfaceEvent) -> None:
         """Run one surface turn, then release the dispatched-set
         slot so a re-drop of the same filename can dispatch again."""
@@ -238,12 +419,55 @@ def _read_surface_type(path: pathlib.Path) -> Optional[str]:
     frontmatter lacks a ``surface_type:`` line. Reads only the first
     ~2 KiB so a malformed body can't stall the watcher.
     """
-    try:
-        with path.open("r", encoding="utf-8", errors="replace") as fh:
-            head = fh.read(2048)
-    except OSError:
+    head = _read_frontmatter_head(path)
+    if head is None:
         return None
     match = _SURFACE_TYPE_RE.search(head)
     if match is None:
         return None
     return match.group(1).strip().strip("\"'")
+
+
+def _read_frontmatter_head(path: pathlib.Path) -> Optional[str]:
+    """Return the first ~2 KiB of a surface file, or None on I/O error.
+    Shared by frontmatter parsers so a malformed body can't stall the
+    watcher."""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            return fh.read(2048)
+    except OSError:
+        return None
+
+
+def _dedup_key(path: pathlib.Path) -> Optional[str]:
+    """Compute the id+date dedup key for a surface.
+
+    Order of preference for each component:
+      * source-id: ``source-id`` frontmatter field, else the filename
+        slug after the ``YYYY-MM-DD-HHMMSS-`` prefix.
+      * date:      ``date`` frontmatter field, else the ``YYYY-MM-DD``
+        prefix of the filename.
+
+    Returns ``None`` when neither path yields both components — those
+    surfaces fall through to no-dedup, matching today's behaviour.
+    """
+    head = _read_frontmatter_head(path)
+    source_id: Optional[str] = None
+    date: Optional[str] = None
+    if head is not None:
+        m = _SOURCE_ID_RE.search(head)
+        if m is not None:
+            source_id = m.group(1).strip().strip("\"'")
+        m = _FRONTMATTER_DATE_RE.search(head)
+        if m is not None:
+            date = m.group(1).strip().strip("\"'")
+    if source_id is None or date is None:
+        m = _FILENAME_DATE_SLUG_RE.match(path.stem)
+        if m is not None:
+            if date is None:
+                date = m.group(1)
+            if source_id is None:
+                source_id = m.group(2)
+    if not source_id or not date:
+        return None
+    return f"{source_id}|{date}"
