@@ -45,6 +45,16 @@
      page) bind hx-trigger="sse:change". The connection lives on a
      stable wrapper element so the sidebar's outerHTML swap doesn't
      drop us off the channel. #}
+  <script>
+    // Close any open <details class="nav-dropdown"> when the user
+    // clicks outside it. Native <details> only toggles on summary
+    // click; for a nav-style dropdown we want click-outside-to-close.
+    document.addEventListener('click', (e) => {
+      document.querySelectorAll('details.nav-dropdown[open]').forEach((d) => {
+        if (!d.contains(e.target)) d.removeAttribute('open');
+      });
+    });
+  </script>
   <div hx-ext="sse" sse-connect="/stream/changes" class="layout">
     {% include "_sidebar.html" %}
     <main>
