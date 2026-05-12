@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -40,6 +41,14 @@ from yaml_lite import extract_wikilinks, split_frontmatter  # noqa: E402
 
 
 SCHEMA_VERSION = 1
+
+# Belt-and-suspenders frontmatter stripper applied to the raw file text
+# before ``split_frontmatter`` runs. ``split_frontmatter`` is line-based
+# and bails out on irregular shapes (no leading fence, missing closing
+# fence, CRLF endings, etc.); this regex catches the well-formed cases
+# unconditionally so frontmatter keys like ``access_count`` and
+# ``last_accessed`` never reach the FTS5 corpus.
+_FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 
 # Folders whose inbound links count as structural citations.
 STRUCTURAL_FOLDERS = {"projects", "reference", "people", "decisions"}
@@ -198,6 +207,7 @@ def collect_notes(vault: Path) -> list[dict]:
         except (OSError, UnicodeDecodeError):
             continue
         fm, body = split_frontmatter(text)
+        body = _FRONTMATTER_RE.sub("", body)
         slug = slug_for(md, vault, colliding_stems)
         title = fm.get("title") or slug
         if isinstance(title, list):

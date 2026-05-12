@@ -40,6 +40,7 @@ import logging
 import pathlib
 import re
 import sqlite3
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -167,6 +168,53 @@ _STOPWORDS = frozenset(
         "any",
         "all",
         "some",
+        # Phase-1 expansion (2026-05-12): 44 additional terms from the
+        # preprocessing design doc. See
+        # cortex-memory/research/2026-05-12-cue-runner-preprocessing-implementation-plan.md.
+        "again",
+        "above",
+        "although",
+        "below",
+        "both",
+        "being",
+        "been",
+        "between",
+        "can",
+        "during",
+        "each",
+        "few",
+        "further",
+        "here",
+        "him",
+        "how",
+        "may",
+        "might",
+        "more",
+        "most",
+        "must",
+        "nor",
+        "off",
+        "once",
+        "our",
+        "ours",
+        "other",
+        "out",
+        "shall",
+        "same",
+        "since",
+        "such",
+        "through",
+        "though",
+        "too",
+        "under",
+        "unless",
+        "until",
+        "up",
+        "us",
+        "very",
+        "whether",
+        "whom",
+        "whose",
     }
 )
 
@@ -226,6 +274,7 @@ def _tokenize_query(query: str) -> list[str]:
     Empty result is possible (e.g. user just said "hi") — the caller
     must short-circuit on that.
     """
+    query = unicodedata.normalize("NFKC", query)
     seen: set[str] = set()
     tokens: list[str] = []
     for raw in _TOKEN_RE.findall(query.lower()):
