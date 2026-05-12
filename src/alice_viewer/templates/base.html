@@ -18,7 +18,7 @@
       <span class="logo">◑</span>
       <span>{{ personae.agent.name }} Viewer</span>
     </div>
-    {% set history_active = active in ('timeline', 'wakes', 'turns', 'interactions') %}
+    {% set history_active = active in ('timeline', 'wakes', 'turns', 'interactions', 'narrative') %}
     <nav>
       <a href="/chat"       class="{% if active == 'chat' %}on{% endif %}">chat</a>
       <details class="nav-dropdown {% if history_active %}on{% endif %}">
@@ -28,9 +28,9 @@
           <a href="/wakes"        class="{% if active == 'wakes' %}on{% endif %}">wakes</a>
           <a href="/turns"        class="{% if active == 'turns' %}on{% endif %}">turns</a>
           <a href="/interactions" class="{% if active == 'interactions' %}on{% endif %}">interactions</a>
+          <a href="/narrative"    class="{% if active == 'narrative' %}on{% endif %}">narrative</a>
         </div>
       </details>
-      <a href="/narrative"  class="{% if active == 'narrative' %}on{% endif %}">narrative</a>
       <a href="/canvas"     class="{% if active == 'canvas' %}on{% endif %}">canvas</a>
       <a href="/graph"      class="{% if active == 'graph' %}on{% endif %}">flow graph</a>
       <a href="/memory"     class="{% if active == 'memory' %}on{% endif %}">memory graph</a>
