@@ -81,6 +81,42 @@ __all__ = [
 log = logging.getLogger(__name__)
 
 
+# Candidate interpreters for the ``submit_result`` MCP server. Order matters
+# — first one that imports ``claude_agent_sdk`` cleanly wins. ``sys.executable``
+# is checked implicitly inside the picker below before the fallbacks.
+_MCP_PYTHON_FALLBACKS: tuple[str, ...] = (
+    "/opt/alice-venv/bin/python3",
+    "/host-home/alice-speaking/.venv/bin/python",
+)
+
+
+def _pick_mcp_python() -> str:
+    """Return a python that has ``claude_agent_sdk`` importable.
+
+    The MCP server is a tiny stdio process; we just need an interpreter
+    that can run ``alice_thinking.experiments.submit_result`` without
+    blowing up on the SDK import. Falls back to ``sys.executable`` if no
+    fallback path passes — the runner will still try, and the failure
+    will surface as a clear traceback in the transcript.
+    """
+    candidates: tuple[str, ...] = (sys.executable, *_MCP_PYTHON_FALLBACKS)
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            result = subprocess.run(
+                [path, "-c", "import claude_agent_sdk"],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode == 0:
+            return path
+    return sys.executable
+
+
 # Wall-clock safety net per the design-review concern. Not a "kill after"
 # expectation — most experiments finish in seconds. This catches runaway
 # loops the deny-list doesn't (e.g. read→write→read in a tight cycle).
@@ -732,19 +768,21 @@ class ExperimentRunner:
         # The CLI's --mcp-config JSON shape: {"mcpServers": {"<name>": {...}}}
         # An stdio server entry is {"type":"stdio","command":"...","args":[...]}.
         #
-        # Use ``sys.executable`` (the python that's running the runner)
-        # rather than bare ``python3``. The MCP server needs
-        # ``claude_agent_sdk`` importable, and bare ``python3`` resolves
-        # against PATH — which in the alice container picks up
-        # ``/usr/bin/python3`` (no claude_agent_sdk) instead of the venv
-        # python that the runner itself is using. That mismatch made the
-        # subagent's MCP server fail on init, leaving the subagent unable
-        # to call ``submit_result`` even though the work succeeded.
+        # The MCP server needs ``claude_agent_sdk`` importable. ``sys.executable``
+        # is the right default when the runner's own python has the SDK, but
+        # the runner is also dispatched from environments that intentionally
+        # don't (e.g. ``/state/sci-env`` carries torch_geometric for ML
+        # experiments but not the SDK). Detect at runtime: prefer
+        # ``sys.executable``; otherwise probe a small list of known-good
+        # locations and pick the first one that imports the SDK cleanly.
+        # That keeps the subagent's MCP server working regardless of which
+        # python the operator (or thinking) used to invoke the CLI.
+        mcp_python = _pick_mcp_python()
         config = {
             "mcpServers": {
                 "alice_experiment": {
                     "type": "stdio",
-                    "command": sys.executable,
+                    "command": mcp_python,
                     "args": [
                         "-m",
                         "alice_thinking.experiments.submit_result",
