@@ -41,10 +41,10 @@ while true; do
     fi
 
     start_ts=$(date +%s)
-    # s6-redirfd opens fd 2 after the privilege drop so the log file is
-    # owned by alice; shell `2>>` would open it as the supervising root
-    # shell.
-    flock -n "$LOCK" s6-setuidgid alice s6-redirfd -a 2 /state/worker/sm-dispatcher-stderr.log \
+    # redirfd (execline) opens fd 2 after the privilege drop so the log
+    # file is owned by alice; shell `2>>` would open it as the
+    # supervising root shell.
+    flock -n "$LOCK" s6-setuidgid alice redirfd -a 2 /state/worker/sm-dispatcher-stderr.log \
         /usr/local/bin/alice-sm-dispatcher || true
     end_ts=$(date +%s)
     elapsed=$(( end_ts - start_ts ))
