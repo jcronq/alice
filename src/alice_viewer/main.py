@@ -147,8 +147,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         last_wake = wakes[-1] if wakes else None
         last_turn = turns[-1] if turns else None
         return {
-            "directive": sources.read_directive(p.inner),
-            "paths": p,
+            "current_objective": sources.read_current_objective(p.inner),
             "pending_surfaces": len(surfaces),
             "pending_emergencies": len(emergencies),
             "last_wake_ts": last_wake.start_ts if last_wake else None,
@@ -710,9 +709,19 @@ def create_app(paths: Paths | None = None) -> FastAPI:
                 f"<p><a href='/canvas'>← back to index</a></p>",
                 status_code=404,
             )
+        # Authored canvas decks → reveal.js slideshow.
+        # Auto-promoted experiment cards → plain markdown paper view.
+        # Reveal.js treats every standalone `---` as a slide break,
+        # which slices research-paper frontmatter into nonsense slides,
+        # so experiments get their own template.
+        template = (
+            "canvas_paper.html"
+            if canvas.get("source") == "experiment"
+            else "canvas_view.html"
+        )
         return templates.TemplateResponse(
             request,
-            "canvas_view.html",
+            template,
             {
                 "canvas": canvas,
                 "state": _state_context(),

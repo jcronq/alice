@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}{{ canvas.title }}{% endblock %}
+{% block body %}
+  <article class="canvas-paper">
+    <header class="canvas-paper-head">
+      <p class="muted">
+        <a href="/canvas">← canvas index</a>
+        <span class="canvas-paper-source">source: {{ canvas.source }}</span>
+        <span class="canvas-paper-slug">/canvas/{{ canvas.slug }}</span>
+      </p>
+      <h1>{{ canvas.title }}</h1>
+    </header>
+    <section class="canvas-paper-body" id="paper-body">
+      <pre id="paper-raw" style="display:none">{{ canvas.body }}</pre>
+    </section>
+  </article>
+
+  <script>
+    (function () {
+      const raw = document.getElementById("paper-raw").textContent;
+      const body = document.getElementById("paper-body");
+      if (window.marked && window.DOMPurify) {
+        const rendered = window.marked.parse(raw, { breaks: true });
+        body.innerHTML = window.DOMPurify.sanitize(rendered);
+      } else {
+        const pre = document.createElement("pre");
+        pre.textContent = raw;
+        body.innerHTML = "";
+        body.appendChild(pre);
+      }
+    })();
+  </script>
+
+  <style>
+    .canvas-paper { max-width: 820px; margin: 0 auto; padding: 0 12px 60px; }
+    .canvas-paper-head { margin: 16px 0 24px; }
+    .canvas-paper-head h1 { margin: 8px 0 0; font-size: 26px; }
+    .canvas-paper-head p { font-size: 12px; }
+    .canvas-paper-source { margin-left: 14px; font-family: var(--mono, monospace); }
+    .canvas-paper-slug { margin-left: 14px; font-family: var(--mono, monospace); opacity: 0.6; }
+    .canvas-paper-body { line-height: 1.55; font-size: 15px; }
+    .canvas-paper-body h1, .canvas-paper-body h2, .canvas-paper-body h3 {
+      margin-top: 1.4em; margin-bottom: 0.4em;
+    }
+    .canvas-paper-body h1 { font-size: 22px; }
+    .canvas-paper-body h2 { font-size: 18px; }
+    .canvas-paper-body h3 { font-size: 16px; }
+    .canvas-paper-body p { margin: 0.6em 0; }
+    .canvas-paper-body pre {
+      background: var(--panel-2, #1a1a1a); padding: 10px 14px; border-radius: 4px;
+      overflow-x: auto; font-size: 12px; line-height: 1.4;
+    }
+    .canvas-paper-body code {
+      background: var(--panel-2, #1a1a1a); padding: 1px 4px; border-radius: 3px;
+      font-size: 0.92em;
+    }
+    .canvas-paper-body pre code { background: none; padding: 0; }
+    .canvas-paper-body table {
+      border-collapse: collapse; margin: 0.8em 0;
+      font-size: 13px;
+    }
+    .canvas-paper-body th, .canvas-paper-body td {
+      border: 1px solid var(--border); padding: 4px 10px;
+    }
+    .canvas-paper-body th { background: var(--panel-2, #1a1a1a); }
+    .canvas-paper-body blockquote {
+      border-left: 3px solid var(--accent); padding-left: 12px; margin: 0.8em 0;
+      color: var(--muted);
+    }
+    .canvas-paper-body hr {
+      border: 0; border-top: 1px solid var(--border); margin: 1.4em 0;
+    }
+  </style>
+{% endblock %}

@@ -406,6 +406,18 @@ def _speaking_summary(event: str, rec: dict[str, Any]) -> str:
         chars = rec.get("outbound_chars") or 0
         err = rec.get("error")
         return f"turn end · {chars} chars" + (f" · error={err}" if err else "")
+    if event == "viewer_chat_turn_start":
+        return f"viewer-chat · {rec.get('display_name')} → {_trim(rec.get('inbound') or '', 120)}"
+    if event == "viewer_chat_turn_end":
+        err = rec.get("error")
+        dur = rec.get("duration_ms")
+        return f"viewer-chat end · {dur}ms" + (f" · error={err}" if err else "")
+    if event == "a2a_turn_start":
+        return f"a2a · {rec.get('display_name')} → {_trim(rec.get('inbound') or '', 120)}"
+    if event == "a2a_turn_end":
+        err = rec.get("error")
+        dur = rec.get("duration_ms")
+        return f"a2a end · {dur}ms" + (f" · error={err}" if err else "")
     if event in ("signal_send", "cli_send", "discord_send"):
         transport = event.removesuffix("_send")
         chunks = rec.get("chunk_count")
@@ -668,6 +680,97 @@ def read_thoughts(inner: pathlib.Path) -> list[UnifiedEvent]:
 
 def read_directive(inner: pathlib.Path) -> str:
     return _read_text(inner / "directive.md")
+
+
+def read_current_objective(inner: pathlib.Path) -> dict[str, Any] | None:
+    """Return a short summary of what thinking is currently chasing.
+
+    Source priority:
+      1. ``inner/state/active-thread.md`` — if a continuation thread is
+         in flight, its ``topic`` + ``next_step`` frontmatter is the
+         single most accurate "current objective" signal.
+      2. ``inner/directive.md`` — the standing directive's ``## Current
+         focus`` section (first paragraph after the heading) when no
+         active thread is set. This is the durable focus, not a live
+         task, so it's the fallback rather than the primary.
+
+    Returns ``None`` if neither source has usable content (rare — the
+    directive is part of the repo). Shape::
+
+        {"source": "active-thread" | "directive",
+         "topic": str,
+         "detail": str | None}
+    """
+    thread_path = inner / "state" / "active-thread.md"
+    thread_text = _read_text(thread_path)
+    if thread_text:
+        fm = _parse_frontmatter(thread_text)
+        topic = (fm.get("topic") or "").strip() if fm else ""
+        if topic:
+            next_step = (fm.get("next_step") or "").strip() if fm else ""
+            last_action = (fm.get("last_action") or "").strip() if fm else ""
+            detail = next_step or last_action or None
+            return {
+                "source": "active-thread",
+                "topic": topic,
+                "detail": detail,
+            }
+    directive_text = _read_text(inner / "directive.md")
+    if directive_text:
+        focus = _extract_section_paragraph(directive_text, "Current focus")
+        if focus:
+            return {
+                "source": "directive",
+                "topic": "current focus",
+                "detail": focus,
+            }
+    return None
+
+
+def _parse_frontmatter(text: str) -> dict[str, str] | None:
+    """Return a flat ``key: value`` dict from a YAML-ish frontmatter
+    block (``---``-delimited at file start). One-line strings only —
+    multi-line / nested YAML is not required by the active-thread.md
+    schema. Returns ``None`` when no frontmatter is present."""
+    if not text.startswith("---\n"):
+        return None
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        return None
+    block = text[4:end]
+    out: dict[str, str] = {}
+    for line in block.splitlines():
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        out[k.strip()] = v.strip()
+    return out
+
+
+def _extract_section_paragraph(text: str, heading_name: str) -> str | None:
+    """Pull the first non-empty paragraph that follows ``## <heading_name>``
+    in a markdown document. Returns ``None`` if the heading is missing
+    or the section is empty."""
+    lines = text.splitlines()
+    needle = f"## {heading_name}".lower()
+    in_section = False
+    para: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not in_section:
+            if stripped.lower() == needle:
+                in_section = True
+            continue
+        if stripped.startswith("## "):
+            break  # next heading — stop
+        if not stripped:
+            if para:
+                break  # end of first paragraph
+            continue
+        para.append(stripped)
+    if not para:
+        return None
+    return " ".join(para)
 
 
 _CANVAS_SLUG_RE = __import__("re").compile(r"^[a-z0-9][a-z0-9_-]*$")
