@@ -45,6 +45,7 @@ import pathlib
 import secrets
 import shutil
 import subprocess
+import sys
 import time
 from typing import Any, Callable, Optional
 
@@ -730,11 +731,20 @@ class ExperimentRunner:
         """
         # The CLI's --mcp-config JSON shape: {"mcpServers": {"<name>": {...}}}
         # An stdio server entry is {"type":"stdio","command":"...","args":[...]}.
+        #
+        # Use ``sys.executable`` (the python that's running the runner)
+        # rather than bare ``python3``. The MCP server needs
+        # ``claude_agent_sdk`` importable, and bare ``python3`` resolves
+        # against PATH — which in the alice container picks up
+        # ``/usr/bin/python3`` (no claude_agent_sdk) instead of the venv
+        # python that the runner itself is using. That mismatch made the
+        # subagent's MCP server fail on init, leaving the subagent unable
+        # to call ``submit_result`` even though the work succeeded.
         config = {
             "mcpServers": {
                 "alice_experiment": {
                     "type": "stdio",
-                    "command": "python3",
+                    "command": sys.executable,
                     "args": [
                         "-m",
                         "alice_thinking.experiments.submit_result",

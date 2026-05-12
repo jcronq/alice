@@ -310,15 +310,45 @@ def _build_server(args: argparse.Namespace):
 async def _run_stdio(args: argparse.Namespace) -> int:
     """Drive the stdio MCP server until the parent CLI exits.
 
-    SDK servers built via ``create_sdk_mcp_server`` expose a
-    ``run_stdio()`` coroutine; if the SDK version doesn't, fall back to
-    the ``run`` method. Any error is logged and surfaces as a non-zero
-    exit code so the runner can detect a misconfigured invocation.
+    ``create_sdk_mcp_server`` returns a descriptor dict of shape
+    ``{"type": ..., "name": ..., "instance": <mcp.server.lowlevel.Server>}``.
+    The underlying ``Server`` instance has a ``run`` coroutine that
+    expects ``(read_stream, write_stream, initialization_options)``; we
+    wire it to stdio via ``mcp.server.stdio.stdio_server`` which is the
+    standard MCP-Python pattern. Older SDK versions returned an object
+    with a ``run_stdio()`` shortcut directly — we still handle that as
+    a fallback so the module is portable across SDK upgrades.
     """
-    server = _build_server(args)
-    runner = getattr(server, "run_stdio", None) or getattr(server, "run", None)
+    server_descriptor = _build_server(args)
+    server = (
+        server_descriptor.get("instance")
+        if isinstance(server_descriptor, dict)
+        else server_descriptor
+    )
+    if server is None:
+        log.error("MCP server build returned no instance; SDK incompatible")
+        return 2
+    # Newer SDK: lowlevel Server with `run(read, write, init_opts)`.
+    if hasattr(server, "run") and hasattr(server, "create_initialization_options"):
+        try:
+            from mcp.server.stdio import stdio_server
+
+            async with stdio_server() as (read_stream, write_stream):
+                await server.run(
+                    read_stream,
+                    write_stream,
+                    server.create_initialization_options(),
+                )
+            return 0
+        except KeyboardInterrupt:
+            return 0
+        except Exception:  # noqa: BLE001
+            log.exception("stdio MCP server failed")
+            return 1
+    # Older SDK shortcut.
+    runner = getattr(server, "run_stdio", None)
     if runner is None:
-        log.error("MCP server has no run_stdio/run method; SDK incompatible")
+        log.error("MCP server has no run_stdio / lowlevel.run; SDK incompatible")
         return 2
     try:
         result = runner()
