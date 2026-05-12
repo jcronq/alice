@@ -75,6 +75,7 @@ def test_empty_poll_writes_empty_state(state_path: pathlib.Path) -> None:
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda repo: [],
         post_comment=recorder,
         now_iso=_frozen_now,
@@ -97,6 +98,7 @@ def test_happy_path_posts_one_comment(state_path: pathlib.Path) -> None:
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda repo: issues,
         post_comment=recorder,
         now_iso=_frozen_now,
@@ -126,6 +128,7 @@ def test_dedup_skips_already_commented_issues(state_path: pathlib.Path) -> None:
     sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda repo: issues,
         post_comment=recorder1,
         now_iso=_frozen_now,
@@ -138,6 +141,7 @@ def test_dedup_skips_already_commented_issues(state_path: pathlib.Path) -> None:
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda repo: issues,
         post_comment=recorder2,
         now_iso=_frozen_now,
@@ -157,6 +161,7 @@ def test_untrusted_author_is_skipped(state_path: pathlib.Path) -> None:
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda repo: issues,
         post_comment=recorder,
         now_iso=_frozen_now,
@@ -179,6 +184,7 @@ def test_missing_art_label_is_skipped(state_path: pathlib.Path) -> None:
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda repo: issues,
         post_comment=recorder,
         now_iso=_frozen_now,
@@ -196,6 +202,7 @@ def test_two_sm_labels_is_skipped(state_path: pathlib.Path) -> None:
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda repo: issues,
         post_comment=recorder,
         now_iso=_frozen_now,
@@ -214,6 +221,7 @@ def test_non_canonical_sm_label_is_skipped(state_path: pathlib.Path) -> None:
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda repo: issues,
         post_comment=recorder,
         now_iso=_frozen_now,
@@ -254,6 +262,7 @@ def test_dry_run_does_not_post_or_persist(state_path: pathlib.Path) -> None:
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda repo: issues,
         post_comment=recorder,
         dry_run=True,
@@ -283,6 +292,7 @@ def test_gh_failure_returns_nonzero_and_does_not_write_state(
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=bad_list,
         post_comment=recorder,
         now_iso=_frozen_now,
@@ -311,6 +321,7 @@ def test_multiple_mixed_issues_in_one_pass(state_path: pathlib.Path) -> None:
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda repo: issues,
         post_comment=recorder,
         now_iso=_frozen_now,
@@ -392,6 +403,7 @@ def test_t1_selected_with_linked_pr_transitions_to_reviewing(
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda repo: issues,
         post_comment=recorder,
         edit_labels=label_rec,
@@ -433,6 +445,7 @@ def test_t1_selected_without_linked_pr_stays(state_path: pathlib.Path) -> None:
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda repo: issues,
         post_comment=recorder,
         edit_labels=label_rec,
@@ -484,6 +497,7 @@ def test_t2_reviewing_merged_green_ci_transitions_to_done_and_closes(
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda repo: issues,
         post_comment=recorder,
         edit_labels=label_rec,
@@ -538,6 +552,7 @@ def test_t3_reviewing_merged_red_ci_transitions_to_building_no_close(
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda repo: issues,
         post_comment=recorder,
         edit_labels=label_rec,
@@ -588,6 +603,7 @@ def test_t2_t3_reviewing_merged_pending_ci_stays(state_path: pathlib.Path) -> No
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda repo: issues,
         post_comment=recorder,
         edit_labels=label_rec,
@@ -621,6 +637,7 @@ def test_t2_t3_reviewing_pr_still_open_stays(state_path: pathlib.Path) -> None:
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda repo: issues,
         post_comment=recorder,
         edit_labels=label_rec,
@@ -652,6 +669,7 @@ def test_phase_1_5_no_action_on_building_label(state_path: pathlib.Path) -> None
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda repo: issues,
         post_comment=recorder,
         edit_labels=label_rec,
@@ -701,6 +719,7 @@ def test_v0_hello_dedup_still_works_alongside_phase_1_5(
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda repo: issues,
         post_comment=recorder,
         edit_labels=label_rec,
@@ -796,6 +815,7 @@ def test_reviewing_merged_pr_with_green_ci_transitions_to_done_via_real_finder(
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda repo: issues,
         post_comment=recorder,
         edit_labels=label_rec,
@@ -865,6 +885,7 @@ def test_sweep_closed_selected_merged_green_ci_to_done(
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda _r: [],
         list_stale_closed=lambda _r: stale,
         post_comment=recorder,
@@ -930,6 +951,7 @@ def test_sweep_closed_reviewing_merged_green_ci_to_done(
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda _r: [],
         list_stale_closed=lambda _r: stale,
         post_comment=recorder,
@@ -971,6 +993,7 @@ def test_sweep_closed_selected_pr_closed_unmerged_to_rejected(
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda _r: [],
         list_stale_closed=lambda _r: stale,
         post_comment=recorder,
@@ -1009,6 +1032,7 @@ def test_sweep_closed_selected_no_linked_pr_to_rejected(
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda _r: [],
         list_stale_closed=lambda _r: stale,
         post_comment=recorder,
@@ -1073,6 +1097,7 @@ def test_sweep_closed_selected_merged_red_ci_to_rejected(
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda _r: [],
         list_stale_closed=lambda _r: stale,
         post_comment=recorder,
@@ -1166,6 +1191,7 @@ def test_sweep_done_line_includes_swept_counter(state_path: pathlib.Path) -> Non
     sm.run(
         repo="jcronq/alice",
         state_path=state_path,
+        enable_spawn=False,
         list_issues=lambda _r: [],
         list_stale_closed=lambda _r: [],
         post_comment=Recorder(),
@@ -1180,3 +1206,597 @@ def test_sweep_done_line_includes_swept_counter(state_path: pathlib.Path) -> Non
     done_line = [line for line in logged if line.startswith("[sm-dispatcher] done")]
     assert done_line, f"expected a done line in: {logged!r}"
     assert "swept=0" in done_line[0]
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — auto-spawn claude agents on sm:selected
+# ---------------------------------------------------------------------------
+
+
+class FakePopen:
+    """Minimal stand-in for ``subprocess.Popen``.
+
+    Records what it was called with and exposes a fake ``pid``. The
+    dispatcher only needs ``proc.pid`` post-spawn; the fake never
+    actually runs anything.
+    """
+
+    next_pid = 90000
+
+    def __init__(self, args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self.pid = FakePopen.next_pid
+        FakePopen.next_pid += 1
+        # The dispatcher closes its end of stdin/stdout/stderr after
+        # construction. We don't need to model that.
+
+
+def test_phase2_spawn_fires_on_code_artifact_with_no_prior_spawn(
+    state_path,
+    tmp_path,
+) -> None:
+    """sm:selected + art:code + no [SM] spawn-started → fires Popen,
+    posts spawn-started, writes pidfile and prompt.txt.
+    """
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    popens: list[FakePopen] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    def spawn(issue, art_label, repo):
+        return sm.spawn_agent(
+            issue,
+            art_label,
+            repo,
+            spawn_dir=spawn_dir,
+            claude_bin="/usr/bin/claude",
+            post_comment=recorder,
+            popen=popen,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+
+    issues = [_make_issue(200, sm_labels=("sm:selected",), art_labels=("art:code",))]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        list_comments=lambda _r, _n: [],  # no prior spawn-started
+        post_comment=recorder,
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        count_running=lambda: 0,
+        spawn=spawn,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 1
+    assert popens, "expected Popen to be called"
+    # Popen launched claude with --print.
+    cmd = popens[0].args
+    assert cmd[-1] == "--print"
+    assert cmd[0].endswith("claude")
+    # Detached from controlling terminal.
+    assert popens[0].kwargs.get("start_new_session") is True
+    # Two comments on #200: dispatcher-hello + [SM] spawn-started.
+    bodies = [b for _r, n, b in recorder.posted if n == 200]
+    assert any(b.startswith("[SM] dispatcher-hello") for b in bodies)
+    assert any(b.startswith("[SM] spawn-started") for b in bodies)
+    started = [b for b in bodies if b.startswith("[SM] spawn-started")][0]
+    assert "task=#200" in started
+    assert "artifact=art:code" in started
+    assert "runtime=claude-cli" in started
+    # spawn dir contains prompt.txt + pidfile.
+    spawn_subdirs = [
+        d for d in spawn_dir.iterdir() if d.is_dir() and d.name.startswith("spawn-")
+    ]
+    assert len(spawn_subdirs) == 1
+    assert (spawn_subdirs[0] / "prompt.txt").is_file()
+    assert (spawn_subdirs[0] / "pidfile").is_file()
+    prompt = (spawn_subdirs[0] / "prompt.txt").read_text()
+    # Code-worker framing.
+    assert "code-worker" in prompt
+    assert "open a pr" in prompt.lower()
+    assert "Closes #200" in prompt
+    assert "Do not --no-verify" in prompt
+
+
+def test_phase2_spawn_fires_on_research_note_with_writer_template(
+    state_path,
+    tmp_path,
+) -> None:
+    """sm:selected + art:research_note → spawn uses research-writer role."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    popens: list[FakePopen] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    def spawn(issue, art_label, repo):
+        return sm.spawn_agent(
+            issue,
+            art_label,
+            repo,
+            spawn_dir=spawn_dir,
+            claude_bin="/usr/bin/claude",
+            post_comment=recorder,
+            popen=popen,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+
+    issues = [
+        _make_issue(
+            201, sm_labels=("sm:selected",), art_labels=("art:research_note",)
+        )
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        list_comments=lambda _r, _n: [],
+        post_comment=recorder,
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        count_running=lambda: 0,
+        spawn=spawn,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 1
+    assert len(popens) == 1
+    spawn_subdirs = [
+        d for d in spawn_dir.iterdir() if d.is_dir() and d.name.startswith("spawn-")
+    ]
+    prompt = (spawn_subdirs[0] / "prompt.txt").read_text()
+    assert "research-writer" in prompt
+    assert "research note at" in prompt
+    assert "sm:selected → sm:done" in prompt
+    started = [
+        b for _r, n, b in recorder.posted if n == 201 and "spawn-started" in b
+    ][0]
+    assert "artifact=art:research_note" in started
+
+
+def test_phase2_already_spawned_marker_skips_new_spawn(
+    state_path,
+    tmp_path,
+) -> None:
+    """Issue with a prior [SM] spawn-started from jcronq → no second spawn."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    popens: list[FakePopen] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    def spawn(issue, art_label, repo):
+        return sm.spawn_agent(
+            issue,
+            art_label,
+            repo,
+            spawn_dir=spawn_dir,
+            popen=popen,
+            post_comment=recorder,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+
+    issues = [_make_issue(202, sm_labels=("sm:selected",), art_labels=("art:code",))]
+    existing = [
+        {
+            "body": (
+                "[SM] spawn-started task=#202 artifact=art:code "
+                "runtime=claude-cli spawn_id=spawn-202-1 ts=2026-05-12T11:00:00+00:00"
+            ),
+            "author": {"login": "jcronq"},
+        }
+    ]
+
+    # Pre-seed dedup so the hello doesn't post either; we're testing
+    # spawn dedup, not hello dedup.
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({"version": sm.STATE_VERSION, "hello_commented": [202]})
+    )
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        list_comments=lambda _r, _n: existing,
+        post_comment=recorder,
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        count_running=lambda: 0,
+        spawn=spawn,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 0
+    assert popens == []
+    # No new [SM] spawn-started comment posted.
+    new_starts = [b for _r, _n, b in recorder.posted if "spawn-started" in b]
+    assert new_starts == []
+
+
+def test_phase2_concurrency_cap_queues_excess_spawns(
+    state_path,
+    tmp_path,
+) -> None:
+    """3 sm:selected issues + MAX=2 → 2 spawned, 3rd skipped."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    popens: list[FakePopen] = []
+
+    running_count = {"n": 0}
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        # Each new spawn bumps the apparent running count.
+        running_count["n"] += 1
+        return p
+
+    def spawn(issue, art_label, repo):
+        return sm.spawn_agent(
+            issue,
+            art_label,
+            repo,
+            spawn_dir=spawn_dir,
+            popen=popen,
+            post_comment=recorder,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+
+    issues = [
+        _make_issue(
+            301 + i, sm_labels=("sm:selected",), art_labels=("art:code",)
+        )
+        for i in range(3)
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        list_comments=lambda _r, _n: [],
+        post_comment=recorder,
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        count_running=lambda: running_count["n"],
+        spawn=spawn,
+        max_concurrent_spawns=2,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 2
+    assert len(popens) == 2
+    spawned_nums = [n for n, _a, _id in report.spawn_records]
+    # First two in iteration order.
+    assert spawned_nums == [301, 302]
+
+
+def test_phase2_untrusted_author_skipped_before_spawn(
+    state_path,
+    tmp_path,
+) -> None:
+    """Trust filter applies before spawn — untrusted author → no spawn."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    popens: list[FakePopen] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    def spawn(issue, art_label, repo):
+        return sm.spawn_agent(
+            issue,
+            art_label,
+            repo,
+            spawn_dir=spawn_dir,
+            popen=popen,
+            post_comment=recorder,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+
+    issues = [
+        _make_issue(
+            401,
+            sm_labels=("sm:selected",),
+            art_labels=("art:code",),
+            author="random-drive-by",
+        )
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        list_comments=lambda _r, _n: [],
+        post_comment=recorder,
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        count_running=lambda: 0,
+        spawn=spawn,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 0
+    assert popens == []
+    # Trust rejection counted exactly once (not double-counted in
+    # spawn pass).
+    assert report.skipped_trust == 1
+
+
+def test_phase2_unrecognized_artifact_label_skips_spawn(
+    state_path,
+    tmp_path,
+) -> None:
+    """art:* passes trust but isn't in SPAWN_MAP → no spawn, log line.
+
+    Strategy: shrink SPAWN_MAP via monkeypatch so a trusted ``art:code``
+    issue passes the trust filter (which uses the unchanged
+    ART_LABEL_WHITELIST) but hits the "no spawn config" branch inside
+    :func:`_process_selected`.
+    """
+    import unittest.mock as mock
+
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    popens: list[FakePopen] = []
+    logged: list[str] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    def spawn(issue, art_label, repo):
+        return sm.spawn_agent(
+            issue,
+            art_label,
+            repo,
+            spawn_dir=spawn_dir,
+            popen=popen,
+            post_comment=recorder,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+
+    issues = [
+        _make_issue(501, sm_labels=("sm:selected",), art_labels=("art:code",))
+    ]
+
+    # SPAWN_MAP without art:code → trust passes (art:code is in the
+    # whitelist) but spawn lookup misses.
+    with mock.patch.object(sm, "SPAWN_MAP", {}):
+        exit_code, report = sm.run(
+            repo="jcronq/alice",
+            state_path=state_path,
+            list_issues=lambda _r: issues,
+            list_stale_closed=lambda _r: [],
+            list_comments=lambda _r, _n: [],
+            post_comment=recorder,
+            edit_labels=LabelRecorder(),
+            close_issue=CloseRecorder(),
+            find_linked_pr=_no_pr,
+            pr_merge_status=_no_call,
+            master_ci_status=_no_call,
+            count_running=lambda: 0,
+            spawn=spawn,
+            now_iso=_frozen_now,
+            log=logged.append,
+        )
+
+    assert exit_code == 0
+    assert report.spawned == 0
+    assert popens == []
+    assert any(
+        "unrecognized artifact 'art:code'" in m for m in logged
+    ), f"expected log line, got: {logged!r}"
+
+
+def test_phase2_dry_run_logs_spawn_intent_without_popen(
+    state_path,
+    tmp_path,
+) -> None:
+    """--dry-run path: spawn pass reports intent and prompt preview but
+    never calls Popen or posts the [SM] spawn-started comment.
+    """
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    popens: list[FakePopen] = []
+    logged: list[str] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    def spawn(issue, art_label, repo):
+        return sm.spawn_agent(
+            issue,
+            art_label,
+            repo,
+            spawn_dir=spawn_dir,
+            popen=popen,
+            post_comment=recorder,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+
+    issues = [_make_issue(601, sm_labels=("sm:selected",), art_labels=("art:code",))]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        list_comments=lambda _r, _n: [],
+        post_comment=recorder,
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        count_running=lambda: 0,
+        spawn=spawn,
+        dry_run=True,
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 1
+    assert popens == []
+    # No [SM] spawn-started posted in dry-run.
+    assert not any("spawn-started" in b for _r, _n, b in recorder.posted)
+    assert any("DRY-RUN would spawn on #601" in m for m in logged)
+    assert any("DRY-RUN prompt preview" in m for m in logged)
+    # spawn_records reflects intent.
+    assert report.spawn_records == [(601, "art:code", "<dry-run>")]
+
+
+def test_phase2_done_line_includes_spawned_counter(state_path) -> None:
+    logged: list[str] = []
+    sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: [],
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+    done = [line for line in logged if line.startswith("[sm-dispatcher] done")]
+    assert done, logged
+    assert "spawned=0" in done[0]
+
+
+def test_phase2_count_running_spawns_reaps_dead_pidfiles(tmp_path) -> None:
+    """count_running_spawns marks dead PIDs and moves their dirs to .finished/."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+
+    # Live pidfile — use this very process.
+    live = spawn_dir / "spawn-alive"
+    live.mkdir()
+    (live / "pidfile").write_text(str(__import__("os").getpid()))
+
+    # Dead pidfile — pick a PID extremely unlikely to be live. We use
+    # the kernel's max + 1 (effectively impossible).
+    dead = spawn_dir / "spawn-dead"
+    dead.mkdir()
+    (dead / "pidfile").write_text("99999999")
+
+    live_count = sm.count_running_spawns(spawn_dir)
+    assert live_count == 1
+    # Dead dir got moved into .finished/.
+    assert not dead.exists()
+    finished = spawn_dir / ".finished" / "spawn-dead"
+    assert finished.exists()
+
+
+def test_phase2_gh_find_unspawned_selected_issues_filters_by_trusted_author(
+    state_path,
+) -> None:
+    """The standalone helper filters open sm:selected issues, returning
+    only those WITHOUT a trusted-author [SM] spawn-started comment.
+    """
+    issues = [
+        _make_issue(701, sm_labels=("sm:selected",), art_labels=("art:code",)),
+        _make_issue(702, sm_labels=("sm:selected",), art_labels=("art:code",)),
+        _make_issue(703, sm_labels=("sm:selected",), art_labels=("art:code",)),
+    ]
+    # #701: trusted-author spawn-started → already spawned
+    # #702: untrusted-author spawn-started → should still count as
+    #       unspawned (someone could spoof the prefix)
+    # #703: no comments → unspawned
+    comment_map = {
+        701: [
+            {
+                "body": "[SM] spawn-started task=#701 artifact=art:code",
+                "author": {"login": "jcronq"},
+            }
+        ],
+        702: [
+            {
+                "body": "[SM] spawn-started task=#702 artifact=art:code",
+                "author": {"login": "drive-by"},
+            }
+        ],
+        703: [],
+    }
+
+    def list_issues(_r):
+        return issues
+
+    def list_comments(_r, n):
+        return comment_map[n]
+
+    unspawned = sm.gh_find_unspawned_selected_issues(
+        "jcronq/alice",
+        list_issues=list_issues,
+        list_comments=list_comments,
+    )
+    assert sorted(i["number"] for i in unspawned) == [702, 703]

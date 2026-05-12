@@ -1,4 +1,4 @@
-"""State Machine v0/v1.5 dispatcher — ``gh``-driven label-driven dispatcher.
+"""State Machine v0/v1.5/v2 dispatcher — ``gh``-driven label-driven dispatcher.
 
 Modeled on :mod:`alice_watchers.github`. Each invocation is a single pass:
 
@@ -16,6 +16,12 @@ Modeled on :mod:`alice_watchers.github`. Each invocation is a single pass:
        re-comment on the next cadence.
      - If a linked open PR exists, transition to ``sm:reviewing``
        (Phase 1.5 T1). Hello + transition can co-occur in one pass.
+     - Phase 2: if the issue has not already been spawned on (no
+       ``[SM] spawn-started`` comment from a trusted author), and the
+       global concurrency cap has room, spawn a detached ``claude``
+       CLI subprocess to actually do the work. The spawn comment is
+       posted *before* the Popen so the next pass sees the dedup
+       marker even if the spawn crashes immediately.
   3. For ``sm:reviewing`` issues (Phase 1.5 T2/T3):
      - If the linked PR is merged AND master CI on the merge commit
        is green → relabel ``sm:done``, close the issue.
@@ -23,14 +29,15 @@ Modeled on :mod:`alice_watchers.github`. Each invocation is a single pass:
        ``sm:building`` (do NOT close, do NOT spawn anything yet).
      - If still pending or PR still open, stay.
 
-Phase 1.5 explicitly does NOT spawn agents, handle ``sm:draft``, or
-route amendments. Those land in v1+.
+Phase 2 adds agent spawning but does NOT handle the persona × runtime
+matrix (everything spawns Claude CLI), amendments in-flight, or
+session continuity across review cycles. Those land in later phases.
 
 The script is intended to be invoked on a cadence by s6 (later phase);
 right now it runs by hand via ``python -m alice_sm.dispatcher``. The
-``--dry-run`` flag prints the comments / transitions that would be
-posted without touching GitHub or the state file — useful for tests
-and manual verification.
+``--dry-run`` flag prints the comments / transitions / spawns that
+would be made without touching GitHub or launching subprocesses —
+useful for tests and manual verification.
 """
 
 from __future__ import annotations
@@ -43,6 +50,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
@@ -114,6 +122,88 @@ NON_TERMINAL_SM_LABELS: frozenset[str] = SM_LABEL_WHITELIST - TERMINAL_SM_LABELS
 # Schema version of the state file. Bump if the structure changes
 # incompatibly.
 STATE_VERSION = 1
+
+
+def _now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — agent spawn constants
+# ---------------------------------------------------------------------------
+
+# Per-artifact spawn config. Each entry tells the dispatcher how to
+# frame the spawn prompt for an artifact type:
+#
+#   * ``system_prompt_role`` — short role label rendered into the
+#     prompt header (Claude doesn't actually get a separate system
+#     prompt from us; the CLI's defaults take over). The label drives
+#     the in-prompt persona framing.
+#   * ``instruction_trailer`` — final instructions appended after the
+#     issue body. ``{issue_number}`` is the substitution token.
+#
+# Out of scope for v1: the (persona × runtime) matrix from the design
+# doc. v1 spawns Claude for every artifact; the spawn map is the
+# extension point for later phases.
+SPAWN_MAP: dict[str, dict[str, str]] = {
+    "art:code": {
+        "system_prompt_role": "code-worker",
+        "instruction_trailer": (
+            "Open a PR titled appropriately with `Closes #{issue_number}` "
+            "in the body. Self-merge once CI is green. Do not --no-verify."
+        ),
+    },
+    "art:config_change": {
+        "system_prompt_role": "code-worker",
+        "instruction_trailer": (
+            "Open a PR titled appropriately with `Closes #{issue_number}` "
+            "in the body. Self-merge once CI is green. Do not --no-verify."
+        ),
+    },
+    "art:research_note": {
+        "system_prompt_role": "research-writer",
+        "instruction_trailer": (
+            "Produce a research note at "
+            "~/alice-mind/cortex-memory/research/<date>-<slug>.md. After "
+            "writing the note, edit issue #{issue_number} to relabel "
+            "sm:selected → sm:done and post a "
+            "`[SM] transition from=selected to=done reason=\"research "
+            "note at <path>\"` comment."
+        ),
+    },
+    "art:experiment": {
+        "system_prompt_role": "research-writer",
+        "instruction_trailer": (
+            "Same as research_note for v1. Produce a note with "
+            "hypothesis/null/verdict frontmatter; transition to done "
+            "when complete."
+        ),
+    },
+}
+
+# Cap on simultaneously running claude subprocess spawns. Excess
+# eligible ``sm:selected`` issues stay queued until the next dispatcher
+# pass — back-pressure rather than crash-on-overload.
+MAX_CONCURRENT_SPAWNS = 2
+
+# Per-spawn workdir. One subdir per spawn id, with ``prompt.txt``,
+# ``pidfile``, ``stdout.log``, ``stderr.log``. Dead spawns get moved
+# under ``.finished/<id>/`` by :func:`count_running_spawns` so the live
+# count stays accurate on the next pass.
+SPAWN_DIR = pathlib.Path("/state/worker/sm-dispatcher-spawns")
+
+# The ``claude`` binary used to launch worker agents. Issue #101's
+# original spec named ``/opt/alice-venv/bin/claude`` but the live host
+# ships ``/usr/bin/claude``. We resolve at run time: prefer the spec'd
+# path if it exists, fall back to the on-PATH binary.
+CLAUDE_BIN_PREFERRED = "/opt/alice-venv/bin/claude"
+CLAUDE_BIN_FALLBACK = "claude"
+
+# Prefix on the audit-trail comment that signals "we've already spawned
+# an agent on this issue". The next pass's
+# :func:`gh_find_unspawned_selected_issues` filters on this prefix +
+# trusted-author authorship to dedup.
+SPAWN_STARTED_PREFIX = "[SM] spawn-started"
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +378,7 @@ def gh_list_selected_issues(repo: str, *, gh_bin: str = "gh") -> list[dict[str, 
         "--label",
         ACTIVE_SM_LABEL,
         "--json",
-        "number,title,labels,author,createdAt",
+        "number,title,labels,author,createdAt,body",
         "--limit",
         str(RECENT_ISSUE_LIMIT),
     ]
@@ -321,7 +411,7 @@ def gh_list_sm_issues(repo: str, *, gh_bin: str = "gh") -> list[dict[str, Any]]:
         "--search",
         "label:sm:draft,sm:selected,sm:building,sm:reviewing,sm:validating",
         "--json",
-        "number,title,labels,author,createdAt",
+        "number,title,labels,author,createdAt,body",
         "--limit",
         str(RECENT_ISSUE_LIMIT),
     ]
@@ -372,7 +462,7 @@ def gh_list_stale_closed_sm_issues(
         "--search",
         f"label:{search_terms}",
         "--json",
-        "number,title,labels,author,createdAt",
+        "number,title,labels,author,createdAt,body",
         "--limit",
         str(RECENT_ISSUE_LIMIT),
     ]
@@ -432,6 +522,97 @@ def gh_close_issue(repo: str, number: int, *, gh_bin: str = "gh") -> None:
     """Close an issue via ``gh issue close``."""
     args = [gh_bin, "issue", "close", str(number), "--repo", repo]
     _run_gh(args)
+
+
+def gh_list_issue_comments(
+    repo: str, number: int, *, gh_bin: str = "gh"
+) -> list[dict[str, Any]]:
+    """Return the comment list for an issue via ``gh issue view``.
+
+    Each entry has ``body`` and ``author.login``. Used by
+    :func:`gh_find_unspawned_selected_issues` to check for the
+    ``[SM] spawn-started`` audit comment.
+    """
+    args = [
+        gh_bin,
+        "issue",
+        "view",
+        str(number),
+        "--repo",
+        repo,
+        "--json",
+        "comments",
+    ]
+    stdout = _run_gh(args)
+    if not stdout.strip():
+        return []
+    payload = json.loads(stdout)
+    if not isinstance(payload, dict):
+        return []
+    raw = payload.get("comments") or []
+    if not isinstance(raw, list):
+        return []
+    return raw
+
+
+def gh_find_unspawned_selected_issues(
+    repo: str,
+    *,
+    list_issues: Callable[[str], list[dict[str, Any]]] | None = None,
+    list_comments: Callable[[str, int], list[dict[str, Any]]] | None = None,
+    trusted_authors: frozenset[str] = TRUSTED_AUTHORS,
+    spawn_prefix: str = SPAWN_STARTED_PREFIX,
+) -> list[dict[str, Any]]:
+    """Return open ``sm:selected`` issues with no ``[SM] spawn-started`` comment.
+
+    Phase 2 dedup primitive — paired with :func:`spawn_agent`. The
+    "we've already spawned" signal is a comment whose body starts with
+    :data:`SPAWN_STARTED_PREFIX` and whose author is in
+    ``trusted_authors`` (so a random commenter typing the prefix
+    can't trick the dispatcher into skipping a real task).
+
+    Both ``list_issues`` and ``list_comments`` are injectable for tests.
+    """
+    if list_issues is None:
+        list_issues = gh_list_selected_issues
+    if list_comments is None:
+        list_comments = gh_list_issue_comments
+
+    candidates = list_issues(repo)
+    unspawned: list[dict[str, Any]] = []
+    for issue in candidates:
+        number = issue.get("number")
+        if not isinstance(number, int):
+            continue
+        try:
+            comments = list_comments(repo, number)
+        except GHCommandError:
+            # Defer to caller's error handling — re-raise so the main
+            # loop can detect auth/rate-limit and bail. For other
+            # transient errors the caller's outer try/except will skip
+            # this issue.
+            raise
+        already_spawned = False
+        for c in comments:
+            body = c.get("body") if isinstance(c, dict) else None
+            author = c.get("author") if isinstance(c, dict) else None
+            if isinstance(author, dict):
+                login = author.get("login")
+            elif isinstance(author, str):
+                login = author
+            else:
+                login = None
+            if (
+                isinstance(body, str)
+                and body.startswith(spawn_prefix)
+                and isinstance(login, str)
+                and login in trusted_authors
+            ):
+                already_spawned = True
+                break
+        if not already_spawned:
+            unspawned.append(issue)
+    return unspawned
 
 
 def gh_find_linked_pr(
@@ -581,6 +762,304 @@ CloseIssueFn = Callable[[str, int], None]
 FindLinkedPRFn = Callable[[str, int], dict[str, Any] | None]
 PRMergeStatusFn = Callable[[str, int], dict[str, Any]]
 MasterCIStatusFn = Callable[[str, str], dict[str, Any]]
+ListCommentsFn = Callable[[str, int], list[dict[str, Any]]]
+FindUnspawnedFn = Callable[[str], list[dict[str, Any]]]
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — spawn machinery
+# ---------------------------------------------------------------------------
+
+
+def resolve_claude_bin(
+    *,
+    preferred: str = CLAUDE_BIN_PREFERRED,
+    fallback: str = CLAUDE_BIN_FALLBACK,
+) -> str:
+    """Return the path to the ``claude`` binary.
+
+    Prefers the spec'd venv path when it exists; otherwise returns the
+    PATH-resolved binary name (so ``subprocess.Popen`` will resolve it
+    via the shell's normal lookup).
+    """
+    if pathlib.Path(preferred).is_file():
+        return preferred
+    return fallback
+
+
+def count_running_spawns(
+    spawn_dir: pathlib.Path = SPAWN_DIR,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> int:
+    """Return the number of live spawned subprocesses.
+
+    Walks ``spawn_dir/*/pidfile``. For each pidfile, sends signal 0 to
+    the pid; ``ProcessLookupError`` (or ``PermissionError`` for a
+    re-used pid we no longer own) marks the spawn dead. Dead spawn
+    directories are moved to ``spawn_dir/.finished/<id>/`` so a future
+    pass doesn't keep re-checking them.
+
+    On a missing or unreadable pidfile, the spawn dir is treated as
+    dead and moved to ``.finished/``.
+    """
+    if not spawn_dir.is_dir():
+        return 0
+    finished_root = spawn_dir / ".finished"
+    live = 0
+    for child in spawn_dir.iterdir():
+        if not child.is_dir():
+            continue
+        if child.name == ".finished":
+            continue
+        pidfile = child / "pidfile"
+        is_alive = False
+        if pidfile.is_file():
+            try:
+                pid_text = pidfile.read_text().strip()
+                pid = int(pid_text)
+            except (OSError, ValueError):
+                pid = None
+            if pid is not None:
+                try:
+                    os.kill(pid, 0)
+                    is_alive = True
+                except ProcessLookupError:
+                    is_alive = False
+                except PermissionError:
+                    # PID exists but is owned by someone else — treat
+                    # as not-our-spawn-anymore; the original spawn
+                    # exited and the OS recycled the pid.
+                    is_alive = False
+                except OSError:
+                    # Some other unexpected error; be conservative and
+                    # don't claim it dead.
+                    is_alive = True
+        if is_alive:
+            live += 1
+        else:
+            try:
+                finished_root.mkdir(parents=True, exist_ok=True)
+                target = finished_root / child.name
+                if target.exists():
+                    # Collision: append a counter so we don't clobber
+                    # the previous reap.
+                    i = 1
+                    while (finished_root / f"{child.name}.{i}").exists():
+                        i += 1
+                    target = finished_root / f"{child.name}.{i}"
+                child.rename(target)
+            except OSError as exc:
+                if log is not None:
+                    log(
+                        f"[sm-dispatcher] could not reap dead spawn "
+                        f"{child}: {exc}"
+                    )
+    return live
+
+
+def compose_spawn_prompt(
+    issue: dict[str, Any],
+    spawn_config: dict[str, str],
+) -> str:
+    """Render the full prompt text fed to the spawned ``claude`` agent.
+
+    The prompt embeds the issue body verbatim, the artifact label, the
+    issue source (author identity), and the role-specific instruction
+    trailer with ``{issue_number}`` substituted.
+    """
+    number = issue.get("number")
+    title = issue.get("title") or "(no title)"
+    body = issue.get("body") or "(no body)"
+    art_label = "art:unknown"
+    for name in _label_names(issue):
+        if name.startswith("art:") and name in ART_LABEL_WHITELIST:
+            art_label = name
+            break
+    login = _author_login(issue) or "(unknown)"
+    source_label = f"source:{login}"
+
+    role = spawn_config["system_prompt_role"]
+    trailer = spawn_config["instruction_trailer"].format(issue_number=number)
+
+    if role == "code-worker":
+        task_framing = (
+            "Your task: implement the change described above. Read the "
+            "relevant code first, write a focused diff, run tests, and "
+            "open a PR."
+        )
+    else:
+        task_framing = (
+            "Your task: produce the research note described above. "
+            "Read prior art in the vault, write the note with proper "
+            "frontmatter and wikilinks, then post the SM transition "
+            "comment when finished."
+        )
+
+    # The agent name itself is intentionally left out of the literal
+    # prompt — the SM task is repo-anchored, not persona-anchored, and
+    # the runtime persona system owns identity rendering. The role
+    # label (``code-worker`` / ``research-writer``) carries the
+    # behavioral framing.
+    return (
+        f"You are a {role} agent working on an SM task.\n"
+        f"\n"
+        f"Issue: #{number}\n"
+        f"Title: {title}\n"
+        f"Source: {source_label}\n"
+        f"Artifact type: {art_label}\n"
+        f"\n"
+        f"Issue body:\n"
+        f"{body}\n"
+        f"\n"
+        f"{task_framing}\n"
+        f"\n"
+        f"{trailer}\n"
+        f"\n"
+        f"Operate as a real engineer would: read the relevant code "
+        f"first, test before merging, do not bypass CI hooks. "
+        f"Self-merge when CI is green (for code work) or post the "
+        f"transition comment (for research work).\n"
+    )
+
+
+def render_spawn_started_comment(
+    number: int,
+    art_label: str,
+    spawn_id: str,
+    *,
+    runtime: str = "claude-cli",
+    timestamp: str | None = None,
+) -> str:
+    """Produce the literal ``[SM] spawn-started ...`` audit comment."""
+    ts = timestamp or _now_iso()
+    return (
+        f"{SPAWN_STARTED_PREFIX} task=#{number} artifact={art_label} "
+        f"runtime={runtime} spawn_id={spawn_id} ts={ts}"
+    )
+
+
+def spawn_agent(
+    issue: dict[str, Any],
+    art_label: str,
+    repo: str,
+    *,
+    spawn_dir: pathlib.Path = SPAWN_DIR,
+    claude_bin: str | None = None,
+    post_comment: PostCommentFn = gh_post_comment,
+    popen: Callable[..., Any] = subprocess.Popen,
+    now_iso: Callable[[], str] = _now_iso,
+    log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
+    clock: Callable[[], float] = None,  # type: ignore[assignment]
+) -> str | None:
+    """Spawn a detached ``claude`` agent for an ``sm:selected`` issue.
+
+    Steps (per issue #101 spec):
+
+      1. Mint ``spawn_id = "spawn-<N>-<unix-ts>"``.
+      2. Create ``spawn_dir/<spawn_id>/``.
+      3. Compose the prompt + write ``prompt.txt``.
+      4. Post ``[SM] spawn-started ...`` audit comment (dedup signal
+         for the next dispatcher pass — posted BEFORE the Popen so a
+         crash during launch still leaves the dedup marker).
+      5. Launch claude detached via ``subprocess.Popen``:
+         stdin=open(prompt.txt), stdout/stderr to log files,
+         ``start_new_session=True`` so the agent survives the
+         dispatcher exiting.
+      6. Write PID to ``pidfile``.
+
+    Returns the ``spawn_id`` on success, or ``None`` if the spawn
+    config is missing (unknown ``art:*`` label). Does NOT wait for the
+    spawned subprocess to complete — the dispatcher exits immediately
+    after the Popen returns.
+    """
+    if clock is None:
+        clock = time.time
+    spawn_config = SPAWN_MAP.get(art_label)
+    if spawn_config is None:
+        log(
+            f"[sm-dispatcher] no spawn config for artifact {art_label!r} "
+            f"on #{issue.get('number')} — skipping spawn"
+        )
+        return None
+
+    number = issue.get("number")
+    if not isinstance(number, int):
+        log(
+            f"[sm-dispatcher] cannot spawn on non-integer issue "
+            f"number: {number!r}"
+        )
+        return None
+
+    if claude_bin is None:
+        claude_bin = resolve_claude_bin()
+
+    spawn_id = f"spawn-{number}-{int(clock())}"
+    work_dir = spawn_dir / spawn_id
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    prompt_text = compose_spawn_prompt(issue, spawn_config)
+    prompt_path = work_dir / "prompt.txt"
+    prompt_path.write_text(prompt_text)
+
+    # Post the [SM] spawn-started audit comment FIRST. If this fails
+    # we abort the spawn — without the dedup marker, the next pass
+    # would re-spawn the same task. Posting before Popen means a
+    # crash-during-launch still leaves the marker, which is the
+    # correct dedup semantics (the dispatcher exits after Popen
+    # returns; the supervisor cadence will catch the dead pidfile via
+    # count_running_spawns on the next pass).
+    body = render_spawn_started_comment(
+        number, art_label, spawn_id, timestamp=now_iso()
+    )
+    try:
+        post_comment(repo, number, body)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] failed to post spawn-started on #{number}: "
+            f"{exc} — aborting spawn"
+        )
+        # Re-raise so the caller (main loop) can detect auth / rate
+        # limit and bail. Other errors propagate too — the spawn dir
+        # is left behind (without a pidfile) and gets reaped on the
+        # next pass.
+        raise
+
+    stdout_path = work_dir / "stdout.log"
+    stderr_path = work_dir / "stderr.log"
+    pidfile_path = work_dir / "pidfile"
+
+    # Open prompt as stdin, log files as stdout/stderr. start_new_session
+    # detaches the subprocess from the dispatcher's controlling
+    # terminal + signal group — the dispatcher process can exit and
+    # the agent keeps running.
+    stdin_fh = open(prompt_path, "rb")
+    stdout_fh = open(stdout_path, "wb")
+    stderr_fh = open(stderr_path, "wb")
+    try:
+        proc = popen(
+            [claude_bin, "--print"],
+            stdin=stdin_fh,
+            stdout=stdout_fh,
+            stderr=stderr_fh,
+            start_new_session=True,
+        )
+    finally:
+        # Close the parent's view of the FDs — the child inherits its
+        # own copies. Keeping them open in the parent would mean the
+        # files only fully release when the dispatcher exits.
+        stdin_fh.close()
+        stdout_fh.close()
+        stderr_fh.close()
+
+    pid = getattr(proc, "pid", None)
+    if pid is not None:
+        pidfile_path.write_text(str(pid))
+    log(
+        f"[sm-dispatcher] spawned {spawn_id} (pid={pid}) on #{number} "
+        f"art={art_label}"
+    )
+    return spawn_id
 
 
 # ---------------------------------------------------------------------------
@@ -690,10 +1169,6 @@ def evaluate_trust(
 # ---------------------------------------------------------------------------
 
 
-def _now_iso() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-
-
 def render_hello_comment(
     number: int,
     art_label: str,
@@ -741,6 +1216,13 @@ class RunReport:
     # separately from ``transitioned`` so the done-line tells you at a
     # glance whether the missed-window sweep is firing.
     swept: int = 0
+    # Phase 2 — count of agent spawns this pass.
+    spawned: int = 0
+    # Issue numbers + spawn ids for which an agent was spawned. Useful
+    # for tests + dry-run reporting.
+    spawn_records: list[tuple[int, str, str]] = field(
+        default_factory=list
+    )  # (issue_number, art_label, spawn_id or "<dry-run>")
 
 
 def _process_selected(
@@ -752,11 +1234,22 @@ def _process_selected(
     post_comment: PostCommentFn,
     edit_labels: EditLabelsFn,
     find_linked_pr: FindLinkedPRFn,
+    list_comments: ListCommentsFn | None,
+    count_running: Callable[[], int] | None,
+    spawn: Callable[[dict[str, Any], str, str], str | None] | None,
+    max_concurrent_spawns: int,
     dry_run: bool,
     log: Callable[[str], None],
     now_iso: Callable[[], str],
 ) -> None:
-    """Hello + T1 (selected → reviewing) for a single sm:selected issue."""
+    """Hello + T1 (selected → reviewing) + Phase 2 spawn for one sm:selected
+    issue.
+
+    Order matters: trust filter → hello (idempotent) → T1 if linked PR
+    exists (terminating, since work is already in flight) → otherwise
+    Phase 2 spawn (gated by concurrency cap + dedup on
+    ``[SM] spawn-started`` audit comments).
+    """
     number = issue["number"]
     decision = evaluate_trust(issue)
     if not decision.accepted:
@@ -796,48 +1289,131 @@ def _process_selected(
         if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
             raise
         return
-    if pr is None:
-        return
-    # T1 fires only when the linked PR is still OPEN. ``gh_find_linked_pr``
-    # queries ``--state all`` (so the T2/T3 path can find merged PRs); we
-    # filter here so an sm:selected issue whose PR has already merged or
-    # closed doesn't get bounced to sm:reviewing — that lifecycle stage
-    # is past.
-    pr_state = (pr.get("state") or "").upper()
-    if pr_state != "OPEN":
-        log(
-            f"[sm-dispatcher] #{number} selected but linked PR is {pr_state!r} "
-            f"(not OPEN) — not transitioning to reviewing"
+    if pr is not None:
+        # T1 fires only when the linked PR is still OPEN.
+        # ``gh_find_linked_pr`` queries ``--state all`` (so the T2/T3
+        # path can find merged PRs); we filter here so an sm:selected
+        # issue whose PR has already merged or closed doesn't get
+        # bounced to sm:reviewing — that lifecycle stage is past.
+        pr_state = (pr.get("state") or "").upper()
+        if pr_state != "OPEN":
+            log(
+                f"[sm-dispatcher] #{number} selected but linked PR is "
+                f"{pr_state!r} (not OPEN) — not transitioning to reviewing"
+            )
+            return
+        pr_url = pr.get("url") or "<unknown>"
+        transition_body = render_transition_comment(
+            ACTIVE_SM_LABEL, REVIEWING_SM_LABEL, f"PR opened: {pr_url}"
         )
-        return
-    pr_url = pr.get("url") or "<unknown>"
-    transition_body = render_transition_comment(
-        ACTIVE_SM_LABEL, REVIEWING_SM_LABEL, f"PR opened: {pr_url}"
-    )
-    if dry_run:
-        log(
-            f"[sm-dispatcher] DRY-RUN would transition #{number}: "
-            f"selected → reviewing ({pr_url})"
-        )
+        if dry_run:
+            log(
+                f"[sm-dispatcher] DRY-RUN would transition #{number}: "
+                f"selected → reviewing ({pr_url})"
+            )
+            report.transitioned += 1
+            report.transitions.append(
+                (number, ACTIVE_SM_LABEL, REVIEWING_SM_LABEL)
+            )
+            return
+        try:
+            edit_labels(
+                repo,
+                number,
+                add=[REVIEWING_SM_LABEL],
+                remove=[ACTIVE_SM_LABEL],
+            )
+            post_comment(repo, number, transition_body)
+        except GHCommandError as exc:
+            log(f"[sm-dispatcher] failed to transition #{number}: {exc}")
+            if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+                raise
+            return
         report.transitioned += 1
         report.transitions.append((number, ACTIVE_SM_LABEL, REVIEWING_SM_LABEL))
+        log(f"[sm-dispatcher] transitioned #{number}: selected → reviewing")
         return
-    try:
-        edit_labels(
-            repo,
-            number,
-            add=[REVIEWING_SM_LABEL],
-            remove=[ACTIVE_SM_LABEL],
+
+    # No linked PR yet — Phase 2 spawn path. Caller passes
+    # spawn/count_running/list_comments=None to disable (tests that
+    # only care about hello/T1 paths can leave these out).
+    if spawn is None or count_running is None or list_comments is None:
+        return
+
+    if art_label not in SPAWN_MAP:
+        log(
+            f"[sm-dispatcher] spawn skip #{number}: "
+            f"unrecognized artifact {art_label!r}"
         )
-        post_comment(repo, number, transition_body)
+        return
+
+    # Dedup: do we already have an [SM] spawn-started audit comment?
+    try:
+        comments = list_comments(repo, number)
     except GHCommandError as exc:
-        log(f"[sm-dispatcher] failed to transition #{number}: {exc}")
+        log(
+            f"[sm-dispatcher] failed to list comments for #{number}: {exc}"
+        )
         if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
             raise
         return
-    report.transitioned += 1
-    report.transitions.append((number, ACTIVE_SM_LABEL, REVIEWING_SM_LABEL))
-    log(f"[sm-dispatcher] transitioned #{number}: selected → reviewing")
+    already_spawned = False
+    for c in comments:
+        if not isinstance(c, dict):
+            continue
+        cb = c.get("body")
+        ca = c.get("author")
+        if isinstance(ca, dict):
+            login = ca.get("login")
+        elif isinstance(ca, str):
+            login = ca
+        else:
+            login = None
+        if (
+            isinstance(cb, str)
+            and cb.startswith(SPAWN_STARTED_PREFIX)
+            and isinstance(login, str)
+            and login in TRUSTED_AUTHORS
+        ):
+            already_spawned = True
+            break
+    if already_spawned:
+        return
+
+    live = count_running()
+    if live >= max_concurrent_spawns:
+        log(
+            f"[sm-dispatcher] spawn skip #{number}: concurrency cap "
+            f"reached ({live}/{max_concurrent_spawns}) — queued for "
+            f"next pass"
+        )
+        return
+
+    if dry_run:
+        preview = compose_spawn_prompt(issue, SPAWN_MAP[art_label])[:240]
+        log(
+            f"[sm-dispatcher] DRY-RUN would spawn on #{number} "
+            f"art={art_label} (running={live}/{max_concurrent_spawns})"
+        )
+        log(f"[sm-dispatcher] DRY-RUN prompt preview: {preview!r}")
+        report.spawned += 1
+        report.spawn_records.append((number, art_label, "<dry-run>"))
+        return
+
+    try:
+        spawn_id = spawn(issue, art_label, repo)
+    except GHCommandError as exc:
+        log(f"[sm-dispatcher] failed to spawn on #{number}: {exc}")
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+    except OSError as exc:
+        log(f"[sm-dispatcher] spawn OS error on #{number}: {exc}")
+        return
+    if spawn_id is None:
+        return
+    report.spawned += 1
+    report.spawn_records.append((number, art_label, spawn_id))
 
 
 def _process_reviewing(
@@ -1148,12 +1724,17 @@ def run(
     state_path: pathlib.Path,
     list_issues: ListIssuesFn | None = None,
     list_stale_closed: ListIssuesFn | None = None,
+    list_comments: ListCommentsFn | None = None,
     post_comment: PostCommentFn = gh_post_comment,
     edit_labels: EditLabelsFn = gh_edit_labels,
     close_issue: CloseIssueFn = gh_close_issue,
     find_linked_pr: FindLinkedPRFn = gh_find_linked_pr,
     pr_merge_status: PRMergeStatusFn = gh_get_pr_merge_status,
     master_ci_status: MasterCIStatusFn = gh_get_master_ci_status,
+    count_running: Callable[[], int] | None = None,
+    spawn: Callable[[dict[str, Any], str, str], str | None] | None = None,
+    enable_spawn: bool = True,
+    max_concurrent_spawns: int = MAX_CONCURRENT_SPAWNS,
     dry_run: bool = False,
     log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
     now_iso: Callable[[], str] = _now_iso,
@@ -1170,6 +1751,28 @@ def run(
         list_issues = gh_list_sm_issues
     if list_stale_closed is None:
         list_stale_closed = gh_list_stale_closed_sm_issues
+    if enable_spawn:
+        # Default to live production wiring when the caller hasn't
+        # provided test fixtures. enable_spawn=False is the test escape
+        # hatch — leaves list_comments / count_running / spawn as None,
+        # so :func:`_process_selected` short-circuits the spawn branch.
+        if list_comments is None:
+            list_comments = gh_list_issue_comments
+        if count_running is None:
+            def count_running() -> int:
+                return count_running_spawns(SPAWN_DIR, log=log)
+        if spawn is None:
+            def spawn(
+                issue: dict[str, Any], art_label: str, repo: str
+            ) -> str | None:
+                return spawn_agent(
+                    issue,
+                    art_label,
+                    repo,
+                    post_comment=post_comment,
+                    log=log,
+                    now_iso=now_iso,
+                )
 
     report = RunReport()
     try:
@@ -1219,6 +1822,10 @@ def run(
                     post_comment=post_comment,
                     edit_labels=edit_labels,
                     find_linked_pr=find_linked_pr,
+                    list_comments=list_comments,
+                    count_running=count_running,
+                    spawn=spawn,
+                    max_concurrent_spawns=max_concurrent_spawns,
                     dry_run=dry_run,
                     log=log,
                     now_iso=now_iso,
@@ -1310,6 +1917,7 @@ def run(
         f"posted={report.posted} "
         f"transitioned={report.transitioned} "
         f"swept={report.swept} "
+        f"spawned={report.spawned} "
         f"skipped_dedup={report.skipped_dedup} "
         f"skipped_trust={report.skipped_trust}"
     )
@@ -1318,7 +1926,7 @@ def run(
 
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="One pass of the State Machine v0/v1.5 dispatcher."
+        description="One pass of the State Machine v0/v1.5/v2 dispatcher."
     )
     parser.add_argument(
         "--repo",
