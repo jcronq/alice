@@ -221,15 +221,17 @@ def summarize_wake(w: Wake, run_summary_module=None) -> str:
         except Exception:  # noqa: BLE001
             pass
 
-    # Fallback: first non-empty assistant_text or thinking block.
-    for ev in w.events:
-        if ev.kind in ("assistant_text", "thinking"):
-            text = (ev.detail.get("text") or "").strip()
-            if text:
-                return text.replace("\n", " ")[:160]
+    # Fallback while the Haiku summary is being generated. Used to
+    # leak Alice's raw thinking block, which (a) reads as her internal
+    # monologue ("Let me start by understanding the current state…")
+    # rather than a summary, and (b) can be confusing once the real
+    # summary lands and replaces it. Now we say "summarising…" with a
+    # tool fingerprint when one's available — concrete enough to give
+    # the operator a hint, neutral enough not to be mistaken for the
+    # actual summary.
     if w.tools:
-        return f"used {', '.join(w.tools[:6])}"
-    return "(no activity captured)"
+        return f"summarising… (used {', '.join(w.tools[:5])})"
+    return "summarising…"
 
 
 def summarize_turn(t: Turn) -> str:
@@ -375,6 +377,24 @@ def group_turns(events: list[UnifiedEvent]) -> list[Turn]:
             turn.sender_name = d.get("display_name")
             turn.inbound = d.get("inbound")
         elif ev.kind == "discord_turn_end":
+            turn.end_ts = ev.ts
+            turn.error = d.get("error")
+            turn.duration_ms = d.get("duration_ms")
+        elif ev.kind == "viewer_chat_turn_start":
+            turn.kind = "viewer-chat"
+            turn.start_ts = ev.ts
+            turn.sender_name = d.get("display_name")
+            turn.inbound = d.get("inbound")
+        elif ev.kind == "viewer_chat_turn_end":
+            turn.end_ts = ev.ts
+            turn.error = d.get("error")
+            turn.duration_ms = d.get("duration_ms")
+        elif ev.kind == "a2a_turn_start":
+            turn.kind = "a2a"
+            turn.start_ts = ev.ts
+            turn.sender_name = d.get("display_name")
+            turn.inbound = d.get("inbound")
+        elif ev.kind == "a2a_turn_end":
             turn.end_ts = ev.ts
             turn.error = d.get("error")
             turn.duration_ms = d.get("duration_ms")
