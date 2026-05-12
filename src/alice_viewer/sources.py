@@ -1812,7 +1812,7 @@ def now() -> float:
 
 @dataclass
 class RunningJob:
-    kind: str  # "wake" | "experiment" | "subagent"
+    kind: str  # "wake" | "experiment" | "subagent" | "talking"
     job_id: str
     started_at: float  # unix ts
     elapsed_s: float
@@ -1830,17 +1830,50 @@ class RunningJob:
         }
 
 
+def _read_jsonl_tail(
+    path: pathlib.Path, max_bytes: int = 8 * 1024 * 1024
+) -> Iterator[dict[str, Any]]:
+    """Yield JSONL records from the LAST ``max_bytes`` of ``path`` in
+    forward order. Drops the first (probably partial) line so a
+    truncated open record at the seek boundary doesn't poison parsing.
+
+    Used by the running-jobs scanner so it doesn't have to walk the
+    full 1+ GB thinking.log on every 10s page refresh — the only
+    relevant events are within the last ~2h, which fits comfortably
+    in 8 MB even on the busiest day.
+    """
+    if not path.is_file():
+        return
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+                f.readline()  # drop the partial leading line
+            for raw in f:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return
+
+
 def _open_wakes(
     thinking_log: pathlib.Path,
     cutoff_ts: float,
     now_ts: float,
 ) -> list[RunningJob]:
-    """Thinking is serial — at most one wake open at a time. Walk the
-    log and track the last unmatched wake_start. If a closing event
-    (wake_end / timeout / exception) follows it, the wake is done.
+    """Thinking is serial — at most one wake open at a time. Tail-scan
+    the log and track the last unmatched wake_start. If a closing
+    event (wake_end / timeout / exception) follows it, the wake is
+    done.
     """
     open_start: dict[str, Any] | None = None
-    for rec in _read_jsonl(thinking_log):
+    for rec in _read_jsonl_tail(thinking_log):
         event = rec.get("event") or ""
         if event == "wake_start":
             open_start = rec
@@ -1868,6 +1901,80 @@ def _open_wakes(
     ]
 
 
+# Speaking turn events follow a uniform shape: ``<channel>_turn_start``
+# opens, ``<channel>_turn_end`` closes, both carry the same ``turn_id``.
+# These are the kinds we expect to see — anything ending in
+# ``_turn_start`` matches the suffix-rule in _open_speaking_turns and
+# this list is for the kind label / display only.
+_SPEAKING_KIND_LABELS = {
+    "signal": "signal",
+    "cli": "cli",
+    "discord": "discord",
+    "a2a": "a2a",
+    "viewer_chat": "viewer-chat",
+    "viewer-chat": "viewer-chat",
+    "surface": "surface",
+    "emergency": "emergency",
+    "background_task": "bg-task",
+}
+
+
+def _open_speaking_turns(
+    speaking_log: pathlib.Path,
+    cutoff_ts: float,
+    now_ts: float,
+) -> list[RunningJob]:
+    """Track ``<channel>_turn_start`` events by ``turn_id``; remove on
+    ``<channel>_turn_end``. Surviving turn_ids above ``cutoff_ts`` are
+    still in flight — the "talking runs" the operator wants visible
+    when Alice is mid-Bash-loop on a Signal message and not yet
+    replying.
+    """
+    open_by_turn_id: dict[str, tuple[str, dict[str, Any]]] = {}
+    for rec in _read_jsonl_tail(speaking_log):
+        event = rec.get("event") or ""
+        tid = rec.get("turn_id")
+        if not tid:
+            continue
+        if event.endswith("_turn_start"):
+            kind_raw = event[: -len("_turn_start")]
+            open_by_turn_id[tid] = (kind_raw, rec)
+        elif event.endswith("_turn_end"):
+            open_by_turn_id.pop(tid, None)
+    out: list[RunningJob] = []
+    for tid, (kind_raw, rec) in open_by_turn_id.items():
+        ts = float(rec.get("ts") or 0.0)
+        if ts < cutoff_ts:
+            continue
+        kind_label = _SPEAKING_KIND_LABELS.get(kind_raw, kind_raw)
+        sender = (
+            rec.get("sender_name")
+            or rec.get("display_name")
+            or rec.get("principal_id")
+            or "?"
+        )
+        inbound = (rec.get("inbound") or "").strip().replace("\n", " ")[:140]
+        if inbound:
+            what = f"{kind_label} · {sender}: {inbound}"
+        else:
+            what = f"{kind_label} turn from {sender}"
+        out.append(
+            RunningJob(
+                kind="talking",
+                job_id=tid,
+                started_at=ts,
+                elapsed_s=max(0.0, now_ts - ts),
+                what=what,
+                detail={
+                    "channel_kind": kind_raw,
+                    "sender_name": sender,
+                    "inbound_chars": rec.get("inbound_chars"),
+                },
+            )
+        )
+    return out
+
+
 def _open_subagents(
     speaking_log: pathlib.Path,
     cutoff_ts: float,
@@ -1877,7 +1984,7 @@ def _open_subagents(
     remove on ``background_task_dispatch_complete``. Surviving handles
     above ``cutoff_ts`` are still running."""
     open_by_handle: dict[str, dict[str, Any]] = {}
-    for rec in _read_jsonl(speaking_log):
+    for rec in _read_jsonl_tail(speaking_log):
         event = rec.get("event") or ""
         handle = rec.get("handle")
         if not handle:
@@ -1999,5 +2106,6 @@ def list_running_jobs(
     jobs.extend(_open_wakes(paths.thinking_log, cutoff, now_ts))
     jobs.extend(_open_experiments(paths.mind_dir, cutoff, now_ts))
     jobs.extend(_open_subagents(paths.speaking_log, cutoff, now_ts))
+    jobs.extend(_open_speaking_turns(paths.speaking_log, cutoff, now_ts))
     jobs.sort(key=lambda j: j.started_at, reverse=True)
     return jobs

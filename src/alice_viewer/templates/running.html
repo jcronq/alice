@@ -1,35 +1,24 @@
 {% extends "base.html" %}
 {% block title %}running{% endblock %}
 {% block body %}
-  <script>setTimeout(() => location.reload(), 10000);</script>
   <h1>running</h1>
   <p class="muted">
-    What's in flight right now. Thinking wakes, experiments, and
-    background sub-agents — anything with a start signal but no
-    completion yet. Auto-refresh every 10s. Jobs older than 2h are
+    What's in flight right now. Talking turns (signal/cli/discord/
+    viewer-chat/etc.), thinking wakes, experiments, and background
+    sub-agents — anything with a start signal but no completion yet.
+    Auto-refreshes every 5s via partial swap. Jobs older than 2h are
     treated as zombies and dropped.
   </p>
 
-  {% if jobs %}
-    <ul class="running-list">
-      {% for j in jobs %}
-        <li class="running-row running-{{ j.kind }}">
-          <span class="running-kind">{{ j.kind }}</span>
-          <span class="running-what">{{ j.what }}</span>
-          <span class="running-id">{{ j.job_id }}</span>
-          <span class="running-meta">
-            started {{ j.started_at | localtime }} ·
-            running {{ j.elapsed_s | int }}s
-          </span>
-        </li>
-      {% endfor %}
-    </ul>
-  {% else %}
-    <p class="muted"><em>Nothing running. All hemispheres idle.</em></p>
-  {% endif %}
+  <div id="running-list"
+       hx-get="/api/running/partial"
+       hx-trigger="load, every 5s"
+       hx-swap="innerHTML">
+    {% include "_running_rows.html" %}
+  </div>
 
   <style>
-    .running-list { list-style: none; padding: 0; margin: 1.5em 0; max-width: 820px; }
+    .running-list { list-style: none; padding: 0; margin: 1.5em 0; max-width: 920px; }
     .running-list li { margin: 0; }
     .running-row {
       display: grid; grid-template-columns: 90px 1fr auto; grid-template-rows: auto auto;
@@ -42,7 +31,8 @@
       text-transform: uppercase; letter-spacing: 0.05em;
       padding: 3px 8px; border-radius: 3px; text-align: center;
     }
-    .running-wake .running-kind   { background: #3b5e8e; color: #e8f0ff; }
+    .running-talking .running-kind    { background: #8e6e3b; color: #fff5e0; }
+    .running-wake .running-kind       { background: #3b5e8e; color: #e8f0ff; }
     .running-experiment .running-kind { background: #5e3b8e; color: #f0e8ff; }
     .running-subagent .running-kind   { background: #3b8e5e; color: #e8ffe8; }
     .running-what {

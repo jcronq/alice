@@ -1,0 +1,20 @@
+{# Partial: just the running-rows list. Called as the initial render
+   from running.html AND as the hx-get target every 5s for live
+   updates without a full page reload. #}
+{% if jobs %}
+  <ul class="running-list">
+    {% for j in jobs %}
+      <li class="running-row running-{{ j.kind }}">
+        <span class="running-kind">{{ j.kind }}</span>
+        <span class="running-what">{{ j.what }}</span>
+        <span class="running-id">{{ j.job_id }}</span>
+        <span class="running-meta">
+          started {{ j.started_at | localtime }} ·
+          running {{ j.elapsed_s | int }}s
+        </span>
+      </li>
+    {% endfor %}
+  </ul>
+{% else %}
+  <p class="muted"><em>Nothing running. All hemispheres idle.</em></p>
+{% endif %}

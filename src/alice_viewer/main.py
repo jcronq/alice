@@ -773,6 +773,19 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         jobs = sources.list_running_jobs(p)
         return JSONResponse([j.to_dict() for j in jobs])
 
+    @app.get("/api/running/partial", response_class=HTMLResponse)
+    async def api_running_partial(request: Request):
+        """HTMX-driven partial refresh for the /running tab. Avoids the
+        sidebar + full base.html round-trip every 5s — same data, just
+        the rows."""
+        p: Paths = app.state.paths
+        jobs = sources.list_running_jobs(p)
+        return templates.TemplateResponse(
+            request,
+            "_running_rows.html",
+            {"jobs": [j.to_dict() for j in jobs]},
+        )
+
     # ------------------------------------------------------------------
     # JSON APIs (fuel for d3)
 
