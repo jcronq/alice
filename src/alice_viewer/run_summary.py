@@ -30,12 +30,14 @@ HAIKU_MODEL = "claude-haiku-4-5"
 
 # Bump when the prompt or output shape changes — cached entries with a
 # lower schema are treated as missing so summaries regenerate lazily.
-# Schema 3: concatenate assistant_text events (handles both
-# per-block claude_agent_sdk wakes AND fragmented per-token pi wakes
-# from before alice_pi.translator's text_end fix; the previous version
-# overwrote on each event, leaving final_text="OK" or similar for
-# pi-routed wakes whose deltas arrived in 2-5 char chunks).
-CACHE_SCHEMA = 3
+# Schema 4: prompt rewrite to surface SIGNAL over RECAP. The schema-3
+# prompt asked for "the full arc of what I accomplished," which on
+# routine wakes produced boilerplate ("I initialized the wake,
+# verified state, audited vault, fixed frontmatter, closed the wake")
+# that's noise to the operator. The new prompt asks for what was
+# notable / different, with explicit permission to say "routine" in
+# one phrase when nothing happened.
+CACHE_SCHEMA = 4
 
 
 def cache_dir() -> pathlib.Path:
@@ -170,13 +172,31 @@ def _build_prompt(events: list) -> str:
     sampled_thoughts = _sample_thoughts(thoughts)
 
     parts = [
-        "Summarize the FULL ARC of this thinking wake — what I actually",
-        "accomplished from start to finish, not just what I set out to do.",
-        "1–3 short sentences, ~240 characters max. Cover distinct phases",
-        "if there were several (e.g. groom + fix + verify), in order.",
-        "FIRST PERSON past tense — 'I groomed X, then fixed Y' not",
-        "third person. You ARE the agent; the wake is yours.",
-        "No quotes, no preamble like 'In this wake', just the summary.",
+        "Summarize what was NOTABLE about this wake — anything that",
+        "surprised you, departed from routine, found a problem, made a",
+        "decision, or moved a project forward. The OPERATOR reads this",
+        "to decide whether to dig in; their time is the constraint.",
+        "",
+        "Most wakes are routine: standard vault check, no problems,",
+        "frontmatter touch-ups, no active threads. Those should be ONE",
+        "short phrase, e.g.:",
+        "  • 'routine; vault clean.'",
+        "  • 'routine; 3 broken wikilinks logged, no other signal.'",
+        "  • 'routine groom; nothing notable.'",
+        "DO NOT recite the standard checklist (initialised wake / verified",
+        "state / audited vault / fixed frontmatter / closed wake) — the",
+        "operator already knows you do those every wake. They are noise.",
+        "",
+        "When the wake DID something interesting, lead with it — what",
+        "you found, decided, or shipped. 1–3 short sentences, ~240 chars",
+        "max, in distinct phases if it spanned several. Examples:",
+        "  • 'Caught a stale stage_d_pairs file from 2 weeks back; archived.'",
+        "  • 'Found 41 broken wikilinks all in dailies — logged for later.'",
+        "  • 'Drafted the run_experiment design doc and surfaced it to Jason.'",
+        "",
+        "FIRST PERSON past tense — 'I caught X' not third person. You ARE",
+        "the agent; the wake is yours. No quotes, no preamble like 'In",
+        "this wake', just the summary.",
         "",
     ]
     if sampled_thoughts:
