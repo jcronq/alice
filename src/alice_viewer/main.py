@@ -686,14 +686,24 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         return EventSourceResponse(gen())
 
     @app.get("/canvas", response_class=HTMLResponse)
-    async def canvas_index(request: Request):
+    async def canvas_index(request: Request, page: int = 1, page_size: int = 20):
         p: Paths = app.state.paths
-        canvases = sources.list_canvases(p.inner, p.mind_dir)
+        all_canvases = sources.list_canvases(p.inner, p.mind_dir)
+        page_size = max(1, min(page_size, 100))
+        total = len(all_canvases)
+        last_page = max(1, (total + page_size - 1) // page_size)
+        page = max(1, min(page, last_page))
+        start = (page - 1) * page_size
+        canvases = all_canvases[start : start + page_size]
         return templates.TemplateResponse(
             request,
             "canvas_index.html",
             {
                 "canvases": canvases,
+                "page": page,
+                "page_size": page_size,
+                "last_page": last_page,
+                "total": total,
                 "state": _state_context(),
                 "active": "canvas",
             },

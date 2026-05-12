@@ -20,6 +20,20 @@
         </li>
       {% endfor %}
     </ul>
+
+    <nav class="canvas-pager">
+      {% if page > 1 %}
+        <a href="/canvas?page={{ page - 1 }}&page_size={{ page_size }}">← prev</a>
+      {% else %}
+        <span class="muted">← prev</span>
+      {% endif %}
+      <span class="muted">page {{ page }} of {{ last_page }} · {{ total }} total</span>
+      {% if page < last_page %}
+        <a href="/canvas?page={{ page + 1 }}&page_size={{ page_size }}">next →</a>
+      {% else %}
+        <span class="muted">next →</span>
+      {% endif %}
+    </nav>
   {% else %}
     <p class="muted"><em>No canvases yet. {{ personae.agent.name }} hasn't authored any.</em></p>
   {% endif %}
@@ -45,5 +59,12 @@
       grid-column: 1 / -1; grid-row: 2; font-size: 12px; color: var(--muted);
       font-family: var(--mono, monospace);
     }
+    .canvas-pager {
+      max-width: 820px; display: flex; justify-content: space-between;
+      align-items: center; padding: 12px 4px; font-size: 13px;
+      border-top: 1px solid var(--border); margin-top: 12px;
+    }
+    .canvas-pager a { color: var(--accent); text-decoration: none; }
+    .canvas-pager a:hover { text-decoration: underline; }
   </style>
 {% endblock %}
