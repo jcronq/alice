@@ -435,7 +435,7 @@ def gh_get_pr_merge_status(
         "--repo",
         repo,
         "--json",
-        "mergeCommit,merged,url",
+        "state,mergeCommit,url",
     ]
     stdout = _run_gh(args)
     if not stdout.strip():
@@ -446,7 +446,7 @@ def gh_get_pr_merge_status(
     merge_commit = payload.get("mergeCommit") or {}
     oid = merge_commit.get("oid") if isinstance(merge_commit, dict) else None
     return {
-        "merged": bool(payload.get("merged")),
+        "merged": payload.get("state") == "MERGED",
         "merge_commit_oid": oid,
         "pr_url": payload.get("url"),
     }
