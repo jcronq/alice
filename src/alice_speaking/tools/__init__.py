@@ -26,6 +26,7 @@ from . import (
     config_tools,
     deploy,
     fs,
+    host_claude,
     inner,
     memory,
     messaging,
@@ -130,6 +131,7 @@ def build(
         *config_tools.build(cfg, personae=personae),
         *fs.build(cfg, personae=personae),
         *deploy.build(cfg, personae=personae),
+        *host_claude.build(cfg, personae=personae),
     ]
     if sender is not None or signal is not None:
         tool_list.extend(

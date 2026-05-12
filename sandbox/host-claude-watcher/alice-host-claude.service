@@ -1,0 +1,31 @@
+[Unit]
+Description=Alice host-side Claude task watcher (Speaking <-> Claude CLI bridge)
+Documentation=https://github.com/jcronq/alice/tree/master/sandbox/host-claude-watcher
+After=network.target
+
+[Service]
+Type=simple
+# Adjust User= to the account that owns ~/.claude and has the `claude`
+# binary on PATH. Don't run this as root.
+User=alice
+Group=alice
+# The script discovers ALICE_HOST_CLAUDE_ROOT (default: /state/worker/host-claude).
+# Override here if your bind-mount layout differs.
+# Environment=ALICE_HOST_CLAUDE_ROOT=/state/worker/host-claude
+# Environment=ALICE_HOST_CLAUDE_BIN=/usr/local/bin/claude
+ExecStart=/usr/local/bin/alice-host-claude-watcher.sh
+Restart=on-failure
+RestartSec=5
+# Capture all log lines to the journal; the script logs to stderr.
+StandardOutput=journal
+StandardError=journal
+# Hardening — tasks only ever touch ALICE_HOST_CLAUDE_ROOT and PATH-located
+# binaries. Tighten further once the deployment shape settles.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/state/worker/host-claude
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
