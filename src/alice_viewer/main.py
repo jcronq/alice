@@ -765,16 +765,11 @@ def create_app(paths: Paths | None = None) -> FastAPI:
     @app.get("/api/memory-graph")
     async def api_memory_graph() -> JSONResponse:
         p: Paths = app.state.paths
-        nodes, edges = sources.read_memory_graph(p.mind_dir)
+        nodes, edges, cluster_metrics = sources.load_memory_graph_bundle(p.mind_dir)
         # Compute in-degree for sizing.
         in_deg: dict[str, int] = {}
         for e in edges:
             in_deg[e.target] = in_deg.get(e.target, 0) + 1
-        # Cluster diagnostics over the topical subgraph (dailies, instructions,
-        # index notes, and unresolved ghosts excluded — they bridge across
-        # domains and would mask real lobe formation). See
-        # sources.compute_cluster_metrics.
-        cluster_metrics = sources.compute_cluster_metrics(nodes, edges)
         node_cluster = cluster_metrics.get("node_cluster", {})
 
         # Phase 2 + LLM labels: run the persistent registry against the
@@ -818,14 +813,21 @@ def create_app(paths: Paths | None = None) -> FastAPI:
                 if stable:
                     stable_by_cid[c["id"]] = stable
 
-        # Decorate clusters in-place with cluster_slug + llm_label so
-        # the UI doesn't have to do the registry lookup itself.
+        # Build a fresh decorated clusters list — cluster_metrics is a
+        # shared cached object, so we must not mutate it in place.
         entries = (registry or {}).get("entries", {})
+        decorated_clusters = []
         for c in clusters_list:
             stable = stable_by_cid.get(c["id"])
             entry = entries.get(stable) if stable else None
-            c["cluster_slug"] = stable
-            c["llm_label"] = (entry or {}).get("llm_label")
+            decorated_clusters.append(
+                {
+                    **c,
+                    "cluster_slug": stable,
+                    "llm_label": (entry or {}).get("llm_label"),
+                }
+            )
+        response_metrics = {**cluster_metrics, "clusters": decorated_clusters}
 
         return JSONResponse(
             {
@@ -842,7 +844,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
                     for n in nodes
                 ],
                 "edges": [{"source": e.source, "target": e.target} for e in edges],
-                "cluster_metrics": cluster_metrics,
+                "cluster_metrics": response_metrics,
             }
         )
 
@@ -902,27 +904,28 @@ def create_app(paths: Paths | None = None) -> FastAPI:
 
         Cadence:
 
-        - **Computed fresh on every request.** No caching at this layer;
-          ``read_memory_graph`` re-walks ``cortex-memory/`` and ``memory/``
-          on each call, then ``compute_cluster_metrics`` re-runs label
-          propagation. ``generated_at`` is the response time, never older.
-          For today's vault (~950 nodes, ~7400 edges) the round-trip is
-          subsecond. If the vault grows past the point where this hurts,
-          we'll add a TTL/invalidation layer at the route boundary, not
-          inside the compute functions.
+        - Cached at the ``sources.load_memory_graph_bundle`` layer:
+          stat-only signature over ``cortex-memory/`` + ``memory/`` (with
+          ``cortex-memory/dailies/`` excluded — those churn on every
+          wake) decides hit vs miss. Hit reuses the cached
+          ``(nodes, edges, cluster_metrics)``; miss re-walks and
+          re-runs label propagation. The registry rebuild + LLM-label
+          refresh still run on every request (both cheap; LLM refresh
+          short-circuits when no lobes are pending). ``generated_at``
+          is the response time and reflects when the *registry* state
+          was assembled, not the underlying graph snapshot.
 
         Phase 1 omits per-cluster modularity (Phase 3) and Jaccard-tracked
         identity drift (Phase 2). Both will be added in place without
         breaking existing keys.
         """
         p: Paths = app.state.paths
-        nodes, edges = sources.read_memory_graph(p.mind_dir)
+        nodes, edges, cm = sources.load_memory_graph_bundle(p.mind_dir)
         in_deg: dict[str, int] = {}
         out_deg: dict[str, int] = {}
         for e in edges:
             in_deg[e.target] = in_deg.get(e.target, 0) + 1
             out_deg[e.source] = out_deg.get(e.source, 0) + 1
-        cm = sources.compute_cluster_metrics(nodes, edges)
         node_cluster = cm.get("node_cluster", {})
         clusters = cm.get("clusters", [])
         cross_cluster_edges = cm.get("cross_cluster_edges", [])
@@ -1088,8 +1091,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         snapshot payload.
         """
         p: Paths = app.state.paths
-        nodes, edges = sources.read_memory_graph(p.mind_dir)
-        cm = sources.compute_cluster_metrics(nodes, edges)
+        nodes, edges, cm = sources.load_memory_graph_bundle(p.mind_dir)
         topical_clusters = [c for c in cm.get("clusters", []) if not c["is_misc"]]
         reg_path = cluster_registry.registry_path()
         prev_registry = cluster_registry.load_registry(reg_path)

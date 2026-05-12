@@ -811,65 +811,241 @@ class MemoryEdge:
     target: str
 
 
-def read_memory_graph(mind: pathlib.Path) -> tuple[list[MemoryNode], list[MemoryEdge]]:
-    """Scan cortex-memory + legacy memory/ for wikilinks and return a graph.
+# Incremental in-process memo for the memory graph. The three routes that
+# need it (/api/memory-graph, /api/cluster-snapshot, /api/cluster-registry)
+# all walked cortex-memory/ + memory/ and re-ran label propagation on every
+# request — ~280ms of file IO + clustering per call on a 1300-note vault.
+#
+# Cache layers (in increasing rebuild cost):
+#
+#   1. Hit (signature matches): return cached bundle. ~50ms stat walk.
+#   2. Near-miss (some files changed, no topical change): re-read only the
+#      changed bodies, rebuild edges, **reuse cached cluster_metrics**.
+#      Saves the ~100ms cluster recompute.
+#   3. Topical miss (a topical file changed): re-read changed bodies +
+#      recompute clusters.
+#   4. Cold start: full walk.
+#
+# Per-file body bodies are not stored — we keep the parsed wikilink target
+# labels (``file_wikilinks``) which is what the edge step needs, and is
+# smaller. ``compute_cluster_metrics`` stays pure; the cache just decides
+# whether to call it.
+#
+# Same single-worker assumption as _load_all_cache: no cross-worker
+# coherence concern.
+@dataclass
+class _MemoryGraphCache:
+    signature: tuple  # ((rel_path, mtime_ns, size), ...) for all tracked files
+    topical_signature: tuple  # subset of signature for topical files
+    nodes_by_id: dict[str, MemoryNode]  # real (non-ghost) nodes
+    file_wikilinks: dict[str, tuple[str, ...]]  # source id → raw target labels
+    nodes: list[MemoryNode]  # full materialized list (includes ghosts)
+    edges: list[MemoryEdge]
+    cluster_metrics: dict[str, Any]
 
-    Both roots are unioned so dated daily logs and legacy curated notes show
-    up alongside the groomed wiki, inviting Alice to migrate/link them over
-    time. Wikilinks resolve across both roots by title/slug.
+
+_memory_graph_cache: _MemoryGraphCache | None = None
+
+
+_FINGERPRINT_EXCLUDE_PREFIXES = ("cortex-memory/dailies/",)
+
+
+def memory_graph_signature(mind: pathlib.Path) -> tuple:
+    """Cheap stat-only fingerprint over the markdown corpus.
+
+    Walks the same roots ``read_memory_graph`` walks, but only stat()s —
+    no file reads, no wikilink parsing. Any mtime or size change to a
+    tracked ``*.md`` file flips the signature and invalidates the cache.
+
+    Dailies (``cortex-memory/dailies/``) are intentionally excluded
+    from the signature: thinking writes to today's daily on every wake
+    (access_count bumps, etc.), so including them would invalidate the
+    cache constantly during active wakes. Dailies are non-topical, so
+    their edits never affect cluster metrics anyway; the only cost is
+    that newly-added or freshly-edited daily nodes may take until the
+    next non-daily change to surface in the response payload.
+
+    Signature tuples are ``(rel_path, mtime_ns, size)`` where ``rel_path``
+    is the path relative to ``mind`` with the ``.md`` suffix retained —
+    this is enough to reconstruct both the node id (strip ``.md``) and
+    the absolute path (prepend ``mind``) without restatting.
     """
-    nodes: dict[str, MemoryNode] = {}
-    file_bodies: dict[str, str] = {}
+    items: list[tuple[str, int, int]] = []
     for root_name in ("cortex-memory", "memory"):
         root = mind / root_name
         if not root.is_dir():
             continue
         for path in root.rglob("*.md"):
             try:
-                rel = path.relative_to(mind).with_suffix("")
+                rel = path.relative_to(mind).as_posix()
             except ValueError:
                 continue
-            node_id = str(
-                rel
-            )  # e.g. "cortex-memory/people/friend" or "memory/2026-04-24"
-            label = path.stem
-            folder = "/".join(rel.parts[:-1]) or rel.parts[0]
+            if rel.startswith(_FINGERPRINT_EXCLUDE_PREFIXES):
+                continue
             try:
                 st = path.stat()
             except OSError:
                 continue
-            nodes[node_id] = MemoryNode(
-                id=node_id,
-                label=label,
-                path=str(path),
-                folder=folder,
-                size=st.st_size,
-                mtime=st.st_mtime,
-            )
-            file_bodies[node_id] = _read_text(path)
+            items.append((rel, st.st_mtime_ns, st.st_size))
+    items.sort()
+    return tuple(items)
 
-    if not nodes:
-        return [], []
-    root = None  # sentinel; kept for later functions that reference root
 
-    # Build a label → node_id index for resolving wikilinks.
+def _topical_subset(signature: tuple) -> tuple:
+    """Return only the topical entries from a memory_graph_signature.
+
+    Filtering happens on the in-memory signature tuple so it costs one
+    pass over ~1300 entries with no syscalls.
+    """
+    return tuple(item for item in signature if _is_topical(_folder_from_rel(item[0])))
+
+
+def _folder_from_rel(rel: str) -> str:
+    """Folder of a rel path like ``cortex-memory/people/alice.md`` → ``cortex-memory/people``.
+
+    Matches the ``folder`` field that ``MemoryNode`` stores.
+    """
+    parts = rel.split("/")
+    if len(parts) == 1:
+        return parts[0]
+    return "/".join(parts[:-1])
+
+
+def _rel_to_node_id(rel: str) -> str:
+    """``cortex-memory/people/alice.md`` → ``cortex-memory/people/alice``."""
+    return rel[:-3] if rel.endswith(".md") else rel
+
+
+def read_memory_graph(mind: pathlib.Path) -> tuple[list[MemoryNode], list[MemoryEdge]]:
+    """Scan cortex-memory + legacy memory/ for wikilinks and return a graph.
+
+    Memoized via the cache layers in ``_MemoryGraphCache``. Callers must
+    treat the returned lists as read-only — mutating them would poison
+    the cache across requests.
+
+    Both roots are unioned so dated daily logs and legacy curated notes
+    show up alongside the groomed wiki, inviting Alice to migrate/link
+    them over time. Wikilinks resolve across both roots by title/slug.
+    """
+    nodes, edges, _ = load_memory_graph_bundle(mind)
+    return nodes, edges
+
+
+def load_memory_graph_bundle(
+    mind: pathlib.Path,
+) -> tuple[list[MemoryNode], list[MemoryEdge], dict[str, Any]]:
+    """Return cached ``(nodes, edges, cluster_metrics)`` for ``mind``.
+
+    Routes that need all three should call this rather than chaining
+    ``read_memory_graph`` + ``compute_cluster_metrics`` so the bundle
+    is consistent and the cluster reuse path actually fires. The
+    returned ``cluster_metrics`` is a shared reference — callers must
+    not mutate it (build a new decorated dict if you need to add fields).
+    """
+    global _memory_graph_cache
+    sig = memory_graph_signature(mind)
+    c = _memory_graph_cache
+    if c is not None and c.signature == sig:
+        return c.nodes, c.edges, c.cluster_metrics
+    new_cache = _update_memory_graph_cache(mind, sig, c)
+    _memory_graph_cache = new_cache
+    return new_cache.nodes, new_cache.edges, new_cache.cluster_metrics
+
+
+def _update_memory_graph_cache(
+    mind: pathlib.Path,
+    new_sig: tuple,
+    prev: _MemoryGraphCache | None,
+) -> _MemoryGraphCache:
+    """Build the next cache entry, reusing whatever ``prev`` still applies.
+
+    Bodies are only re-read for added/changed files. Cluster metrics are
+    reused when the topical subset of the signature hasn't shifted.
+    Ghost nodes for unresolved wikilinks are rebuilt from scratch each
+    call so any wikilink that newly resolves (or stops resolving) is
+    reflected in one pass — re-resolving 1300 sources × handful of links
+    is cheap (<10ms in practice).
+    """
+    topical_sig = _topical_subset(new_sig)
+
+    new_stat: dict[str, tuple[int, int]] = {
+        rel: (mtime, size) for rel, mtime, size in new_sig
+    }
+    if prev is not None:
+        old_stat: dict[str, tuple[int, int]] = {
+            rel: (mtime, size) for rel, mtime, size in prev.signature
+        }
+        nodes_by_id = dict(prev.nodes_by_id)
+        file_wikilinks = dict(prev.file_wikilinks)
+    else:
+        old_stat = {}
+        nodes_by_id = {}
+        file_wikilinks = {}
+
+    # Removed files: drop their nodes + cached wikilinks.
+    for rel in old_stat.keys() - new_stat.keys():
+        node_id = _rel_to_node_id(rel)
+        nodes_by_id.pop(node_id, None)
+        file_wikilinks.pop(node_id, None)
+
+    # Added or changed files: re-read body + re-parse wikilinks.
+    for rel, stat in new_stat.items():
+        if old_stat.get(rel) == stat:
+            continue
+        path = mind / rel
+        node_id = _rel_to_node_id(rel)
+        folder = _folder_from_rel(rel)
+        label = path.stem
+        try:
+            st = path.stat()
+        except OSError:
+            nodes_by_id.pop(node_id, None)
+            file_wikilinks.pop(node_id, None)
+            continue
+        nodes_by_id[node_id] = MemoryNode(
+            id=node_id,
+            label=label,
+            path=str(path),
+            folder=folder,
+            size=st.st_size,
+            mtime=st.st_mtime,
+        )
+        body = _read_text(path)
+        labels: list[str] = []
+        for match in WIKILINK_RE.finditer(body):
+            t = match.group(1).strip()
+            if t:
+                labels.append(t)
+        file_wikilinks[node_id] = tuple(labels)
+
+    # If nothing tracked, short-circuit.
+    if not nodes_by_id:
+        return _MemoryGraphCache(
+            signature=new_sig,
+            topical_signature=topical_sig,
+            nodes_by_id=nodes_by_id,
+            file_wikilinks=file_wikilinks,
+            nodes=[],
+            edges=[],
+            cluster_metrics={},
+        )
+
+    # Label → first node_id lookup, for wikilink resolution.
     by_label: dict[str, str] = {}
-    for nid, n in nodes.items():
+    for nid, n in nodes_by_id.items():
         by_label.setdefault(n.label.lower(), nid)
 
+    # Materialize edges + ghost nodes from the cached wikilink labels.
+    full_nodes: dict[str, MemoryNode] = dict(nodes_by_id)
     edges: list[MemoryEdge] = []
     seen_edges: set[tuple[str, str]] = set()
-    for src_id, body in file_bodies.items():
-        for match in WIKILINK_RE.finditer(body):
-            target_label = match.group(1).strip()
-            if not target_label:
-                continue
+    for src_id, target_labels in file_wikilinks.items():
+        for target_label in target_labels:
             target_id = by_label.get(target_label.lower())
             if target_id is None:
-                # Broken link — create a placeholder node so it shows up.
                 ghost_id = f"unresolved::{target_label}"
-                if ghost_id not in nodes:
-                    nodes[ghost_id] = MemoryNode(
+                if ghost_id not in full_nodes:
+                    full_nodes[ghost_id] = MemoryNode(
                         id=ghost_id,
                         label=target_label,
                         path="",
@@ -886,7 +1062,29 @@ def read_memory_graph(mind: pathlib.Path) -> tuple[list[MemoryNode], list[Memory
             seen_edges.add(edge)
             edges.append(MemoryEdge(source=src_id, target=target_id))
 
-    return list(nodes.values()), edges
+    nodes_list = list(full_nodes.values())
+
+    # Cluster metrics: reuse iff the topical subset is byte-identical.
+    # Non-topical edits (canvases, decisions-index, etc.) skip the
+    # ~100ms label-propagation pass.
+    if (
+        prev is not None
+        and prev.topical_signature == topical_sig
+        and prev.cluster_metrics
+    ):
+        cluster_metrics = prev.cluster_metrics
+    else:
+        cluster_metrics = compute_cluster_metrics(nodes_list, edges)
+
+    return _MemoryGraphCache(
+        signature=new_sig,
+        topical_signature=topical_sig,
+        nodes_by_id=nodes_by_id,
+        file_wikilinks=file_wikilinks,
+        nodes=nodes_list,
+        edges=edges,
+        cluster_metrics=cluster_metrics,
+    )
 
 
 # Folders whose notes count as the "topical subgraph" for cluster
