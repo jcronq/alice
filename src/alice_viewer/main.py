@@ -308,6 +308,27 @@ def create_app(paths: Paths | None = None) -> FastAPI:
             },
         )
 
+    @app.get("/api/wakes/{wake_id}/summary", response_class=HTMLResponse)
+    async def wake_summary_cell(request: Request, wake_id: str):
+        """HTMX poll target for the per-row 'summarising…' fallback.
+        Returns the same summary cell partial — when the Haiku call
+        has filled the cache, the response omits the polling
+        attributes so the swap stops the poll naturally."""
+        from . import run_summary
+
+        p: Paths = app.state.paths
+        events = sources.load_all(p)
+        wakes = aggregators.group_wakes(events)
+        wake = next((w for w in wakes if w.wake_id == wake_id), None)
+        if wake is None:
+            return HTMLResponse("<span>(unknown wake)</span>")
+        summary = aggregators.summarize_wake(wake, run_summary) or ""
+        return templates.TemplateResponse(
+            request,
+            "_wake_summary_cell.html",
+            {"w": wake, "summary": summary},
+        )
+
     @app.get("/wakes/{wake_id}", response_class=HTMLResponse)
     async def wake_detail(request: Request, wake_id: str):
         from . import run_summary

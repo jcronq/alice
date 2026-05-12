@@ -1,0 +1,14 @@
+{# Wake-summary cell. When the summary is the "summarising…" placeholder
+   (Haiku call still pending in background), the rendered span polls
+   /api/wakes/<id>/summary every 3s and swaps itself in once the real
+   summary lands. The polling response (the "real" branch below) omits
+   hx attributes so polling stops naturally on the swap.
+   Required context: w (Wake), summary (str). #}
+{% if summary.startswith("summarising") %}
+<span class="wake-summary-pending"
+      hx-get="/api/wakes/{{ w.wake_id }}/summary"
+      hx-trigger="every 3s"
+      hx-swap="outerHTML">{{ summary }}</span>
+{% else %}
+<span>{{ summary }}</span>
+{% endif %}
