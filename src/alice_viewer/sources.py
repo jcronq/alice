@@ -807,14 +807,44 @@ def _research_dir(mind_dir: pathlib.Path) -> pathlib.Path:
     return mind_dir / "cortex-memory" / "research"
 
 
+def _research_paper_signal(fm: dict[str, str]) -> str | None:
+    """Return a short label naming why a research note belongs on canvas,
+    or ``None`` if it doesn't. Two paths:
+
+    - **explicit:** ``canvas_paper: true`` (or ``yes``/``1``,
+      case-insensitive) — the honest signal thinking sets when she
+      bypasses the runner and writes a canvas-shaped report.
+
+    - **auto-detected:** frontmatter ``tags`` contains the substring
+      ``experiment``, or ``note_type`` matches ``experiment`` /
+      ``evaluation`` / ``measurement`` / ``results``. Catches bypass
+      work she didn't remember to flag. Calibrated against the live
+      vault — picks up ~14 of 1,042 research notes, ~70% legit
+      experiment reports, the rest are design-around-experiment notes
+      that still belong on canvas because they reference real numbers.
+    """
+    explicit = (fm.get("canvas_paper") or "").strip().lower()
+    if explicit in ("true", "yes", "1"):
+        return "explicit-flag"
+    tags = (fm.get("tags") or "").lower()
+    if "experiment" in tags:
+        return "auto-tag"
+    note_type = (fm.get("note_type") or "").strip().lower()
+    if note_type in ("experiment", "evaluation", "measurement", "results"):
+        return "auto-note_type"
+    return None
+
+
 def _list_research_papers(
     mind_dir: pathlib.Path,
     skip_slugs: set[str],
 ) -> list[dict[str, Any]]:
-    """Scan ``cortex-memory/research/`` for notes carrying
-    ``canvas_paper: true`` in frontmatter. Returns the same entry shape
-    as ``list_canvases``. ``skip_slugs`` is the set of slugs already
-    claimed by the canvas/experiment scans — those win on collision.
+    """Scan ``cortex-memory/research/`` for notes that belong on the
+    canvas index. Two acceptance paths — see ``_research_paper_signal``.
+
+    Returns the same entry shape as ``list_canvases``. ``skip_slugs``
+    is the set of slugs already claimed by the canvas/experiment scans
+    — those win on collision.
     """
     rdir = _research_dir(mind_dir)
     if not rdir.is_dir():
@@ -833,9 +863,7 @@ def _list_research_papers(
         fm = _parse_frontmatter(text)
         if not fm:
             continue
-        # ``canvas_paper: true`` (or ``True``); strip whitespace.
-        flag = (fm.get("canvas_paper") or "").strip().lower()
-        if flag not in ("true", "yes", "1"):
+        if _research_paper_signal(fm) is None:
             continue
         try:
             stat = path.stat()
@@ -867,9 +895,10 @@ def _list_research_papers(
 def _find_research_paper(
     mind_dir: pathlib.Path, slug: str
 ) -> dict[str, Any] | None:
-    """Look up a single flagged research paper by slug. Mirrors
-    ``read_canvas`` but only returns notes that explicitly opted in
-    via ``canvas_paper: true``."""
+    """Look up a single canvas-eligible research paper by slug. Mirrors
+    ``read_canvas`` but only returns notes that pass
+    ``_research_paper_signal`` (explicit flag or auto-detected tag/
+    note_type)."""
     rdir = _research_dir(mind_dir)
     path = rdir / f"{slug}.md"
     try:
@@ -885,8 +914,7 @@ def _find_research_paper(
     fm = _parse_frontmatter(text)
     if not fm:
         return None
-    flag = (fm.get("canvas_paper") or "").strip().lower()
-    if flag not in ("true", "yes", "1"):
+    if _research_paper_signal(fm) is None:
         return None
     body = text
     title = slug

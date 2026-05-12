@@ -402,3 +402,74 @@ def test_canvas_wins_over_research_on_slug_collision(tmp_path):
     rows = [c for c in out if c["slug"] == "shared"]
     assert len(rows) == 1
     assert rows[0]["source"] == "canvas"
+
+
+# ---------------------------------------------------------------------------
+# Auto-detected research papers (tag / note_type signals, no explicit flag)
+
+
+def test_auto_detect_via_experiment_tag(tmp_path):
+    """``tags: [..., experiment, ...]`` should mark the note as
+    canvas-eligible even without ``canvas_paper: true``."""
+    p = _paths(tmp_path)
+    _make_research(
+        p,
+        "auto-by-tag",
+        "---\ntags: [research, retrieval, experiment, gcn]\n---\n# Auto by tag\n",
+    )
+    out = sources.list_canvases(p.inner, p.mind_dir)
+    rows = [c for c in out if c["source"] == "research"]
+    assert any(c["slug"] == "auto-by-tag" for c in rows)
+
+
+def test_auto_detect_via_note_type(tmp_path):
+    """``note_type: evaluation`` (or experiment/measurement/results)
+    should also pass the auto-detect filter."""
+    p = _paths(tmp_path)
+    for slug, t in [
+        ("nt-experiment", "experiment"),
+        ("nt-evaluation", "evaluation"),
+        ("nt-measurement", "measurement"),
+        ("nt-results", "results"),
+    ]:
+        _make_research(p, slug, f"---\nnote_type: {t}\n---\n# {slug}\n")
+    out = sources.list_canvases(p.inner, p.mind_dir)
+    research_slugs = {c["slug"] for c in out if c["source"] == "research"}
+    assert research_slugs >= {
+        "nt-experiment",
+        "nt-evaluation",
+        "nt-measurement",
+        "nt-results",
+    }
+
+
+def test_auto_detect_excludes_design_tag(tmp_path):
+    """Tag ``design`` alone (no ``experiment``) doesn't qualify."""
+    p = _paths(tmp_path)
+    _make_research(
+        p,
+        "just-design",
+        "---\ntags: [research, design, retrieval]\n---\n# Just design\n",
+    )
+    _make_research(
+        p,
+        "just-investigation",
+        "---\nnote_type: investigation\n---\n# Investigation\n",
+    )
+    out = sources.list_canvases(p.inner, p.mind_dir)
+    research_slugs = {c["slug"] for c in out if c["source"] == "research"}
+    assert "just-design" not in research_slugs
+    assert "just-investigation" not in research_slugs
+
+
+def test_read_auto_detected_paper(tmp_path):
+    p = _paths(tmp_path)
+    _make_research(
+        p,
+        "auto-readable",
+        "---\nnote_type: experiment\n---\n# Auto Readable\nbody\n",
+    )
+    out = sources.read_canvas(p.inner, "auto-readable", p.mind_dir)
+    assert out is not None
+    assert out["source"] == "research"
+    assert out["title"] == "Auto Readable"
