@@ -741,14 +741,16 @@ def create_app(paths: Paths | None = None) -> FastAPI:
                 status_code=404,
             )
         # Authored canvas decks → reveal.js slideshow.
-        # Auto-promoted experiment cards → plain markdown paper view.
-        # Reveal.js treats every standalone `---` as a slide break,
-        # which slices research-paper frontmatter into nonsense slides,
-        # so experiments get their own template.
+        # Everything else (experiment cards, auto-promoted research
+        # papers) → plain markdown paper view. Reveal.js treats every
+        # standalone `---` as a slide break, which slices research-paper
+        # frontmatter into nonsense slides, so only hand-authored canvas
+        # decks (where the author intentionally wrote slide separators)
+        # get the slideshow treatment.
         template = (
-            "canvas_paper.html"
-            if canvas.get("source") == "experiment"
-            else "canvas_view.html"
+            "canvas_view.html"
+            if canvas.get("source") == "canvas"
+            else "canvas_paper.html"
         )
         return templates.TemplateResponse(
             request,
