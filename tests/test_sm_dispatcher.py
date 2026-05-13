@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import subprocess
 
 import pytest
 
@@ -89,7 +90,11 @@ def test_empty_poll_writes_empty_state(state_path: pathlib.Path) -> None:
     # State file is written (empty), so the next run loads cleanly.
     assert state_path.is_file()
     data = json.loads(state_path.read_text())
-    assert data == {"version": sm.STATE_VERSION, "hello_commented": []}
+    assert data == {
+        "version": sm.STATE_VERSION,
+        "hello_commented": [],
+        "verify_failed_posted": [],
+    }
 
 
 def test_happy_path_posts_one_comment(state_path: pathlib.Path) -> None:
@@ -498,6 +503,8 @@ def test_t2_reviewing_merged_green_ci_transitions_to_done_and_closes(
         repo="jcronq/alice",
         state_path=state_path,
         enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
         list_issues=lambda repo: issues,
         post_comment=recorder,
         edit_labels=label_rec,
@@ -816,6 +823,8 @@ def test_reviewing_merged_pr_with_green_ci_transitions_to_done_via_real_finder(
         repo="jcronq/alice",
         state_path=state_path,
         enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
         list_issues=lambda repo: issues,
         post_comment=recorder,
         edit_labels=label_rec,
@@ -1967,3 +1976,999 @@ def test_sort_oldest_first_missing_created_at_sorts_last() -> None:
     ]
     ordered = sm._sort_oldest_first(payload)
     assert [i["number"] for i in ordered] == [3, 1, 2]
+
+
+# ---------------------------------------------------------------------------
+# Issue #127 — post-merge working-tree cleanup
+# ---------------------------------------------------------------------------
+
+
+class _FakeGit:
+    """Record each ``git`` invocation and return scripted CompletedProcess
+    results. Each script entry is a (returncode, stdout, stderr) tuple
+    keyed by the first positional argument (e.g. ``"status"``,
+    ``"checkout"``, ``"pull"``, ``"branch"``, ``"rev-parse"``).
+    """
+
+    def __init__(self, script: dict[str, tuple[int, str, str]]) -> None:
+        self.script = script
+        self.calls: list[tuple[list[str], pathlib.Path]] = []
+
+    def __call__(
+        self, args: list[str], cwd: pathlib.Path
+    ) -> "subprocess.CompletedProcess[str]":
+        self.calls.append((list(args), cwd))
+        verb = args[0] if args else ""
+        rc, stdout, stderr = self.script.get(verb, (0, "", ""))
+        return subprocess.CompletedProcess(
+            args=["git", *args], returncode=rc, stdout=stdout, stderr=stderr
+        )
+
+
+def test_post_merge_cleanup_happy_path_switches_pulls_deletes(
+    tmp_path: pathlib.Path,
+) -> None:
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    logged: list[str] = []
+    fake_git = _FakeGit(
+        {
+            "status": (0, "", ""),  # clean tree
+            "rev-parse": (0, "feat/foo-127\n", ""),
+            "checkout": (0, "Switched to branch 'master'\n", ""),
+            "pull": (0, "Already up to date.\n", ""),
+            "branch": (0, "Deleted branch feat/foo-127\n", ""),
+        }
+    )
+    sm._post_merge_cleanup(
+        repo_path=repo_path,
+        branch="feat/foo-127",
+        issue_number=127,
+        run_git=fake_git,
+        log=logged.append,
+    )
+    verbs = [c[0][0] for c in fake_git.calls]
+    assert verbs == ["status", "rev-parse", "checkout", "pull", "branch"]
+    assert fake_git.calls[2][0] == ["checkout", "master"]
+    assert fake_git.calls[3][0] == ["pull", "--ff-only", "origin", "master"]
+    assert fake_git.calls[4][0] == ["branch", "-d", "feat/foo-127"]
+    assert any("switched" in m for m in logged)
+    assert any("pulled origin/master" in m for m in logged)
+    assert any("deleted local branch 'feat/foo-127'" in m for m in logged)
+    # Audit-trail prefix on every line.
+    assert all(m.startswith("[SM] checkout #127") for m in logged)
+
+
+def test_post_merge_cleanup_already_on_master_skips_checkout(
+    tmp_path: pathlib.Path,
+) -> None:
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    logged: list[str] = []
+    fake_git = _FakeGit(
+        {
+            "status": (0, "", ""),
+            "rev-parse": (0, "master\n", ""),
+            "pull": (0, "", ""),
+        }
+    )
+    sm._post_merge_cleanup(
+        repo_path=repo_path,
+        branch=None,
+        issue_number=200,
+        run_git=fake_git,
+        log=logged.append,
+    )
+    verbs = [c[0][0] for c in fake_git.calls]
+    # No ``checkout`` (already on master), no ``branch -d`` (branch=None).
+    assert verbs == ["status", "rev-parse", "pull"]
+    assert any("already on master" in m for m in logged)
+
+
+def test_post_merge_cleanup_dirty_tree_skips_everything(
+    tmp_path: pathlib.Path,
+) -> None:
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    logged: list[str] = []
+    fake_git = _FakeGit(
+        {
+            "status": (0, " M src/dispatcher.py\n", ""),
+        }
+    )
+    sm._post_merge_cleanup(
+        repo_path=repo_path,
+        branch="feat/foo-127",
+        issue_number=127,
+        run_git=fake_git,
+        log=logged.append,
+    )
+    verbs = [c[0][0] for c in fake_git.calls]
+    # ``status`` runs to detect dirtiness; nothing else fires.
+    assert verbs == ["status"]
+    assert any("uncommitted changes" in m for m in logged)
+    assert any("operator should resolve" in m for m in logged)
+
+
+def test_post_merge_cleanup_local_branch_already_gone_is_logged_not_error(
+    tmp_path: pathlib.Path,
+) -> None:
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    logged: list[str] = []
+    fake_git = _FakeGit(
+        {
+            "status": (0, "", ""),
+            "rev-parse": (0, "master\n", ""),
+            "pull": (0, "", ""),
+            "branch": (1, "", "error: branch 'feat/foo-127' not found.\n"),
+        }
+    )
+    sm._post_merge_cleanup(
+        repo_path=repo_path,
+        branch="feat/foo-127",
+        issue_number=127,
+        run_git=fake_git,
+        log=logged.append,
+    )
+    assert any("already absent" in m for m in logged)
+    # No "failed" log line — already-absent is the idempotent case.
+    assert not any("failed" in m for m in logged)
+
+
+def test_post_merge_cleanup_pull_failure_is_logged_but_non_fatal(
+    tmp_path: pathlib.Path,
+) -> None:
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    logged: list[str] = []
+    fake_git = _FakeGit(
+        {
+            "status": (0, "", ""),
+            "rev-parse": (0, "feat/foo-127\n", ""),
+            "checkout": (0, "", ""),
+            "pull": (1, "", "fatal: Not possible to fast-forward, aborting.\n"),
+            "branch": (0, "Deleted branch feat/foo-127\n", ""),
+        }
+    )
+    sm._post_merge_cleanup(
+        repo_path=repo_path,
+        branch="feat/foo-127",
+        issue_number=127,
+        run_git=fake_git,
+        log=logged.append,
+    )
+    # Pull failure logged...
+    assert any("git pull --ff-only origin master failed" in m for m in logged)
+    # ...but the branch delete still ran (pull failure is non-fatal).
+    verbs = [c[0][0] for c in fake_git.calls]
+    assert "branch" in verbs
+
+
+def test_post_merge_cleanup_repo_path_missing_skips(
+    tmp_path: pathlib.Path,
+) -> None:
+    missing = tmp_path / "does-not-exist"
+    logged: list[str] = []
+
+    def boom(_args: list[str], _cwd: pathlib.Path) -> None:
+        raise AssertionError("run_git must not be called when repo_path is missing")
+
+    sm._post_merge_cleanup(
+        repo_path=missing,
+        branch="feat/foo-127",
+        issue_number=127,
+        run_git=boom,  # type: ignore[arg-type]
+        log=logged.append,
+    )
+    assert any("repo path missing" in m for m in logged)
+
+
+def test_reviewing_done_transition_invokes_cleanup_with_branch(
+    state_path: pathlib.Path,
+) -> None:
+    """T2 reviewing→done must call post_merge_cleanup with the PR's head branch."""
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    issues = [_make_issue(127, sm_labels=("sm:reviewing",))]
+    cleanup_calls: list[tuple[str | None, int]] = []
+
+    def find_pr(_repo: str, _n: int) -> dict | None:
+        return {"number": 250, "url": "https://example/pr/250"}
+
+    def merge_status(_repo: str, _pr: int) -> dict:
+        return {
+            "merged": True,
+            "merge_commit_oid": "deadbeefcafe",
+            "pr_url": "https://example/pr/250",
+            "head_ref_name": "feat/sm-checkout-127",
+        }
+
+    def ci(_repo: str, _sha: str) -> dict:
+        return {"conclusion": "success", "run_url": "https://example/ci"}
+
+    def cleanup(branch: str | None, issue_number: int) -> None:
+        cleanup_calls.append((branch, issue_number))
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=ci,
+        post_merge_cleanup=cleanup,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert cleanup_calls == [("feat/sm-checkout-127", 127)]
+    assert report.cleaned_up == 1
+    assert report.transitioned == 1
+
+
+def test_reviewing_ci_red_does_not_invoke_cleanup(
+    state_path: pathlib.Path,
+) -> None:
+    """CI red → building. Tree is NOT touched (Issue #127 scope)."""
+    issues = [_make_issue(128, sm_labels=("sm:reviewing",))]
+
+    def find_pr(_repo: str, _n: int) -> dict | None:
+        return {"number": 251, "url": "https://example/pr/251"}
+
+    def merge_status(_repo: str, _pr: int) -> dict:
+        return {
+            "merged": True,
+            "merge_commit_oid": "deadbeef",
+            "pr_url": "https://example/pr/251",
+            "head_ref_name": "feat/red-128",
+        }
+
+    def ci(_repo: str, _sha: str) -> dict:
+        return {"conclusion": "failure", "run_url": "https://example/ci/red"}
+
+    def boom(_b: str | None, _n: int) -> None:
+        raise AssertionError("cleanup must not run on CI-red path")
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: issues,
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=ci,
+        post_merge_cleanup=boom,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.cleaned_up == 0
+
+
+def test_reviewing_pr_unmerged_does_not_invoke_cleanup(
+    state_path: pathlib.Path,
+) -> None:
+    """PR closed-unmerged → stays at reviewing; cleanup never fires.
+
+    The issue body explicitly carves this out: "keep the work for
+    inspection" — we don't restore master if the PR didn't merge.
+    """
+    issues = [_make_issue(129, sm_labels=("sm:reviewing",))]
+
+    def find_pr(_repo: str, _n: int) -> dict | None:
+        return {"number": 252, "url": "https://example/pr/252"}
+
+    def merge_status(_repo: str, _pr: int) -> dict:
+        return {
+            "merged": False,
+            "merge_commit_oid": None,
+            "pr_url": None,
+            "head_ref_name": None,
+        }
+
+    def boom(_b: str | None, _n: int) -> None:
+        raise AssertionError("cleanup must not run on unmerged PR")
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: issues,
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=lambda *_a, **_k: {"conclusion": None, "run_url": None},
+        post_merge_cleanup=boom,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.cleaned_up == 0
+
+
+def test_reviewing_done_cleanup_exception_is_swallowed(
+    state_path: pathlib.Path,
+) -> None:
+    """A cleanup blow-up must not crash the dispatcher pass — the GH
+    transition has already succeeded and we don't want to corrupt the
+    audit trail on a tree-cleanup hiccup."""
+    issues = [_make_issue(130, sm_labels=("sm:reviewing",))]
+    logged: list[str] = []
+
+    def find_pr(_repo: str, _n: int) -> dict | None:
+        return {"number": 253, "url": "https://example/pr/253"}
+
+    def merge_status(_repo: str, _pr: int) -> dict:
+        return {
+            "merged": True,
+            "merge_commit_oid": "abc",
+            "pr_url": "https://example/pr/253",
+            "head_ref_name": "feat/x-130",
+        }
+
+    def ci(_repo: str, _sha: str) -> dict:
+        return {"conclusion": "success", "run_url": "https://example/ci/g"}
+
+    def cleanup(_b: str | None, _n: int) -> None:
+        raise RuntimeError("disk full")
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=ci,
+        post_merge_cleanup=cleanup,
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    # Transition still counted (we did close the issue on GH).
+    assert report.transitioned == 1
+    # Cleanup NOT counted as a success.
+    assert report.cleaned_up == 0
+    assert any("post-merge cleanup raised" in m for m in logged)
+
+
+def test_gh_get_pr_merge_status_extracts_head_ref_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The PR-merge-status helper now returns ``head_ref_name`` so the
+    cleanup helper knows which local branch to delete."""
+
+    def fake_run_gh(args: list[str], *, timeout: int = 60) -> str:
+        # Must request headRefName in the json field selector
+        # (single comma-separated arg after ``--json``).
+        json_idx = args.index("--json")
+        assert "headRefName" in args[json_idx + 1].split(",")
+        return json.dumps(
+            {
+                "state": "MERGED",
+                "mergeCommit": {"oid": "abc123"},
+                "url": "https://example/pr/9",
+                "headRefName": "feat/x-9",
+            }
+        )
+
+    monkeypatch.setattr(sm, "_run_gh", fake_run_gh)
+    out = sm.gh_get_pr_merge_status("jcronq/alice", 9)
+    assert out == {
+        "merged": True,
+        "merge_commit_oid": "abc123",
+        "pr_url": "https://example/pr/9",
+        "head_ref_name": "feat/x-9",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Issue #128 — sm:reviewing → sm:done verification gate
+# ---------------------------------------------------------------------------
+
+
+def _ci_green(_repo: str, _sha: str) -> dict:
+    return {"conclusion": "success", "run_url": "https://example/ci/green"}
+
+
+def _merge_status_merged(_repo: str, _pr: int) -> dict:
+    return {
+        "merged": True,
+        "merge_commit_oid": "abc12345",
+        "pr_url": "https://example/pr/200",
+        "head_ref_name": "feat/x",
+    }
+
+
+def _find_pr_200(_repo: str, _n: int) -> dict | None:
+    return {
+        "number": 200,
+        "url": "https://example/pr/200",
+        "state": "MERGED",
+    }
+
+
+def test_verify_viewer_route_pass_passes_through(state_path: pathlib.Path) -> None:
+    """A merged-green PR that touches viewer code AND probes successfully
+    transitions to sm:done with both verify-pass and transition audit
+    comments."""
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    issues = [_make_issue(200, sm_labels=("sm:reviewing",))]
+
+    def pr_files(_repo: str, _n: int) -> list[str]:
+        return ["src/alice_viewer/main.py", "tests/test_viewer_x.py"]
+
+    def verifier(pr_number: int, files: list[str]) -> dict:
+        assert pr_number == 200
+        assert "src/alice_viewer/main.py" in files
+        return {
+            "outcome": "pass",
+            "reason": "viewer marker present",
+            "route": "http://localhost:7777/",
+        }
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        list_issues=lambda repo: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=_find_pr_200,
+        pr_merge_status=_merge_status_merged,
+        master_ci_status=_ci_green,
+        pr_files=pr_files,
+        verify_pr=verifier,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.verify_pass == 1
+    assert report.verify_skip == 0
+    assert report.verify_failed == 0
+    assert report.transitioned == 1
+    # Issue closed and relabeled.
+    assert close_rec.closed == [("jcronq/alice", 200)]
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:done"]
+    assert edit["remove"] == ["sm:reviewing"]
+    bodies = [body for _r, _n, body in recorder.posted]
+    assert any(
+        b.startswith("[SM] verify-pass task=#200 route=http://localhost:7777/")
+        for b in bodies
+    )
+    assert any(
+        '[SM] transition from=reviewing to=done' in b for b in bodies
+    )
+    # verify-pass should be posted BEFORE the transition comment so the
+    # audit trail reads in causal order.
+    pass_idx = next(
+        i for i, (_r, _n, b) in enumerate(recorder.posted)
+        if b.startswith("[SM] verify-pass")
+    )
+    trans_idx = next(
+        i for i, (_r, _n, b) in enumerate(recorder.posted)
+        if "[SM] transition from=reviewing to=done" in b
+    )
+    assert pass_idx < trans_idx
+
+
+def test_verify_skip_when_no_viewer_files_still_transitions(
+    state_path: pathlib.Path,
+) -> None:
+    """A merged-green PR with no viewer touches gets verify-skip + still
+    transitions to sm:done. The audit trail records that no recipe
+    matched."""
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    issues = [_make_issue(201, sm_labels=("sm:reviewing",))]
+
+    def pr_files(_repo: str, _n: int) -> list[str]:
+        return ["src/alice_sm/dispatcher.py", "tests/test_sm_dispatcher.py"]
+
+    # Verifier returns skip — its decision, not the dispatcher's.
+    def verifier(_pr: int, _files: list[str]) -> dict:
+        return {
+            "outcome": "skip",
+            "reason": "no verification recipe matched",
+            "route": None,
+        }
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        list_issues=lambda repo: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=_find_pr_200,
+        pr_merge_status=_merge_status_merged,
+        master_ci_status=_ci_green,
+        pr_files=pr_files,
+        verify_pr=verifier,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.verify_skip == 1
+    assert report.verify_pass == 0
+    assert report.verify_failed == 0
+    assert report.transitioned == 1
+    assert close_rec.closed == [("jcronq/alice", 201)]
+    bodies = [body for _r, _n, body in recorder.posted]
+    assert any(b.startswith("[SM] verify-skip task=#201") for b in bodies)
+
+
+def test_verify_failed_halts_at_reviewing(state_path: pathlib.Path) -> None:
+    """Verifier returns fail — issue stays at sm:reviewing, no label edit,
+    no close, verify-failed comment posted."""
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    issues = [_make_issue(202, sm_labels=("sm:reviewing",))]
+
+    def pr_files(_repo: str, _n: int) -> list[str]:
+        return ["src/alice_viewer/main.py"]
+
+    def verifier(_pr: int, _files: list[str]) -> dict:
+        return {
+            "outcome": "fail",
+            "reason": "viewer probe HTTP 502",
+            "route": "http://localhost:7777/",
+        }
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        list_issues=lambda repo: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=_find_pr_200,
+        pr_merge_status=_merge_status_merged,
+        master_ci_status=_ci_green,
+        pr_files=pr_files,
+        verify_pr=verifier,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # No transition, no close, no relabel.
+    assert report.transitioned == 0
+    assert close_rec.closed == []
+    assert label_rec.calls == []
+    # Verify-failed counted + comment posted.
+    assert report.verify_failed == 1
+    bodies = [body for _r, _n, body in recorder.posted]
+    failed = [b for b in bodies if b.startswith("[SM] verify-failed task=#202")]
+    assert len(failed) == 1
+    assert 'reason="viewer probe HTTP 502"' in failed[0]
+    # State persisted the dedup entry.
+    persisted = json.loads(state_path.read_text())
+    assert persisted["verify_failed_posted"] == [202]
+
+
+def test_verify_failed_dedup_does_not_spam(state_path: pathlib.Path) -> None:
+    """Second cadence on the same failing issue must NOT re-post the
+    verify-failed comment — state-backed dedup."""
+    issues = [_make_issue(203, sm_labels=("sm:reviewing",))]
+
+    def pr_files(_repo: str, _n: int) -> list[str]:
+        return ["src/alice_viewer/main.py"]
+
+    def verifier(_pr: int, _files: list[str]) -> dict:
+        return {"outcome": "fail", "reason": "viewer probe timeout", "route": None}
+
+    # Pass 1: posts.
+    recorder1 = Recorder()
+    sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        list_issues=lambda r: issues,
+        post_comment=recorder1,
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_find_pr_200,
+        pr_merge_status=_merge_status_merged,
+        master_ci_status=_ci_green,
+        pr_files=pr_files,
+        verify_pr=verifier,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+    assert any(
+        b.startswith("[SM] verify-failed") for _r, _n, b in recorder1.posted
+    )
+
+    # Pass 2: must not re-post.
+    recorder2 = Recorder()
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        list_issues=lambda r: issues,
+        post_comment=recorder2,
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_find_pr_200,
+        pr_merge_status=_merge_status_merged,
+        master_ci_status=_ci_green,
+        pr_files=pr_files,
+        verify_pr=verifier,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    failed_bodies = [
+        b for _r, _n, b in recorder2.posted if b.startswith("[SM] verify-failed")
+    ]
+    assert failed_bodies == []
+    # Counter still increments — we did evaluate the verifier — but no
+    # comment hit the wire. This is the "we know it's still broken,
+    # waiting for Jason" cadence.
+    assert report.verify_failed == 1
+
+
+def test_verifier_exception_treated_as_failed(state_path: pathlib.Path) -> None:
+    """A verifier that raises must NOT crash the dispatcher; it gets
+    converted to a verify-failed outcome with the exception in the
+    reason."""
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    issues = [_make_issue(204, sm_labels=("sm:reviewing",))]
+
+    def pr_files(_repo: str, _n: int) -> list[str]:
+        return ["src/alice_viewer/main.py"]
+
+    def verifier(_pr: int, _files: list[str]) -> dict:
+        raise RuntimeError("network on fire")
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        list_issues=lambda r: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=_find_pr_200,
+        pr_merge_status=_merge_status_merged,
+        master_ci_status=_ci_green,
+        pr_files=pr_files,
+        verify_pr=verifier,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.verify_failed == 1
+    assert report.transitioned == 0
+    assert close_rec.closed == []
+    bodies = [b for _r, _n, b in recorder.posted]
+    assert any(
+        b.startswith("[SM] verify-failed") and "network on fire" in b for b in bodies
+    )
+
+
+def test_verify_disabled_via_kwarg_skips_gate(state_path: pathlib.Path) -> None:
+    """``enable_verify=False`` reverts to pre-#128 behavior: CI-green
+    leads straight to sm:done with NO verify-* audit comment."""
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    issues = [_make_issue(205, sm_labels=("sm:reviewing",))]
+
+    # If the verifier or pr_files were called we'd see it — leave the
+    # production helpers wired in but flip the kill switch and assert
+    # neither runs.
+    sentinel: list[str] = []
+
+    def pr_files(_repo: str, _n: int) -> list[str]:
+        sentinel.append("pr_files")
+        return ["src/alice_viewer/main.py"]
+
+    def verifier(_pr: int, _files: list[str]) -> dict:
+        sentinel.append("verifier")
+        return {"outcome": "fail", "reason": "should not run", "route": None}
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda r: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=_find_pr_200,
+        pr_merge_status=_merge_status_merged,
+        master_ci_status=_ci_green,
+        pr_files=pr_files,
+        verify_pr=verifier,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert sentinel == []
+    assert report.transitioned == 1
+    assert close_rec.closed == [("jcronq/alice", 205)]
+    bodies = [b for _r, _n, b in recorder.posted]
+    assert not any(b.startswith("[SM] verify-") for b in bodies)
+
+
+def test_verify_recovery_clears_state_ledger(state_path: pathlib.Path) -> None:
+    """Once the verifier flips back to pass, the verify_failed_posted
+    ledger entry for that issue is cleared, so a future re-failure on
+    the same issue (e.g. CI red → re-green → fail again) gets a fresh
+    comment."""
+    issues = [_make_issue(206, sm_labels=("sm:reviewing",))]
+    outcomes = iter([
+        {"outcome": "fail", "reason": "first fail", "route": "http://x/"},
+        {"outcome": "pass", "reason": "recovered", "route": "http://x/"},
+    ])
+
+    def pr_files(_repo: str, _n: int) -> list[str]:
+        return ["src/alice_viewer/main.py"]
+
+    def verifier(_pr: int, _files: list[str]) -> dict:
+        return next(outcomes)
+
+    # Pass 1: fail → ledger populated.
+    sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        list_issues=lambda r: issues,
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_find_pr_200,
+        pr_merge_status=_merge_status_merged,
+        master_ci_status=_ci_green,
+        pr_files=pr_files,
+        verify_pr=verifier,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+    assert json.loads(state_path.read_text())["verify_failed_posted"] == [206]
+
+    # Pass 2: recovers → ledger cleared, issue transitions.
+    close2 = CloseRecorder()
+    sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        list_issues=lambda r: issues,
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        close_issue=close2,
+        find_linked_pr=_find_pr_200,
+        pr_merge_status=_merge_status_merged,
+        master_ci_status=_ci_green,
+        pr_files=pr_files,
+        verify_pr=verifier,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+    assert close2.closed == [("jcronq/alice", 206)]
+    assert json.loads(state_path.read_text())["verify_failed_posted"] == []
+
+
+def test_verify_viewer_route_marker_missing_is_fail() -> None:
+    """The viewer-route smoke test fails when the response body doesn't
+    contain the marker substring, even with a 200 status."""
+
+    def fake_get(_url: str) -> tuple[int, str]:
+        return 200, "<html><body>oops, wrong page</body>"
+
+    verdict = sm.verify_viewer_route(
+        url="http://x/", marker="</html>", http_get=fake_get
+    )
+    assert verdict["outcome"] == "fail"
+    assert "marker" in verdict["reason"]
+    assert verdict["route"] == "http://x/"
+
+
+def test_verify_viewer_route_marker_present_is_pass() -> None:
+    def fake_get(_url: str) -> tuple[int, str]:
+        return 200, "<html><body>ok</body></html>"
+
+    verdict = sm.verify_viewer_route(
+        url="http://x/", marker="</html>", http_get=fake_get
+    )
+    assert verdict["outcome"] == "pass"
+    assert verdict["route"] == "http://x/"
+
+
+def test_verify_viewer_route_http_500_is_fail() -> None:
+    def fake_get(_url: str) -> tuple[int, str]:
+        return 500, "Internal Server Error"
+
+    verdict = sm.verify_viewer_route(
+        url="http://x/", marker="</html>", http_get=fake_get
+    )
+    assert verdict["outcome"] == "fail"
+    assert "HTTP 500" in verdict["reason"]
+
+
+def test_verify_viewer_route_connection_refused_is_fail() -> None:
+    import urllib.error
+
+    def fake_get(_url: str) -> tuple[int, str]:
+        raise urllib.error.URLError("Connection refused")
+
+    verdict = sm.verify_viewer_route(
+        url="http://x/", marker="</html>", http_get=fake_get
+    )
+    assert verdict["outcome"] == "fail"
+    assert "viewer probe failed" in verdict["reason"]
+
+
+def test_default_verifier_skips_when_no_viewer_files() -> None:
+    verdict = sm.default_verifier(
+        99,
+        ["src/alice_sm/dispatcher.py"],
+        viewer_url="http://unused/",
+        viewer_marker="</html>",
+        http_get=lambda _u: (_ for _ in ()).throw(AssertionError("must not call")),
+    )
+    assert verdict["outcome"] == "skip"
+    assert verdict["route"] is None
+
+
+def test_default_verifier_runs_recipe_when_viewer_files_present() -> None:
+    called: list[str] = []
+
+    def fake_get(url: str) -> tuple[int, str]:
+        called.append(url)
+        return 200, "<html>ok</html>"
+
+    verdict = sm.default_verifier(
+        99,
+        ["src/alice_viewer/templates/timeline.html"],
+        viewer_url="http://probe/",
+        viewer_marker="</html>",
+        http_get=fake_get,
+    )
+    assert verdict["outcome"] == "pass"
+    assert called == ["http://probe/"]
+
+
+def test_verify_env_kill_switch_disables_default_verifier(
+    state_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ALICE_VERIFY_ENABLED=0`` reverts to pre-#128 behavior even when
+    the caller didn't pass ``enable_verify=False`` (operational
+    kill-switch the dispatcher checks each pass)."""
+    monkeypatch.setenv(sm.VERIFY_ENABLED_ENV, "0")
+
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    issues = [_make_issue(207, sm_labels=("sm:reviewing",))]
+    sentinel: list[str] = []
+
+    def pr_files(_repo: str, _n: int) -> list[str]:
+        sentinel.append("pr_files")
+        return ["src/alice_viewer/main.py"]
+
+    def verifier(_pr: int, _files: list[str]) -> dict:
+        sentinel.append("verifier")
+        return {"outcome": "fail", "reason": "x", "route": None}
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        list_issues=lambda r: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=_find_pr_200,
+        pr_merge_status=_merge_status_merged,
+        master_ci_status=_ci_green,
+        pr_files=pr_files,
+        verify_pr=verifier,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert sentinel == []  # neither helper ran
+    assert report.transitioned == 1
+    assert close_rec.closed == [("jcronq/alice", 207)]
+
+
+def test_render_verify_comment_shapes() -> None:
+    ts = "2026-05-12T12:00:00+00:00"
+    assert (
+        sm.render_verify_comment("pass", 1, route="http://x/", timestamp=ts)
+        == "[SM] verify-pass task=#1 route=http://x/ ts=2026-05-12T12:00:00+00:00"
+    )
+    assert (
+        sm.render_verify_comment("skip", 2, reason="no recipe", timestamp=ts)
+        == '[SM] verify-skip task=#2 reason="no recipe" '
+           "ts=2026-05-12T12:00:00+00:00"
+    )
+    assert (
+        sm.render_verify_comment("failed", 3, reason="500", timestamp=ts)
+        == '[SM] verify-failed task=#3 reason="500" '
+           "ts=2026-05-12T12:00:00+00:00"
+    )
+
+
+def test_dispatcher_state_carries_verify_failed_field_across_load_save(
+    state_path: pathlib.Path,
+) -> None:
+    """Forward-compatible state file: missing ``verify_failed_posted``
+    key in an older file loads as empty; new key persists on save."""
+    state_path.write_text(
+        json.dumps({"version": sm.STATE_VERSION, "hello_commented": [1, 2]})
+    )
+    loaded = sm.load_state(state_path)
+    assert loaded.hello_commented == [1, 2]
+    assert loaded.verify_failed_posted == []
+
+    loaded.mark_verify_failed(42)
+    sm.save_state(state_path, loaded)
+    on_disk = json.loads(state_path.read_text())
+    assert on_disk["verify_failed_posted"] == [42]
+    assert on_disk["hello_commented"] == [1, 2]
+
+
+def test_gh_get_pr_files_parses_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run_gh(args: list[str], *, timeout: int = 60) -> str:
+        assert "files" in args[args.index("--json") + 1].split(",")
+        return json.dumps({
+            "files": [
+                {"path": "src/alice_viewer/main.py"},
+                {"path": "tests/test_x.py"},
+            ]
+        })
+
+    monkeypatch.setattr(sm, "_run_gh", fake_run_gh)
+    out = sm.gh_get_pr_files("jcronq/alice", 200)
+    assert out == ["src/alice_viewer/main.py", "tests/test_x.py"]

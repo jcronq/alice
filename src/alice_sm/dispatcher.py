@@ -51,6 +51,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
@@ -237,6 +239,68 @@ SPAWN_STARTED_PREFIX = "[SM] spawn-started"
 
 
 # ---------------------------------------------------------------------------
+# Issue #128 — sm:reviewing → sm:done verification (smoke-test) gate
+# ---------------------------------------------------------------------------
+#
+# After CI is green on the merge commit but before we relabel the issue
+# sm:done, run an artifact-specific smoke test. CI catches regressions
+# inside the source tree; this third tier confirms the actually-running
+# system reflects the change (the canonical motivating bug: PR #119
+# merged green, but the live viewer process was still serving stale
+# Python — only a real HTTP probe would have caught it).
+#
+# v1 (this issue's minimal cut) only ships the *viewer-route* recipe:
+# if the merged PR touched any file under ``src/alice_viewer/``, the
+# dispatcher GETs a configured URL on the running viewer and asserts
+# a marker substring is present in the response body. Anything else
+# (dispatcher touches, speaking touches, art:research_note, ...) is
+# treated as ``verify-skip`` — recorded in the audit comment but
+# allowed through to ``sm:done``. The shape extends to more recipes
+# without changing the dispatcher control flow.
+
+VERIFY_PASS_PREFIX = "[SM] verify-pass"
+VERIFY_SKIP_PREFIX = "[SM] verify-skip"
+VERIFY_FAILED_PREFIX = "[SM] verify-failed"
+
+# Path prefix that flags a PR file as a "viewer touch" — anything under
+# the alice_viewer package, including templates and static assets. Kept
+# narrow so dispatcher / speaking / sm changes don't accidentally
+# trigger the viewer probe.
+VERIFY_VIEWER_PATH_PREFIX = "src/alice_viewer/"
+
+# Default URL hit by the viewer-route smoke test. Override with
+# ``ALICE_VERIFY_VIEWER_URL``. The path is intentionally the index —
+# v1 only needs to confirm the FastAPI process is alive and serving
+# *some* response with the marker; per-route assertions are a follow-up.
+VERIFY_VIEWER_URL_ENV = "ALICE_VERIFY_VIEWER_URL"
+VERIFY_VIEWER_URL_DEFAULT = "http://localhost:7777/"
+
+# Substring asserted in the viewer response body. Override with
+# ``ALICE_VERIFY_VIEWER_MARKER``. ``</html>`` is the cheapest
+# "rendered a template, didn't 500" signal short of parsing HTML.
+VERIFY_VIEWER_MARKER_ENV = "ALICE_VERIFY_VIEWER_MARKER"
+VERIFY_VIEWER_MARKER_DEFAULT = "</html>"
+
+# HTTP timeout for the viewer probe. Short so a wedged viewer doesn't
+# stall the whole dispatcher pass.
+VERIFY_HTTP_TIMEOUT_SECONDS = 5
+
+# Master kill-switch. ``ALICE_VERIFY_ENABLED=0`` reverts the dispatcher
+# to pre-#128 behavior — straight from CI-green to ``sm:done`` with no
+# smoke test. Defaults to enabled.
+VERIFY_ENABLED_ENV = "ALICE_VERIFY_ENABLED"
+
+# Shared working tree on the worker — all v1 workers checkout into this
+# one repo. Issue #127: after a PR merges, the dispatcher restores this
+# tree to ``BASE_BRANCH`` so the next cycle reads master and not the
+# departing worker's feature branch. If we move to per-worker worktrees
+# in a later phase, cleanup migrates with the worker's lifecycle and
+# this constant becomes per-spawn config.
+WORKER_REPO_PATH = pathlib.Path("/home/alice/alice")
+BASE_BRANCH = "master"
+
+
+# ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
 
@@ -295,10 +359,18 @@ class DispatcherState:
     ``hello_commented`` is the FIFO list of issue numbers we've already
     posted the dispatcher-hello on. Insertion-ordered so the oldest
     fall off first when we hit :data:`SEEN_ISSUE_CAP`.
+
+    ``verify_failed_posted`` (issue #128) is the FIFO list of issue
+    numbers we've already posted a ``[SM] verify-failed`` comment on
+    while the issue remained at ``sm:reviewing``. Without this dedup,
+    every dispatcher cadence would re-post the failure (CI stays green
+    on the same merge commit, so the verifier keeps running). Cleared
+    implicitly when the issue eventually transitions out of reviewing.
     """
 
     version: int = STATE_VERSION
     hello_commented: list[int] = field(default_factory=list)
+    verify_failed_posted: list[int] = field(default_factory=list)
 
     def has_hello(self, number: int) -> bool:
         return number in self.hello_commented
@@ -313,10 +385,32 @@ class DispatcherState:
             overflow = len(self.hello_commented) - SEEN_ISSUE_CAP
             del self.hello_commented[:overflow]
 
+    def has_verify_failed(self, number: int) -> bool:
+        return number in self.verify_failed_posted
+
+    def mark_verify_failed(self, number: int) -> None:
+        if number in self.verify_failed_posted:
+            return
+        self.verify_failed_posted.append(number)
+        if len(self.verify_failed_posted) > SEEN_ISSUE_CAP:
+            overflow = len(self.verify_failed_posted) - SEEN_ISSUE_CAP
+            del self.verify_failed_posted[:overflow]
+
+    def clear_verify_failed(self, number: int) -> None:
+        # Called when the issue transitions out of sm:reviewing — the
+        # dedup signal is scoped to "still pending verification on this
+        # merge". Once the label changes (to done after a retry pass,
+        # or to building if CI flips red), the ledger entry is stale.
+        try:
+            self.verify_failed_posted.remove(number)
+        except ValueError:
+            pass
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": self.version,
             "hello_commented": list(self.hello_commented),
+            "verify_failed_posted": list(self.verify_failed_posted),
         }
 
 
@@ -339,7 +433,16 @@ def load_state(state_path: pathlib.Path) -> DispatcherState:
         return DispatcherState()
     raw = data.get("hello_commented") or []
     numbers: list[int] = [int(n) for n in raw if isinstance(n, int)]
-    return DispatcherState(version=STATE_VERSION, hello_commented=numbers)
+    # ``verify_failed_posted`` was added in #128. Older state files
+    # don't have the field; default to empty so the dispatcher keeps
+    # working across the upgrade without a manual reset.
+    raw_vf = data.get("verify_failed_posted") or []
+    vf_numbers: list[int] = [int(n) for n in raw_vf if isinstance(n, int)]
+    return DispatcherState(
+        version=STATE_VERSION,
+        hello_commented=numbers,
+        verify_failed_posted=vf_numbers,
+    )
 
 
 def save_state(state_path: pathlib.Path, state: DispatcherState) -> None:
@@ -347,6 +450,9 @@ def save_state(state_path: pathlib.Path, state: DispatcherState) -> None:
     if len(state.hello_commented) > SEEN_ISSUE_CAP:
         overflow = len(state.hello_commented) - SEEN_ISSUE_CAP
         del state.hello_commented[:overflow]
+    if len(state.verify_failed_posted) > SEEN_ISSUE_CAP:
+        overflow = len(state.verify_failed_posted) - SEEN_ISSUE_CAP
+        del state.verify_failed_posted[:overflow]
     state_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(
         dir=state_path.parent, prefix=".sm-dispatcher-", suffix=".json"
@@ -708,7 +814,13 @@ def gh_find_linked_pr(
 def gh_get_pr_merge_status(
     repo: str, pr_number: int, *, gh_bin: str = "gh"
 ) -> dict[str, Any]:
-    """Return ``{merged, merge_commit_oid, pr_url}`` for a PR."""
+    """Return ``{merged, merge_commit_oid, pr_url, head_ref_name}`` for a PR.
+
+    ``head_ref_name`` is the source branch (the worker's feature branch
+    for SM-spawned PRs) — Issue #127 uses it to delete the merged local
+    branch during post-merge cleanup. ``None`` if the gh payload didn't
+    return it (defensive against schema drift).
+    """
     args = [
         gh_bin,
         "pr",
@@ -717,20 +829,28 @@ def gh_get_pr_merge_status(
         "--repo",
         repo,
         "--json",
-        "state,mergeCommit,url",
+        "state,mergeCommit,url,headRefName",
     ]
     stdout = _run_gh(args)
+    empty = {
+        "merged": False,
+        "merge_commit_oid": None,
+        "pr_url": None,
+        "head_ref_name": None,
+    }
     if not stdout.strip():
-        return {"merged": False, "merge_commit_oid": None, "pr_url": None}
+        return empty
     payload = json.loads(stdout)
     if not isinstance(payload, dict):
-        return {"merged": False, "merge_commit_oid": None, "pr_url": None}
+        return empty
     merge_commit = payload.get("mergeCommit") or {}
     oid = merge_commit.get("oid") if isinstance(merge_commit, dict) else None
+    head_ref = payload.get("headRefName")
     return {
         "merged": payload.get("state") == "MERGED",
         "merge_commit_oid": oid,
         "pr_url": payload.get("url"),
+        "head_ref_name": head_ref if isinstance(head_ref, str) and head_ref else None,
     }
 
 
@@ -795,6 +915,46 @@ def gh_get_master_ci_status(
     return {"conclusion": "success", "run_url": first_url}
 
 
+def gh_get_pr_files(
+    repo: str, pr_number: int, *, gh_bin: str = "gh"
+) -> list[str]:
+    """Return the list of file paths changed by a PR.
+
+    Used by the issue #128 verification step to decide whether the
+    viewer-route smoke test applies (any path under
+    ``src/alice_viewer/`` flips the recipe on). An empty list on a
+    successful call is legal (a PR with only renames-as-deletes is
+    unusual but not impossible); the verifier treats empty as "no
+    viewer touch → skip", which is the safe default.
+    """
+    args = [
+        gh_bin,
+        "pr",
+        "view",
+        str(pr_number),
+        "--repo",
+        repo,
+        "--json",
+        "files",
+    ]
+    stdout = _run_gh(args)
+    if not stdout.strip():
+        return []
+    payload = json.loads(stdout)
+    if not isinstance(payload, dict):
+        return []
+    raw = payload.get("files") or []
+    if not isinstance(raw, list):
+        return []
+    paths: list[str] = []
+    for entry in raw:
+        if isinstance(entry, dict):
+            p = entry.get("path")
+            if isinstance(p, str):
+                paths.append(p)
+    return paths
+
+
 # Callable aliases — tests inject fakes here without monkeypatching the
 # module-level names.
 ListIssuesFn = Callable[[str], list[dict[str, Any]]]
@@ -806,6 +966,155 @@ PRMergeStatusFn = Callable[[str, int], dict[str, Any]]
 MasterCIStatusFn = Callable[[str, str], dict[str, Any]]
 ListCommentsFn = Callable[[str, int], list[dict[str, Any]]]
 FindUnspawnedFn = Callable[[str], list[dict[str, Any]]]
+PRFilesFn = Callable[[str, int], list[str]]
+# Verifier contract: takes a PR number + the list of files it changed,
+# returns a verdict dict ``{outcome, reason, route}``. ``outcome`` is
+# one of ``"pass"`` / ``"skip"`` / ``"fail"`` — corresponding to the
+# three audit comment shapes. ``route`` is the URL hit on pass / fail
+# (None on skip).
+VerifyFn = Callable[[int, list[str]], dict[str, Any]]
+# (cmd_args, cwd) → CompletedProcess. ``cmd_args`` is the trailing
+# argv (no leading ``git``); ``cwd`` is the repo to operate in. Tests
+# inject a fake to avoid touching the real working tree.
+GitRunFn = Callable[[list[str], pathlib.Path], "subprocess.CompletedProcess[str]"]
+PostMergeCleanupFn = Callable[[str | None, int], None]
+
+
+# ---------------------------------------------------------------------------
+# Issue #127 — post-merge working-tree cleanup
+# ---------------------------------------------------------------------------
+
+
+def _run_git(
+    args: list[str],
+    cwd: pathlib.Path,
+    *,
+    timeout: int = 30,
+) -> "subprocess.CompletedProcess[str]":
+    """Invoke ``git -C <cwd> <args...>`` and return the CompletedProcess.
+
+    Never raises on non-zero exit — callers inspect ``returncode`` /
+    ``stderr`` and decide whether to log+continue or bail. Wraps
+    ``OSError`` / ``TimeoutExpired`` as a synthetic returncode=-1 result
+    so the cleanup helper has a uniform shape to inspect.
+    """
+    try:
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(
+            args=["git", "-C", str(cwd), *args],
+            returncode=-1,
+            stdout="",
+            stderr=str(exc),
+        )
+
+
+def _post_merge_cleanup(
+    *,
+    repo_path: pathlib.Path,
+    branch: str | None,
+    issue_number: int,
+    base_branch: str = BASE_BRANCH,
+    run_git: GitRunFn = _run_git,
+    log: Callable[[str], None],
+) -> None:
+    """Restore the worker's shared tree to ``base_branch`` after a PR merge.
+
+    Issue #127. Called from the ``sm:reviewing → sm:done`` transition
+    (i.e., only after the dispatcher has confirmed PR merged + master CI
+    green). Idempotent; safe to call when already on master or when the
+    feature branch has already been pulled.
+
+    Steps (each tolerates the "already in target state" case):
+      1. If the working tree has uncommitted changes — log a warning
+         and skip the rest. We never want to clobber in-flight edits;
+         the operator handles it manually.
+      2. ``git checkout base_branch`` (skipped if already on it).
+      3. ``git pull --ff-only origin base_branch``. Failure here is
+         logged but non-fatal — the checkout still succeeded.
+      4. ``git branch -d <branch>`` for the merged feature branch.
+         Skipped if ``branch`` is None, equal to ``base_branch``, or
+         already absent locally.
+
+    All log lines use the ``[SM] checkout`` prefix for the audit trail.
+    """
+    log_prefix = f"[SM] checkout #{issue_number}"
+
+    if not repo_path.is_dir():
+        log(f"{log_prefix} skip: repo path missing at {repo_path}")
+        return
+
+    dirty = run_git(["status", "--porcelain"], repo_path)
+    if dirty.returncode != 0:
+        # If we can't tell, be defensive — don't touch the tree.
+        log(
+            f"{log_prefix} skip: git status failed in {repo_path} "
+            f"({dirty.stderr.strip() or dirty.returncode}); leaving alone"
+        )
+        return
+    if dirty.stdout.strip():
+        log(
+            f"{log_prefix} skip: uncommitted changes in {repo_path} "
+            f"(branch={branch!r}); not switching — operator should resolve"
+        )
+        return
+
+    current = run_git(["rev-parse", "--abbrev-ref", "HEAD"], repo_path)
+    current_branch = current.stdout.strip() if current.returncode == 0 else None
+    if current.returncode != 0:
+        log(
+            f"{log_prefix}: could not read current branch "
+            f"({current.stderr.strip() or current.returncode}); continuing"
+        )
+
+    if current_branch == base_branch:
+        log(f"{log_prefix}: {repo_path} already on {base_branch}")
+    else:
+        checkout = run_git(["checkout", base_branch], repo_path)
+        if checkout.returncode != 0:
+            log(
+                f"{log_prefix} failed: git checkout {base_branch} "
+                f"({checkout.stderr.strip() or checkout.returncode}); "
+                f"leaving tree on {current_branch!r}"
+            )
+            return
+        log(
+            f"{log_prefix}: switched {repo_path} from "
+            f"{current_branch!r} to {base_branch}"
+        )
+
+    pull = run_git(["pull", "--ff-only", "origin", base_branch], repo_path)
+    if pull.returncode != 0:
+        log(
+            f"{log_prefix}: git pull --ff-only origin {base_branch} failed "
+            f"({pull.stderr.strip() or pull.returncode}); next cycle will retry"
+        )
+    else:
+        log(f"{log_prefix}: pulled origin/{base_branch} into {repo_path}")
+
+    if branch and branch != base_branch:
+        delete = run_git(["branch", "-d", branch], repo_path)
+        if delete.returncode == 0:
+            log(f"{log_prefix}: deleted local branch {branch!r}")
+        else:
+            stderr = delete.stderr.lower()
+            # "not found" / "no such branch" → already gone (the
+            # previous cleanup pass got it, or the worker never created
+            # a local ref). Don't escalate.
+            if "not found" in stderr or "no such branch" in stderr:
+                log(f"{log_prefix}: local branch {branch!r} already absent")
+            else:
+                log(
+                    f"{log_prefix}: git branch -d {branch} failed "
+                    f"({delete.stderr.strip() or delete.returncode}); "
+                    f"leaving branch in place"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1294,6 +1603,166 @@ def render_transition_comment(from_state: str, to_state: str, reason: str) -> st
 
 
 # ---------------------------------------------------------------------------
+# Issue #128 — verification (smoke-test) machinery
+# ---------------------------------------------------------------------------
+
+
+def render_verify_comment(
+    outcome: str,
+    number: int,
+    *,
+    reason: str | None = None,
+    route: str | None = None,
+    timestamp: str | None = None,
+) -> str:
+    """Produce a literal ``[SM] verify-{pass,skip,failed} ...`` payload.
+
+    ``outcome`` selects the prefix; the other fields are formatted to
+    match the existing ``[SM] xxx key=value ...`` shape used throughout
+    the dispatcher's audit trail.
+    """
+    ts = timestamp or _now_iso()
+    if outcome == "pass":
+        return f"{VERIFY_PASS_PREFIX} task=#{number} route={route} ts={ts}"
+    if outcome == "skip":
+        return (
+            f"{VERIFY_SKIP_PREFIX} task=#{number} "
+            f'reason="{reason or "no recipe matched"}" ts={ts}'
+        )
+    if outcome == "failed":
+        return (
+            f"{VERIFY_FAILED_PREFIX} task=#{number} "
+            f'reason="{reason or "verification failed"}" ts={ts}'
+        )
+    raise ValueError(f"unknown verify outcome: {outcome!r}")
+
+
+def _http_get_body(
+    url: str,
+    *,
+    timeout: float = VERIFY_HTTP_TIMEOUT_SECONDS,
+    opener: Callable[..., Any] = urllib.request.urlopen,
+) -> tuple[int, str]:
+    """Issue a GET, return ``(status, body_text)``.
+
+    Wraps :func:`urllib.request.urlopen` so tests can inject a fake
+    opener and avoid actual network I/O. Decodes the body as UTF-8 with
+    ``errors='replace'`` — the marker check is a substring match so
+    mojibake on the boundary won't matter.
+    """
+    req = urllib.request.Request(url, headers={"User-Agent": "alice-sm-verify/1"})
+    with opener(req, timeout=timeout) as resp:
+        status = getattr(resp, "status", 200)
+        raw = resp.read()
+    if isinstance(raw, bytes):
+        body = raw.decode("utf-8", errors="replace")
+    else:
+        body = str(raw)
+    return status, body
+
+
+def verify_viewer_route(
+    *,
+    url: str,
+    marker: str,
+    http_get: Callable[[str], tuple[int, str]] | None = None,
+) -> dict[str, Any]:
+    """Run the viewer-route smoke test, return a verdict dict.
+
+    Verdict keys:
+      - ``outcome``: ``"pass"`` or ``"fail"``
+      - ``reason``: short human string (populated on fail)
+      - ``route``: URL probed (populated on pass; included on fail for
+        the audit comment so Jason can replay it manually)
+
+    Failure modes that count as a *fail* (not a transient bail-out):
+      - Connection refused / timeout / DNS error
+      - Non-2xx HTTP status
+      - 2xx but the marker substring isn't in the response body
+
+    The verifier never raises; transport errors are caught and
+    reported as ``outcome="fail"`` so the dispatcher can post the
+    ``verify-failed`` audit comment and leave the issue at
+    ``sm:reviewing`` for a human to inspect.
+    """
+    getter = http_get or _http_get_body
+    try:
+        status, body = getter(url)
+    except (urllib.error.URLError, OSError) as exc:
+        return {
+            "outcome": "fail",
+            "reason": f"viewer probe failed: {exc.__class__.__name__}: {exc}",
+            "route": url,
+        }
+    except Exception as exc:  # pragma: no cover — defensive
+        return {
+            "outcome": "fail",
+            "reason": f"viewer probe raised {exc.__class__.__name__}: {exc}",
+            "route": url,
+        }
+    if not (200 <= int(status) < 300):
+        return {
+            "outcome": "fail",
+            "reason": f"viewer probe HTTP {status}",
+            "route": url,
+        }
+    if marker not in body:
+        return {
+            "outcome": "fail",
+            "reason": f"marker {marker!r} not found in response body",
+            "route": url,
+        }
+    return {"outcome": "pass", "reason": "viewer marker present", "route": url}
+
+
+def _touches_viewer(files: Iterable[str]) -> bool:
+    return any(p.startswith(VERIFY_VIEWER_PATH_PREFIX) for p in files)
+
+
+def default_verifier(
+    pr_number: int,
+    files: list[str],
+    *,
+    viewer_url: str | None = None,
+    viewer_marker: str | None = None,
+    http_get: Callable[[str], tuple[int, str]] | None = None,
+) -> dict[str, Any]:
+    """Default issue-#128 verification recipe dispatcher.
+
+    Picks a verification recipe based on what the merged PR touched.
+    v1 only ships the *viewer-route* recipe; anything else returns
+    ``outcome="skip"`` with a recipe-not-matched reason so the
+    dispatcher can still close the issue (audit-trail visible) without
+    pretending we ran a check we didn't.
+
+    Wired into :func:`run` via the ``verify_pr`` keyword argument so
+    tests can inject a recipe stub that doesn't open sockets.
+    """
+    url = viewer_url or os.environ.get(VERIFY_VIEWER_URL_ENV, VERIFY_VIEWER_URL_DEFAULT)
+    marker = viewer_marker or os.environ.get(
+        VERIFY_VIEWER_MARKER_ENV, VERIFY_VIEWER_MARKER_DEFAULT
+    )
+    if _touches_viewer(files):
+        return verify_viewer_route(url=url, marker=marker, http_get=http_get)
+    # Future recipes (dispatcher --check, speaking enqueue-and-assert,
+    # research-note path-exists) extend this branch. Until then,
+    # anything outside the viewer touch is treated as "no recipe
+    # matched" and allowed through with a verify-skip audit comment.
+    return {
+        "outcome": "skip",
+        "reason": "no verification recipe matched (no src/alice_viewer/ files in PR)",
+        "route": None,
+    }
+
+
+def _verify_enabled() -> bool:
+    raw = os.environ.get(VERIFY_ENABLED_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+# ---------------------------------------------------------------------------
 # Main pass
 # ---------------------------------------------------------------------------
 
@@ -1322,6 +1791,19 @@ class RunReport:
     spawn_records: list[tuple[int, str, str]] = field(
         default_factory=list
     )  # (issue_number, art_label, spawn_id or "<dry-run>")
+    # Issue #127 — count of post-merge working-tree cleanups invoked on
+    # the ``sm:reviewing → sm:done`` path. Logged on the done-line so
+    # the operator sees whether checkouts are firing.
+    cleaned_up: int = 0
+    # Issue #128 — verification outcome counters. ``verify_pass`` and
+    # ``verify_skip`` both allow the issue through to ``sm:done`` (the
+    # latter records that no recipe matched); ``verify_failed`` holds
+    # the issue at ``sm:reviewing`` for human inspection.
+    verify_pass: int = 0
+    verify_skip: int = 0
+    verify_failed: int = 0
+    # (issue_number, outcome, reason) for the done-line / tests.
+    verify_records: list[tuple[int, str, str]] = field(default_factory=list)
 
 
 def _process_selected(
@@ -1501,6 +1983,7 @@ def _process_reviewing(
     *,
     issue: dict[str, Any],
     repo: str,
+    state: DispatcherState,
     report: RunReport,
     post_comment: PostCommentFn,
     edit_labels: EditLabelsFn,
@@ -1508,10 +1991,27 @@ def _process_reviewing(
     find_linked_pr: FindLinkedPRFn,
     pr_merge_status: PRMergeStatusFn,
     master_ci_status: MasterCIStatusFn,
+    pr_files: PRFilesFn | None,
+    verify_pr: VerifyFn | None,
+    post_merge_cleanup: PostMergeCleanupFn | None,
     dry_run: bool,
     log: Callable[[str], None],
+    now_iso: Callable[[], str] = _now_iso,
 ) -> None:
-    """T2 (reviewing → done) and T3 (reviewing → building) for one issue."""
+    """T2 (reviewing → done) and T3 (reviewing → building) for one issue.
+
+    ``post_merge_cleanup`` (Issue #127) is invoked after a successful
+    ``reviewing → done`` transition with the merged PR's head branch and
+    the issue number. ``None`` disables cleanup (the test default).
+
+    ``verify_pr`` (Issue #128) is the smoke-test gate run between
+    "CI-green" and the actual ``sm:done`` transition. ``None`` disables
+    verification entirely (pre-#128 behavior — used by tests that
+    don't want to stub the verifier). When non-None, the verifier is
+    called with the linked PR number + its changed-file list (obtained
+    via ``pr_files``); the verdict's ``outcome`` decides whether to
+    proceed, skip-with-audit, or halt at ``sm:reviewing``.
+    """
     number = issue["number"]
     try:
         pr = find_linked_pr(repo, number)
@@ -1563,6 +2063,132 @@ def _process_reviewing(
         return
 
     if conclusion == "success":
+        # ----- Issue #128 verification gate -----
+        # CI green is necessary but not sufficient — run an
+        # artifact-specific smoke test against the *actually-running*
+        # system before declaring the issue done.
+        verdict: dict[str, Any] | None = None
+        if verify_pr is not None:
+            files: list[str] = []
+            if pr_files is not None:
+                try:
+                    files = pr_files(repo, pr_number)
+                except GHCommandError as exc:
+                    log(
+                        f"[sm-dispatcher] failed to fetch PR files for "
+                        f"#{pr_number}: {exc}"
+                    )
+                    if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+                        raise
+                    # Without the file list we can't pick a recipe; bail
+                    # this cadence and let the next poll retry. The
+                    # issue stays at sm:reviewing.
+                    return
+            try:
+                verdict = verify_pr(pr_number, files)
+            except Exception as exc:  # noqa: BLE001 — verifier must never crash the loop
+                log(
+                    f"[sm-dispatcher] verifier raised for #{number}: "
+                    f"{exc.__class__.__name__}: {exc} — treating as verify-failed"
+                )
+                verdict = {
+                    "outcome": "fail",
+                    "reason": f"verifier crashed: {exc.__class__.__name__}: {exc}",
+                    "route": None,
+                }
+            outcome = (verdict or {}).get("outcome") or "fail"
+
+            if outcome == "fail":
+                v_reason = (verdict or {}).get("reason") or "verification failed"
+                v_route = (verdict or {}).get("route")
+                # Counter reflects "verifier returned fail this pass" —
+                # incremented regardless of whether we actually post a
+                # comment (dedup may suppress it). The operator's
+                # done-line read of ``verify_failed=N`` should mean
+                # "there are still N broken merges parked at reviewing"
+                # rather than "we sent N comments to GH this cadence".
+                report.verify_failed += 1
+                report.verify_records.append((number, "fail", v_reason))
+                verify_body = render_verify_comment(
+                    "failed",
+                    number,
+                    reason=v_reason,
+                    route=v_route,
+                    timestamp=now_iso(),
+                )
+                if dry_run:
+                    log(
+                        f"[sm-dispatcher] DRY-RUN would post verify-failed on "
+                        f"#{number}: {v_reason}"
+                    )
+                    return
+                if state.has_verify_failed(number):
+                    # Already posted this cadence-or-prior; don't spam.
+                    # The label stays at sm:reviewing — a human inspects
+                    # and either rolls back, escalates, or overrides.
+                    log(
+                        f"[sm-dispatcher] #{number} verify still failing "
+                        f"({v_reason}) — comment already posted, staying"
+                    )
+                    return
+                try:
+                    post_comment(repo, number, verify_body)
+                except GHCommandError as exc:
+                    log(
+                        f"[sm-dispatcher] failed to post verify-failed on "
+                        f"#{number}: {exc}"
+                    )
+                    if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+                        raise
+                    return
+                state.mark_verify_failed(number)
+                log(
+                    f"[sm-dispatcher] #{number} verify-failed posted "
+                    f"({v_reason}) — staying at sm:reviewing"
+                )
+                return
+
+            # outcome == "pass" or "skip" — both allow the transition.
+            # Post the audit comment first so the trail records *why*
+            # we proceeded (pass means a probe succeeded; skip means
+            # no recipe matched). If posting fails we still proceed —
+            # the audit is best-effort, not gating.
+            v_reason = (verdict or {}).get("reason") or ""
+            v_route = (verdict or {}).get("route")
+            verify_body = render_verify_comment(
+                outcome,
+                number,
+                reason=v_reason,
+                route=v_route,
+                timestamp=now_iso(),
+            )
+            if dry_run:
+                log(
+                    f"[sm-dispatcher] DRY-RUN would post verify-{outcome} on "
+                    f"#{number}: {v_reason}"
+                )
+            else:
+                try:
+                    post_comment(repo, number, verify_body)
+                except GHCommandError as exc:
+                    log(
+                        f"[sm-dispatcher] failed to post verify-{outcome} on "
+                        f"#{number}: {exc} — proceeding anyway"
+                    )
+                    if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+                        raise
+            if outcome == "pass":
+                report.verify_pass += 1
+            else:
+                report.verify_skip += 1
+            report.verify_records.append((number, outcome, v_reason))
+            # If the issue had a prior verify-failed entry, clear it —
+            # this cadence succeeded and the dedup ledger entry is
+            # stale.
+            state.clear_verify_failed(number)
+
+        # ----- end verification gate -----
+
         reason = f"PR merged: {pr_url}, CI green on {sha}"
         body = render_transition_comment(REVIEWING_SM_LABEL, DONE_SM_LABEL, reason)
         if dry_run:
@@ -1590,6 +2216,20 @@ def _process_reviewing(
         report.transitioned += 1
         report.transitions.append((number, REVIEWING_SM_LABEL, DONE_SM_LABEL))
         log(f"[sm-dispatcher] transitioned #{number}: reviewing → done (closed)")
+        # Issue #127 — restore the worker's working tree to master so the
+        # next cycle doesn't read dispatcher.py from this departing
+        # worker's feature branch. Cleanup is bounded to this exact
+        # transition (merged + green); CI-red and unmerged-closed paths
+        # never reach here.
+        if post_merge_cleanup is not None:
+            try:
+                post_merge_cleanup(merge_info.get("head_ref_name"), number)
+                report.cleaned_up += 1
+            except Exception as exc:  # noqa: BLE001 — cleanup is best-effort
+                log(
+                    f"[sm-dispatcher] post-merge cleanup raised for #{number}: "
+                    f"{exc!r}"
+                )
         return
 
     if conclusion == "failure":
@@ -1617,6 +2257,10 @@ def _process_reviewing(
             if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
                 raise
             return
+        # CI flipped red — the prior verify-failed entry (if any) was
+        # for the green build that just regressed. Clear so when CI
+        # eventually re-greens we don't suppress a fresh failure.
+        state.clear_verify_failed(number)
         report.transitioned += 1
         report.transitions.append((number, REVIEWING_SM_LABEL, BUILDING_SM_LABEL))
         log(f"[sm-dispatcher] transitioned #{number}: reviewing → building (CI red)")
@@ -1816,6 +2460,12 @@ def run(
     spawn: Callable[[dict[str, Any], str, str], str | None] | None = None,
     enable_spawn: bool = True,
     max_concurrent_spawns: int = MAX_CONCURRENT_SPAWNS,
+    post_merge_cleanup: PostMergeCleanupFn | None = None,
+    enable_cleanup: bool = True,
+    worker_repo_path: pathlib.Path = WORKER_REPO_PATH,
+    pr_files: PRFilesFn | None = None,
+    verify_pr: VerifyFn | None = None,
+    enable_verify: bool = True,
     dry_run: bool = False,
     log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
     now_iso: Callable[[], str] = _now_iso,
@@ -1856,6 +2506,34 @@ def run(
                     log=log,
                     now_iso=now_iso,
                 )
+
+    # Issue #127 — bind the production cleanup callable when enabled and
+    # not explicitly injected. Tests opt out with ``enable_cleanup=False``
+    # (mirrors the ``enable_spawn=False`` escape hatch) or pass a fake.
+    if enable_cleanup and post_merge_cleanup is None and not dry_run:
+        def post_merge_cleanup(branch: str | None, issue_number: int) -> None:
+            _post_merge_cleanup(
+                repo_path=worker_repo_path,
+                branch=branch,
+                issue_number=issue_number,
+                log=log,
+            )
+
+    # Issue #128 — bind the production verifier + PR-files fetcher when
+    # the caller hasn't injected fakes. ``enable_verify=False`` and the
+    # ``ALICE_VERIFY_ENABLED`` env var both flip the gate off, in which
+    # case ``_process_reviewing`` receives ``verify_pr=None`` and goes
+    # straight from CI-green to ``sm:done`` (pre-#128 behavior). The
+    # env-var path is the operational kill-switch; the kwarg path is
+    # the test escape hatch.
+    if enable_verify and verify_pr is None and _verify_enabled():
+        if pr_files is None:
+            pr_files = gh_get_pr_files
+        verify_pr = default_verifier
+    elif not enable_verify or not _verify_enabled():
+        # Operator/test explicitly disabled — None signals "skip the
+        # whole gate" to ``_process_reviewing``.
+        verify_pr = None
 
     report = RunReport()
     try:
@@ -1917,6 +2595,7 @@ def run(
                 _process_reviewing(
                     issue=issue,
                     repo=repo,
+                    state=state,
                     report=report,
                     post_comment=post_comment,
                     edit_labels=edit_labels,
@@ -1924,8 +2603,12 @@ def run(
                     find_linked_pr=find_linked_pr,
                     pr_merge_status=pr_merge_status,
                     master_ci_status=master_ci_status,
+                    pr_files=pr_files,
+                    verify_pr=verify_pr,
+                    post_merge_cleanup=post_merge_cleanup,
                     dry_run=dry_run,
                     log=log,
+                    now_iso=now_iso,
                 )
             else:
                 # Phase 1.5 doesn't act on draft / building / validating
@@ -2001,6 +2684,10 @@ def run(
         f"transitioned={report.transitioned} "
         f"swept={report.swept} "
         f"spawned={report.spawned} "
+        f"cleaned_up={report.cleaned_up} "
+        f"verify_pass={report.verify_pass} "
+        f"verify_skip={report.verify_skip} "
+        f"verify_failed={report.verify_failed} "
         f"skipped_dedup={report.skipped_dedup} "
         f"skipped_trust={report.skipped_trust}"
     )
