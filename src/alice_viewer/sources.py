@@ -16,11 +16,13 @@ single uvicorn worker).
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import math
 import os
 import pathlib
 import re
+import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Iterator
@@ -2441,6 +2443,22 @@ def _history_sm_spawns(
 _SM_SPAWN_FILE_MAX_BYTES = 64 * 1024
 
 
+def _sm_spawn_issue_number(spawn_id: str) -> int | None:
+    """Pull the issue number out of a spawn id (``spawn-<N>-<ts>``).
+
+    Returns None for unrecognized shapes — the caller treats that as
+    "skip the GH timeline fetch", since we don't know which issue to
+    query.
+    """
+    m = _SM_SPAWN_FINISHED_NAME_RE.match(spawn_id)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
 def _find_sm_spawn_dir(
     paths: Paths, spawn_id: str
 ) -> pathlib.Path | None:
@@ -2462,17 +2480,32 @@ def _find_sm_spawn_dir(
 
 
 def sm_spawn_trace_events(
-    spawn_dir: pathlib.Path, fallback_ts: float
+    spawn_dir: pathlib.Path,
+    fallback_ts: float,
+    *,
+    repo: str | None = None,
+    issue_number: int | None = None,
+    fetch_timeline: "Callable[[str, int], list[dict[str, Any]]] | None" = None,
 ) -> list[UnifiedEvent]:
     """Build a synthetic event trace for an SM-dispatcher spawn.
 
-    SM workers don't write a structured event log — the viewer's run-
-    detail modal expects one (#126). Wrap each of ``prompt.txt`` /
-    ``stdout.log`` / ``stderr.log`` (if present) as a single text-shaped
-    event so the modal renders the contents inline. Missing files are
-    skipped silently. Contents over ``_SM_SPAWN_FILE_MAX_BYTES`` are
-    tail-truncated with a marker line — the tail is what matters when
-    a worker died at the end.
+    Combines three sources into one chronological feed:
+
+      1. The spawn's prompt + stdout + stderr files (always shown so a
+         worker that crashed before writing its session JSONL still has
+         *something* visible in the modal).
+      2. The worker's full claude session JSONL (if present): every
+         tool call, every assistant text/thinking, every tool result —
+         the same shape thinking-wakes already render. Issue #137.
+      3. The issue's GitHub timeline (if ``repo`` and ``issue_number``
+         are supplied and ``fetch_timeline`` resolves): label changes,
+         ``[SM] *`` audit comments, PR cross-references — interleaved
+         by timestamp with the worker's tool calls. Issue #137.
+
+    Missing inputs are silently skipped — the trace degrades gracefully
+    rather than 500ing the detail endpoint. ``fetch_timeline`` is
+    injectable so tests can stub the gh-CLI dependency; the live caller
+    (:mod:`alice_viewer.main`) wires in :func:`fetch_issue_timeline_cached`.
     """
     out: list[UnifiedEvent] = []
     for filename, kind in (
@@ -2509,6 +2542,447 @@ def sm_spawn_trace_events(
                 detail={"filename": filename, "text": text},
             )
         )
+
+    # Worker session JSONL — every tool call etc.
+    out.extend(parse_worker_session_events(spawn_dir, fallback_ts))
+
+    # Issue timeline — label changes + [SM] audit comments + PR linkage.
+    if (
+        fetch_timeline is not None
+        and repo is not None
+        and isinstance(issue_number, int)
+        and issue_number > 0
+    ):
+        try:
+            raw_events = fetch_timeline(repo, issue_number)
+        except Exception:
+            raw_events = []
+        out.extend(
+            _gh_timeline_to_events(
+                raw_events, spawn_dir.name, fallback_ts
+            )
+        )
+
+    out.sort(key=lambda e: e.ts)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Worker session JSONL parser (issue #137)
+#
+# The SM dispatcher pre-mints a UUID session id per spawn, passes it to
+# claude via ``--session-id``, and copies the resulting session JSONL
+# into ``<spawn_dir>/session.jsonl`` at reap time. This block parses
+# that JSONL into the same UnifiedEvent shape thinking-wakes use, so
+# the existing trace renderer in events.js handles it without a new
+# code path.
+
+_WORKER_SESSION_FILENAME = "session.jsonl"
+_WORKER_SESSION_ID_FILENAME = "session_id"
+# Per-event payload truncation. Long tool inputs (full file contents
+# from a Write call, large grep outputs in a result) would balloon the
+# JSON detail response; cap at the same boundary as ``_SM_SPAWN_FILE_MAX_BYTES``
+# but per-event so the cap composes with the file-level guard.
+_WORKER_SESSION_TEXT_CAP = 8 * 1024
+
+
+def _resolve_worker_session_jsonl(
+    spawn_dir: pathlib.Path,
+    *,
+    projects_dir: pathlib.Path | None = None,
+) -> pathlib.Path | None:
+    """Find the worker's session JSONL.
+
+    Prefers ``<spawn_dir>/session.jsonl`` (copied at reap time); falls
+    back to globbing ``~/.claude/projects/*/<session_id>.jsonl`` if a
+    ``session_id`` file is present but the JSONL hasn't been copied
+    yet (live spawn, or a finished spawn from before the copy-at-reap
+    landed). Returns None if neither path resolves.
+    """
+    in_spawn = spawn_dir / _WORKER_SESSION_FILENAME
+    if in_spawn.is_file():
+        return in_spawn
+    sid_path = spawn_dir / _WORKER_SESSION_ID_FILENAME
+    if not sid_path.is_file():
+        return None
+    try:
+        session_id = sid_path.read_text().strip()
+    except OSError:
+        return None
+    if not session_id:
+        return None
+    pdir = projects_dir or (pathlib.Path.home() / ".claude" / "projects")
+    if not pdir.is_dir():
+        return None
+    for hit in pdir.glob(f"*/{session_id}.jsonl"):
+        return hit
+    return None
+
+
+def _truncate_text(text: str, cap: int = _WORKER_SESSION_TEXT_CAP) -> str:
+    if len(text) <= cap:
+        return text
+    return text[:cap] + f"\n... [truncated, {len(text) - cap} bytes]"
+
+
+def _parse_iso_ts(s: str | None) -> float | None:
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        # Claude session JSONL uses Z-suffix UTC; datetime.fromisoformat
+        # handles +00:00 but not Z directly until 3.11. Replace.
+        normalized = s.replace("Z", "+00:00")
+        return _dt.datetime.fromisoformat(normalized).timestamp()
+    except ValueError:
+        return None
+
+
+def parse_worker_session_events(
+    spawn_dir: pathlib.Path,
+    fallback_ts: float,
+    *,
+    projects_dir: pathlib.Path | None = None,
+) -> list[UnifiedEvent]:
+    """Parse the worker's claude session JSONL into UnifiedEvents.
+
+    Maps the SDK record shapes onto the kinds the trace renderer
+    already knows about:
+
+      * record ``type=user``       → ``user_message`` (initial prompt
+        plus any tool results — the SDK packs tool_result blocks into
+        user-shaped records)
+      * record ``type=assistant``  → one event per content block:
+          - ``thinking``    → ``thinking``
+          - ``text``        → ``assistant_text``
+          - ``tool_use``    → ``tool_use``
+      * everything else (queue-operation, system, etc.) → skipped.
+
+    The output is what the wake-trace renderer expects — the modal
+    code path doesn't need any awareness that this came from an SM
+    spawn rather than a thinking wake.
+    """
+    out: list[UnifiedEvent] = []
+    jsonl = _resolve_worker_session_jsonl(spawn_dir, projects_dir=projects_dir)
+    if jsonl is None:
+        return out
+    correlation_id = spawn_dir.name
+    for rec in _read_jsonl(jsonl):
+        rtype = rec.get("type")
+        ts = _parse_iso_ts(rec.get("timestamp")) or fallback_ts
+        if rtype == "user":
+            msg = rec.get("message") or {}
+            content = msg.get("content")
+            if isinstance(content, str):
+                text = content.strip()
+                if not text:
+                    continue
+                out.append(
+                    UnifiedEvent(
+                        ts=ts,
+                        hemisphere="sm",
+                        kind="user_message",
+                        correlation_id=correlation_id,
+                        summary=text.splitlines()[0][:140],
+                        detail={"text": _truncate_text(text)},
+                    )
+                )
+            elif isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "tool_result":
+                        result = block.get("content")
+                        if isinstance(result, list):
+                            parts: list[str] = []
+                            for sub in result:
+                                if isinstance(sub, dict) and sub.get("type") == "text":
+                                    parts.append(str(sub.get("text", "")))
+                            text = "\n".join(parts)
+                        else:
+                            text = str(result or "")
+                        is_error = bool(block.get("is_error"))
+                        kind = "result"
+                        summary = (
+                            ("error · " if is_error else "")
+                            + (text.strip().splitlines()[0][:140] if text.strip() else "(empty result)")
+                        )
+                        out.append(
+                            UnifiedEvent(
+                                ts=ts,
+                                hemisphere="sm",
+                                kind=kind,
+                                correlation_id=correlation_id,
+                                summary=summary,
+                                detail={
+                                    "text": _truncate_text(text),
+                                    "tool_use_id": block.get("tool_use_id"),
+                                    "is_error": is_error,
+                                },
+                            )
+                        )
+                    elif btype == "text":
+                        text = str(block.get("text", "")).strip()
+                        if not text:
+                            continue
+                        out.append(
+                            UnifiedEvent(
+                                ts=ts,
+                                hemisphere="sm",
+                                kind="user_message",
+                                correlation_id=correlation_id,
+                                summary=text.splitlines()[0][:140],
+                                detail={"text": _truncate_text(text)},
+                            )
+                        )
+        elif rtype == "assistant":
+            msg = rec.get("message") or {}
+            content = msg.get("content") or []
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "thinking":
+                    text = str(block.get("thinking", "")).strip()
+                    if not text:
+                        continue
+                    out.append(
+                        UnifiedEvent(
+                            ts=ts,
+                            hemisphere="sm",
+                            kind="thinking",
+                            correlation_id=correlation_id,
+                            summary=text.splitlines()[0][:140],
+                            detail={"text": _truncate_text(text)},
+                        )
+                    )
+                elif btype == "text":
+                    text = str(block.get("text", "")).strip()
+                    if not text:
+                        continue
+                    out.append(
+                        UnifiedEvent(
+                            ts=ts,
+                            hemisphere="sm",
+                            kind="assistant_text",
+                            correlation_id=correlation_id,
+                            summary=text.splitlines()[0][:140],
+                            detail={"text": _truncate_text(text)},
+                        )
+                    )
+                elif btype == "tool_use":
+                    name = block.get("name") or "?"
+                    tool_input = block.get("input")
+                    out.append(
+                        UnifiedEvent(
+                            ts=ts,
+                            hemisphere="sm",
+                            kind="tool_use",
+                            correlation_id=correlation_id,
+                            summary=f"{name}",
+                            detail={
+                                "name": name,
+                                "input": tool_input,
+                                "id": block.get("id"),
+                            },
+                        )
+                    )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# GitHub issue timeline (issue #137)
+#
+# Pulls label changes, [SM] audit comments, and cross-referenced PR
+# events for one issue and converts them into UnifiedEvents that
+# interleave with the worker's session events on the spawn-detail
+# trace. ``gh api`` is the transport; we cache for 60s per issue so
+# the modal is snappy on re-open without burning rate limit.
+
+_GH_TIMELINE_CACHE: dict[tuple[str, int], tuple[float, list[dict[str, Any]]]] = {}
+_GH_TIMELINE_TTL_S = 60.0
+_GH_TIMELINE_TIMEOUT_S = 8
+
+
+def fetch_issue_timeline_cached(
+    repo: str,
+    issue_number: int,
+    *,
+    now_ts: Callable[[], float] = time.time,
+    runner: "Callable[[list[str]], str] | None" = None,
+    ttl_s: float = _GH_TIMELINE_TTL_S,
+) -> list[dict[str, Any]]:
+    """Return the raw ``gh api`` timeline payload for one issue.
+
+    Cached per ``(repo, issue_number)`` for ``ttl_s`` seconds; SM spawns
+    are short-lived so a 60s TTL is plenty. ``runner`` is injectable so
+    tests don't shell out — the production caller passes the live
+    ``_run_gh_timeline`` runner that calls the ``gh`` CLI.
+
+    Returns an empty list if the call fails (the modal stays usable
+    even if gh is missing or the network is down).
+    """
+    key = (repo, issue_number)
+    now = now_ts()
+    cached = _GH_TIMELINE_CACHE.get(key)
+    if cached is not None and now - cached[0] < ttl_s:
+        return cached[1]
+    if runner is None:
+        runner = _run_gh_timeline
+    try:
+        out = runner(
+            [
+                "gh",
+                "api",
+                "--paginate",
+                f"repos/{repo}/issues/{issue_number}/timeline",
+            ]
+        )
+        events = json.loads(out)
+        if not isinstance(events, list):
+            events = []
+    except Exception:
+        events = []
+    _GH_TIMELINE_CACHE[key] = (now, events)
+    return events
+
+
+def _run_gh_timeline(args: list[str]) -> str:
+    """Run a ``gh api`` command, return stdout.
+
+    Wrapped in a function so :func:`fetch_issue_timeline_cached` can
+    inject a fake without monkeypatching subprocess globally. Raises
+    on non-zero exit so the caller's try/except suppresses to an
+    empty timeline.
+    """
+    proc = subprocess.run(
+        args,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=_GH_TIMELINE_TIMEOUT_S,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"gh exited {proc.returncode}: {proc.stderr.strip()[:200]}"
+        )
+    return proc.stdout
+
+
+def _gh_timeline_to_events(
+    raw: list[dict[str, Any]],
+    correlation_id: str,
+    fallback_ts: float,
+) -> list[UnifiedEvent]:
+    """Convert a ``gh api .../timeline`` payload to UnifiedEvents.
+
+    Filters down to the events that meaningfully tell the SM lifecycle
+    story:
+
+      * ``commented`` — only ``[SM] ...`` audit comments (not noise)
+      * ``labeled`` / ``unlabeled`` — only ``sm:*`` and ``art:*`` labels
+      * ``cross-referenced`` — PR linkage events
+      * ``closed`` / ``reopened`` — issue lifecycle
+
+    Other events (assigned, milestoned, mentioned, ...) are dropped to
+    keep the trace dense. ``correlation_id`` is the spawn id so the
+    rendered rows visually group with the rest of the spawn's trace.
+    """
+    out: list[UnifiedEvent] = []
+    for ev in raw:
+        if not isinstance(ev, dict):
+            continue
+        kind_raw = ev.get("event")
+        ts_iso = ev.get("created_at") or ev.get("submitted_at")
+        ts = _parse_iso_ts(ts_iso) or fallback_ts
+        actor = ev.get("actor") or ev.get("user") or {}
+        actor_login = (
+            actor.get("login") if isinstance(actor, dict) else None
+        ) or "unknown"
+        if kind_raw == "commented":
+            body = ev.get("body") or ""
+            if not body.startswith("[SM] "):
+                continue
+            first_line = body.strip().splitlines()[0][:140] if body.strip() else "(empty)"
+            out.append(
+                UnifiedEvent(
+                    ts=ts,
+                    hemisphere="sm",
+                    kind="gh_comment",
+                    correlation_id=correlation_id,
+                    summary=first_line,
+                    detail={
+                        "actor": actor_login,
+                        "text": _truncate_text(body),
+                        "html_url": ev.get("html_url"),
+                    },
+                )
+            )
+        elif kind_raw in ("labeled", "unlabeled"):
+            label = ev.get("label") or {}
+            name = label.get("name") if isinstance(label, dict) else None
+            if not isinstance(name, str):
+                continue
+            if not (name.startswith("sm:") or name.startswith("art:")):
+                continue
+            verb = "labeled" if kind_raw == "labeled" else "unlabeled"
+            out.append(
+                UnifiedEvent(
+                    ts=ts,
+                    hemisphere="sm",
+                    kind="gh_event",
+                    correlation_id=correlation_id,
+                    summary=f"{verb} {name} by {actor_login}",
+                    detail={
+                        "subtype": kind_raw,
+                        "label": name,
+                        "actor": actor_login,
+                    },
+                )
+            )
+        elif kind_raw == "cross-referenced":
+            source = ev.get("source") or {}
+            issue_ref = (
+                source.get("issue") if isinstance(source, dict) else None
+            ) or {}
+            ref_num = issue_ref.get("number")
+            ref_url = issue_ref.get("html_url")
+            is_pr = isinstance(issue_ref.get("pull_request"), dict)
+            label_word = "PR" if is_pr else "issue"
+            summary = f"linked from {label_word} #{ref_num}" if ref_num else "cross-reference"
+            out.append(
+                UnifiedEvent(
+                    ts=ts,
+                    hemisphere="sm",
+                    kind="gh_event",
+                    correlation_id=correlation_id,
+                    summary=summary,
+                    detail={
+                        "subtype": "cross-referenced",
+                        "ref_number": ref_num,
+                        "ref_url": ref_url,
+                        "is_pr": is_pr,
+                        "actor": actor_login,
+                    },
+                )
+            )
+        elif kind_raw in ("closed", "reopened", "merged"):
+            out.append(
+                UnifiedEvent(
+                    ts=ts,
+                    hemisphere="sm",
+                    kind="gh_event",
+                    correlation_id=correlation_id,
+                    summary=f"{kind_raw} by {actor_login}",
+                    detail={
+                        "subtype": kind_raw,
+                        "actor": actor_login,
+                        "commit_id": ev.get("commit_id"),
+                    },
+                )
+            )
     return out
 
 

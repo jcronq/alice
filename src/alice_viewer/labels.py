@@ -71,6 +71,12 @@ KIND_LABELS: dict[str, str] = {
     "sm_prompt": "spawn prompt",
     "sm_stdout": "spawn stdout",
     "sm_stderr": "spawn stderr",
+    # SM-spawn lifecycle events pulled from the issue's GitHub timeline
+    # (#137). ``gh_comment`` carries an [SM] audit comment body;
+    # ``gh_event`` is everything else (label changes, PR cross-refs,
+    # close/reopen).
+    "gh_comment": "[SM] comment",
+    "gh_event": "github event",
 }
 
 
@@ -143,6 +149,11 @@ KIND_FAMILIES: dict[str, str] = {
     "sm_prompt": "text",
     "sm_stdout": "text",
     "sm_stderr": "error",
+    # GitHub-derived SM lifecycle events. Comments are text-shaped (have
+    # bodies); the rest are short and bucket as meta so they don't fight
+    # the worker's tool-call rows for visual weight.
+    "gh_comment": "text",
+    "gh_event": "meta",
 }
 
 

@@ -233,6 +233,11 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         (which ``group_runs`` doesn't see) also resolve — and synthesises
         an event trace from the spawn dir's files since SM workers don't
         emit structured events (#126).
+
+        For ``sm_spawn`` runs the trace also includes the worker's full
+        claude session JSONL (every tool call) and the issue's GitHub
+        timeline (label changes, ``[SM] *`` audit comments, PR linkage),
+        merged chronologically (#137).
         """
         p: Paths = app.state.paths
         events = sources.load_all(p)
@@ -247,7 +252,19 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         if match.kind == "sm_spawn" and not trace:
             spawn_dir = sources._find_sm_spawn_dir(p, match.run_id)
             if spawn_dir is not None:
-                trace = sources.sm_spawn_trace_events(spawn_dir, match.start_ts)
+                # The spawn id format is ``spawn-<N>-<unix-ts>``; pull
+                # the issue number out so the timeline fetcher can hit
+                # the right gh endpoint. Bad/legacy ids fall through
+                # to no-timeline mode (the fetcher is a no-op without
+                # an issue number).
+                issue_number = sources._sm_spawn_issue_number(match.run_id)
+                trace = sources.sm_spawn_trace_events(
+                    spawn_dir,
+                    match.start_ts,
+                    repo=os.environ.get("ALICE_SM_REPO", "jcronq/alice"),
+                    issue_number=issue_number,
+                    fetch_timeline=sources.fetch_issue_timeline_cached,
+                )
         return JSONResponse(
             {
                 "run": match.to_dict(),

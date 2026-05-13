@@ -47,12 +47,14 @@ import datetime as dt
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
@@ -236,6 +238,18 @@ CLAUDE_BIN_FALLBACK = "claude"
 # :func:`gh_find_unspawned_selected_issues` filters on this prefix +
 # trusted-author authorship to dedup.
 SPAWN_STARTED_PREFIX = "[SM] spawn-started"
+
+# Issue #137 — worker session capture. We pre-mint a UUID per spawn and
+# pass it via ``--session-id`` so the worker writes its session JSONL to
+# a known file. The id is persisted in ``<spawn_dir>/session_id`` at
+# launch time so the reaper (and the viewer) can find the session log
+# even if the dispatcher crashes mid-pass. On reap we copy the JSONL
+# from ``~/.claude/projects/<normalized-cwd>/<session_id>.jsonl`` into
+# ``<spawn_dir>/session.jsonl`` so the spawn dir stays self-contained
+# (survives a ``find -delete`` purge of ~/.claude/projects later).
+SESSION_ID_FILENAME = "session_id"
+SESSION_JSONL_FILENAME = "session.jsonl"
+CLAUDE_PROJECTS_DIR = pathlib.Path.home() / ".claude" / "projects"
 
 
 # ---------------------------------------------------------------------------
@@ -1164,18 +1178,99 @@ def _spawn_dir_is_alive(child: pathlib.Path) -> bool:
     return True
 
 
+def _find_worker_session_jsonl(
+    session_id: str,
+    *,
+    projects_dir: pathlib.Path = CLAUDE_PROJECTS_DIR,
+) -> pathlib.Path | None:
+    """Locate the claude CLI's session JSONL for ``session_id``.
+
+    The CLI writes to ``~/.claude/projects/<normalized-cwd>/<id>.jsonl``;
+    the normalized-cwd path depends on where the worker was launched.
+    Since session IDs are UUIDs, a glob across project dirs will match
+    at most one file — we don't need to know the cwd to find it.
+
+    Returns None if the JSONL is missing (worker died before writing,
+    or session persistence was disabled).
+    """
+    if not projects_dir.is_dir():
+        return None
+    for hit in projects_dir.glob(f"*/{session_id}.jsonl"):
+        return hit
+    return None
+
+
+def _copy_session_jsonl_into_spawn(
+    spawn_dir: pathlib.Path,
+    *,
+    log: Callable[[str], None] | None = None,
+    projects_dir: pathlib.Path = CLAUDE_PROJECTS_DIR,
+) -> None:
+    """Copy the worker's session JSONL into ``spawn_dir/session.jsonl``.
+
+    Called at reap time so the finished spawn dir is self-contained:
+    the viewer can render the worker's full trace from the spawn dir
+    alone, even after a future ``find -delete`` cleans up
+    ``~/.claude/projects/``. No-op when:
+      * the spawn never wrote a ``session_id`` file (older spawn dir
+        from before #137)
+      * the session JSONL doesn't exist (worker crashed pre-write,
+        or ``--no-session-persistence`` was in play)
+      * a ``session.jsonl`` is already present (idempotent — re-reaping
+        an already-finished dir doesn't redo the copy)
+    """
+    sid_path = spawn_dir / SESSION_ID_FILENAME
+    if not sid_path.is_file():
+        return
+    target = spawn_dir / SESSION_JSONL_FILENAME
+    if target.exists():
+        return
+    try:
+        session_id = sid_path.read_text().strip()
+    except OSError:
+        return
+    if not session_id:
+        return
+    src = _find_worker_session_jsonl(session_id, projects_dir=projects_dir)
+    if src is None:
+        if log is not None:
+            log(
+                f"[sm-dispatcher] reap {spawn_dir.name}: no session "
+                f"JSONL found for session_id={session_id} (worker may "
+                f"have crashed before writing)"
+            )
+        return
+    try:
+        shutil.copy2(src, target)
+    except OSError as exc:
+        if log is not None:
+            log(
+                f"[sm-dispatcher] reap {spawn_dir.name}: failed to "
+                f"copy session JSONL from {src}: {exc}"
+            )
+
+
 def _reap_spawn_dir(
     child: pathlib.Path,
     finished_root: pathlib.Path,
     *,
     log: Callable[[str], None] | None = None,
+    projects_dir: pathlib.Path = CLAUDE_PROJECTS_DIR,
 ) -> None:
     """Move a dead spawn dir into ``finished_root/<name>``.
 
     On name collision, suffix ``.1``, ``.2``, ... so a previous reap
     isn't clobbered. ``OSError`` is swallowed and logged — the next
     pass will retry.
+
+    Issue #137: before the rename, copy the worker's session JSONL into
+    the spawn dir so the finished entry is self-contained.
     """
+    # Copy session JSONL while the dir is still at its original path
+    # (paths inside the spawn dir don't depend on the rename, but
+    # doing it before the move keeps a clean failure mode — if rename
+    # fails we still have the JSONL alongside the live dir for retry).
+    _copy_session_jsonl_into_spawn(child, log=log, projects_dir=projects_dir)
     try:
         finished_root.mkdir(parents=True, exist_ok=True)
         target = finished_root / child.name
@@ -1354,6 +1449,7 @@ def spawn_agent(
     now_iso: Callable[[], str] = _now_iso,
     log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
     clock: Callable[[], float] = None,  # type: ignore[assignment]
+    new_session_id: Callable[[], str] = lambda: str(uuid.uuid4()),
 ) -> str | None:
     """Spawn a detached ``claude`` agent for an SM issue.
 
@@ -1410,6 +1506,13 @@ def spawn_agent(
     prompt_path = work_dir / "prompt.txt"
     prompt_path.write_text(prompt_text)
 
+    # Issue #137: pre-mint a session id so we can find the worker's
+    # session JSONL after the fact (and copy it into the spawn dir on
+    # reap). Persist BEFORE Popen so a crash mid-launch still leaves
+    # the id for the reaper to consult.
+    session_id = new_session_id()
+    (work_dir / SESSION_ID_FILENAME).write_text(session_id)
+
     # Post the [SM] spawn-started audit comment FIRST. If this fails
     # we abort the spawn — without the dedup marker, the next pass
     # would re-spawn the same task. Posting before Popen means a
@@ -1446,7 +1549,7 @@ def spawn_agent(
     stderr_fh = open(stderr_path, "wb")
     try:
         proc = popen(
-            [claude_bin, "--print"],
+            [claude_bin, "--print", "--session-id", session_id],
             stdin=stdin_fh,
             stdout=stdout_fh,
             stderr=stderr_fh,
@@ -1465,7 +1568,7 @@ def spawn_agent(
         pidfile_path.write_text(str(pid))
     log(
         f"[sm-dispatcher] spawned {spawn_id} (pid={pid}) on #{number} "
-        f"art={art_label}"
+        f"art={art_label} session_id={session_id}"
     )
     return spawn_id
 

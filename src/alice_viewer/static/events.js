@@ -55,6 +55,8 @@ const KIND_LABELS = {
   sm_prompt: 'spawn prompt',
   sm_stdout: 'spawn stdout',
   sm_stderr: 'spawn stderr',
+  gh_comment: '[SM] comment',
+  gh_event: 'github event',
 };
 
 const KIND_FAMILIES = {
@@ -79,6 +81,7 @@ const KIND_FAMILIES = {
   config_reload: 'meta', quiet_queue_enter: 'meta', quiet_queue_drain: 'meta', system: 'meta',
   context_compaction_start: 'meta', context_compaction: 'meta', session_roll: 'meta',
   sm_prompt: 'text', sm_stdout: 'text', sm_stderr: 'error',
+  gh_comment: 'text', gh_event: 'meta',
 };
 
 window.humanizeKind = (k) => KIND_LABELS[k] || (k || '').replace(/_/g, ' ');
@@ -575,7 +578,10 @@ function _renderTraceRow(ev) {
     ev.kind === 'assistant_text' ||
     ev.kind === 'sm_prompt' ||
     ev.kind === 'sm_stdout' ||
-    ev.kind === 'sm_stderr';
+    ev.kind === 'sm_stderr' ||
+    ev.kind === 'user_message' ||
+    ev.kind === 'result' ||
+    ev.kind === 'gh_comment';
   const isRich = isText || ev.kind === 'tool_use' || ev.kind === 'system';
 
   if (!isRich) {

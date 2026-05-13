@@ -1293,10 +1293,14 @@ def test_phase2_spawn_fires_on_code_artifact_with_no_prior_spawn(
     assert exit_code == 0
     assert report.spawned == 1
     assert popens, "expected Popen to be called"
-    # Popen launched claude with --print.
+    # Popen launched claude with --print and a pre-minted --session-id
+    # (issue #137 — capture worker session for the viewer trace).
     cmd = popens[0].args
-    assert cmd[-1] == "--print"
     assert cmd[0].endswith("claude")
+    assert "--print" in cmd
+    assert "--session-id" in cmd
+    sid_idx = cmd.index("--session-id")
+    assert sid_idx + 1 < len(cmd), "expected a UUID after --session-id"
     # Detached from controlling terminal.
     assert popens[0].kwargs.get("start_new_session") is True
     # Two comments on #200: dispatcher-hello + [SM] spawn-started.
@@ -1307,13 +1311,17 @@ def test_phase2_spawn_fires_on_code_artifact_with_no_prior_spawn(
     assert "task=#200" in started
     assert "artifact=art:code" in started
     assert "runtime=claude-cli" in started
-    # spawn dir contains prompt.txt + pidfile.
+    # spawn dir contains prompt.txt + pidfile + session_id (#137).
     spawn_subdirs = [
         d for d in spawn_dir.iterdir() if d.is_dir() and d.name.startswith("spawn-")
     ]
     assert len(spawn_subdirs) == 1
     assert (spawn_subdirs[0] / "prompt.txt").is_file()
     assert (spawn_subdirs[0] / "pidfile").is_file()
+    sid_file = spawn_subdirs[0] / "session_id"
+    assert sid_file.is_file()
+    # And it matches the value passed to --session-id.
+    assert sid_file.read_text().strip() == cmd[sid_idx + 1]
     prompt = (spawn_subdirs[0] / "prompt.txt").read_text()
     # Code-worker framing.
     assert "code-worker" in prompt
@@ -1842,6 +1850,87 @@ def test_phase2_count_running_spawns_reaps_dead_pidfiles(tmp_path) -> None:
     assert not dead.exists()
     finished = spawn_dir / ".finished" / "spawn-dead"
     assert finished.exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #137 — worker session JSONL capture on reap
+
+
+def test_reap_copies_session_jsonl_into_spawn_dir(tmp_path) -> None:
+    """When a spawn dir has a session_id pointing at a JSONL in the
+    fake projects dir, _reap_spawn_dir copies it into ``session.jsonl``
+    before the rename so the finished spawn dir is self-contained."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    fake_projects = tmp_path / "fake-claude-projects"
+    fake_projects.mkdir()
+
+    sid = "11111111-2222-3333-4444-555555555555"
+    project_subdir = fake_projects / "-some-cwd"
+    project_subdir.mkdir()
+    src = project_subdir / f"{sid}.jsonl"
+    src.write_text('{"type":"user","message":{"content":"hi"}}\n')
+
+    dead = spawn_dir / "spawn-9-1"
+    dead.mkdir()
+    (dead / "pidfile").write_text("99999999")  # PID definitely not alive
+    (dead / sm.SESSION_ID_FILENAME).write_text(sid)
+
+    finished_root = spawn_dir / ".finished"
+    sm._reap_spawn_dir(dead, finished_root, projects_dir=fake_projects)
+
+    moved = finished_root / "spawn-9-1"
+    assert moved.is_dir()
+    assert (moved / sm.SESSION_JSONL_FILENAME).is_file()
+    assert (moved / sm.SESSION_JSONL_FILENAME).read_text().startswith('{"type":"user"')
+
+
+def test_reap_without_session_id_is_noop(tmp_path) -> None:
+    """A spawn dir that pre-dates issue #137 (no session_id file) reaps
+    cleanly without trying to copy any JSONL."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    fake_projects = tmp_path / "fake-claude-projects"
+    fake_projects.mkdir()
+
+    dead = spawn_dir / "spawn-9-1"
+    dead.mkdir()
+    (dead / "pidfile").write_text("99999999")
+
+    finished_root = spawn_dir / ".finished"
+    sm._reap_spawn_dir(dead, finished_root, projects_dir=fake_projects)
+
+    moved = finished_root / "spawn-9-1"
+    assert moved.is_dir()
+    assert not (moved / sm.SESSION_JSONL_FILENAME).exists()
+
+
+def test_reap_session_id_present_but_jsonl_missing_logs_and_continues(
+    tmp_path,
+) -> None:
+    """Session id is set but the JSONL doesn't exist (worker crashed
+    before persisting). Reap completes without raising; nothing is
+    copied."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    fake_projects = tmp_path / "fake-claude-projects"
+    fake_projects.mkdir()
+
+    dead = spawn_dir / "spawn-9-1"
+    dead.mkdir()
+    (dead / "pidfile").write_text("99999999")
+    (dead / sm.SESSION_ID_FILENAME).write_text("nonexistent-session-id")
+
+    finished_root = spawn_dir / ".finished"
+    logged: list[str] = []
+    sm._reap_spawn_dir(
+        dead, finished_root, projects_dir=fake_projects, log=logged.append
+    )
+
+    moved = finished_root / "spawn-9-1"
+    assert moved.is_dir()
+    assert not (moved / sm.SESSION_JSONL_FILENAME).exists()
+    assert any("no session JSONL found" in m for m in logged)
 
 
 def test_phase2_has_live_spawn_for_issue_matches_by_issue_number(

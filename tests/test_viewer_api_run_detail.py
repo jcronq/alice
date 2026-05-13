@@ -247,3 +247,280 @@ def test_api_run_detail_sm_spawn_dir_missing_returns_run_no_events(client, paths
     # The run is gone from group_runs too (since _history_sm_spawns
     # rescans), so this is just 404 — but it must not 500.
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Issue #137 — worker session JSONL + GH issue timeline merge
+
+
+def _write_worker_session_jsonl(spawn_dir: pathlib.Path) -> None:
+    """Drop a ``session.jsonl`` matching the claude-CLI shape into the
+    spawn dir. Covers the four block types the parser handles."""
+    records = [
+        # initial user prompt
+        {
+            "type": "user",
+            "timestamp": "2026-05-12T10:00:00.000Z",
+            "message": {"role": "user", "content": "do the thing"},
+        },
+        # assistant thinking + text + tool_use in one record
+        {
+            "type": "assistant",
+            "timestamp": "2026-05-12T10:00:01.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "let me grep first"},
+                    {"type": "text", "text": "Checking the file."},
+                    {
+                        "type": "tool_use",
+                        "id": "tu_1",
+                        "name": "Grep",
+                        "input": {"pattern": "needle", "path": "src/"},
+                    },
+                ],
+            },
+        },
+        # tool result (tool_result block packed into a user record)
+        {
+            "type": "user",
+            "timestamp": "2026-05-12T10:00:02.000Z",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_1",
+                        "is_error": False,
+                        "content": [
+                            {"type": "text", "text": "src/foo.py:42: needle"}
+                        ],
+                    }
+                ],
+            },
+        },
+        # noise that should be ignored
+        {
+            "type": "queue-operation",
+            "timestamp": "2026-05-12T10:00:03.000Z",
+        },
+    ]
+    (spawn_dir / "session.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in records) + "\n"
+    )
+
+
+def test_parse_worker_session_events_emits_one_event_per_block(paths):
+    """Each content block in the assistant record turns into its own
+    UnifiedEvent so the trace can render thinking, reply, and tool call
+    as distinct rows."""
+    d = _finished_spawn(paths, "spawn-7-700")
+    _write_worker_session_jsonl(d)
+
+    evs = sources.parse_worker_session_events(d, fallback_ts=0.0)
+    kinds = [e.kind for e in evs]
+    # user prompt → user_message
+    # assistant block → thinking + assistant_text + tool_use
+    # tool_result block → result
+    assert kinds == [
+        "user_message",
+        "thinking",
+        "assistant_text",
+        "tool_use",
+        "result",
+    ]
+    by_kind = {e.kind: e for e in evs}
+    assert by_kind["thinking"].detail["text"].startswith("let me grep")
+    assert by_kind["assistant_text"].detail["text"].startswith("Checking")
+    assert by_kind["tool_use"].detail["name"] == "Grep"
+    assert by_kind["tool_use"].detail["input"]["pattern"] == "needle"
+    assert "src/foo.py" in by_kind["result"].detail["text"]
+    assert by_kind["result"].detail["is_error"] is False
+
+
+def test_parse_worker_session_events_falls_back_to_session_id_glob(paths, tmp_path):
+    """If session.jsonl wasn't copied into the spawn dir but a
+    ``session_id`` file is present, the parser globs the projects dir
+    to find the still-live JSONL — that's the live-spawn case."""
+    d = _finished_spawn(paths, "spawn-8-800")
+    sid = "deadbeef-1111-2222-3333-444444444444"
+    (d / "session_id").write_text(sid)
+    fake_projects = tmp_path / "fake-projects"
+    project_subdir = fake_projects / "-some-cwd"
+    project_subdir.mkdir(parents=True)
+    (project_subdir / f"{sid}.jsonl").write_text(
+        json.dumps({
+            "type": "assistant",
+            "timestamp": "2026-05-12T11:00:00Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "live-only"}],
+            },
+        }) + "\n"
+    )
+    evs = sources.parse_worker_session_events(
+        d, fallback_ts=0.0, projects_dir=fake_projects
+    )
+    assert [e.kind for e in evs] == ["assistant_text"]
+    assert evs[0].detail["text"] == "live-only"
+
+
+def test_parse_worker_session_events_no_session_returns_empty(paths):
+    """No session_id, no session.jsonl, no projects dir → no events
+    (the trace falls back to prompt/stdout/stderr only)."""
+    d = _finished_spawn(paths, "spawn-9-900")
+    evs = sources.parse_worker_session_events(d, fallback_ts=0.0)
+    assert evs == []
+
+
+def test_gh_timeline_to_events_filters_to_sm_signal(paths):
+    """Only [SM] comments + sm:/art: label changes + cross-references +
+    close/reopen survive the filter — random GitHub noise is dropped."""
+    raw = [
+        {
+            "event": "labeled",
+            "created_at": "2026-05-12T09:00:00Z",
+            "actor": {"login": "jcronq"},
+            "label": {"name": "sm:selected"},
+        },
+        {
+            "event": "labeled",
+            "created_at": "2026-05-12T09:01:00Z",
+            "actor": {"login": "drive-by"},
+            "label": {"name": "needs-design"},  # not sm/art → filtered
+        },
+        {
+            "event": "commented",
+            "created_at": "2026-05-12T09:02:00Z",
+            "user": {"login": "jcronq"},
+            "body": "[SM] dispatcher-hello task=#137 ...",
+        },
+        {
+            "event": "commented",
+            "created_at": "2026-05-12T09:03:00Z",
+            "user": {"login": "alice"},
+            "body": "Looks good to me!",  # not [SM] → filtered
+        },
+        {
+            "event": "cross-referenced",
+            "created_at": "2026-05-12T09:04:00Z",
+            "actor": {"login": "jcronq"},
+            "source": {
+                "issue": {
+                    "number": 999,
+                    "html_url": "https://github.com/x/y/pull/999",
+                    "pull_request": {"url": "..."},
+                }
+            },
+        },
+        {
+            "event": "closed",
+            "created_at": "2026-05-12T09:05:00Z",
+            "actor": {"login": "jcronq"},
+            "commit_id": "abc123",
+        },
+    ]
+    out = sources._gh_timeline_to_events(raw, "spawn-1-1", fallback_ts=0.0)
+    summaries = [e.summary for e in out]
+    kinds = [e.kind for e in out]
+    # 4 surviving events out of 6 (the non-sm label + chatty comment dropped).
+    assert len(out) == 4
+    assert kinds.count("gh_comment") == 1
+    assert kinds.count("gh_event") == 3
+    assert any("labeled sm:selected" in s for s in summaries)
+    assert any("[SM] dispatcher-hello" in s for s in summaries)
+    assert any("linked from PR #999" in s for s in summaries)
+    assert any("closed by jcronq" in s for s in summaries)
+
+
+def test_fetch_issue_timeline_cached_caches_within_ttl(paths):
+    """Two calls within the TTL window hit the runner once."""
+    sources._GH_TIMELINE_CACHE.clear()
+    calls: list[list[str]] = []
+
+    def runner(args):
+        calls.append(list(args))
+        return json.dumps([{"event": "closed", "created_at": "2026-05-12T10:00:00Z"}])
+
+    now = [1000.0]
+
+    a = sources.fetch_issue_timeline_cached(
+        "jcronq/alice", 137, runner=runner, now_ts=lambda: now[0]
+    )
+    b = sources.fetch_issue_timeline_cached(
+        "jcronq/alice", 137, runner=runner, now_ts=lambda: now[0] + 30
+    )
+    assert a == b
+    assert len(calls) == 1, "expected the second call to be served from cache"
+    assert calls[0][0] == "gh"
+    assert "repos/jcronq/alice/issues/137/timeline" in calls[0][-1]
+
+    # Past the TTL the runner is consulted again.
+    sources.fetch_issue_timeline_cached(
+        "jcronq/alice", 137, runner=runner, now_ts=lambda: now[0] + 9999
+    )
+    assert len(calls) == 2
+
+
+def test_fetch_issue_timeline_cached_returns_empty_on_runner_failure(paths):
+    """A failing gh call must not crash the modal — degrade to no events."""
+    sources._GH_TIMELINE_CACHE.clear()
+
+    def runner(_args):
+        raise RuntimeError("gh: command not found")
+
+    out = sources.fetch_issue_timeline_cached("jcronq/alice", 137, runner=runner)
+    assert out == []
+
+
+def test_sm_spawn_trace_events_merges_all_three_sources_chronologically(paths):
+    """The assembled trace contains the spawn-dir files, the worker
+    session, and the GH timeline — sorted by timestamp."""
+    d = _finished_spawn(paths, "spawn-137-1778600300", stdout="working...\n")
+    _write_worker_session_jsonl(d)
+
+    fake_timeline = [
+        {
+            "event": "labeled",
+            "created_at": "2026-05-12T09:59:00Z",
+            "actor": {"login": "jcronq"},
+            "label": {"name": "sm:selected"},
+        },
+        {
+            "event": "commented",
+            "created_at": "2026-05-12T10:00:30Z",  # between assistant + result
+            "user": {"login": "jcronq"},
+            "body": "[SM] spawn-started task=#137 artifact=art:code",
+        },
+    ]
+
+    evs = sources.sm_spawn_trace_events(
+        d,
+        fallback_ts=0.0,
+        repo="jcronq/alice",
+        issue_number=137,
+        fetch_timeline=lambda _r, _n: fake_timeline,
+    )
+    kinds = [e.kind for e in evs]
+    # Should include both gh_* events and worker session events plus
+    # the file-shaped sm_prompt/sm_stdout.
+    assert "sm_prompt" in kinds
+    assert "sm_stdout" in kinds
+    assert "thinking" in kinds
+    assert "tool_use" in kinds
+    assert "result" in kinds
+    assert "gh_event" in kinds  # the labeled event
+    assert "gh_comment" in kinds  # the [SM] spawn-started
+
+    # Chronological sort: timestamps monotonically increase.
+    timestamps = [e.ts for e in evs]
+    assert timestamps == sorted(timestamps)
+
+
+def test_sm_spawn_issue_number_pulls_n_from_spawn_id(paths):
+    """The viewer extracts the issue number from the spawn id so the
+    timeline fetch can target the right issue."""
+    assert sources._sm_spawn_issue_number("spawn-137-1778600300") == 137
+    assert sources._sm_spawn_issue_number("spawn-1-99.2") == 1  # post-collision suffix
+    assert sources._sm_spawn_issue_number("not-a-spawn") is None
+    assert sources._sm_spawn_issue_number("") is None
