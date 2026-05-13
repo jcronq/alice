@@ -126,7 +126,9 @@
         });
         es.addEventListener('bucket_progress', (m) => {
           const d = JSON.parse(m.data);
-          metaText.textContent = `buckets: ${d.cached}/${d.total} ready (${d.pending} generating)…`;
+          const failed = d.failed || 0;
+          const failedSuffix = failed > 0 ? ` · ${failed} failed (skipped)` : '';
+          metaText.textContent = `buckets: ${d.cached}/${d.total} ready (${d.pending} generating)${failedSuffix}…`;
         });
         es.addEventListener('chunk', (m) => {
           const d = JSON.parse(m.data);

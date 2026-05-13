@@ -23,7 +23,20 @@ from .settings import Paths
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 BUCKET_MODEL = "claude-haiku-4-5"  # one-shot bucket summaries — Haiku is plenty
-DEFAULT_MAX_SECONDS = 90
+# Wall-clock cap on the streamed merge step. Covers the entire async
+# iteration over the SDK's stream — if Claude (or whatever's proxying
+# it) hangs without yielding, we surface an SSE ``error`` event
+# instead of letting the connection silently die. Bumped from 90s →
+# 10 min after #135: a healthy provider always finishes inside this,
+# and the old 90s ceiling kept firing on cold/slow runs even though
+# the streamed merge was still making forward progress.
+DEFAULT_MAX_SECONDS = 600
+# Per-bucket cap on the one-shot Haiku summarization call. One slow
+# call (provider 5xx, network stall) can't stall the whole fill — on
+# timeout the bucket is recorded with an empty summary so the merge
+# step skips it, and the rest of the fill continues. 60s is well
+# above a healthy Haiku response time for a 200-event prompt.
+BUCKET_MAX_SECONDS = 60
 # Final-merge cache TTL. Was 5 min when the cache was in-memory only;
 # bumped to 7d now that it's disk-persisted (mirrors bucket_cache).
 # Content-hash invalidation already handles "new events landed in the
@@ -435,7 +448,9 @@ async def _summarize_bucket(slot: BucketSlot) -> bucket_cache.BucketSummary:
         )
     prompt = _bucket_prompt(slot)
     started = time.time()
-    text, cost = await _run_once(prompt, max_output_tokens_hint=300)
+    # Per-bucket wall-clock cap — see BUCKET_MAX_SECONDS docstring.
+    async with asyncio.timeout(BUCKET_MAX_SECONDS):
+        text, cost = await _run_once(prompt, max_output_tokens_hint=300)
     return bucket_cache.BucketSummary(
         bucket_start=slot.start,
         bucket_seconds=slot.end - slot.start,
@@ -514,12 +529,15 @@ async def ensure_bucket_cache(
         else:
             to_generate.append((idx, slot))
 
+    failures: list[str] = []
+
     if progress_cb:
         await progress_cb(
             {
                 "cached": sum(1 for r in results if r is not None),
                 "total": len(slots),
                 "pending": len(to_generate),
+                "failed": 0,
             }
         )
 
@@ -527,9 +545,31 @@ async def ensure_bucket_cache(
 
     async def _one(idx: int, slot: BucketSlot):
         async with sem:
-            summary = await _summarize_bucket(slot)
-            # Only persist closed buckets — open buckets will change as events accumulate.
-            if not slot.is_open(now_ts):
+            try:
+                summary = await _summarize_bucket(slot)
+                persist = not slot.is_open(now_ts)
+            except Exception as exc:  # noqa: BLE001 — includes asyncio.TimeoutError
+                # One bucket failing is recoverable: record an empty
+                # placeholder so the merge step skips it (empty
+                # summaries are dropped by render_merge_prompt) and
+                # the rest of the fill keeps going. Don't persist
+                # failure placeholders to disk — a future request
+                # should retry.
+                failures.append(
+                    f"bucket {slot.start}: {type(exc).__name__}: {exc}"
+                )
+                summary = bucket_cache.BucketSummary(
+                    bucket_start=slot.start,
+                    bucket_seconds=slot.end - slot.start,
+                    content_hash=slot.content_hash,
+                    event_count=len(slot.events),
+                    summary="",
+                    cost_usd=0.0,
+                    duration_ms=0,
+                    generated_at=time.time(),
+                )
+                persist = False
+            if persist:
                 try:
                     bucket_cache.write(summary)
                 except OSError:
@@ -538,7 +578,12 @@ async def ensure_bucket_cache(
             if progress_cb:
                 done = sum(1 for r in results if r is not None)
                 await progress_cb(
-                    {"cached": done, "total": len(slots), "pending": len(slots) - done}
+                    {
+                        "cached": done,
+                        "total": len(slots),
+                        "pending": len(slots) - done,
+                        "failed": len(failures),
+                    }
                 )
 
     await asyncio.gather(*(_one(i, s) for i, s in to_generate))
