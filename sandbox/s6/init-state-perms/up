@@ -1,0 +1,4 @@
+foreground {
+    mkdir -p /state/worker /state/daemon
+}
+chown -R alice:alice /state

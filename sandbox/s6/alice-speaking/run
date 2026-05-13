@@ -1,0 +1,110 @@
+#!/command/with-contenv bash
+# Speaking Alice — Python daemon (Claude Agent SDK) that replaces the legacy
+# signal-bridge.sh. Runs as alice.
+#
+# Holds the flock on /state/worker/lease for the process lifetime so the
+# existing blue/green deploy mechanism (alice-deploy worker) still coordinates
+# handoff correctly. When blue/green is retired the flock wrapper can go.
+set -e
+
+# Skip the signal-cli readiness probe when Signal is disabled — the daemon
+# container is up but signal-cli isn't running, so polling would just burn
+# 60s before timing out on every (re)start.
+SIGNAL_DISABLED=
+if [ -f /state/daemon/signal-disabled ]; then
+    SIGNAL_DISABLED=1
+fi
+
+if [ -z "${SIGNAL_DISABLED}" ]; then
+    # Wait for signal-cli's HTTP endpoint. depends_on's service_healthy normally
+    # handles this but belt-and-braces.
+    for _ in $(seq 1 60); do
+        if curl -sfo /dev/null -X POST "${SIGNAL_API:-http://alice-daemon:8080}/api/v1/rpc" \
+            -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","method":"version","id":"ping"}' 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+fi
+
+export ALICE_CONFIG=/home/alice/.config/alice/alice.env
+# Monorepo root bind-mounted at /home/alice/alice — src/ holds all Python
+# packages (alice_core, alice_speaking, alice_thinking, alice_viewer).
+export PYTHONPATH=/home/alice/alice/src
+# Unbuffered stdout so s6 can see logs in real time.
+export PYTHONUNBUFFERED=1
+
+# Redirect stderr to a host-visible log file so install/runtime issues are
+# debuggable from `tail -F ~/.local/state/alice/worker/speaking-stderr.log`.
+# stdlib logging defaults to stderr; the EventLogger writes to /state/speaking.log.
+#
+# redirfd (execline) opens fd 2 *after* s6-setuidgid drops privileges, so
+# the log file is created/owned by alice. A shell-level `2>>` would be
+# evaluated by the parent shell (still root), leaving the inode root-owned
+# and breaking subsequent alice-uid writes (#10).
+#
+# Hot-restart loop: the inner `while true` re-execs the Python interpreter
+# when /state/worker/reload-requested-internal exists. The alice-reload-watcher
+# s6 service touches that flag and then runs `s6-svc -r` against this
+# service; SIGTERM forwards to the Python process, the loop sees the flag,
+# clears it, and starts a fresh interpreter — picking up bind-mounted code
+# changes without dropping the flock or recycling the s6 service. If the
+# flag isn't set after the Python process exits, this is a normal shutdown
+# (or a crash) and we break out so s6's own restart-backoff handles it.
+# Design: cortex-memory/research/2026-05-05-speaking-self-deploy-design.md.
+#
+# Lock + signal forwarding: the lock used to be held by ``flock -x LEASE
+# bash -c …`` — but flock(1) parents bash and DOES NOT forward signals,
+# so an s6 SIGTERM hit flock first. flock would terminate, bash would be
+# orphaned, and Python never saw the signal — it just got SIGKILLed at
+# the s6 gracetime cliff with the in-flight Claude turn dying mid-call.
+# Now bash itself opens fd 9 on the lease file and ``flock -x`` it: the
+# lock survives across hot-reload iterations (the fd stays open), and
+# the SIGTERM hits bash, runs the trap, and forwards to Python so the
+# daemon's drain path (see SpeakingDaemon.run) gets to actually run.
+exec s6-setuidgid alice redirfd -a 2 /state/worker/speaking-stderr.log \
+    bash -c '
+        # Hold the worker-slot lease for the lifetime of this shell —
+        # fd 9 stays open across the hot-reload while-loop, so the
+        # blue/green deploy still sees a continuously-held lock.
+        exec 9>>/state/worker/lease
+        flock -x 9
+
+        shutdown=
+        child=
+        on_signal() {
+            shutdown=1
+            if [[ -n "$child" ]]; then
+                kill -TERM "$child" 2>/dev/null || true
+            fi
+        }
+        trap on_signal TERM INT
+
+        while true; do
+            /opt/alice-venv/bin/python -m alice_speaking &
+            child=$!
+
+            # Signals interrupt wait (return 128+signum); the trap then
+            # forwards SIGTERM to Python. We re-wait until Python is
+            # actually reaped — drain mode in the daemon may take a
+            # while to finish the in-flight turn. ``|| rc=$?`` keeps
+            # the non-zero from killing the script under set -e.
+            while :; do
+                rc=0
+                wait "$child" 2>/dev/null || rc=$?
+                kill -0 "$child" 2>/dev/null || break
+            done
+
+            if [[ -n "$shutdown" ]]; then
+                # Real shutdown: do not honour a stale reload flag.
+                break
+            fi
+            if [[ -f /state/worker/reload-requested-internal ]]; then
+                rm -f /state/worker/reload-requested-internal
+            else
+                break
+            fi
+        done
+        exit "${rc:-0}"
+    '

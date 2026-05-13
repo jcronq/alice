@@ -1,0 +1,8 @@
+#!/command/with-contenv bash
+# Commit + push alice-mind every 15 minutes. s6 restarts us on crash.
+exec s6-setuidgid alice bash -c '
+    while true; do
+        /usr/local/bin/alice-mind-autopush 2>&1 || true
+        sleep 900
+    done
+'

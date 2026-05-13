@@ -1,0 +1,120 @@
+#!/command/with-contenv bash
+# alice-thinker — timer loop that fires alice-think on a mode-aware cadence.
+# Singleton enforced by `flock -n` on a shared lock; a second firing skips
+# rather than queues, matching the REM-cycle design where overlap is bad.
+#
+# Mode-aware cadence per Alice's active/sleep design:
+#   active mode (07:00–23:00): generative learning, fixed 5-min cadence
+#     (overridable via thinking.active_cadence_minutes)
+#   sleep mode (23:00–07:00): vault grooming with exponential backoff —
+#     5 → 10 → 20 → 40 min, hard-resets to 5 on meaningful work. The
+#     wake.py process writes the next interval to
+#     /state/worker/next-thinking-interval-seconds after each wake;
+#     the supervisor reads that here. See
+#     cortex-memory/research/2026-05-01-sleep-mode-exponential-backoff-design.md.
+#
+# Inbox interrupt: a new file in $MIND/inner/notes/ wakes the thinker
+# immediately regardless of the current backoff interval. We use
+# inotifywait with a timeout so the wait returns on either condition.
+# See cortex-memory/research/2026-05-01-sleep-mode-exponential-backoff-design.md.
+set -e
+
+LOCK=/state/worker/thinking.lock
+INTERVAL_FILE=/state/worker/next-thinking-interval-seconds
+CONFIG_JSON=/home/alice/alice-mind/config/alice.config.json
+NOTES_DIR=/home/alice/alice-mind/inner/notes
+DEFAULT_REM_CADENCE_MIN=5
+DEFAULT_ACTIVE_CADENCE_MIN=5
+
+mkdir -p "$(dirname "$LOCK")" "$NOTES_DIR"
+touch "$LOCK"
+chown alice:alice "$LOCK" || true
+
+# Graceful shutdown: a deploy SIGTERMs the worker container, s6 forwards
+# to this supervisor. We do NOT want to kill an in-flight alice-think
+# wake — the python subprocess writes to the mind repo and a SIGKILL at
+# the s6 gracetime cliff leaves files half-written. Bash defers traps
+# for foreground commands, so the in-flight ``flock + alice-think``
+# finishes naturally before the loop checks STOPPING and breaks. Sleeps
+# run in the background with ``wait`` so the trap fires immediately
+# during quiet periods (otherwise bash would defer the trap until a
+# multi-minute sleep returns).
+STOPPING=
+on_signal() {
+    STOPPING=1
+}
+trap on_signal TERM INT
+
+sleep 60 &
+wait $! 2>/dev/null || true
+
+while true; do
+    [ -n "$STOPPING" ] && break
+
+    hour=$(date +%H)
+    hour=${hour#0}
+    if [ "$hour" -lt 7 ] || [ "$hour" -ge 23 ]; then
+        mode=sleep
+    else
+        mode=active
+    fi
+
+    start_ts=$(date +%s)
+    # Foreground on purpose: bash defers the trap until alice-think
+    # returns, so the wake completes rather than being SIGKILLed.
+    flock -n "$LOCK" s6-setuidgid alice /usr/local/bin/alice-think || true
+    end_ts=$(date +%s)
+    elapsed=$(( end_ts - start_ts ))
+
+    [ -n "$STOPPING" ] && break
+
+    # Determine the wait interval AFTER the wake — wake.py just wrote
+    # the new sleep-mode interval to $INTERVAL_FILE.
+    if [ "$mode" = sleep ] && [ -r "$INTERVAL_FILE" ]; then
+        cadence=$(cat "$INTERVAL_FILE" 2>/dev/null || echo "")
+        case "$cadence" in
+            ''|*[!0-9]*) cadence=$(( DEFAULT_REM_CADENCE_MIN * 60 )) ;;
+        esac
+    else
+        if [ "$mode" = sleep ]; then
+            default_min="$DEFAULT_REM_CADENCE_MIN"
+            config_key=rem_cadence_minutes
+        else
+            default_min="$DEFAULT_ACTIVE_CADENCE_MIN"
+            config_key=active_cadence_minutes
+        fi
+        cadence_min="$default_min"
+        if [ -f "$CONFIG_JSON" ] && command -v jq >/dev/null 2>&1; then
+            v=$(jq -r ".thinking.$config_key // empty" "$CONFIG_JSON" 2>/dev/null || true)
+            case "$v" in
+                ''|*[!0-9]*) ;;
+                *) cadence_min="$v" ;;
+            esac
+        fi
+        cadence=$(( cadence_min * 60 ))
+    fi
+
+    remainder=$(( cadence - elapsed ))
+    if [ "$remainder" -gt 0 ]; then
+        # If a note arrived between the wake finishing and now, skip
+        # the wait so the next wake drains it immediately. Otherwise
+        # wait on inotify so a future arrival interrupts the backoff.
+        # Both inotifywait and sleep run in the background and we use
+        # ``wait``: ``wait`` is interruptible by signals, so a SIGTERM
+        # during a quiet period fires the trap promptly instead of
+        # waiting up to ``$remainder`` seconds.
+        if [ -d "$NOTES_DIR" ] && find "$NOTES_DIR" -mindepth 1 -maxdepth 1 -type f \
+                \( -name '*.md' -o -name '*.markdown' \) -print -quit 2>/dev/null | grep -q .; then
+            :
+        elif command -v inotifywait >/dev/null 2>&1 && [ -d "$NOTES_DIR" ]; then
+            inotifywait -q -e create -e moved_to -t "$remainder" "$NOTES_DIR" \
+                >/dev/null 2>&1 &
+            wait $! 2>/dev/null || true
+        else
+            sleep "$remainder" &
+            wait $! 2>/dev/null || true
+        fi
+    fi
+
+    [ -n "$STOPPING" ] && break
+done

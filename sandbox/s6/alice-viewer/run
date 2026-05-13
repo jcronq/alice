@@ -1,0 +1,16 @@
+#!/command/with-contenv bash
+# alice-viewer — FastAPI/uvicorn HTTP UI on :7777. Folded from the standalone
+# viewer container, which ran the same process as its Dockerfile CMD
+# (sandbox/viewer/Dockerfile:47). In the single-container shape the viewer
+# is just another s6 longrun under the same supervisor as speaking/thinker.
+#
+# Environment (ALICE_VIEWER_HOST/PORT, ALICE_VIEWER_RELOAD, etc.) is set by
+# the container env, same as today via docker-compose; this run script only
+# fixes PYTHONPATH so the bind-mounted src/ tree is importable. PYTHONUNBUFFERED
+# keeps logs flowing through s6's catchlog in real time.
+set -e
+
+export PYTHONPATH=/home/alice/alice/src
+export PYTHONUNBUFFERED=1
+
+exec s6-setuidgid alice /opt/alice-venv/bin/python -m alice_viewer.main

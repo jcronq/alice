@@ -1,0 +1,55 @@
+#!/command/with-contenv bash
+# alice-sm-dispatcher — timer loop that runs the State Machine v0
+# dispatcher: polls jcronq/alice for sm:selected issues and posts a
+# one-time hello comment per unseen issue. Dedup state lives at
+# /state/worker/sm-dispatcher-state.json.
+#
+# Singleton via `flock -n` so a slow poll can't double-fire.
+#
+# Cadence is read from alice.config.json `sm_dispatcher.poll_interval_seconds`
+# on each cycle (live reconfig, no restart needed). Default: 60s, floor 60s.
+# Dispatcher is a no-op when no sm:selected issues are open, so it's
+# safe to leave running.
+set -e
+
+LOCK=/state/worker/sm-dispatcher.lock
+CONFIG_JSON=/home/alice/alice-mind/config/alice.config.json
+DEFAULT_INTERVAL=60
+
+mkdir -p "$(dirname "$LOCK")"
+touch "$LOCK"
+chown alice:alice "$LOCK" || true
+
+# Stagger startup so the dispatcher and gh-watcher don't both wake up
+# in lockstep when the worker boots.
+sleep 45
+
+while true; do
+    interval="$DEFAULT_INTERVAL"
+    if [ -f "$CONFIG_JSON" ] && command -v jq >/dev/null 2>&1; then
+        v=$(jq -r '.sm_dispatcher.poll_interval_seconds // empty' "$CONFIG_JSON" 2>/dev/null || true)
+        case "$v" in
+            ''|*[!0-9]*) ;;
+            *) interval="$v" ;;
+        esac
+    fi
+    if [ "$interval" -lt 60 ]; then
+        # Polling faster than once a minute would burn rate limit and
+        # GitHub's secondary-rate-limit thresholds for not much win —
+        # same reasoning as alice-gh-watcher.
+        interval=60
+    fi
+
+    start_ts=$(date +%s)
+    # redirfd (execline) opens fd 2 after the privilege drop so the log
+    # file is owned by alice; shell `2>>` would open it as the
+    # supervising root shell.
+    flock -n "$LOCK" s6-setuidgid alice redirfd -a 2 /state/worker/sm-dispatcher-stderr.log \
+        /usr/local/bin/alice-sm-dispatcher || true
+    end_ts=$(date +%s)
+    elapsed=$(( end_ts - start_ts ))
+    remainder=$(( interval - elapsed ))
+    if [ "$remainder" -gt 0 ]; then
+        sleep "$remainder"
+    fi
+done

@@ -1,0 +1,35 @@
+#!/command/with-contenv bash
+# alice-thinker-watchdog — 30s tick that detects + recovers hung thinking
+# wakes. Phase 1 spec: pure deterministic rules over /state/worker/thinking.lock,
+# /proc/locks, the most recent inner/thoughts/<today>/*.md mtime, and
+# /state/worker/next-thinking-interval-seconds. SIGTERM → SIGKILL on a
+# stuck process; clear the lock file on an orphan.
+#
+# Phase 2 (not wired here) will layer an LLM judgment call on top of
+# the deterministic rules for the gray cases (long Stage D synthesis vs
+# actual hung). The hooks live in the python module; the cadence loop
+# stays here.
+#
+# Cadence is fixed at 30s — explicit per spec. Don't replace with
+# inotify; we want the watchdog to fire even when nothing changes
+# on disk (a hung process holding a stale wake file is exactly the
+# case where the watchdog must still tick).
+set -u
+
+WATCHDOG_BIN=/usr/local/bin/alice-thinker-watchdog
+TICK_SECONDS=30
+
+if [ ! -x "$WATCHDOG_BIN" ]; then
+    echo "[alice-thinker-watchdog] missing $WATCHDOG_BIN" >&2
+    exit 1
+fi
+
+# Brief startup nap — let init-state-perms settle and avoid a tick
+# during the worker's blue/green handoff window. Mirrors the 60s nap
+# at the top of alice-thinker/run.
+sleep 30
+
+while true; do
+    s6-setuidgid alice "$WATCHDOG_BIN" || true
+    sleep "$TICK_SECONDS"
+done
