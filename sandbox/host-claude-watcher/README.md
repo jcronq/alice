@@ -41,24 +41,50 @@ path, so `inbox/` and `outbox/` mean the same thing on both sides.
 
 ## Install
 
-```bash
-# 1. Copy the script onto the host.
-sudo cp alice-host-claude-watcher.sh /usr/local/bin/
-sudo chmod +x /usr/local/bin/alice-host-claude-watcher.sh
+The systemd unit runs `alice-host-claude-watcher.sh` directly from the
+bind-mounted repo (`ExecStart=${ALICE_REPO}/sandbox/host-claude-watcher/...`)
+so updating the daemon code is just `git pull && systemctl restart
+alice-host-claude` — no `/usr/local/bin/` copy step. Issue #144 traced a
+multi-hour stall to that copy step being skipped after PR #138 merged.
 
-# 2. Drop the systemd unit. Edit User= / Group= in the unit if you're
-#    not running as the `alice` host user; the binary needs to be on
-#    that user's PATH and ~/.claude needs to be readable.
+```bash
+# 1. Drop the systemd unit. Edit User= / Group= if you're not running
+#    as the `alice` host user; the binary needs to be on that user's
+#    PATH and ~/.claude needs to be readable. Edit ALICE_REPO if your
+#    clone lives somewhere other than ~/alice.
 sudo cp alice-host-claude.service /etc/systemd/system/
 
-# 3. Create the shared bind-mount dir if it doesn't exist yet.
+# 2. Create the shared bind-mount dir if it doesn't exist yet.
 sudo install -d -o alice -g alice /state/worker/host-claude/{inbox,outbox,.handled}
 
-# 4. Enable + start.
+# 3. Enable + start.
 sudo systemctl daemon-reload
 sudo systemctl enable --now alice-host-claude.service
 sudo systemctl status alice-host-claude.service
 ```
+
+## Update
+
+After `git pull`ing a change to `alice-host-claude-watcher.sh` or to the
+unit file:
+
+```bash
+# If the unit file changed:
+sudo cp alice-host-claude.service /etc/systemd/system/ && sudo systemctl daemon-reload
+# Always:
+sudo systemctl restart alice-host-claude.service
+```
+
+Verify the daemon is running the new code by reading the startup banner:
+
+```bash
+journalctl -u alice-host-claude.service -n 20 | grep 'script_sha='
+```
+
+The `script_sha=` prefix is the first 12 chars of the script's sha256.
+After a code change it must differ from the previous restart; if it
+doesn't, the wrong file is being executed (e.g. an old
+`/usr/local/bin/alice-host-claude-watcher.sh` shadow).
 
 The daemon logs to the journal:
 

@@ -56,6 +56,14 @@ log() {
     printf '%s [%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$1" "$2" >&2
 }
 
+# Startup banner. The sha256 prefix is a deploy-freshness check: after a
+# repo change to this script, `journalctl -u alice-host-claude.service`
+# should show a different `script_sha=` than before. Pre-#144 the
+# systemd unit ran a stale /usr/local/bin/ copy and there was no way to
+# tell from the journal whether the new code was loaded.
+SCRIPT_SHA="$(sha256sum "$0" 2>/dev/null | awk '{print substr($1,1,12)}')"
+log INFO "alice-host-claude-watcher starting script_path=$0 script_sha=${SCRIPT_SHA:-unknown} inbox_dir=$INBOX_DIR"
+
 # Look up the claude binary up-front. Refuse to run without it; a daemon
 # that silently no-ops every inbox file is worse than one that doesn't
 # start.

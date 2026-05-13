@@ -18,6 +18,7 @@ outbox never appears; post-fix it round-trips immediately.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import pathlib
 import shutil
@@ -37,6 +38,44 @@ pytestmark = pytest.mark.skipif(
     shutil.which("inotifywait") is None,
     reason="inotify-tools not installed; live-watch test needs inotifywait",
 )
+
+
+def test_startup_banner_includes_script_sha(tmp_path: pathlib.Path):
+    """Issue #144: stale `/usr/local/bin/` copies of the watcher silently
+    survived `systemctl restart`, leaving the host running pre-#138 code
+    while the repo claimed the fix was deployed. The startup banner now
+    emits `script_sha=<12hex>` so `journalctl` answers "which version is
+    running?" at a glance — a deploy that didn't take shows the old sha.
+
+    We invoke the watcher in --single-shot mode (no watch loop, exits
+    after draining the empty inbox) and assert the banner is in stderr
+    and matches the script's actual sha256 prefix.
+    """
+    root = tmp_path / "host-claude"
+    for d in (root / "inbox", root / "outbox", root / ".handled"):
+        d.mkdir(parents=True)
+
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text("#!/usr/bin/env bash\nexit 0\n")
+    fake_claude.chmod(0o755)
+
+    env = os.environ.copy()
+    env["ALICE_HOST_CLAUDE_ROOT"] = str(root)
+    env["ALICE_HOST_CLAUDE_BIN"] = str(fake_claude)
+
+    proc = subprocess.run(
+        ["bash", str(WATCHER), "--single-shot"],
+        env=env,
+        capture_output=True,
+        timeout=10,
+    )
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", errors="replace")
+
+    stderr = proc.stderr.decode("utf-8", errors="replace")
+    expected_sha = hashlib.sha256(WATCHER.read_bytes()).hexdigest()[:12]
+    assert "alice-host-claude-watcher starting" in stderr, stderr
+    assert f"script_sha={expected_sha}" in stderr, stderr
+    assert f"inbox_dir={root / 'inbox'}" in stderr, stderr
 
 
 def _write_request(inbox: pathlib.Path, request_id: str, body: str) -> pathlib.Path:
