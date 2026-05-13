@@ -229,6 +229,7 @@ def collect_notes(vault: Path) -> list[dict]:
             "aliases_json": json.dumps(aliases, ensure_ascii=False),
             "created": str(fm.get("created") or ""),
             "updated": str(fm.get("updated") or ""),
+            "access_count": int(fm.get("access_count") or 0),
             "body": body,
             "_aliases": aliases,
             "_wikilink_targets": extract_wikilinks(body),
@@ -359,11 +360,13 @@ def build(vault: Path, db_path: Path) -> dict:
                 )
                 link_count += 1
 
-        # Seed empty note_metrics rows so retrieval-protocol updates don't need INSERTs.
+        # Seed note_metrics from frontmatter. Frontmatter is canonical;
+        # the cue runner bumps both frontmatter and DB on each retrieval,
+        # so reading from frontmatter on rebuild preserves accumulated counts.
         for r in records:
             conn.execute(
-                "INSERT INTO note_metrics(slug, access_count) VALUES(?, 0)",
-                (r["slug"],),
+                "INSERT INTO note_metrics(slug, access_count) VALUES(?, ?)",
+                (r["slug"], r["access_count"]),
             )
 
         conn.execute(

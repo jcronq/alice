@@ -138,3 +138,31 @@ def test_build_raises_when_vault_missing(tmp_path: pathlib.Path):
     db_path = tmp_path / "index.db"
     with pytest.raises(SystemExit, match="vault not found"):
         build(tmp_path / "nonexistent", db_path)
+
+
+def test_note_metrics_seeded_from_frontmatter_access_count(tmp_path: pathlib.Path):
+    """Frontmatter is canonical for ``access_count``. The cue runner
+    bumps both frontmatter and DB on each retrieval; on rebuild, the
+    indexer must read access_count from frontmatter so accumulated
+    counts survive. Previously the seed always wrote 0, making the
+    recency boost inert."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "popular.md").write_text(
+        "---\ntitle: Popular\naccess_count: 42\n---\n\nBody.\n"
+    )
+    (vault / "fresh.md").write_text(
+        "---\ntitle: Fresh\n---\n\nBody.\n"
+    )
+
+    db_path = tmp_path / "index.db"
+    build(vault, db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = dict(conn.execute("SELECT slug, access_count FROM note_metrics"))
+    finally:
+        conn.close()
+
+    assert rows["popular"] == 42, f"expected 42 from frontmatter, got {rows.get('popular')}"
+    assert rows["fresh"] == 0, f"missing access_count should default to 0, got {rows.get('fresh')}"
