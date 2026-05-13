@@ -87,7 +87,12 @@ TRUSTED_AUTHORS: frozenset[str] = frozenset({"jcronq"})
 SM_LABEL_WHITELIST: frozenset[str] = frozenset(
     {
         "sm:draft",
+        "sm:needs_study",
         "sm:selected",
+        "sm:designing",
+        "sm:design_review",
+        "sm:designed",
+        "sm:compacting",
         "sm:building",
         "sm:reviewing",
         "sm:validating",
@@ -117,6 +122,18 @@ REVIEWING_SM_LABEL = "sm:reviewing"
 BUILDING_SM_LABEL = "sm:building"
 DONE_SM_LABEL = "sm:done"
 REJECTED_SM_LABEL = "sm:rejected"
+
+# SM v2 design-pipeline states (#148, #149). The dispatcher's main
+# switch falls through to the "no action this phase" branch for these
+# until follow-on issues wire the thinking-agent spawn machinery and
+# the per-state handlers. Adding them here makes them valid sm:*
+# labels so an issue tagged e.g. sm:designing doesn't trip the
+# "expected exactly one whitelisted sm:* label" trust-filter rejection.
+NEEDS_STUDY_SM_LABEL = "sm:needs_study"
+DESIGNING_SM_LABEL = "sm:designing"
+DESIGN_REVIEW_SM_LABEL = "sm:design_review"
+DESIGNED_SM_LABEL = "sm:designed"
+COMPACTING_SM_LABEL = "sm:compacting"
 
 # Terminal ``sm:*`` states — the dispatcher's sweep pass leaves these
 # alone. Non-terminal labels on a *closed* issue indicate a missed

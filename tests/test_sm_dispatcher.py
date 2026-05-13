@@ -238,6 +238,107 @@ def test_non_canonical_sm_label_is_skipped(state_path: pathlib.Path) -> None:
     assert report.skipped_trust == 1
 
 
+# Issue #150 — SM v2 pipeline labels are whitelisted but not yet routed.
+# The dispatcher's main switch falls through to "no action this phase";
+# the trust filter must accept them as valid sm:* values.
+V2_PIPELINE_LABELS = (
+    "sm:needs_study",
+    "sm:designing",
+    "sm:design_review",
+    "sm:designed",
+    "sm:compacting",
+    "sm:building",
+)
+
+
+@pytest.mark.parametrize("sm_label", V2_PIPELINE_LABELS)
+def test_v2_pipeline_label_is_in_whitelist(sm_label: str) -> None:
+    assert sm_label in sm.SM_LABEL_WHITELIST
+    assert sm_label not in sm.TERMINAL_SM_LABELS
+    assert sm_label in sm.NON_TERMINAL_SM_LABELS
+
+
+@pytest.mark.parametrize("sm_label", V2_PIPELINE_LABELS)
+def test_v2_pipeline_label_logs_no_action_this_phase(
+    state_path: pathlib.Path, sm_label: str
+) -> None:
+    """An issue at one of the new v2 states lists cleanly and the
+    dispatcher logs ``no action this phase`` rather than rejecting it
+    as an unknown sm:* label.
+    """
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    issues = [_make_issue(150, sm_labels=(sm_label,))]
+    logged: list[str] = []
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda repo: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert recorder.posted == []
+    assert label_rec.calls == []
+    assert close_rec.closed == []
+    assert report.transitioned == 0
+    assert report.skipped_trust == 0
+    assert any(
+        f"#150 at {sm_label} — no action this phase" in m for m in logged
+    ), logged
+    assert not any("expected exactly one whitelisted sm:* label" in m for m in logged)
+
+
+@pytest.mark.parametrize("sm_label", V2_PIPELINE_LABELS)
+def test_v2_pipeline_label_without_art_still_rejected(
+    state_path: pathlib.Path, sm_label: str
+) -> None:
+    """The trust filter still requires an ``art:*`` label. Whitelisting
+    new sm:* states must not relax that gate.
+
+    Note: with the new label-routed main loop the missing-art:* check
+    runs only inside ``_process_selected`` (after the sm-label switch).
+    For the new v2 states the dispatcher takes the no-op branch, so a
+    missing art:* doesn't bump ``skipped_trust`` — but the issue still
+    gets no action (no comments, no transitions, no spawns).
+    """
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    issues = [_make_issue(151, sm_labels=(sm_label,), art_labels=())]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda repo: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert recorder.posted == []
+    assert label_rec.calls == []
+    assert close_rec.closed == []
+    assert report.transitioned == 0
+
+
 def test_state_caps_at_1000_oldest_evicted(state_path: pathlib.Path) -> None:
     """After 1001 unique issues are recorded, the oldest one drops off."""
     state = sm.DispatcherState()
