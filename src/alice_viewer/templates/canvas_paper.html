@@ -21,12 +21,13 @@
   </article>
 
   <script>
-    (function () {
+    (async function () {
       const raw = document.getElementById("paper-raw").textContent;
       const body = document.getElementById("paper-body");
       if (window.marked && window.DOMPurify) {
         const rendered = window.marked.parse(raw, { breaks: true });
-        body.innerHTML = window.DOMPurify.sanitize(rendered);
+        body.innerHTML = window.DOMPurify.sanitize(rendered, { ADD_TAGS: ["foreignObject"] });
+        if (window.renderMermaid) await window.renderMermaid(body);
       } else {
         const pre = document.createElement("pre");
         pre.textContent = raw;
