@@ -29,7 +29,6 @@ import time
 from typing import Any, Callable, Iterable, Optional
 
 from ..runtime import (
-    BUILD_AGENT_TOOL_ALLOWLIST,
     BuildPromptInputs,
     Phase,
     PhaseRunner,
