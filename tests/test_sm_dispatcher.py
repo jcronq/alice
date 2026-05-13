@@ -110,6 +110,7 @@ def test_empty_poll_writes_empty_state(state_path: pathlib.Path) -> None:
         "hello_commented": [],
         "verify_failed_posted": [],
         "needs_study_hinted": [],
+        "design_revisions": {},
     }
 
 
@@ -254,11 +255,10 @@ def test_non_canonical_sm_label_is_skipped(state_path: pathlib.Path) -> None:
     assert report.skipped_trust == 1
 
 
-# Issue #150 — SM v2 pipeline labels are whitelisted but not yet routed.
-# The dispatcher's main switch falls through to "no action this phase";
-# the trust filter must accept them as valid sm:* values.
-# Issue #157 adds the ``sm:needs_study`` handler, so that label dropped
-# off this "no action" matrix — covered by its own test block below.
+# Issue #150 — SM v2 pipeline labels are whitelisted. Each label has
+# a dedicated handler (designing/design_review/designed/compacting/building
+# via #164; needs_study via #157), so the "no action this phase" matrix
+# is now empty. The whitelist + non-terminal membership assertions stay.
 V2_PIPELINE_LABELS = (
     "sm:designing",
     "sm:design_review",
@@ -273,87 +273,6 @@ def test_v2_pipeline_label_is_in_whitelist(sm_label: str) -> None:
     assert sm_label in sm.SM_LABEL_WHITELIST
     assert sm_label not in sm.TERMINAL_SM_LABELS
     assert sm_label in sm.NON_TERMINAL_SM_LABELS
-
-
-@pytest.mark.parametrize("sm_label", V2_PIPELINE_LABELS)
-def test_v2_pipeline_label_logs_no_action_this_phase(
-    state_path: pathlib.Path, sm_label: str
-) -> None:
-    """An issue at one of the new v2 states lists cleanly and the
-    dispatcher logs ``no action this phase`` rather than rejecting it
-    as an unknown sm:* label.
-    """
-    recorder = Recorder()
-    label_rec = LabelRecorder()
-    close_rec = CloseRecorder()
-    issues = [_make_issue(150, sm_labels=(sm_label,))]
-    logged: list[str] = []
-
-    exit_code, report = sm.run(
-        repo="jcronq/alice",
-        state_path=state_path,
-        enable_spawn=False,
-        list_issues=lambda repo: issues,
-        post_comment=recorder,
-        edit_labels=label_rec,
-        close_issue=close_rec,
-        find_linked_pr=_no_pr,
-        pr_merge_status=_no_call,
-        master_ci_status=_no_call,
-        now_iso=_frozen_now,
-        log=logged.append,
-    )
-
-    assert exit_code == 0
-    assert recorder.posted == []
-    assert label_rec.calls == []
-    assert close_rec.closed == []
-    assert report.transitioned == 0
-    assert report.skipped_trust == 0
-    assert any(
-        f"#150 at {sm_label} — no action this phase" in m for m in logged
-    ), logged
-    assert not any("expected exactly one whitelisted sm:* label" in m for m in logged)
-
-
-@pytest.mark.parametrize("sm_label", V2_PIPELINE_LABELS)
-def test_v2_pipeline_label_without_art_still_rejected(
-    state_path: pathlib.Path, sm_label: str
-) -> None:
-    """The trust filter still requires an ``art:*`` label. Whitelisting
-    new sm:* states must not relax that gate.
-
-    Note: with the new label-routed main loop the missing-art:* check
-    runs only inside ``_process_selected`` (after the sm-label switch).
-    For the new v2 states the dispatcher takes the no-op branch, so a
-    missing art:* doesn't bump ``skipped_trust`` — but the issue still
-    gets no action (no comments, no transitions, no spawns).
-    """
-    recorder = Recorder()
-    label_rec = LabelRecorder()
-    close_rec = CloseRecorder()
-    issues = [_make_issue(151, sm_labels=(sm_label,), art_labels=())]
-
-    exit_code, report = sm.run(
-        repo="jcronq/alice",
-        state_path=state_path,
-        enable_spawn=False,
-        list_issues=lambda repo: issues,
-        post_comment=recorder,
-        edit_labels=label_rec,
-        close_issue=close_rec,
-        find_linked_pr=_no_pr,
-        pr_merge_status=_no_call,
-        master_ci_status=_no_call,
-        now_iso=_frozen_now,
-        log=lambda _m: None,
-    )
-
-    assert exit_code == 0
-    assert recorder.posted == []
-    assert label_rec.calls == []
-    assert close_rec.closed == []
-    assert report.transitioned == 0
 
 
 def test_state_caps_at_1000_oldest_evicted(state_path: pathlib.Path) -> None:
@@ -4423,3 +4342,801 @@ def test_selected_return_to_study_dry_run_records_intent_only(
     assert (504, "sm:selected", "sm:needs_study") in report.transitions
     assert recorder.posted == []
     assert label_rec.calls == []
+
+
+
+
+# ---------------------------------------------------------------------------
+# Issue #164 — sm:designing / design_review / designed / compacting / building
+# ---------------------------------------------------------------------------
+
+
+def _design_issue(
+    number: int,
+    *,
+    sm_label: str,
+    body: str = "design this",
+    art_labels: tuple[str, ...] = ("art:code",),
+    author: str = "jcronq",
+    title: str = "Design task",
+) -> dict:
+    return _make_issue(
+        number,
+        author=author,
+        sm_labels=(sm_label,),
+        art_labels=art_labels,
+        title=title,
+    ) | {"body": body}
+
+
+# ----- _process_designing -----
+
+
+def test_designing_design_ready_transitions_to_design_review(
+    state_path: pathlib.Path,
+) -> None:
+    issues = [_design_issue(400, sm_label="sm:designing")]
+    comments = [
+        _audit_comment(
+            "[SM] design-ready note=[[2026-05-13-design-400]] author=alice"
+        ),
+    ]
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 1
+    assert (400, "sm:designing", "sm:design_review") in report.transitions
+    assert len(label_rec.calls) == 1
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:design_review"]
+    assert edit["remove"] == ["sm:designing"]
+    bodies = [b for _r, _n, b in recorder.posted]
+    assert any("from=designing to=design_review" in b for b in bodies)
+    assert any(b.startswith("[SM] design-ready-audit") for b in bodies)
+    assert any("note=[[2026-05-13-design-400]]" in b for b in bodies)
+
+
+def test_designing_without_design_ready_is_no_op(
+    state_path: pathlib.Path,
+) -> None:
+    issues = [_design_issue(401, sm_label="sm:designing")]
+    label_rec = LabelRecorder()
+    recorder = Recorder()
+    logged: list[str] = []
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=recorder,
+        edit_labels=label_rec,
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert label_rec.calls == []
+    assert recorder.posted == []
+    assert any("no [SM] design-ready comment yet" in m for m in logged)
+
+
+def test_designing_malformed_design_ready_is_no_op(
+    state_path: pathlib.Path,
+) -> None:
+    """Missing required ``note`` / ``author`` fields → parser rejects, handler stays."""
+    issues = [_design_issue(402, sm_label="sm:designing")]
+    # Missing the wikilink target — parser returns None.
+    comments = [_audit_comment("[SM] design-ready note=plain-text author=alice")]
+    label_rec = LabelRecorder()
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert label_rec.calls == []
+
+
+def test_designing_untrusted_design_ready_does_not_transition(
+    state_path: pathlib.Path,
+) -> None:
+    issues = [_design_issue(403, sm_label="sm:designing")]
+    comments = [
+        _audit_comment(
+            "[SM] design-ready note=[[forged]] author=alice",
+            author="random-drive-by",
+        ),
+    ]
+    label_rec = LabelRecorder()
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert label_rec.calls == []
+
+
+# ----- _process_design_review -----
+
+
+def test_design_review_design_approved_transitions_to_designed(
+    state_path: pathlib.Path,
+) -> None:
+    issues = [_design_issue(410, sm_label="sm:design_review")]
+    comments = [_audit_comment("[SM] design-approved")]
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 1
+    assert (410, "sm:design_review", "sm:designed") in report.transitions
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:designed"]
+    assert edit["remove"] == ["sm:design_review"]
+    assert any(
+        "from=design_review to=designed" in b for _r, _n, b in recorder.posted
+    )
+
+
+def test_design_review_approved_clears_revision_counter(
+    state_path: pathlib.Path,
+) -> None:
+    """A prior revise streak must be cleared on approve so a future
+    re-entry starts fresh."""
+    # Pre-seed state with 2 prior revisions on issue 411.
+    state = sm.DispatcherState()
+    state.design_revisions[411] = 2
+    sm.save_state(state_path, state)
+
+    issues = [_design_issue(411, sm_label="sm:design_review")]
+    comments = [_audit_comment("[SM] design-approved")]
+
+    sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    persisted = sm.load_state(state_path)
+    assert 411 not in persisted.design_revisions
+
+
+def test_design_review_design_revise_bounces_to_designing(
+    state_path: pathlib.Path,
+) -> None:
+    issues = [_design_issue(412, sm_label="sm:design_review")]
+    comments = [
+        _audit_comment(
+            '[SM] design-revise reason="needs more detail" feedback=[[fb-412]]'
+        ),
+    ]
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 1
+    assert (412, "sm:design_review", "sm:designing") in report.transitions
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:designing"]
+    assert edit["remove"] == ["sm:design_review"]
+    # Revision counter is bumped to 1 on first bounce.
+    persisted = sm.load_state(state_path)
+    assert persisted.design_revisions.get(412) == 1
+    assert any(
+        "from=design_review to=designing" in b and "iteration=1" in b
+        for _r, _n, b in recorder.posted
+    )
+
+
+def test_design_review_revise_at_cap_routes_to_rejected(
+    state_path: pathlib.Path,
+) -> None:
+    """The (cap+1)th revise bounces straight to ``sm:rejected``."""
+    state = sm.DispatcherState()
+    state.design_revisions[413] = sm.DESIGN_REVISION_CAP  # already at the cap
+    sm.save_state(state_path, state)
+
+    issues = [_design_issue(413, sm_label="sm:design_review")]
+    comments = [
+        _audit_comment(
+            '[SM] design-revise reason="still wrong" feedback=[[fb-413]]'
+        ),
+    ]
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 1
+    assert (413, "sm:design_review", "sm:rejected") in report.transitions
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:rejected"]
+    assert edit["remove"] == ["sm:design_review"]
+    bodies = [b for _r, _n, b in recorder.posted]
+    assert any("from=design_review to=rejected" in b for b in bodies)
+    assert any(b.startswith("[SM] design-revisions-capped") for b in bodies)
+    assert any(f"cap={sm.DESIGN_REVISION_CAP}" in b for b in bodies)
+    # Counter cleared after the terminal transition so a fresh re-entry
+    # (manual relabel) starts at zero again.
+    persisted = sm.load_state(state_path)
+    assert 413 not in persisted.design_revisions
+
+
+def test_design_review_revise_iterations_count_across_passes(
+    state_path: pathlib.Path,
+) -> None:
+    """Three revises in a row → three bounces; the fourth trips the cap."""
+    label_rec = LabelRecorder()
+
+    def _run_once(comments: list[dict]) -> sm.RunReport:
+        issues = [_design_issue(414, sm_label="sm:design_review")]
+        _ec, rep = sm.run(
+            repo="jcronq/alice",
+            state_path=state_path,
+            enable_spawn=False,
+            enable_cleanup=False,
+            enable_verify=False,
+            list_issues=lambda repo: issues,
+            list_comments=lambda repo, n: comments,
+            post_comment=Recorder(),
+            edit_labels=label_rec,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+        return rep
+
+    # Three iteration bounces.
+    for i in range(1, sm.DESIGN_REVISION_CAP + 1):
+        rep = _run_once(
+            [
+                _audit_comment(
+                    f'[SM] design-revise reason="iter-{i}" feedback=[[fb-{i}]]'
+                )
+            ]
+        )
+        assert (414, "sm:design_review", "sm:designing") in rep.transitions
+    persisted = sm.load_state(state_path)
+    assert persisted.design_revisions[414] == sm.DESIGN_REVISION_CAP
+
+    # Fourth revise → rejected.
+    rep = _run_once(
+        [
+            _audit_comment(
+                '[SM] design-revise reason="iter-4" feedback=[[fb-4]]'
+            )
+        ]
+    )
+    assert (414, "sm:design_review", "sm:rejected") in rep.transitions
+
+
+def test_design_review_no_recognized_comment_is_no_op(
+    state_path: pathlib.Path,
+) -> None:
+    issues = [_design_issue(415, sm_label="sm:design_review")]
+    label_rec = LabelRecorder()
+    logged: list[str] = []
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [_audit_comment("looks good")],
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert label_rec.calls == []
+    assert any(
+        "awaiting design-approved" in m for m in logged
+    ), logged
+
+
+# ----- _process_designed -----
+
+
+def _make_live_spawn_dir(tmp_path: pathlib.Path, issue_number: int) -> pathlib.Path:
+    """Build a fake live per-issue spawn dir with the dispatcher's
+    PID as the pidfile (so the live-check accepts it)."""
+    import os
+
+    spawn_root = tmp_path / "sm-spawns"
+    spawn_root.mkdir(parents=True, exist_ok=True)
+    child = spawn_root / f"spawn-{issue_number}-1700000000"
+    child.mkdir()
+    (child / "pidfile").write_text(str(os.getpid()))
+    return child
+
+
+def test_designed_writes_signal_and_transitions_to_compacting(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    issues = [_design_issue(420, sm_label="sm:designed")]
+    spawn_dir = _make_live_spawn_dir(tmp_path, 420)
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=recorder,
+        edit_labels=label_rec,
+        live_spawn_dir=lambda number: spawn_dir if number == 420 else None,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 1
+    assert (420, "sm:designed", "sm:compacting") in report.transitions
+    # Signal file is at <spawn-dir>/compact.signal.
+    signal = spawn_dir / sm.COMPACT_SIGNAL_FILENAME
+    assert signal.is_file()
+    assert signal.read_text().strip() == "compact"
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:compacting"]
+    assert edit["remove"] == ["sm:designed"]
+    assert any(
+        "from=designed to=compacting" in b for _r, _n, b in recorder.posted
+    )
+
+
+def test_designed_without_live_spawn_stays_for_human_triage(
+    state_path: pathlib.Path,
+) -> None:
+    issues = [_design_issue(421, sm_label="sm:designed")]
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    logged: list[str] = []
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=recorder,
+        edit_labels=label_rec,
+        live_spawn_dir=lambda _n: None,
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert label_rec.calls == []
+    assert recorder.posted == []
+    assert any(
+        "no live per-issue spawn dir" in m and "#421" in m for m in logged
+    )
+
+
+# ----- _process_compacting -----
+
+
+def test_compacting_build_started_transitions_to_building(
+    state_path: pathlib.Path,
+) -> None:
+    issues = [_design_issue(430, sm_label="sm:compacting")]
+    comments = [_audit_comment("[SM] build-started task=#430")]
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        has_live_spawn=lambda _n: True,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 1
+    assert (430, "sm:compacting", "sm:building") in report.transitions
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:building"]
+    assert edit["remove"] == ["sm:compacting"]
+    assert any(
+        "from=compacting to=building" in b for _r, _n, b in recorder.posted
+    )
+
+
+def test_compacting_without_build_started_is_no_op(
+    state_path: pathlib.Path,
+) -> None:
+    issues = [_design_issue(431, sm_label="sm:compacting")]
+    label_rec = LabelRecorder()
+    logged: list[str] = []
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        has_live_spawn=lambda _n: True,
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert label_rec.calls == []
+    assert any("awaiting [SM] build-started" in m for m in logged)
+
+
+def test_compacting_build_started_with_dead_spawn_still_transitions(
+    state_path: pathlib.Path,
+) -> None:
+    """Agent died mid-compaction is a degenerate case. The audit trail
+    says it claimed it started; we log a warning but still honor the
+    signal so the issue isn't permanently stuck."""
+    issues = [_design_issue(432, sm_label="sm:compacting")]
+    comments = [_audit_comment("[SM] build-started")]
+    label_rec = LabelRecorder()
+    logged: list[str] = []
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        has_live_spawn=lambda _n: False,
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 1
+    assert (432, "sm:compacting", "sm:building") in report.transitions
+    assert any(
+        "no live spawn dir" in m and "agent may have died" in m for m in logged
+    )
+
+
+def test_compacting_build_started_from_untrusted_author_ignored(
+    state_path: pathlib.Path,
+) -> None:
+    issues = [_design_issue(433, sm_label="sm:compacting")]
+    comments = [_audit_comment("[SM] build-started", author="random-drive-by")]
+    label_rec = LabelRecorder()
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        has_live_spawn=lambda _n: True,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert label_rec.calls == []
+
+
+# ----- _process_building -----
+
+
+def test_building_linked_pr_transitions_to_reviewing(
+    state_path: pathlib.Path,
+) -> None:
+    issues = [_design_issue(440, sm_label="sm:building")]
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+
+    def find_pr(_repo: str, _n: int) -> dict | None:
+        return {
+            "number": 999,
+            "url": "https://github.com/jcronq/alice/pull/999",
+            "state": "OPEN",
+        }
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=recorder,
+        edit_labels=label_rec,
+        find_linked_pr=find_pr,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 1
+    assert (440, "sm:building", "sm:reviewing") in report.transitions
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:reviewing"]
+    assert edit["remove"] == ["sm:building"]
+    assert any(
+        "from=building to=reviewing" in b and "pull/999" in b
+        for _r, _n, b in recorder.posted
+    )
+
+
+def test_building_without_linked_pr_is_no_op(
+    state_path: pathlib.Path,
+) -> None:
+    issues = [_design_issue(441, sm_label="sm:building")]
+    label_rec = LabelRecorder()
+    logged: list[str] = []
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        find_linked_pr=_no_pr,
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert label_rec.calls == []
+    assert any("no linked PR yet" in m for m in logged)
+
+
+def test_building_with_closed_linked_pr_does_not_transition(
+    state_path: pathlib.Path,
+) -> None:
+    """A non-OPEN linked PR (CLOSED / MERGED) at building isn't the
+    handoff signal — that lifecycle goes through the reviewing path."""
+    issues = [_design_issue(442, sm_label="sm:building")]
+    label_rec = LabelRecorder()
+
+    def find_pr(_repo: str, _n: int) -> dict | None:
+        return {
+            "number": 1000,
+            "url": "https://github.com/jcronq/alice/pull/1000",
+            "state": "CLOSED",
+        }
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        find_linked_pr=find_pr,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert label_rec.calls == []
+
+
+# ----- DispatcherState forward-compat for design_revisions -----
+
+
+def test_dispatcher_state_carries_design_revisions_field_across_load_save(
+    state_path: pathlib.Path,
+) -> None:
+    """Pre-#164 state files load with empty design_revisions; new field
+    persists on save."""
+    state_path.write_text(
+        json.dumps({"version": sm.STATE_VERSION, "hello_commented": [5, 6]})
+    )
+    loaded = sm.load_state(state_path)
+    assert loaded.hello_commented == [5, 6]
+    assert loaded.design_revisions == {}
+
+    loaded.bump_design_revisions(42)
+    loaded.bump_design_revisions(42)
+    loaded.bump_design_revisions(43)
+    sm.save_state(state_path, loaded)
+    on_disk = json.loads(state_path.read_text())
+    # JSON keys are strings; the in-memory dataclass uses int keys.
+    assert on_disk["design_revisions"] == {"42": 2, "43": 1}
+
+    # Reload coerces keys back to int.
+    reloaded = sm.load_state(state_path)
+    assert reloaded.design_revisions == {42: 2, 43: 1}
+
+
+def test_dispatcher_state_clear_design_revisions_is_idempotent() -> None:
+    state = sm.DispatcherState()
+    state.bump_design_revisions(7)
+    assert state.design_revision_count(7) == 1
+    state.clear_design_revisions(7)
+    state.clear_design_revisions(7)  # idempotent — no error on missing key
+    assert state.design_revision_count(7) == 0
+
+
+def test_render_design_ready_audit_shape() -> None:
+    out = sm.render_design_ready_audit_comment(
+        42, "design-note", timestamp="2026-05-13T12:00:00+00:00"
+    )
+    assert out == (
+        "[SM] design-ready-audit task=#42 note=[[design-note]] "
+        "ts=2026-05-13T12:00:00+00:00"
+    )
+
+
+def test_render_design_revisions_capped_shape() -> None:
+    out = sm.render_design_revisions_capped_comment(
+        42, 4, timestamp="2026-05-13T12:00:00+00:00"
+    )
+    assert out == (
+        "[SM] design-revisions-capped task=#42 count=4 cap=3 "
+        "ts=2026-05-13T12:00:00+00:00"
+    )
+
+
+def test_find_live_spawn_dir_for_issue_returns_none_when_absent(
+    tmp_path: pathlib.Path,
+) -> None:
+    spawn_root = tmp_path / "spawns"
+    spawn_root.mkdir()
+    assert sm.find_live_spawn_dir_for_issue(99, spawn_root) is None
+
+
+def test_find_live_spawn_dir_for_issue_returns_live_dir(
+    tmp_path: pathlib.Path,
+) -> None:
+    import os
+
+    spawn_root = tmp_path / "spawns"
+    spawn_root.mkdir()
+    child = spawn_root / "spawn-99-1700000000"
+    child.mkdir()
+    (child / "pidfile").write_text(str(os.getpid()))
+    found = sm.find_live_spawn_dir_for_issue(99, spawn_root)
+    assert found == child
+
+
+def test_find_live_spawn_dir_skips_dead_dirs(
+    tmp_path: pathlib.Path,
+) -> None:
+    spawn_root = tmp_path / "spawns"
+    spawn_root.mkdir()
+    dead = spawn_root / "spawn-99-1700000000"
+    dead.mkdir()
+    # PID 1 is init — definitely live, but we won't have permission
+    # to signal it. Use an obviously-dead PID instead. Use 999999 which
+    # is well past pid_max on a typical default of 32768.
+    (dead / "pidfile").write_text("999999")
+    assert sm.find_live_spawn_dir_for_issue(99, spawn_root) is None

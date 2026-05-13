@@ -424,3 +424,41 @@ def test_parse_comment_untrusted_logs(log: LogCapture) -> None:
     body = "[SM] design-approved"
     assert cm.parse_comment(body, "drive-by", log=log) is None
     assert "untrusted" in log.joined()
+
+
+# ---------------------------------------------------------------------------
+# build-started (issue #164)
+# ---------------------------------------------------------------------------
+
+
+def test_build_started_happy(log: LogCapture) -> None:
+    body = "[SM] build-started"
+    out = cm.parse_build_started(body, "jcronq", log=log)
+    assert out == cm.BuildStarted()
+    assert log.lines == []
+
+
+def test_build_started_with_trailing_audit_fields_accepted(log: LogCapture) -> None:
+    # The agent may render an audit-style payload — we tolerate
+    # ``task=#N ts=...`` trailing fields rather than require a bare verb.
+    body = "[SM] build-started task=#42 ts=2026-05-13T12:00:00+00:00"
+    out = cm.parse_build_started(body, "jcronq", log=log)
+    assert out == cm.BuildStarted()
+
+
+def test_build_started_untrusted_returns_none(log: LogCapture) -> None:
+    body = "[SM] build-started"
+    assert cm.parse_build_started(body, "drive-by", log=log) is None
+    assert "untrusted" in log.joined()
+
+
+def test_build_started_dispatch_resolves(log: LogCapture) -> None:
+    body = "[SM] build-started"
+    assert cm.parse_comment(body, "jcronq", log=log) == cm.BuildStarted()
+
+
+def test_build_started_does_not_match_other_verbs(log: LogCapture) -> None:
+    # Verb-prefix guard: ``build-started-something`` must NOT trip the
+    # ``build-started`` parser.
+    body = "[SM] build-started-other"
+    assert cm.parse_build_started(body, "jcronq", log=log) is None

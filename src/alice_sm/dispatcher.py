@@ -152,6 +152,25 @@ STUDY_HINT_WRITTEN_PREFIX = "[SM] study-hint-written"
 # import cycle and to let tests override per-call.
 NEEDS_STUDY_HINT_DIR = pathlib.Path("/home/alice/alice-mind/inner/notes")
 
+# Issue #164 — design-pipeline handlers. The dispatcher caps design
+# revision iterations to prevent an infinite design/review loop; the
+# fourth ``[SM] design-revise`` comment trips the cap and the issue
+# bounces to ``sm:rejected`` with an audit comment.
+DESIGN_REVISION_CAP = 3
+
+# Filename of the signal file the dispatcher drops into the live
+# per-issue spawn dir to ask the thinking-agent to compact. The agent
+# (see ``alice_thinking/cli/perissue.py``) polls for this file after
+# Speaking approves the design; finding it triggers the compaction +
+# BUILD-phase restart. Kept short / deterministic so the agent's
+# filesystem watch doesn't need to be clever.
+COMPACT_SIGNAL_FILENAME = "compact.signal"
+
+# Audit-comment prefix the dispatcher posts when it sees a fresh
+# ``[SM] design-ready`` from the thinking-agent — Speaking polls for
+# this prefix to know there's a new design draft to review.
+DESIGN_READY_AUDIT_PREFIX = "[SM] design-ready-audit"
+
 # Terminal ``sm:*`` states — the dispatcher's sweep pass leaves these
 # alone. Non-terminal labels on a *closed* issue indicate a missed
 # transition (Phase 1.6 sweep target).
@@ -423,12 +442,20 @@ class DispatcherState:
     semantics. The defensive comment-prefix scan in
     :func:`_process_needs_study` handles state-file resets so a single
     cycle can't double-fire the hint.
+
+    ``design_revisions`` (issue #164) maps issue number → count of
+    ``[SM] design-revise`` bounces seen at the ``sm:design_review``
+    gate. Capped at :data:`DESIGN_REVISION_CAP` to prevent an infinite
+    design/revise loop; the entry is cleared on a successful
+    ``design-approved`` transition (so a future re-entry into the
+    design lane starts fresh).
     """
 
     version: int = STATE_VERSION
     hello_commented: list[int] = field(default_factory=list)
     verify_failed_posted: list[int] = field(default_factory=list)
     needs_study_hinted: list[int] = field(default_factory=list)
+    design_revisions: dict[int, int] = field(default_factory=dict)
 
     def has_hello(self, number: int) -> bool:
         return number in self.hello_commented
@@ -475,12 +502,26 @@ class DispatcherState:
             overflow = len(self.needs_study_hinted) - SEEN_ISSUE_CAP
             del self.needs_study_hinted[:overflow]
 
+    def design_revision_count(self, number: int) -> int:
+        return self.design_revisions.get(number, 0)
+
+    def bump_design_revisions(self, number: int) -> int:
+        """Increment the revision counter for ``number`` and return the new value."""
+        new = self.design_revisions.get(number, 0) + 1
+        self.design_revisions[number] = new
+        return new
+
+    def clear_design_revisions(self, number: int) -> None:
+        self.design_revisions.pop(number, None)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": self.version,
             "hello_commented": list(self.hello_commented),
             "verify_failed_posted": list(self.verify_failed_posted),
             "needs_study_hinted": list(self.needs_study_hinted),
+            # Keys are stringified for JSON-stability; load_state coerces back.
+            "design_revisions": {str(k): v for k, v in self.design_revisions.items()},
         }
 
 
@@ -512,11 +553,23 @@ def load_state(state_path: pathlib.Path) -> DispatcherState:
     # default-to-empty treatment for older state files.
     raw_ns = data.get("needs_study_hinted") or []
     ns_numbers: list[int] = [int(n) for n in raw_ns if isinstance(n, int)]
+    # ``design_revisions`` was added in #164. Keys are persisted as
+    # strings (JSON object keys); coerce back to int and skip any
+    # malformed entry so a hand-edited state file can't crash the load.
+    raw_dr = data.get("design_revisions") or {}
+    design_revisions: dict[int, int] = {}
+    if isinstance(raw_dr, dict):
+        for k, v in raw_dr.items():
+            try:
+                design_revisions[int(k)] = int(v)
+            except (TypeError, ValueError):
+                continue
     return DispatcherState(
         version=STATE_VERSION,
         hello_commented=numbers,
         verify_failed_posted=vf_numbers,
         needs_study_hinted=ns_numbers,
+        design_revisions=design_revisions,
     )
 
 
@@ -634,7 +687,7 @@ def gh_list_sm_issues(repo: str, *, gh_bin: str = "gh") -> list[dict[str, Any]]:
         "--state",
         "open",
         "--search",
-        "label:sm:draft,sm:selected,sm:building,sm:reviewing,sm:validating",
+        "label:sm:draft,sm:needs_study,sm:selected,sm:designing,sm:design_review,sm:designed,sm:compacting,sm:building,sm:reviewing,sm:validating",
         "--json",
         "number,title,labels,author,createdAt,body",
         "--limit",
@@ -1460,6 +1513,36 @@ def has_live_spawn_for_issue(
     return alive
 
 
+def find_live_spawn_dir_for_issue(
+    issue_number: int,
+    spawn_dir: pathlib.Path = SPAWN_DIR,
+) -> pathlib.Path | None:
+    """Return the path of the live spawn dir for ``issue_number``, or None.
+
+    Issue #164's design-pipeline handlers use this to drop a compaction
+    signal file into the per-issue spawn dir at ``sm:designed`` entry.
+    Mirrors :func:`has_live_spawn_for_issue` but returns the path
+    instead of a bool. Does NOT reap dead dirs — the caller already
+    ran the bool check (or, in dry-run, doesn't care).
+
+    When multiple live dirs exist for the same issue (shouldn't happen
+    in practice; the spawn machinery enforces at-most-one), the first
+    one found is returned. The signal file is per-dir, so a stale
+    second dir won't pick up the signal — that's a feature, not a bug.
+    """
+    if not spawn_dir.is_dir():
+        return None
+    prefix = f"spawn-{issue_number}-"
+    for child in spawn_dir.iterdir():
+        if not child.is_dir() or child.name == ".finished":
+            continue
+        if not child.name.startswith(prefix):
+            continue
+        if _spawn_dir_is_alive(child):
+            return child
+    return None
+
+
 # Issue #142 — canonical spawn dir name shape, ``spawn-<N>-<unix-ts>``.
 # Used by :func:`proactive_reap_dead_spawns` to recover the issue number
 # the dispatcher should look up when deciding whether a dead dir is safe
@@ -1961,6 +2044,49 @@ def render_study_hint_audit_comment(
     return (
         f"{STUDY_HINT_WRITTEN_PREFIX} task=#{number} "
         f"path={note_path} ts={ts}"
+    )
+
+
+def render_design_ready_audit_comment(
+    number: int,
+    note: str,
+    *,
+    timestamp: str | None = None,
+) -> str:
+    """Produce a ``[SM] design-ready-audit ...`` payload.
+
+    Issue #164. Posted on the issue when the dispatcher observes a
+    fresh ``[SM] design-ready`` from the thinking-agent and transitions
+    the issue to ``sm:design_review``. Speaking's review loop polls for
+    this prefix as the "there's a design ready to review" signal. The
+    ``note=`` field carries the wikilink to the draft so a human (or
+    Speaking) can read it without re-parsing the agent's comment.
+    """
+    ts = timestamp or _now_iso()
+    return (
+        f"{DESIGN_READY_AUDIT_PREFIX} task=#{number} "
+        f"note=[[{note}]] ts={ts}"
+    )
+
+
+def render_design_revisions_capped_comment(
+    number: int,
+    revisions: int,
+    *,
+    timestamp: str | None = None,
+) -> str:
+    """Produce a ``[SM] design-revisions-capped ...`` audit payload.
+
+    Issue #164. Posted alongside the transition to ``sm:rejected`` when
+    the design/review loop trips :data:`DESIGN_REVISION_CAP`. The audit
+    line is in addition to the standard ``[SM] transition`` comment so
+    operators have a self-explanatory marker when the issue surfaces in
+    triage.
+    """
+    ts = timestamp or _now_iso()
+    return (
+        f"[SM] design-revisions-capped task=#{number} "
+        f"count={revisions} cap={DESIGN_REVISION_CAP} ts={ts}"
     )
 
 
@@ -3143,6 +3269,625 @@ def _process_needs_study(
     )
 
 
+# ---------------------------------------------------------------------------
+# Issue #164 — sm:designing / design_review / designed / compacting / building
+# ---------------------------------------------------------------------------
+
+
+def _find_parsed_comment_of_type(
+    comments: list[dict[str, Any]],
+    expected_types: type | tuple[type, ...],
+    *,
+    trusted_authors: frozenset[str],
+    log: Callable[[str], None],
+):
+    """Scan ``comments`` newest-first and return the first parsed match, or None.
+
+    The trust check is enforced inside the parsers themselves
+    (:mod:`alice_sm.comments`), so an untrusted commenter pasting one
+    of the canonical verbs parses to ``None`` and is silently skipped.
+    """
+    from alice_sm.comments import parse_comment
+
+    for c in reversed(comments):
+        if not isinstance(c, dict):
+            continue
+        body = c.get("body")
+        if not isinstance(body, str):
+            continue
+        login = _comment_author_login(c)
+        parsed = parse_comment(
+            body,
+            login,
+            trusted_authors=trusted_authors,
+            log=log,
+        )
+        if isinstance(parsed, expected_types):
+            return parsed
+    return None
+
+
+def _process_designing(
+    *,
+    issue: dict[str, Any],
+    repo: str,
+    report: RunReport,
+    post_comment: PostCommentFn,
+    edit_labels: EditLabelsFn,
+    list_comments: ListCommentsFn,
+    trusted_authors: frozenset[str],
+    dry_run: bool,
+    log: Callable[[str], None],
+    now_iso: Callable[[], str],
+) -> None:
+    """sm:designing → sm:design_review on a fresh ``[SM] design-ready`` comment.
+
+    The thinking-agent is running and producing a design draft. When it
+    emits ``[SM] design-ready note=[[...]]`` the dispatcher relabels the
+    issue ``sm:design_review`` and posts a ``[SM] design-ready-audit``
+    so Speaking's review loop knows to pick it up.
+
+    No design-ready comment yet → no action; the agent is still
+    working. The handler is otherwise idempotent: once the label flips
+    to ``sm:design_review`` the issue's next pass goes through
+    :func:`_process_design_review` instead.
+    """
+    number = issue["number"]
+    try:
+        comments = list_comments(repo, number)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] designing #{number}: "
+            f"failed to list comments: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+
+    from alice_sm.comments import DesignReady
+
+    parsed = _find_parsed_comment_of_type(
+        comments,
+        DesignReady,
+        trusted_authors=trusted_authors,
+        log=log,
+    )
+    if parsed is None:
+        log(
+            f"[sm-dispatcher] designing #{number}: "
+            f"no [SM] design-ready comment yet"
+        )
+        return
+
+    reason = f"design-ready note=[[{parsed.note}]]"
+    transition_body = render_transition_comment(
+        DESIGNING_SM_LABEL, DESIGN_REVIEW_SM_LABEL, reason
+    )
+    audit_body = render_design_ready_audit_comment(
+        number, parsed.note, timestamp=now_iso()
+    )
+    if dry_run:
+        log(
+            f"[sm-dispatcher] DRY-RUN would transition #{number}: "
+            f"designing → design_review ({reason})"
+        )
+        report.transitioned += 1
+        report.transitions.append(
+            (number, DESIGNING_SM_LABEL, DESIGN_REVIEW_SM_LABEL)
+        )
+        return
+    try:
+        edit_labels(
+            repo,
+            number,
+            add=[DESIGN_REVIEW_SM_LABEL],
+            remove=[DESIGNING_SM_LABEL],
+        )
+        post_comment(repo, number, transition_body)
+        post_comment(repo, number, audit_body)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] designing #{number}: "
+            f"failed to transition to design_review: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+    report.transitioned += 1
+    report.transitions.append(
+        (number, DESIGNING_SM_LABEL, DESIGN_REVIEW_SM_LABEL)
+    )
+    log(
+        f"[sm-dispatcher] transitioned #{number}: "
+        f"designing → design_review ({reason})"
+    )
+
+
+def _process_design_review(
+    *,
+    issue: dict[str, Any],
+    repo: str,
+    state: DispatcherState,
+    report: RunReport,
+    post_comment: PostCommentFn,
+    edit_labels: EditLabelsFn,
+    list_comments: ListCommentsFn,
+    trusted_authors: frozenset[str],
+    dry_run: bool,
+    log: Callable[[str], None],
+    now_iso: Callable[[], str],
+) -> None:
+    """sm:design_review → sm:designed | sm:designing | sm:rejected.
+
+    Speaking owns this gate. Two parseable verbs from a trusted author:
+
+      * ``[SM] design-approved`` → ``sm:designed``. Clears the per-issue
+        revision counter so a future re-entry starts fresh.
+      * ``[SM] design-revise reason=... feedback=[[...]]`` → bumps
+        :attr:`DispatcherState.design_revisions` for the issue. While
+        the count is at or below :data:`DESIGN_REVISION_CAP` the issue
+        bounces back to ``sm:designing`` for another iteration.
+        On the (cap+1)th bounce the issue is routed to ``sm:rejected``
+        with a ``[SM] design-revisions-capped`` audit so the operator
+        sees why the loop terminated.
+
+    Comments that aren't ``[SM] design-{approved,revise}`` are
+    ignored; we wait for the next pass.
+    """
+    number = issue["number"]
+    try:
+        comments = list_comments(repo, number)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] design_review #{number}: "
+            f"failed to list comments: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+
+    from alice_sm.comments import DesignApproved, DesignRevise
+
+    parsed = _find_parsed_comment_of_type(
+        comments,
+        (DesignApproved, DesignRevise),
+        trusted_authors=trusted_authors,
+        log=log,
+    )
+    if parsed is None:
+        log(
+            f"[sm-dispatcher] design_review #{number}: "
+            f"awaiting design-approved / design-revise"
+        )
+        return
+
+    if isinstance(parsed, DesignApproved):
+        target = DESIGNED_SM_LABEL
+        reason = "design-approved"
+        transition_body = render_transition_comment(
+            DESIGN_REVIEW_SM_LABEL, target, reason
+        )
+        if dry_run:
+            log(
+                f"[sm-dispatcher] DRY-RUN would transition #{number}: "
+                f"design_review → designed (approved)"
+            )
+            report.transitioned += 1
+            report.transitions.append(
+                (number, DESIGN_REVIEW_SM_LABEL, target)
+            )
+            return
+        try:
+            edit_labels(
+                repo,
+                number,
+                add=[target],
+                remove=[DESIGN_REVIEW_SM_LABEL],
+            )
+            post_comment(repo, number, transition_body)
+        except GHCommandError as exc:
+            log(
+                f"[sm-dispatcher] design_review #{number}: "
+                f"failed to transition to designed: {exc}"
+            )
+            if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+                raise
+            return
+        state.clear_design_revisions(number)
+        report.transitioned += 1
+        report.transitions.append((number, DESIGN_REVIEW_SM_LABEL, target))
+        log(
+            f"[sm-dispatcher] transitioned #{number}: "
+            f"design_review → designed (approved)"
+        )
+        return
+
+    # ----- design-revise branch -----
+    # Use the pre-existing count to decide: if the count is already at
+    # the cap, the new revise comment is the (cap+1)th bounce — reject.
+    # Otherwise increment and bounce back to designing.
+    prior = state.design_revision_count(number)
+    if prior >= DESIGN_REVISION_CAP:
+        capped_count = prior + 1
+        reason = (
+            f"design-revisions-capped count={capped_count} "
+            f"cap={DESIGN_REVISION_CAP}"
+        )
+        transition_body = render_transition_comment(
+            DESIGN_REVIEW_SM_LABEL, REJECTED_SM_LABEL, reason
+        )
+        audit_body = render_design_revisions_capped_comment(
+            number, capped_count, timestamp=now_iso()
+        )
+        if dry_run:
+            log(
+                f"[sm-dispatcher] DRY-RUN would transition #{number}: "
+                f"design_review → rejected ({reason})"
+            )
+            report.transitioned += 1
+            report.transitions.append(
+                (number, DESIGN_REVIEW_SM_LABEL, REJECTED_SM_LABEL)
+            )
+            return
+        try:
+            edit_labels(
+                repo,
+                number,
+                add=[REJECTED_SM_LABEL],
+                remove=[DESIGN_REVIEW_SM_LABEL],
+            )
+            post_comment(repo, number, transition_body)
+            post_comment(repo, number, audit_body)
+        except GHCommandError as exc:
+            log(
+                f"[sm-dispatcher] design_review #{number}: "
+                f"failed to transition to rejected: {exc}"
+            )
+            if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+                raise
+            return
+        state.clear_design_revisions(number)
+        report.transitioned += 1
+        report.transitions.append(
+            (number, DESIGN_REVIEW_SM_LABEL, REJECTED_SM_LABEL)
+        )
+        log(
+            f"[sm-dispatcher] transitioned #{number}: "
+            f"design_review → rejected ({reason})"
+        )
+        return
+
+    # Under the cap → iterate.
+    new_count = state.bump_design_revisions(number)
+    reason = (
+        f'design-revise iteration={new_count} '
+        f'reason="{parsed.reason}" feedback=[[{parsed.feedback}]]'
+    )
+    transition_body = render_transition_comment(
+        DESIGN_REVIEW_SM_LABEL, DESIGNING_SM_LABEL, reason
+    )
+    if dry_run:
+        # Roll back the bump so dry-run is side-effect-free on the
+        # ledger; we already incremented above to render the reason.
+        state.design_revisions[number] = new_count - 1
+        if state.design_revisions[number] == 0:
+            state.clear_design_revisions(number)
+        log(
+            f"[sm-dispatcher] DRY-RUN would transition #{number}: "
+            f"design_review → designing ({reason})"
+        )
+        report.transitioned += 1
+        report.transitions.append(
+            (number, DESIGN_REVIEW_SM_LABEL, DESIGNING_SM_LABEL)
+        )
+        return
+    try:
+        edit_labels(
+            repo,
+            number,
+            add=[DESIGNING_SM_LABEL],
+            remove=[DESIGN_REVIEW_SM_LABEL],
+        )
+        post_comment(repo, number, transition_body)
+    except GHCommandError as exc:
+        # Undo the ledger bump — the GH side didn't move, so the next
+        # pass should observe the same revise comment and retry.
+        state.design_revisions[number] = new_count - 1
+        if state.design_revisions[number] == 0:
+            state.clear_design_revisions(number)
+        log(
+            f"[sm-dispatcher] design_review #{number}: "
+            f"failed to bounce to designing: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+    report.transitioned += 1
+    report.transitions.append(
+        (number, DESIGN_REVIEW_SM_LABEL, DESIGNING_SM_LABEL)
+    )
+    log(
+        f"[sm-dispatcher] transitioned #{number}: "
+        f"design_review → designing ({reason})"
+    )
+
+
+def _process_designed(
+    *,
+    issue: dict[str, Any],
+    repo: str,
+    report: RunReport,
+    post_comment: PostCommentFn,
+    edit_labels: EditLabelsFn,
+    live_spawn_dir: Callable[[int], pathlib.Path | None] | None,
+    dry_run: bool,
+    log: Callable[[str], None],
+) -> None:
+    """sm:designed → sm:compacting: drop the compact signal, flip the label.
+
+    Brief checkpoint state. On entry we:
+
+      1. Locate the live per-issue spawn dir.
+      2. Write ``<spawn-dir>/compact.signal`` so the agent picks it
+         up on its next iteration and triggers the compaction +
+         BUILD-phase restart (per sub-issue 3's PhaseRunner).
+      3. Transition the issue ``sm:designed → sm:compacting``.
+
+    If there is no live spawn dir for the issue we log a WARNING and
+    stay at ``sm:designed`` — without a running agent the signal would
+    go unread, and silently transitioning would leave the issue stuck
+    at ``sm:compacting`` with no agent to advance it.
+    """
+    number = issue["number"]
+
+    spawn_path: pathlib.Path | None = None
+    if live_spawn_dir is not None:
+        spawn_path = live_spawn_dir(number)
+
+    if spawn_path is None:
+        log(
+            f"[sm-dispatcher] designed #{number}: WARNING — no live "
+            f"per-issue spawn dir; cannot write compact signal. "
+            f"Leaving at sm:designed for the next pass / human triage."
+        )
+        return
+
+    reason = f"compact signal at {spawn_path / COMPACT_SIGNAL_FILENAME}"
+    transition_body = render_transition_comment(
+        DESIGNED_SM_LABEL, COMPACTING_SM_LABEL, reason
+    )
+    if dry_run:
+        log(
+            f"[sm-dispatcher] DRY-RUN would transition #{number}: "
+            f"designed → compacting ({reason})"
+        )
+        report.transitioned += 1
+        report.transitions.append(
+            (number, DESIGNED_SM_LABEL, COMPACTING_SM_LABEL)
+        )
+        return
+
+    signal_path = spawn_path / COMPACT_SIGNAL_FILENAME
+    try:
+        signal_path.write_text("compact\n")
+    except OSError as exc:
+        log(
+            f"[sm-dispatcher] designed #{number}: failed to write "
+            f"compact signal at {signal_path}: {exc}"
+        )
+        return
+    try:
+        edit_labels(
+            repo,
+            number,
+            add=[COMPACTING_SM_LABEL],
+            remove=[DESIGNED_SM_LABEL],
+        )
+        post_comment(repo, number, transition_body)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] designed #{number}: "
+            f"failed to transition to compacting: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+    report.transitioned += 1
+    report.transitions.append(
+        (number, DESIGNED_SM_LABEL, COMPACTING_SM_LABEL)
+    )
+    log(
+        f"[sm-dispatcher] transitioned #{number}: "
+        f"designed → compacting ({reason})"
+    )
+
+
+def _process_compacting(
+    *,
+    issue: dict[str, Any],
+    repo: str,
+    report: RunReport,
+    post_comment: PostCommentFn,
+    edit_labels: EditLabelsFn,
+    list_comments: ListCommentsFn,
+    has_live_spawn: Callable[[int], bool] | None,
+    trusted_authors: frozenset[str],
+    dry_run: bool,
+    log: Callable[[str], None],
+) -> None:
+    """sm:compacting → sm:building on the agent's ``[SM] build-started`` comment.
+
+    The thinking-agent is mid-compaction (container restart in
+    progress). When it comes back up in BUILD mode it posts
+    ``[SM] build-started`` — that's the dispatcher's signal to flip
+    the label so :func:`_process_building` takes over and watches for
+    the PR.
+
+    The ``has_live_spawn`` callable is consulted as a confidence
+    check: if the agent died during compaction (no live spawn) we
+    still honor the build-started signal but log a warning, since the
+    audit trail says the agent claimed it started; humans can sort it
+    out from there.
+    """
+    number = issue["number"]
+    try:
+        comments = list_comments(repo, number)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] compacting #{number}: "
+            f"failed to list comments: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+
+    from alice_sm.comments import BuildStarted
+
+    parsed = _find_parsed_comment_of_type(
+        comments,
+        BuildStarted,
+        trusted_authors=trusted_authors,
+        log=log,
+    )
+    if parsed is None:
+        log(
+            f"[sm-dispatcher] compacting #{number}: "
+            f"awaiting [SM] build-started"
+        )
+        return
+
+    if has_live_spawn is not None and not has_live_spawn(number):
+        log(
+            f"[sm-dispatcher] compacting #{number}: WARNING — "
+            f"build-started seen but no live spawn dir; agent may have "
+            f"died during compaction. Transitioning anyway per audit trail."
+        )
+
+    reason = "build-started"
+    transition_body = render_transition_comment(
+        COMPACTING_SM_LABEL, BUILDING_SM_LABEL, reason
+    )
+    if dry_run:
+        log(
+            f"[sm-dispatcher] DRY-RUN would transition #{number}: "
+            f"compacting → building (build-started)"
+        )
+        report.transitioned += 1
+        report.transitions.append(
+            (number, COMPACTING_SM_LABEL, BUILDING_SM_LABEL)
+        )
+        return
+    try:
+        edit_labels(
+            repo,
+            number,
+            add=[BUILDING_SM_LABEL],
+            remove=[COMPACTING_SM_LABEL],
+        )
+        post_comment(repo, number, transition_body)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] compacting #{number}: "
+            f"failed to transition to building: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+    report.transitioned += 1
+    report.transitions.append(
+        (number, COMPACTING_SM_LABEL, BUILDING_SM_LABEL)
+    )
+    log(
+        f"[sm-dispatcher] transitioned #{number}: "
+        f"compacting → building (build-started)"
+    )
+
+
+def _process_building(
+    *,
+    issue: dict[str, Any],
+    repo: str,
+    report: RunReport,
+    post_comment: PostCommentFn,
+    edit_labels: EditLabelsFn,
+    find_linked_pr: FindLinkedPRFn,
+    dry_run: bool,
+    log: Callable[[str], None],
+) -> None:
+    """sm:building → sm:reviewing once a linked PR appears.
+
+    Mirrors the T1 sub-path inside :func:`_process_selected`: an
+    open linked PR is the "build complete" signal. The build-phase
+    agent opens its PR as a draft (per ``per-issue-build.md``); the
+    dispatcher relabels and hands off to the existing reviewing-state
+    pipeline (CI + verify + Sonnet review).
+    """
+    number = issue["number"]
+    try:
+        pr = find_linked_pr(repo, number)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] building #{number}: "
+            f"failed to look up linked PR: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+    if pr is None:
+        log(
+            f"[sm-dispatcher] building #{number}: "
+            f"no linked PR yet — staying"
+        )
+        return
+    pr_state = (pr.get("state") or "").upper()
+    if pr_state != "OPEN":
+        log(
+            f"[sm-dispatcher] building #{number}: linked PR is "
+            f"{pr_state!r} (not OPEN) — not transitioning"
+        )
+        return
+
+    pr_url = pr.get("url") or "<unknown>"
+    reason = f"PR opened: {pr_url}"
+    transition_body = render_transition_comment(
+        BUILDING_SM_LABEL, REVIEWING_SM_LABEL, reason
+    )
+    if dry_run:
+        log(
+            f"[sm-dispatcher] DRY-RUN would transition #{number}: "
+            f"building → reviewing ({pr_url})"
+        )
+        report.transitioned += 1
+        report.transitions.append(
+            (number, BUILDING_SM_LABEL, REVIEWING_SM_LABEL)
+        )
+        return
+    try:
+        edit_labels(
+            repo,
+            number,
+            add=[REVIEWING_SM_LABEL],
+            remove=[BUILDING_SM_LABEL],
+        )
+        post_comment(repo, number, transition_body)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] building #{number}: "
+            f"failed to transition to reviewing: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+    report.transitioned += 1
+    report.transitions.append(
+        (number, BUILDING_SM_LABEL, REVIEWING_SM_LABEL)
+    )
+    log(
+        f"[sm-dispatcher] transitioned #{number}: "
+        f"building → reviewing ({pr_url})"
+    )
+
+
 def _process_stale_closed(
     *,
     issue: dict[str, Any],
@@ -3332,6 +4077,7 @@ def run(
     pr_merge_status: PRMergeStatusFn = gh_get_pr_merge_status,
     master_ci_status: MasterCIStatusFn = gh_get_master_ci_status,
     has_live_spawn: Callable[[int], bool] | None = None,
+    live_spawn_dir: Callable[[int], pathlib.Path | None] | None = None,
     count_running: Callable[[], int] | None = None,
     spawn: Callable[[dict[str, Any], str, str], str | None] | None = None,
     get_issue: Callable[[int], dict[str, Any] | None] | None = None,
@@ -3374,6 +4120,9 @@ def run(
         if has_live_spawn is None:
             def has_live_spawn(number: int) -> bool:
                 return has_live_spawn_for_issue(number, SPAWN_DIR, log=log)
+        if live_spawn_dir is None:
+            def live_spawn_dir(number: int) -> pathlib.Path | None:
+                return find_live_spawn_dir_for_issue(number, SPAWN_DIR)
         if count_running is None:
             def count_running() -> int:
                 return count_running_spawns(SPAWN_DIR, log=log)
@@ -3544,9 +4293,71 @@ def run(
                     dry_run=dry_run,
                     log=log,
                 )
+            elif sm_label == DESIGNING_SM_LABEL:
+                _process_designing(
+                    issue=issue,
+                    repo=repo,
+                    report=report,
+                    post_comment=post_comment,
+                    edit_labels=edit_labels,
+                    list_comments=list_comments,
+                    trusted_authors=trusted_authors,
+                    dry_run=dry_run,
+                    log=log,
+                    now_iso=now_iso,
+                )
+            elif sm_label == DESIGN_REVIEW_SM_LABEL:
+                _process_design_review(
+                    issue=issue,
+                    repo=repo,
+                    state=state,
+                    report=report,
+                    post_comment=post_comment,
+                    edit_labels=edit_labels,
+                    list_comments=list_comments,
+                    trusted_authors=trusted_authors,
+                    dry_run=dry_run,
+                    log=log,
+                    now_iso=now_iso,
+                )
+            elif sm_label == DESIGNED_SM_LABEL:
+                _process_designed(
+                    issue=issue,
+                    repo=repo,
+                    report=report,
+                    post_comment=post_comment,
+                    edit_labels=edit_labels,
+                    live_spawn_dir=live_spawn_dir,
+                    dry_run=dry_run,
+                    log=log,
+                )
+            elif sm_label == COMPACTING_SM_LABEL:
+                _process_compacting(
+                    issue=issue,
+                    repo=repo,
+                    report=report,
+                    post_comment=post_comment,
+                    edit_labels=edit_labels,
+                    list_comments=list_comments,
+                    has_live_spawn=has_live_spawn,
+                    trusted_authors=trusted_authors,
+                    dry_run=dry_run,
+                    log=log,
+                )
+            elif sm_label == BUILDING_SM_LABEL:
+                _process_building(
+                    issue=issue,
+                    repo=repo,
+                    report=report,
+                    post_comment=post_comment,
+                    edit_labels=edit_labels,
+                    find_linked_pr=find_linked_pr,
+                    dry_run=dry_run,
+                    log=log,
+                )
             else:
-                # Phase 1.5 doesn't act on building / validating / done /
-                # rejected / blocked. Listed for visibility only.
+                # Phase 1.5 doesn't act on validating / done / rejected /
+                # blocked. Listed for visibility only.
                 log(f"[sm-dispatcher] #{number} at {sm_label} — no action this phase")
         except GHCommandError as exc:
             # Auth/rate-limit re-raised from inner handlers — bail.

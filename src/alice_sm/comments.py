@@ -191,6 +191,17 @@ class ReturnToStudy:
     reason: str
 
 
+@dataclass(frozen=True)
+class BuildStarted:
+    """``[SM] build-started`` — thinking-agent emits after compaction, in BUILD mode.
+
+    Signals to the dispatcher that the per-issue agent has finished
+    compaction and is now implementing against the approved design. The
+    dispatcher consumes it to transition ``sm:compacting`` →
+    ``sm:building``.
+    """
+
+
 # Union over every parsed result type. Handlers that consume
 # :func:`parse_comment` typically ``isinstance``-dispatch on this.
 ParsedComment = (
@@ -206,6 +217,7 @@ ParsedComment = (
     | StudyRejected
     | RouteToStudy
     | ReturnToStudy
+    | BuildStarted
 )
 
 
@@ -628,6 +640,28 @@ def parse_return_to_study(
     return ReturnToStudy(reason=reason)
 
 
+def parse_build_started(
+    body: str,
+    comment_author: str | None,
+    *,
+    trusted_authors: frozenset[str] = TRUSTED_AUTHORS,
+    log: Callable[[str], None] = _default_log,
+) -> BuildStarted | None:
+    """``[SM] build-started`` — thinking-agent emits after compaction.
+
+    Bare verb (no fields). The dispatcher consumes the prefix as the
+    sm:compacting → sm:building signal; a ``task=#N`` or ``ts=...``
+    suffix is tolerated (the agent may render an audit-style payload)
+    but not required.
+    """
+    tail = _strip_verb(body, "build-started")
+    if tail is None:
+        return None
+    if not _check_trust(comment_author, trusted_authors, "build-started", log):
+        return None
+    return BuildStarted()
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -651,6 +685,7 @@ _PARSERS: tuple[tuple[str, Callable[..., ParsedComment | None]], ...] = (
     ("study-rejected", parse_study_rejected),
     ("route-to-study", parse_route_to_study),
     ("return-to-study", parse_return_to_study),
+    ("build-started", parse_build_started),
 )
 
 
