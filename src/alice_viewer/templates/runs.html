@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block title %}runs{% endblock %}
+{% block body %}
+  <h1>SM dispatcher runs · <span id="runs-total">{{ total_runs }}</span></h1>
+  <p class="muted">
+    Live and finished SM-dispatcher worker spawns. ``/running`` shows
+    only live work across all hemispheres; this view is the SM-only
+    counterpart so you can follow a worker from spawn through reap.
+    Click a row to open the linked GitHub issue.
+  </p>
+
+  <div class="runs" id="runs"
+       hx-get="/runs/page?offset=0&limit={{ limit }}"
+       hx-trigger="sse:change[window.scrollY<200]"
+       hx-swap="innerHTML">
+    {% if runs %}
+      {% with page_url='/runs/page' %}
+        {% include "_runs_partial.html" %}
+      {% endwith %}
+    {% else %}
+      <div class="muted" style="padding:30px">No SM dispatcher runs yet.</div>
+    {% endif %}
+  </div>
+
+  <style>
+    .runs { display: flex; flex-direction: column; gap: 4px; }
+    .runs-sentinel {
+      padding: 14px 12px;
+      text-align: center;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .run {
+      display: grid;
+      grid-template-columns: 130px 130px 90px 1fr 90px;
+      gap: 12px;
+      padding: 8px 12px;
+      background: var(--panel);
+      border-left: 3px solid transparent;
+      border-radius: 0 4px 4px 0;
+      font-size: 12px;
+      cursor: pointer;
+      align-items: center;
+      min-height: 48px;
+    }
+    .run > * { min-width: 0; }
+    .run:hover { background: var(--panel-2); }
+    .run.hemi-sm { border-left-color: #8e3b3b; }
+    .run.kind-sm_spawn .kind-chip {
+      background: #8e3b3b; color: #ffe8e8;
+      padding: 2px 6px; border-radius: 3px;
+      font-family: var(--mono, monospace); font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.05em;
+    }
+    .run.status-running { border-left-color: var(--ok); }
+    .run .ts { color: var(--muted); font-size: 11px; line-height: 1.5; }
+    .run .kind { display: flex; gap: 6px; align-items: center; }
+    .run .kind .kind-chip { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .run .who { font-family: var(--mono); color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+    .run .summary {
+      color: var(--text);
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      line-height: 1.4;
+    }
+    .run .metrics { font-size: 11px; line-height: 1.5; text-align: right; }
+    .live-dot {
+      display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+      background: var(--ok); margin-right: 4px; vertical-align: middle;
+      animation: pulse 1.5s infinite ease-in-out;
+    }
+    .run.running { background: linear-gradient(90deg, var(--panel), color-mix(in srgb, var(--ok) 6%, var(--panel))); }
+  </style>
+
+  <script>
+    (function () {
+      const container = document.getElementById('runs');
+      container.addEventListener('click', (e) => {
+        if (e.target.tagName === 'A') return;
+        const row = e.target.closest('.run');
+        if (!row) return;
+        const externalUrl = row.getAttribute('data-external-url');
+        if (externalUrl) {
+          window.open(externalUrl, '_blank', 'noopener');
+        }
+      });
+    })();
+  </script>
+{% endblock %}

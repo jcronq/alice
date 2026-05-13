@@ -39,8 +39,11 @@
   </div>
 {% endfor %}
 {% if has_more %}
+  {# /runs reuses this partial too; ``page_url`` lets it point the
+     infinite-scroll sentinel at its own paginator instead of timeline's. #}
+  {% set _page_url = page_url or '/timeline/page' %}
   <div class="runs-sentinel"
-       hx-get="/timeline/page?offset={{ next_offset }}&limit={{ limit }}{% if hemisphere %}&hemisphere={{ hemisphere }}{% endif %}"
+       hx-get="{{ _page_url }}?offset={{ next_offset }}&limit={{ limit }}{% if hemisphere %}&hemisphere={{ hemisphere }}{% endif %}"
        hx-trigger="revealed"
        hx-swap="outerHTML">
     <span class="muted">loading more…</span>

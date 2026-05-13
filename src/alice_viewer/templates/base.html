@@ -18,7 +18,7 @@
       <span class="logo">◑</span>
       <span>{{ personae.agent.name }} Viewer</span>
     </div>
-    {% set history_active = active in ('timeline', 'wakes', 'turns', 'interactions', 'narrative') %}
+    {% set history_active = active in ('timeline', 'wakes', 'turns', 'runs', 'interactions', 'narrative') %}
     <nav>
       <a href="/chat"       class="{% if active == 'chat' %}on{% endif %}">chat</a>
       <details class="nav-dropdown {% if history_active %}on{% endif %}">
@@ -27,6 +27,7 @@
           <a href="/"             class="{% if active == 'timeline' %}on{% endif %}">timeline</a>
           <a href="/wakes"        class="{% if active == 'wakes' %}on{% endif %}">wakes</a>
           <a href="/turns"        class="{% if active == 'turns' %}on{% endif %}">turns</a>
+          <a href="/runs"         class="{% if active == 'runs' %}on{% endif %}">runs</a>
           <a href="/interactions" class="{% if active == 'interactions' %}on{% endif %}">interactions</a>
           <a href="/narrative"    class="{% if active == 'narrative' %}on{% endif %}">narrative</a>
         </div>

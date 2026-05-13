@@ -252,6 +252,53 @@ def create_app(paths: Paths | None = None) -> FastAPI:
             runs = [r for r in runs if r.hemisphere == hemisphere]
         return JSONResponse([r.to_dict() for r in runs[:limit]])
 
+    @app.get("/runs", response_class=HTMLResponse)
+    async def runs_index(request: Request, limit: int = 50):
+        """SM-dispatcher spawns — live + finished, newest start first.
+
+        Sibling of ``/wakes`` and ``/turns`` for SM worker runs (#124);
+        a filtered view onto the same data ``group_sm_runs`` produces.
+        """
+        p: Paths = app.state.paths
+        runs = aggregators.group_sm_runs(p)
+        total = len(runs)
+        page = runs[:limit]
+        return templates.TemplateResponse(
+            request,
+            "runs.html",
+            {
+                "runs": page,
+                "total_runs": total,
+                "limit": limit,
+                "next_offset": limit,
+                "has_more": total > limit,
+                "state": _state_context(),
+                "active": "runs",
+            },
+        )
+
+    @app.get("/runs/page", response_class=HTMLResponse)
+    async def runs_page(request: Request, offset: int = 0, limit: int = 50):
+        """HTML partial for one page of SM-runs rows + (optionally) a new
+        infinite-scroll sentinel. Mirrors ``/timeline/page``."""
+        p: Paths = app.state.paths
+        runs = aggregators.group_sm_runs(p)
+        page = runs[offset : offset + limit]
+        next_offset = offset + limit
+        return templates.TemplateResponse(
+            request,
+            "_runs_partial.html",
+            {
+                "runs": page,
+                "limit": limit,
+                "next_offset": next_offset,
+                "has_more": next_offset < len(runs),
+                # _runs_partial.html's sentinel hard-codes /timeline/page;
+                # signal we want the SM-only feed instead.
+                "page_url": "/runs/page",
+            },
+        )
+
     @app.get("/wakes", response_class=HTMLResponse)
     async def wakes_index(request: Request, limit: int = 50):
         from . import run_summary

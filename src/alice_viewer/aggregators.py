@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
@@ -210,34 +211,93 @@ def group_runs(
         for fs in _sources._history_sm_spawns(
             paths.state_dir / "sm-dispatcher-spawns"
         ):
-            duration_ms = max(0, int((fs.ended_at - fs.started_at) * 1000))
-            if fs.outcome_hint:
-                summary = f"{fs.art_label} · {fs.outcome_hint[:140]}"
-            else:
-                summary = fs.art_label
-            runs.append(
-                Run(
-                    run_id=fs.spawn_id,
-                    kind="sm_spawn",
-                    hemisphere="sm",
-                    start_ts=fs.started_at,
-                    end_ts=fs.ended_at,
-                    status="ended",
-                    summary=summary,
-                    duration_ms=duration_ms,
-                    cost_usd=None,
-                    model=None,
-                    tools=[],
-                    sender_name=f"#{fs.issue_number}",
-                    inbound=None,
-                    outbound=None,
-                    error=None,
-                    detail_url=(
-                        f"https://github.com/jcronq/alice/issues/{fs.issue_number}"
-                    ),
-                    events=[],
-                )
-            )
+            runs.append(_finished_sm_to_run(fs))
+    runs.sort(key=lambda r: r.start_ts, reverse=True)
+    return runs
+
+
+def _finished_sm_to_run(fs: _sources.FinishedSmSpawn) -> Run:
+    duration_ms = max(0, int((fs.ended_at - fs.started_at) * 1000))
+    if fs.outcome_hint:
+        summary = f"{fs.art_label} · {fs.outcome_hint[:140]}"
+    else:
+        summary = fs.art_label
+    return Run(
+        run_id=fs.spawn_id,
+        kind="sm_spawn",
+        hemisphere="sm",
+        start_ts=fs.started_at,
+        end_ts=fs.ended_at,
+        status="ended",
+        summary=summary,
+        duration_ms=duration_ms,
+        cost_usd=None,
+        model=None,
+        tools=[],
+        sender_name=f"#{fs.issue_number}",
+        inbound=None,
+        outbound=None,
+        error=None,
+        detail_url=(
+            f"https://github.com/jcronq/alice/issues/{fs.issue_number}"
+        ),
+        events=[],
+    )
+
+
+def _live_sm_to_run(job: _sources.RunningJob) -> Run:
+    issue_number = int(job.detail.get("issue_number", 0))
+    art_label = str(job.detail.get("art_label", "art:unknown"))
+    # ``job.what`` is shaped ``#NN · art:* · tail``; strip the ``#NN · ``
+    # prefix so it doesn't double up with the sender_name column.
+    prefix = f"#{issue_number} · "
+    summary = job.what[len(prefix):] if job.what.startswith(prefix) else job.what
+    return Run(
+        run_id=job.job_id,
+        kind="sm_spawn",
+        hemisphere="sm",
+        start_ts=job.started_at,
+        end_ts=None,
+        status="running",
+        summary=summary or art_label,
+        duration_ms=None,
+        cost_usd=None,
+        model=None,
+        tools=[],
+        sender_name=f"#{issue_number}",
+        inbound=None,
+        outbound=None,
+        error=None,
+        detail_url=(
+            f"https://github.com/jcronq/alice/issues/{issue_number}"
+        ),
+        events=[],
+    )
+
+
+def group_sm_runs(paths: Paths, now_ts: float | None = None) -> list[Run]:
+    """Live + finished SM-dispatcher spawns, unified and newest-first.
+
+    Powers the ``/runs`` history-dropdown entry (#124): past and current
+    SM worker runs in one tab. ``/running`` shows only live spawns; the
+    main timeline shows only finished ones — this view stitches them
+    together so the lifecycle of a single worker can be followed without
+    bouncing between tabs.
+
+    ``now_ts`` is an injection seam for tests so live-spawn detection is
+    deterministic; defaults to ``time.time()``. The stale cutoff matches
+    ``list_running_jobs`` (2 hours) — older spawn dirs are zombies and
+    are surfaced as finished if they've been reaped, dropped otherwise.
+    """
+    if now_ts is None:
+        now_ts = time.time()
+    spawn_dir = paths.state_dir / "sm-dispatcher-spawns"
+    runs: list[Run] = []
+    for fs in _sources._history_sm_spawns(spawn_dir):
+        runs.append(_finished_sm_to_run(fs))
+    cutoff = now_ts - 7200
+    for job in _sources._open_sm_spawns(spawn_dir, cutoff, now_ts):
+        runs.append(_live_sm_to_run(job))
     runs.sort(key=lambda r: r.start_ts, reverse=True)
     return runs
 
