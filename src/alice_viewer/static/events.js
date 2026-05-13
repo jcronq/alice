@@ -52,6 +52,9 @@ const KIND_LABELS = {
   note_consumed: 'note · consumed',
   thought_written: 'thought · written',
   turn_log: 'signal turn (legacy)',
+  sm_prompt: 'spawn prompt',
+  sm_stdout: 'spawn stdout',
+  sm_stderr: 'spawn stderr',
 };
 
 const KIND_FAMILIES = {
@@ -75,6 +78,7 @@ const KIND_FAMILIES = {
   context_compaction_error: 'error',
   config_reload: 'meta', quiet_queue_enter: 'meta', quiet_queue_drain: 'meta', system: 'meta',
   context_compaction_start: 'meta', context_compaction: 'meta', session_roll: 'meta',
+  sm_prompt: 'text', sm_stdout: 'text', sm_stderr: 'error',
 };
 
 window.humanizeKind = (k) => KIND_LABELS[k] || (k || '').replace(/_/g, ' ');
@@ -566,11 +570,13 @@ function _renderTraceRow(ev) {
   const ts = fmtTs(ev.ts).replace(/^.* /, '');
   const detail = ev.detail || {};
 
-  const isRich =
+  const isText =
     ev.kind === 'thinking' ||
     ev.kind === 'assistant_text' ||
-    ev.kind === 'tool_use' ||
-    ev.kind === 'system';
+    ev.kind === 'sm_prompt' ||
+    ev.kind === 'sm_stdout' ||
+    ev.kind === 'sm_stderr';
+  const isRich = isText || ev.kind === 'tool_use' || ev.kind === 'system';
 
   if (!isRich) {
     return '<div class="trace-row compact fam-' + fam + '">' +
@@ -581,7 +587,7 @@ function _renderTraceRow(ev) {
   }
 
   let body;
-  if (ev.kind === 'thinking' || ev.kind === 'assistant_text') {
+  if (isText) {
     const text = (detail.text || '').trim();
     body = text
       ? '<div class="trace-text">' + escapeHtml(text) + '</div>'

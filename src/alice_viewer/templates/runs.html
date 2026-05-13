@@ -6,7 +6,8 @@
     Live and finished SM-dispatcher worker spawns. ``/running`` shows
     only live work across all hemispheres; this view is the SM-only
     counterpart so you can follow a worker from spawn through reap.
-    Click a row to open the linked GitHub issue.
+    Click a row to open the spawn's trace (prompt + stdout + stderr);
+    the issue-number link goes to GitHub.
   </p>
 
   <div class="runs" id="runs"
@@ -78,14 +79,15 @@
   <script>
     (function () {
       const container = document.getElementById('runs');
-      container.addEventListener('click', (e) => {
+      container.addEventListener('click', async (e) => {
+        // The sender-name cell wraps the issue # in an <a> — let it
+        // navigate to GitHub instead of stealing the click for the modal.
         if (e.target.tagName === 'A') return;
         const row = e.target.closest('.run');
         if (!row) return;
-        const externalUrl = row.getAttribute('data-external-url');
-        if (externalUrl) {
-          window.open(externalUrl, '_blank', 'noopener');
-        }
+        const id = row.getAttribute('data-run-id');
+        if (!id) return;
+        await window.openRunModal(id);
       });
     })();
   </script>

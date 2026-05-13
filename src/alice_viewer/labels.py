@@ -65,6 +65,12 @@ KIND_LABELS: dict[str, str] = {
     "note_consumed": "note · consumed",
     "thought_written": "thought · written",
     "turn_log": "signal turn (legacy log)",
+    # SM-dispatcher spawn synthetic events (one per file in the spawn
+    # dir). The worker doesn't emit structured logs; these wrap the raw
+    # files so the run-detail modal has something to render.
+    "sm_prompt": "spawn prompt",
+    "sm_stdout": "spawn stdout",
+    "sm_stderr": "spawn stderr",
 }
 
 
@@ -132,6 +138,11 @@ KIND_FAMILIES: dict[str, str] = {
     "context_compaction_start": "meta",
     "context_compaction": "meta",
     "session_roll": "meta",
+    # SM spawn synthetic events — prompt/stdout render as text; stderr
+    # is bucketed with errors so failed workers stand out in the trace.
+    "sm_prompt": "text",
+    "sm_stdout": "text",
+    "sm_stderr": "error",
 }
 
 

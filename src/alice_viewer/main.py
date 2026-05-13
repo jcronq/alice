@@ -227,17 +227,31 @@ def create_app(paths: Paths | None = None) -> FastAPI:
 
     @app.get("/api/runs/{run_id}")
     async def api_run_detail(run_id: str) -> JSONResponse:
-        """Return one run + its event trace as JSON for the timeline modal."""
+        """Return one run + its event trace as JSON for the timeline modal.
+
+        Falls through to ``group_sm_runs`` so live SM-dispatcher spawns
+        (which ``group_runs`` doesn't see) also resolve — and synthesises
+        an event trace from the spawn dir's files since SM workers don't
+        emit structured events (#126).
+        """
         p: Paths = app.state.paths
         events = sources.load_all(p)
         runs = aggregators.group_runs(events, paths=p)
         match = next((r for r in runs if r.run_id == run_id), None)
+        trace = list(match.events) if match else []
+        if match is None:
+            sm_runs = aggregators.group_sm_runs(p)
+            match = next((r for r in sm_runs if r.run_id == run_id), None)
         if match is None:
             return JSONResponse({"error": "not found"}, status_code=404)
+        if match.kind == "sm_spawn" and not trace:
+            spawn_dir = sources._find_sm_spawn_dir(p, match.run_id)
+            if spawn_dir is not None:
+                trace = sources.sm_spawn_trace_events(spawn_dir, match.start_ts)
         return JSONResponse(
             {
                 "run": match.to_dict(),
-                "events": [e.to_dict() for e in match.events],
+                "events": [e.to_dict() for e in trace],
             }
         )
 

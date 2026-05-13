@@ -2434,6 +2434,84 @@ def _history_sm_spawns(
     return out
 
 
+# Cap synthetic-event payloads so a runaway stdout.log doesn't blow up
+# the JSON detail response. Anything over this is tail-truncated; the
+# tail is far more useful than the head when triaging a worker that
+# died at the end.
+_SM_SPAWN_FILE_MAX_BYTES = 64 * 1024
+
+
+def _find_sm_spawn_dir(
+    paths: Paths, spawn_id: str
+) -> pathlib.Path | None:
+    """Locate the on-disk dir for an SM spawn, whether live or reaped.
+
+    Live spawns live at ``<state>/sm-dispatcher-spawns/<spawn_id>/``;
+    once reaped, the dispatcher moves them to
+    ``<state>/sm-dispatcher-spawns/.finished/<spawn_id>/``. Try finished
+    first since the history view is the more common entry point.
+    """
+    root = paths.state_dir / "sm-dispatcher-spawns"
+    finished = root / ".finished" / spawn_id
+    if finished.is_dir():
+        return finished
+    live = root / spawn_id
+    if live.is_dir():
+        return live
+    return None
+
+
+def sm_spawn_trace_events(
+    spawn_dir: pathlib.Path, fallback_ts: float
+) -> list[UnifiedEvent]:
+    """Build a synthetic event trace for an SM-dispatcher spawn.
+
+    SM workers don't write a structured event log — the viewer's run-
+    detail modal expects one (#126). Wrap each of ``prompt.txt`` /
+    ``stdout.log`` / ``stderr.log`` (if present) as a single text-shaped
+    event so the modal renders the contents inline. Missing files are
+    skipped silently. Contents over ``_SM_SPAWN_FILE_MAX_BYTES`` are
+    tail-truncated with a marker line — the tail is what matters when
+    a worker died at the end.
+    """
+    out: list[UnifiedEvent] = []
+    for filename, kind in (
+        ("prompt.txt", "sm_prompt"),
+        ("stdout.log", "sm_stdout"),
+        ("stderr.log", "sm_stderr"),
+    ):
+        path = spawn_dir / filename
+        if not path.is_file():
+            continue
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        truncated = False
+        if len(raw) > _SM_SPAWN_FILE_MAX_BYTES:
+            raw = raw[-_SM_SPAWN_FILE_MAX_BYTES:]
+            truncated = True
+        text = raw.decode("utf-8", errors="replace")
+        if truncated:
+            text = f"... [truncated to last {_SM_SPAWN_FILE_MAX_BYTES} bytes]\n" + text
+        try:
+            ts = path.stat().st_mtime
+        except OSError:
+            ts = fallback_ts
+        summary = text.strip().splitlines()[0][:140] if text.strip() else f"{filename} (empty)"
+        out.append(
+            UnifiedEvent(
+                ts=ts,
+                hemisphere="sm",
+                kind=kind,
+                correlation_id=spawn_dir.name,
+                summary=summary,
+                detail={"filename": filename, "text": text},
+            )
+        )
+    return out
+
+
 def list_running_jobs(
     paths: Paths,
     now_ts: float | None = None,
