@@ -57,6 +57,23 @@ PREFIX = "[SM]"
 # :class:`alice_speaking.review.code_reviewer.CodeReviewResult`.
 CODE_REVIEW_VERDICTS: frozenset[str] = frozenset({"approved", "needs_revision"})
 
+# Allowed values on ``[SM] exit-transition`` (issue #174). The
+# research_note worker chooses one of these to declare what should
+# happen with the note after it's written:
+#
+#   * ``disseminate`` — groom the note into cortex-memory (atomic notes,
+#     wikilinks, decay-aware). The learning becomes durable memory.
+#   * ``spawn-code`` — file a follow-up ``art:code`` issue scoped to the
+#     implementation the findings imply.
+#   * ``both``       — disseminate AND spawn code. Most likely for
+#     substantive design work.
+#
+# The dispatcher's research_note close path requires one of these to be
+# present from a trusted author before it will close the GH issue.
+EXIT_TRANSITION_VALUES: frozenset[str] = frozenset(
+    {"disseminate", "spawn-code", "both"}
+)
+
 # Wikilink target: anything non-empty that doesn't itself contain ``]]``.
 # We deliberately do NOT enforce a slug/path shape — the vault accepts
 # free-form note titles and the parser shouldn't second-guess what's
@@ -202,6 +219,34 @@ class BuildStarted:
     """
 
 
+@dataclass(frozen=True)
+class ExitTransition:
+    """``[SM] exit-transition=<value> findings=[[...]]? spawned=<text>?``.
+
+    Issue #174. Posted by the research-writer worker before requesting
+    ``sm:done`` on an ``art:research_note`` issue. ``value`` is one of
+    :data:`EXIT_TRANSITION_VALUES`; ``findings`` (if present) names the
+    research-note vault wikilink; ``spawned`` (if present) records any
+    follow-up issues the worker filed.
+
+    The dispatcher's research_note close path requires this comment
+    from a trusted author before it will close the GH issue — without
+    it the lifecycle never completes and the work card stays in the
+    viewer's open list.
+
+    Two on-the-wire forms are accepted:
+
+      * ``[SM] exit-transition=both ...``  (used in the wild on the
+        retroactive #136/#148/#149/#170 closes)
+      * ``[SM] exit-transition both ...``  (matches the canonical
+        ``[SM] <verb> key=value`` shape used by every other parser)
+    """
+
+    value: str
+    findings: str | None = None
+    spawned: str | None = None
+
+
 # Union over every parsed result type. Handlers that consume
 # :func:`parse_comment` typically ``isinstance``-dispatch on this.
 ParsedComment = (
@@ -218,6 +263,7 @@ ParsedComment = (
     | RouteToStudy
     | ReturnToStudy
     | BuildStarted
+    | ExitTransition
 )
 
 
@@ -662,6 +708,116 @@ def parse_build_started(
     return BuildStarted()
 
 
+# ``[SM] exit-transition`` allows ``=`` between verb and value as well as
+# whitespace — the wild-form (#136/#148/#149/#170 retroactive closes)
+# used ``exit-transition=both``, and the canonical bareword shape is
+# ``exit-transition both``. Both must parse to the same dataclass.
+_EXIT_TRANSITION_HEAD_RE = re.compile(
+    r"^\[SM\]\s+exit-transition(?P<sep>[=\s])(?P<rest>.*)$",
+    re.DOTALL,
+)
+
+
+def parse_exit_transition(
+    body: str,
+    comment_author: str | None,
+    *,
+    trusted_authors: frozenset[str] = TRUSTED_AUTHORS,
+    valid_values: frozenset[str] = EXIT_TRANSITION_VALUES,
+    log: Callable[[str], None] = _default_log,
+) -> ExitTransition | None:
+    """``[SM] exit-transition=<value> findings=[[...]]? spawned=<text>?``.
+
+    Issue #174 — research_note close-path enforcement. ``value`` must be
+    one of :data:`EXIT_TRANSITION_VALUES`. ``findings`` (when present)
+    must be a wikilink. ``spawned`` is opaque free-form text the parser
+    captures but doesn't validate (it can contain ``#N`` lists or prose).
+
+    Accepted shapes:
+
+      * ``[SM] exit-transition=both``
+      * ``[SM] exit-transition both findings=[[note]]``
+      * ``[SM] exit-transition=both findings=[[note]] spawned="#150 #151"``
+      * ``[SM] exit-transition=both findings=[[note]] spawned=#150 #151``
+
+    The trailing ``spawned=`` value, when bareword, swallows the rest of
+    the line so a worker can drop a free-form ``#150 #151 #152`` list
+    without quoting. ``findings`` and ``spawned`` are both optional —
+    only ``value`` is required.
+    """
+    m = _EXIT_TRANSITION_HEAD_RE.match(body)
+    if m is None:
+        return None
+    if not _check_trust(comment_author, trusted_authors, "exit-transition", log):
+        return None
+
+    rest = m.group("rest").strip()
+    if not rest:
+        log("[sm-comments] exit-transition missing value")
+        return None
+
+    # First token after the verb is the value. After ``exit-transition=``
+    # the value is the first whitespace-delimited token; after
+    # ``exit-transition <value>`` it's the same shape. Tokens that look
+    # like ``key=val`` belong to the kv tail, so the head must be a
+    # bareword without ``=`` inside.
+    head, _, tail = rest.partition(" ")
+    if "=" in head:
+        # Caller wrote ``exit-transition value=both`` — accept the kv form.
+        kv = _extract_kv(rest)
+        value = kv.get("value")
+        if value is None:
+            log(
+                f"[sm-comments] exit-transition kv-form missing 'value': {rest!r}"
+            )
+            return None
+        findings_raw = kv.get("findings")
+        spawned = kv.get("spawned")
+    else:
+        value = head
+        findings_raw = None
+        spawned = None
+        if tail.strip():
+            kv = _extract_kv(tail)
+            findings_raw = kv.get("findings")
+            spawned = kv.get("spawned")
+            # ``spawned=#150 #151`` (bareword + trailing tokens) is
+            # common in the wild. ``_extract_kv`` captures only the
+            # first bareword token. Re-scan the original tail to recover
+            # everything after ``spawned=`` so the audit trail keeps the
+            # full list intact.
+            spawn_idx = tail.find("spawned=")
+            if spawn_idx >= 0:
+                trailing = tail[spawn_idx + len("spawned=") :].strip()
+                # Stop at the next ``key=`` so we don't swallow another
+                # field. ``findings=`` is the only other field today; if
+                # we add more, this needs widening.
+                cut = trailing.find(" findings=")
+                if cut >= 0:
+                    trailing = trailing[:cut].strip()
+                if trailing:
+                    spawned = trailing
+
+    if value not in valid_values:
+        log(
+            f"[sm-comments] exit-transition unknown value {value!r} — "
+            f"expected one of {sorted(valid_values)}"
+        )
+        return None
+
+    findings: str | None = None
+    if findings_raw is not None:
+        findings = _parse_wikilink(findings_raw)
+        if findings is None:
+            log(
+                f"[sm-comments] exit-transition findings is not a wikilink: "
+                f"{findings_raw!r}"
+            )
+            return None
+
+    return ExitTransition(value=value, findings=findings, spawned=spawned)
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -686,6 +842,7 @@ _PARSERS: tuple[tuple[str, Callable[..., ParsedComment | None]], ...] = (
     ("route-to-study", parse_route_to_study),
     ("return-to-study", parse_return_to_study),
     ("build-started", parse_build_started),
+    ("exit-transition", parse_exit_transition),
 )
 
 
@@ -707,7 +864,15 @@ def parse_comment(
     if not body.startswith(PREFIX):
         return None
     for verb, parser in _PARSERS:
-        if not body.startswith(f"{PREFIX} {verb}"):
+        head = f"{PREFIX} {verb}"
+        if not body.startswith(head):
+            continue
+        # The verb must terminate at a word boundary — ``exit-transition``
+        # admits ``=`` here (wild-form on #174) in addition to whitespace
+        # / EOL; every other verb only sees whitespace or EOL because the
+        # per-parser :func:`_strip_verb` rejects the rest.
+        next_ch = body[len(head) : len(head) + 1]
+        if next_ch and next_ch not in (" ", "\t", "\n", "="):
             continue
         # Each parser re-validates its own prefix — the startswith above
         # is a cheap pre-filter that lets us pick the right parser

@@ -171,6 +171,17 @@ COMPACT_SIGNAL_FILENAME = "compact.signal"
 # this prefix to know there's a new design draft to review.
 DESIGN_READY_AUDIT_PREFIX = "[SM] design-ready-audit"
 
+# Issue #174 — research_note close path. Worker-emitted ``[SM]
+# exit-transition`` comment is required from a trusted author before
+# the dispatcher will close the GH issue on an ``art:research_note``
+# task. ``EXIT_TRANSITION_REQUIRED_PREFIX`` is the reminder the
+# dispatcher posts (once) when the issue is at ``sm:done`` + still
+# OPEN but no exit-transition has been recorded yet. Dedup is
+# enforced by a state-ledger field and a defensive scan of existing
+# audit comments (so a state-file reset doesn't re-spam the reminder).
+EXIT_TRANSITION_PREFIX = "[SM] exit-transition"
+EXIT_TRANSITION_REQUIRED_PREFIX = "[SM] exit-transition-required"
+
 # Terminal ``sm:*`` states — the dispatcher's sweep pass leaves these
 # alone. Non-terminal labels on a *closed* issue indicate a missed
 # transition (Phase 1.6 sweep target).
@@ -509,6 +520,14 @@ class DispatcherState:
     design/revise loop; the entry is cleared on a successful
     ``design-approved`` transition (so a future re-entry into the
     design lane starts fresh).
+
+    ``exit_required_posted`` (issue #174) is the FIFO list of issue
+    numbers where the ``[SM] exit-transition-required`` reminder has
+    already been posted while the issue sat at ``sm:done`` + still
+    OPEN + ``art:research_note`` with no exit-transition comment. The
+    research_note close path stays a no-op on subsequent passes until
+    the worker (or a human) lands the exit-transition; the reminder
+    must not re-fire every cadence.
     """
 
     version: int = STATE_VERSION
@@ -516,6 +535,7 @@ class DispatcherState:
     verify_failed_posted: list[int] = field(default_factory=list)
     needs_study_hinted: list[int] = field(default_factory=list)
     design_revisions: dict[int, int] = field(default_factory=dict)
+    exit_required_posted: list[int] = field(default_factory=list)
 
     def has_hello(self, number: int) -> bool:
         return number in self.hello_commented
@@ -574,6 +594,25 @@ class DispatcherState:
     def clear_design_revisions(self, number: int) -> None:
         self.design_revisions.pop(number, None)
 
+    def has_exit_required(self, number: int) -> bool:
+        return number in self.exit_required_posted
+
+    def mark_exit_required(self, number: int) -> None:
+        if number in self.exit_required_posted:
+            return
+        self.exit_required_posted.append(number)
+        if len(self.exit_required_posted) > SEEN_ISSUE_CAP:
+            overflow = len(self.exit_required_posted) - SEEN_ISSUE_CAP
+            del self.exit_required_posted[:overflow]
+
+    def clear_exit_required(self, number: int) -> None:
+        # Cleared once the issue actually closes — a future re-open is
+        # an aberration the next pass will handle from scratch.
+        try:
+            self.exit_required_posted.remove(number)
+        except ValueError:
+            pass
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": self.version,
@@ -582,6 +621,7 @@ class DispatcherState:
             "needs_study_hinted": list(self.needs_study_hinted),
             # Keys are stringified for JSON-stability; load_state coerces back.
             "design_revisions": {str(k): v for k, v in self.design_revisions.items()},
+            "exit_required_posted": list(self.exit_required_posted),
         }
 
 
@@ -624,12 +664,18 @@ def load_state(state_path: pathlib.Path) -> DispatcherState:
                 design_revisions[int(k)] = int(v)
             except (TypeError, ValueError):
                 continue
+    # ``exit_required_posted`` was added in #174. Forward-compat
+    # default-to-empty so the dispatcher keeps working across the
+    # upgrade without a manual reset.
+    raw_er = data.get("exit_required_posted") or []
+    er_numbers: list[int] = [int(n) for n in raw_er if isinstance(n, int)]
     return DispatcherState(
         version=STATE_VERSION,
         hello_commented=numbers,
         verify_failed_posted=vf_numbers,
         needs_study_hinted=ns_numbers,
         design_revisions=design_revisions,
+        exit_required_posted=er_numbers,
     )
 
 
@@ -644,6 +690,9 @@ def save_state(state_path: pathlib.Path, state: DispatcherState) -> None:
     if len(state.needs_study_hinted) > SEEN_ISSUE_CAP:
         overflow = len(state.needs_study_hinted) - SEEN_ISSUE_CAP
         del state.needs_study_hinted[:overflow]
+    if len(state.exit_required_posted) > SEEN_ISSUE_CAP:
+        overflow = len(state.exit_required_posted) - SEEN_ISSUE_CAP
+        del state.exit_required_posted[:overflow]
     state_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(
         dir=state_path.parent, prefix=".sm-dispatcher-", suffix=".json"
@@ -819,6 +868,55 @@ def gh_list_stale_closed_sm_issues(
         issue
         for issue in payload
         if any(n in NON_TERMINAL_SM_LABELS for n in _label_names(issue))
+    ]
+
+
+def gh_list_open_done_sm_issues(
+    repo: str, *, gh_bin: str = "gh"
+) -> list[dict[str, Any]]:
+    """Return OPEN issues that carry ``sm:done`` — the #174 close-stragglers.
+
+    The ``art:research_note`` worker flips ``sm:selected → sm:done`` directly
+    (no PR, no ``sm:reviewing`` pit-stop), so the main open-issue poll —
+    which only searches non-terminal ``sm:*`` labels — never sees these
+    issues again and ``gh issue close`` never fires. The result: research
+    items look "failed" in the viewer because the card stays in the open
+    list while the work is actually done.
+
+    This helper is the open-side companion to
+    :func:`gh_list_stale_closed_sm_issues`: it returns OPEN issues whose
+    ``sm:*`` label is *terminal*. The caller (:func:`_process_open_done`)
+    re-validates the artifact and enforces the
+    ``[SM] exit-transition`` gate before closing.
+    """
+    args = [
+        gh_bin,
+        "issue",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "open",
+        "--search",
+        f"label:{DONE_SM_LABEL}",
+        "--json",
+        "number,title,labels,author,createdAt,body",
+        "--limit",
+        str(RECENT_ISSUE_LIMIT),
+    ]
+    stdout = _run_gh(args)
+    if not stdout.strip():
+        return []
+    payload = json.loads(stdout)
+    if not isinstance(payload, list):
+        return []
+    # Client-side defense: only keep issues whose label set contains
+    # ``sm:done``. A loosened search qualifier upstream must not pull
+    # in unrelated issues.
+    return [
+        issue
+        for issue in payload
+        if DONE_SM_LABEL in _label_names(issue)
     ]
 
 
@@ -2363,6 +2461,27 @@ def render_study_hint_audit_comment(
     )
 
 
+def render_exit_transition_required_comment(
+    number: int,
+    *,
+    timestamp: str | None = None,
+) -> str:
+    """Produce a ``[SM] exit-transition-required ...`` payload (issue #174).
+
+    Posted by the dispatcher on an ``art:research_note`` issue that has
+    been flipped to ``sm:done`` (and not closed) but never received an
+    ``[SM] exit-transition`` comment from a trusted author. The reminder
+    enumerates the valid values and tells the worker / operator what
+    has to land before the close fires.
+    """
+    ts = timestamp or _now_iso()
+    return (
+        f"{EXIT_TRANSITION_REQUIRED_PREFIX} task=#{number} "
+        f'expected=one-of="disseminate|spawn-code|both" '
+        f"ts={ts}"
+    )
+
+
 def render_design_ready_audit_comment(
     number: int,
     note: str,
@@ -2638,6 +2757,11 @@ class RunReport:
     # pass. Tracked separately so the operator can tell at a glance
     # whether the thinking-agent has been handed fresh work.
     hinted: int = 0
+    # Issue #174 — count of research_note issues closed this pass via
+    # the open-done sweep + count of ``exit-transition-required``
+    # reminder comments posted while waiting on the worker.
+    research_closed: int = 0
+    exit_required_posted: int = 0
 
 
 def _process_selected(
@@ -4380,12 +4504,230 @@ def _process_stale_closed(
     )
 
 
+def _has_exit_transition_comment(
+    repo: str,
+    number: int,
+    list_comments: ListCommentsFn,
+    trusted_authors: frozenset[str],
+    log: Callable[[str], None],
+) -> bool:
+    """Return True iff a trusted ``[SM] exit-transition`` comment exists on the issue.
+
+    Issue #174. Used by :func:`_process_open_done` as the gating signal
+    on the research_note close path. We import :mod:`alice_sm.comments`
+    lazily inside the function to avoid the circular import (comments
+    imports ``TRUSTED_AUTHORS`` / ``ART_LABEL_WHITELIST`` from this
+    module at top level).
+    """
+    from alice_sm import comments as cm  # local import — avoid cycle
+
+    try:
+        items = list_comments(repo, number)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] failed to list comments for #{number} while "
+            f"checking exit-transition: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return False
+    for item in items:
+        body = item.get("body")
+        author = item.get("author")
+        # ``gh issue view --json comments`` returns
+        # ``[{"author": {"login": ...}, "body": ...}, ...]``. Accept the
+        # bare-login shape for test-fixture readability.
+        if isinstance(author, dict):
+            login = author.get("login")
+        elif isinstance(author, str):
+            login = author
+        else:
+            login = None
+        if not isinstance(body, str):
+            continue
+        parsed = cm.parse_exit_transition(
+            body, login, trusted_authors=trusted_authors, log=lambda _m: None
+        )
+        if parsed is not None:
+            return True
+    return False
+
+
+def _process_open_done(
+    *,
+    issue: dict[str, Any],
+    repo: str,
+    state: DispatcherState,
+    report: RunReport,
+    post_comment: PostCommentFn,
+    close_issue: CloseIssueFn,
+    list_comments: ListCommentsFn,
+    trusted_authors: frozenset[str],
+    dry_run: bool,
+    log: Callable[[str], None],
+    now_iso: Callable[[], str] = _now_iso,
+) -> None:
+    """Close OPEN issues at ``sm:done`` once their exit gate is satisfied (issue #174).
+
+    The ``art:research_note`` worker flips ``sm:selected → sm:done``
+    directly without producing a PR, so the canonical close path
+    (:func:`_process_reviewing` → merged PR → ``gh issue close``) never
+    fires for these tasks. Without this handler the issue stays in the
+    open list forever and the work looks "stuck" from the viewer's
+    lens even though the vault note exists.
+
+    Behaviour for ``art:research_note`` issues:
+
+      * If a ``[SM] exit-transition`` comment from a trusted author is
+        present (``disseminate`` | ``spawn-code`` | ``both``) → close
+        the issue and emit a ``[SM] transition from=done to=done
+        reason=...`` audit comment recording the close. Clears the
+        ``exit_required_posted`` ledger entry.
+      * If missing → post the ``[SM] exit-transition-required`` reminder
+        once (deduped via the state ledger + a defensive comment scan
+        so a state-file reset doesn't re-spam) and stay.
+
+    For any other artifact (``art:code`` / ``art:config_change`` /
+    ``art:experiment``) an OPEN-at-``sm:done`` issue is a state-machine
+    aberration — the close should have happened on the
+    ``sm:reviewing → sm:done`` transition. Log the surprise and skip;
+    a human picks it up. We do NOT auto-close art:code without the
+    PR-merged + CI-green pedigree the canonical path enforces.
+    """
+    number = issue["number"]
+    names = _label_names(issue)
+    art_labels = [n for n in names if n in ART_LABEL_WHITELIST]
+    if not art_labels:
+        log(
+            f"[sm-dispatcher] open-done skip #{number}: no whitelisted art:* label "
+            f"({names!r})"
+        )
+        return
+    art_label = sorted(art_labels)[0]
+
+    if art_label != "art:research_note":
+        log(
+            f"[sm-dispatcher] open-done skip #{number}: OPEN at {DONE_SM_LABEL} with "
+            f"{art_label} — expected the canonical sm:reviewing → sm:done path "
+            f"to have closed this; leaving for human review"
+        )
+        return
+
+    # art:research_note — gate on exit-transition from a trusted author.
+    try:
+        has_exit = _has_exit_transition_comment(
+            repo, number, list_comments, trusted_authors, log
+        )
+    except GHCommandError:
+        # Fatal gh error (auth / rate limit) — re-raised by helper.
+        raise
+
+    if has_exit:
+        reason = "art:research_note + exit-transition recorded"
+        body = render_transition_comment(DONE_SM_LABEL, DONE_SM_LABEL, reason)
+        if dry_run:
+            log(
+                f"[sm-dispatcher] DRY-RUN would close #{number}: "
+                f"art:research_note + exit-transition present"
+            )
+            report.research_closed += 1
+            return
+        try:
+            close_issue(repo, number)
+            post_comment(repo, number, body)
+        except GHCommandError as exc:
+            log(
+                f"[sm-dispatcher] open-done failed to close #{number}: {exc}"
+            )
+            if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+                raise
+            return
+        state.clear_exit_required(number)
+        report.research_closed += 1
+        log(
+            f"[sm-dispatcher] open-done closed #{number}: "
+            f"art:research_note + exit-transition recorded"
+        )
+        return
+
+    # No exit-transition yet — post the reminder once.
+    if state.has_exit_required(number):
+        log(
+            f"[sm-dispatcher] open-done #{number}: still waiting on exit-transition "
+            f"(reminder already posted)"
+        )
+        return
+
+    # Defensive comment-prefix scan: catches the state-file-reset case
+    # where the ledger entry was lost but the reminder is already on
+    # the issue. Without this, a wiped state file would re-spam the
+    # comment on every open research_note + done issue.
+    try:
+        existing = list_comments(repo, number)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] failed to scan comments for #{number} before "
+            f"posting exit-transition-required: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+    for item in existing:
+        body_text = item.get("body")
+        author = item.get("author")
+        if isinstance(author, dict):
+            login = author.get("login")
+        elif isinstance(author, str):
+            login = author
+        else:
+            login = None
+        if (
+            isinstance(body_text, str)
+            and body_text.startswith(EXIT_TRANSITION_REQUIRED_PREFIX)
+            and login in trusted_authors
+        ):
+            # Adopt the on-issue evidence as the dedup signal even
+            # though our local ledger was empty.
+            state.mark_exit_required(number)
+            log(
+                f"[sm-dispatcher] open-done #{number}: exit-transition-required "
+                f"already on issue (ledger reset); marking and skipping"
+            )
+            return
+
+    reminder = render_exit_transition_required_comment(number, timestamp=now_iso())
+    if dry_run:
+        log(
+            f"[sm-dispatcher] DRY-RUN would post exit-transition-required on "
+            f"#{number}"
+        )
+        report.exit_required_posted += 1
+        return
+    try:
+        post_comment(repo, number, reminder)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] open-done failed to post exit-transition-required "
+            f"on #{number}: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+    state.mark_exit_required(number)
+    report.exit_required_posted += 1
+    log(
+        f"[sm-dispatcher] open-done #{number}: posted exit-transition-required "
+        f"(art:research_note + {DONE_SM_LABEL} + OPEN)"
+    )
+
+
 def run(
     *,
     repo: str = DEFAULT_REPO,
     state_path: pathlib.Path,
     list_issues: ListIssuesFn | None = None,
     list_stale_closed: ListIssuesFn | None = None,
+    list_open_done: ListIssuesFn | None = None,
     post_comment: PostCommentFn = gh_post_comment,
     edit_labels: EditLabelsFn = gh_edit_labels,
     close_issue: CloseIssueFn = gh_close_issue,
@@ -4425,6 +4767,8 @@ def run(
         list_issues = gh_list_sm_issues
     if list_stale_closed is None:
         list_stale_closed = gh_list_stale_closed_sm_issues
+    if list_open_done is None:
+        list_open_done = gh_list_open_done_sm_issues
     if list_comments is None:
         list_comments = gh_list_issue_comments
     if enable_spawn:
@@ -4728,6 +5072,63 @@ def run(
                 log(f"[sm-dispatcher] fatal gh error during sweep: {exc}")
                 break
 
+    # Issue #174 — open-done sweep: OPEN issues at ``sm:done`` are the
+    # art:research_note close-stragglers. The worker flipped the label
+    # but no ``gh issue close`` ever fired (no PR pedigree means
+    # ``_process_reviewing`` never owned the close). The handler
+    # enforces the ``[SM] exit-transition`` gate and closes the issue.
+    # Best-effort, same as the closed-stale sweep.
+    if not fatal_exit:
+        try:
+            open_done_issues = list_open_done(repo)
+        except GHCommandError as exc:
+            if exc.looks_like_auth_failure:
+                log(
+                    f"[sm-dispatcher] open-done sweep auth failure listing "
+                    f"{repo}: {exc}"
+                )
+                fatal_exit = True
+            elif exc.looks_like_rate_limit:
+                log(
+                    f"[sm-dispatcher] open-done sweep rate-limited listing "
+                    f"{repo}: {exc}"
+                )
+                fatal_exit = True
+            else:
+                log(
+                    f"[sm-dispatcher] open-done sweep failed to list "
+                    f"{repo}: {exc}"
+                )
+            open_done_issues = []
+        for issue in open_done_issues:
+            number = issue.get("number")
+            if not isinstance(number, int):
+                log(
+                    f"[sm-dispatcher] open-done sweep skip issue with non-integer "
+                    f"number: {number!r}"
+                )
+                continue
+            try:
+                _process_open_done(
+                    issue=issue,
+                    repo=repo,
+                    state=state,
+                    report=report,
+                    post_comment=post_comment,
+                    close_issue=close_issue,
+                    list_comments=list_comments,
+                    trusted_authors=trusted_authors,
+                    dry_run=dry_run,
+                    log=log,
+                    now_iso=now_iso,
+                )
+            except GHCommandError as exc:
+                fatal_exit = True
+                log(
+                    f"[sm-dispatcher] fatal gh error during open-done sweep: {exc}"
+                )
+                break
+
     if fatal_exit:
         # Persist what we did manage so dedup state for any successful
         # hello posts isn't lost.
@@ -4749,6 +5150,8 @@ def run(
         f"verify_pass={report.verify_pass} "
         f"verify_skip={report.verify_skip} "
         f"verify_failed={report.verify_failed} "
+        f"research_closed={report.research_closed} "
+        f"exit_required={report.exit_required_posted} "
         f"skipped_dedup={report.skipped_dedup} "
         f"skipped_trust={report.skipped_trust}"
     )

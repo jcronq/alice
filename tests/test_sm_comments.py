@@ -462,3 +462,95 @@ def test_build_started_does_not_match_other_verbs(log: LogCapture) -> None:
     # ``build-started`` parser.
     body = "[SM] build-started-other"
     assert cm.parse_build_started(body, "jcronq", log=log) is None
+
+
+# ---------------------------------------------------------------------------
+# exit-transition (issue #174)
+# ---------------------------------------------------------------------------
+
+
+def test_exit_transition_wild_form_disseminate(log: LogCapture) -> None:
+    # ``exit-transition=<value>`` is the form used in the wild on the
+    # retroactive #136/#148/#149/#170 closes.
+    body = "[SM] exit-transition=disseminate"
+    out = cm.parse_exit_transition(body, "jcronq", log=log)
+    assert out == cm.ExitTransition(value="disseminate", findings=None, spawned=None)
+    assert log.lines == []
+
+
+def test_exit_transition_wild_form_with_findings_and_spawned(log: LogCapture) -> None:
+    body = (
+        "[SM] exit-transition=both findings=[[2026-05-12-eks-phase-2]] "
+        "spawned=spawned #152 #155"
+    )
+    out = cm.parse_exit_transition(body, "jcronq", log=log)
+    assert out is not None
+    assert out.value == "both"
+    assert out.findings == "2026-05-12-eks-phase-2"
+    # The ``spawned=`` bareword + trailing-token recovery preserves the
+    # full ``#N #N`` list rather than just the first token.
+    assert out.spawned == "spawned #152 #155"
+
+
+def test_exit_transition_canonical_bareword_form(log: LogCapture) -> None:
+    body = "[SM] exit-transition spawn-code findings=[[my-note]]"
+    out = cm.parse_exit_transition(body, "jcronq", log=log)
+    assert out == cm.ExitTransition(
+        value="spawn-code", findings="my-note", spawned=None
+    )
+
+
+def test_exit_transition_unknown_value_rejected(log: LogCapture) -> None:
+    body = "[SM] exit-transition=archive"
+    assert cm.parse_exit_transition(body, "jcronq", log=log) is None
+    assert "unknown value" in log.joined()
+
+
+def test_exit_transition_missing_value(log: LogCapture) -> None:
+    body = "[SM] exit-transition"
+    assert cm.parse_exit_transition(body, "jcronq", log=log) is None
+
+
+def test_exit_transition_untrusted_returns_none(log: LogCapture) -> None:
+    body = "[SM] exit-transition=both"
+    assert cm.parse_exit_transition(body, "drive-by", log=log) is None
+    assert "untrusted" in log.joined()
+
+
+def test_exit_transition_bad_findings_wikilink(log: LogCapture) -> None:
+    body = "[SM] exit-transition=both findings=plain-text"
+    assert cm.parse_exit_transition(body, "jcronq", log=log) is None
+    assert "not a wikilink" in log.joined()
+
+
+def test_exit_transition_does_not_match_required_reminder(log: LogCapture) -> None:
+    # ``exit-transition-required`` is the dispatcher's reminder prefix.
+    # The worker-emitted parser must NOT match it (otherwise the
+    # reminder itself would be misread as a worker exit-transition and
+    # we'd close the issue based on our own nag).
+    body = (
+        '[SM] exit-transition-required task=#136 '
+        'expected=one-of="disseminate|spawn-code|both" ts=2026-05-13T12:00:00+00:00'
+    )
+    assert cm.parse_exit_transition(body, "jcronq", log=log) is None
+    # Same body via dispatch wrapper must also stay None.
+    assert cm.parse_comment(body, "jcronq", log=log) is None
+
+
+def test_exit_transition_dispatch_wild_form(log: LogCapture) -> None:
+    # The dispatch wrapper must route ``exit-transition=both`` to the
+    # parser despite the ``=`` (rather than space) between verb and
+    # value — both shapes appear in the wild.
+    body = "[SM] exit-transition=both findings=[[note-x]]"
+    out = cm.parse_comment(body, "jcronq", log=log)
+    assert isinstance(out, cm.ExitTransition)
+    assert out.value == "both"
+    assert out.findings == "note-x"
+
+
+def test_exit_transition_dispatch_bareword_form(log: LogCapture) -> None:
+    body = "[SM] exit-transition disseminate"
+    out = cm.parse_comment(body, "jcronq", log=log)
+    assert out == cm.ExitTransition(
+        value="disseminate", findings=None, spawned=None
+    )

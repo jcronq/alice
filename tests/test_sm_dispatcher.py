@@ -42,6 +42,20 @@ def _stub_gh_list_issue_comments(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sm, "gh_list_issue_comments", lambda _repo, _n: [])
 
 
+@pytest.fixture(autouse=True)
+def _stub_gh_list_open_done(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default the issue #174 open-done sweep listing to empty.
+
+    Without this stub, tests that don't inject ``list_open_done=``
+    would shell out to real ``gh`` and discover any actual OPEN
+    ``sm:done`` research_note stragglers on jcronq/alice — accidentally
+    posting reminders or closing them under the test's identity. Tests
+    that exercise the open-done sweep override ``list_open_done=`` on
+    their own ``sm.run`` call, which takes precedence.
+    """
+    monkeypatch.setattr(sm, "gh_list_open_done_sm_issues", lambda _repo: [])
+
+
 @pytest.fixture
 def state_path(tmp_path: pathlib.Path) -> pathlib.Path:
     return tmp_path / "sm-dispatcher-state.json"
@@ -111,6 +125,7 @@ def test_empty_poll_writes_empty_state(state_path: pathlib.Path) -> None:
         "verify_failed_posted": [],
         "needs_study_hinted": [],
         "design_revisions": {},
+        "exit_required_posted": [],
     }
 
 
@@ -5576,3 +5591,520 @@ def test_thinking_shim_main_exits_nonzero_when_prompt_missing(tmp_path) -> None:
         ]
     )
     assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #174 — open-done research_note close path
+# ---------------------------------------------------------------------------
+
+
+def _audit_comment(body: str, author: str = "jcronq") -> dict:
+    """Build a fake ``gh issue view --json comments`` payload entry."""
+    return {"body": body, "author": {"login": author}}
+
+
+def test_open_done_research_note_with_exit_transition_closes_issue(
+    state_path: pathlib.Path,
+) -> None:
+    """art:research_note at sm:done + OPEN + exit-transition comment →
+    ``gh issue close`` fires, audit comment posted, ledger cleared.
+    """
+    recorder = Recorder()
+    close_rec = CloseRecorder()
+    open_done = [
+        _make_issue(
+            136,
+            sm_labels=("sm:done",),
+            art_labels=("art:research_note",),
+        )
+    ]
+    comments = [
+        _audit_comment(
+            "[SM] transition from=selected to=done "
+            'reason="research note at cortex-memory/research/note.md"'
+        ),
+        _audit_comment(
+            "[SM] exit-transition=both findings=[[note]] spawned=#150 #151"
+        ),
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: [],
+        list_open_done=lambda _r: open_done,
+        list_comments=lambda _r, _n: comments,
+        post_comment=recorder,
+        close_issue=close_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # Close fires.
+    assert close_rec.closed == [("jcronq/alice", 136)]
+    # Audit comment recording the close was posted.
+    bodies = [b for _r, _n, b in recorder.posted]
+    assert any(
+        "[SM] transition from=done to=done" in b
+        and "art:research_note + exit-transition recorded" in b
+        for b in bodies
+    )
+    # No exit-transition-required nag was posted (the exit was already on the issue).
+    assert not any(
+        b.startswith(sm.EXIT_TRANSITION_REQUIRED_PREFIX) for b in bodies
+    )
+    assert report.research_closed == 1
+    assert report.exit_required_posted == 0
+
+
+def test_open_done_research_note_with_spawn_code_value_closes(
+    state_path: pathlib.Path,
+) -> None:
+    """``exit-transition=spawn-code findings=[[...]]`` is accepted just
+    like ``both`` — only the presence + value validity matters for the
+    close gate. The spawned-issue tracking is the worker's problem."""
+    recorder = Recorder()
+    close_rec = CloseRecorder()
+    open_done = [
+        _make_issue(
+            148, sm_labels=("sm:done",), art_labels=("art:research_note",)
+        )
+    ]
+    comments = [
+        _audit_comment("[SM] exit-transition=spawn-code findings=[[my-note]]")
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: [],
+        list_open_done=lambda _r: open_done,
+        list_comments=lambda _r, _n: comments,
+        post_comment=recorder,
+        close_issue=close_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert close_rec.closed == [("jcronq/alice", 148)]
+    assert report.research_closed == 1
+
+
+def test_open_done_research_note_with_disseminate_value_closes(
+    state_path: pathlib.Path,
+) -> None:
+    """``exit-transition=disseminate`` (no findings, no spawned) also closes."""
+    recorder = Recorder()
+    close_rec = CloseRecorder()
+    open_done = [
+        _make_issue(
+            170, sm_labels=("sm:done",), art_labels=("art:research_note",)
+        )
+    ]
+    comments = [_audit_comment("[SM] exit-transition=disseminate")]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: [],
+        list_open_done=lambda _r: open_done,
+        list_comments=lambda _r, _n: comments,
+        post_comment=recorder,
+        close_issue=close_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert close_rec.closed == [("jcronq/alice", 170)]
+    assert report.research_closed == 1
+
+
+def test_open_done_research_note_without_exit_transition_posts_reminder(
+    state_path: pathlib.Path,
+) -> None:
+    """art:research_note at sm:done + OPEN, no exit-transition →
+    dispatcher posts ``[SM] exit-transition-required`` reminder once
+    and does NOT close the issue."""
+    recorder = Recorder()
+    close_rec = CloseRecorder()
+    open_done = [
+        _make_issue(
+            149, sm_labels=("sm:done",), art_labels=("art:research_note",)
+        )
+    ]
+    comments = [
+        _audit_comment(
+            "[SM] transition from=selected to=done "
+            'reason="research note at cortex-memory/research/x.md"'
+        )
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: [],
+        list_open_done=lambda _r: open_done,
+        list_comments=lambda _r, _n: comments,
+        post_comment=recorder,
+        close_issue=close_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # Did NOT close.
+    assert close_rec.closed == []
+    # Reminder posted exactly once.
+    reminders = [
+        b for _r, _n, b in recorder.posted
+        if b.startswith(sm.EXIT_TRANSITION_REQUIRED_PREFIX)
+    ]
+    assert len(reminders) == 1
+    assert "task=#149" in reminders[0]
+    assert 'expected=one-of="disseminate|spawn-code|both"' in reminders[0]
+    assert report.research_closed == 0
+    assert report.exit_required_posted == 1
+    # Ledger flipped.
+    data = json.loads(state_path.read_text())
+    assert data["exit_required_posted"] == [149]
+
+
+def test_open_done_reminder_is_deduped_across_runs(
+    state_path: pathlib.Path,
+) -> None:
+    """Second cadence with the same OPEN + sm:done + no exit-transition
+    state must not re-post the reminder — the state ledger guards
+    against per-cycle spam."""
+    recorder = Recorder()
+    close_rec = CloseRecorder()
+    open_done = [
+        _make_issue(
+            149, sm_labels=("sm:done",), art_labels=("art:research_note",)
+        )
+    ]
+
+    # First pass: posts the reminder.
+    sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: [],
+        list_open_done=lambda _r: open_done,
+        list_comments=lambda _r, _n: [],
+        post_comment=recorder,
+        close_issue=close_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+    assert sum(
+        1
+        for _r, _n, b in recorder.posted
+        if b.startswith(sm.EXIT_TRANSITION_REQUIRED_PREFIX)
+    ) == 1
+
+    # Second pass: same state, no new reminder.
+    sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: [],
+        list_open_done=lambda _r: open_done,
+        list_comments=lambda _r, _n: [],
+        post_comment=recorder,
+        close_issue=close_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+    # Still exactly one reminder across both passes.
+    assert sum(
+        1
+        for _r, _n, b in recorder.posted
+        if b.startswith(sm.EXIT_TRANSITION_REQUIRED_PREFIX)
+    ) == 1
+    assert close_rec.closed == []
+
+
+def test_open_done_reminder_adopts_existing_on_issue_after_state_reset(
+    state_path: pathlib.Path,
+) -> None:
+    """Defense-in-depth: if the local ledger is empty but the reminder
+    is already on the issue (state-file reset / re-deploy), the
+    dispatcher must adopt the on-issue evidence rather than re-spam."""
+    recorder = Recorder()
+    close_rec = CloseRecorder()
+    open_done = [
+        _make_issue(
+            149, sm_labels=("sm:done",), art_labels=("art:research_note",)
+        )
+    ]
+    comments = [
+        _audit_comment(
+            "[SM] exit-transition-required task=#149 "
+            'expected=one-of="disseminate|spawn-code|both" '
+            "ts=2026-05-12T10:00:00+00:00"
+        )
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: [],
+        list_open_done=lambda _r: open_done,
+        list_comments=lambda _r, _n: comments,
+        post_comment=recorder,
+        close_issue=close_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # No new reminder posted.
+    new_reminders = [
+        b
+        for _r, _n, b in recorder.posted
+        if b.startswith(sm.EXIT_TRANSITION_REQUIRED_PREFIX)
+    ]
+    assert new_reminders == []
+    # No close (still no exit-transition).
+    assert close_rec.closed == []
+    # Ledger adopted the on-issue evidence so future passes still dedup.
+    data = json.loads(state_path.read_text())
+    assert data["exit_required_posted"] == [149]
+    assert report.exit_required_posted == 0
+
+
+def test_open_done_reminder_rejects_untrusted_existing_evidence(
+    state_path: pathlib.Path,
+) -> None:
+    """A drive-by reminder from an untrusted author must NOT count for
+    dedup — the dispatcher should still post its own reminder under
+    a trusted identity."""
+    recorder = Recorder()
+    close_rec = CloseRecorder()
+    open_done = [
+        _make_issue(
+            149, sm_labels=("sm:done",), art_labels=("art:research_note",)
+        )
+    ]
+    comments = [
+        _audit_comment(
+            "[SM] exit-transition-required task=#149", author="drive-by"
+        )
+    ]
+
+    sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: [],
+        list_open_done=lambda _r: open_done,
+        list_comments=lambda _r, _n: comments,
+        post_comment=recorder,
+        close_issue=close_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+    new_reminders = [
+        b
+        for _r, _n, b in recorder.posted
+        if b.startswith(sm.EXIT_TRANSITION_REQUIRED_PREFIX)
+    ]
+    assert len(new_reminders) == 1
+
+
+def test_open_done_research_note_rejects_untrusted_exit_transition(
+    state_path: pathlib.Path,
+) -> None:
+    """A drive-by ``[SM] exit-transition`` comment must NOT close the
+    issue — the close gate trusts only TRUSTED_AUTHORS."""
+    recorder = Recorder()
+    close_rec = CloseRecorder()
+    open_done = [
+        _make_issue(
+            136, sm_labels=("sm:done",), art_labels=("art:research_note",)
+        )
+    ]
+    comments = [
+        _audit_comment(
+            "[SM] exit-transition=both findings=[[note]]", author="drive-by"
+        )
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: [],
+        list_open_done=lambda _r: open_done,
+        list_comments=lambda _r, _n: comments,
+        post_comment=recorder,
+        close_issue=close_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert close_rec.closed == []  # NOT closed
+    # Reminder is posted instead (the drive-by didn't count as a gate-satisfier).
+    assert report.exit_required_posted == 1
+    assert report.research_closed == 0
+
+
+def test_open_done_non_research_artifact_is_skipped_for_safety(
+    state_path: pathlib.Path,
+) -> None:
+    """``art:code`` at OPEN + sm:done is an aberration — the canonical
+    sm:reviewing → sm:done path should have closed it. Don't auto-close
+    without the PR-merged + CI-green pedigree; log and leave for a
+    human."""
+    recorder = Recorder()
+    close_rec = CloseRecorder()
+    open_done = [
+        _make_issue(200, sm_labels=("sm:done",), art_labels=("art:code",))
+    ]
+    comments = [
+        _audit_comment("[SM] exit-transition=both findings=[[some-note]]")
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: [],
+        list_open_done=lambda _r: open_done,
+        list_comments=lambda _r, _n: comments,
+        post_comment=recorder,
+        close_issue=close_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # Did NOT close — close path is gated on the PR-merged pedigree for art:code.
+    assert close_rec.closed == []
+    # No exit-required reminder either — the art:research_note gate
+    # doesn't apply.
+    assert all(
+        not b.startswith(sm.EXIT_TRANSITION_REQUIRED_PREFIX)
+        for _r, _n, b in recorder.posted
+    )
+    assert report.research_closed == 0
+    assert report.exit_required_posted == 0
+
+
+def test_open_done_sweep_does_not_interfere_with_art_code_reviewing_path(
+    state_path: pathlib.Path,
+) -> None:
+    """Regression: the canonical art:code path (sm:reviewing + merged
+    PR + green CI) still closes the issue. The new open-done sweep is
+    additive, not a replacement, and the art:code transitions don't
+    accidentally route through the research-note gate.
+    """
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    issues = [
+        _make_issue(
+            91,
+            sm_labels=("sm:reviewing",),
+            art_labels=("art:code",),
+        )
+    ]
+
+    def find_pr(_repo: str, _n: int) -> dict | None:
+        return {
+            "number": 90,
+            "url": "https://github.com/jcronq/alice/pull/90",
+            "state": "MERGED",
+        }
+
+    def merge_status(_repo: str, _pr: int) -> dict:
+        return {
+            "merged": True,
+            "merge_commit_oid": "cafebabe",
+            "pr_url": "https://github.com/jcronq/alice/pull/90",
+            "head_ref_name": "feat/x",
+        }
+
+    def ci(_repo: str, _sha: str) -> dict:
+        return {"conclusion": "success", "run_url": "https://x"}
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        list_open_done=lambda _r: [],  # empty — the issue is at sm:reviewing
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=ci,
+        enable_verify=False,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # Canonical close path fired.
+    assert close_rec.closed == [("jcronq/alice", 91)]
+    assert (91, "sm:reviewing", "sm:done") in report.transitions
+    assert report.transitioned == 1
+    # Research-note sweep counters untouched.
+    assert report.research_closed == 0
+    assert report.exit_required_posted == 0
+
+
+def test_open_done_closed_sweep_still_works(
+    state_path: pathlib.Path,
+) -> None:
+    """Regression: the #94 closed-stale sweep continues to route a
+    closed issue without an exit-transition comment to its terminal
+    label. The open-done sweep is a separate pass and must not
+    short-circuit the existing logic."""
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    # Closed issue at sm:selected with no linked PR → routes to sm:rejected.
+    stale = [_make_issue(120, sm_labels=("sm:selected",))]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: stale,
+        list_open_done=lambda _r: [],
+        find_linked_pr=lambda _r, _n: None,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.swept == 1
+    assert (120, "sm:selected", "sm:rejected") in report.transitions
+    # Closed-stale sweep never re-closes.
+    assert close_rec.closed == []
