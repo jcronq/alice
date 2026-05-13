@@ -84,9 +84,9 @@ alice-up           # start fresh on new image
 
 ## Debugging
 
-- `docker logs alice-worker-blue` — s6 + service startup output
+- `docker logs alice` — s6 + service startup output
 - `alice-shell` → poke around as Alice
-- `docker inspect alice-worker-blue` → see mounts, env, network
+- `docker inspect alice` → see mounts, env, network
 - Speaking daemon stderr (Python tracebacks):
   `~/.local/state/alice/worker/speaking-stderr.log`
 - Speaking event stream (structured JSON):

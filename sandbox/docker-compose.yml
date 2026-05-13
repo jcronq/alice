@@ -1,189 +1,85 @@
-# Alice's sandbox — blue/green split-container layout.
+# Alice's sandbox — single-container shape (EKS Phase 2).
 #
-#   alice-daemon:       signal-cli only, singleton
-#   alice-worker-blue:  a worker slot; exactly one of blue/green is live
-#   alice-worker-green: the other worker slot
+# One container runs the consolidated image from sandbox/Dockerfile (#152):
+# s6-overlay supervises signal-daemon, alice-speaking, alice-thinker, the
+# viewer, and the housekeeping daemons (gh-watcher, sm-dispatcher,
+# autopush, embedder, reload-watcher, thinker-watchdog). The blue/green
+# split, the alice-net bridge, the worker lease, and the compose
+# `profiles` mechanic are all gone — everything is localhost in here.
 #
-# Only ONE of blue/green is running normally. The deploy script alternates
-# which slot takes the new image. The live one holds an exclusive flock on
-# /state/worker/lease; the other, if alive, blocks on the flock and waits.
-#
-# On first start, `compose up` brings up alice-worker-blue only (profile
-# selection via COMPOSE_PROFILES or `--profile` flag).
+# The previous 3-service compose lives at sandbox/legacy-3svc.yml for the
+# cutover window (rollback path). The actual switch is handled by the
+# cutover doc; see [[2026-05-12-eks-phase-2-single-container]] §6.
 #
 # Personal sidecars go in docker-compose.override.yml.
 
-x-worker-base: &worker-base
-  build:
-    context: ..
-    dockerfile: sandbox/worker/Dockerfile
-    args:
-      USER_ID: ${USER_ID:-1000}
-      GROUP_ID: ${GROUP_ID:-1000}
-  restart: unless-stopped
-  depends_on:
-    alice-daemon:
-      condition: service_healthy
-  networks:
-    - alice-net
-  labels:
-    alice.role: worker
-  environment:
-    SIGNAL_API: "http://alice-daemon:8080"
-    SIGNAL_LOG_FILE: "/state/daemon/signal-daemon.log"
-    STATE_DIR: "/state/worker"
-    TZ: "${ALICE_TZ:-America/New_York}"
-    PATH: "/home/alice/alice-tools/bin:/home/alice/.local/bin:/usr/local/bin:/usr/bin:/bin"
-    # CLI transport socket — moved from container-local /tmp to the
-    # host-shared /state mount so the viewer container (which also
-    # bind-mounts the same host dir) can talk to it for the /context
-    # tab. Real Linux Docker supports AF_UNIX on bind mounts; the
-    # /tmp default in alice_speaking.infra.config is conservative for
-    # virtiofs/9p (Rancher Desktop / Docker Desktop on macOS) where
-    # bind() returns EPERM on cross-VM unix sockets.
-    ALICE_CLI_SOCKET: "/state/alice.sock"
-    # s6-overlay's default 3-second graceperiod is far too short for the
-    # speaking/thinker drain on shutdown: a SIGTERM during a Claude turn
-    # or an alice-think wake can legitimately take minutes to finish
-    # cleanly, and getting SIGKILLed at the gracetime cliff defeats the
-    # whole point of having drain hooks. 1800000 ms = 30 min, matching
-    # the deploy script's CLEANUP_TIMEOUT for the background old-container
-    # cleanup. A wake older than that is a hung wake the watchdog should
-    # have surfaced; force-kill is fine at that point.
-    S6_SERVICES_GRACETIME: "${S6_SERVICES_GRACETIME:-1800000}"
-    S6_KILL_GRACETIME: "${S6_KILL_GRACETIME:-1800000}"
-    # GitHub PAT for the gh CLI (and git-over-https via gh's credential
-    # helper). Sourced from alice.env by bin/_alice-env.sh, so adding
-    # GH_TOKEN=ghp_... to alice.env then bouncing the worker is enough
-    # to pick it up. Empty (the default) lets gh fall through to the
-    # mounted ~/.config/gh OAuth credentials instead — existing host
-    # auth setups keep working.
-    GH_TOKEN: "${GH_TOKEN:-}"
-    # A2A (Google Agent2Agent protocol) — opt-in via alice.env. The
-    # speaking daemon spins up a uvicorn server on this port inside the
-    # worker container when ALICE_A2A_ENABLED=true. The port is
-    # intentionally NOT published to the host by default: blue and green
-    # slots share the same x-worker-base, and a static publish would
-    # conflict during alice-deploy's swap (both containers briefly run).
-    # To expose A2A to the host or wider network, add a docker-compose
-    # .override.yml entry that publishes ALICE_A2A_PORT only on the slot
-    # you actually want live, or front the workers with an external
-    # load balancer that targets the lease-holder.
-    ALICE_A2A_ENABLED: "${ALICE_A2A_ENABLED:-}"
-    ALICE_A2A_PORT: "${ALICE_A2A_PORT:-}"
-    ALICE_A2A_HOST: "${ALICE_A2A_HOST:-}"
-    ALICE_A2A_PRINCIPAL: "${ALICE_A2A_PRINCIPAL:-}"
-    ALICE_A2A_EXTERNAL_URL: "${ALICE_A2A_EXTERNAL_URL:-}"
-    # viewer-chat transport (PR #46). Listens on 0.0.0.0 so the
-    # viewer container (on the same alice-net bridge) can reach it
-    # over the worker's hostname. Default port 8181 collides with
-    # Alice's local embedder (Qwen3-Embedding-4B on the GPU passed
-    # through earlier); shift to 8182 so both services coexist.
-    ALICE_VIEWER_CHAT_HOST: "0.0.0.0"
-    ALICE_VIEWER_CHAT_PORT: "8182"
-  volumes:
-    # Mind + tools default to <repo>/data/{alice-mind,alice-tools}; alice-up
-    # exports ALICE_MIND / ALICE_TOOLS pointing there. Fall back to the
-    # legacy ~/alice-{mind,tools} paths if compose is invoked directly.
-    - ${ALICE_MIND:-${HOME}/alice-mind}:/home/alice/alice-mind:rw
-    - ${ALICE_TOOLS:-${HOME}/alice-tools}:/home/alice/alice-tools:rw
-    # Monorepo bind-mounted rw so Alice can self-improve in place (her
-    # subagents can commit + push from inside the container). The host
-    # path holds everything that runs her — agent kernel, speaking
-    # daemon, thinking wake, viewer — under src/*. Policy: thinking MUST
-    # NOT write here (hemisphere boundary); enforcement is documentation.
-    # Override ALICE_REPO when this repo lives somewhere other than ~/alice
-    # (e.g. ~/dev/alice). alice-up auto-detects from its own location.
-    - ${ALICE_REPO:-${HOME}/alice}:/home/alice/alice:rw
-    - ${HOME}/.config/gh:/home/alice/.config/gh:ro
-    - ${HOME}/.ssh:/home/alice/.ssh:ro
-    - ${HOME}/.config/alice:/home/alice/.config/alice:ro
-    - ${HOME}/.alice-claude:/home/alice/.claude:rw
-    # Host's Claude config — mounted as DIRECTORIES (not individual files)
-    # so that atomic file replaces (e.g. /login writing a new credentials
-    # file) become visible inside the container. Single-file bind mounts
-    # pin the inode at container-create time and go silently stale on
-    # token refresh. The entrypoint symlinks .credentials.json and
-    # .claude.json into their expected locations.
-    - ${HOME}/.claude:/host-claude:ro
-    # Host's Codex CLI auth — same directory-not-file rule as Claude
-    # above. The entrypoint runs codex-to-pi-auth at container start
-    # to translate ~/.codex/auth.json into ~/.pi/agent/auth.json so
-    # PiKernel can use the ChatGPT subscription.
-    - ${HOME}/.codex:/host-codex:ro
-    - ${HOME}:/host-home:ro
-    - ${HOME}/.local/state/alice:/state:rw
-  working_dir: /home/alice/alice-mind
-  command: ["/usr/local/bin/entrypoint.sh", "sleep", "infinity"]
-  # NVIDIA GPU passthrough. The host has 2× RTX 3070; we expose ONE so
-  # an embedding-server workload (Qwen3-Embedding-4B served from
-  # alice's sci-env) can run on-GPU while leaving the second 3070 free
-  # for other host workloads. Requires (a) nvidia-container-toolkit on
-  # the host and (b) the nvidia runtime registered in
-  # /etc/docker/daemon.json (`nvidia-ctk runtime configure --runtime
-  # =docker` does this). If those aren't set up, this block is a
-  # silent no-op for compose v2 (engine ignores unknown runtime hint),
-  # so the worker still starts — just without /dev/nvidia*.
-  runtime: nvidia
-  deploy:
-    resources:
-      reservations:
-        devices:
-          - driver: nvidia
-            count: 1
-            capabilities: [gpu]
-
 services:
-  alice-daemon:
+  alice:
     build:
       context: ..
-      dockerfile: sandbox/daemon/Dockerfile
+      dockerfile: sandbox/Dockerfile
       args:
         USER_ID: ${USER_ID:-1000}
         GROUP_ID: ${GROUP_ID:-1000}
-    image: alice-daemon:latest
-    container_name: alice-daemon
-    hostname: alice-daemon
+    image: alice:latest
+    container_name: alice
+    hostname: alice
     restart: unless-stopped
-    networks:
-      - alice-net
-    environment:
-      TZ: "${ALICE_TZ:-America/New_York}"
-    volumes:
-      - ${HOME}/.config/alice:/home/alice/.config/alice:ro
-      - ${HOME}/.local/share/signal-cli:/home/alice/.local/share/signal-cli:rw
-      - ${HOME}/.local/state/alice:/state:rw
-
-  alice-worker-blue:
-    <<: *worker-base
-    image: alice-worker:blue
-    container_name: alice-worker-blue
-    hostname: alice-worker-blue
-    profiles: ["blue"]
-
-  alice-worker-green:
-    <<: *worker-base
-    image: alice-worker:green
-    container_name: alice-worker-green
-    hostname: alice-worker-green
-    profiles: ["green"]
-
-  alice-viewer:
-    build:
-      context: ..
-      dockerfile: sandbox/viewer/Dockerfile
-      args:
-        USER_ID: ${USER_ID:-1000}
-        GROUP_ID: ${GROUP_ID:-1000}
-    image: alice-viewer:latest
-    container_name: alice-viewer
-    hostname: alice-viewer
-    restart: unless-stopped
-    networks:
-      - alice-net
+    # Match S6_SERVICES_GRACETIME below: a SIGTERM during a Claude turn
+    # or an alice-think wake can legitimately take minutes to drain
+    # cleanly, and getting SIGKILLed at the gracetime cliff defeats the
+    # drain hooks. 30 min mirrors the legacy CLEANUP_TIMEOUT used by
+    # the old alice-deploy script.
+    stop_grace_period: 30m
     ports:
+      # viewer — FastAPI UI, served by the in-container alice-viewer s6 service.
       - "7777:7777"
+      # signal-cli RPC — was previously published only on the alice-net bridge
+      # from the alice-daemon container. Single container now, so we publish
+      # it to the host. Signal client work on the host (manual signal-cli
+      # commands) can talk to the same daemon without nsenter/docker exec.
+      - "8080:8080"
     environment:
+      # signal-cli is in the same container; no inter-service hop.
+      SIGNAL_API: "http://localhost:8080"
+      SIGNAL_LOG_FILE: "/state/daemon/signal-daemon.log"
+      STATE_DIR: "/state/worker"
+      TZ: "${ALICE_TZ:-America/New_York}"
+      PATH: "/home/alice/alice-tools/bin:/home/alice/.local/bin:/usr/local/bin:/usr/bin:/bin"
+      # CLI transport socket — host-shared via /state so external tools
+      # (and any future sidecar containers an override adds) can reach
+      # the speaking daemon's local RPC. See legacy-3svc.yml for the
+      # macOS/virtiofs caveat that drove this off /tmp.
+      ALICE_CLI_SOCKET: "/state/alice.sock"
+      # s6-overlay's default 3-second graceperiod is far too short for the
+      # speaking/thinker drain on shutdown. 1800000 ms = 30 min, matching
+      # stop_grace_period above so docker doesn't SIGKILL out from under
+      # s6's drain. A wake older than that is a hung wake the watchdog
+      # should have surfaced; force-kill is fine at that point.
+      S6_SERVICES_GRACETIME: "${S6_SERVICES_GRACETIME:-1800000}"
+      S6_KILL_GRACETIME: "${S6_KILL_GRACETIME:-1800000}"
+      # GitHub PAT for the gh CLI (and git-over-https via gh's credential
+      # helper). Sourced from alice.env by bin/_alice-env.sh, so adding
+      # GH_TOKEN=ghp_... to alice.env then bouncing the container is
+      # enough to pick it up. Empty (the default) lets gh fall through to
+      # the mounted ~/.config/gh OAuth credentials.
+      GH_TOKEN: "${GH_TOKEN:-}"
+      # A2A (Google Agent2Agent protocol) — opt-in via alice.env. The
+      # speaking daemon spins up a uvicorn server on this port inside the
+      # container when ALICE_A2A_ENABLED=true. Not host-published by
+      # default; add a docker-compose.override.yml entry to publish.
+      ALICE_A2A_ENABLED: "${ALICE_A2A_ENABLED:-}"
+      ALICE_A2A_PORT: "${ALICE_A2A_PORT:-}"
+      ALICE_A2A_HOST: "${ALICE_A2A_HOST:-}"
+      ALICE_A2A_PRINCIPAL: "${ALICE_A2A_PRINCIPAL:-}"
+      ALICE_A2A_EXTERNAL_URL: "${ALICE_A2A_EXTERNAL_URL:-}"
+      # viewer-chat transport (PR #46). Speaking daemon listens on
+      # localhost (no longer 0.0.0.0 — the viewer is in the same
+      # container now, no Docker bridge to traverse).
+      ALICE_VIEWER_CHAT_HOST: "127.0.0.1"
+      ALICE_VIEWER_CHAT_PORT: "8182"
+      # Viewer process config (folded in from the retired alice-viewer
+      # service block).
       ALICE_VIEWER_HOST: "0.0.0.0"
       ALICE_VIEWER_PORT: "7777"
       ALICE_STATE: "/state/worker"
@@ -191,36 +87,60 @@ services:
       ALICE_VIEWER_CACHE_DIR: "/state/viewer-cache"
       # Hot-reload on bind-mounted Python source changes — keeps the
       # viewer in parity with the worker, where `alice-reload-watcher`
-      # already re-execs alice-speaking on source edits. Without this,
-      # a PR that adds or moves a route only takes effect after a manual
-      # container bounce; templates auto-reload but Python does not.
-      # Scoped to src/alice_viewer/ inside the run() entrypoint so
-      # unrelated repo writes do not trigger churn. Issue #130.
+      # already re-execs alice-speaking on source edits. Scoped to
+      # src/alice_viewer/ inside the run() entrypoint. Issue #130.
       ALICE_VIEWER_RELOAD: "1"
       # Opt into LLM-derived display labels for memory-graph lobes
       # (alice_viewer.lobe_labeler). Cached in registry.json keyed on
       # member-set signature, so flipping this on doesn't burn tokens
       # on every page load — only on minted/drifted lobes.
       ALICE_LOBE_LLM_LABELS: "1"
-      # viewer-chat transport (PR #46) — points the in-browser /chat
-      # client at the worker's chat endpoint. PORT must match
-      # ALICE_VIEWER_CHAT_PORT in x-worker-base (8182, shifted off
-      # the embedder's 8181). HOST is hardcoded to the current live
-      # slot; on the next blue/green swap, this will need to flip to
-      # the new slot (TODO: dynamic network alias or alice-deploy
-      # script that rewrites it at swap time).
-      ALICE_VIEWER_CHAT_DAEMON_HOST: "${ALICE_VIEWER_CHAT_DAEMON_HOST:-alice-worker-blue}"
-      ALICE_VIEWER_CHAT_DAEMON_PORT: "${ALICE_VIEWER_CHAT_DAEMON_PORT:-8182}"
-      TZ: "${ALICE_TZ:-America/New_York}"
+      # viewer-chat client — speaking daemon is now localhost (no more
+      # blue/green DNS dance). Port must match ALICE_VIEWER_CHAT_PORT
+      # above.
+      ALICE_VIEWER_CHAT_DAEMON_HOST: "127.0.0.1"
+      ALICE_VIEWER_CHAT_DAEMON_PORT: "8182"
     volumes:
-      - ${ALICE_REPO:-${HOME}/alice}:/home/alice/alice:ro
-      - ${ALICE_MIND:-${HOME}/alice-mind}:/home/alice/alice-mind:ro
-      - ${HOME}/.local/state/alice:/state:rw
-      # alice.env carries CLAUDE_CODE_OAUTH_TOKEN for run_summary's
-      # Haiku call; alice_core.auth reads it from this default path.
+      # Mind + tools default to <repo>/data/{alice-mind,alice-tools}; alice-up
+      # exports ALICE_MIND / ALICE_TOOLS pointing there. Fall back to the
+      # legacy ~/alice-{mind,tools} paths if compose is invoked directly.
+      - ${ALICE_MIND:-${HOME}/alice-mind}:/home/alice/alice-mind
+      - ${ALICE_TOOLS:-${HOME}/alice-tools}:/home/alice/alice-tools
+      # Monorepo bind-mounted rw so Alice can self-improve in place. The
+      # host path holds everything that runs her — agent kernel, speaking
+      # daemon, thinking wake, viewer — under src/*. Policy: thinking MUST
+      # NOT write here (hemisphere boundary); enforcement is documentation.
+      - ${ALICE_REPO:-${HOME}/alice}:/home/alice/alice
+      # State (worker, viewer-cache, daemon log, sci-env venv, etc.).
+      - ${HOME}/.local/state/alice:/state
+      # signal-cli's account database (linked devices, contacts, etc.).
+      - ${HOME}/.local/share/signal-cli:/home/alice/.local/share/signal-cli
+      # Alice's per-container Claude config (separate from the host's,
+      # so the host's running claude binary doesn't fight the container's
+      # over session state).
+      - ${HOME}/.alice-claude:/home/alice/.claude
+      # Host's Claude config — mounted as a DIRECTORY (not individual
+      # files) so atomic file replaces (e.g. /login writing a new
+      # credentials file) become visible inside the container. The
+      # entrypoint symlinks .credentials.json into its expected
+      # location.
+      - ${HOME}/.claude:/host-claude:ro
       - ${HOME}/.config/alice:/home/alice/.config/alice:ro
-
-networks:
-  alice-net:
-    name: alice-net
-    driver: bridge
+      - ${HOME}/.config/gh:/home/alice/.config/gh:ro
+      - ${HOME}/.ssh:/home/alice/.ssh:ro
+    working_dir: /home/alice/alice-mind
+    # NVIDIA GPU passthrough. The embedder s6 service (Qwen3-Embedding-4B
+    # served from /state/sci-env) needs CUDA; the rest of the container
+    # is happy without. Requires (a) nvidia-container-toolkit on the
+    # host and (b) the nvidia runtime registered in /etc/docker/daemon.json.
+    # If those aren't set up, compose v2 ignores the unknown runtime
+    # hint, so the container still starts — just without /dev/nvidia*
+    # and the embedder falls into its idle/no-GPU branch.
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
