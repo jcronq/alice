@@ -262,9 +262,15 @@ if command -v inotifywait >/dev/null 2>&1; then
     # next new event.
     drain_inbox
     while true; do
-        # close_write fires when a writer fsync+closes a freshly created
-        # file (atomic-rename also triggers moved_to). We accept either.
-        inotifywait -q -e close_write,moved_to --format '%f' "$INBOX_DIR" \
+        # -m is load-bearing. The MCP tool writes via tempfile+rename in
+        # the same dir, which fires CLOSE_WRITE on the .tmp file before
+        # the MOVED_TO on the final .md name. Without -m, inotifywait
+        # exits on the first event — the CLOSE_WRITE for `.foo.md.tmp`
+        # — which we filter out as non-`*.md`, and the subsequent
+        # MOVED_TO `foo.md` is gone by the time the outer loop respawns
+        # inotifywait. Result: every request stalls until the next
+        # unrelated event happens to wake the watcher.
+        inotifywait -m -q -e close_write,moved_to --format '%f' "$INBOX_DIR" \
             | while read -r created; do
                 case "$created" in
                     *.md) ;;
@@ -279,6 +285,11 @@ if command -v inotifywait >/dev/null 2>&1; then
                         log ERROR "process_file failed for $created"
                 fi
             done
+        # inotifywait exited unexpectedly (kernel-watch exhaustion, signal,
+        # etc). Drain whatever's queued before restarting so files that
+        # arrived during the gap aren't stranded until the next event.
+        log WARN "inotifywait exited; draining inbox before restart"
+        drain_inbox
     done
 else
     log WARN "inotifywait not available; falling back to 5s polling"
