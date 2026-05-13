@@ -1046,11 +1046,61 @@ def read_canvas(
         }
     # Fall through to flagged research notes — only those that opted in
     # via ``canvas_paper: true``. Unflagged research notes return None
-    # even if their slug matches, so this path can't be abused to read
-    # arbitrary vault content.
+    # even if their slug matches; the unflagged fallback for /canvas/<slug>
+    # lives in ``read_research_note`` so this strict path stays available
+    # for callers that need the opt-in semantics.
     if mind_dir is not None:
         return _find_research_paper(mind_dir, slug)
     return None
+
+
+def read_research_note(
+    mind_dir: pathlib.Path, slug: str
+) -> dict[str, Any] | None:
+    """Read any research note under ``cortex-memory/research/`` by slug,
+    regardless of the ``canvas_paper`` flag.
+
+    Used as the fallback for ``/canvas/{slug}`` (issue #175) so links to
+    research notes that didn't opt into canvas-paper presentation still
+    render as plain markdown rather than 404ing. The slug regex restricts
+    the readable surface to ``cortex-memory/research/*.md``, so this can't
+    be abused to read arbitrary vault content.
+    """
+    if not _CANVAS_SLUG_RE.match(slug):
+        return None
+    rdir = _research_dir(mind_dir)
+    path = rdir / f"{slug}.md"
+    try:
+        path_resolved = path.resolve()
+        rdir_resolved = rdir.resolve()
+    except OSError:
+        return None
+    if not str(path_resolved).startswith(str(rdir_resolved) + "/"):
+        return None
+    if not path_resolved.is_file():
+        return None
+    try:
+        text = path_resolved.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    body = text
+    title = slug
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end != -1:
+            body = text[end + 5 :]
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            title = stripped[2:].strip()
+            break
+    return {
+        "slug": slug,
+        "title": title,
+        "body": body,
+        "path": str(path_resolved),
+        "source": "research",
+    }
 
 
 def find_wake_thought(

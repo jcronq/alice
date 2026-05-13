@@ -9,6 +9,11 @@
         <span class="canvas-paper-slug">/canvas/{{ canvas.slug }}</span>
       </p>
       <h1>{{ canvas.title }}</h1>
+      {% if fallback_banner %}
+        <p class="canvas-paper-fallback">
+          This note isn't in canvas-paper presentation format; rendering as plain markdown.
+        </p>
+      {% endif %}
     </header>
     <section class="canvas-paper-body" id="paper-body">
       <pre id="paper-raw" style="display:none">{{ canvas.body }}</pre>
@@ -38,6 +43,11 @@
     .canvas-paper-head p { font-size: 12px; }
     .canvas-paper-source { margin-left: 14px; font-family: var(--mono, monospace); }
     .canvas-paper-slug { margin-left: 14px; font-family: var(--mono, monospace); opacity: 0.6; }
+    .canvas-paper-fallback {
+      margin: 12px 0 0; padding: 8px 12px;
+      background: var(--panel-2, #1a1a1a); border-left: 3px solid var(--accent);
+      font-size: 12px; color: var(--muted);
+    }
     .canvas-paper-body { line-height: 1.55; font-size: 15px; }
     .canvas-paper-body h1, .canvas-paper-body h2, .canvas-paper-body h3 {
       margin-top: 1.4em; margin-bottom: 0.4em;

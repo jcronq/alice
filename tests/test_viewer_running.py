@@ -462,9 +462,11 @@ def test_read_canvas_finds_flagged_research_paper(tmp_path):
 
 
 def test_read_canvas_rejects_unflagged_research_paper(tmp_path):
-    """An unflagged research note must NOT be readable via /canvas/<slug>
-    even if the slug matches — path-traversal-style protection so the
-    canvas pane can't be used to read arbitrary vault content."""
+    """``read_canvas`` itself returns None for an unflagged research
+    note — preserves the strict opt-in semantics for callers that need
+    them (e.g. canvas-index listing). The /canvas/<slug> route layers a
+    fallback on top via ``read_research_note`` (see issue #175 tests
+    below); this test only pins the function's own behaviour."""
     p = _paths(tmp_path)
     _make_research(p, "2026-05-11-private", "---\ntitle: Private\n---\n# X\n")
     out = sources.read_canvas(p.inner, "2026-05-11-private", p.mind_dir)
@@ -554,3 +556,158 @@ def test_read_auto_detected_paper(tmp_path):
     assert out is not None
     assert out["source"] == "research"
     assert out["title"] == "Auto Readable"
+
+
+# ---------------------------------------------------------------------------
+# read_research_note — the /canvas/{slug} fallback (issue #175)
+
+
+def test_read_research_note_finds_unflagged(tmp_path):
+    """An unflagged research note is readable via ``read_research_note``
+    so the /canvas/<slug> route can render it as plain markdown."""
+    p = _paths(tmp_path)
+    _make_research(
+        p,
+        "2026-05-12-eks-portability-audit-phase-1",
+        "---\ntitle: EKS\n---\n# Phase 1\nbody body\n",
+    )
+    out = sources.read_research_note(
+        p.mind_dir, "2026-05-12-eks-portability-audit-phase-1"
+    )
+    assert out is not None
+    assert out["source"] == "research"
+    assert out["title"] == "Phase 1"
+    assert "body body" in out["body"]
+
+
+def test_read_research_note_finds_flagged(tmp_path):
+    """Flagged notes also resolve via the fallback (same shape) — keeps
+    the route logic simple: try canvas first, then unflagged fallback."""
+    p = _paths(tmp_path)
+    _make_research(
+        p, "rp-flagged", "---\ncanvas_paper: true\n---\n# Flagged\nx\n"
+    )
+    out = sources.read_research_note(p.mind_dir, "rp-flagged")
+    assert out is not None
+    assert out["title"] == "Flagged"
+
+
+def test_read_research_note_strips_frontmatter(tmp_path):
+    p = _paths(tmp_path)
+    _make_research(
+        p, "rp-fm", "---\ntitle: T\n---\n# Body Title\nactual body\n"
+    )
+    out = sources.read_research_note(p.mind_dir, "rp-fm")
+    assert out is not None
+    assert "title: T" not in out["body"]
+    assert "actual body" in out["body"]
+
+
+def test_read_research_note_missing_slug_returns_none(tmp_path):
+    p = _paths(tmp_path)
+    p.mind_dir.mkdir(parents=True, exist_ok=True)
+    out = sources.read_research_note(p.mind_dir, "does-not-exist")
+    assert out is None
+
+
+def test_read_research_note_rejects_path_traversal(tmp_path):
+    """Slug regex blocks ``..`` and slashes; the resolve+prefix check
+    blocks symlink escapes."""
+    p = _paths(tmp_path)
+    _make_research(p, "rp-real", "# Real\n")
+    assert sources.read_research_note(p.mind_dir, "../etc/passwd") is None
+    assert sources.read_research_note(p.mind_dir, "foo/bar") is None
+    assert sources.read_research_note(p.mind_dir, "RP-UPPER") is None
+
+
+# ---------------------------------------------------------------------------
+# /canvas/{slug} route — fallback integration (issue #175)
+
+
+def test_canvas_route_renders_unflagged_research_with_banner(tmp_path):
+    """GET /canvas/<slug-of-unflagged-research-note> → 200 with banner
+    and the note's markdown body."""
+    from fastapi.testclient import TestClient
+
+    from alice_viewer.main import create_app
+
+    paths = _paths(tmp_path)
+    paths.mind_dir.mkdir(parents=True, exist_ok=True)
+    paths.state_dir.mkdir(parents=True, exist_ok=True)
+    _make_research(
+        paths,
+        "2026-05-12-design-doc",
+        "---\ntitle: D\n---\n# Design Doc\nplain body text\n",
+    )
+    app = create_app(paths=paths)
+    client = TestClient(app)
+    r = client.get("/canvas/2026-05-12-design-doc")
+    assert r.status_code == 200
+    body = r.text
+    assert "Design Doc" in body
+    assert "plain body text" in body
+    assert "rendering as plain markdown" in body
+
+
+def test_canvas_route_flagged_research_has_no_banner(tmp_path):
+    """Regression: flagged notes still render via the canvas-paper
+    path and don't get the fallback banner."""
+    from fastapi.testclient import TestClient
+
+    from alice_viewer.main import create_app
+
+    paths = _paths(tmp_path)
+    paths.mind_dir.mkdir(parents=True, exist_ok=True)
+    paths.state_dir.mkdir(parents=True, exist_ok=True)
+    _make_research(
+        paths,
+        "2026-05-12-paper",
+        "---\ncanvas_paper: true\n---\n# Real Paper\nbody\n",
+    )
+    app = create_app(paths=paths)
+    client = TestClient(app)
+    r = client.get("/canvas/2026-05-12-paper")
+    assert r.status_code == 200
+    assert "Real Paper" in r.text
+    assert "rendering as plain markdown" not in r.text
+
+
+def test_canvas_route_unknown_slug_still_404s(tmp_path):
+    """Regression: a slug that doesn't exist anywhere still 404s with
+    the existing 'canvas not found' page."""
+    from fastapi.testclient import TestClient
+
+    from alice_viewer.main import create_app
+
+    paths = _paths(tmp_path)
+    paths.mind_dir.mkdir(parents=True, exist_ok=True)
+    paths.state_dir.mkdir(parents=True, exist_ok=True)
+    app = create_app(paths=paths)
+    client = TestClient(app)
+    r = client.get("/canvas/2026-05-12-nope")
+    assert r.status_code == 404
+    assert "canvas not found" in r.text
+
+
+def test_canvas_route_authored_canvas_uses_slideshow(tmp_path):
+    """Regression: authored canvas decks still use canvas_view.html
+    (reveal.js), not the markdown paper template."""
+    from fastapi.testclient import TestClient
+
+    from alice_viewer.main import create_app
+
+    paths = _paths(tmp_path)
+    paths.mind_dir.mkdir(parents=True, exist_ok=True)
+    paths.state_dir.mkdir(parents=True, exist_ok=True)
+    (paths.inner / "canvas").mkdir(parents=True, exist_ok=True)
+    (paths.inner / "canvas" / "authored-deck.md").write_text(
+        "# Deck\n\n---\n\nslide two\n"
+    )
+    app = create_app(paths=paths)
+    client = TestClient(app)
+    r = client.get("/canvas/authored-deck")
+    assert r.status_code == 200
+    # canvas_view.html (reveal slideshow) — not canvas_paper.html.
+    # The slideshow template loads reveal.js; the paper one doesn't.
+    assert "reveal" in r.text.lower()
+    assert "rendering as plain markdown" not in r.text

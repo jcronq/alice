@@ -812,6 +812,15 @@ def create_app(paths: Paths | None = None) -> FastAPI:
     async def canvas_view(request: Request, slug: str):
         p: Paths = app.state.paths
         canvas = sources.read_canvas(p.inner, slug, p.mind_dir)
+        # Fallback (issue #175): worker-generated /canvas/<slug> links
+        # routinely point at research notes that didn't opt into
+        # ``canvas_paper: true``. Rather than 404ing, render them as
+        # plain markdown with a small banner explaining the format.
+        fallback_banner = False
+        if canvas is None and p.mind_dir is not None:
+            canvas = sources.read_research_note(p.mind_dir, slug)
+            if canvas is not None:
+                fallback_banner = True
         if canvas is None:
             return HTMLResponse(
                 f"<h1>canvas not found: {slug}</h1>"
@@ -820,11 +829,12 @@ def create_app(paths: Paths | None = None) -> FastAPI:
             )
         # Authored canvas decks → reveal.js slideshow.
         # Everything else (experiment cards, auto-promoted research
-        # papers) → plain markdown paper view. Reveal.js treats every
-        # standalone `---` as a slide break, which slices research-paper
-        # frontmatter into nonsense slides, so only hand-authored canvas
-        # decks (where the author intentionally wrote slide separators)
-        # get the slideshow treatment.
+        # papers, unflagged research fallbacks) → plain markdown paper
+        # view. Reveal.js treats every standalone `---` as a slide
+        # break, which slices research-paper frontmatter into nonsense
+        # slides, so only hand-authored canvas decks (where the author
+        # intentionally wrote slide separators) get the slideshow
+        # treatment.
         template = (
             "canvas_view.html"
             if canvas.get("source") == "canvas"
@@ -835,6 +845,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
             template,
             {
                 "canvas": canvas,
+                "fallback_banner": fallback_banner,
                 "state": _state_context(),
                 "active": "canvas",
             },
