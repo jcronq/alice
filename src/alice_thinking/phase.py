@@ -77,6 +77,18 @@ class Phase(enum.Enum):
     # ``_QwenReviser`` inside the design-commission loop to drive a
     # single revision turn through the standard PhaseRunner path.
     REVISE = "revise"
+    # Per-issue, stimulus-spawned modes (sub-issue 3 of SM v2 pipeline
+    # revision, ``[[2026-05-13-sm-v2-pipeline-revision]]``). The
+    # thinking-agent is spawned by
+    # :func:`alice_sm.dispatcher.spawn_thinking_agent` to handle one
+    # ``(sm:selected, art:code)`` issue end-to-end: design first, then
+    # — after Speaking's review + a compaction step — build. Both
+    # phases share the spawn dir; the entrypoint script
+    # (:mod:`scripts.sm-thinking-perissue` / ``alice/scripts/sm-thinking-perissue.py``)
+    # dispatches into the right one from the prompt's ``phase``
+    # frontmatter.
+    PER_ISSUE_DESIGN = "per_issue_design"
+    PER_ISSUE_BUILD = "per_issue_build"
 
 
 @dataclass(frozen=True)
@@ -473,7 +485,25 @@ _PHASE_FRAGMENT_FILES: dict[Phase, str] = {
     # fixed body. The reviser supplies the spec/draft/feedback as injected
     # content; the fragment instructs the model to return only revised draft.
     Phase.REVISE: "revise.md",
+    # Per-issue phases — the spawn_thinking_agent entrypoint writes the
+    # issue body (for DESIGN) or the approved design note (for BUILD)
+    # into ``injected_content``; the fragment supplies the operating
+    # instructions for that tier.
+    Phase.PER_ISSUE_DESIGN: "per-issue-design.md",
+    Phase.PER_ISSUE_BUILD: "per-issue-build.md",
 }
+
+
+# Phases that compose without the wake-mode prelude. The standard
+# prelude is wake-centric (write a wake file, drain notes, the
+# "research + memory only" constitutional boundary) and inappropriate
+# for stimulus-spawned per-issue work — in particular, BUILD must
+# touch code outside ``~/alice-mind/`` and open PRs, which the
+# default prelude explicitly forbids. These phases ship their own
+# framing in the fragment.
+_PHASES_WITHOUT_PRELUDE: frozenset[Phase] = frozenset(
+    {Phase.PER_ISSUE_DESIGN, Phase.PER_ISSUE_BUILD}
+)
 
 
 class PromptFragmentLoader:
@@ -522,14 +552,25 @@ class PromptFragmentLoader:
     ) -> str:
         """Compose the full prompt: ``timestamp_header + prelude + phase fragment``.
 
-        ``injected_content`` is reserved for STM/LTM hookup — when set,
-        it is inserted between the prelude and the phase body. Today
-        the kwarg is plumbed but unused; companion designs that ship
-        STM/LTM consume it.
+        ``injected_content`` is inserted between the prelude and the
+        phase body. STM/LTM designs use it for substrate excerpts; the
+        per-issue phases (:attr:`Phase.PER_ISSUE_DESIGN` /
+        :attr:`Phase.PER_ISSUE_BUILD`) use it for the issue body or the
+        approved design note that the entrypoint script reads from the
+        spawn dir.
+
+        Per-issue phases skip the wake-mode prelude
+        (:data:`_PHASES_WITHOUT_PRELUDE`) — that prelude is wake-centric
+        and its "no writes outside ``~/alice-mind/``" constitutional
+        boundary is wrong for BUILD mode, which must open PRs and edit
+        code under ``alice/``. The per-issue fragments carry their own
+        framing.
         """
-        prelude = self.load_prelude()
         phase_body = self.load_phase(phase)
-        sections = [timestamp_header.rstrip(), "", prelude.rstrip()]
+        sections: list[str] = [timestamp_header.rstrip()]
+        if phase not in _PHASES_WITHOUT_PRELUDE:
+            prelude = self.load_prelude()
+            sections += ["", prelude.rstrip()]
         if injected_content:
             sections += ["", "---", "", injected_content.rstrip()]
         sections += ["", "---", "", phase_body.rstrip(), ""]

@@ -146,7 +146,14 @@ def test_real_phases_share_full_tool_allowlist(tmp_path) -> None:
     """Speaking review 2026-05-07: per-phase tool restrictions
     narrowed the design space. Every non-Quick phase now ships with
     the same full tool set; the prompt fragment guides use, not the
-    harness."""
+    harness.
+
+    Per-issue phases (#163) opt into the same allowlist — BUILD needs
+    Bash for ``git``/``gh`` and DESIGN needs read tools for prior-art
+    lookup. The MCP entries (send_message, run_experiment) are
+    irrelevant for the per-issue lane but harmless; the prompt fragment
+    is the right place to constrain use, not the kernel allowlist.
+    """
     runner = PhaseRunner()
     for phase in (
         Phase.ACTIVE,
@@ -155,6 +162,8 @@ def test_real_phases_share_full_tool_allowlist(tmp_path) -> None:
         Phase.SLEEP_D,
         Phase.DESIGN_COMMISSION,
         Phase.CONFLICT_RESOLUTION,
+        Phase.PER_ISSUE_DESIGN,
+        Phase.PER_ISSUE_BUILD,
     ):
         spec = runner.kernel_spec(phase, _ctx(tmp_path))
         assert set(spec.allowed_tools) == _FULL_SET, (
@@ -191,6 +200,8 @@ def test_max_seconds_defaults_unbounded_for_real_wakes(tmp_path) -> None:
         Phase.SLEEP_D,
         Phase.DESIGN_COMMISSION,
         Phase.CONFLICT_RESOLUTION,
+        Phase.PER_ISSUE_DESIGN,
+        Phase.PER_ISSUE_BUILD,
     ):
         spec = runner.kernel_spec(phase, _ctx(tmp_path))
         assert spec.max_seconds == 0
@@ -352,3 +363,114 @@ def test_load_phase_config_default_is_full_dispatch_on(tmp_path) -> None:
     """Phase 3 ships with full dispatch on by default."""
     cfg = load_phase_config(tmp_path)
     assert cfg.enable_full_sleep_dispatch is True
+
+
+# ---------------------------------------------------------------------------
+# Per-issue phases (#163) — stimulus-spawned, prompt fragment carries
+# its own framing (no wake prelude).
+# ---------------------------------------------------------------------------
+
+
+def test_per_issue_design_prompt_reaches_comment_emission_point(tmp_path) -> None:
+    """Phase.PER_ISSUE_DESIGN composes a prompt that tells the agent
+    how to emit the `[SM] design-ready` comment. That's the test's
+    real shape: the runtime composes the prompt; the kernel (faked
+    here via a non-call assertion against the spec) is downstream.
+
+    The injected issue body must appear inline so the agent can read
+    it. The fragment must carry the design-ready emission contract —
+    if it drops, the comment never goes out and Speaking has no
+    review signal.
+    """
+    runner = PhaseRunner()
+    issue_body = (
+        "Issue: #163\n"
+        "Title: Add per-issue phases\n"
+        "Source: source:jcronq\n"
+        "\n"
+        "Implement Phase.PER_ISSUE_DESIGN and PER_ISSUE_BUILD."
+    )
+    prompt, spec = runner.run(
+        Phase.PER_ISSUE_DESIGN, _ctx(tmp_path), injected_content=issue_body
+    )
+    # Body lands inline so the agent has the issue context.
+    assert "Title: Add per-issue phases" in prompt
+    # Fragment carries the design-ready emission contract.
+    assert "[SM] design-ready" in prompt
+    # And the design-revise iteration hint.
+    assert "[SM] design-revise" in prompt
+    # No wake-mode prelude leaks in — per-issue phases bypass it
+    # because BUILD must write code outside ~/alice-mind/.
+    assert "Thinking Alice — wake" not in prompt
+    assert "drain the notes inbox" not in prompt
+    # KernelSpec is properly built.
+    assert spec.model == "claude-sonnet-test"
+    assert set(spec.allowed_tools) == _FULL_SET
+
+
+def test_per_issue_build_prompt_carries_approved_design_note(tmp_path) -> None:
+    """Phase.PER_ISSUE_BUILD reads the approved design note as entry
+    context. The dispatcher's compaction step (sub-issue 4) writes
+    the approved note into the recomposed prompt.txt body; the
+    runner forwards it as ``injected_content`` so the BUILD agent
+    sees what it must implement.
+    """
+    runner = PhaseRunner()
+    approved_design_note = (
+        "---\n"
+        "title: Per-issue phases\n"
+        "issue: 163\n"
+        "status: approved\n"
+        "---\n"
+        "\n"
+        "# Per-issue phases\n"
+        "\n"
+        "## Scope\n"
+        "- Add Phase.PER_ISSUE_DESIGN\n"
+        "- Add Phase.PER_ISSUE_BUILD\n"
+    )
+    prompt, spec = runner.run(
+        Phase.PER_ISSUE_BUILD,
+        _ctx(tmp_path),
+        injected_content=approved_design_note,
+    )
+    # Approved design note appears inline as entry context.
+    assert "issue: 163" in prompt
+    assert "Add Phase.PER_ISSUE_DESIGN" in prompt
+    # Fragment carries the draft-PR contract.
+    assert "draft" in prompt.lower() and "PR" in prompt
+    # And the no-force-push / no --no-verify constraints survive.
+    assert "--no-verify" in prompt
+    # Same KernelSpec shape as other real phases.
+    assert spec.model == "claude-sonnet-test"
+    assert set(spec.allowed_tools) == _FULL_SET
+    # BUILD spec needs to be unbounded so a long implementation pass
+    # doesn't get killed mid-edit.
+    assert spec.max_seconds == 0
+
+
+def test_per_issue_phases_skip_wake_prelude(tmp_path) -> None:
+    """Regression — make sure the wake prelude doesn't leak through.
+
+    The prelude's "research + memory, no real-world writes"
+    constitutional boundary would prevent BUILD from opening PRs.
+    Per-issue phases must compose without it.
+    """
+    runner = PhaseRunner()
+    for phase in (Phase.PER_ISSUE_DESIGN, Phase.PER_ISSUE_BUILD):
+        prompt, _ = runner.run(phase, _ctx(tmp_path), injected_content="body")
+        assert "Thinking Alice — wake" not in prompt
+        assert "drain the notes inbox" not in prompt
+        # Sanity — the body still lands.
+        assert "body" in prompt
+
+
+def test_existing_wake_phases_still_carry_prelude(tmp_path) -> None:
+    """Regression — wake-cadence phases keep the prelude. Per-issue
+    skip is opt-in via the _PHASES_WITHOUT_PRELUDE set; other phases
+    must still get the full wake framing.
+    """
+    runner = PhaseRunner()
+    for phase in (Phase.ACTIVE, Phase.SLEEP_B, Phase.SLEEP_C, Phase.SLEEP_D):
+        prompt, _ = runner.run(phase, _ctx(tmp_path))
+        assert "Thinking Alice — wake" in prompt

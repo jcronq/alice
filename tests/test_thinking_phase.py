@@ -457,6 +457,50 @@ def test_loader_compose_threads_injected_content() -> None:
     assert prelude_idx < inject_idx < phase_idx
 
 
+def test_loader_per_issue_phases_skip_prelude() -> None:
+    """Per-issue phases (#163) bypass the wake-mode prelude. The
+    prelude's "no writes outside ~/alice-mind/" constitutional
+    boundary would prevent BUILD from opening PRs; per-issue
+    fragments carry their own framing.
+    """
+    loader = PromptFragmentLoader()
+    for phase in (Phase.PER_ISSUE_DESIGN, Phase.PER_ISSUE_BUILD):
+        out = loader.compose(
+            phase,
+            timestamp_header="ts",
+            injected_content="<<ENTRY CONTEXT>>",
+        )
+        # No wake prelude.
+        assert "Thinking Alice — wake" not in out
+        assert "Step 1 — write the wake file" not in out
+        # Injected content lands inline.
+        assert "<<ENTRY CONTEXT>>" in out
+        # Phase-specific Step 0 framing is present.
+        assert "Step 0" in out
+
+
+def test_loader_per_issue_design_fragment_emits_design_ready_contract() -> None:
+    """The DESIGN fragment must instruct the agent to emit the
+    ``[SM] design-ready`` comment — without it, Speaking has no
+    review trigger and the pipeline stalls."""
+    loader = PromptFragmentLoader()
+    out = loader.load_phase(Phase.PER_ISSUE_DESIGN)
+    assert "[SM] design-ready" in out
+    assert "[SM] design-revise" in out
+
+
+def test_loader_per_issue_build_fragment_emits_draft_pr_contract() -> None:
+    """The BUILD fragment must instruct the agent to open a draft PR
+    (not self-merge from build phase — that's sub-issue 6's
+    reviewer's job)."""
+    loader = PromptFragmentLoader()
+    out = loader.load_phase(Phase.PER_ISSUE_BUILD)
+    assert "draft" in out.lower()
+    assert "PR" in out
+    # No --no-verify, no force-push — kernel constraints.
+    assert "--no-verify" in out
+
+
 # ---------------------------------------------------------------------------
 # detect_commission_notes
 # ---------------------------------------------------------------------------

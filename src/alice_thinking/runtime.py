@@ -39,6 +39,18 @@ as a no-op stub for the companion STM/LTM design — Hebbian
 edge-weight updates plug in there. See §Required Interfaces for
 Companion Designs in
 ``cortex-memory/research/2026-05-07-thinking-phase-routing-design.md``.
+
+Per-issue phases (:attr:`Phase.PER_ISSUE_DESIGN` /
+:attr:`Phase.PER_ISSUE_BUILD`) are stimulus-spawned by
+:func:`alice_sm.dispatcher.spawn_thinking_agent` rather than picked by
+the wake cadence selector. They route through the same
+:meth:`PhaseRunner.run` path as cadence-driven phases — the caller is
+the ``scripts/sm-thinking-perissue.py`` entrypoint, which reads the
+spawn dir's ``prompt.txt`` and hands the issue body / approved design
+note to the runner via ``injected_content``. The prompt fragments
+(:mod:`alice_thinking.prompts.per-issue-design`, ``per-issue-build``)
+carry per-issue-specific framing and bypass the wake prelude (see
+:data:`alice_thinking.phase._PHASES_WITHOUT_PRELUDE`).
 """
 
 from __future__ import annotations

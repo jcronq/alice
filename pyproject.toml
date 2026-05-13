@@ -62,6 +62,13 @@ alice-seed-access-counts = "alice_indexer.seed_access_counts:main"
 # drop a task spec into /state/worker/host-claude/inbox/ from the CLI
 # instead of going through the MCP server. See sandbox/host-claude-watcher/.
 alice-host-claude-request = "alice_speaking.tools.host_claude:main"
+# Per-issue thinking-agent entrypoint (#163). Invoked by
+# alice_sm.dispatcher.spawn_thinking_agent for each (sm:selected, art:code)
+# issue — reads <spawn-dir>/prompt.txt, resolves Phase from frontmatter,
+# drives the kernel through alice_thinking.runtime.PhaseRunner. The
+# scripts/sm-thinking-perissue.py shim is a thin file-path wrapper around
+# the same module for repo-root invocations.
+alice-sm-thinking-perissue = "alice_thinking.cli.perissue:main"
 
 [build-system]
 requires = ["hatchling"]
