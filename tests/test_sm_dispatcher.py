@@ -6828,3 +6828,599 @@ def test_open_done_closed_sweep_still_works(
     assert (120, "sm:selected", "sm:rejected") in report.transitions
     # Closed-stale sweep never re-closes.
     assert close_rec.closed == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #176 — dependency-aware queue
+# ---------------------------------------------------------------------------
+
+
+def _make_issue_with_body(
+    number: int,
+    body: str,
+    *,
+    author: str = "jcronq",
+    sm_labels: tuple[str, ...] = ("sm:selected",),
+    art_labels: tuple[str, ...] = ("art:code",),
+) -> dict:
+    issue = _make_issue(
+        number, author=author, sm_labels=sm_labels, art_labels=art_labels
+    )
+    issue["body"] = body
+    return issue
+
+
+def _dep_get_issue(state_by_n: dict[int, tuple[str, str | None]]):
+    """Build a fake ``get_issue(number) -> payload`` from a state map.
+
+    ``state_by_n`` maps issue number → ``(gh_state, sm_label_or_None)``.
+    A number missing from the map → returns None (404).
+    """
+
+    def get_issue(n: int) -> dict | None:
+        if n not in state_by_n:
+            return None
+        gh_state, sm_label = state_by_n[n]
+        labels = []
+        if sm_label is not None:
+            labels.append({"name": sm_label})
+        return {"number": n, "state": gh_state, "labels": labels}
+
+    return get_issue
+
+
+def test_deps_all_resolved_spawns(state_path, tmp_path) -> None:
+    """Issue body with ``Depends on #N`` where #N is closed sm:done → spawn fires."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    popens: list[FakePopen] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    def spawn(issue, art_label, repo):
+        return sm.spawn_agent(
+            issue,
+            art_label,
+            repo,
+            spawn_dir=spawn_dir,
+            popen=popen,
+            post_comment=recorder,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+
+    issues = [_make_issue_with_body(600, "Depends on #500")]
+    get_issue = _dep_get_issue({500: ("CLOSED", "sm:done")})
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        post_comment=recorder,
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        count_running=lambda: 0,
+        spawn=spawn,
+        get_issue=get_issue,
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 1
+    assert report.spawn_skipped_blocked_deps == 0
+    assert len(popens) == 1
+
+
+def test_deps_open_dep_skips_spawn_no_label_change(state_path, tmp_path) -> None:
+    """``Depends on #N`` where #N still open sm:selected → no spawn, no label change."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    popens: list[FakePopen] = []
+    logged: list[str] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    def spawn(issue, art_label, repo):
+        return sm.spawn_agent(
+            issue,
+            art_label,
+            repo,
+            spawn_dir=spawn_dir,
+            popen=popen,
+            post_comment=recorder,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+
+    issues = [_make_issue_with_body(601, "Depends on #500")]
+    get_issue = _dep_get_issue({500: ("OPEN", "sm:selected")})
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        count_running=lambda: 0,
+        spawn=spawn,
+        get_issue=get_issue,
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 0
+    assert popens == []
+    assert report.spawn_skipped_blocked_deps == 1
+    # No spawn-started comment posted (spec: "no spawn-started comment").
+    bodies = [b for _r, _n, b in recorder.posted]
+    assert not any(b.startswith("[SM] spawn-started") for b in bodies)
+    # No label change on the gated issue (spec: "no label change").
+    assert label_rec.calls == []
+    # Skip log line is emitted.
+    assert any(
+        "spawn skip #601" in m and "blocked by #500" in m for m in logged
+    ), f"missing skip log line in {logged!r}"
+
+
+def test_deps_rejected_dep_transitions_to_blocked(state_path, tmp_path) -> None:
+    """``Depends on #N`` where #N closed sm:rejected → transition to sm:blocked."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+
+    def spawn(*_a, **_kw):  # pragma: no cover — must not be called
+        raise AssertionError("spawn should not fire when dep is rejected")
+
+    issues = [_make_issue_with_body(602, "Depends on #500")]
+    get_issue = _dep_get_issue({500: ("CLOSED", "sm:rejected")})
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        count_running=lambda: 0,
+        spawn=spawn,
+        get_issue=get_issue,
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 1
+    assert (602, "sm:selected", "sm:blocked") in report.transitions
+    # Label edit: add sm:blocked, remove sm:selected.
+    assert len(label_rec.calls) == 1
+    edit = label_rec.calls[0]
+    assert edit["number"] == 602
+    assert edit["add"] == ["sm:blocked"]
+    assert edit["remove"] == ["sm:selected"]
+    # Transition comment carries the rejected-dep reason + the
+    # ``unblocked_by`` field so the audit trail records what should
+    # un-stick the issue.
+    bodies = [b for _r, _n, b in recorder.posted if _n == 602]
+    transition = [b for b in bodies if b.startswith("[SM] transition")]
+    assert len(transition) == 1
+    assert "from=selected" in transition[0]
+    assert "to=blocked" in transition[0]
+    assert 'reason="dependency #500 was rejected"' in transition[0]
+    assert 'unblocked_by="speaking to re-scope"' in transition[0]
+
+
+def test_deps_multiple_all_resolved_spawns(state_path, tmp_path) -> None:
+    """Multiple deps, all resolved sm:done → spawn fires."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    popens: list[FakePopen] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    def spawn(issue, art_label, repo):
+        return sm.spawn_agent(
+            issue,
+            art_label,
+            repo,
+            spawn_dir=spawn_dir,
+            popen=popen,
+            post_comment=recorder,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+
+    issues = [_make_issue_with_body(603, "Depends on #500, #501\nBlocked by #502")]
+    get_issue = _dep_get_issue(
+        {
+            500: ("CLOSED", "sm:done"),
+            501: ("CLOSED", "sm:done"),
+            502: ("CLOSED", "sm:done"),
+        }
+    )
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        post_comment=recorder,
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        count_running=lambda: 0,
+        spawn=spawn,
+        get_issue=get_issue,
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 1
+    assert len(popens) == 1
+
+
+def test_deps_multiple_one_unresolved_skips_spawn(state_path, tmp_path) -> None:
+    """Multiple deps, one still open → no spawn."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    popens: list[FakePopen] = []
+    logged: list[str] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    def spawn(issue, art_label, repo):
+        return sm.spawn_agent(
+            issue,
+            art_label,
+            repo,
+            spawn_dir=spawn_dir,
+            popen=popen,
+            post_comment=recorder,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+
+    issues = [_make_issue_with_body(604, "Depends on #500, #501")]
+    get_issue = _dep_get_issue(
+        {500: ("CLOSED", "sm:done"), 501: ("OPEN", "sm:selected")}
+    )
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        count_running=lambda: 0,
+        spawn=spawn,
+        get_issue=get_issue,
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 0
+    assert popens == []
+    assert report.spawn_skipped_blocked_deps == 1
+    # Only the open dep gets cited in the skip log line.
+    skip_lines = [m for m in logged if "spawn skip #604" in m]
+    assert any("#501" in m for m in skip_lines)
+    assert not any("#500" in m for m in skip_lines)
+    assert label_rec.calls == []
+
+
+def test_deps_nonexistent_dep_treated_as_resolved(state_path, tmp_path) -> None:
+    """``Depends on #99999`` where #99999 doesn't exist → warn, treat as resolved."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    popens: list[FakePopen] = []
+    logged: list[str] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    def spawn(issue, art_label, repo):
+        return sm.spawn_agent(
+            issue,
+            art_label,
+            repo,
+            spawn_dir=spawn_dir,
+            popen=popen,
+            post_comment=recorder,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+
+    issues = [_make_issue_with_body(605, "Depends on #99999")]
+    # get_issue returns None for #99999 (typo / moved / 404).
+    get_issue = _dep_get_issue({})
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        post_comment=recorder,
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        count_running=lambda: 0,
+        spawn=spawn,
+        get_issue=get_issue,
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    # Spawn proceeds — a typo can't permanently stall the queue.
+    assert report.spawned == 1
+    assert len(popens) == 1
+    # Warning log line is emitted so the operator notices the missing ref.
+    assert any(
+        "dep #99999 not found" in m for m in logged
+    ), f"missing 404 warning in {logged!r}"
+
+
+def test_deps_blocked_by_synonym_gates_spawn(state_path, tmp_path) -> None:
+    """``Blocked by #N`` is treated the same as ``Depends on #N``."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    popens: list[FakePopen] = []
+    logged: list[str] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    def spawn(issue, art_label, repo):
+        return sm.spawn_agent(
+            issue,
+            art_label,
+            repo,
+            spawn_dir=spawn_dir,
+            popen=popen,
+            post_comment=recorder,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+
+    issues = [_make_issue_with_body(606, "Blocked by #500")]
+    get_issue = _dep_get_issue({500: ("OPEN", "sm:selected")})
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        post_comment=recorder,
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        count_running=lambda: 0,
+        spawn=spawn,
+        get_issue=get_issue,
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 0
+    assert report.spawn_skipped_blocked_deps == 1
+    assert any("blocked by #500" in m for m in logged)
+
+
+def test_deps_amendment_comment_adds_dependency(state_path, tmp_path) -> None:
+    """Trusted-author comment adding ``Depends on #N`` after the issue
+    was filed is respected by the dependency parser."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    popens: list[FakePopen] = []
+    logged: list[str] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    def spawn(issue, art_label, repo):
+        return sm.spawn_agent(
+            issue,
+            art_label,
+            repo,
+            spawn_dir=spawn_dir,
+            popen=popen,
+            post_comment=recorder,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+
+    # Body has no deps; the dep arrives as an amendment comment.
+    issues = [_make_issue_with_body(607, "Sub-issue: wire up X.")]
+    amendment = [
+        {
+            "body": "Depends on #500",
+            "author": {"login": "jcronq"},
+        }
+    ]
+    get_issue = _dep_get_issue({500: ("OPEN", "sm:selected")})
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        list_comments=lambda _r, _n: amendment,
+        post_comment=recorder,
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        count_running=lambda: 0,
+        spawn=spawn,
+        get_issue=get_issue,
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 0
+    assert report.spawn_skipped_blocked_deps == 1
+    assert any("blocked by #500" in m for m in logged)
+
+
+def test_deps_amendment_from_untrusted_author_is_ignored(
+    state_path, tmp_path
+) -> None:
+    """A drive-by commenter can't inject ``Depends on #N`` to stall an issue.
+
+    Untrusted-author amendment comments are filtered out before the
+    parser runs — same trust model as ``[SM]`` verb comments.
+    """
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    popens: list[FakePopen] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    def spawn(issue, art_label, repo):
+        return sm.spawn_agent(
+            issue,
+            art_label,
+            repo,
+            spawn_dir=spawn_dir,
+            popen=popen,
+            post_comment=recorder,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+
+    issues = [_make_issue_with_body(608, "Sub-issue: wire up Y.")]
+    untrusted_amendment = [
+        {
+            "body": "Depends on #500",
+            "author": {"login": "random-drive-by"},
+        }
+    ]
+    # If we did consult the comment, this would gate the spawn (and the
+    # test would fail). Returning OPEN here verifies the comment was
+    # NOT consulted.
+    get_issue = _dep_get_issue({500: ("OPEN", "sm:selected")})
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        list_comments=lambda _r, _n: untrusted_amendment,
+        post_comment=recorder,
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        count_running=lambda: 0,
+        spawn=spawn,
+        get_issue=get_issue,
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 1
+
+
+def test_deps_blocked_dep_dry_run_does_not_post(state_path) -> None:
+    """Dry-run mode preserves the gate logic but does not post or persist."""
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+
+    issues = [_make_issue_with_body(609, "Depends on #500")]
+    get_issue = _dep_get_issue({500: ("CLOSED", "sm:rejected")})
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        get_issue=get_issue,
+        dry_run=True,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 1
+    assert (609, "sm:selected", "sm:blocked") in report.transitions
+    # Dry-run: no comments actually posted, no label edits applied.
+    assert recorder.posted == []
+    assert label_rec.calls == []

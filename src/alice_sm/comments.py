@@ -819,6 +819,121 @@ def parse_exit_transition(
 
 
 # ---------------------------------------------------------------------------
+# Issue #176 — dependency parser
+# ---------------------------------------------------------------------------
+#
+# The dispatcher gates spawns on resolution of cross-issue dependencies
+# declared in plain prose on the issue body (and amendment comments).
+# Format: a line that begins with one of the recognized verbs followed by
+# one or more ``#N`` references (comma-separated is fine).
+#
+#     Depends on #5
+#     Blocked by #5, #6
+#     Soft depends on #5
+#
+# Hard verbs gate the spawn; soft verbs are captured but informational
+# only. Case-insensitive. Anchored to the start of the (lstripped) line
+# so prose like "If this requires #5 ..." does not produce a false
+# positive — the convention is that humans put the directive on its own
+# line.
+
+# Hard verbs gate spawning. "soft depends on" must come before "depends on"
+# in the alternation so the regex engine picks the longer match first.
+_HARD_DEP_VERBS: tuple[str, ...] = (
+    "depends on",
+    "blocked by",
+    "requires",
+    "waits for",
+)
+_SOFT_DEP_VERBS: tuple[str, ...] = (
+    "soft depends on",
+    "prefers",
+)
+
+_DEP_VERB_RE = re.compile(
+    r"^(?P<verb>"
+    + "|".join(re.escape(v) for v in (*_SOFT_DEP_VERBS, *_HARD_DEP_VERBS))
+    + r")\b",
+    re.IGNORECASE,
+)
+
+# Issue references on the rest of the line: ``#N`` tokens, comma-separated
+# or whitespace-separated. We match each ``#N`` independently so
+# ``Depends on #5, #6 and #7`` picks up all three.
+_ISSUE_REF_RE = re.compile(r"#(?P<num>\d+)")
+
+
+@dataclass(frozen=True)
+class IssueDependencies:
+    """Hard and soft dependency issue numbers parsed from prose.
+
+    ``hard`` gates the dispatcher spawn (every ``hard`` ref must be
+    closed at ``sm:done`` before the issue is eligible). ``soft`` is
+    informational only — useful for "I'd prefer #N to land first but
+    it's not strictly required" — and does not block spawning.
+
+    Both lists are de-duplicated and preserve first-seen order so the
+    log line and any future viewer rendering are deterministic.
+    """
+
+    hard: tuple[int, ...]
+    soft: tuple[int, ...]
+
+
+def parse_dependencies(text: str | None) -> IssueDependencies:
+    """Scan prose for ``Depends on #N`` / ``Blocked by #N`` / etc.
+
+    Recognized hard verbs: ``Depends on``, ``Blocked by``, ``Requires``,
+    ``Waits for``. Soft verbs: ``Soft depends on``, ``Prefers``. All
+    case-insensitive. The verb must start the (lstripped) line — prose
+    like "but this requires #N to land first" is intentionally not
+    picked up.
+
+    Comma- or whitespace-separated continuations on the same line are
+    captured, so::
+
+        Depends on #5, #6 and #7
+
+    yields ``hard == (5, 6, 7)``.
+    """
+    if not text:
+        return IssueDependencies(hard=(), soft=())
+    hard: list[int] = []
+    soft: list[int] = []
+    seen_hard: set[int] = set()
+    seen_soft: set[int] = set()
+    for raw_line in text.splitlines():
+        line = raw_line.lstrip()
+        m = _DEP_VERB_RE.match(line)
+        if m is None:
+            continue
+        verb = m.group("verb").lower()
+        is_soft = verb in _SOFT_DEP_VERBS
+        rest = line[m.end() :]
+        for ref in _ISSUE_REF_RE.finditer(rest):
+            n = int(ref.group("num"))
+            if is_soft:
+                if n in seen_hard or n in seen_soft:
+                    # If the same #N appears as both hard and soft,
+                    # hard wins; if it's already in soft we don't
+                    # double-count.
+                    continue
+                seen_soft.add(n)
+                soft.append(n)
+            else:
+                if n in seen_hard:
+                    continue
+                # Promote: a previously-soft ref now declared hard
+                # moves out of the soft list.
+                if n in seen_soft:
+                    seen_soft.discard(n)
+                    soft.remove(n)
+                seen_hard.add(n)
+                hard.append(n)
+    return IssueDependencies(hard=tuple(hard), soft=tuple(soft))
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 

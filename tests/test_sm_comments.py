@@ -554,3 +554,125 @@ def test_exit_transition_dispatch_bareword_form(log: LogCapture) -> None:
     assert out == cm.ExitTransition(
         value="disseminate", findings=None, spawned=None
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #176 — dependency parser (Depends on #N / Blocked by #N / etc.)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_dependencies_empty_text() -> None:
+    assert cm.parse_dependencies("") == cm.IssueDependencies(hard=(), soft=())
+    assert cm.parse_dependencies(None) == cm.IssueDependencies(hard=(), soft=())
+
+
+def test_parse_dependencies_depends_on() -> None:
+    out = cm.parse_dependencies("Depends on #5")
+    assert out == cm.IssueDependencies(hard=(5,), soft=())
+
+
+def test_parse_dependencies_case_insensitive() -> None:
+    out = cm.parse_dependencies("DEPENDS ON #5\ndepends on #6\nDepends On #7")
+    assert out == cm.IssueDependencies(hard=(5, 6, 7), soft=())
+
+
+def test_parse_dependencies_blocked_by_synonym() -> None:
+    out = cm.parse_dependencies("Blocked by #5")
+    assert out == cm.IssueDependencies(hard=(5,), soft=())
+
+
+def test_parse_dependencies_requires_synonym() -> None:
+    out = cm.parse_dependencies("Requires #5")
+    assert out == cm.IssueDependencies(hard=(5,), soft=())
+
+
+def test_parse_dependencies_waits_for_synonym() -> None:
+    out = cm.parse_dependencies("Waits for #5")
+    assert out == cm.IssueDependencies(hard=(5,), soft=())
+
+
+def test_parse_dependencies_comma_separated() -> None:
+    out = cm.parse_dependencies("Depends on #5, #6, #7")
+    assert out == cm.IssueDependencies(hard=(5, 6, 7), soft=())
+
+
+def test_parse_dependencies_mixed_separators() -> None:
+    out = cm.parse_dependencies("Depends on #5, #6 and #7")
+    assert out == cm.IssueDependencies(hard=(5, 6, 7), soft=())
+
+
+def test_parse_dependencies_soft_depends_on() -> None:
+    out = cm.parse_dependencies("Soft depends on #5\nPrefers #6")
+    assert out == cm.IssueDependencies(hard=(), soft=(5, 6))
+
+
+def test_parse_dependencies_soft_does_not_eat_hard() -> None:
+    # "Soft depends on" must match the longer alternation, NOT the
+    # "depends on" branch starting partway into the line.
+    out = cm.parse_dependencies("Soft depends on #5")
+    assert out == cm.IssueDependencies(hard=(), soft=(5,))
+
+
+def test_parse_dependencies_hard_overrides_soft_for_same_ref() -> None:
+    # A dep that's both soft and hard is treated as hard. Order in body
+    # shouldn't matter — hard wins regardless of which line came first.
+    soft_first = cm.parse_dependencies("Soft depends on #5\nDepends on #5")
+    assert soft_first == cm.IssueDependencies(hard=(5,), soft=())
+    hard_first = cm.parse_dependencies("Depends on #5\nSoft depends on #5")
+    assert hard_first == cm.IssueDependencies(hard=(5,), soft=())
+
+
+def test_parse_dependencies_inline_mention_is_not_a_dep() -> None:
+    # The verb must start the (lstripped) line. Prose mid-sentence
+    # must not produce a false positive.
+    text = "This thing requires #5 to land before we can ship."
+    assert cm.parse_dependencies(text) == cm.IssueDependencies(hard=(), soft=())
+
+
+def test_parse_dependencies_leading_whitespace_ok() -> None:
+    # List-marker style ("  - Depends on #5") should still parse, since
+    # we lstrip before anchoring. (We don't strip the leading '- '
+    # marker though — that's prose, not whitespace.)
+    out = cm.parse_dependencies("  Depends on #5")
+    assert out == cm.IssueDependencies(hard=(5,), soft=())
+
+
+def test_parse_dependencies_deduplicates_within_same_text() -> None:
+    out = cm.parse_dependencies("Depends on #5\nDepends on #5\nBlocked by #5")
+    assert out == cm.IssueDependencies(hard=(5,), soft=())
+
+
+def test_parse_dependencies_preserves_order() -> None:
+    out = cm.parse_dependencies(
+        "Depends on #9\nBlocked by #3\nRequires #11, #1"
+    )
+    assert out == cm.IssueDependencies(hard=(9, 3, 11, 1), soft=())
+
+
+def test_parse_dependencies_multiline_body() -> None:
+    body = """\
+This is a sub-issue scoped to wiring up the new routing layer.
+
+Depends on #150
+Blocked by #151, #152
+
+Some prose explaining the design considerations.
+
+Soft depends on #149
+
+End of body.
+"""
+    assert cm.parse_dependencies(body) == cm.IssueDependencies(
+        hard=(150, 151, 152), soft=(149,)
+    )
+
+
+def test_parse_dependencies_ignores_non_verb_lines_with_hashrefs() -> None:
+    body = """\
+See #5 for context.
+This change relates to #6.
+Depends on #7
+"""
+    # Only the explicit verb line counts; the bare "#5" mentions don't
+    # become deps.
+    assert cm.parse_dependencies(body) == cm.IssueDependencies(hard=(7,), soft=())

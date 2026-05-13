@@ -3239,6 +3239,86 @@ class RunReport:
     # reminder comments posted while waiting on the worker.
     research_closed: int = 0
     exit_required_posted: int = 0
+    # Issue #176 — count of spawns skipped because at least one hard
+    # dependency was still open ("blocked by #N"). Distinct from
+    # ``skipped_dedup`` / ``skipped_trust`` so the done-line shows the
+    # queue is gated on dependencies, not auth / dedup.
+    spawn_skipped_blocked_deps: int = 0
+
+
+@dataclass(frozen=True)
+class DependencyResolution:
+    """Result of resolving a list of dependency issue numbers.
+
+    Issue #176. Returned by :func:`resolve_dependencies`. The dispatcher
+    uses ``rejected`` to short-circuit to ``sm:blocked`` (a closed
+    rejected dep is permanent), ``blocking`` to gate spawning (open
+    dep — try again next pass), and ``missing`` only as a log signal
+    (a typo / moved issue is treated as resolved so the dispatcher
+    doesn't stall forever on a misspelling).
+    """
+
+    blocking: tuple[int, ...]
+    rejected: tuple[int, ...]
+    missing: tuple[int, ...]
+    resolved: tuple[int, ...]
+
+
+def resolve_dependencies(
+    deps: Iterable[int],
+    get_issue: Callable[[int], dict[str, Any] | None],
+    *,
+    log: Callable[[str], None] = lambda _m: None,
+) -> DependencyResolution:
+    """Look up each dep's current GH state + labels and bucket the results.
+
+    Issue #176. ``get_issue`` is the ``(number) -> payload | None``
+    callable bound to the active repo (typically
+    ``lambda n: gh_get_issue(repo, n)``). The dispatcher wires it up in
+    :func:`run` when ``enable_spawn`` is True; tests inject a fake.
+
+    Buckets:
+
+      * ``blocking``  — open issue (still needs to be resolved)
+      * ``rejected``  — closed with ``sm:rejected`` (permanent block)
+      * ``missing``   — ``get_issue`` returned ``None`` (404 / typo);
+                        treated as resolved per spec to avoid stalling
+                        the queue on a misspelled reference.
+      * ``resolved``  — closed without ``sm:rejected`` (assumed
+                        ``sm:done`` or otherwise satisfied).
+    """
+    blocking: list[int] = []
+    rejected: list[int] = []
+    missing: list[int] = []
+    resolved: list[int] = []
+    for n in deps:
+        payload = get_issue(n)
+        if payload is None:
+            log(
+                f"[sm-dispatcher] dep #{n} not found "
+                f"(404 / typo / permission) — treating as resolved"
+            )
+            missing.append(n)
+            continue
+        gh_state = (payload.get("state") or "").upper()
+        labels = {
+            lab.get("name")
+            for lab in (payload.get("labels") or [])
+            if isinstance(lab, dict) and isinstance(lab.get("name"), str)
+        }
+        if gh_state == "OPEN":
+            blocking.append(n)
+            continue
+        if REJECTED_SM_LABEL in labels:
+            rejected.append(n)
+            continue
+        resolved.append(n)
+    return DependencyResolution(
+        blocking=tuple(blocking),
+        rejected=tuple(rejected),
+        missing=tuple(missing),
+        resolved=tuple(resolved),
+    )
 
 
 def _process_selected(
@@ -3259,17 +3339,23 @@ def _process_selected(
     dry_run: bool,
     log: Callable[[str], None],
     now_iso: Callable[[], str],
+    get_issue: Callable[[int], dict[str, Any] | None] | None = None,
 ) -> None:
     """Return-to-study check + Hello + T1 (selected → reviewing) + Phase 2
     spawn for one sm:selected issue.
 
     Order matters: trust filter → return-to-study scan (terminating: an
     explicit ``[SM] return-to-study`` from the worker reverses the
-    state before any new work fires) → hello (idempotent) → T1 if
-    linked PR exists (terminating, since work is already in flight) →
-    otherwise Phase 2 spawn (gated by concurrency cap + dedup on a
-    live spawn dir for the issue — see
-    :func:`has_live_spawn_for_issue`).
+    state before any new work fires) → dependency check (issue #176:
+    rejected dep → ``sm:blocked``, terminating) → hello (idempotent) →
+    T1 if linked PR exists (terminating, since work is already in
+    flight) → otherwise Phase 2 spawn (gated by concurrency cap + dedup
+    on a live spawn dir + open hard-deps from issue #176).
+
+    ``get_issue`` (issue #176) is the per-issue lookup used to resolve
+    ``Depends on #N`` references on the body. ``None`` disables the
+    dependency gate entirely — production callers always bind it; tests
+    that don't exercise the gate can leave it unset.
     """
     number = issue["number"]
     decision = evaluate_trust(issue, trusted_authors=trusted_authors)
@@ -3342,6 +3428,103 @@ def _process_selected(
             f"selected → needs_study ({reason})"
         )
         return
+
+    # ----- dependency parse + resolve (issue #176) -----
+    # ``Depends on #N`` / ``Blocked by #N`` / etc. live in plain prose
+    # on the issue body and any trusted-author amendment comments. The
+    # parser is anchored to start-of-line so prose inside ordinary
+    # comments doesn't produce false positives.
+    from alice_sm.comments import parse_dependencies as _parse_deps
+
+    dep_sources: list[str] = []
+    body_text = issue.get("body")
+    if isinstance(body_text, str) and body_text:
+        dep_sources.append(body_text)
+    for c in sel_comments:
+        if not isinstance(c, dict):
+            continue
+        cb = c.get("body")
+        if not isinstance(cb, str) or not cb:
+            continue
+        # Skip ``[SM] ...`` audit/protocol comments — those are the
+        # dispatcher's own log lines and won't contain user-authored
+        # dependency directives. The trust filter further restricts to
+        # trusted authors so a drive-by commenter can't inject deps
+        # that would gate or transition the issue.
+        if cb.startswith("[SM] "):
+            continue
+        author = _comment_author_login(c)
+        if author not in trusted_authors:
+            continue
+        dep_sources.append(cb)
+    parsed_deps = _parse_deps("\n".join(dep_sources)) if dep_sources else None
+
+    blocking_deps: tuple[int, ...] = ()
+    if parsed_deps is not None and (parsed_deps.hard or parsed_deps.soft):
+        if get_issue is None:
+            # Production wires get_issue via ``run()``; tests that don't
+            # exercise the gate leave it None. Treat as "no resolver" =
+            # don't block, but log so the operator notices if it ever
+            # fires in prod.
+            log(
+                f"[sm-dispatcher] #{number}: deps "
+                f"hard={list(parsed_deps.hard)} soft={list(parsed_deps.soft)} "
+                f"present but no get_issue resolver bound — "
+                f"skipping dependency gate"
+            )
+        else:
+            resolution = resolve_dependencies(
+                parsed_deps.hard, get_issue, log=log
+            )
+            if resolution.rejected:
+                rejected_str = ", ".join(f"#{n}" for n in resolution.rejected)
+                inner_reason = (
+                    f"dependency {rejected_str} was rejected"
+                )
+                transition_body = (
+                    f'[SM] transition from=selected to=blocked '
+                    f'reason="{inner_reason}" '
+                    f'unblocked_by="speaking to re-scope"'
+                )
+                if dry_run:
+                    log(
+                        f"[sm-dispatcher] DRY-RUN would transition "
+                        f"#{number}: selected → blocked ({inner_reason})"
+                    )
+                    report.transitioned += 1
+                    report.transitions.append(
+                        (number, ACTIVE_SM_LABEL, BLOCKED_SM_LABEL)
+                    )
+                    return
+                try:
+                    edit_labels(
+                        repo,
+                        number,
+                        add=[BLOCKED_SM_LABEL],
+                        remove=[ACTIVE_SM_LABEL],
+                    )
+                    post_comment(repo, number, transition_body)
+                except GHCommandError as exc:
+                    log(
+                        f"[sm-dispatcher] selected #{number}: "
+                        f"failed dependency-rejected transition: {exc}"
+                    )
+                    if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+                        raise
+                    return
+                report.transitioned += 1
+                report.transitions.append(
+                    (number, ACTIVE_SM_LABEL, BLOCKED_SM_LABEL)
+                )
+                log(
+                    f"[sm-dispatcher] transitioned #{number}: "
+                    f"selected → blocked ({inner_reason})"
+                )
+                return
+            # Soft-dep + missing branches are log-only; the hard-blocking
+            # gate is applied below, after hello + T1, so the audit comment
+            # still posts even when the issue is queued.
+            blocking_deps = resolution.blocking
 
     art_label = decision.art_label or "art:unknown"
 
@@ -3431,6 +3614,20 @@ def _process_selected(
             f"[sm-dispatcher] spawn skip #{number}: "
             f"unrecognized artifact {art_label!r}"
         )
+        return
+
+    # Issue #176 — gate the spawn on any unresolved hard dependency.
+    # No spawn-started comment, no label change; the issue stays at
+    # sm:selected and the dispatcher re-checks on the next pass when
+    # the dep may have closed. Logged once per pass per blocking dep
+    # so the operator can see what's holding the queue.
+    if blocking_deps:
+        blocked_str = ", ".join(f"#{n}" for n in blocking_deps)
+        log(
+            f"[sm-dispatcher] spawn skip #{number}: "
+            f"blocked by {blocked_str}"
+        )
+        report.spawn_skipped_blocked_deps += 1
         return
 
     # Dedup on a live spawn dir (issue #115). The historic
@@ -5668,6 +5865,7 @@ def run(
                     dry_run=dry_run,
                     log=log,
                     now_iso=now_iso,
+                    get_issue=get_issue,
                 )
             elif sm_label == REVIEWING_SM_LABEL:
                 _process_reviewing(
