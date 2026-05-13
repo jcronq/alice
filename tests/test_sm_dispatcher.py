@@ -5619,6 +5619,472 @@ def test_thinking_shim_main_exits_nonzero_when_prompt_missing(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Issue #184 — spawn_speaking_agent (SM v2 per-issue build phase)
+# ---------------------------------------------------------------------------
+
+
+def test_speaking_spawn_writes_correctly_formed_spawn_dir(tmp_path) -> None:
+    """spawn_speaking_agent produces ``<spawn_dir>/spawn-<N>-<ts>/`` with
+    ``prompt.txt`` (build framing), ``pidfile``, ``session_id`` —
+    mirrors the worker / thinking lane layout so the reaper / viewer
+    don't need a third on-disk shape to read."""
+    spawn_dir = tmp_path / "speaking-spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    popens: list[FakePopen] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    issue = _make_issue(
+        800,
+        sm_labels=("sm:designed",),
+        art_labels=("art:code",),
+        title="build something",
+    )
+    issue["body"] = "this is the issue body"
+
+    spawn_id = sm.spawn_speaking_agent(
+        issue,
+        "art:code",
+        "jcronq/alice",
+        design_note_path="/home/alice/alice-mind/cortex-memory/designs/d.md",
+        spawn_dir=spawn_dir,
+        python_bin="/opt/alice-venv/bin/python",
+        post_comment=recorder,
+        popen=popen,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert spawn_id is not None
+    assert spawn_id.startswith("spawn-800-")
+    subdirs = [
+        d for d in spawn_dir.iterdir() if d.is_dir() and d.name.startswith("spawn-")
+    ]
+    assert len(subdirs) == 1
+    sub = subdirs[0]
+    assert sub.name == spawn_id
+    # On-disk artifacts the dispatcher / reaper / viewer rely on.
+    assert (sub / "prompt.txt").is_file()
+    assert (sub / "pidfile").is_file()
+    assert (sub / "session_id").is_file()
+    pid_text = (sub / "pidfile").read_text()
+    assert pid_text == str(popens[0].pid)
+
+    prompt = (sub / "prompt.txt").read_text()
+    # Speaking-agent build framing — distinct from the thinking-agent
+    # design prompt and the v1 code-worker prompt.
+    assert "speaking-agent" in prompt.lower()
+    assert "build mode" in prompt.lower()
+    assert "per_issue_build" in prompt
+    assert "Issue: #800" in prompt
+    assert "this is the issue body" in prompt
+    # Design note pointer baked into the prompt + frontmatter.
+    assert "/home/alice/alice-mind/cortex-memory/designs/d.md" in prompt
+    # The shim resolves phase from frontmatter; lock the shape in.
+    assert prompt.startswith("---\n")
+    assert "phase: per_issue_build" in prompt
+    # Build phase, not design — no design-ready trailer.
+    assert "design-ready" not in prompt
+    # The build-complete audit-comment prefix is referenced in the
+    # instruction trailer so the operator can see the shape inline.
+    assert "[SM] build-complete" in prompt
+
+
+def test_speaking_spawn_invokes_python_shim_with_args(tmp_path) -> None:
+    """Popen is called with the venv python + ``-m alice_sm.speaking_shim``
+    + spawn-dir + session-id + mode=build, detached via
+    ``start_new_session=True``."""
+    spawn_dir = tmp_path / "speaking-spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    popens: list[FakePopen] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    issue = _make_issue(801, sm_labels=("sm:designed",), art_labels=("art:code",))
+
+    spawn_id = sm.spawn_speaking_agent(
+        issue,
+        "art:code",
+        "jcronq/alice",
+        spawn_dir=spawn_dir,
+        python_bin="/opt/alice-venv/bin/python",
+        post_comment=recorder,
+        popen=popen,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert spawn_id is not None
+    assert len(popens) == 1
+    cmd = popens[0].args
+    assert cmd[0] == "/opt/alice-venv/bin/python"
+    assert cmd[1:3] == ["-m", "alice_sm.speaking_shim"]
+    # --spawn-dir / --session-id / --mode passed through.
+    assert "--spawn-dir" in cmd
+    assert "--session-id" in cmd
+    assert "--mode" in cmd
+    mode_idx = cmd.index("--mode")
+    assert cmd[mode_idx + 1] == "build"
+    sid_idx = cmd.index("--session-id")
+    session_id_arg = cmd[sid_idx + 1]
+    sub = next(
+        d for d in spawn_dir.iterdir() if d.is_dir() and d.name.startswith("spawn-")
+    )
+    assert (sub / "session_id").read_text() == session_id_arg
+    # Detached so the dispatcher exiting doesn't take the agent with it.
+    assert popens[0].kwargs.get("start_new_session") is True
+
+
+def test_speaking_spawn_started_comment_shape(tmp_path) -> None:
+    """The audit comment uses the ``[SM] speaking-spawn-started`` prefix
+    and carries task / artifact / phase / runtime / spawn_id / ts —
+    distinct from worker and thinking prefixes so the comments module
+    can disambiguate without a body-shape cascade."""
+    spawn_dir = tmp_path / "speaking-spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+
+    def popen(*args, **kwargs):
+        return FakePopen(*args, **kwargs)
+
+    issue = _make_issue(802, sm_labels=("sm:designed",), art_labels=("art:code",))
+    spawn_id = sm.spawn_speaking_agent(
+        issue,
+        "art:code",
+        "jcronq/alice",
+        spawn_dir=spawn_dir,
+        python_bin="/opt/alice-venv/bin/python",
+        post_comment=recorder,
+        popen=popen,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert spawn_id is not None
+    started = [b for _r, n, b in recorder.posted if n == 802]
+    assert len(started) == 1
+    body = started[0]
+    assert body.startswith("[SM] speaking-spawn-started")
+    # Distinct from the worker-pool and thinking-lane prefixes.
+    assert not body.startswith("[SM] spawn-started ")
+    assert not body.startswith("[SM] thinking-spawn-started")
+    assert "task=#802" in body
+    assert "artifact=art:code" in body
+    assert "phase=per_issue_build" in body
+    assert "runtime=claude-agent-sdk:opus" in body
+    assert f"spawn_id={spawn_id}" in body
+    assert f"ts={_frozen_now()}" in body
+
+
+def test_render_speaking_spawn_started_comment_exact_shape() -> None:
+    """Unit test on the renderer so the wire format is locked in."""
+    out = sm.render_speaking_spawn_started_comment(
+        42, "art:code", "spawn-42-1000", timestamp="2026-05-13T00:00:00+00:00"
+    )
+    assert out == (
+        "[SM] speaking-spawn-started task=#42 artifact=art:code "
+        "phase=per_issue_build runtime=claude-agent-sdk:opus "
+        "spawn_id=spawn-42-1000 ts=2026-05-13T00:00:00+00:00"
+    )
+
+
+def test_has_live_speaking_spawn_for_issue_matches_live_reaps_dead(tmp_path) -> None:
+    """``has_live_speaking_spawn_for_issue`` returns True for a dir with a
+    live PID, False for dead, and reaps the dead dir into
+    ``.finished/``. Consults only the speaking lane dir."""
+    import os as _os
+
+    spawn_dir = tmp_path / "speaking-spawns"
+    spawn_dir.mkdir()
+
+    # #100: live (this process).
+    live = spawn_dir / "spawn-100-1"
+    live.mkdir()
+    (live / "pidfile").write_text(str(_os.getpid()))
+
+    # #200: dead (impossible PID).
+    dead = spawn_dir / "spawn-200-1"
+    dead.mkdir()
+    (dead / "pidfile").write_text("99999999")
+
+    assert sm.has_live_speaking_spawn_for_issue(100, spawn_dir) is True
+    assert live.exists()  # live dir preserved
+
+    assert sm.has_live_speaking_spawn_for_issue(200, spawn_dir) is False
+    # Dead dir got reaped to .finished/.
+    assert not dead.exists()
+    assert (spawn_dir / ".finished" / "spawn-200-1").exists()
+
+    # No spawn at all for #300 → False, no side effects.
+    assert sm.has_live_speaking_spawn_for_issue(300, spawn_dir) is False
+
+
+def test_has_live_speaking_spawn_does_not_see_other_pools(tmp_path) -> None:
+    """The speaking, thinking, and worker lanes are independent. A live
+    spawn in another pool for #N must NOT make
+    ``has_live_speaking_spawn_for_issue(N)`` return True."""
+    import os as _os
+
+    worker_dir = tmp_path / "worker-spawns"
+    worker_dir.mkdir()
+    thinking_dir = tmp_path / "thinking-spawns"
+    thinking_dir.mkdir()
+    speaking_dir = tmp_path / "speaking-spawns"
+    speaking_dir.mkdir()
+
+    live_worker = worker_dir / "spawn-500-1"
+    live_worker.mkdir()
+    (live_worker / "pidfile").write_text(str(_os.getpid()))
+    live_thinking = thinking_dir / "spawn-500-1"
+    live_thinking.mkdir()
+    (live_thinking / "pidfile").write_text(str(_os.getpid()))
+
+    assert sm.has_live_spawn_for_issue(500, worker_dir) is True
+    assert sm.has_live_thinking_spawn_for_issue(500, thinking_dir) is True
+    assert sm.has_live_speaking_spawn_for_issue(500, speaking_dir) is False
+
+
+def test_count_running_speaking_spawns_independent_pool(tmp_path) -> None:
+    """count_running_speaking_spawns reflects only the speaking-lane dir;
+    used by the future ``_process_designed`` wiring to gate against
+    :data:`MAX_CONCURRENT_SPEAKING_SPAWNS` without conflating other
+    pools' counts."""
+    import os as _os
+
+    speaking_dir = tmp_path / "speaking-spawns"
+    speaking_dir.mkdir()
+    thinking_dir = tmp_path / "thinking-spawns"
+    thinking_dir.mkdir()
+    worker_dir = tmp_path / "worker-spawns"
+    worker_dir.mkdir()
+
+    # Two live speaking-agent spawns.
+    for n, ts in ((101, "1"), (102, "1")):
+        d = speaking_dir / f"spawn-{n}-{ts}"
+        d.mkdir()
+        (d / "pidfile").write_text(str(_os.getpid()))
+    # Other-pool spawns don't count toward the speaking total.
+    td = thinking_dir / "spawn-200-1"
+    td.mkdir()
+    (td / "pidfile").write_text(str(_os.getpid()))
+    wd = worker_dir / "spawn-300-1"
+    wd.mkdir()
+    (wd / "pidfile").write_text(str(_os.getpid()))
+
+    assert sm.count_running_speaking_spawns(speaking_dir) == 2
+    assert sm.count_running_thinking_spawns(thinking_dir) == 1
+    assert sm.count_running_spawns(worker_dir) == 1
+
+
+def test_speaking_spawn_concurrency_cap_blocks_at_N_live_spawns(tmp_path) -> None:
+    """When the speaking lane is full (count == MAX_CONCURRENT_SPEAKING_SPAWNS),
+    the caller should not fire another spawn. This issue ships the
+    machinery; the gate logic itself lives in the future
+    ``_process_designed`` wiring. The test locks in the contract: the
+    counter returns the expected value the caller will gate against."""
+    import os as _os
+
+    speaking_dir = tmp_path / "speaking-spawns"
+    speaking_dir.mkdir()
+
+    cap = sm.MAX_CONCURRENT_SPEAKING_SPAWNS
+    assert cap == 2
+
+    for i in range(cap):
+        d = speaking_dir / f"spawn-{700 + i}-1"
+        d.mkdir()
+        (d / "pidfile").write_text(str(_os.getpid()))
+
+    assert sm.count_running_speaking_spawns(speaking_dir) == cap
+    # The caller's gate: ``count_running_speaking_spawns() >= cap`` →
+    # don't spawn. This is the contract.
+    assert sm.count_running_speaking_spawns(speaking_dir) >= cap
+
+
+def test_speaking_spawn_concurrency_cap_constant_and_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``MAX_CONCURRENT_SPEAKING_SPAWNS`` defaults to 2 and is overridden
+    by ``ALICE_MAX_CONCURRENT_SPEAKING_SPAWNS``. The cap is enforced by
+    the caller — this test locks in the constant's contract."""
+    import importlib
+
+    assert sm.MAX_CONCURRENT_SPEAKING_SPAWNS == 2
+
+    monkeypatch.setenv("ALICE_MAX_CONCURRENT_SPEAKING_SPAWNS", "5")
+    reloaded = importlib.reload(sm)
+    try:
+        assert reloaded.MAX_CONCURRENT_SPEAKING_SPAWNS == 5
+    finally:
+        # Restore the module-level constant for the rest of the suite.
+        monkeypatch.delenv("ALICE_MAX_CONCURRENT_SPEAKING_SPAWNS", raising=False)
+        importlib.reload(sm)
+
+
+def test_speaking_spawn_dir_is_separate_from_other_default_dirs() -> None:
+    """The default speaking-lane spawn dir is distinct from
+    :data:`SPAWN_DIR` and :data:`SM_THINKING_SPAWN_DIR` so the three
+    pools don't share on-disk state."""
+    assert sm.SM_SPEAKING_SPAWN_DIR != sm.SPAWN_DIR
+    assert sm.SM_SPEAKING_SPAWN_DIR != sm.SM_THINKING_SPAWN_DIR
+    assert sm.SM_SPEAKING_SPAWN_DIR == pathlib.Path(
+        "/state/worker/sm-speaking-spawns"
+    )
+
+
+def test_speaking_spawn_started_prefix_distinct_from_other_prefixes() -> None:
+    """The audit prefixes are distinct so the comments dedup module
+    can disambiguate. None is a prefix of another."""
+    assert sm.SPEAKING_SPAWN_STARTED_PREFIX == "[SM] speaking-spawn-started"
+    assert sm.SPEAKING_SPAWN_STARTED_PREFIX != sm.SPAWN_STARTED_PREFIX
+    assert sm.SPEAKING_SPAWN_STARTED_PREFIX != sm.THINKING_SPAWN_STARTED_PREFIX
+    # Prevent accidental match against the wrong cascade branch.
+    assert not sm.SPEAKING_SPAWN_STARTED_PREFIX.startswith(sm.SPAWN_STARTED_PREFIX)
+    assert not sm.SPAWN_STARTED_PREFIX.startswith(sm.SPEAKING_SPAWN_STARTED_PREFIX)
+    assert not sm.SPEAKING_SPAWN_STARTED_PREFIX.startswith(
+        sm.THINKING_SPAWN_STARTED_PREFIX
+    )
+    assert not sm.THINKING_SPAWN_STARTED_PREFIX.startswith(
+        sm.SPEAKING_SPAWN_STARTED_PREFIX
+    )
+
+
+def test_speaking_spawn_aborts_on_failed_comment_post(tmp_path) -> None:
+    """If the audit-comment POST fails (auth / rate limit / transport),
+    the spawn is aborted: no Popen, exception re-raised. Mirrors the
+    thinking-lane semantics — without the dedup marker the next pass
+    would re-spawn."""
+    spawn_dir = tmp_path / "speaking-spawns"
+    spawn_dir.mkdir()
+
+    def failing_post(_r, _n, _b):
+        raise sm.GHCommandError(returncode=1, stderr="rate limit", args=[])
+
+    popens: list[FakePopen] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    issue = _make_issue(803, sm_labels=("sm:designed",), art_labels=("art:code",))
+
+    with pytest.raises(sm.GHCommandError):
+        sm.spawn_speaking_agent(
+            issue,
+            "art:code",
+            "jcronq/alice",
+            spawn_dir=spawn_dir,
+            python_bin="/opt/alice-venv/bin/python",
+            post_comment=failing_post,
+            popen=popen,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+
+    assert popens == []
+    # Spawn dir exists but pidfile does NOT — reaper sweeps it next pass.
+    sub = next(
+        d for d in spawn_dir.iterdir() if d.is_dir() and d.name.startswith("spawn-")
+    )
+    assert (sub / "prompt.txt").is_file()
+    assert not (sub / "pidfile").exists()
+
+
+def test_speaking_spawn_non_integer_issue_number_returns_none(tmp_path) -> None:
+    """Defensive: a malformed payload (issue number is None / str) must
+    not crash; spawn_speaking_agent returns None and posts nothing."""
+    spawn_dir = tmp_path / "speaking-spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    popens: list[FakePopen] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    issue = {
+        "number": "not-an-int",
+        "title": "broken",
+        "labels": [{"name": "sm:designed"}, {"name": "art:code"}],
+        "author": {"login": "jcronq"},
+    }
+    result = sm.spawn_speaking_agent(
+        issue,
+        "art:code",
+        "jcronq/alice",
+        spawn_dir=spawn_dir,
+        python_bin="/opt/alice-venv/bin/python",
+        post_comment=recorder,
+        popen=popen,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+    assert result is None
+    assert recorder.posted == []
+    assert popens == []
+
+
+def test_speaking_shim_module_is_importable_and_exits_cleanly() -> None:
+    """The placeholder shim is a real Python module — the dispatcher
+    path can be exercised without the speaking runtime. A future
+    sub-issue replaces this with the real PhaseRunner.PER_ISSUE_BUILD
+    dispatch + Task-tool sub-agent invocation."""
+    import importlib
+
+    shim = importlib.import_module("alice_sm.speaking_shim")
+    assert hasattr(shim, "main")
+
+
+def test_speaking_shim_main_exits_zero_with_valid_args(tmp_path) -> None:
+    """Calling speaking_shim.main with a valid --spawn-dir / --session-id
+    / --mode returns 0 (placeholder behavior)."""
+    from alice_sm import speaking_shim
+
+    spawn_dir = tmp_path / "spawn-dir"
+    spawn_dir.mkdir()
+    (spawn_dir / "prompt.txt").write_text("placeholder prompt")
+    rc = speaking_shim.main(
+        [
+            "--spawn-dir",
+            str(spawn_dir),
+            "--session-id",
+            "11111111-2222-3333-4444-555555555555",
+            "--mode",
+            "build",
+        ]
+    )
+    assert rc == 0
+
+
+def test_speaking_shim_main_exits_nonzero_when_prompt_missing(tmp_path) -> None:
+    """A spawn dir without ``prompt.txt`` is malformed → the shim exits
+    non-zero so the reaper sees a clean failure."""
+    from alice_sm import speaking_shim
+
+    spawn_dir = tmp_path / "spawn-dir"
+    spawn_dir.mkdir()
+    rc = speaking_shim.main(
+        [
+            "--spawn-dir",
+            str(spawn_dir),
+            "--session-id",
+            "11111111-2222-3333-4444-555555555555",
+        ]
+    )
+    assert rc == 1
+
+
+# ---------------------------------------------------------------------------
 # Issue #173 — auto-rebase on CONFLICTING PRs at sm:reviewing
 # ---------------------------------------------------------------------------
 

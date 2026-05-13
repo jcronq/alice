@@ -364,6 +364,68 @@ PYTHON_BIN_FALLBACK = "python3"
 # replaces it with the real PhaseRunner dispatch.
 THINKING_SHIM_MODULE = "alice_sm.thinking_shim"
 
+# ---------------------------------------------------------------------------
+# Issue #184 — per-issue speaking-agent spawn (SM v2 build phase)
+# ---------------------------------------------------------------------------
+#
+# Per the post-amendment to ``[[2026-05-13-sm-v2-pipeline-revision]]``
+# (Jason 2026-05-13 09:51 EDT), the build phase is owned by a
+# stimulus-spawned speaking-instance — NOT the long-lived thinking-agent
+# that produced the design. Sibling to :func:`spawn_thinking_agent`
+# (which owns the design phase, PR #159). The two lanes have independent
+# concurrency caps and on-disk dirs so a multi-hour build can't starve a
+# pending design draft and vice versa.
+#
+# This issue (#184) only ships the spawn machinery. Wiring into
+# ``_process_designed`` / the SPAWN_MAP cutover is a separate sub-issue,
+# as is the Sonnet code-review wiring at sm:reviewing.
+
+# Separate spawn dir for the speaking-build lane. Same on-disk shape as
+# :data:`SPAWN_DIR` and :data:`SM_THINKING_SPAWN_DIR` (per-spawn subdir
+# with ``prompt.txt`` / ``pidfile`` / ``stdout.log`` / ``stderr.log`` /
+# ``session_id``) so the reaper, the viewer, and ``has_live_*`` helpers
+# don't need a third on-disk shape to read.
+SM_SPEAKING_SPAWN_DIR = pathlib.Path("/state/worker/sm-speaking-spawns")
+
+# Concurrency cap for the speaking-build lane. Distinct from
+# :data:`MAX_CONCURRENT_SPAWNS` and :data:`MAX_CONCURRENT_THINKING_SPAWNS`
+# so a long-running build can't drain capacity from one-shot research
+# dispatches or the thinking-agent design loop. Configurable via env so
+# operators can tune without a redeploy.
+MAX_CONCURRENT_SPEAKING_SPAWNS = int(
+    os.environ.get("ALICE_MAX_CONCURRENT_SPEAKING_SPAWNS", "2")
+)
+
+# Audit-comment prefix for the speaking-build lane. Distinct from
+# :data:`SPAWN_STARTED_PREFIX` and :data:`THINKING_SPAWN_STARTED_PREFIX`
+# so the comments module can disambiguate the three spawn events without
+# a body-shape cascade. Neither is a prefix of the other.
+SPEAKING_SPAWN_STARTED_PREFIX = "[SM] speaking-spawn-started"
+
+# Runtime label rendered into the audit comment. The shim is a Python
+# entrypoint; the *agent* it boots reaches for the Task/Agent tool to
+# dispatch the actual implementation sub-agent (claude-agent-sdk at Opus
+# depth), per the persona × runtime matrix in
+# ``[[2026-05-12-sm-v2-agent-type-system]]``.
+SPEAKING_RUNTIME_LABEL = "claude-agent-sdk:opus"
+
+# Per-issue phase the speaking-agent enters at spawn time. The dispatcher
+# only handles the build phase here; the design phase belongs to the
+# thinking-agent (see :data:`THINKING_PHASE_PER_ISSUE_DESIGN`).
+SPEAKING_PHASE_PER_ISSUE_BUILD = "per_issue_build"
+
+# Audit-comment prefix the speaking-agent emits when its sub-agent has
+# opened a draft PR. Posted from inside the shim, not the dispatcher.
+# Kept here so the dedup machinery has a single source of truth for the
+# wire format.
+SPEAKING_BUILD_COMPLETE_PREFIX = "[SM] build-complete"
+
+# Dotted module path of the speaking-mode entrypoint shim. Placeholder
+# implementation lives at :mod:`alice_sm.speaking_shim`; the real
+# PhaseRunner.PER_ISSUE_BUILD dispatch (with Task-tool sub-agent
+# invocation) lands in the speaking sub-issue that replaces the shim.
+SPEAKING_SHIM_MODULE = "alice_sm.speaking_shim"
+
 # Issue #137 — worker session capture. We pre-mint a UUID per spawn and
 # pass it via ``--session-id`` so the worker writes its session JSONL to
 # a known file. The id is persisted in ``<spawn_dir>/session_id`` at
@@ -1998,6 +2060,40 @@ def has_live_thinking_spawn_for_issue(
     return has_live_spawn_for_issue(issue_number, spawn_dir, log=log)
 
 
+def count_running_speaking_spawns(
+    spawn_dir: pathlib.Path = SM_SPEAKING_SPAWN_DIR,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> int:
+    """Mirror of :func:`count_running_spawns` scoped to the speaking-build lane.
+
+    Issue #184. The speaking-build lane has its own concurrency cap
+    (:data:`MAX_CONCURRENT_SPEAKING_SPAWNS`) so a long-running build can
+    not drain capacity from the thinking-design loop or the v1
+    code-worker pool. The on-disk shape is identical so the
+    implementation is a thin wrapper.
+    """
+    return count_running_spawns(spawn_dir, log=log)
+
+
+def has_live_speaking_spawn_for_issue(
+    issue_number: int,
+    spawn_dir: pathlib.Path = SM_SPEAKING_SPAWN_DIR,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> bool:
+    """Mirror of :func:`has_live_spawn_for_issue` scoped to the speaking lane.
+
+    Issue #184. Returns True when ``spawn_dir`` contains a live
+    ``spawn-<issue_number>-*/`` for the speaking-build lane; stale
+    matches are reaped into ``.finished/`` the same way as the worker
+    and thinking lanes. Consults only :data:`SM_SPEAKING_SPAWN_DIR` —
+    a live thinking-agent spawn in :data:`SM_THINKING_SPAWN_DIR` on
+    the same issue must NOT satisfy this check.
+    """
+    return has_live_spawn_for_issue(issue_number, spawn_dir, log=log)
+
+
 # Issue #142 — canonical spawn dir name shape, ``spawn-<N>-<unix-ts>``.
 # Used by :func:`proactive_reap_dead_spawns` to recover the issue number
 # the dispatcher should look up when deciding whether a dead dir is safe
@@ -2695,6 +2791,241 @@ def spawn_thinking_agent(
         pidfile_path.write_text(str(pid))
     log(
         f"[sm-dispatcher] spawned thinking-agent {spawn_id} (pid={pid}) "
+        f"on #{number} art={art_label} phase={phase} "
+        f"session_id={session_id}"
+    )
+    return spawn_id
+
+
+# ---------------------------------------------------------------------------
+# Issue #184 — per-issue speaking-agent spawn machinery (build phase)
+# ---------------------------------------------------------------------------
+
+
+def compose_speaking_spawn_prompt(
+    issue: dict[str, Any],
+    *,
+    design_note_path: str | pathlib.Path | None = None,
+) -> str:
+    """Render the prompt fed into ``<speaking_spawn_dir>/prompt.txt``.
+
+    The speaking-agent reads this verbatim at boot. The structure mirrors
+    :func:`compose_spawn_prompt` and :func:`compose_thinking_spawn_prompt`
+    so the operator-facing ``cat prompt.txt`` view is familiar across
+    all three lanes — only the role framing and instruction trailer
+    change.
+
+    A frontmatter block carries the ``phase:`` value the shim resolves
+    via :func:`alice_thinking.cli.perissue.parse_frontmatter`-style
+    parsing, plus a ``design_note:`` pointer to the approved design.
+    The path comes from the dispatcher's ``_process_designed`` wiring
+    (a separate sub-issue); when no path is supplied (e.g., dry-run /
+    unit-test invocation) the field renders as ``(unset)`` so the
+    operator can spot the misconfiguration in ``cat prompt.txt``.
+    """
+    number = issue.get("number")
+    title = issue.get("title") or "(no title)"
+    body = issue.get("body") or "(no body)"
+    art_label = "art:unknown"
+    for name in _label_names(issue):
+        if name.startswith("art:") and name in ART_LABEL_WHITELIST:
+            art_label = name
+            break
+    login = _author_login(issue) or "(unknown)"
+    source_label = f"source:{login}"
+    design_note_value = (
+        str(design_note_path) if design_note_path is not None else "(unset)"
+    )
+
+    return (
+        f"---\n"
+        f"phase: {SPEAKING_PHASE_PER_ISSUE_BUILD}\n"
+        f"design_note: {design_note_value}\n"
+        f"---\n"
+        f"You are a speaking-agent working on SM task #{number} in "
+        f"build mode ({SPEAKING_PHASE_PER_ISSUE_BUILD}).\n"
+        f"\n"
+        f"Issue: #{number}\n"
+        f"Title: {title}\n"
+        f"Source: {source_label}\n"
+        f"Artifact type: {art_label}\n"
+        f"Design note: {design_note_value}\n"
+        f"\n"
+        f"Issue body:\n"
+        f"{body}\n"
+        f"\n"
+        f"Your task: load the approved design note above, then dispatch "
+        f"the Task / Agent tool with the design + relevant repo context "
+        f"to a sub-agent. The sub-agent implements the change and opens "
+        f"a draft PR titled appropriately with `Closes #{number}` in "
+        f"the body. When the sub-agent returns, post "
+        f"`{SPEAKING_BUILD_COMPLETE_PREFIX} pr=<url>` on the issue (or "
+        f"an error variant if the sub-agent could not open a PR).\n"
+        f"\n"
+        f"Operate as a real engineer would: the sub-agent must read the "
+        f"relevant code first, test before opening the PR, and not "
+        f"bypass CI hooks.\n"
+    )
+
+
+def render_speaking_spawn_started_comment(
+    number: int,
+    art_label: str,
+    spawn_id: str,
+    *,
+    phase: str = SPEAKING_PHASE_PER_ISSUE_BUILD,
+    runtime: str = SPEAKING_RUNTIME_LABEL,
+    timestamp: str | None = None,
+) -> str:
+    """Produce the literal ``[SM] speaking-spawn-started ...`` audit comment.
+
+    The shape is distinct from :func:`render_spawn_started_comment` and
+    :func:`render_thinking_spawn_started_comment` — distinct prefix plus
+    a ``phase=`` field — so the comments module can disambiguate the
+    three spawn events without re-implementing a body-shape cascade.
+    """
+    ts = timestamp or _now_iso()
+    return (
+        f"{SPEAKING_SPAWN_STARTED_PREFIX} task=#{number} "
+        f"artifact={art_label} phase={phase} runtime={runtime} "
+        f"spawn_id={spawn_id} ts={ts}"
+    )
+
+
+def spawn_speaking_agent(
+    issue: dict[str, Any],
+    art_label: str,
+    repo: str,
+    *,
+    design_note_path: str | pathlib.Path | None = None,
+    spawn_dir: pathlib.Path = SM_SPEAKING_SPAWN_DIR,
+    python_bin: str | None = None,
+    shim_module: str = SPEAKING_SHIM_MODULE,
+    phase: str = SPEAKING_PHASE_PER_ISSUE_BUILD,
+    runtime: str = SPEAKING_RUNTIME_LABEL,
+    post_comment: PostCommentFn = gh_post_comment,
+    popen: Callable[..., Any] = subprocess.Popen,
+    now_iso: Callable[[], str] = _now_iso,
+    log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
+    clock: Callable[[], float] | None = None,
+    new_session_id: Callable[[], str] = lambda: str(uuid.uuid4()),
+) -> str | None:
+    """Spawn a per-issue speaking-agent for the build phase of an SM issue.
+
+    Issue #184. Sibling of :func:`spawn_thinking_agent` (the design
+    phase) and :func:`spawn_agent` (the v1 worker pool). The shape is
+    identical on disk (``<spawn_dir>/<spawn_id>/`` with ``prompt.txt`` /
+    ``pidfile`` / ``stdout.log`` / ``stderr.log`` / ``session_id``) but
+    the lane is separate: distinct concurrency cap
+    (:data:`MAX_CONCURRENT_SPEAKING_SPAWNS`), distinct audit-comment
+    prefix (:data:`SPEAKING_SPAWN_STARTED_PREFIX`), distinct spawn dir
+    (:data:`SM_SPEAKING_SPAWN_DIR`).
+
+    Steps (mirror of :func:`spawn_thinking_agent`):
+
+      1. Mint ``spawn_id = "spawn-<N>-<unix-ts>"`` and create
+         ``spawn_dir/<spawn_id>/``.
+      2. Compose the build-mode prompt (with ``design_note_path`` baked
+         into the frontmatter) and write ``prompt.txt``.
+      3. Pre-mint and persist the claude-agent-sdk session id
+         (``session_id``) before Popen so a crash mid-launch still
+         leaves the reaper a pointer.
+      4. Post the ``[SM] speaking-spawn-started ...`` audit comment
+         FIRST — without the dedup marker the next pass would re-spawn.
+      5. Launch the speaking shim detached via
+         ``python -m alice_sm.speaking_shim --spawn-dir <dir> --session-id <uuid> --mode build``
+         with stdout/stderr to log files, ``start_new_session=True`` so
+         the agent survives the dispatcher exiting.
+      6. Write PID to ``pidfile``.
+
+    Returns the ``spawn_id`` on success, or ``None`` if the issue number
+    isn't an integer (defensive — the dispatcher's main loop already
+    filters those out). Does NOT wait for the spawned subprocess.
+
+    The wire-up into ``_process_designed`` lands in a separate sub-issue
+    once spawn + entrypoint are tested in isolation; this issue ships
+    only the machinery. The real entrypoint replaces
+    :mod:`alice_sm.speaking_shim`.
+    """
+    if clock is None:
+        clock = time.time
+
+    number = issue.get("number")
+    if not isinstance(number, int):
+        log(
+            f"[sm-dispatcher] cannot spawn speaking-agent on "
+            f"non-integer issue number: {number!r}"
+        )
+        return None
+
+    if python_bin is None:
+        python_bin = resolve_python_bin()
+
+    spawn_id = f"spawn-{number}-{int(clock())}"
+    work_dir = spawn_dir / spawn_id
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    prompt_text = compose_speaking_spawn_prompt(
+        issue, design_note_path=design_note_path
+    )
+    prompt_path = work_dir / "prompt.txt"
+    prompt_path.write_text(prompt_text)
+
+    # Pre-mint the SDK session id so the reaper can recover the worker's
+    # session JSONL even if the shim crashes before logging it. Persist
+    # BEFORE Popen for the same reason :func:`spawn_thinking_agent` does.
+    session_id = new_session_id()
+    (work_dir / SESSION_ID_FILENAME).write_text(session_id)
+
+    body = render_speaking_spawn_started_comment(
+        number,
+        art_label,
+        spawn_id,
+        phase=phase,
+        runtime=runtime,
+        timestamp=now_iso(),
+    )
+    try:
+        post_comment(repo, number, body)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] failed to post speaking-spawn-started on "
+            f"#{number}: {exc} — aborting spawn"
+        )
+        raise
+
+    stdout_path = work_dir / "stdout.log"
+    stderr_path = work_dir / "stderr.log"
+    pidfile_path = work_dir / "pidfile"
+
+    stdout_fh = open(stdout_path, "wb")
+    stderr_fh = open(stderr_path, "wb")
+    try:
+        proc = popen(
+            [
+                python_bin,
+                "-m",
+                shim_module,
+                "--spawn-dir",
+                str(work_dir),
+                "--session-id",
+                session_id,
+                "--mode",
+                "build",
+            ],
+            stdout=stdout_fh,
+            stderr=stderr_fh,
+            start_new_session=True,
+        )
+    finally:
+        stdout_fh.close()
+        stderr_fh.close()
+
+    pid = getattr(proc, "pid", None)
+    if pid is not None:
+        pidfile_path.write_text(str(pid))
+    log(
+        f"[sm-dispatcher] spawned speaking-agent {spawn_id} (pid={pid}) "
         f"on #{number} art={art_label} phase={phase} "
         f"session_id={session_id}"
     )
