@@ -1,251 +1,221 @@
 #!/usr/bin/env bash
-# alice-deploy — blue/green update for Alice.
+# alice-deploy — rebuild + relaunch the single Alice container.
 #
-#   alice-deploy worker               # build + swap the worker slot
-#   alice-deploy worker --rollback    # swap back to the other (prior) slot
-#   alice-deploy daemon               # update the daemon (brief reconnect)
-#   alice-deploy all                  # daemon, then worker
+#   alice-deploy                build, graceful stop, replace, verify.
+#   alice-deploy --rollback     restore alice:premigration, replace, verify.
+#   alice-deploy --dry-run      print what would happen, do nothing.
 #
-# Architecture: two worker slots, blue and green. Exactly one is live (holds
-# /state/worker/lease). Deploy alternates:
+# Single-container shape (EKS Phase 2, #160). The compose service is
+# `alice`; the image tag is `alice:latest`. Before every fresh build we
+# re-tag the live image as `alice:premigration` so --rollback has a
+# known-good anchor. The graceful stop relies on docker honoring
+# `stop_grace_period: 30m` in sandbox/docker-compose.yml, which mirrors
+# S6_SERVICES_GRACETIME inside the container — speaking and thinking get
+# the same window to drain that the legacy 3-svc layout's
+# CLEANUP_TIMEOUT used to give the detached cleanup goroutine.
 #
-#   1. Detect live slot (flock probe). NEXT = the other slot.
-#   2. Force-remove any leftover container in the NEXT slot — usually the
-#      previous deploy's OLD container that finished draining. If a deploy
-#      cadence outpaces thinker drain (rare), this SIGKILLs an in-flight
-#      wake; the watchdog handles the consequences.
-#   3. Build new image; tag as alice-worker:$NEXT.
-#   4. `compose --profile $NEXT up -d alice-worker-$NEXT`. New container
-#      starts, bridge blocks on flock (live still holds it).
-#   5. SIGTERM live worker. The speaking bridge enters drain mode (finish
-#      current turn + queued events, then exit) — fd 9 released, lease
-#      transfers. The thinker keeps running, finishing its in-flight wake
-#      in the background; the container only fully exits when every
-#      service has drained.
-#   6. NEXT worker's bridge unblocks, acquires lease, does catchup, resumes
-#      processing — Alice is now talking from the new slot.
-#   7. Detach a background cleanup that waits for the old container to
-#      exit (= thinker also drained), then ``docker rm``s it. 30-minute
-#      hard cap.
-#
-# Rollback: same flow but keep the NEXT slot's EXISTING image (don't rebuild).
-# Since each slot's image tag points at whatever it was last deployed with,
-# the other slot is always the last-known-good.
+# Health = the viewer's `/` returning 200. The sanity probe re-confirms
+# that the four critical s6 services (signal-daemon, alice-speaking,
+# alice-thinker, alice-viewer) are up, which catches the case where the
+# viewer comes up but a peer service crash-loops behind it.
 
 set -euo pipefail
 
 ALICE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SANDBOX_DIR="$ALICE_ROOT/sandbox"
-DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-300}"
-READY_TIMEOUT="${READY_TIMEOUT:-90}"
-HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-60}"
-# Hard cap on background cleanup: how long we wait for the old container
-# to exit naturally (= thinker finished its in-flight wake) before
-# SIGKILLing it. 30 min covers any reasonable wake; longer than that is
-# a hung wake the watchdog should have caught.
-CLEANUP_TIMEOUT="${CLEANUP_TIMEOUT:-1800}"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-90}"
+SERVICE_PROBE_TIMEOUT="${SERVICE_PROBE_TIMEOUT:-60}"
+HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:7777/}"
+CONTAINER="alice"
+IMAGE="alice:latest"
+PREMIG_IMAGE="alice:premigration"
+S6_SERVICES=(signal-daemon alice-speaking alice-thinker alice-viewer)
 
 # shellcheck source=./_alice-env.sh
 . "$ALICE_ROOT/bin/_alice-env.sh"
 
+DRY_RUN=0
+MODE=deploy
+
 die() { echo "alice-deploy: $*" >&2; exit 1; }
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
-usage() { sed -n '3,26p' "$0"; }
+usage() {
+    cat <<'USAGE'
+alice-deploy — rebuild + relaunch the single Alice container.
+
+Usage:
+    alice-deploy                Build, graceful stop, replace, verify.
+    alice-deploy --rollback     Restore alice:premigration and replace.
+    alice-deploy --dry-run      Print what would happen, do nothing.
+    alice-deploy -h | --help    This help.
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --rollback) MODE=rollback ;;
+        --dry-run)  DRY_RUN=1 ;;
+        -h|--help)  usage; exit 0 ;;
+        *)          usage; exit 2 ;;
+    esac
+    shift
+done
+
+# Pre-flight. Mirrors alice-up so a misconfigured host fails before the
+# tagging/build dance starts. Skipped in dry-run so the dry-run can be
+# used on a host without docker (e.g. CI shell-syntax checks).
+if [ "$DRY_RUN" != 1 ]; then
+    command -v docker >/dev/null 2>&1 \
+        || die "docker not found on PATH. Install Docker and retry."
+    docker info >/dev/null 2>&1 \
+        || die "docker daemon isn't running (or your user can't reach it)."
+fi
+[ -f "$SANDBOX_DIR/docker-compose.yml" ] \
+    || die "compose file missing: $SANDBOX_DIR/docker-compose.yml"
+
+run() {
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "[dry-run] $*"
+    else
+        "$@"
+    fi
+}
 
 compose() {
     # All ALICE_* / USER_ID / GROUP_ID env vars are exported by
     # _alice-env.sh, so the subshell inherits them and docker compose
     # resolves the bind-mount paths consistently with alice-up. Without
     # this, the compose file's defaults (e.g. ${HOME}/alice-mind) take
-    # effect and a deploy silently remounts the worker onto stub dirs
+    # effect and a deploy silently remounts the container onto stub dirs
     # — disconnected from live state. See issue #2.
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "[dry-run] (cd $SANDBOX_DIR && docker compose $*)"
+        return 0
+    fi
     ( cd "$SANDBOX_DIR" && docker compose "$@" )
 }
 
-# ---------- slot detection ----------
-lease_held_in() {
-    # Returns 0 if the container's bridge holds the lease.
-    local name="$1"
-    docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null | grep -q running || return 1
-    ! docker exec "$name" flock -n /state/worker/lease true 2>/dev/null
+image_exists() {
+    docker image inspect "$1" >/dev/null 2>&1
 }
 
-detect_live_slot() {
-    # Print "blue" or "green" for the currently-live slot. Exits 1 if neither.
-    if lease_held_in alice-worker-blue; then echo blue; return 0; fi
-    if lease_held_in alice-worker-green; then echo green; return 0; fi
-    return 1
+container_running() {
+    [ "$(docker inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null || true)" = "running" ]
 }
 
-other_slot() {
-    case "$1" in
-        blue)  echo green ;;
-        green) echo blue ;;
-        *) die "unknown slot: $1" ;;
-    esac
-}
-
-# ---------- readiness probes ----------
-wait_bridge_running() {
-    # Wait for the container to be running AND for the alice-speaking daemon
-    # process to exist (even if it's still blocked on the flock — the process
-    # being alive is what we care about here).
-    local name="$1" timeout="${2:-$READY_TIMEOUT}"
+wait_health() {
+    local url="$1" timeout="${2:-$HEALTH_TIMEOUT}"
     local i
     for ((i=0; i<timeout*2; i++)); do
-        if docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null | grep -q running; then
-            if docker exec "$name" pgrep -f alice_speaking >/dev/null 2>&1; then
-                return 0
-            fi
+        if curl -sf -o /dev/null "$url" 2>/dev/null; then
+            return 0
         fi
         sleep 0.5
     done
     return 1
 }
 
-wait_lease_held() {
-    local name="$1" timeout="${2:-$READY_TIMEOUT}"
-    local i
-    for ((i=0; i<timeout*2; i++)); do
-        if lease_held_in "$name"; then return 0; fi
-        sleep 0.5
-    done
-    return 1
-}
-
-wait_daemon_healthy() {
-    local timeout="${1:-$HEALTH_TIMEOUT}"
-    local i
-    for ((i=0; i<timeout*2; i++)); do
-        [ "$(docker inspect -f '{{.State.Health.Status}}' alice-daemon 2>/dev/null || echo "")" = "healthy" ] \
-            && return 0
-        sleep 0.5
-    done
-    return 1
-}
-
-# ---------- worker deploy ----------
-deploy_worker() {
-    local mode="${1:-build}"     # 'build' or 'rollback'
-
-    local live
-    if ! live=$(detect_live_slot); then
-        die "no live worker (neither blue nor green holds the lease)"
-    fi
-    local next
-    next=$(other_slot "$live")
-    log "live=$live  next=$next  mode=$mode"
-
-    if [ "$mode" = "rollback" ]; then
-        # Use whatever image $next currently has (= last deployed to that slot).
-        docker image inspect "alice-worker:$next" >/dev/null 2>&1 \
-            || die "no alice-worker:$next image to roll back to"
-        log "Rolling back to existing alice-worker:$next"
-    else
-        log "Building alice-worker:$next ..."
-        # compose build uses the :<next> tag from the compose config.
-        compose --profile "$next" build "alice-worker-$next"
-    fi
-
-    # Clean up any stale container in the next slot from a prior failed deploy.
-    docker rm -f "alice-worker-$next" >/dev/null 2>&1 || true
-
-    log "Starting alice-worker-$next ..."
-    compose --profile "$next" up -d --no-build "alice-worker-$next" >/dev/null
-
-    log "Waiting for alice-worker-$next bridge to start ..."
-    if ! wait_bridge_running "alice-worker-$next"; then
-        log "alice-worker-$next failed to start"
-        docker logs --tail 80 "alice-worker-$next" 2>&1 || true
-        docker rm -f "alice-worker-$next" >/dev/null 2>&1 || true
-        die "deploy aborted"
-    fi
-
-    log "SIGTERM → alice-worker-$live (speaking drains, lease releases) ..."
-    docker kill --signal=SIGTERM "alice-worker-$live" 2>/dev/null || true
-
-    log "Waiting for alice-worker-$next to acquire lease ..."
-    if ! wait_lease_held "alice-worker-$next" "$DRAIN_TIMEOUT"; then
-        log "drain timeout — SIGKILLing alice-worker-$live"
-        docker kill "alice-worker-$live" 2>/dev/null || true
-        if ! wait_lease_held "alice-worker-$next" 30; then
-            docker logs --tail 80 "alice-worker-$next" 2>&1 || true
-            docker rm -f "alice-worker-$next" >/dev/null 2>&1 || true
-            die "deploy FAILED: next worker could not acquire lease"
-        fi
-    fi
-
-    log "alice-worker-$next is live. Live slot is now $next."
-    log "alice-worker-$live still draining (thinker may have an in-flight wake); cleanup detached."
-    detach_old_container_cleanup "alice-worker-$live"
-}
-
-# Wait in the background for ``$1`` to exit naturally (the thinker
-# supervisor finishes its in-flight wake, then s6 brings the container
-# down) and ``docker rm`` it. ``CLEANUP_TIMEOUT`` (default 30 min) caps
-# the wait — past that we SIGKILL on the assumption the wake is hung
-# and the watchdog will surface it elsewhere. Disowned so the deploy
-# script can return immediately; the subshell survives independent of
-# the parent shell.
-detach_old_container_cleanup() {
-    local name="$1"
-    (
-        local deadline poll_interval=10
-        deadline=$(( $(date +%s) + CLEANUP_TIMEOUT ))
-        while [ "$(date +%s)" -lt "$deadline" ]; do
-            local status
-            status=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || echo missing)
+verify_s6_services() {
+    # `s6-svstat` lives in the s6-overlay PATH inside the container.
+    # Its first output token is "up" or "down"; we poll until every
+    # named service reports "up" or we hit the timeout. Long-running
+    # service startup (sci-env venv pull, embedder warmup) means we
+    # can't assume all four are up the instant the viewer answers 200.
+    local timeout="${SERVICE_PROBE_TIMEOUT}"
+    local svc i status ok
+    for svc in "${S6_SERVICES[@]}"; do
+        ok=0
+        for ((i=0; i<timeout*2; i++)); do
+            status=$(docker exec "$CONTAINER" s6-svstat "/run/service/$svc" 2>/dev/null || true)
             case "$status" in
-                missing)
-                    exit 0
-                    ;;
-                exited|dead)
-                    docker rm "$name" >/dev/null 2>&1 || true
-                    exit 0
-                    ;;
+                up\ *) ok=1; break ;;
             esac
-            sleep "$poll_interval"
+            sleep 0.5
         done
-        # Cap exceeded — assume hung wake; force-kill and reap.
-        docker rm -f "$name" >/dev/null 2>&1 || true
-    ) </dev/null >/dev/null 2>&1 &
-    disown
-}
-
-# ---------- daemon deploy ----------
-deploy_daemon() {
-    log "Building alice-daemon ..."
-    compose build alice-daemon
-
-    log "Recreating alice-daemon (worker will briefly fail to reach it — messages buffer at Signal servers) ..."
-    compose up -d --no-build --no-deps --force-recreate alice-daemon >/dev/null
-
-    if ! wait_daemon_healthy; then
-        die "daemon did not become healthy; check 'docker logs alice-daemon'"
-    fi
-    log "Daemon updated."
-}
-
-# ---------- dispatch ----------
-case "${1:-}" in
-    worker)
-        if [ "${2:-}" = "--rollback" ]; then
-            deploy_worker "rollback"
-        else
-            deploy_worker "build"
+        if [ "$ok" != 1 ]; then
+            log "s6 service $svc not up: ${status:-<no status>}"
+            return 1
         fi
-        ;;
-    daemon)
-        deploy_daemon
-        ;;
-    all)
-        deploy_daemon
-        deploy_worker "build"
-        ;;
-    -h|--help|"")
-        usage
-        ;;
-    *)
-        usage; exit 2 ;;
+        log "s6 service $svc: up"
+    done
+    return 0
+}
+
+graceful_stop() {
+    if ! container_running; then
+        log "$CONTAINER not running; nothing to stop."
+        return 0
+    fi
+    # `docker compose stop` sends SIGTERM and waits up to the
+    # stop_grace_period configured in docker-compose.yml (30m). s6's
+    # drain hooks then run speaking + thinking through their queue
+    # before the container exits.
+    log "Stopping $CONTAINER (graceful, up to compose stop_grace_period) ..."
+    compose stop "$CONTAINER"
+}
+
+post_up_verify() {
+    local label="$1"
+    log "Probing $HEALTH_URL (timeout ${HEALTH_TIMEOUT}s) ..."
+    if [ "$DRY_RUN" != 1 ] && ! wait_health "$HEALTH_URL" "$HEALTH_TIMEOUT"; then
+        docker logs --tail 80 "$CONTAINER" 2>&1 || true
+        die "$label aborted: viewer never returned 200 at $HEALTH_URL"
+    fi
+    log "Verifying s6 services: ${S6_SERVICES[*]} ..."
+    if [ "$DRY_RUN" != 1 ] && ! verify_s6_services; then
+        docker logs --tail 80 "$CONTAINER" 2>&1 || true
+        die "$label aborted: one or more s6 services not up"
+    fi
+}
+
+deploy() {
+    log "mode=deploy"
+    # Snapshot the live image as the rollback anchor BEFORE building.
+    # `docker compose build` would otherwise overwrite alice:latest and
+    # the prior image would only be reachable by SHA. Skipped on first
+    # deploy when alice:latest doesn't exist yet.
+    if image_exists "$IMAGE"; then
+        log "Tagging $IMAGE -> $PREMIG_IMAGE (rollback anchor) ..."
+        run docker tag "$IMAGE" "$PREMIG_IMAGE"
+    else
+        log "$IMAGE not present; skipping premigration tag (first deploy)."
+    fi
+
+    log "Building $IMAGE ..."
+    compose build alice
+
+    graceful_stop
+
+    log "Bringing up $CONTAINER ..."
+    compose up -d --no-build alice
+
+    post_up_verify "deploy"
+    log "Deploy complete. $IMAGE is live; previous image preserved as $PREMIG_IMAGE."
+}
+
+rollback() {
+    log "mode=rollback"
+    if [ "$DRY_RUN" != 1 ] && ! image_exists "$PREMIG_IMAGE"; then
+        die "no $PREMIG_IMAGE to roll back to (deploy at least once first)"
+    fi
+
+    graceful_stop
+
+    log "Restoring $PREMIG_IMAGE -> $IMAGE ..."
+    run docker tag "$PREMIG_IMAGE" "$IMAGE"
+
+    # --force-recreate: the image content didn't change, just the tag's
+    # SHA. Compose's "is recreate needed" check is content-based; without
+    # the flag it can leave the existing container in place.
+    log "Bringing up $CONTAINER ..."
+    compose up -d --no-build --force-recreate alice
+
+    post_up_verify "rollback"
+    log "Rollback complete. $IMAGE now points at the prior image."
+}
+
+case "$MODE" in
+    deploy)   deploy ;;
+    rollback) rollback ;;
 esac
