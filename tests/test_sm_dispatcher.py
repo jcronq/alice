@@ -94,6 +94,7 @@ def test_empty_poll_writes_empty_state(state_path: pathlib.Path) -> None:
         "version": sm.STATE_VERSION,
         "hello_commented": [],
         "verify_failed_posted": [],
+        "needs_study_hinted": [],
     }
 
 
@@ -241,8 +242,9 @@ def test_non_canonical_sm_label_is_skipped(state_path: pathlib.Path) -> None:
 # Issue #150 — SM v2 pipeline labels are whitelisted but not yet routed.
 # The dispatcher's main switch falls through to "no action this phase";
 # the trust filter must accept them as valid sm:* values.
+# Issue #157 adds the ``sm:needs_study`` handler, so that label dropped
+# off this "no action" matrix — covered by its own test block below.
 V2_PIPELINE_LABELS = (
-    "sm:needs_study",
     "sm:designing",
     "sm:design_review",
     "sm:designed",
@@ -3390,3 +3392,602 @@ def test_gh_get_pr_files_parses_payload(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(sm, "_run_gh", fake_run_gh)
     out = sm.gh_get_pr_files("jcronq/alice", 200)
     assert out == ["src/alice_viewer/main.py", "tests/test_x.py"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #157 — sm:needs_study handler
+# ---------------------------------------------------------------------------
+
+
+def _audit_comment(body: str, *, author: str = "jcronq") -> dict:
+    """Helper: build a ``gh issue view --json comments`` entry."""
+    return {"body": body, "author": {"login": author}}
+
+
+def _needs_study_issue(
+    number: int,
+    *,
+    body: str = "study this thing",
+    art_labels: tuple[str, ...] = ("art:code",),
+    author: str = "jcronq",
+    title: str = "Study task",
+) -> dict:
+    return _make_issue(
+        number,
+        author=author,
+        sm_labels=("sm:needs_study",),
+        art_labels=art_labels,
+        title=title,
+    ) | {"body": body}
+
+
+def test_needs_study_writes_hint_and_posts_audit_comment(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """First pass: write the hint file + post the study-hint-written audit."""
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    issues = [_needs_study_issue(300, body="please study X")]
+    notes_dir = tmp_path / "notes"
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=recorder,
+        edit_labels=label_rec,
+        notes_dir=notes_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.hinted == 1
+    assert report.transitioned == 0
+    # Hint file exists with the expected name.
+    hint_file = notes_dir / "sm-needs-study-issue300.md"
+    assert hint_file.is_file()
+    contents = hint_file.read_text()
+    assert "kind: sm-needs-study" in contents
+    assert "issue: 300" in contents
+    assert "please study X" in contents
+    # Exactly one comment posted: the audit.
+    assert len(recorder.posted) == 1
+    _repo, num, body = recorder.posted[0]
+    assert num == 300
+    assert body.startswith("[SM] study-hint-written task=#300")
+    assert str(hint_file) in body
+    # State ledger updated.
+    persisted = json.loads(state_path.read_text())
+    assert persisted["needs_study_hinted"] == [300]
+
+
+def test_needs_study_hint_is_idempotent_across_passes(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """Second pass with the same slate must not re-write or re-post."""
+    notes_dir = tmp_path / "notes"
+    issues = [_needs_study_issue(301)]
+
+    # First pass — write + post.
+    rec1 = Recorder()
+    sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=rec1,
+        edit_labels=LabelRecorder(),
+        notes_dir=notes_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+    assert len(rec1.posted) == 1
+
+    hint_file = notes_dir / "sm-needs-study-issue301.md"
+    first_contents = hint_file.read_text()
+
+    # Second pass — ledger says we've already hinted.
+    rec2 = Recorder()
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=rec2,
+        edit_labels=LabelRecorder(),
+        notes_dir=notes_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+    assert exit_code == 0
+    assert rec2.posted == []
+    assert report.hinted == 0
+    assert hint_file.read_text() == first_contents
+
+
+def test_needs_study_skips_hint_when_audit_comment_already_exists(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """State-file reset: ledger empty but the audit comment is on GH."""
+    notes_dir = tmp_path / "notes"
+    issues = [_needs_study_issue(302)]
+    existing_audit = _audit_comment(
+        "[SM] study-hint-written task=#302 path=/tmp/x.md ts=2026-05-12T00:00:00Z"
+    )
+
+    recorder = Recorder()
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [existing_audit],
+        post_comment=recorder,
+        edit_labels=LabelRecorder(),
+        notes_dir=notes_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+    assert exit_code == 0
+    assert recorder.posted == []
+    assert report.hinted == 0
+    assert not (notes_dir / "sm-needs-study-issue302.md").exists()
+    persisted = json.loads(state_path.read_text())
+    assert 302 in persisted["needs_study_hinted"]
+
+
+def test_needs_study_audit_from_untrusted_author_does_not_dedup(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """A drive-by commenter pasting the audit prefix mustn't suppress the hint."""
+    notes_dir = tmp_path / "notes"
+    issues = [_needs_study_issue(303)]
+    forged = _audit_comment(
+        "[SM] study-hint-written task=#303 path=/forged.md ts=now",
+        author="random-drive-by",
+    )
+
+    recorder = Recorder()
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [forged],
+        post_comment=recorder,
+        edit_labels=LabelRecorder(),
+        notes_dir=notes_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+    assert exit_code == 0
+    assert report.hinted == 1
+    assert (notes_dir / "sm-needs-study-issue303.md").is_file()
+    assert any(b.startswith("[SM] study-hint-written") for _r, _n, b in recorder.posted)
+
+
+def test_needs_study_study_complete_transitions_to_selected(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    notes_dir = tmp_path / "notes"
+    issues = [_needs_study_issue(310, art_labels=("art:code",))]
+    comments = [
+        _audit_comment(
+            "[SM] study-hint-written task=#310 path=/x.md ts=2026-05-12T00:00:00Z"
+        ),
+        _audit_comment(
+            "[SM] study-complete art=art:code findings=[[research-310]]"
+        ),
+    ]
+
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        notes_dir=notes_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 1
+    assert (310, "sm:needs_study", "sm:selected") in report.transitions
+    transition_bodies = [b for _r, _n, b in recorder.posted if "transition" in b]
+    assert any(
+        "from=needs_study to=selected" in b and "study-complete" in b
+        for b in transition_bodies
+    )
+    assert len(label_rec.calls) == 1
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:selected"]
+    assert edit["remove"] == ["sm:needs_study"]
+
+
+def test_needs_study_study_complete_swaps_art_label(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """If thinking concludes the artifact kind changed, swap art:* atomically."""
+    notes_dir = tmp_path / "notes"
+    issues = [_needs_study_issue(311, art_labels=("art:code",))]
+    comments = [
+        _audit_comment(
+            "[SM] study-hint-written task=#311 path=/x.md ts=2026-05-12T00:00:00Z"
+        ),
+        _audit_comment(
+            "[SM] study-complete art=art:research_note findings=[[r311]]"
+        ),
+    ]
+
+    label_rec = LabelRecorder()
+    sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        notes_dir=notes_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert len(label_rec.calls) == 1
+    edit = label_rec.calls[0]
+    assert set(edit["add"]) == {"sm:selected", "art:research_note"}
+    assert set(edit["remove"]) == {"sm:needs_study", "art:code"}
+
+
+def test_needs_study_study_complete_unknown_art_logs_and_does_not_transition(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """An unrecognized art label is rejected by the parser → no transition."""
+    notes_dir = tmp_path / "notes"
+    issues = [_needs_study_issue(312)]
+    comments = [
+        _audit_comment(
+            "[SM] study-hint-written task=#312 path=/x.md ts=2026-05-12T00:00:00Z"
+        ),
+        _audit_comment("[SM] study-complete art=art:bogus findings=[[r312]]"),
+    ]
+    logged: list[str] = []
+
+    label_rec = LabelRecorder()
+    recorder = Recorder()
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        notes_dir=notes_dir,
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert label_rec.calls == []
+    assert any("art:bogus" in m and "whitelist" in m for m in logged)
+
+
+def test_needs_study_study_blocked_transitions_to_blocked(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    notes_dir = tmp_path / "notes"
+    issues = [_needs_study_issue(320)]
+    comments = [
+        _audit_comment(
+            "[SM] study-hint-written task=#320 path=/x.md ts=2026-05-12T00:00:00Z"
+        ),
+        _audit_comment('[SM] study-blocked reason="need vault access"'),
+    ]
+
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        notes_dir=notes_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 1
+    assert (320, "sm:needs_study", "sm:blocked") in report.transitions
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:blocked"]
+    assert edit["remove"] == ["sm:needs_study"]
+
+
+def test_needs_study_study_rejected_transitions_to_rejected(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    notes_dir = tmp_path / "notes"
+    issues = [_needs_study_issue(321)]
+    comments = [
+        _audit_comment(
+            "[SM] study-hint-written task=#321 path=/x.md ts=2026-05-12T00:00:00Z"
+        ),
+        _audit_comment('[SM] study-rejected reason="out of scope"'),
+    ]
+
+    label_rec = LabelRecorder()
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        notes_dir=notes_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 1
+    assert (321, "sm:needs_study", "sm:rejected") in report.transitions
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:rejected"]
+    assert edit["remove"] == ["sm:needs_study"]
+
+
+def test_needs_study_study_progress_logs_and_stays(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """Most recent comment is study-progress → no transition, log once."""
+    notes_dir = tmp_path / "notes"
+    issues = [_needs_study_issue(322)]
+    comments = [
+        _audit_comment(
+            "[SM] study-hint-written task=#322 path=/x.md ts=2026-05-12T00:00:00Z"
+        ),
+        _audit_comment("[SM] study-progress note=[[checkpoint-322]]"),
+    ]
+
+    logged: list[str] = []
+    label_rec = LabelRecorder()
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        notes_dir=notes_dir,
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert label_rec.calls == []
+    assert any("thinking still working" in m for m in logged)
+
+
+def test_needs_study_picks_most_recent_study_comment(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """Comments are scanned newest-first: study-complete after study-progress
+    wins."""
+    notes_dir = tmp_path / "notes"
+    issues = [_needs_study_issue(323)]
+    comments = [
+        _audit_comment(
+            "[SM] study-hint-written task=#323 path=/x.md ts=2026-05-12T00:00:00Z"
+        ),
+        _audit_comment("[SM] study-progress note=[[chk1]]"),
+        _audit_comment("[SM] study-progress note=[[chk2]]"),
+        _audit_comment("[SM] study-complete art=art:code findings=[[done]]"),
+    ]
+
+    label_rec = LabelRecorder()
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        notes_dir=notes_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 1
+    assert (323, "sm:needs_study", "sm:selected") in report.transitions
+
+
+def test_needs_study_progress_after_complete_does_not_unwind(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """If thinking posts study-progress AFTER a study-complete (out of
+    spec but observable), the newest verb wins → no transition this pass."""
+    notes_dir = tmp_path / "notes"
+    issues = [_needs_study_issue(324)]
+    comments = [
+        _audit_comment("[SM] study-complete art=art:code findings=[[done]]"),
+        _audit_comment("[SM] study-progress note=[[oops]]"),
+    ]
+
+    label_rec = LabelRecorder()
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        notes_dir=notes_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert label_rec.calls == []
+
+
+def test_needs_study_untrusted_comment_author_is_ignored(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """An untrusted commenter cannot trigger a transition by pasting the
+    study-complete verb."""
+    notes_dir = tmp_path / "notes"
+    issues = [_needs_study_issue(325)]
+    comments = [
+        _audit_comment(
+            "[SM] study-hint-written task=#325 path=/x.md ts=2026-05-12T00:00:00Z"
+        ),
+        _audit_comment(
+            "[SM] study-complete art=art:code findings=[[fake]]",
+            author="random-drive-by",
+        ),
+    ]
+
+    label_rec = LabelRecorder()
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        notes_dir=notes_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert label_rec.calls == []
+
+
+def test_needs_study_dry_run_does_not_write_or_post(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    notes_dir = tmp_path / "notes"
+    issues = [_needs_study_issue(330)]
+
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=recorder,
+        edit_labels=label_rec,
+        notes_dir=notes_dir,
+        dry_run=True,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.hinted == 1  # intent recorded
+    assert recorder.posted == []
+    assert label_rec.calls == []
+    assert not (notes_dir / "sm-needs-study-issue330.md").exists()
+    # Dry-run also skips state persistence.
+    assert not state_path.is_file()
+
+
+def test_render_study_hint_audit_shape() -> None:
+    out = sm.render_study_hint_audit_comment(
+        42,
+        "/tmp/hint.md",
+        timestamp="2026-05-12T12:00:00+00:00",
+    )
+    assert out == (
+        "[SM] study-hint-written task=#42 path=/tmp/hint.md "
+        "ts=2026-05-12T12:00:00+00:00"
+    )
+
+
+def test_dispatcher_state_carries_needs_study_field_across_load_save(
+    state_path: pathlib.Path,
+) -> None:
+    """Forward-compat: pre-#157 state files load with empty ledger; new
+    field persists on save."""
+    state_path.write_text(
+        json.dumps({"version": sm.STATE_VERSION, "hello_commented": [1, 2]})
+    )
+    loaded = sm.load_state(state_path)
+    assert loaded.hello_commented == [1, 2]
+    assert loaded.needs_study_hinted == []
+
+    loaded.mark_needs_study_hint(42)
+    loaded.mark_needs_study_hint(43)
+    sm.save_state(state_path, loaded)
+    on_disk = json.loads(state_path.read_text())
+    assert on_disk["needs_study_hinted"] == [42, 43]
+    assert on_disk["hello_commented"] == [1, 2]
+
+
+def test_dispatcher_state_needs_study_fifo_eviction() -> None:
+    state = sm.DispatcherState()
+    for n in range(1, sm.SEEN_ISSUE_CAP + 1):
+        state.mark_needs_study_hint(n)
+    assert len(state.needs_study_hinted) == sm.SEEN_ISSUE_CAP
+    state.mark_needs_study_hint(sm.SEEN_ISSUE_CAP + 1)
+    assert len(state.needs_study_hinted) == sm.SEEN_ISSUE_CAP
+    assert 1 not in state.needs_study_hinted
+    assert state.needs_study_hinted[-1] == sm.SEEN_ISSUE_CAP + 1

@@ -122,6 +122,7 @@ REVIEWING_SM_LABEL = "sm:reviewing"
 BUILDING_SM_LABEL = "sm:building"
 DONE_SM_LABEL = "sm:done"
 REJECTED_SM_LABEL = "sm:rejected"
+BLOCKED_SM_LABEL = "sm:blocked"
 
 # SM v2 design-pipeline states (#148, #149). The dispatcher's main
 # switch falls through to the "no action this phase" branch for these
@@ -134,6 +135,21 @@ DESIGNING_SM_LABEL = "sm:designing"
 DESIGN_REVIEW_SM_LABEL = "sm:design_review"
 DESIGNED_SM_LABEL = "sm:designed"
 COMPACTING_SM_LABEL = "sm:compacting"
+
+# Issue #157 — sm:needs_study handler. The dispatcher posts a
+# ``[SM] study-hint-written`` audit comment once per issue at this
+# state, after writing an ``inner/notes/sm-needs-study-issue<N>.md``
+# hint file for the thinking-agent to pick up on her next wake.
+# Idempotency is enforced by a ledger field on :class:`DispatcherState`
+# plus a defensive scan of existing audit comments (so a state-file
+# reset doesn't double-fire the hint).
+STUDY_HINT_WRITTEN_PREFIX = "[SM] study-hint-written"
+
+# Directory where the thinking-agent reads inbound work. Mirrors
+# ``alice_watchers.github.DEFAULT_MIND / "inner/notes"`` — kept as a
+# path constant rather than imported to avoid a watcher → dispatcher
+# import cycle and to let tests override per-call.
+NEEDS_STUDY_HINT_DIR = pathlib.Path("/home/alice/alice-mind/inner/notes")
 
 # Terminal ``sm:*`` states — the dispatcher's sweep pass leaves these
 # alone. Non-terminal labels on a *closed* issue indicate a missed
@@ -398,11 +414,20 @@ class DispatcherState:
     every dispatcher cadence would re-post the failure (CI stays green
     on the same merge commit, so the verifier keeps running). Cleared
     implicitly when the issue eventually transitions out of reviewing.
+
+    ``needs_study_hinted`` (issue #157) is the FIFO list of issue
+    numbers we've already written a hint file + posted a
+    ``[SM] study-hint-written`` audit comment on while the issue carried
+    ``sm:needs_study``. Mirrors ``hello_commented`` — same FIFO eviction
+    semantics. The defensive comment-prefix scan in
+    :func:`_process_needs_study` handles state-file resets so a single
+    cycle can't double-fire the hint.
     """
 
     version: int = STATE_VERSION
     hello_commented: list[int] = field(default_factory=list)
     verify_failed_posted: list[int] = field(default_factory=list)
+    needs_study_hinted: list[int] = field(default_factory=list)
 
     def has_hello(self, number: int) -> bool:
         return number in self.hello_commented
@@ -438,11 +463,23 @@ class DispatcherState:
         except ValueError:
             pass
 
+    def has_needs_study_hint(self, number: int) -> bool:
+        return number in self.needs_study_hinted
+
+    def mark_needs_study_hint(self, number: int) -> None:
+        if number in self.needs_study_hinted:
+            return
+        self.needs_study_hinted.append(number)
+        if len(self.needs_study_hinted) > SEEN_ISSUE_CAP:
+            overflow = len(self.needs_study_hinted) - SEEN_ISSUE_CAP
+            del self.needs_study_hinted[:overflow]
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": self.version,
             "hello_commented": list(self.hello_commented),
             "verify_failed_posted": list(self.verify_failed_posted),
+            "needs_study_hinted": list(self.needs_study_hinted),
         }
 
 
@@ -470,10 +507,15 @@ def load_state(state_path: pathlib.Path) -> DispatcherState:
     # working across the upgrade without a manual reset.
     raw_vf = data.get("verify_failed_posted") or []
     vf_numbers: list[int] = [int(n) for n in raw_vf if isinstance(n, int)]
+    # ``needs_study_hinted`` was added in #157. Same forward-compat
+    # default-to-empty treatment for older state files.
+    raw_ns = data.get("needs_study_hinted") or []
+    ns_numbers: list[int] = [int(n) for n in raw_ns if isinstance(n, int)]
     return DispatcherState(
         version=STATE_VERSION,
         hello_commented=numbers,
         verify_failed_posted=vf_numbers,
+        needs_study_hinted=ns_numbers,
     )
 
 
@@ -485,6 +527,9 @@ def save_state(state_path: pathlib.Path, state: DispatcherState) -> None:
     if len(state.verify_failed_posted) > SEEN_ISSUE_CAP:
         overflow = len(state.verify_failed_posted) - SEEN_ISSUE_CAP
         del state.verify_failed_posted[:overflow]
+    if len(state.needs_study_hinted) > SEEN_ISSUE_CAP:
+        overflow = len(state.needs_study_hinted) - SEEN_ISSUE_CAP
+        del state.needs_study_hinted[:overflow]
     state_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(
         dir=state_path.parent, prefix=".sm-dispatcher-", suffix=".json"
@@ -1897,6 +1942,53 @@ def render_transition_comment(from_state: str, to_state: str, reason: str) -> st
     return f'[SM] transition from={f_short} to={t_short} reason="{reason}"'
 
 
+def render_study_hint_audit_comment(
+    number: int,
+    note_path: pathlib.Path | str,
+    *,
+    timestamp: str | None = None,
+) -> str:
+    """Produce a ``[SM] study-hint-written ...`` payload.
+
+    Posted on the issue after the dispatcher drops a hint markdown file
+    into ``inner/notes/`` for the thinking-agent to pick up. The audit
+    comment is the source-of-truth dedup signal — :func:`_process_needs_study`
+    won't re-write the hint if it sees this prefix from a trusted author
+    on a later pass, even if the local state ledger was lost.
+    """
+    ts = timestamp or _now_iso()
+    return (
+        f"{STUDY_HINT_WRITTEN_PREFIX} task=#{number} "
+        f"path={note_path} ts={ts}"
+    )
+
+
+def render_study_hint_note_body(issue: dict[str, Any]) -> str:
+    """Render the hint-file body for ``inner/notes/sm-needs-study-issue<N>.md``.
+
+    Minimal viable shape: YAML-like frontmatter with the bits the
+    thinking-agent's wake prompt needs to pick the file up + route it
+    (kind=sm-needs-study, issue=#<N>, source=alice-sm-dispatcher),
+    followed by the issue title and body verbatim. The fully-baked
+    prompt format lands in sub-issue #6 — this body is the contract
+    surface the prompt will eventually consume.
+    """
+    number = issue.get("number")
+    title = issue.get("title") or ""
+    body = issue.get("body") or ""
+    labels = ", ".join(sorted(_label_names(issue)))
+    frontmatter = (
+        "---\n"
+        "kind: sm-needs-study\n"
+        f"issue: {number}\n"
+        f"title: {title}\n"
+        f"labels: [{labels}]\n"
+        "source: alice-sm-dispatcher\n"
+        "---\n"
+    )
+    return f"{frontmatter}\n# Issue #{number}: {title}\n\n{body.rstrip()}\n"
+
+
 # ---------------------------------------------------------------------------
 # Issue #128 — verification (smoke-test) machinery
 # ---------------------------------------------------------------------------
@@ -2099,6 +2191,10 @@ class RunReport:
     verify_failed: int = 0
     # (issue_number, outcome, reason) for the done-line / tests.
     verify_records: list[tuple[int, str, str]] = field(default_factory=list)
+    # Issue #157 — count of ``sm:needs_study`` hint files written this
+    # pass. Tracked separately so the operator can tell at a glance
+    # whether the thinking-agent has been handed fresh work.
+    hinted: int = 0
 
 
 def _process_selected(
@@ -2562,6 +2658,297 @@ def _process_reviewing(
         return
 
 
+# ---------------------------------------------------------------------------
+# Issue #157 — sm:needs_study handler
+# ---------------------------------------------------------------------------
+
+
+def _comment_author_login(comment: dict[str, Any]) -> str | None:
+    """Pull the GitHub login off a ``gh issue view --json comments`` entry.
+
+    ``gh`` returns the ``author`` field as ``{"login": "..."}``; older
+    payloads or test fixtures sometimes use a bare string. Returns
+    ``None`` on any shape we don't understand so the parser layer can
+    apply its own trust check and reject.
+    """
+    author = comment.get("author") if isinstance(comment, dict) else None
+    if isinstance(author, dict):
+        login = author.get("login")
+        if isinstance(login, str):
+            return login
+    if isinstance(author, str):
+        return author
+    return None
+
+
+def _has_prior_study_hint_audit(
+    comments: list[dict[str, Any]],
+    *,
+    trusted_authors: frozenset[str],
+) -> bool:
+    """Return True iff any comment is a trusted-authored study-hint audit.
+
+    Defense-in-depth dedup: if the local state file was reset, the
+    audit comment is the only persistent record that the hint was
+    already written. Trust is required so a random commenter pasting
+    the prefix can't trick the dispatcher into skipping a real hint
+    emission.
+    """
+    for c in comments:
+        if not isinstance(c, dict):
+            continue
+        body = c.get("body")
+        if not isinstance(body, str) or not body.startswith(STUDY_HINT_WRITTEN_PREFIX):
+            continue
+        login = _comment_author_login(c)
+        if isinstance(login, str) and login in trusted_authors:
+            return True
+    return False
+
+
+def _current_art_label(
+    issue: dict[str, Any], art_whitelist: frozenset[str]
+) -> str | None:
+    """Return the single whitelisted ``art:*`` label, or None if not exactly one.
+
+    Used by :func:`_process_needs_study` to decide whether to swap the
+    art label on study-complete. Multiple art labels or zero matches
+    return None — the swap path treats either as "no current label to
+    remove" and applies the parsed art label additively.
+    """
+    names = _label_names(issue)
+    arts = [n for n in names if n.startswith("art:") and n in art_whitelist]
+    if len(arts) != 1:
+        return None
+    return arts[0]
+
+
+def _process_needs_study(
+    *,
+    issue: dict[str, Any],
+    repo: str,
+    state: DispatcherState,
+    report: RunReport,
+    post_comment: PostCommentFn,
+    edit_labels: EditLabelsFn,
+    list_comments: ListCommentsFn,
+    notes_dir: pathlib.Path,
+    trusted_authors: frozenset[str],
+    art_whitelist: frozenset[str],
+    dry_run: bool,
+    log: Callable[[str], None],
+    now_iso: Callable[[], str],
+) -> None:
+    """Hint emission + comment-driven transitions for one ``sm:needs_study`` issue.
+
+    Two-phase pass:
+
+      1. **Hint emission.** Idempotent on the ledger field
+         ``DispatcherState.needs_study_hinted`` and defensively on the
+         ``[SM] study-hint-written`` audit comment from a trusted
+         author. On first encounter we write
+         ``inner/notes/sm-needs-study-issue<N>.md`` (issue body +
+         frontmatter the thinking-agent's wake prompt picks up — see
+         #6) and post the audit comment.
+
+      2. **Comment-driven transitions.** Scan comments newest-first
+         via :func:`alice_sm.comments.parse_comment`. The first parsed
+         study-verb wins:
+
+           * ``study-complete`` → ``sm:selected``, swap ``art:*`` if
+             the parsed art label differs from the issue's current one
+             (the parser already validated whitelist membership).
+           * ``study-blocked``  → ``sm:blocked``.
+           * ``study-rejected`` → ``sm:rejected``.
+           * ``study-progress`` → no-op (thinking still working);
+             ``study-progress`` resets the 7-day stall clock in #4.
+
+         Comments that aren't ``[SM] study-*`` (audit comments,
+         human prose) are ignored. The trust check inside each parser
+         keeps a random commenter from forging a transition.
+    """
+    number = issue["number"]
+
+    # ----- step 1: hint emission -----
+    # The comments list is needed for both the audit-comment dedup
+    # check and the transition scan below, so fetch once and reuse.
+    try:
+        comments = list_comments(repo, number)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] needs_study #{number}: "
+            f"failed to list comments: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+
+    if state.has_needs_study_hint(number):
+        already_hinted = True
+    elif _has_prior_study_hint_audit(comments, trusted_authors=trusted_authors):
+        # Defensive: state file lost, audit comment persists. Mark in
+        # the ledger so the next pass takes the fast path.
+        state.mark_needs_study_hint(number)
+        already_hinted = True
+    else:
+        already_hinted = False
+
+    if not already_hinted:
+        note_path = notes_dir / f"sm-needs-study-issue{number}.md"
+        note_body = render_study_hint_note_body(issue)
+        audit_body = render_study_hint_audit_comment(
+            number, note_path, timestamp=now_iso()
+        )
+        if dry_run:
+            log(
+                f"[sm-dispatcher] DRY-RUN would write hint for #{number} "
+                f"at {note_path} and post audit comment"
+            )
+            report.hinted += 1
+        else:
+            try:
+                notes_dir.mkdir(parents=True, exist_ok=True)
+                note_path.write_text(note_body)
+            except OSError as exc:
+                log(
+                    f"[sm-dispatcher] needs_study #{number}: "
+                    f"failed to write hint at {note_path}: {exc}"
+                )
+                return
+            try:
+                post_comment(repo, number, audit_body)
+            except GHCommandError as exc:
+                log(
+                    f"[sm-dispatcher] needs_study #{number}: "
+                    f"failed to post study-hint-written: {exc}"
+                )
+                if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+                    raise
+                # The hint file is on disk. We didn't mark the ledger,
+                # so the next pass will retry the comment post — the
+                # audit-comment scan above will see no prior audit and
+                # re-attempt (the file write is idempotent on the
+                # known filename).
+                return
+            state.mark_needs_study_hint(number)
+            report.hinted += 1
+            log(
+                f"[sm-dispatcher] needs_study #{number}: hint written "
+                f"at {note_path}"
+            )
+
+    # ----- step 2: comment-driven transitions -----
+    # Local import to avoid a top-of-module cycle: ``alice_sm.comments``
+    # imports ``ART_LABEL_WHITELIST`` / ``TRUSTED_AUTHORS`` from this
+    # module.
+    from alice_sm.comments import (
+        StudyBlocked,
+        StudyComplete,
+        StudyProgress,
+        StudyRejected,
+        parse_comment,
+    )
+
+    parsed_study = None
+    for c in reversed(comments):
+        if not isinstance(c, dict):
+            continue
+        body = c.get("body")
+        if not isinstance(body, str):
+            continue
+        login = _comment_author_login(c)
+        parsed = parse_comment(
+            body,
+            login,
+            trusted_authors=trusted_authors,
+            log=log,
+        )
+        if isinstance(
+            parsed, (StudyComplete, StudyBlocked, StudyRejected, StudyProgress)
+        ):
+            parsed_study = parsed
+            break
+
+    if parsed_study is None:
+        log(
+            f"[sm-dispatcher] needs_study #{number}: "
+            f"no parsed study-* comment yet"
+        )
+        return
+
+    if isinstance(parsed_study, StudyProgress):
+        # Thinking checkpointed but hasn't decided yet. Sub-issue #4
+        # will hang the 7-day stall sweep off this branch.
+        log(
+            f"[sm-dispatcher] needs_study #{number}: thinking still "
+            f"working (note=[[{parsed_study.note}]])"
+        )
+        return
+
+    # Transition verb. Build the (target, reason, add, remove) tuple
+    # per verdict, then apply uniformly.
+    current_art = _current_art_label(issue, art_whitelist)
+    if isinstance(parsed_study, StudyComplete):
+        target = ACTIVE_SM_LABEL
+        reason = (
+            f"study-complete findings=[[{parsed_study.findings}]] "
+            f"art={parsed_study.art_label}"
+        )
+        add_labels = [target]
+        remove_labels = [NEEDS_STUDY_SM_LABEL]
+        if (
+            parsed_study.art_label != current_art
+            and current_art is not None
+        ):
+            add_labels.append(parsed_study.art_label)
+            remove_labels.append(current_art)
+        elif current_art is None:
+            # Issue carried no whitelisted art:* before — apply the
+            # parsed one rather than leave the issue art-less.
+            add_labels.append(parsed_study.art_label)
+    elif isinstance(parsed_study, StudyBlocked):
+        target = BLOCKED_SM_LABEL
+        reason = f"study-blocked reason=\"{parsed_study.reason}\""
+        add_labels = [target]
+        remove_labels = [NEEDS_STUDY_SM_LABEL]
+    elif isinstance(parsed_study, StudyRejected):
+        target = REJECTED_SM_LABEL
+        reason = f"study-rejected reason=\"{parsed_study.reason}\""
+        add_labels = [target]
+        remove_labels = [NEEDS_STUDY_SM_LABEL]
+    else:  # pragma: no cover — exhaustively matched above.
+        return
+
+    transition_body = render_transition_comment(
+        NEEDS_STUDY_SM_LABEL, target, reason
+    )
+    if dry_run:
+        log(
+            f"[sm-dispatcher] DRY-RUN would transition #{number}: "
+            f"needs_study → {target} ({reason})"
+        )
+        report.transitioned += 1
+        report.transitions.append((number, NEEDS_STUDY_SM_LABEL, target))
+        return
+    try:
+        edit_labels(repo, number, add=add_labels, remove=remove_labels)
+        post_comment(repo, number, transition_body)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] needs_study #{number}: "
+            f"failed to transition to {target}: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+    report.transitioned += 1
+    report.transitions.append((number, NEEDS_STUDY_SM_LABEL, target))
+    log(
+        f"[sm-dispatcher] transitioned #{number}: "
+        f"needs_study → {target} ({reason})"
+    )
+
+
 def _process_stale_closed(
     *,
     issue: dict[str, Any],
@@ -2763,6 +3150,9 @@ def run(
     pr_files: PRFilesFn | None = None,
     verify_pr: VerifyFn | None = None,
     enable_verify: bool = True,
+    list_comments: ListCommentsFn | None = None,
+    notes_dir: pathlib.Path = NEEDS_STUDY_HINT_DIR,
+    trusted_authors: frozenset[str] = TRUSTED_AUTHORS,
     dry_run: bool = False,
     log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
     now_iso: Callable[[], str] = _now_iso,
@@ -2779,6 +3169,8 @@ def run(
         list_issues = gh_list_sm_issues
     if list_stale_closed is None:
         list_stale_closed = gh_list_stale_closed_sm_issues
+    if list_comments is None:
+        list_comments = gh_list_issue_comments
     if enable_spawn:
         # Default to live production wiring when the caller hasn't
         # provided test fixtures. enable_spawn=False is the test escape
@@ -2927,6 +3319,22 @@ def run(
                     log=log,
                     now_iso=now_iso,
                 )
+            elif sm_label == NEEDS_STUDY_SM_LABEL:
+                _process_needs_study(
+                    issue=issue,
+                    repo=repo,
+                    state=state,
+                    report=report,
+                    post_comment=post_comment,
+                    edit_labels=edit_labels,
+                    list_comments=list_comments,
+                    notes_dir=notes_dir,
+                    trusted_authors=trusted_authors,
+                    art_whitelist=ART_LABEL_WHITELIST,
+                    dry_run=dry_run,
+                    log=log,
+                    now_iso=now_iso,
+                )
             else:
                 # Phase 1.5 doesn't act on draft / building / validating
                 # / done / rejected / blocked. Listed for visibility
@@ -3001,6 +3409,7 @@ def run(
         f"transitioned={report.transitioned} "
         f"swept={report.swept} "
         f"spawned={report.spawned} "
+        f"hinted={report.hinted} "
         f"cleaned_up={report.cleaned_up} "
         f"verify_pass={report.verify_pass} "
         f"verify_skip={report.verify_skip} "
