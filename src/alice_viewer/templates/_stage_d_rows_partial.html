@@ -9,8 +9,9 @@
 {% if not rows %}
   <div class="stage-d-empty muted">
     <p>No Stage D attempts in this window.</p>
-    <p>If thinking hasn't run Stage D yet, this is normal — the firehose log only fills up
-       overnight. To populate sample data for development, run:</p>
+    <p>If thinking hasn't run Stage D yet, this is normal — the pairs log
+       only fills up overnight. To populate sample data for development,
+       run:</p>
     <pre>python -m alice_viewer.stage_d_store --regen-fixtures</pre>
   </div>
 {% else %}
@@ -54,7 +55,9 @@
             <a class="stage-d-slug" href="/memory?focus={{ sa }}" title="{{ sa }}">{{ sa.split('/')[-1] }}</a>
             <span class="stage-d-pair-x muted">×</span>
             <a class="stage-d-slug" href="/memory?focus={{ sb }}" title="{{ sb }}">{{ sb.split('/')[-1] }}</a>
-            <span class="stage-d-attempt-n muted">attempt {{ r.draft_attempt_n }}</span>
+            {% if r.qwen_verdict or r.haiku_verdict %}
+              <span class="stage-d-attempt-n muted">attempt {{ r.draft_attempt_n }}</span>
+            {% endif %}
           </div>
           <div class="stage-d-row-meta">
             <span class="stage-d-outcome stage-d-outcome-{{ r.outcome }}">
@@ -62,6 +65,7 @@
               {% elif r.outcome == 'dropped_agreement_reject' %}dropped (both reject)
               {% elif r.outcome == 'dropped_disagreement_exhausted' %}dropped (disagree, exhausted)
               {% elif r.outcome == 'disagreement_pending' %}disagreement pending
+              {% elif r.outcome == 'null_result' %}null result
               {% else %}{{ r.outcome }}{% endif %}
             </span>
             {% if r.label_record %}
@@ -73,45 +77,55 @@
           </div>
         </div>
 
-        <details class="stage-d-synth"{% if is_active %} open{% endif %}>
-          <summary>synthesis text</summary>
-          <pre class="stage-d-synth-body">{{ r.synthesis_text }}</pre>
-          {% if r.shipped_slug %}
-            <div class="stage-d-shipped-link">
-              shipped to:
-              <a href="/memory?focus={{ r.shipped_slug }}" title="{{ r.shipped_slug }}">{{ r.shipped_slug }}</a>
-            </div>
-          {% endif %}
-          {% if r.retry_history %}
-            <div class="stage-d-retries">
-              <div class="muted">retry history ({{ r.retry_history | length }} prior draft{{ '' if r.retry_history | length == 1 else 's' }})</div>
-              {% for prior in r.retry_history %}
-                <pre class="stage-d-retry-body">{{ prior }}</pre>
-              {% endfor %}
-            </div>
-          {% endif %}
-        </details>
+        {% if r.synthesis_text or r.shipped_slug or r.retry_history %}
+          <details class="stage-d-synth"{% if is_active %} open{% endif %}>
+            <summary>synthesis text</summary>
+            {% if r.synthesis_text %}
+              <pre class="stage-d-synth-body">{{ r.synthesis_text }}</pre>
+            {% endif %}
+            {% if r.shipped_slug %}
+              <div class="stage-d-shipped-link">
+                shipped to:
+                <a href="/memory?focus={{ r.shipped_slug }}" title="{{ r.shipped_slug }}">{{ r.shipped_slug }}</a>
+              </div>
+            {% endif %}
+            {% if r.retry_history %}
+              <div class="stage-d-retries">
+                <div class="muted">retry history ({{ r.retry_history | length }} prior draft{{ '' if r.retry_history | length == 1 else 's' }})</div>
+                {% for prior in r.retry_history %}
+                  <pre class="stage-d-retry-body">{{ prior }}</pre>
+                {% endfor %}
+              </div>
+            {% endif %}
+          </details>
+        {% endif %}
 
-        <div class="stage-d-verdicts">
-          <div class="stage-d-verdict stage-d-verdict-qwen">
-            <div class="stage-d-verdict-head">
-              <span class="stage-d-judge">qwen</span>
-              <span class="stage-d-tier stage-d-tier-{{ r.qwen_verdict.tier | lower }}">{{ r.qwen_verdict.tier }}</span>
-              <span class="stage-d-decision stage-d-decision-{{ r.qwen_verdict.decision }}">{{ r.qwen_verdict.decision }}</span>
-              <span class="stage-d-novel">novel: {{ r.qwen_verdict.novel }}</span>
-            </div>
-            <div class="stage-d-verdict-reason">{{ r.qwen_verdict.reason }}</div>
+        {% if r.qwen_verdict or r.haiku_verdict %}
+          <div class="stage-d-verdicts">
+            {% if r.qwen_verdict %}
+              <div class="stage-d-verdict stage-d-verdict-qwen">
+                <div class="stage-d-verdict-head">
+                  <span class="stage-d-judge">qwen</span>
+                  <span class="stage-d-tier stage-d-tier-{{ r.qwen_verdict.tier | lower }}">{{ r.qwen_verdict.tier }}</span>
+                  <span class="stage-d-decision stage-d-decision-{{ r.qwen_verdict.decision }}">{{ r.qwen_verdict.decision }}</span>
+                  <span class="stage-d-novel">novel: {{ r.qwen_verdict.novel }}</span>
+                </div>
+                <div class="stage-d-verdict-reason">{{ r.qwen_verdict.reason }}</div>
+              </div>
+            {% endif %}
+            {% if r.haiku_verdict %}
+              <div class="stage-d-verdict stage-d-verdict-haiku">
+                <div class="stage-d-verdict-head">
+                  <span class="stage-d-judge">haiku</span>
+                  <span class="stage-d-tier stage-d-tier-{{ r.haiku_verdict.tier | lower }}">{{ r.haiku_verdict.tier }}</span>
+                  <span class="stage-d-decision stage-d-decision-{{ r.haiku_verdict.decision }}">{{ r.haiku_verdict.decision }}</span>
+                  <span class="stage-d-novel">novel: {{ r.haiku_verdict.novel }}</span>
+                </div>
+                <div class="stage-d-verdict-reason">{{ r.haiku_verdict.reason }}</div>
+              </div>
+            {% endif %}
           </div>
-          <div class="stage-d-verdict stage-d-verdict-haiku">
-            <div class="stage-d-verdict-head">
-              <span class="stage-d-judge">haiku</span>
-              <span class="stage-d-tier stage-d-tier-{{ r.haiku_verdict.tier | lower }}">{{ r.haiku_verdict.tier }}</span>
-              <span class="stage-d-decision stage-d-decision-{{ r.haiku_verdict.decision }}">{{ r.haiku_verdict.decision }}</span>
-              <span class="stage-d-novel">novel: {{ r.haiku_verdict.novel }}</span>
-            </div>
-            <div class="stage-d-verdict-reason">{{ r.haiku_verdict.reason }}</div>
-          </div>
-        </div>
+        {% endif %}
 
         <div class="stage-d-row-actions">
           {% for v in valid_labels %}

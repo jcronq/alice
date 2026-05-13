@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import pathlib
 import sys
@@ -27,7 +28,15 @@ from typing import Any, Iterable
 
 ATTEMPTS_FILENAME = "stage-d-attempts.jsonl"
 LABELS_FILENAME = "stage-d-labels.jsonl"
+PAIRS_FILENAME_GLOB = "stage-d-pairs-*.jsonl"
 FIXTURE_ID_PREFIX = "att-fixture-"
+# Outcome used for synthesised "attempts" that came from a pairs-log
+# entry whose ``synthesis`` field was ``null`` — the wake decided not to
+# ship a synthesis for the pair (a valid Stage D outcome, see
+# ``prompts/sleep-d.md``). Kept distinct from ``dropped_agreement_reject``
+# so the surface can render the right label.
+PAIR_NULL_OUTCOME = "null_result"
+PAIR_ID_PREFIX = "pair-"
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +56,18 @@ def attempts_path(mind_dir: pathlib.Path) -> pathlib.Path:
 
 def labels_path(mind_dir: pathlib.Path) -> pathlib.Path:
     return state_dir(mind_dir) / LABELS_FILENAME
+
+
+def pairs_log_paths(mind_dir: pathlib.Path) -> list[pathlib.Path]:
+    """Per-night Stage D pairs logs: every
+    ``inner/state/stage-d-pairs-YYYY-MM-DD.jsonl`` in date order.
+
+    The wake prompt (``alice_thinking/prompts/sleep-d.md``) appends one
+    line per synthesis attempt — these are the operational logs the
+    viewer reads; the firehose ``stage-d-attempts.jsonl`` is only
+    written by the unused Python-side dual-judge pipeline.
+    """
+    return sorted(state_dir(mind_dir).glob(PAIRS_FILENAME_GLOB))
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +99,57 @@ def read_attempts(mind_dir: pathlib.Path) -> list[dict[str, Any]]:
 
 def read_labels(mind_dir: pathlib.Path) -> list[dict[str, Any]]:
     return _read_jsonl(labels_path(mind_dir))
+
+
+def read_pairs(mind_dir: pathlib.Path) -> list[dict[str, Any]]:
+    """Read every per-night pairs log into a flat list (file order).
+
+    Each line is the wake-prompt schema
+    ``{"ts", "note_a", "note_b", "synthesis"}`` — distinct from the
+    rich dual-judge ``stage-d-attempts.jsonl`` schema.
+    """
+    out: list[dict[str, Any]] = []
+    for path in pairs_log_paths(mind_dir):
+        out.extend(_read_jsonl(path))
+    return out
+
+
+def _pair_record_id(ts: str, note_a: str, note_b: str) -> str:
+    """Stable id for a pair-log entry so labels survive log re-reads.
+
+    SHA1 of ``ts|note_a|note_b`` — deterministic, fixed length, and
+    distinct from real ``att-…`` attempt ids so they can coexist with
+    the firehose log if it ever fills up.
+    """
+    key = f"{ts}|{note_a}|{note_b}".encode("utf-8")
+    return f"{PAIR_ID_PREFIX}{hashlib.sha1(key).hexdigest()[:24]}"
+
+
+def pair_to_attempt(pair: dict[str, Any]) -> dict[str, Any]:
+    """Map a pairs-log line into the attempt-record shape the template
+    + filter/summary helpers already understand.
+
+    Synthesis is ``null`` for a null-result wake — the pair was tried
+    but no synthesis shipped. We surface that as ``outcome=null_result``
+    so the rows partial can render a distinct label.
+    """
+    ts = str(pair.get("ts") or "")
+    note_a = str(pair.get("note_a") or "")
+    note_b = str(pair.get("note_b") or "")
+    synthesis_slug = pair.get("synthesis")
+    shipped = bool(synthesis_slug)
+    return {
+        "id": _pair_record_id(ts, note_a, note_b),
+        "pair": {"slug_a": note_a, "slug_b": note_b},
+        "synthesis_text": "",
+        "draft_attempt_n": 1,
+        "qwen_verdict": None,
+        "haiku_verdict": None,
+        "outcome": "shipped" if shipped else PAIR_NULL_OUTCOME,
+        "retry_history": [],
+        "created_at": ts,
+        "shipped_slug": f"research/{synthesis_slug}" if shipped else None,
+    }
 
 
 def latest_label_by_attempt(
@@ -118,12 +190,34 @@ def join_attempts_with_labels(
     return out
 
 
+def load_review_rows(mind_dir: pathlib.Path) -> list[dict[str, Any]]:
+    """Return joined attempt-shaped records from every available source.
+
+    Combines the dual-judge firehose ``stage-d-attempts.jsonl`` (if
+    present) with the per-night pairs logs (the wake prompt's actual
+    operational log). Pair-derived rows are synthesised into the same
+    shape as firehose attempts so filter/sort/summary helpers and the
+    rows template render both without branching.
+    """
+    attempts = read_attempts(mind_dir)
+    pair_rows = [pair_to_attempt(p) for p in read_pairs(mind_dir)]
+    labels = read_labels(mind_dir)
+    return join_attempts_with_labels(attempts + pair_rows, labels)
+
+
 # ---------------------------------------------------------------------------
 # Filter / sort / summarize
 
 
-# Outcomes considered "drop" for filtering purposes.
-DROP_OUTCOMES = {"dropped_agreement_reject", "dropped_disagreement_exhausted"}
+# Outcomes considered "drop" for filtering purposes. ``null_result``
+# comes from a pairs-log entry whose ``synthesis`` field was ``null`` —
+# the pair was tried but produced no synthesis, which is operationally a
+# drop from the surface's perspective.
+DROP_OUTCOMES = {
+    "dropped_agreement_reject",
+    "dropped_disagreement_exhausted",
+    PAIR_NULL_OUTCOME,
+}
 
 
 def is_disagreement(att: dict[str, Any]) -> bool:

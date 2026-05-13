@@ -1486,9 +1486,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
 
     def _stage_d_load_joined() -> list[dict[str, Any]]:
         p: Paths = app.state.paths
-        attempts = stage_d_store.read_attempts(p.mind_dir)
-        labels = stage_d_store.read_labels(p.mind_dir)
-        return stage_d_store.join_attempts_with_labels(attempts, labels)
+        return stage_d_store.load_review_rows(p.mind_dir)
 
     @app.get("/stage-d-review", response_class=HTMLResponse)
     async def stage_d_review(
