@@ -509,6 +509,17 @@ class DispatcherState:
     design/revise loop; the entry is cleared on a successful
     ``design-approved`` transition (so a future re-entry into the
     design lane starts fresh).
+
+    ``rebase_attempted`` (issue #173) is the FIFO list of issue numbers
+    we've already fired a Tier 2 rebase spawn for at ``sm:reviewing``.
+    Used to detect "spawned worker died without resolving the conflict"
+    on a follow-up cycle: if the entry is set, no live spawn dir
+    exists, and the PR is still CONFLICTING, escalate to Tier 3.
+
+    ``rebase_escalated_posted`` (issue #173) is the FIFO list of issue
+    numbers where the Tier 3 escalation comment has already been
+    posted. Without this dedup the dispatcher would re-escalate on
+    every cadence while the operator is still triaging.
     """
 
     version: int = STATE_VERSION
@@ -516,6 +527,8 @@ class DispatcherState:
     verify_failed_posted: list[int] = field(default_factory=list)
     needs_study_hinted: list[int] = field(default_factory=list)
     design_revisions: dict[int, int] = field(default_factory=dict)
+    rebase_attempted: list[int] = field(default_factory=list)
+    rebase_escalated_posted: list[int] = field(default_factory=list)
 
     def has_hello(self, number: int) -> bool:
         return number in self.hello_commented
@@ -574,6 +587,37 @@ class DispatcherState:
     def clear_design_revisions(self, number: int) -> None:
         self.design_revisions.pop(number, None)
 
+    def has_rebase_attempted(self, number: int) -> bool:
+        return number in self.rebase_attempted
+
+    def mark_rebase_attempted(self, number: int) -> None:
+        if number in self.rebase_attempted:
+            return
+        self.rebase_attempted.append(number)
+        if len(self.rebase_attempted) > SEEN_ISSUE_CAP:
+            overflow = len(self.rebase_attempted) - SEEN_ISSUE_CAP
+            del self.rebase_attempted[:overflow]
+
+    def clear_rebase_attempted(self, number: int) -> None:
+        # Cleared on a successful Tier 1 rebase OR when the issue leaves
+        # sm:reviewing — the conflict episode is closed and a future
+        # re-entry should start fresh.
+        try:
+            self.rebase_attempted.remove(number)
+        except ValueError:
+            pass
+
+    def has_rebase_escalated(self, number: int) -> bool:
+        return number in self.rebase_escalated_posted
+
+    def mark_rebase_escalated(self, number: int) -> None:
+        if number in self.rebase_escalated_posted:
+            return
+        self.rebase_escalated_posted.append(number)
+        if len(self.rebase_escalated_posted) > SEEN_ISSUE_CAP:
+            overflow = len(self.rebase_escalated_posted) - SEEN_ISSUE_CAP
+            del self.rebase_escalated_posted[:overflow]
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": self.version,
@@ -582,6 +626,8 @@ class DispatcherState:
             "needs_study_hinted": list(self.needs_study_hinted),
             # Keys are stringified for JSON-stability; load_state coerces back.
             "design_revisions": {str(k): v for k, v in self.design_revisions.items()},
+            "rebase_attempted": list(self.rebase_attempted),
+            "rebase_escalated_posted": list(self.rebase_escalated_posted),
         }
 
 
@@ -624,12 +670,21 @@ def load_state(state_path: pathlib.Path) -> DispatcherState:
                 design_revisions[int(k)] = int(v)
             except (TypeError, ValueError):
                 continue
+    # ``rebase_attempted`` / ``rebase_escalated_posted`` were added in
+    # #173. Forward-compat default-to-empty so the dispatcher keeps
+    # working across the upgrade without a manual reset.
+    raw_ra = data.get("rebase_attempted") or []
+    ra_numbers: list[int] = [int(n) for n in raw_ra if isinstance(n, int)]
+    raw_re = data.get("rebase_escalated_posted") or []
+    re_numbers: list[int] = [int(n) for n in raw_re if isinstance(n, int)]
     return DispatcherState(
         version=STATE_VERSION,
         hello_commented=numbers,
         verify_failed_posted=vf_numbers,
         needs_study_hinted=ns_numbers,
         design_revisions=design_revisions,
+        rebase_attempted=ra_numbers,
+        rebase_escalated_posted=re_numbers,
     )
 
 
@@ -644,6 +699,12 @@ def save_state(state_path: pathlib.Path, state: DispatcherState) -> None:
     if len(state.needs_study_hinted) > SEEN_ISSUE_CAP:
         overflow = len(state.needs_study_hinted) - SEEN_ISSUE_CAP
         del state.needs_study_hinted[:overflow]
+    if len(state.rebase_attempted) > SEEN_ISSUE_CAP:
+        overflow = len(state.rebase_attempted) - SEEN_ISSUE_CAP
+        del state.rebase_attempted[:overflow]
+    if len(state.rebase_escalated_posted) > SEEN_ISSUE_CAP:
+        overflow = len(state.rebase_escalated_posted) - SEEN_ISSUE_CAP
+        del state.rebase_escalated_posted[:overflow]
     state_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(
         dir=state_path.parent, prefix=".sm-dispatcher-", suffix=".json"
@@ -1086,6 +1147,46 @@ def gh_get_pr_merge_status(
     }
 
 
+def gh_get_pr_mergeable(
+    repo: str, pr_number: int, *, gh_bin: str = "gh"
+) -> dict[str, Any]:
+    """Return ``{mergeable, head_ref_name, head_ref_oid}`` for an open PR.
+
+    Issue #173 — the dispatcher uses this at ``sm:reviewing`` when the
+    PR is still open to decide whether to attempt an auto-rebase.
+
+    ``mergeable`` is one of:
+      * ``"MERGEABLE"`` — clean merge possible
+      * ``"CONFLICTING"`` — needs rebase / manual resolution
+      * ``"UNKNOWN"``    — GitHub is still computing
+      * ``None``         — gh returned no payload (treat as UNKNOWN)
+    """
+    args = [
+        gh_bin,
+        "pr",
+        "view",
+        str(pr_number),
+        "--repo",
+        repo,
+        "--json",
+        "mergeable,headRefName,headRefOid",
+    ]
+    stdout = _run_gh(args)
+    empty = {"mergeable": None, "head_ref_name": None, "head_ref_oid": None}
+    if not stdout.strip():
+        return empty
+    payload = json.loads(stdout)
+    if not isinstance(payload, dict):
+        return empty
+    head_ref = payload.get("headRefName")
+    head_oid = payload.get("headRefOid")
+    return {
+        "mergeable": payload.get("mergeable"),
+        "head_ref_name": head_ref if isinstance(head_ref, str) and head_ref else None,
+        "head_ref_oid": head_oid if isinstance(head_oid, str) and head_oid else None,
+    }
+
+
 def gh_get_master_ci_status(
     repo: str, commit_sha: str, *, gh_bin: str = "gh"
 ) -> dict[str, Any]:
@@ -1195,6 +1296,7 @@ EditLabelsFn = Callable[..., None]
 CloseIssueFn = Callable[[str, int], None]
 FindLinkedPRFn = Callable[[str, int], dict[str, Any] | None]
 PRMergeStatusFn = Callable[[str, int], dict[str, Any]]
+PRMergeableFn = Callable[[str, int], dict[str, Any]]
 MasterCIStatusFn = Callable[[str, str], dict[str, Any]]
 ListCommentsFn = Callable[[str, int], list[dict[str, Any]]]
 FindUnspawnedFn = Callable[[str], list[dict[str, Any]]]
@@ -1347,6 +1449,165 @@ def _post_merge_cleanup(
                     f"({delete.stderr.strip() or delete.returncode}); "
                     f"leaving branch in place"
                 )
+
+
+# ---------------------------------------------------------------------------
+# Issue #173 — Tier 1 auto-rebase on CONFLICTING PRs
+# ---------------------------------------------------------------------------
+
+
+def _attempt_auto_rebase(
+    *,
+    branch: str,
+    repo_path: pathlib.Path,
+    base_branch: str = BASE_BRANCH,
+    run_git: GitRunFn = _run_git,
+    log: Callable[[str], None],
+    issue_number: int | None = None,
+) -> dict[str, Any]:
+    """Try to rebase ``branch`` onto ``origin/<base_branch>`` and force-push.
+
+    Issue #173 Tier 1. Returns ``{ok, reason}``:
+      * ``ok=True`` — the rebase produced no conflicts AND the
+        force-push (``--force-with-lease``) succeeded; ``reason`` is a
+        short human-readable description for the audit comment.
+      * ``ok=False`` — at least one step failed; ``reason`` describes
+        which step and (when known) the offending file or stderr.
+
+    Defensive choices:
+      * Refuses to act if the working tree has uncommitted changes —
+        we never want to clobber in-flight edits, even on a worker tree
+        nominally owned by this loop.
+      * Always tries ``git rebase --abort`` on failure so the tree
+        isn't left mid-rebase for the next caller (post-merge cleanup,
+        or the next dispatcher pass).
+      * Always tries to restore ``base_branch`` at the end of a
+        failed rebase so a follow-up cycle starts clean.
+
+    The function returns the verdict; the caller decides whether to
+    fire the Tier 2 spawn.
+    """
+    log_prefix = (
+        f"[SM] rebase #{issue_number}"
+        if issue_number is not None
+        else "[SM] rebase"
+    )
+
+    if not repo_path.is_dir():
+        return {
+            "ok": False,
+            "reason": f"worker repo path missing at {repo_path}",
+        }
+
+    dirty = run_git(["status", "--porcelain"], repo_path)
+    if dirty.returncode != 0:
+        return {
+            "ok": False,
+            "reason": (
+                f"git status failed: {dirty.stderr.strip()[:200] or dirty.returncode}"
+            ),
+        }
+    if dirty.stdout.strip():
+        return {
+            "ok": False,
+            "reason": "worker tree dirty; refusing to rebase",
+        }
+
+    fetch = run_git(["fetch", "origin", "--prune"], repo_path)
+    if fetch.returncode != 0:
+        return {
+            "ok": False,
+            "reason": (
+                f"git fetch failed: "
+                f"{fetch.stderr.strip()[:200] or fetch.returncode}"
+            ),
+        }
+
+    # Force-create / reset the local branch to origin/<branch> so we
+    # rebase from the published tip, not from whatever stale local
+    # state the worker tree happens to be on.
+    checkout = run_git(
+        ["checkout", "-B", branch, f"origin/{branch}"],
+        repo_path,
+    )
+    if checkout.returncode != 0:
+        # Best-effort restore to base.
+        run_git(["checkout", base_branch], repo_path)
+        return {
+            "ok": False,
+            "reason": (
+                f"git checkout origin/{branch} failed: "
+                f"{checkout.stderr.strip()[:200] or checkout.returncode}"
+            ),
+        }
+
+    rebase = run_git(["rebase", f"origin/{base_branch}"], repo_path)
+    if rebase.returncode != 0:
+        # Parse stderr/stdout for the offending file (best-effort).
+        offender = _extract_rebase_conflict_file(rebase.stdout, rebase.stderr)
+        run_git(["rebase", "--abort"], repo_path)
+        run_git(["checkout", base_branch], repo_path)
+        return {
+            "ok": False,
+            "reason": (
+                f"auto-rebase failed at {offender}"
+                if offender
+                else "auto-rebase produced conflicts"
+            ),
+        }
+
+    push = run_git(
+        ["push", "--force-with-lease", "origin", f"HEAD:{branch}"],
+        repo_path,
+    )
+    if push.returncode != 0:
+        # Push failed — leave history rebased locally but report
+        # failure. The next cycle's cleanup / re-fetch will reconcile.
+        run_git(["checkout", base_branch], repo_path)
+        return {
+            "ok": False,
+            "reason": (
+                f"git push --force-with-lease failed: "
+                f"{push.stderr.strip()[:200] or push.returncode}"
+            ),
+        }
+
+    # Restore to base so the next dispatcher pass doesn't read the
+    # feature branch. Mirrors :func:`_post_merge_cleanup` — failure is
+    # logged but non-fatal; the rebase + push already succeeded.
+    restore = run_git(["checkout", base_branch], repo_path)
+    if restore.returncode != 0:
+        log(
+            f"{log_prefix}: rebase+push ok but failed to restore "
+            f"{base_branch}: {restore.stderr.strip()[:200] or restore.returncode}"
+        )
+    log(f"{log_prefix}: rebased {branch} onto origin/{base_branch} and pushed")
+    return {
+        "ok": True,
+        "reason": f"rebased onto origin/{base_branch} and force-pushed",
+    }
+
+
+_REBASE_CONFLICT_FILE_RE = re.compile(
+    r"CONFLICT\s*\([^)]*\)\s*:\s*Merge conflict in (\S+)"
+)
+
+
+def _extract_rebase_conflict_file(stdout: str, stderr: str) -> str | None:
+    """Pull the first ``CONFLICT (...): Merge conflict in <path>`` filename.
+
+    git's rebase output writes conflict notices to either stdout or
+    stderr depending on the version / terminal. We scan both and return
+    the first match. ``None`` if no recognisable conflict line is
+    present (caller falls back to a generic reason).
+    """
+    for chunk in (stdout, stderr):
+        if not chunk:
+            continue
+        m = _REBASE_CONFLICT_FILE_RE.search(chunk)
+        if m:
+            return m.group(1)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1990,6 +2251,138 @@ def spawn_agent(
     return spawn_id
 
 
+def compose_rebase_prompt(
+    issue: dict[str, Any],
+    *,
+    branch: str,
+    reason: str,
+    base_branch: str = BASE_BRANCH,
+    repo_path: pathlib.Path = WORKER_REPO_PATH,
+) -> str:
+    """Render the prompt fed to a Tier 2 rebase worker.
+
+    Issue #173. The worker's only job is to resolve conflicts on
+    ``branch`` against ``base_branch`` and push the result; it must
+    not merge or close anything. The dispatcher picks the PR up again
+    on the next cycle once the push lands.
+    """
+    number = issue.get("number")
+    title = issue.get("title") or "(no title)"
+    return (
+        f"You are a code-worker agent. Your task: resolve merge "
+        f"conflicts on branch '{branch}' against '{base_branch}' for "
+        f"issue #{number} ({title}).\n"
+        f"\n"
+        f"Context: the dispatcher attempted an auto-rebase and it "
+        f"failed: {reason}\n"
+        f"\n"
+        f"Steps:\n"
+        f"  1. cd {repo_path}\n"
+        f"  2. git fetch origin\n"
+        f"  3. git checkout {branch}\n"
+        f"  4. git rebase origin/{base_branch}\n"
+        f"  5. Resolve conflicts using your judgment. Re-run tests "
+        f"locally if the conflict touches code semantics, not just "
+        f"adjacent line changes. Do not bypass hooks (no --no-verify).\n"
+        f"  6. git push --force-with-lease origin {branch}\n"
+        f"\n"
+        f"Do NOT close or merge the PR yourself. After your push, the "
+        f"State Machine dispatcher will pick the PR up on the next "
+        f"cycle, re-run verification, and self-merge if CI is green.\n"
+    )
+
+
+def spawn_rebase_agent(
+    issue: dict[str, Any],
+    repo: str,
+    branch: str,
+    reason: str,
+    *,
+    spawn_dir: pathlib.Path = SPAWN_DIR,
+    repo_path: pathlib.Path = WORKER_REPO_PATH,
+    base_branch: str = BASE_BRANCH,
+    claude_bin: str | None = None,
+    popen: Callable[..., Any] = subprocess.Popen,
+    log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
+    clock: Callable[[], float] = None,  # type: ignore[assignment]
+    new_session_id: Callable[[], str] = lambda: str(uuid.uuid4()),
+) -> str | None:
+    """Spawn a detached ``claude`` worker to resolve a merge conflict.
+
+    Issue #173 Tier 2 spawn. Mirrors :func:`spawn_agent` (same spawn dir
+    layout, pidfile, session JSONL) so the existing reap / liveness
+    machinery treats this spawn identically to a regular worker. The
+    only difference: the prompt is composed by
+    :func:`compose_rebase_prompt` and the SPAWN_MAP is bypassed.
+
+    Returns the ``spawn_id`` on success or ``None`` if the issue
+    payload is malformed.
+
+    Caller is responsible for posting the ``[SM] rebase-needed`` audit
+    comment — that doubles as the dedup marker on the issue and
+    persists across dispatcher passes whether or not the spawn lands.
+    """
+    if clock is None:
+        clock = time.time
+
+    number = issue.get("number")
+    if not isinstance(number, int):
+        log(
+            f"[sm-dispatcher] cannot spawn rebase on non-integer issue "
+            f"number: {number!r}"
+        )
+        return None
+
+    if claude_bin is None:
+        claude_bin = resolve_claude_bin()
+
+    spawn_id = f"spawn-{number}-{int(clock())}"
+    work_dir = spawn_dir / spawn_id
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    prompt_text = compose_rebase_prompt(
+        issue,
+        branch=branch,
+        reason=reason,
+        base_branch=base_branch,
+        repo_path=repo_path,
+    )
+    prompt_path = work_dir / "prompt.txt"
+    prompt_path.write_text(prompt_text)
+
+    session_id = new_session_id()
+    (work_dir / SESSION_ID_FILENAME).write_text(session_id)
+
+    stdout_path = work_dir / "stdout.log"
+    stderr_path = work_dir / "stderr.log"
+    pidfile_path = work_dir / "pidfile"
+
+    stdin_fh = open(prompt_path, "rb")
+    stdout_fh = open(stdout_path, "wb")
+    stderr_fh = open(stderr_path, "wb")
+    try:
+        proc = popen(
+            [claude_bin, "--print", "--session-id", session_id],
+            stdin=stdin_fh,
+            stdout=stdout_fh,
+            stderr=stderr_fh,
+            start_new_session=True,
+        )
+    finally:
+        stdin_fh.close()
+        stdout_fh.close()
+        stderr_fh.close()
+
+    pid = getattr(proc, "pid", None)
+    if pid is not None:
+        pidfile_path.write_text(str(pid))
+    log(
+        f"[sm-dispatcher] spawned rebase {spawn_id} (pid={pid}) on "
+        f"#{number} branch={branch} session_id={session_id}"
+    )
+    return spawn_id
+
+
 # ---------------------------------------------------------------------------
 # Issue #156 — per-issue thinking-agent spawn machinery
 # ---------------------------------------------------------------------------
@@ -2467,6 +2860,79 @@ def render_verify_comment(
     raise ValueError(f"unknown verify outcome: {outcome!r}")
 
 
+# Issue #173 — audit-comment prefixes for the auto-rebase handler. The
+# dispatcher posts one of these on the originating issue whenever it
+# acts on a CONFLICTING PR so the audit trail records what happened:
+#
+#   * ``[SM] rebase-pushed`` — Tier 1 succeeded, force-pushed cleanly.
+#   * ``[SM] rebase-needed`` — Tier 2 fired, a fresh worker was spawned
+#     to resolve conflicts manually.
+#   * ``[SM] rebase-escalated`` — Tier 3 fired, the spawned worker died
+#     without producing a clean push; surfaced for human triage.
+REBASE_PUSHED_PREFIX = "[SM] rebase-pushed"
+REBASE_NEEDED_PREFIX = "[SM] rebase-needed"
+REBASE_ESCALATED_PREFIX = "[SM] rebase-escalated"
+
+
+def render_rebase_pushed_audit_comment(
+    number: int,
+    branch: str,
+    *,
+    timestamp: str | None = None,
+) -> str:
+    """Produce a ``[SM] rebase-pushed ...`` payload (Tier 1 success).
+
+    Posted when the dispatcher's in-process auto-rebase succeeded —
+    the feature branch was force-pushed with the rebased history. CI
+    will re-fire on the new head; the dispatcher will pick the PR up
+    again on the next cadence.
+    """
+    ts = timestamp or _now_iso()
+    return f"{REBASE_PUSHED_PREFIX} task=#{number} branch={branch} ts={ts}"
+
+
+def render_rebase_needed_audit_comment(
+    number: int,
+    branch: str,
+    reason: str,
+    *,
+    timestamp: str | None = None,
+) -> str:
+    """Produce a ``[SM] rebase-needed ...`` payload (Tier 2 escalation).
+
+    Posted when the cheap auto-rebase failed and the dispatcher spawned
+    a fresh worker to resolve conflicts. ``reason`` is the short
+    diagnostic from the rebase attempt (e.g. ``"git rebase produced
+    conflicts"``).
+    """
+    ts = timestamp or _now_iso()
+    return (
+        f"{REBASE_NEEDED_PREFIX} task=#{number} branch={branch} "
+        f'reason="{reason}" ts={ts}'
+    )
+
+
+def render_rebase_escalation_comment(
+    number: int,
+    branch: str,
+    reason: str,
+    *,
+    timestamp: str | None = None,
+) -> str:
+    """Produce a ``[SM] rebase-escalated ...`` payload (Tier 3 surface).
+
+    Posted when the spawned rebase worker has died and the PR is still
+    CONFLICTING — the dispatcher gives up and tags the issue for human
+    triage. Dedup'd by :class:`DispatcherState.rebase_escalated_posted`
+    so it fires at most once per CONFLICTING episode.
+    """
+    ts = timestamp or _now_iso()
+    return (
+        f"{REBASE_ESCALATED_PREFIX} task=#{number} branch={branch} "
+        f'reason="{reason}" ts={ts}'
+    )
+
+
 def _http_get_body(
     url: str,
     *,
@@ -2638,6 +3104,17 @@ class RunReport:
     # pass. Tracked separately so the operator can tell at a glance
     # whether the thinking-agent has been handed fresh work.
     hinted: int = 0
+    # Issue #173 — auto-rebase outcome counters for the
+    # ``sm:reviewing`` × CONFLICTING handler. ``rebase_pushed`` covers
+    # Tier 1 (cheap in-process rebase pushed to origin),
+    # ``rebase_spawned`` covers Tier 2 (rebase failed → fresh worker
+    # spawned), ``rebase_escalated`` covers Tier 3 (spawn also dead,
+    # PR still conflicting → surfaced to Jason).
+    rebase_pushed: int = 0
+    rebase_spawned: int = 0
+    rebase_escalated: int = 0
+    # (issue_number, tier, reason) for the done-line / tests.
+    rebase_records: list[tuple[int, str, str]] = field(default_factory=list)
 
 
 def _process_selected(
@@ -2898,8 +3375,12 @@ def _process_reviewing(
     pr_files: PRFilesFn | None,
     verify_pr: VerifyFn | None,
     post_merge_cleanup: PostMergeCleanupFn | None,
-    dry_run: bool,
-    log: Callable[[str], None],
+    pr_mergeable: "PRMergeableFn | None" = None,
+    attempt_rebase: "Callable[[str], dict[str, Any]] | None" = None,
+    spawn_rebase: "Callable[[dict[str, Any], str, str, str], str | None] | None" = None,
+    has_live_spawn: "Callable[[int], bool] | None" = None,
+    dry_run: bool = False,
+    log: Callable[[str], None] = lambda s: None,
     now_iso: Callable[[], str] = _now_iso,
 ) -> None:
     """T2 (reviewing → done) and T3 (reviewing → building) for one issue.
@@ -2915,6 +3396,14 @@ def _process_reviewing(
     called with the linked PR number + its changed-file list (obtained
     via ``pr_files``); the verdict's ``outcome`` decides whether to
     proceed, skip-with-audit, or halt at ``sm:reviewing``.
+
+    ``pr_mergeable`` / ``attempt_rebase`` / ``spawn_rebase`` /
+    ``has_live_spawn`` (Issue #173) drive the auto-rebase handler on
+    unmerged PRs at sm:reviewing. If the PR comes back ``CONFLICTING``,
+    the dispatcher fires the three-tier rebase recovery (in-process
+    rebase → fresh worker → escalation comment). All four arguments
+    default to ``None`` — when any is unset the conflict handler is
+    a no-op and the issue stays at sm:reviewing (pre-#173 behavior).
     """
     number = issue["number"]
     try:
@@ -2944,7 +3433,25 @@ def _process_reviewing(
         return
 
     if not merge_info.get("merged"):
-        # PR still open — stay at reviewing.
+        # PR still open — check whether it's stuck on a merge conflict
+        # and drive the Tier 1/2/3 auto-rebase handler. When the helper
+        # callables aren't wired (e.g. tests that don't care about
+        # conflicts), this stays a no-op.
+        _handle_conflicting_pr(
+            issue=issue,
+            repo=repo,
+            pr_number=pr_number,
+            state=state,
+            report=report,
+            post_comment=post_comment,
+            pr_mergeable=pr_mergeable,
+            attempt_rebase=attempt_rebase,
+            spawn_rebase=spawn_rebase,
+            has_live_spawn=has_live_spawn,
+            dry_run=dry_run,
+            log=log,
+            now_iso=now_iso,
+        )
         return
 
     sha = merge_info.get("merge_commit_oid")
@@ -3119,6 +3626,11 @@ def _process_reviewing(
             return
         report.transitioned += 1
         report.transitions.append((number, REVIEWING_SM_LABEL, DONE_SM_LABEL))
+        # Issue #173: a successful done transition closes any prior
+        # CONFLICTING episode for this issue. Clear the dedup ledger so a
+        # future re-entry into sm:reviewing (unlikely, but the state file
+        # is long-lived) can fire Tier 1/2/3 again from scratch.
+        state.clear_rebase_attempted(number)
         log(f"[sm-dispatcher] transitioned #{number}: reviewing → done (closed)")
         # Issue #127 — restore the worker's working tree to master so the
         # next cycle doesn't read dispatcher.py from this departing
@@ -3165,10 +3677,223 @@ def _process_reviewing(
         # for the green build that just regressed. Clear so when CI
         # eventually re-greens we don't suppress a fresh failure.
         state.clear_verify_failed(number)
+        # Issue #173: a CI-red transition also closes the CONFLICTING
+        # episode — the work moves back to sm:building and a fresh PR
+        # may eventually open. Clear the ledger entry so the next
+        # CONFLICTING incident starts fresh.
+        state.clear_rebase_attempted(number)
         report.transitioned += 1
         report.transitions.append((number, REVIEWING_SM_LABEL, BUILDING_SM_LABEL))
         log(f"[sm-dispatcher] transitioned #{number}: reviewing → building (CI red)")
         return
+
+
+def _handle_conflicting_pr(
+    *,
+    issue: dict[str, Any],
+    repo: str,
+    pr_number: int,
+    state: DispatcherState,
+    report: RunReport,
+    post_comment: PostCommentFn,
+    pr_mergeable: "PRMergeableFn | None",
+    attempt_rebase: "Callable[[str], dict[str, Any]] | None",
+    spawn_rebase: "Callable[[dict[str, Any], str, str, str], str | None] | None",
+    has_live_spawn: "Callable[[int], bool] | None",
+    dry_run: bool,
+    log: Callable[[str], None],
+    now_iso: Callable[[], str] = _now_iso,
+) -> None:
+    """Issue #173 — Tier 1/2/3 auto-rebase handler for a CONFLICTING PR.
+
+    Called from :func:`_process_reviewing` when the linked PR is still
+    open. Looks up the GitHub-computed ``mergeable`` state and, if it
+    is ``CONFLICTING``, runs the recovery ladder:
+
+      * **Tier 1 (cheap)** — fire :func:`attempt_rebase`. On success
+        post ``[SM] rebase-pushed`` and return; CI will re-fire on the
+        new head and the dispatcher picks the PR up next cycle.
+      * **Tier 2 (escalation)** — on rebase failure, post
+        ``[SM] rebase-needed`` (with the offending file / stderr in the
+        reason) AND spawn a fresh worker via :func:`spawn_rebase` to
+        resolve conflicts manually. Marks the issue in
+        ``state.rebase_attempted`` so a follow-up cycle can detect
+        "the spawn died but the PR is still conflicting".
+      * **Tier 3 (give up)** — if a prior Tier 2 spawn is dead (no live
+        spawn dir) AND the PR is still CONFLICTING, post a
+        ``[SM] rebase-escalated`` audit comment exactly once and stop
+        retrying. Dedup'd by ``state.rebase_escalated_posted``.
+
+    ``MERGEABLE`` and ``UNKNOWN`` results are no-ops — the existing
+    worker self-merge path drives MERGEABLE, and UNKNOWN means GitHub
+    is still computing so we wait. Any wiring callable left as ``None``
+    short-circuits the handler (test/dry-run escape hatch).
+    """
+    number = issue["number"]
+    if pr_mergeable is None or attempt_rebase is None or spawn_rebase is None:
+        # Conflict handler isn't wired this run — silent no-op.
+        return
+
+    try:
+        info = pr_mergeable(repo, pr_number)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] failed mergeable lookup for PR #{pr_number}: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+
+    mergeable = info.get("mergeable")
+    if mergeable != "CONFLICTING":
+        # MERGEABLE → wait for the worker's self-merge.
+        # UNKNOWN → GH still computing, retry next cycle.
+        # Anything else (None/odd) → treat as UNKNOWN.
+        if mergeable in (None, "UNKNOWN"):
+            log(
+                f"[sm-dispatcher] #{number} PR #{pr_number} mergeable={mergeable!r} "
+                f"— retry next cycle"
+            )
+        return
+
+    branch = info.get("head_ref_name")
+    if not branch:
+        # Can't act without a branch name. Log and wait.
+        log(
+            f"[sm-dispatcher] #{number} PR #{pr_number} CONFLICTING but no "
+            f"head_ref_name in gh payload — staying"
+        )
+        return
+
+    # Already escalated to Tier 3 — stay silent until the operator
+    # intervenes (either rebases manually, closes the PR, or flips the
+    # state ledger entry by transitioning out of sm:reviewing).
+    if state.has_rebase_escalated(number):
+        log(
+            f"[sm-dispatcher] #{number} CONFLICTING + already escalated — staying"
+        )
+        return
+
+    # Tier 2 spawn already in flight — give it room to work.
+    if has_live_spawn is not None and has_live_spawn(number):
+        log(
+            f"[sm-dispatcher] #{number} CONFLICTING — rebase spawn in flight, waiting"
+        )
+        return
+
+    # Prior Tier 2 spawn is dead but the PR is still CONFLICTING → Tier 3.
+    if state.has_rebase_attempted(number):
+        reason = "spawned rebase worker dead but PR still CONFLICTING"
+        body = render_rebase_escalation_comment(
+            number, branch, reason, timestamp=now_iso()
+        )
+        if dry_run:
+            log(
+                f"[sm-dispatcher] DRY-RUN would escalate rebase on "
+                f"#{number} (branch={branch})"
+            )
+            report.rebase_escalated += 1
+            report.rebase_records.append((number, "tier3-escalation", reason))
+            return
+        try:
+            post_comment(repo, number, body)
+        except GHCommandError as exc:
+            log(
+                f"[sm-dispatcher] failed to post rebase escalation on "
+                f"#{number}: {exc}"
+            )
+            if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+                raise
+            return
+        state.mark_rebase_escalated(number)
+        report.rebase_escalated += 1
+        report.rebase_records.append((number, "tier3-escalation", reason))
+        log(
+            f"[sm-dispatcher] #{number} rebase escalation surfaced (Tier 3, "
+            f"branch={branch})"
+        )
+        return
+
+    # Tier 1 — cheap in-process rebase attempt.
+    if dry_run:
+        log(
+            f"[sm-dispatcher] DRY-RUN would attempt rebase on "
+            f"#{number} (branch={branch})"
+        )
+        return
+
+    result = attempt_rebase(branch)
+    if result.get("ok"):
+        report.rebase_pushed += 1
+        reason = result.get("reason") or "rebased and pushed"
+        report.rebase_records.append((number, "tier1-pushed", reason))
+        body = render_rebase_pushed_audit_comment(
+            number, branch, timestamp=now_iso()
+        )
+        try:
+            post_comment(repo, number, body)
+        except GHCommandError as exc:
+            log(
+                f"[sm-dispatcher] rebase pushed on #{number} but audit "
+                f"comment failed: {exc}"
+            )
+            if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+                raise
+            # Non-fatal: the push already happened.
+        log(
+            f"[sm-dispatcher] #{number} auto-rebased and pushed branch={branch}"
+        )
+        return
+
+    # Tier 2 — rebase failed. Post audit + spawn worker.
+    reason = result.get("reason") or "auto-rebase failed"
+    audit_body = render_rebase_needed_audit_comment(
+        number, branch, reason, timestamp=now_iso()
+    )
+    try:
+        post_comment(repo, number, audit_body)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] failed to post rebase-needed audit on "
+            f"#{number}: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+
+    try:
+        spawn_id = spawn_rebase(issue, repo, branch, reason)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] failed to launch rebase spawn for "
+            f"#{number}: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+    except OSError as exc:
+        # Popen / filesystem errors: log + continue; the audit comment
+        # was already posted so the cadence trail records the attempt.
+        log(
+            f"[sm-dispatcher] rebase spawn launch raised OSError on "
+            f"#{number}: {exc}"
+        )
+        return
+
+    if spawn_id is None:
+        log(
+            f"[sm-dispatcher] rebase spawn returned None for #{number} — "
+            f"will retry next cycle"
+        )
+        return
+
+    state.mark_rebase_attempted(number)
+    report.rebase_spawned += 1
+    report.rebase_records.append((number, "tier2-spawn", reason))
+    log(
+        f"[sm-dispatcher] #{number} rebase spawn launched ({spawn_id}, "
+        f"branch={branch})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4391,11 +5116,15 @@ def run(
     close_issue: CloseIssueFn = gh_close_issue,
     find_linked_pr: FindLinkedPRFn = gh_find_linked_pr,
     pr_merge_status: PRMergeStatusFn = gh_get_pr_merge_status,
+    pr_mergeable: PRMergeableFn | None = None,
     master_ci_status: MasterCIStatusFn = gh_get_master_ci_status,
     has_live_spawn: Callable[[int], bool] | None = None,
     live_spawn_dir: Callable[[int], pathlib.Path | None] | None = None,
     count_running: Callable[[], int] | None = None,
     spawn: Callable[[dict[str, Any], str, str], str | None] | None = None,
+    spawn_rebase: Callable[[dict[str, Any], str, str, str], str | None] | None = None,
+    attempt_rebase: Callable[[str], dict[str, Any]] | None = None,
+    enable_rebase: bool = True,
     get_issue: Callable[[int], dict[str, Any] | None] | None = None,
     proactive_reap: Callable[[], tuple[int, int]] | None = None,
     enable_spawn: bool = True,
@@ -4491,6 +5220,41 @@ def run(
         # whole gate" to ``_process_reviewing``.
         verify_pr = None
 
+    # Issue #173 — bind the production auto-rebase callables. The
+    # ``enable_rebase=False`` flag and the absence of an injected
+    # ``spawn_rebase`` (with ``enable_spawn=False``) both leave the
+    # CONFLICTING handler a silent no-op, matching the existing test
+    # escape-hatch shape for ``_process_reviewing``.
+    if enable_rebase and not dry_run:
+        if pr_mergeable is None:
+            pr_mergeable = gh_get_pr_mergeable
+        if attempt_rebase is None:
+            def attempt_rebase(branch: str) -> dict[str, Any]:
+                return _attempt_auto_rebase(
+                    branch=branch,
+                    repo_path=worker_repo_path,
+                    log=log,
+                )
+        if enable_spawn and spawn_rebase is None:
+            def spawn_rebase(
+                issue: dict[str, Any],
+                repo: str,
+                branch: str,
+                reason: str,
+            ) -> str | None:
+                return spawn_rebase_agent(
+                    issue,
+                    repo,
+                    branch,
+                    reason,
+                    log=log,
+                )
+    else:
+        # Disabled: leave all three None so _handle_conflicting_pr no-ops.
+        pr_mergeable = None
+        attempt_rebase = None
+        spawn_rebase = None
+
     report = RunReport()
 
     # Issue #142 — proactive sweep of stale ``active/`` spawn dirs.
@@ -4576,6 +5340,10 @@ def run(
                     pr_files=pr_files,
                     verify_pr=verify_pr,
                     post_merge_cleanup=post_merge_cleanup,
+                    pr_mergeable=pr_mergeable,
+                    attempt_rebase=attempt_rebase,
+                    spawn_rebase=spawn_rebase,
+                    has_live_spawn=has_live_spawn,
                     dry_run=dry_run,
                     log=log,
                     now_iso=now_iso,
@@ -4749,6 +5517,9 @@ def run(
         f"verify_pass={report.verify_pass} "
         f"verify_skip={report.verify_skip} "
         f"verify_failed={report.verify_failed} "
+        f"rebase_pushed={report.rebase_pushed} "
+        f"rebase_spawned={report.rebase_spawned} "
+        f"rebase_escalated={report.rebase_escalated} "
         f"skipped_dedup={report.skipped_dedup} "
         f"skipped_trust={report.skipped_trust}"
     )

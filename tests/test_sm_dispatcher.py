@@ -42,6 +42,29 @@ def _stub_gh_list_issue_comments(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sm, "gh_list_issue_comments", lambda _repo, _n: [])
 
 
+@pytest.fixture(autouse=True)
+def _stub_gh_get_pr_mergeable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default the issue #173 mergeable fetcher to ``UNKNOWN``.
+
+    ``_handle_conflicting_pr`` only fires when the PR is open at
+    sm:reviewing. Existing tests that stub the PR as unmerged would
+    otherwise drop into the live ``gh pr view --json mergeable``
+    invocation. Defaulting to UNKNOWN means "GH is still computing" —
+    the handler short-circuits without changing observable behaviour
+    in pre-#173 tests. Tests that exercise the conflict ladder
+    explicitly inject their own ``pr_mergeable`` and override this.
+    """
+    monkeypatch.setattr(
+        sm,
+        "gh_get_pr_mergeable",
+        lambda _repo, _n: {
+            "mergeable": "UNKNOWN",
+            "head_ref_name": None,
+            "head_ref_oid": None,
+        },
+    )
+
+
 @pytest.fixture
 def state_path(tmp_path: pathlib.Path) -> pathlib.Path:
     return tmp_path / "sm-dispatcher-state.json"
@@ -111,6 +134,8 @@ def test_empty_poll_writes_empty_state(state_path: pathlib.Path) -> None:
         "verify_failed_posted": [],
         "needs_study_hinted": [],
         "design_revisions": {},
+        "rebase_attempted": [],
+        "rebase_escalated_posted": [],
     }
 
 
@@ -5576,3 +5601,698 @@ def test_thinking_shim_main_exits_nonzero_when_prompt_missing(tmp_path) -> None:
         ]
     )
     assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #173 — auto-rebase on CONFLICTING PRs at sm:reviewing
+# ---------------------------------------------------------------------------
+
+
+def _rebase_fixtures():
+    """Bundle the common rebase test setup."""
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+
+    def find_pr(_repo: str, n: int) -> dict | None:
+        return {
+            "number": 500 + n,
+            "url": f"https://github.com/jcronq/alice/pull/{500 + n}",
+            "state": "OPEN",
+        }
+
+    def merge_status(_repo: str, _pr: int) -> dict:
+        return {
+            "merged": False,
+            "merge_commit_oid": None,
+            "pr_url": None,
+            "head_ref_name": None,
+        }
+
+    return recorder, label_rec, close_rec, find_pr, merge_status
+
+
+def test_reviewing_pr_mergeable_clean_does_not_rebase(
+    state_path: pathlib.Path,
+) -> None:
+    """MERGEABLE + open PR → existing path (no rebase, no spawn).
+
+    The dispatcher only acts on CONFLICTING; MERGEABLE means the
+    worker's self-merge is expected to land, and dispatcher should
+    keep its hands off.
+    """
+    recorder, label_rec, close_rec, find_pr, merge_status = _rebase_fixtures()
+    issues = [_make_issue(170, sm_labels=("sm:reviewing",))]
+
+    mergeable_calls: list[tuple[str, int]] = []
+
+    def pr_mergeable(repo: str, pr_number: int) -> dict:
+        mergeable_calls.append((repo, pr_number))
+        return {
+            "mergeable": "MERGEABLE",
+            "head_ref_name": "feat/work-170",
+            "head_ref_oid": "abc123",
+        }
+
+    def attempt_rebase(_branch: str) -> dict:
+        raise AssertionError("rebase must not fire on MERGEABLE")
+
+    def spawn_rebase(*_args, **_kw) -> str | None:
+        raise AssertionError("spawn must not fire on MERGEABLE")
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=_no_call,
+        pr_mergeable=pr_mergeable,
+        attempt_rebase=attempt_rebase,
+        spawn_rebase=spawn_rebase,
+        has_live_spawn=lambda _n: False,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert mergeable_calls == [("jcronq/alice", 670)]
+    assert recorder.posted == []
+    assert label_rec.calls == []
+    assert close_rec.closed == []
+    assert report.rebase_pushed == 0
+    assert report.rebase_spawned == 0
+    assert report.rebase_escalated == 0
+
+
+def test_reviewing_pr_unknown_mergeable_waits(
+    state_path: pathlib.Path,
+) -> None:
+    """UNKNOWN mergeable → no action (GH still computing); retry next cycle."""
+    recorder, label_rec, _, find_pr, merge_status = _rebase_fixtures()
+    issues = [_make_issue(171, sm_labels=("sm:reviewing",))]
+    logged: list[str] = []
+
+    def pr_mergeable(_repo: str, _pr: int) -> dict:
+        return {
+            "mergeable": "UNKNOWN",
+            "head_ref_name": "feat/work-171",
+            "head_ref_oid": "deadbeef",
+        }
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=CloseRecorder(),
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=_no_call,
+        pr_mergeable=pr_mergeable,
+        attempt_rebase=lambda _b: (_ for _ in ()).throw(
+            AssertionError("rebase must not fire on UNKNOWN")
+        ),
+        spawn_rebase=lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("spawn must not fire on UNKNOWN")
+        ),
+        has_live_spawn=lambda _n: False,
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert recorder.posted == []
+    assert report.rebase_pushed == 0
+    assert report.rebase_spawned == 0
+    assert report.rebase_escalated == 0
+    # The skip-log line should mention UNKNOWN so the operator can grep.
+    assert any("mergeable='UNKNOWN'" in m for m in logged)
+
+
+def test_reviewing_pr_conflicting_tier1_rebase_pushes(
+    state_path: pathlib.Path,
+) -> None:
+    """CONFLICTING + successful rebase → push happens, no spawn, audit
+    comment posted.
+
+    Mirrors the issue spec: ``Stub gh-pr-view to return CONFLICTING +
+    a successful subprocess rebase → assert push happens, no spawn
+    fires.``
+    """
+    recorder, label_rec, close_rec, find_pr, merge_status = _rebase_fixtures()
+    issues = [_make_issue(172, sm_labels=("sm:reviewing",))]
+    rebase_calls: list[str] = []
+
+    def pr_mergeable(_repo: str, _pr: int) -> dict:
+        return {
+            "mergeable": "CONFLICTING",
+            "head_ref_name": "feat/work-172",
+            "head_ref_oid": "feedface",
+        }
+
+    def attempt_rebase(branch: str) -> dict:
+        rebase_calls.append(branch)
+        return {
+            "ok": True,
+            "reason": "rebased onto origin/master and force-pushed",
+        }
+
+    def spawn_rebase(*_args, **_kw) -> str | None:
+        raise AssertionError("spawn must not fire when Tier 1 succeeds")
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=_no_call,
+        pr_mergeable=pr_mergeable,
+        attempt_rebase=attempt_rebase,
+        spawn_rebase=spawn_rebase,
+        has_live_spawn=lambda _n: False,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # Rebase ran exactly once on the PR's branch.
+    assert rebase_calls == ["feat/work-172"]
+    # An audit comment was posted.
+    bodies = [body for _r, _n, body in recorder.posted]
+    assert len(bodies) == 1
+    assert bodies[0].startswith(sm.REBASE_PUSHED_PREFIX)
+    assert "branch=feat/work-172" in bodies[0]
+    # No label/close churn — the issue stays at sm:reviewing for the
+    # next cycle to pick up after CI re-runs.
+    assert label_rec.calls == []
+    assert close_rec.closed == []
+    assert report.rebase_pushed == 1
+    assert report.rebase_spawned == 0
+    assert report.rebase_escalated == 0
+    assert (
+        172,
+        "tier1-pushed",
+        "rebased onto origin/master and force-pushed",
+    ) in report.rebase_records
+    # State ledger: not marked attempted (Tier 1 path doesn't dedup).
+    state_data = json.loads(state_path.read_text())
+    assert 172 not in state_data["rebase_attempted"]
+
+
+def test_reviewing_pr_conflicting_tier2_spawns_on_rebase_failure(
+    state_path: pathlib.Path,
+) -> None:
+    """CONFLICTING + rebase fails → spawn fires + ``[SM] rebase-needed``
+    audit comment posted + state marks attempted.
+
+    Mirrors the issue spec: ``Stub gh-pr-view to return CONFLICTING +
+    rebase fails → assert spawn fires with the rebase-prompt config and
+    the audit comment is posted.``
+    """
+    recorder, label_rec, close_rec, find_pr, merge_status = _rebase_fixtures()
+    issues = [_make_issue(173, sm_labels=("sm:reviewing",))]
+    spawn_calls: list[tuple[int, str, str, str]] = []
+
+    def pr_mergeable(_repo: str, _pr: int) -> dict:
+        return {
+            "mergeable": "CONFLICTING",
+            "head_ref_name": "feat/work-173",
+            "head_ref_oid": "facefeed",
+        }
+
+    def attempt_rebase(_branch: str) -> dict:
+        return {
+            "ok": False,
+            "reason": "auto-rebase failed at src/alice_sm/dispatcher.py",
+        }
+
+    def spawn_rebase(
+        issue: dict, repo: str, branch: str, reason: str
+    ) -> str | None:
+        spawn_calls.append((issue["number"], repo, branch, reason))
+        return "spawn-173-1700000000"
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=_no_call,
+        pr_mergeable=pr_mergeable,
+        attempt_rebase=attempt_rebase,
+        spawn_rebase=spawn_rebase,
+        has_live_spawn=lambda _n: False,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # Spawn fired exactly once with the rebase context.
+    assert spawn_calls == [
+        (
+            173,
+            "jcronq/alice",
+            "feat/work-173",
+            "auto-rebase failed at src/alice_sm/dispatcher.py",
+        )
+    ]
+    # ``[SM] rebase-needed`` audit comment was posted.
+    bodies = [body for _r, _n, body in recorder.posted]
+    assert len(bodies) == 1
+    assert bodies[0].startswith(sm.REBASE_NEEDED_PREFIX)
+    assert "branch=feat/work-173" in bodies[0]
+    assert 'reason="auto-rebase failed at src/alice_sm/dispatcher.py"' in bodies[0]
+    # Label/close untouched — the rebase spawn handles the next move.
+    assert label_rec.calls == []
+    assert close_rec.closed == []
+    # Counters.
+    assert report.rebase_pushed == 0
+    assert report.rebase_spawned == 1
+    assert report.rebase_escalated == 0
+    # Persisted dedup signal so a follow-up cycle can detect Tier 3.
+    state_data = json.loads(state_path.read_text())
+    assert 173 in state_data["rebase_attempted"]
+
+
+def test_reviewing_pr_conflicting_tier2_waits_when_spawn_alive(
+    state_path: pathlib.Path,
+) -> None:
+    """CONFLICTING + Tier 2 spawn still alive → no Tier 3, no re-spawn.
+
+    Belt-and-suspenders: the dispatcher should leave a live rebase
+    worker alone rather than re-fire either path on every cadence.
+    """
+    recorder, label_rec, _, find_pr, merge_status = _rebase_fixtures()
+    issues = [_make_issue(174, sm_labels=("sm:reviewing",))]
+
+    def pr_mergeable(_repo: str, _pr: int) -> dict:
+        return {
+            "mergeable": "CONFLICTING",
+            "head_ref_name": "feat/work-174",
+            "head_ref_oid": "cafefeed",
+        }
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=CloseRecorder(),
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=_no_call,
+        pr_mergeable=pr_mergeable,
+        attempt_rebase=lambda _b: (_ for _ in ()).throw(
+            AssertionError("rebase must not fire while spawn is alive")
+        ),
+        spawn_rebase=lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("spawn must not re-fire while one is alive")
+        ),
+        has_live_spawn=lambda _n: True,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert recorder.posted == []
+    assert label_rec.calls == []
+    assert report.rebase_pushed == 0
+    assert report.rebase_spawned == 0
+    assert report.rebase_escalated == 0
+
+
+def test_reviewing_pr_conflicting_tier3_escalates_when_spawn_dead(
+    state_path: pathlib.Path,
+) -> None:
+    """CONFLICTING + prior Tier 2 marked + no live spawn → Tier 3
+    escalation comment posted + state marks escalated.
+
+    Mirrors the issue spec: ``Stub gh-pr-view to return CONFLICTING +
+    spawn dies → assert escalation surface is filed.``
+    """
+    # Pre-seed the state file with a prior rebase_attempted entry.
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": sm.STATE_VERSION,
+                "hello_commented": [],
+                "verify_failed_posted": [],
+                "needs_study_hinted": [],
+                "design_revisions": {},
+                "rebase_attempted": [175],
+                "rebase_escalated_posted": [],
+            }
+        )
+    )
+
+    recorder, label_rec, _, find_pr, merge_status = _rebase_fixtures()
+    issues = [_make_issue(175, sm_labels=("sm:reviewing",))]
+
+    def pr_mergeable(_repo: str, _pr: int) -> dict:
+        return {
+            "mergeable": "CONFLICTING",
+            "head_ref_name": "feat/work-175",
+            "head_ref_oid": "1234beef",
+        }
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=CloseRecorder(),
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=_no_call,
+        pr_mergeable=pr_mergeable,
+        attempt_rebase=lambda _b: (_ for _ in ()).throw(
+            AssertionError("Tier 1 must not fire after Tier 2 already ran")
+        ),
+        spawn_rebase=lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("Tier 2 must not re-fire when escalating")
+        ),
+        has_live_spawn=lambda _n: False,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    bodies = [body for _r, _n, body in recorder.posted]
+    assert len(bodies) == 1
+    assert bodies[0].startswith(sm.REBASE_ESCALATED_PREFIX)
+    assert "branch=feat/work-175" in bodies[0]
+    assert "spawned rebase worker dead" in bodies[0]
+    assert label_rec.calls == []
+    assert report.rebase_pushed == 0
+    assert report.rebase_spawned == 0
+    assert report.rebase_escalated == 1
+    state_data = json.loads(state_path.read_text())
+    assert 175 in state_data["rebase_escalated_posted"]
+
+
+def test_reviewing_pr_conflicting_tier3_dedup_on_second_pass(
+    state_path: pathlib.Path,
+) -> None:
+    """Once escalated, the dispatcher stays silent on subsequent cadences.
+
+    Without this dedup the comment would re-post every minute while
+    Jason is still triaging.
+    """
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": sm.STATE_VERSION,
+                "hello_commented": [],
+                "verify_failed_posted": [],
+                "needs_study_hinted": [],
+                "design_revisions": {},
+                "rebase_attempted": [176],
+                "rebase_escalated_posted": [176],
+            }
+        )
+    )
+
+    recorder, label_rec, _, find_pr, merge_status = _rebase_fixtures()
+    issues = [_make_issue(176, sm_labels=("sm:reviewing",))]
+
+    def pr_mergeable(_repo: str, _pr: int) -> dict:
+        return {
+            "mergeable": "CONFLICTING",
+            "head_ref_name": "feat/work-176",
+            "head_ref_oid": "babecafe",
+        }
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=CloseRecorder(),
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=_no_call,
+        pr_mergeable=pr_mergeable,
+        attempt_rebase=lambda _b: (_ for _ in ()).throw(
+            AssertionError("Tier 1 must not fire once escalated")
+        ),
+        spawn_rebase=lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("Tier 2 must not re-fire once escalated")
+        ),
+        has_live_spawn=lambda _n: False,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert recorder.posted == []
+    assert report.rebase_escalated == 0
+
+
+def test_reviewing_pr_conflicting_missing_branch_stays(
+    state_path: pathlib.Path,
+) -> None:
+    """CONFLICTING but ``head_ref_name`` missing → stay, log skip.
+
+    Defensive: without a branch we can't drive any tier. Surfacing
+    is reserved for the live escalation flow.
+    """
+    recorder, label_rec, _, find_pr, merge_status = _rebase_fixtures()
+    issues = [_make_issue(177, sm_labels=("sm:reviewing",))]
+    logged: list[str] = []
+
+    def pr_mergeable(_repo: str, _pr: int) -> dict:
+        return {
+            "mergeable": "CONFLICTING",
+            "head_ref_name": None,
+            "head_ref_oid": None,
+        }
+
+    exit_code, _ = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: issues,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=CloseRecorder(),
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=_no_call,
+        pr_mergeable=pr_mergeable,
+        attempt_rebase=lambda _b: (_ for _ in ()).throw(
+            AssertionError("must not rebase without a branch name")
+        ),
+        spawn_rebase=lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("must not spawn without a branch name")
+        ),
+        has_live_spawn=lambda _n: False,
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert recorder.posted == []
+    assert any("no head_ref_name" in m for m in logged)
+
+
+def test_attempt_auto_rebase_happy_path_runs_expected_git_sequence(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Tier 1 helper drives the exact git sequence on a clean tree."""
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    calls: list[list[str]] = []
+
+    def fake_git(args: list[str], _cwd: pathlib.Path) -> subprocess.CompletedProcess:
+        calls.append(args)
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    result = sm._attempt_auto_rebase(
+        branch="feat/auto",
+        repo_path=repo_path,
+        run_git=fake_git,
+        log=lambda _m: None,
+        issue_number=99,
+    )
+
+    assert result["ok"] is True
+    assert calls[0][0] == "status"
+    assert calls[1][0:2] == ["fetch", "origin"]
+    assert calls[2][0:3] == ["checkout", "-B", "feat/auto"]
+    assert calls[3] == ["rebase", "origin/master"]
+    assert calls[4][0:2] == ["push", "--force-with-lease"]
+    assert ["checkout", "master"] in calls
+
+
+def test_attempt_auto_rebase_aborts_on_conflict(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Rebase conflicts → abort the rebase, return ok=False, restore master."""
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    calls: list[list[str]] = []
+    rebase_stderr = (
+        "Auto-merging dispatcher.py\n"
+        "CONFLICT (content): Merge conflict in src/alice_sm/dispatcher.py\n"
+    )
+
+    def fake_git(args: list[str], _cwd: pathlib.Path) -> subprocess.CompletedProcess:
+        calls.append(args)
+        if args[0] == "rebase" and "--abort" not in args:
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout="", stderr=rebase_stderr
+            )
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    result = sm._attempt_auto_rebase(
+        branch="feat/auto",
+        repo_path=repo_path,
+        run_git=fake_git,
+        log=lambda _m: None,
+        issue_number=99,
+    )
+
+    assert result["ok"] is False
+    assert "src/alice_sm/dispatcher.py" in result["reason"]
+    assert ["rebase", "--abort"] in calls
+    assert ["checkout", "master"] in calls
+
+
+def test_attempt_auto_rebase_refuses_dirty_tree(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A dirty worker tree blocks the rebase — we never clobber edits."""
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+
+    def fake_git(args: list[str], _cwd: pathlib.Path) -> subprocess.CompletedProcess:
+        if args == ["status", "--porcelain"]:
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout=" M file.txt\n", stderr=""
+            )
+        raise AssertionError(f"unexpected git call on dirty tree: {args}")
+
+    result = sm._attempt_auto_rebase(
+        branch="feat/auto",
+        repo_path=repo_path,
+        run_git=fake_git,
+        log=lambda _m: None,
+    )
+
+    assert result["ok"] is False
+    assert "dirty" in result["reason"]
+
+
+def test_attempt_auto_rebase_missing_repo_path(tmp_path: pathlib.Path) -> None:
+    """A missing repo path returns ok=False without invoking git."""
+
+    def boom_git(*_a, **_k) -> subprocess.CompletedProcess:
+        raise AssertionError("git must not be called when repo path missing")
+
+    result = sm._attempt_auto_rebase(
+        branch="feat/auto",
+        repo_path=tmp_path / "does-not-exist",
+        run_git=boom_git,
+        log=lambda _m: None,
+    )
+
+    assert result["ok"] is False
+    assert "missing" in result["reason"]
+
+
+def test_extract_rebase_conflict_file_parses_standard_output() -> None:
+    """The conflict-file extractor pulls the path out of the git stderr."""
+    stderr = (
+        "Auto-merging foo.py\n"
+        "CONFLICT (content): Merge conflict in foo.py\n"
+        "error: Failed to merge in the changes.\n"
+    )
+    assert sm._extract_rebase_conflict_file("", stderr) == "foo.py"
+
+
+def test_render_rebase_pushed_audit_comment_shape() -> None:
+    body = sm.render_rebase_pushed_audit_comment(
+        123, "feat/work-123", timestamp="2026-05-13T10:00:00+00:00"
+    )
+    assert body == (
+        "[SM] rebase-pushed task=#123 branch=feat/work-123 "
+        "ts=2026-05-13T10:00:00+00:00"
+    )
+
+
+def test_render_rebase_needed_audit_comment_shape() -> None:
+    body = sm.render_rebase_needed_audit_comment(
+        123,
+        "feat/work-123",
+        "auto-rebase failed at dispatcher.py",
+        timestamp="2026-05-13T10:00:00+00:00",
+    )
+    assert body == (
+        '[SM] rebase-needed task=#123 branch=feat/work-123 '
+        'reason="auto-rebase failed at dispatcher.py" '
+        "ts=2026-05-13T10:00:00+00:00"
+    )
+
+
+def test_render_rebase_escalation_comment_shape() -> None:
+    body = sm.render_rebase_escalation_comment(
+        123,
+        "feat/work-123",
+        "spawned rebase worker dead but PR still CONFLICTING",
+        timestamp="2026-05-13T10:00:00+00:00",
+    )
+    assert body == (
+        '[SM] rebase-escalated task=#123 branch=feat/work-123 '
+        'reason="spawned rebase worker dead but PR still CONFLICTING" '
+        "ts=2026-05-13T10:00:00+00:00"
+    )
+
+
+def test_state_round_trips_rebase_fields(state_path: pathlib.Path) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state = sm.DispatcherState()
+    state.mark_rebase_attempted(10)
+    state.mark_rebase_attempted(11)
+    state.mark_rebase_escalated(11)
+    sm.save_state(state_path, state)
+
+    loaded = sm.load_state(state_path)
+    assert loaded.rebase_attempted == [10, 11]
+    assert loaded.rebase_escalated_posted == [11]
+    assert loaded.has_rebase_attempted(10) is True
+    assert loaded.has_rebase_escalated(11) is True
+    assert loaded.has_rebase_escalated(10) is False
+
+
+def test_state_clear_rebase_attempted_is_idempotent() -> None:
+    state = sm.DispatcherState()
+    state.mark_rebase_attempted(42)
+    assert state.has_rebase_attempted(42) is True
+    state.clear_rebase_attempted(42)
+    assert state.has_rebase_attempted(42) is False
+    state.clear_rebase_attempted(42)
