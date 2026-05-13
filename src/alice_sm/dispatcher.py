@@ -47,6 +47,7 @@ import datetime as dt
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -684,6 +685,47 @@ def gh_close_issue(repo: str, number: int, *, gh_bin: str = "gh") -> None:
     """Close an issue via ``gh issue close``."""
     args = [gh_bin, "issue", "close", str(number), "--repo", repo]
     _run_gh(args)
+
+
+def gh_get_issue(
+    repo: str, number: int, *, gh_bin: str = "gh"
+) -> dict[str, Any] | None:
+    """Fetch a single issue's state + labels via ``gh issue view``.
+
+    Issue #142 — the proactive reap pass needs to know whether the
+    issue behind a dead spawn dir has reached a terminal state (CLOSED
+    / sm:done / sm:rejected). ``gh_list_sm_issues`` only returns OPEN
+    issues, so we can't reuse the polled list to answer that question.
+
+    Returns the raw ``{"number", "state", "labels"}`` payload, or
+    ``None`` if the issue doesn't exist (404 / repo permission error /
+    transport failure). A ``None`` return is the caller's signal to
+    leave the spawn dir alone for this cycle and retry on the next
+    pass.
+    """
+    args = [
+        gh_bin,
+        "issue",
+        "view",
+        str(number),
+        "--repo",
+        repo,
+        "--json",
+        "number,state,labels",
+    ]
+    try:
+        stdout = _run_gh(args)
+    except GHCommandError:
+        return None
+    if not stdout.strip():
+        return None
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
 
 
 def gh_list_issue_comments(
@@ -1353,6 +1395,139 @@ def has_live_spawn_for_issue(
         else:
             _reap_spawn_dir(child, finished_root, log=log)
     return alive
+
+
+# Issue #142 — canonical spawn dir name shape, ``spawn-<N>-<unix-ts>``.
+# Used by :func:`proactive_reap_dead_spawns` to recover the issue number
+# the dispatcher should look up when deciding whether a dead dir is safe
+# to reap.
+_SPAWN_DIR_NAME_RE = re.compile(r"^spawn-(\d+)-\d+$")
+
+
+def _spawn_dir_issue_number(name: str) -> int | None:
+    """Extract the issue number from a ``spawn-<N>-<ts>`` dir name.
+
+    Returns ``None`` for any name that doesn't match the canonical
+    pattern (defensive — keeps the proactive reap from accidentally
+    touching unrelated dirs that happen to live alongside spawn dirs).
+    """
+    m = _SPAWN_DIR_NAME_RE.match(name)
+    if m is None:
+        return None
+    return int(m.group(1))
+
+
+def proactive_reap_dead_spawns(
+    spawn_dir: pathlib.Path = SPAWN_DIR,
+    *,
+    get_issue: Callable[[int], dict[str, Any] | None],
+    log: Callable[[str], None] | None = None,
+    projects_dir: pathlib.Path = CLAUDE_PROJECTS_DIR,
+) -> tuple[int, int]:
+    """Sweep ``spawn_dir`` and reap dead dirs whose issue has moved on.
+
+    Issue #142 — without this pass, dead spawn dirs only get reaped
+    when a NEW spawn attempt fires for the same issue (via
+    :func:`has_live_spawn_for_issue`) or when the dispatcher walks the
+    full set for a concurrency count (via :func:`count_running_spawns`,
+    which only runs on the spawn path inside ``_process_selected``).
+    Once the issue closes, neither trigger fires again and the dead
+    dir sits in ``active/`` indefinitely — the symptom that broke the
+    /running and /runs viewer entries for #135 and #137.
+
+    Walks ``spawn_dir/*`` (skipping ``.finished/``). For each dir with
+    a dead pidfile:
+
+      * Issue closed (any label) → reap. The task is settled; the dead
+        dir is just clutter.
+      * Issue at sm:done / sm:rejected (terminal) even if still
+        technically open → reap.
+      * Issue at sm:reviewing / sm:building / sm:validating / sm:draft
+        → reap. The worker progressed past spawn (a PR is open or the
+        pipeline took over); the spawn subprocess being dead is the
+        normal terminal state once init has reaped it.
+      * Issue still at sm:selected → leave the dir alone and log a
+        WARNING. This is the "worker died mid-flight, never opened a
+        PR" case — silently reaping would lose the only on-disk
+        evidence (prompt.txt, stderr.log) a human needs to triage.
+      * ``get_issue`` returned ``None`` (404 / transport error) →
+        leave alone; the next cycle will retry.
+
+    Live spawn dirs are never touched.
+
+    Returns ``(reaped, stuck)`` — count of dirs moved to ``.finished/``
+    and count of dirs left in place for human review.
+    """
+    if not spawn_dir.is_dir():
+        return (0, 0)
+    finished_root = spawn_dir / ".finished"
+    reaped = 0
+    stuck = 0
+    for child in sorted(spawn_dir.iterdir()):
+        if not child.is_dir() or child.name == ".finished":
+            continue
+        if _spawn_dir_is_alive(child):
+            continue
+        number = _spawn_dir_issue_number(child.name)
+        if number is None:
+            if log is not None:
+                log(
+                    f"[sm-dispatcher] proactive-reap: skipping "
+                    f"{child.name} (non-canonical spawn dir name)"
+                )
+            continue
+        issue = get_issue(number)
+        if issue is None:
+            if log is not None:
+                log(
+                    f"[sm-dispatcher] proactive-reap: could not fetch "
+                    f"#{number} state — leaving {child.name} in place"
+                )
+            continue
+        issue_state = (issue.get("state") or "").upper()
+        sm_label = _current_sm_label(issue)
+        if issue_state == "CLOSED" or sm_label in TERMINAL_SM_LABELS:
+            if log is not None:
+                log(
+                    f"[sm-dispatcher] proactive-reap: #{number} "
+                    f"state={issue_state or '?'} sm={sm_label} — "
+                    f"reaping {child.name}"
+                )
+            _reap_spawn_dir(
+                child, finished_root, log=log, projects_dir=projects_dir
+            )
+            reaped += 1
+            continue
+        if sm_label == ACTIVE_SM_LABEL:
+            if log is not None:
+                log(
+                    f"[sm-dispatcher] proactive-reap WARNING: #{number} "
+                    f"still at {ACTIVE_SM_LABEL} but {child.name} pid "
+                    f"is dead — worker likely crashed before opening a "
+                    f"PR. Leaving in place for human review."
+                )
+            stuck += 1
+            continue
+        if sm_label is None:
+            if log is not None:
+                log(
+                    f"[sm-dispatcher] proactive-reap: #{number} has no "
+                    f"single whitelisted sm:* label — leaving "
+                    f"{child.name} alone"
+                )
+            continue
+        # sm:reviewing / sm:building / sm:validating / sm:draft — the
+        # spawn phase is done by definition.
+        if log is not None:
+            log(
+                f"[sm-dispatcher] proactive-reap: #{number} at "
+                f"{sm_label} (past spawn phase) — reaping {child.name}"
+            )
+        _reap_spawn_dir(
+            child, finished_root, log=log, projects_dir=projects_dir
+        )
+        reaped += 1
+    return reaped, stuck
 
 
 def compose_spawn_prompt(
@@ -2561,6 +2736,8 @@ def run(
     has_live_spawn: Callable[[int], bool] | None = None,
     count_running: Callable[[], int] | None = None,
     spawn: Callable[[dict[str, Any], str, str], str | None] | None = None,
+    get_issue: Callable[[int], dict[str, Any] | None] | None = None,
+    proactive_reap: Callable[[], tuple[int, int]] | None = None,
     enable_spawn: bool = True,
     max_concurrent_spawns: int = MAX_CONCURRENT_SPAWNS,
     post_merge_cleanup: PostMergeCleanupFn | None = None,
@@ -2609,6 +2786,14 @@ def run(
                     log=log,
                     now_iso=now_iso,
                 )
+        if get_issue is None:
+            def get_issue(number: int) -> dict[str, Any] | None:
+                return gh_get_issue(repo, number)
+        if proactive_reap is None:
+            def proactive_reap() -> tuple[int, int]:
+                return proactive_reap_dead_spawns(
+                    SPAWN_DIR, get_issue=get_issue, log=log
+                )
 
     # Issue #127 — bind the production cleanup callable when enabled and
     # not explicitly injected. Tests opt out with ``enable_cleanup=False``
@@ -2639,6 +2824,18 @@ def run(
         verify_pr = None
 
     report = RunReport()
+
+    # Issue #142 — proactive sweep of stale ``active/`` spawn dirs.
+    # Without this, dead dirs only get reaped when a new spawn for the
+    # same issue fires (via ``has_live_spawn_for_issue``), so they
+    # accumulate visibly in /running and /runs after their issue closes.
+    # Best-effort: a failure here must not block the main poll.
+    if proactive_reap is not None:
+        try:
+            proactive_reap()
+        except OSError as exc:
+            log(f"[sm-dispatcher] proactive-reap failed: {exc}")
+
     try:
         issues = list_issues(repo)
     except GHCommandError as exc:

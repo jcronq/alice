@@ -1286,6 +1286,7 @@ def test_phase2_spawn_fires_on_code_artifact_with_no_prior_spawn(
         master_ci_status=_no_call,
         count_running=lambda: 0,
         spawn=spawn,
+        proactive_reap=lambda: (0, 0),
         now_iso=_frozen_now,
         log=lambda _m: None,
     )
@@ -1377,6 +1378,7 @@ def test_phase2_spawn_fires_on_research_note_with_writer_template(
         master_ci_status=_no_call,
         count_running=lambda: 0,
         spawn=spawn,
+        proactive_reap=lambda: (0, 0),
         now_iso=_frozen_now,
         log=lambda _m: None,
     )
@@ -1461,6 +1463,7 @@ def test_phase2_live_spawn_dir_skips_new_spawn(
         has_live_spawn=lambda n: sm.has_live_spawn_for_issue(n, spawn_dir),
         count_running=lambda: 1,
         spawn=spawn,
+        proactive_reap=lambda: (0, 0),
         now_iso=_frozen_now,
         log=lambda _m: None,
     )
@@ -1536,6 +1539,7 @@ def test_phase2_stale_spawn_dir_falls_through_and_respawns(
         has_live_spawn=lambda n: sm.has_live_spawn_for_issue(n, spawn_dir),
         count_running=lambda: 0,
         spawn=spawn,
+        proactive_reap=lambda: (0, 0),
         now_iso=_frozen_now,
         log=lambda _m: None,
     )
@@ -1603,6 +1607,7 @@ def test_phase2_concurrency_cap_queues_excess_spawns(
         master_ci_status=_no_call,
         count_running=lambda: running_count["n"],
         spawn=spawn,
+        proactive_reap=lambda: (0, 0),
         max_concurrent_spawns=2,
         now_iso=_frozen_now,
         log=lambda _m: None,
@@ -1665,6 +1670,7 @@ def test_phase2_untrusted_author_skipped_before_spawn(
         master_ci_status=_no_call,
         count_running=lambda: 0,
         spawn=spawn,
+        proactive_reap=lambda: (0, 0),
         now_iso=_frozen_now,
         log=lambda _m: None,
     )
@@ -1733,6 +1739,7 @@ def test_phase2_unrecognized_artifact_label_skips_spawn(
             master_ci_status=_no_call,
             count_running=lambda: 0,
             spawn=spawn,
+            proactive_reap=lambda: (0, 0),
             now_iso=_frozen_now,
             log=logged.append,
         )
@@ -1790,6 +1797,7 @@ def test_phase2_dry_run_logs_spawn_intent_without_popen(
         master_ci_status=_no_call,
         count_running=lambda: 0,
         spawn=spawn,
+        proactive_reap=lambda: (0, 0),
         dry_run=True,
         now_iso=_frozen_now,
         log=logged.append,
@@ -1977,6 +1985,226 @@ def test_phase2_has_live_spawn_for_issue_matches_by_issue_number(
     # happen to overlap.
     assert sm.has_live_spawn_for_issue(101, spawn_dir) is False
     assert sm.has_live_spawn_for_issue(1, spawn_dir) is False
+
+
+# ---------------------------------------------------------------------------
+# Issue #142 — proactive reap of stale active/ spawn dirs
+
+
+def _dead_spawn_dir(spawn_dir: pathlib.Path, name: str) -> pathlib.Path:
+    """Create a spawn dir with a pidfile pointing at a definitely-dead PID."""
+    d = spawn_dir / name
+    d.mkdir()
+    # kernel pid_max + 1; effectively impossible to be live.
+    (d / "pidfile").write_text("99999999")
+    return d
+
+
+def test_proactive_reap_terminal_issue_reaps_dead_dir(tmp_path) -> None:
+    """Dead spawn dir whose issue is at sm:done → moved to .finished/."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    dead = _dead_spawn_dir(spawn_dir, "spawn-135-1778637042")
+
+    def get_issue(number: int) -> dict | None:
+        assert number == 135
+        return {
+            "number": 135,
+            "state": "CLOSED",
+            "labels": [{"name": "sm:done"}, {"name": "art:code"}],
+        }
+
+    logged: list[str] = []
+    reaped, stuck = sm.proactive_reap_dead_spawns(
+        spawn_dir, get_issue=get_issue, log=logged.append
+    )
+
+    assert reaped == 1
+    assert stuck == 0
+    assert not dead.exists()
+    assert (spawn_dir / ".finished" / "spawn-135-1778637042").exists()
+
+
+def test_proactive_reap_stuck_spawn_stays_in_place(tmp_path) -> None:
+    """Dead spawn dir + issue still at sm:selected → not reaped, warning logged."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    dead = _dead_spawn_dir(spawn_dir, "spawn-203-1778500000")
+
+    def get_issue(number: int) -> dict | None:
+        return {
+            "number": 203,
+            "state": "OPEN",
+            "labels": [{"name": "sm:selected"}, {"name": "art:code"}],
+        }
+
+    logged: list[str] = []
+    reaped, stuck = sm.proactive_reap_dead_spawns(
+        spawn_dir, get_issue=get_issue, log=logged.append
+    )
+
+    assert reaped == 0
+    assert stuck == 1
+    # Spawn dir is still in active/ for human review.
+    assert dead.exists()
+    assert not (spawn_dir / ".finished" / dead.name).exists()
+    # Warning was logged.
+    assert any(
+        "WARNING" in m and "#203" in m for m in logged
+    ), f"expected WARNING for stuck #203 in: {logged!r}"
+
+
+def test_proactive_reap_live_spawn_untouched(tmp_path) -> None:
+    """Live spawn dir is never touched, regardless of issue state."""
+    import os as _os
+
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    live = spawn_dir / "spawn-400-1778700000"
+    live.mkdir()
+    (live / "pidfile").write_text(str(_os.getpid()))
+
+    calls: list[int] = []
+
+    def get_issue(number: int) -> dict | None:
+        calls.append(number)
+        return {
+            "number": number,
+            "state": "CLOSED",
+            "labels": [{"name": "sm:done"}],
+        }
+
+    reaped, stuck = sm.proactive_reap_dead_spawns(
+        spawn_dir, get_issue=get_issue, log=lambda _m: None
+    )
+
+    assert reaped == 0
+    assert stuck == 0
+    # Live dir untouched and get_issue never consulted (no reason to ask).
+    assert live.exists()
+    assert calls == []
+
+
+def test_proactive_reap_progressed_issue_reaps_dead_dir(tmp_path) -> None:
+    """Dead spawn dir + issue at sm:reviewing (PR is open) → reaped.
+
+    The worker did its job — the dead pid is just init having reaped
+    the long-since-finished subprocess. No human review needed.
+    """
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    dead = _dead_spawn_dir(spawn_dir, "spawn-150-1778640000")
+
+    def get_issue(number: int) -> dict | None:
+        return {
+            "number": 150,
+            "state": "OPEN",
+            "labels": [{"name": "sm:reviewing"}, {"name": "art:code"}],
+        }
+
+    reaped, stuck = sm.proactive_reap_dead_spawns(
+        spawn_dir, get_issue=get_issue, log=lambda _m: None
+    )
+
+    assert reaped == 1
+    assert stuck == 0
+    assert not dead.exists()
+    assert (spawn_dir / ".finished" / "spawn-150-1778640000").exists()
+
+
+def test_proactive_reap_unfetchable_issue_leaves_dir_alone(tmp_path) -> None:
+    """If get_issue returns None (gh error / 404), the dir is left in place
+    for retry on the next cycle."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    dead = _dead_spawn_dir(spawn_dir, "spawn-999-1778600000")
+
+    logged: list[str] = []
+    reaped, stuck = sm.proactive_reap_dead_spawns(
+        spawn_dir, get_issue=lambda _n: None, log=logged.append
+    )
+
+    assert reaped == 0
+    assert stuck == 0
+    assert dead.exists()
+    assert any("could not fetch" in m for m in logged)
+
+
+def test_proactive_reap_skips_non_canonical_dir_name(tmp_path) -> None:
+    """A subdir that doesn't match ``spawn-<N>-<ts>`` is skipped — defensive
+    against random files / future-format dirs."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    bogus = spawn_dir / "not-a-spawn-dir"
+    bogus.mkdir()
+    (bogus / "pidfile").write_text("99999999")
+
+    calls: list[int] = []
+
+    def get_issue(number: int) -> dict | None:
+        calls.append(number)
+        return None
+
+    reaped, stuck = sm.proactive_reap_dead_spawns(
+        spawn_dir, get_issue=get_issue, log=lambda _m: None
+    )
+
+    assert reaped == 0
+    assert stuck == 0
+    assert bogus.exists()
+    # No lookup attempted for an unparseable name.
+    assert calls == []
+
+
+def test_proactive_reap_run_integration_invokes_callable(state_path) -> None:
+    """run() invokes the injected proactive_reap once per cycle, before
+    issue processing."""
+    calls: list[int] = []
+
+    def fake_reap() -> tuple[int, int]:
+        calls.append(1)
+        return (2, 1)
+
+    recorder = Recorder()
+    exit_code, _report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: [],
+        post_comment=recorder,
+        proactive_reap=fake_reap,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert calls == [1]
+
+
+def test_proactive_reap_run_integration_swallows_oserror(state_path) -> None:
+    """If the proactive reap raises OSError, run() logs and continues —
+    a transient filesystem hiccup must not block the main poll."""
+
+    def crashy_reap() -> tuple[int, int]:
+        raise OSError("disk gone")
+
+    logged: list[str] = []
+    recorder = Recorder()
+    exit_code, _report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: [],
+        post_comment=recorder,
+        proactive_reap=crashy_reap,
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert any("proactive-reap failed" in m for m in logged)
 
 
 def test_phase2_gh_find_unspawned_selected_issues_filters_by_trusted_author(
