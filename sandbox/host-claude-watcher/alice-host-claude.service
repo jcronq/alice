@@ -16,14 +16,18 @@ Group=alice
 # left the deployed script stale after every repo change, so PR #138's
 # inotify fix never took effect on the host.
 #
-# Override ALICE_REPO if your clone lives somewhere other than ~/alice.
-# %h expands to User='s home dir at unit-load time.
-Environment="ALICE_REPO=%h/alice"
+# %h is a systemd specifier that expands to User='s home dir at unit
+# load time. We use it directly in ExecStart because the first arg of
+# ExecStart must be an absolute path or simple filename — env-var
+# expansion (`${ALICE_REPO}/...`) is *rejected* by systemd as "Neither
+# a valid executable name nor an absolute path", which silently left
+# the service un-restartable after PR #147. If your clone lives
+# somewhere other than ~/alice, override ExecStart= via a drop-in.
 # The script discovers ALICE_HOST_CLAUDE_ROOT (default: /state/worker/host-claude).
 # Override here if your bind-mount layout differs.
 # Environment=ALICE_HOST_CLAUDE_ROOT=/state/worker/host-claude
 # Environment=ALICE_HOST_CLAUDE_BIN=/usr/local/bin/claude
-ExecStart=${ALICE_REPO}/sandbox/host-claude-watcher/alice-host-claude-watcher.sh
+ExecStart=%h/alice/sandbox/host-claude-watcher/alice-host-claude-watcher.sh
 Restart=on-failure
 RestartSec=5
 # Capture all log lines to the journal; the script logs to stderr.
