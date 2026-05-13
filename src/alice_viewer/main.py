@@ -1865,13 +1865,21 @@ def run() -> None:  # pragma: no cover
 
     host = os.environ.get("ALICE_VIEWER_HOST", "0.0.0.0")
     port = int(os.environ.get("ALICE_VIEWER_PORT", "7777"))
-    uvicorn.run(
-        "alice_viewer.main:create_app",
-        host=host,
-        port=port,
-        factory=True,
-        reload=bool(os.environ.get("ALICE_VIEWER_RELOAD")),
-    )
+    reload = bool(os.environ.get("ALICE_VIEWER_RELOAD"))
+    kwargs: dict[str, object] = {
+        "host": host,
+        "port": port,
+        "factory": True,
+        "reload": reload,
+    }
+    if reload:
+        # Scope the watcher to the viewer package — without this, uvicorn
+        # watches the process CWD (the repo root inside the container),
+        # which means every unrelated edit anywhere in the monorepo
+        # triggers a restart. Jinja2 templates already auto-reload, but
+        # they live under this same dir so they're covered too. Issue #130.
+        kwargs["reload_dirs"] = [str(BASE_DIR)]
+    uvicorn.run("alice_viewer.main:create_app", **kwargs)
 
 
 if __name__ == "__main__":  # pragma: no cover
