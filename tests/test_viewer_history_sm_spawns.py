@@ -93,6 +93,59 @@ def test_active_spawn_not_in_history(tmp_path):
     assert entries == []
 
 
+def test_dead_top_level_spawn_in_history(tmp_path):
+    """Top-level dirs with a stale pidfile (process gone, dispatcher
+    hasn't reaped yet) count as finished — without this fall-through
+    /api/runs/{id} 404s during the reap gap (#143)."""
+    p = _paths(tmp_path)
+    dead = p.state_dir / "sm-dispatcher-spawns" / "spawn-201-1778600150"
+    dead.mkdir(parents=True)
+    # 2**31 - 1 is the max PID and is reliably unused on a normal box;
+    # mirrors the convention from test_viewer_running.py.
+    (dead / "pidfile").write_text(str(2**31 - 1))
+    (dead / "prompt.txt").write_text(
+        "You are a code-worker agent ...\nArtifact type: art:code\n"
+    )
+    (dead / "stdout.log").write_text("ran 7 tests, all passing\n")
+    entries = sources._history_sm_spawns(
+        p.state_dir / "sm-dispatcher-spawns"
+    )
+    assert len(entries) == 1
+    e = entries[0]
+    assert e.spawn_id == "spawn-201-1778600150"
+    assert e.issue_number == 201
+    assert e.art_label == "art:code"
+    assert e.outcome_hint == "ran 7 tests, all passing"
+
+
+def test_top_level_no_pidfile_not_in_history(tmp_path):
+    """A top-level dir with no pidfile could be a worker mid-startup
+    (after mkdir, before pidfile write). Don't surface it as finished —
+    we'd rather under-report than mis-classify a spinning-up spawn."""
+    p = _paths(tmp_path)
+    pending = p.state_dir / "sm-dispatcher-spawns" / "spawn-202-1778600160"
+    pending.mkdir(parents=True)
+    (pending / "prompt.txt").write_text("Artifact type: art:code\n")
+    entries = sources._history_sm_spawns(
+        p.state_dir / "sm-dispatcher-spawns"
+    )
+    assert entries == []
+
+
+def test_top_level_unreadable_pidfile_not_in_history(tmp_path):
+    """A pidfile that isn't an integer is treated like a missing one —
+    same reasoning as `_top_level_no_pidfile_not_in_history`."""
+    p = _paths(tmp_path)
+    weird = p.state_dir / "sm-dispatcher-spawns" / "spawn-203-1778600170"
+    weird.mkdir(parents=True)
+    (weird / "pidfile").write_text("not-a-pid")
+    (weird / "prompt.txt").write_text("Artifact type: art:code\n")
+    entries = sources._history_sm_spawns(
+        p.state_dir / "sm-dispatcher-spawns"
+    )
+    assert entries == []
+
+
 def test_missing_prompt_yields_art_unknown(tmp_path):
     """A dir with no ``prompt.txt`` (crash-before-write) still shows up
     in history with the fallback ``art:unknown`` label — the dir name

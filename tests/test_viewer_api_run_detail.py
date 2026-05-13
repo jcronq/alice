@@ -200,6 +200,33 @@ def test_api_run_detail_finds_live_sm_spawn(client, paths):
     assert "sm_stdout" in kinds
 
 
+def test_api_run_detail_finds_dead_unreaped_sm_spawn(client, paths):
+    """Top-level spawn dir with a dead pidfile — finished but the
+    dispatcher hasn't moved it to ``.finished/`` yet. Both #129 (live
+    fall-through) and #141 (full trace) miss this case; without the
+    fix in #143 the API 404s during the reap gap."""
+    spawn_dir = paths.state_dir / "sm-dispatcher-spawns" / "spawn-143-1778600250"
+    spawn_dir.mkdir(parents=True)
+    # 2**31 - 1 is the max PID — reliably unused. Same trick as
+    # test_viewer_running.py / test_viewer_history_sm_spawns.py.
+    (spawn_dir / "pidfile").write_text(str(2**31 - 1))
+    (spawn_dir / "prompt.txt").write_text(
+        "You are a code-worker agent ...\nArtifact type: art:code\n"
+    )
+    (spawn_dir / "stdout.log").write_text("merged PR #200\n")
+    r = client.get("/api/runs/spawn-143-1778600250")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["run"]["run_id"] == "spawn-143-1778600250"
+    assert data["run"]["kind"] == "sm_spawn"
+    assert data["run"]["status"] == "ended"
+    kinds = [e["kind"] for e in data["events"]]
+    assert "sm_prompt" in kinds
+    assert "sm_stdout" in kinds
+    stdout_ev = next(e for e in data["events"] if e["kind"] == "sm_stdout")
+    assert "merged PR #200" in stdout_ev["detail"]["text"]
+
+
 def test_api_run_detail_still_resolves_thinking_wake(client, paths):
     """Regression: the original ``group_runs`` lookup must keep working
     for thinking-wake runs."""

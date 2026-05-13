@@ -2380,60 +2380,120 @@ class FinishedSmSpawn:
 def _history_sm_spawns(
     spawn_dir: pathlib.Path,
 ) -> list[FinishedSmSpawn]:
-    """Walk ``<spawn_dir>/.finished/spawn-*/`` and return one record per
-    reaped spawn, sorted newest-mtime first.
+    """Walk every finished SM-dispatcher spawn and return one record per
+    spawn, sorted newest-mtime first.
 
-    Active (live) spawns live one level up under ``<spawn_dir>/spawn-*/``
-    and are intentionally excluded — those belong on /running, not in
-    history. Dirs whose name doesn't match the spawn naming convention
-    are skipped silently (defensive: foreign files in ``.finished/``
-    shouldn't poison the listing).
+    Two on-disk shapes count as "finished":
+      • ``<spawn_dir>/.finished/spawn-*/`` — already reaped.
+      • ``<spawn_dir>/spawn-*/`` whose pidfile points to a process that
+        is no longer running. Between a worker exiting and the
+        dispatcher's next reap pass the spawn dir sits at the top level
+        with a stale pidfile; without picking it up here, ``/api/runs/
+        {id}`` 404s during that gap (#143).
+
+    Top-level dirs with a *live* pidfile are excluded — those are
+    handled by ``_open_sm_spawns`` and surface on /running. Dirs whose
+    name doesn't match the spawn naming convention are skipped silently.
 
     A missing or unparseable ``prompt.txt`` is non-fatal: the row is
     still included with ``art_label="art:unknown"``. The dispatcher
     writes ``prompt.txt`` before launching ``claude``, so its absence
     here is rare but possible (crash during launch, manual cleanup).
     """
-    finished_root = spawn_dir / ".finished"
-    if not finished_root.is_dir():
+    if not spawn_dir.is_dir():
         return []
     out: list[FinishedSmSpawn] = []
-    for child in finished_root.iterdir():
-        if not child.is_dir():
+    finished_root = spawn_dir / ".finished"
+    if finished_root.is_dir():
+        for child in finished_root.iterdir():
+            if not child.is_dir():
+                continue
+            m = _SM_SPAWN_FINISHED_NAME_RE.match(child.name)
+            if not m:
+                continue
+            fs = _read_finished_sm_spawn(
+                child,
+                issue_number=int(m.group(1)),
+                started_at=float(m.group(2)),
+            )
+            if fs is not None:
+                out.append(fs)
+    for child in spawn_dir.iterdir():
+        if not child.is_dir() or child.name.startswith("."):
             continue
-        m = _SM_SPAWN_FINISHED_NAME_RE.match(child.name)
+        m = _SM_SPAWN_NAME_RE.match(child.name)
         if not m:
             continue
-        issue_number = int(m.group(1))
-        started_at = float(m.group(2))
-        try:
-            ended_at = child.stat().st_mtime
-        except OSError:
+        if not _sm_spawn_pid_is_dead(child):
             continue
-        art_label = "art:unknown"
-        prompt_path = child / "prompt.txt"
-        if prompt_path.is_file():
-            try:
-                text = prompt_path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                text = ""
-            am = _SM_SPAWN_ART_RE.search(text)
-            if am:
-                art_label = am.group(1)
-        outcome_hint = _read_last_line(child / "stdout.log")
-        out.append(
-            FinishedSmSpawn(
-                spawn_id=child.name,
-                issue_number=issue_number,
-                art_label=art_label,
-                started_at=started_at,
-                ended_at=ended_at,
-                outcome_hint=outcome_hint,
-                spawn_dir=str(child),
-            )
+        fs = _read_finished_sm_spawn(
+            child,
+            issue_number=int(m.group(1)),
+            started_at=float(m.group(2)),
         )
+        if fs is not None:
+            out.append(fs)
     out.sort(key=lambda r: r.ended_at, reverse=True)
     return out
+
+
+def _sm_spawn_pid_is_dead(spawn_dir: pathlib.Path) -> bool:
+    """True only when there's positive evidence the spawn process has
+    exited: the pidfile exists, holds an integer, and ``kill(pid, 0)``
+    raises ``ProcessLookupError`` (or ``PermissionError`` because the
+    pid was recycled by an unrelated owner). Missing/unreadable pidfile
+    returns False — that could be the brief window between ``mkdir``
+    and ``write pidfile`` during spawn startup, so we'd rather under-
+    surface a dir than mis-classify a spinning-up worker as ended.
+    """
+    pidfile = spawn_dir / "pidfile"
+    if not pidfile.is_file():
+        return False
+    try:
+        pid = int(pidfile.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _read_finished_sm_spawn(
+    child: pathlib.Path,
+    *,
+    issue_number: int,
+    started_at: float,
+) -> FinishedSmSpawn | None:
+    """Build a ``FinishedSmSpawn`` for one spawn dir. Returns None when
+    the dir's mtime can't be stat'd (dir disappeared mid-walk)."""
+    try:
+        ended_at = child.stat().st_mtime
+    except OSError:
+        return None
+    art_label = "art:unknown"
+    prompt_path = child / "prompt.txt"
+    if prompt_path.is_file():
+        try:
+            text = prompt_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        am = _SM_SPAWN_ART_RE.search(text)
+        if am:
+            art_label = am.group(1)
+    outcome_hint = _read_last_line(child / "stdout.log")
+    return FinishedSmSpawn(
+        spawn_id=child.name,
+        issue_number=issue_number,
+        art_label=art_label,
+        started_at=started_at,
+        ended_at=ended_at,
+        outcome_hint=outcome_hint,
+        spawn_dir=str(child),
+    )
 
 
 # Cap synthetic-event payloads so a runaway stdout.log doesn't blow up
