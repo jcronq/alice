@@ -202,35 +202,54 @@ def _now_iso() -> str:
 # ---------------------------------------------------------------------------
 
 # Per-(state, artifact) spawn config. Each entry tells the dispatcher
-# how to frame the spawn prompt for one ``(sm:*, art:*)`` combination:
+# how to frame the spawn prompt and which spawn machinery to invoke
+# for one ``(sm:*, art:*)`` combination:
 #
+#   * ``persona`` — selects the spawn machinery the dispatcher invokes:
+#     ``"worker"`` for the v1 claude-cli code-worker pool
+#     (:func:`spawn_agent`); ``"thinking"`` for the per-issue design
+#     agent (:func:`spawn_thinking_agent`); ``"speaking"`` for the
+#     per-issue build agent (:func:`spawn_speaking_agent`); ``"reviewer"``
+#     for the structured-output code-review sub-agent invoked from
+#     ``_process_reviewing`` (wired separately).
+#   * ``runtime`` — label rendered into the audit comment so the audit
+#     trail records which runtime executed the spawn (claude-cli for
+#     the v1 pool, claude-agent-sdk for the SM v2 thinking/speaking
+#     lanes).
+#   * ``phase`` (optional) — per-issue phase the SDK lanes pass to the
+#     shim entrypoint. Unused for the v1 worker pool.
 #   * ``system_prompt_role`` — short role label rendered into the
-#     prompt header (Claude doesn't actually get a separate system
-#     prompt from us; the CLI's defaults take over). The label drives
-#     the in-prompt persona framing.
+#     v1 worker prompt header (the claude-cli runtime). Ignored by the
+#     SDK lanes — those compose their own prompts in
+#     :func:`compose_thinking_spawn_prompt` and
+#     :func:`compose_speaking_spawn_prompt`.
 #   * ``instruction_trailer`` — final instructions appended after the
-#     issue body. ``{issue_number}`` is the substitution token.
+#     issue body in the v1 worker prompt. ``{issue_number}`` is the
+#     substitution token. Ignored by the SDK lanes.
 #   * ``system_prompt_module`` (optional) — dotted path to a system
 #     prompt constant when the agent is a structured-output sub-agent
-#     (e.g., the code reviewer). The future
-#     ``(sm:reviewing, *)`` integration consumes this; v1
-#     ``(sm:selected, *)`` workers ignore it and rely on the claude
-#     CLI's default system prompt.
+#     (e.g., the code reviewer). Consumed by the
+#     ``(sm:reviewing, art:code)`` reviewer wiring (separate sub-issue).
 #
-# Out of scope for v1: the (persona × runtime) matrix from the design
-# doc. v1 spawns Claude for every ``(sm:selected, art:*)`` row; the
-# spawn map is the extension point for later phases. Issue #107 adds
-# the first ``(sm:reviewing, art:code)`` row — the dispatcher path
-# that consumes it is wired separately.
+# Sub-issue 7 (#186) — SM v2 SPAWN_MAP cutover. The
+# ``(sm:selected, art:code)`` row routes to the per-issue thinking-agent
+# designer (was v1 claude-cli code-worker pre-cutover). The new
+# ``(sm:designed, art:code)`` row routes to the speaking-agent builder.
+# Other ``(sm:selected, art:*)`` rows still spawn the v1 worker pool.
 SPAWN_MAP: dict[tuple[str, str], dict[str, str]] = {
+    # SM v2 design lane. The per-issue thinking-agent reads the issue,
+    # produces a design note at
+    # ``~/alice-mind/cortex-memory/designs/<date>-issue<N>-<slug>.md``,
+    # and posts ``[SM] design-ready note=[[<wikilink>]]`` to advance the
+    # issue to ``sm:design_review``.
     ("sm:selected", "art:code"): {
-        "system_prompt_role": "code-worker",
-        "instruction_trailer": (
-            "Open a PR titled appropriately with `Closes #{issue_number}` "
-            "in the body. Self-merge once CI is green. Do not --no-verify."
-        ),
+        "persona": "thinking",
+        "runtime": "claude-agent-sdk:opus",
+        "phase": "per_issue_design",
     },
     ("sm:selected", "art:config_change"): {
+        "persona": "worker",
+        "runtime": "claude-cli",
         "system_prompt_role": "code-worker",
         "instruction_trailer": (
             "Open a PR titled appropriately with `Closes #{issue_number}` "
@@ -238,6 +257,8 @@ SPAWN_MAP: dict[tuple[str, str], dict[str, str]] = {
         ),
     },
     ("sm:selected", "art:research_note"): {
+        "persona": "worker",
+        "runtime": "claude-cli",
         "system_prompt_role": "research-writer",
         "instruction_trailer": (
             "Produce a research note at "
@@ -249,6 +270,8 @@ SPAWN_MAP: dict[tuple[str, str], dict[str, str]] = {
         ),
     },
     ("sm:selected", "art:experiment"): {
+        "persona": "worker",
+        "runtime": "claude-cli",
         "system_prompt_role": "research-writer",
         "instruction_trailer": (
             "Same as research_note for v1. Produce a note with "
@@ -256,15 +279,26 @@ SPAWN_MAP: dict[tuple[str, str], dict[str, str]] = {
             "when complete."
         ),
     },
+    # SM v2 build lane. The per-issue speaking-agent loads the approved
+    # design note, dispatches the actual code change to a sub-agent via
+    # the Task tool, and posts ``[SM] build-complete pr=<url>`` when the
+    # sub-agent has opened a draft PR. The dispatcher transitions the
+    # issue ``sm:designed → sm:building`` at spawn time so
+    # :func:`_process_building` picks the linked PR up on the next pass.
+    ("sm:designed", "art:code"): {
+        "persona": "speaking",
+        "runtime": "claude-agent-sdk:opus",
+        "phase": "per_issue_build",
+    },
     # Issue #107 — code-quality reviewer for PRs at sm:reviewing. The
     # ``system_prompt_module`` is the dotted import path to
     # :data:`alice_speaking.review.code_reviewer.CODE_REVIEWER_SYSTEM_PROMPT`;
-    # the dispatcher's future ``(sm:reviewing, art:code)`` path will
-    # load it and drive a Sonnet sub-agent that returns the structured
-    # JSON verdict defined in that module. v1 dispatcher does NOT yet
-    # consume this entry from ``_process_reviewing`` — it sits here as
-    # the integration point for the follow-up wiring.
+    # the dispatcher's ``(sm:reviewing, art:code)`` reviewer wiring (a
+    # separate sub-issue) loads it and drives a Sonnet sub-agent that
+    # returns the structured JSON verdict defined in that module.
     ("sm:reviewing", "art:code"): {
+        "persona": "reviewer",
+        "runtime": "claude-agent-sdk:sonnet",
         "system_prompt_role": "code-reviewer",
         "system_prompt_module": (
             "alice_speaking.review.code_reviewer:CODE_REVIEWER_SYSTEM_PROMPT"
@@ -3671,6 +3705,10 @@ def _process_selected(
     log: Callable[[str], None],
     now_iso: Callable[[], str],
     get_issue: Callable[[int], dict[str, Any] | None] | None = None,
+    has_live_thinking_spawn: Callable[[int], bool] | None = None,
+    count_running_thinking: Callable[[], int] | None = None,
+    spawn_thinking: Callable[[dict[str, Any], str, str], str | None] | None = None,
+    max_concurrent_thinking_spawns: int = MAX_CONCURRENT_THINKING_SPAWNS,
 ) -> None:
     """Return-to-study check + Hello + T1 (selected → reviewing) + Phase 2
     spawn for one sm:selected issue.
@@ -3687,6 +3725,17 @@ def _process_selected(
     ``Depends on #N`` references on the body. ``None`` disables the
     dependency gate entirely — production callers always bind it; tests
     that don't exercise the gate can leave it unset.
+
+    Spawn dispatch (sub-issue 7 / #186): the
+    :data:`SPAWN_MAP` row's ``persona`` field selects which spawn
+    machinery to invoke. ``persona == "thinking"`` (the SM v2 design
+    lane for ``art:code``) routes to ``spawn_thinking`` and gates
+    against the thinking-lane's dedup / concurrency helpers
+    (``has_live_thinking_spawn`` / ``count_running_thinking`` /
+    :data:`MAX_CONCURRENT_THINKING_SPAWNS`). All other personae
+    (``"worker"`` for ``art:config_change`` / ``art:research_note`` /
+    ``art:experiment``) route to the v1 ``spawn`` callable, same as
+    the pre-cutover behavior.
     """
     number = issue["number"]
     decision = evaluate_trust(issue, trusted_authors=trusted_authors)
@@ -3934,17 +3983,37 @@ def _process_selected(
         log(f"[sm-dispatcher] transitioned #{number}: selected → reviewing")
         return
 
-    # No linked PR yet — Phase 2 spawn path. Caller passes
-    # spawn/count_running/has_live_spawn=None to disable (tests that
-    # only care about hello/T1 paths can leave these out).
-    if spawn is None or count_running is None or has_live_spawn is None:
-        return
-
-    if (ACTIVE_SM_LABEL, art_label) not in SPAWN_MAP:
+    # No linked PR yet — Phase 2 spawn path.
+    spawn_config = SPAWN_MAP.get((ACTIVE_SM_LABEL, art_label))
+    if spawn_config is None:
         log(
             f"[sm-dispatcher] spawn skip #{number}: "
             f"unrecognized artifact {art_label!r}"
         )
+        return
+
+    persona = spawn_config.get("persona", "worker")
+
+    # Persona selects the spawn lane (sub-issue 7 / #186). The thinking
+    # lane uses its own dedup + concurrency helpers so a long-running
+    # design loop can't starve the v1 worker pool (and vice versa).
+    if persona == "thinking":
+        lane_spawn = spawn_thinking
+        lane_has_live = has_live_thinking_spawn
+        lane_count_running = count_running_thinking
+        lane_cap = max_concurrent_thinking_spawns
+        lane_label = "thinking"
+    else:
+        lane_spawn = spawn
+        lane_has_live = has_live_spawn
+        lane_count_running = count_running
+        lane_cap = max_concurrent_spawns
+        lane_label = "worker"
+
+    # Caller passes the lane's helpers as None to disable spawning
+    # entirely (tests that only care about hello/T1 paths take this
+    # escape hatch).
+    if lane_spawn is None or lane_count_running is None or lane_has_live is None:
         return
 
     # Issue #176 — gate the spawn on any unresolved hard dependency.
@@ -3965,31 +4034,33 @@ def _process_selected(
     # [SM] spawn-started audit comment is NOT consulted — if the
     # worker died after posting the comment but before opening a PR,
     # we want the next pass to retry, not be permanently gated by the
-    # comment. ``has_live_spawn`` also reaps any stale spawn-<N>-* dirs
-    # into ``.finished/`` so they don't keep getting re-checked.
-    if has_live_spawn(number):
+    # comment. The lane-scoped helper also reaps stale ``spawn-<N>-*``
+    # dirs into ``.finished/`` so they don't keep getting re-checked.
+    if lane_has_live(number):
         log(
-            f"[sm-dispatcher] spawn skip #{number}: live spawn dir "
-            f"already running"
+            f"[sm-dispatcher] spawn skip #{number}: live {lane_label} "
+            f"spawn dir already running"
         )
         return
 
-    live = count_running()
-    if live >= max_concurrent_spawns:
+    live = lane_count_running()
+    if live >= lane_cap:
         log(
-            f"[sm-dispatcher] spawn skip #{number}: concurrency cap "
-            f"reached ({live}/{max_concurrent_spawns}) — queued for "
+            f"[sm-dispatcher] spawn skip #{number}: {lane_label} "
+            f"concurrency cap reached ({live}/{lane_cap}) — queued for "
             f"next pass"
         )
         return
 
     if dry_run:
-        preview = compose_spawn_prompt(
-            issue, SPAWN_MAP[(ACTIVE_SM_LABEL, art_label)]
-        )[:240]
+        if persona == "thinking":
+            preview = compose_thinking_spawn_prompt(issue)[:240]
+        else:
+            preview = compose_spawn_prompt(issue, spawn_config)[:240]
         log(
-            f"[sm-dispatcher] DRY-RUN would spawn on #{number} "
-            f"art={art_label} (running={live}/{max_concurrent_spawns})"
+            f"[sm-dispatcher] DRY-RUN would spawn {lane_label} on "
+            f"#{number} art={art_label} "
+            f"(running={live}/{lane_cap})"
         )
         log(f"[sm-dispatcher] DRY-RUN prompt preview: {preview!r}")
         report.spawned += 1
@@ -3997,7 +4068,7 @@ def _process_selected(
         return
 
     try:
-        spawn_id = spawn(issue, art_label, repo)
+        spawn_id = lane_spawn(issue, art_label, repo)
     except GHCommandError as exc:
         log(f"[sm-dispatcher] failed to spawn on #{number}: {exc}")
         if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
@@ -5315,24 +5386,62 @@ def _process_designed(
     live_spawn_dir: Callable[[int], pathlib.Path | None] | None,
     dry_run: bool,
     log: Callable[[str], None],
+    has_live_speaking_spawn: Callable[[int], bool] | None = None,
+    count_running_speaking: Callable[[], int] | None = None,
+    spawn_speaking: Callable[[dict[str, Any], str, str], str | None] | None = None,
+    max_concurrent_speaking_spawns: int = MAX_CONCURRENT_SPEAKING_SPAWNS,
 ) -> None:
-    """sm:designed → sm:compacting: drop the compact signal, flip the label.
+    """sm:designed → next-phase routing for one issue.
 
-    Brief checkpoint state. On entry we:
+    For ``(sm:designed, art:code)`` (sub-issue 7 / #186): spawn the
+    per-issue speaking-agent build lane (:func:`spawn_speaking_agent`),
+    then transition the issue ``sm:designed → sm:building`` so
+    :func:`_process_building` waits for the speaking-agent's draft PR
+    on the next pass.
 
-      1. Locate the live per-issue spawn dir.
-      2. Write ``<spawn-dir>/compact.signal`` so the agent picks it
-         up on its next iteration and triggers the compaction +
-         BUILD-phase restart (per sub-issue 3's PhaseRunner).
-      3. Transition the issue ``sm:designed → sm:compacting``.
+    For other artifact labels with no ``(sm:designed, *)`` row in
+    :data:`SPAWN_MAP`: fall back to the legacy compact-signal behavior
+    (locate the live thinking-agent spawn dir, drop a
+    ``compact.signal``, transition ``sm:designed → sm:compacting``).
+    The compact lane is preserved so an in-flight pre-cutover agent on
+    a non-art:code task can finish without the dispatcher stranding it
+    at ``sm:designed``.
 
-    If there is no live spawn dir for the issue we log a WARNING and
-    stay at ``sm:designed`` — without a running agent the signal would
-    go unread, and silently transitioning would leave the issue stuck
-    at ``sm:compacting`` with no agent to advance it.
+    Speaking-lane spawn helpers default to ``None`` for tests that
+    only exercise the compact-signal path; production wires them in
+    :func:`run`.
     """
     number = issue["number"]
+    art_label = "art:unknown"
+    for name in _label_names(issue):
+        if name.startswith("art:") and name in ART_LABEL_WHITELIST:
+            art_label = name
+            break
 
+    spawn_config = SPAWN_MAP.get((DESIGNED_SM_LABEL, art_label))
+    persona = spawn_config.get("persona") if spawn_config else None
+
+    if persona == "speaking":
+        _designed_spawn_speaking(
+            issue=issue,
+            repo=repo,
+            number=number,
+            art_label=art_label,
+            report=report,
+            post_comment=post_comment,
+            edit_labels=edit_labels,
+            has_live_speaking_spawn=has_live_speaking_spawn,
+            count_running_speaking=count_running_speaking,
+            spawn_speaking=spawn_speaking,
+            max_concurrent_speaking_spawns=max_concurrent_speaking_spawns,
+            dry_run=dry_run,
+            log=log,
+        )
+        return
+
+    # Legacy compact-signal lane (pre-cutover thinking-agent that
+    # restarts itself in build mode). Kept so an in-flight non-art:code
+    # issue at sm:designed isn't stranded by the cutover.
     spawn_path: pathlib.Path | None = None
     if live_spawn_dir is not None:
         spawn_path = live_spawn_dir(number)
@@ -5392,6 +5501,138 @@ def _process_designed(
     log(
         f"[sm-dispatcher] transitioned #{number}: "
         f"designed → compacting ({reason})"
+    )
+
+
+def _designed_spawn_speaking(
+    *,
+    issue: dict[str, Any],
+    repo: str,
+    number: int,
+    art_label: str,
+    report: RunReport,
+    post_comment: PostCommentFn,
+    edit_labels: EditLabelsFn,
+    has_live_speaking_spawn: Callable[[int], bool] | None,
+    count_running_speaking: Callable[[], int] | None,
+    spawn_speaking: Callable[[dict[str, Any], str, str], str | None] | None,
+    max_concurrent_speaking_spawns: int,
+    dry_run: bool,
+    log: Callable[[str], None],
+) -> None:
+    """sm:designed → sm:building: spawn the speaking-agent build lane.
+
+    Sub-issue 7 (#186). Mirrors the spawn block in
+    :func:`_process_selected` for the thinking lane: dedup on a live
+    speaking-lane spawn dir, gate on the lane's concurrency cap, then
+    invoke ``spawn_speaking`` and transition the issue's label to
+    ``sm:building`` so the next dispatcher pass picks the draft PR up
+    via :func:`_process_building`.
+
+    The transition runs BEFORE the spawn — without it, the next pass
+    would re-enter ``_process_designed`` and double-spawn (the live
+    spawn dir dedup would only catch this AFTER the first spawn has
+    written its pidfile; a slow Popen could allow a race). Posting the
+    label change first also matches the pattern in
+    ``_process_selected`` for the v1 worker pool.
+    """
+    if (
+        spawn_speaking is None
+        or has_live_speaking_spawn is None
+        or count_running_speaking is None
+    ):
+        log(
+            f"[sm-dispatcher] designed #{number}: speaking-lane spawn "
+            f"machinery not wired — leaving at sm:designed"
+        )
+        return
+
+    if has_live_speaking_spawn(number):
+        log(
+            f"[sm-dispatcher] designed #{number}: live speaking spawn "
+            f"dir already running — skipping spawn"
+        )
+        return
+
+    live = count_running_speaking()
+    if live >= max_concurrent_speaking_spawns:
+        log(
+            f"[sm-dispatcher] designed #{number}: speaking concurrency "
+            f"cap reached ({live}/{max_concurrent_speaking_spawns}) — "
+            f"queued for next pass"
+        )
+        return
+
+    reason = "build-started: speaking-agent spawned"
+    transition_body = render_transition_comment(
+        DESIGNED_SM_LABEL, BUILDING_SM_LABEL, reason
+    )
+
+    if dry_run:
+        log(
+            f"[sm-dispatcher] DRY-RUN would spawn speaking on #{number} "
+            f"art={art_label} "
+            f"(running={live}/{max_concurrent_speaking_spawns}) and "
+            f"transition designed → building"
+        )
+        report.spawned += 1
+        report.spawn_records.append((number, art_label, "<dry-run>"))
+        report.transitioned += 1
+        report.transitions.append(
+            (number, DESIGNED_SM_LABEL, BUILDING_SM_LABEL)
+        )
+        return
+
+    # Spawn first — the speaking-agent posts its own
+    # [SM] speaking-spawn-started audit comment before launching the
+    # shim, so failure to spawn leaves a recoverable audit trail and
+    # doesn't move the label.
+    try:
+        spawn_id = spawn_speaking(issue, art_label, repo)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] designed #{number}: failed to spawn "
+            f"speaking-agent: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+    except OSError as exc:
+        log(
+            f"[sm-dispatcher] designed #{number}: speaking spawn "
+            f"OS error: {exc}"
+        )
+        return
+    if spawn_id is None:
+        return
+    report.spawned += 1
+    report.spawn_records.append((number, art_label, spawn_id))
+
+    # Transition designed → building so _process_building picks the
+    # draft PR up on the next pass.
+    try:
+        edit_labels(
+            repo,
+            number,
+            add=[BUILDING_SM_LABEL],
+            remove=[DESIGNED_SM_LABEL],
+        )
+        post_comment(repo, number, transition_body)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] designed #{number}: "
+            f"failed to transition to building: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        return
+    report.transitioned += 1
+    report.transitions.append(
+        (number, DESIGNED_SM_LABEL, BUILDING_SM_LABEL)
+    )
+    log(
+        f"[sm-dispatcher] transitioned #{number}: "
+        f"designed → building (speaking spawn_id={spawn_id})"
     )
 
 
@@ -5992,6 +6233,12 @@ def run(
     live_spawn_dir: Callable[[int], pathlib.Path | None] | None = None,
     count_running: Callable[[], int] | None = None,
     spawn: Callable[[dict[str, Any], str, str], str | None] | None = None,
+    has_live_thinking_spawn: Callable[[int], bool] | None = None,
+    count_running_thinking: Callable[[], int] | None = None,
+    spawn_thinking: Callable[[dict[str, Any], str, str], str | None] | None = None,
+    has_live_speaking_spawn: Callable[[int], bool] | None = None,
+    count_running_speaking: Callable[[], int] | None = None,
+    spawn_speaking: Callable[[dict[str, Any], str, str], str | None] | None = None,
     spawn_rebase: Callable[[dict[str, Any], str, str, str], str | None] | None = None,
     attempt_rebase: Callable[[str], dict[str, Any]] | None = None,
     enable_rebase: bool = True,
@@ -5999,6 +6246,8 @@ def run(
     proactive_reap: Callable[[], tuple[int, int]] | None = None,
     enable_spawn: bool = True,
     max_concurrent_spawns: int = MAX_CONCURRENT_SPAWNS,
+    max_concurrent_thinking_spawns: int = MAX_CONCURRENT_THINKING_SPAWNS,
+    max_concurrent_speaking_spawns: int = MAX_CONCURRENT_SPEAKING_SPAWNS,
     post_merge_cleanup: PostMergeCleanupFn | None = None,
     enable_cleanup: bool = True,
     worker_repo_path: pathlib.Path = WORKER_REPO_PATH,
@@ -6062,6 +6311,54 @@ def run(
             def proactive_reap() -> tuple[int, int]:
                 return proactive_reap_dead_spawns(
                     SPAWN_DIR, get_issue=get_issue, log=log
+                )
+        # Sub-issue 7 (#186): SM v2 thinking + speaking lane bindings.
+        # Each lane has its own spawn dir, concurrency cap, and audit
+        # prefix so they don't share dedup / capacity with the v1
+        # worker pool.
+        if has_live_thinking_spawn is None:
+            def has_live_thinking_spawn(number: int) -> bool:
+                return has_live_thinking_spawn_for_issue(
+                    number, SM_THINKING_SPAWN_DIR, log=log
+                )
+        if count_running_thinking is None:
+            def count_running_thinking() -> int:
+                return count_running_thinking_spawns(
+                    SM_THINKING_SPAWN_DIR, log=log
+                )
+        if spawn_thinking is None:
+            def spawn_thinking(
+                issue: dict[str, Any], art_label: str, repo: str
+            ) -> str | None:
+                return spawn_thinking_agent(
+                    issue,
+                    art_label,
+                    repo,
+                    post_comment=post_comment,
+                    log=log,
+                    now_iso=now_iso,
+                )
+        if has_live_speaking_spawn is None:
+            def has_live_speaking_spawn(number: int) -> bool:
+                return has_live_speaking_spawn_for_issue(
+                    number, SM_SPEAKING_SPAWN_DIR, log=log
+                )
+        if count_running_speaking is None:
+            def count_running_speaking() -> int:
+                return count_running_speaking_spawns(
+                    SM_SPEAKING_SPAWN_DIR, log=log
+                )
+        if spawn_speaking is None:
+            def spawn_speaking(
+                issue: dict[str, Any], art_label: str, repo: str
+            ) -> str | None:
+                return spawn_speaking_agent(
+                    issue,
+                    art_label,
+                    repo,
+                    post_comment=post_comment,
+                    log=log,
+                    now_iso=now_iso,
                 )
 
     # Issue #127 — bind the production cleanup callable when enabled and
@@ -6193,6 +6490,10 @@ def run(
                     count_running=count_running,
                     spawn=spawn,
                     max_concurrent_spawns=max_concurrent_spawns,
+                    has_live_thinking_spawn=has_live_thinking_spawn,
+                    count_running_thinking=count_running_thinking,
+                    spawn_thinking=spawn_thinking,
+                    max_concurrent_thinking_spawns=max_concurrent_thinking_spawns,
                     dry_run=dry_run,
                     log=log,
                     now_iso=now_iso,
@@ -6285,6 +6586,10 @@ def run(
                     post_comment=post_comment,
                     edit_labels=edit_labels,
                     live_spawn_dir=live_spawn_dir,
+                    has_live_speaking_spawn=has_live_speaking_spawn,
+                    count_running_speaking=count_running_speaking,
+                    spawn_speaking=spawn_speaking,
+                    max_concurrent_speaking_spawns=max_concurrent_speaking_spawns,
                     dry_run=dry_run,
                     log=log,
                 )

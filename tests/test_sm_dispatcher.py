@@ -1322,8 +1322,14 @@ def test_phase2_spawn_fires_on_code_artifact_with_no_prior_spawn(
     state_path,
     tmp_path,
 ) -> None:
-    """sm:selected + art:code + no [SM] spawn-started → fires Popen,
-    posts spawn-started, writes pidfile and prompt.txt.
+    """sm:selected + art:config_change + no [SM] spawn-started → fires
+    Popen, posts spawn-started, writes pidfile and prompt.txt.
+
+    Issue #186 cutover: ``(sm:selected, art:code)`` now routes to the
+    thinking-agent lane (covered separately by
+    ``test_phase2_selected_art_code_routes_to_thinking_lane``); the v1
+    code-worker pool fires on ``art:config_change`` and the research
+    artifact rows.
     """
     spawn_dir = tmp_path / "spawns"
     spawn_dir.mkdir()
@@ -1348,7 +1354,11 @@ def test_phase2_spawn_fires_on_code_artifact_with_no_prior_spawn(
             log=lambda _m: None,
         )
 
-    issues = [_make_issue(200, sm_labels=("sm:selected",), art_labels=("art:code",))]
+    issues = [
+        _make_issue(
+            200, sm_labels=("sm:selected",), art_labels=("art:config_change",)
+        )
+    ]
 
     exit_code, report = sm.run(
         repo="jcronq/alice",
@@ -1387,7 +1397,7 @@ def test_phase2_spawn_fires_on_code_artifact_with_no_prior_spawn(
     assert any(b.startswith("[SM] spawn-started") for b in bodies)
     started = [b for b in bodies if b.startswith("[SM] spawn-started")][0]
     assert "task=#200" in started
-    assert "artifact=art:code" in started
+    assert "artifact=art:config_change" in started
     assert "runtime=claude-cli" in started
     # spawn dir contains prompt.txt + pidfile + session_id (#137).
     spawn_subdirs = [
@@ -1517,7 +1527,11 @@ def test_phase2_live_spawn_dir_skips_new_spawn(
             log=lambda _m: None,
         )
 
-    issues = [_make_issue(202, sm_labels=("sm:selected",), art_labels=("art:code",))]
+    issues = [
+        _make_issue(
+            202, sm_labels=("sm:selected",), art_labels=("art:config_change",)
+        )
+    ]
 
     # Pre-seed dedup so the hello doesn't post either; we're testing
     # spawn dedup, not hello dedup.
@@ -1594,7 +1608,11 @@ def test_phase2_stale_spawn_dir_falls_through_and_respawns(
             log=lambda _m: None,
         )
 
-    issues = [_make_issue(203, sm_labels=("sm:selected",), art_labels=("art:code",))]
+    issues = [
+        _make_issue(
+            203, sm_labels=("sm:selected",), art_labels=("art:config_change",)
+        )
+    ]
 
     # Pre-seed dedup so the hello doesn't post either.
     state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1666,7 +1684,9 @@ def test_phase2_concurrency_cap_queues_excess_spawns(
 
     issues = [
         _make_issue(
-            301 + i, sm_labels=("sm:selected",), art_labels=("art:code",)
+            301 + i,
+            sm_labels=("sm:selected",),
+            art_labels=("art:config_change",),
         )
         for i in range(3)
     ]
@@ -1859,7 +1879,11 @@ def test_phase2_dry_run_logs_spawn_intent_without_popen(
             log=lambda _m: None,
         )
 
-    issues = [_make_issue(601, sm_labels=("sm:selected",), art_labels=("art:code",))]
+    issues = [
+        _make_issue(
+            601, sm_labels=("sm:selected",), art_labels=("art:config_change",)
+        )
+    ]
 
     exit_code, report = sm.run(
         repo="jcronq/alice",
@@ -1885,10 +1909,10 @@ def test_phase2_dry_run_logs_spawn_intent_without_popen(
     assert popens == []
     # No [SM] spawn-started posted in dry-run.
     assert not any("spawn-started" in b for _r, _n, b in recorder.posted)
-    assert any("DRY-RUN would spawn on #601" in m for m in logged)
+    assert any("DRY-RUN would spawn worker on #601" in m for m in logged)
     assert any("DRY-RUN prompt preview" in m for m in logged)
     # spawn_records reflects intent.
-    assert report.spawn_records == [(601, "art:code", "<dry-run>")]
+    assert report.spawn_records == [(601, "art:config_change", "<dry-run>")]
 
 
 def test_phase2_done_line_includes_spawned_counter(state_path) -> None:
@@ -4789,7 +4813,19 @@ def _make_live_spawn_dir(tmp_path: pathlib.Path, issue_number: int) -> pathlib.P
 def test_designed_writes_signal_and_transitions_to_compacting(
     state_path: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
-    issues = [_design_issue(420, sm_label="sm:designed")]
+    """Legacy compact-signal lane still fires for non-art:code artifacts.
+
+    Sub-issue #186 routed ``(sm:designed, art:code)`` to the
+    speaking-agent build lane, but the compact-signal handler stays
+    in place for any artifact without a ``(sm:designed, *)`` row in
+    :data:`SPAWN_MAP` — so an in-flight pre-cutover thinking-agent on
+    a non-code task can still finish via the same compaction restart.
+    """
+    issues = [
+        _design_issue(
+            420, sm_label="sm:designed", art_labels=("art:research_note",)
+        )
+    ]
     spawn_dir = _make_live_spawn_dir(tmp_path, 420)
     recorder = Recorder()
     label_rec = LabelRecorder()
@@ -4827,7 +4863,11 @@ def test_designed_writes_signal_and_transitions_to_compacting(
 def test_designed_without_live_spawn_stays_for_human_triage(
     state_path: pathlib.Path,
 ) -> None:
-    issues = [_design_issue(421, sm_label="sm:designed")]
+    issues = [
+        _design_issue(
+            421, sm_label="sm:designed", art_labels=("art:research_note",)
+        )
+    ]
     recorder = Recorder()
     label_rec = LabelRecorder()
     logged: list[str] = []
@@ -7307,8 +7347,13 @@ def _make_issue_with_body(
     *,
     author: str = "jcronq",
     sm_labels: tuple[str, ...] = ("sm:selected",),
-    art_labels: tuple[str, ...] = ("art:code",),
+    art_labels: tuple[str, ...] = ("art:config_change",),
 ) -> dict:
+    # Default art:config_change so the v1 worker spawn lane fires for
+    # this fixture's tests (sub-issue #186 routes ``(sm:selected,
+    # art:code)`` through the thinking-agent lane instead, which uses
+    # different machinery). Tests that need the thinking-agent path
+    # pass ``art_labels=("art:code",)`` explicitly.
     issue = _make_issue(
         number, author=author, sm_labels=sm_labels, art_labels=art_labels
     )
@@ -7890,3 +7935,503 @@ def test_deps_blocked_dep_dry_run_does_not_post(state_path) -> None:
     # Dry-run: no comments actually posted, no label edits applied.
     assert recorder.posted == []
     assert label_rec.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #186 — SPAWN_MAP cutover routing
+# ---------------------------------------------------------------------------
+#
+# The cutover wires ``(sm:selected, art:code)`` to spawn_thinking_agent
+# and ``(sm:designed, art:code)`` to spawn_speaking_agent. The v1
+# claude-cli code-worker pool is no longer the path for art:code at
+# sm:selected; it still fires for art:config_change and the research
+# artifact rows.
+
+
+def test_spawn_map_selected_art_code_row_targets_thinking_persona() -> None:
+    """The (sm:selected, art:code) row carries persona=thinking after the
+    cutover; the v1 ``system_prompt_role``/``instruction_trailer`` keys
+    are not present on this row because the thinking-agent composes its
+    own prompt in :func:`compose_thinking_spawn_prompt`."""
+    row = sm.SPAWN_MAP[("sm:selected", "art:code")]
+    assert row["persona"] == "thinking"
+    assert row["runtime"] == "claude-agent-sdk:opus"
+    assert row["phase"] == "per_issue_design"
+    # No worker-prompt fields on the thinking row.
+    assert "system_prompt_role" not in row
+    assert "instruction_trailer" not in row
+
+
+def test_spawn_map_designed_art_code_row_targets_speaking_persona() -> None:
+    """The (sm:designed, art:code) row carries persona=speaking after the
+    cutover."""
+    row = sm.SPAWN_MAP[("sm:designed", "art:code")]
+    assert row["persona"] == "speaking"
+    assert row["runtime"] == "claude-agent-sdk:opus"
+    assert row["phase"] == "per_issue_build"
+
+
+def test_spawn_map_reviewing_art_code_row_preserved() -> None:
+    """The (sm:reviewing, art:code) row from PR #109 must survive the
+    cutover (regression). Its ``system_prompt_module`` is what the
+    Sonnet code-reviewer wiring (separate sub-issue) consumes."""
+    row = sm.SPAWN_MAP[("sm:reviewing", "art:code")]
+    assert row["persona"] == "reviewer"
+    assert (
+        row["system_prompt_module"]
+        == "alice_speaking.review.code_reviewer:CODE_REVIEWER_SYSTEM_PROMPT"
+    )
+    assert "code-reviewer" in row["system_prompt_role"]
+
+
+def test_spawn_map_worker_rows_still_carry_claude_cli_runtime() -> None:
+    """Non-code artifact rows at sm:selected still spawn the v1 worker
+    pool (claude-cli). Locks in that the cutover only re-routes art:code
+    — art:config_change / art:research_note / art:experiment stay on
+    spawn_agent."""
+    for art in ("art:config_change", "art:research_note", "art:experiment"):
+        row = sm.SPAWN_MAP[("sm:selected", art)]
+        assert row["persona"] == "worker", art
+        assert row["runtime"] == "claude-cli", art
+
+
+def _track_spawn(records):
+    """Build a (spawn_callable, list-of-calls) pair so a test can
+    assert which lane the dispatcher routed an issue through."""
+
+    def call(issue, art_label, repo):
+        sid = f"spawn-{issue['number']}-stub"
+        records.append((issue["number"], art_label, sid))
+        return sid
+
+    return call
+
+
+def test_phase2_selected_art_code_routes_to_thinking_lane(
+    state_path,
+) -> None:
+    """sm:selected + art:code → spawn_thinking fires, spawn (v1 worker)
+    does NOT. The audit-comment counters / spawn_records bookkeeping
+    is identical to the worker path so existing telemetry stays valid."""
+    thinking_calls: list = []
+
+    def spawn_worker(*_a, **_kw):  # pragma: no cover — must not fire
+        raise AssertionError(
+            "v1 worker spawn fired for (sm:selected, art:code) after cutover"
+        )
+
+    def spawn_speaking_unused(*_a, **_kw):  # pragma: no cover — must not fire
+        raise AssertionError("speaking spawn fired at sm:selected")
+
+    issues = [_make_issue(700, art_labels=("art:code",))]
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        # v1 worker lane is wired but must not fire for art:code.
+        has_live_spawn=lambda _n: False,
+        count_running=lambda: 0,
+        spawn=spawn_worker,
+        # Thinking lane wired; this is the lane that should fire.
+        has_live_thinking_spawn=lambda _n: False,
+        count_running_thinking=lambda: 0,
+        spawn_thinking=_track_spawn(thinking_calls),
+        # Speaking lane wired but only fires at sm:designed; assert it
+        # stays untouched at sm:selected.
+        has_live_speaking_spawn=lambda _n: False,
+        count_running_speaking=lambda: 0,
+        spawn_speaking=spawn_speaking_unused,
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 1
+    assert thinking_calls == [(700, "art:code", "spawn-700-stub")]
+    assert report.spawn_records == [(700, "art:code", "spawn-700-stub")]
+
+
+def test_phase2_selected_art_config_change_still_routes_to_v1_worker(
+    state_path,
+) -> None:
+    """sm:selected + art:config_change → v1 spawn fires, spawn_thinking
+    must NOT. Pins the cutover's blast radius: only art:code re-routes."""
+    worker_calls: list = []
+
+    def spawn_thinking_unused(*_a, **_kw):  # pragma: no cover — must not fire
+        raise AssertionError(
+            "thinking spawn fired for art:config_change after cutover"
+        )
+
+    issues = [_make_issue(701, art_labels=("art:config_change",))]
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        has_live_spawn=lambda _n: False,
+        count_running=lambda: 0,
+        spawn=_track_spawn(worker_calls),
+        has_live_thinking_spawn=lambda _n: False,
+        count_running_thinking=lambda: 0,
+        spawn_thinking=spawn_thinking_unused,
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 1
+    assert worker_calls == [(701, "art:config_change", "spawn-701-stub")]
+
+
+def test_phase2_selected_art_code_mid_flight_v1_does_not_double_spawn(
+    state_path, tmp_path
+) -> None:
+    """Migration risk (from #186): an issue with a live v1 worker spawn
+    dir already running when the cutover lands. The thinking-lane
+    ``has_live_spawn`` check sees no thinking spawn, but production
+    wiring also checks the v1 spawn dir for dedup. We assert the
+    dispatcher does NOT spawn a thinking-agent on top of a live v1
+    worker — both lane helpers consulted, neither fires twice."""
+    import os as _os
+
+    v1_spawn_dir = tmp_path / "spawns"
+    v1_spawn_dir.mkdir()
+    live_v1 = v1_spawn_dir / "spawn-702-1778600000"
+    live_v1.mkdir()
+    (live_v1 / "pidfile").write_text(str(_os.getpid()))
+
+    thinking_calls: list = []
+
+    def spawn_worker_unused(*_a, **_kw):  # pragma: no cover — must not fire
+        raise AssertionError("v1 worker spawn called during migration")
+
+    issues = [_make_issue(702, art_labels=("art:code",))]
+    # ``has_live_thinking_spawn`` reports the v1 spawn dir as a live
+    # spawn for #702 too — the production deploy treats a mid-flight
+    # v1 worker as a dedup signal so the cutover doesn't double-fire
+    # an agent on the same issue.
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        has_live_spawn=lambda n: sm.has_live_spawn_for_issue(n, v1_spawn_dir),
+        count_running=lambda: 1,
+        spawn=spawn_worker_unused,
+        has_live_thinking_spawn=lambda n: sm.has_live_spawn_for_issue(
+            n, v1_spawn_dir
+        ),
+        count_running_thinking=lambda: 0,
+        spawn_thinking=_track_spawn(thinking_calls),
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 0
+    assert thinking_calls == []
+    # Live v1 spawn dir was not reaped (it's still alive).
+    assert live_v1.exists()
+
+
+def test_phase2_selected_art_code_thinking_concurrency_cap_skips(
+    state_path,
+) -> None:
+    """Thinking lane has its own concurrency cap. With the cap reached,
+    spawn_thinking must not fire even though the v1 worker pool may be
+    idle."""
+    thinking_calls: list = []
+
+    issues = [_make_issue(703, art_labels=("art:code",))]
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        has_live_spawn=lambda _n: False,
+        count_running=lambda: 0,
+        spawn=_no_call,
+        has_live_thinking_spawn=lambda _n: False,
+        count_running_thinking=lambda: 5,
+        spawn_thinking=_track_spawn(thinking_calls),
+        max_concurrent_thinking_spawns=2,
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 0
+    assert thinking_calls == []
+
+
+def test_phase2_selected_art_code_dry_run_uses_thinking_prompt_preview(
+    state_path,
+) -> None:
+    """Dry-run for the thinking lane previews the thinking-agent prompt,
+    not the v1 worker prompt."""
+    thinking_calls: list = []
+    logged: list[str] = []
+
+    issues = [_make_issue(704, art_labels=("art:code",))]
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        has_live_spawn=lambda _n: False,
+        count_running=lambda: 0,
+        spawn=_no_call,
+        has_live_thinking_spawn=lambda _n: False,
+        count_running_thinking=lambda: 0,
+        spawn_thinking=_track_spawn(thinking_calls),
+        proactive_reap=lambda: (0, 0),
+        dry_run=True,
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 1
+    # spawn callable not invoked in dry-run.
+    assert thinking_calls == []
+    assert any(
+        "DRY-RUN would spawn thinking on #704" in m for m in logged
+    ), logged
+    # Prompt preview is the thinking-agent template, not the worker one.
+    preview = [m for m in logged if "prompt preview" in m]
+    assert preview
+    assert "thinking-agent" in preview[0]
+    assert "per_issue_design" in preview[0]
+
+
+def test_phase2_designed_art_code_routes_to_speaking_and_transitions(
+    state_path,
+) -> None:
+    """sm:designed + art:code → spawn_speaking fires, label flips
+    designed → building, [SM] transition audit comment posts. The
+    legacy compact-signal path must NOT fire for art:code."""
+    speaking_calls: list = []
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+
+    def live_spawn_dir_unused(_n):  # pragma: no cover — legacy lane shouldn't fire
+        raise AssertionError(
+            "compact-signal lane consulted for art:code after cutover"
+        )
+
+    issues = [
+        _design_issue(
+            720, sm_label="sm:designed", art_labels=("art:code",)
+        )
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=recorder,
+        edit_labels=label_rec,
+        live_spawn_dir=live_spawn_dir_unused,
+        has_live_speaking_spawn=lambda _n: False,
+        count_running_speaking=lambda: 0,
+        spawn_speaking=_track_spawn(speaking_calls),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 1
+    assert speaking_calls == [(720, "art:code", "spawn-720-stub")]
+    # Label transition designed → building applied.
+    assert report.transitioned == 1
+    assert (720, "sm:designed", "sm:building") in report.transitions
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:building"]
+    assert edit["remove"] == ["sm:designed"]
+    # Transition audit comment carries the build-started reason.
+    bodies = [b for _r, _n, b in recorder.posted]
+    assert any(
+        "from=designed to=building" in b and "build-started" in b
+        for b in bodies
+    )
+
+
+def test_phase2_designed_art_code_live_speaking_spawn_skips(state_path) -> None:
+    """Designed → speaking dedup: if a speaking spawn dir is already
+    running for the issue, the dispatcher does not double-spawn and the
+    label stays at sm:designed."""
+    speaking_calls: list = []
+    label_rec = LabelRecorder()
+
+    issues = [
+        _design_issue(
+            721, sm_label="sm:designed", art_labels=("art:code",)
+        )
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        has_live_speaking_spawn=lambda _n: True,
+        count_running_speaking=lambda: 1,
+        spawn_speaking=_track_spawn(speaking_calls),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 0
+    assert speaking_calls == []
+    assert label_rec.calls == []
+
+
+def test_phase2_designed_art_code_concurrency_cap_skips(state_path) -> None:
+    """Speaking lane has its own concurrency cap; with the cap reached
+    we leave the issue at sm:designed for the next pass."""
+    speaking_calls: list = []
+    label_rec = LabelRecorder()
+
+    issues = [
+        _design_issue(
+            722, sm_label="sm:designed", art_labels=("art:code",)
+        )
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        has_live_speaking_spawn=lambda _n: False,
+        count_running_speaking=lambda: 4,
+        spawn_speaking=_track_spawn(speaking_calls),
+        max_concurrent_speaking_spawns=2,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 0
+    assert speaking_calls == []
+    assert label_rec.calls == []
+
+
+def test_phase2_designed_art_code_dry_run_records_intent_no_spawn(
+    state_path,
+) -> None:
+    """Dry-run for the speaking lane records intent and previews the
+    transition without invoking the spawn callable or applying labels."""
+    speaking_calls: list = []
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    logged: list[str] = []
+
+    issues = [
+        _design_issue(
+            723, sm_label="sm:designed", art_labels=("art:code",)
+        )
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=recorder,
+        edit_labels=label_rec,
+        has_live_speaking_spawn=lambda _n: False,
+        count_running_speaking=lambda: 0,
+        spawn_speaking=_track_spawn(speaking_calls),
+        dry_run=True,
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 1
+    assert report.transitioned == 1
+    assert (723, "sm:designed", "sm:building") in report.transitions
+    assert speaking_calls == []
+    assert recorder.posted == []
+    assert label_rec.calls == []
+    assert any(
+        "DRY-RUN would spawn speaking on #723" in m for m in logged
+    ), logged
+
+
+def test_phase2_audit_prefixes_distinct_across_personae() -> None:
+    """The three spawn lanes post distinct ``[SM] *-spawn-started``
+    prefixes so the comments module + viewer can disambiguate without a
+    body-shape cascade. Regression for sub-issue #186's audit-comment
+    contract."""
+    assert sm.SPAWN_STARTED_PREFIX == "[SM] spawn-started"
+    assert sm.THINKING_SPAWN_STARTED_PREFIX == "[SM] thinking-spawn-started"
+    assert sm.SPEAKING_SPAWN_STARTED_PREFIX == "[SM] speaking-spawn-started"
+    prefixes = {
+        sm.SPAWN_STARTED_PREFIX,
+        sm.THINKING_SPAWN_STARTED_PREFIX,
+        sm.SPEAKING_SPAWN_STARTED_PREFIX,
+    }
+    assert len(prefixes) == 3
+    # Neither prefix is a prefix of another (prevents accidental cascade
+    # collision).
+    for a in prefixes:
+        for b in prefixes:
+            if a is b:
+                continue
+            assert not a.startswith(b), f"{a!r} starts with {b!r}"
