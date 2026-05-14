@@ -8414,6 +8414,242 @@ def test_phase2_designed_art_code_dry_run_records_intent_no_spawn(
     ), logged
 
 
+# ---------------------------------------------------------------------------
+# Issue #202 — silent thinking-spawn loop guard
+# ---------------------------------------------------------------------------
+#
+# Regression for the failure mode observed on #194 (~1125 respawns over
+# 22h): the thinking-shim is a placeholder that exits clean without
+# posting ``[SM] design-ready``. The dispatcher's pre-#202 dedup only
+# consults the live spawn dir, so the next pass sees no live spawn and
+# re-spawns. The guard added detects "audit comment posted but no
+# design-ready ever followed AND no live spawn remains" and transitions
+# the issue to sm:blocked rather than looping.
+
+
+def test_selected_thinking_spawn_silent_completion_transitions_to_blocked(
+    state_path,
+) -> None:
+    """A prior ``[SM] thinking-spawn-started`` audit comment from a
+    trusted author with no follow-up ``[SM] design-ready`` and no live
+    spawn dir means the shim exited silently. The dispatcher must
+    transition the issue to sm:blocked and NOT re-spawn (issue #202)."""
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+
+    issues = [_make_issue(800, art_labels=("art:code",))]
+    comments = [
+        _audit_comment(
+            "[SM] thinking-spawn-started task=#800 artifact=art:code "
+            "phase=per_issue_design runtime=claude-agent-sdk:opus "
+            "spawn_id=spawn-800-1778600000 ts=2026-05-13T15:21:00+00:00"
+        ),
+    ]
+
+    def spawn_thinking_unused(*_a, **_kw):  # pragma: no cover — must not fire
+        raise AssertionError(
+            "silent-spawn-failure guard let the dispatcher re-spawn (loop)"
+        )
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=True,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        list_comments=lambda _r, _n: comments,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        has_live_spawn=lambda _n: False,
+        count_running=lambda: 0,
+        spawn=_no_call,
+        has_live_thinking_spawn=lambda _n: False,
+        count_running_thinking=lambda: 0,
+        spawn_thinking=spawn_thinking_unused,
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 0
+    assert report.transitioned == 1
+    assert (800, "sm:selected", "sm:blocked") in report.transitions
+    edit = label_rec.calls[-1]
+    assert edit["add"] == ["sm:blocked"]
+    assert edit["remove"] == ["sm:selected"]
+    bodies = [b for _r, _n, b in recorder.posted]
+    assert any(
+        "from=selected to=blocked" in b
+        and "without posting" in b
+        and "design-ready" in b
+        for b in bodies
+    ), bodies
+
+
+def test_selected_thinking_spawn_with_design_ready_does_not_block(
+    state_path,
+) -> None:
+    """If a prior ``[SM] design-ready`` follows the thinking-spawn-started
+    audit, the silent-failure guard must NOT fire — the design phase
+    produced its terminal signal, so the loop-detection precondition
+    isn't met (issue #202)."""
+    thinking_calls: list = []
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+
+    issues = [_make_issue(801, art_labels=("art:code",))]
+    comments = [
+        _audit_comment(
+            "[SM] thinking-spawn-started task=#801 artifact=art:code "
+            "phase=per_issue_design runtime=claude-agent-sdk:opus "
+            "spawn_id=spawn-801-1778600000 ts=2026-05-13T15:21:00+00:00"
+        ),
+        _audit_comment(
+            "[SM] design-ready note=[[2026-05-13-issue801-foo]] author=alice"
+        ),
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=True,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        list_comments=lambda _r, _n: comments,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        has_live_spawn=lambda _n: False,
+        count_running=lambda: 0,
+        spawn=_no_call,
+        has_live_thinking_spawn=lambda _n: False,
+        count_running_thinking=lambda: 0,
+        spawn_thinking=_track_spawn(thinking_calls),
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # Guard did NOT trip: no transition to sm:blocked.
+    blocked_transitions = [
+        t for t in report.transitions if t[2] == "sm:blocked"
+    ]
+    assert blocked_transitions == []
+    # Existing behaviour (re-spawn until a downstream handler relabels
+    # off sm:selected) is preserved — the guard is intentionally narrow.
+    assert report.spawned == 1
+    assert thinking_calls == [(801, "art:code", "spawn-801-stub")]
+
+
+def test_selected_thinking_spawn_first_pass_no_prior_audit_spawns(
+    state_path,
+) -> None:
+    """No prior ``[SM] thinking-spawn-started`` audit means this is a
+    first-pass spawn — the silent-failure guard must NOT short-circuit
+    and the normal spawn path must fire (issue #202)."""
+    thinking_calls: list = []
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+
+    issues = [_make_issue(802, art_labels=("art:code",))]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=True,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        list_comments=lambda _r, _n: [],
+        post_comment=recorder,
+        edit_labels=label_rec,
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        has_live_spawn=lambda _n: False,
+        count_running=lambda: 0,
+        spawn=_no_call,
+        has_live_thinking_spawn=lambda _n: False,
+        count_running_thinking=lambda: 0,
+        spawn_thinking=_track_spawn(thinking_calls),
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 1
+    assert thinking_calls == [(802, "art:code", "spawn-802-stub")]
+    blocked_transitions = [
+        t for t in report.transitions if t[2] == "sm:blocked"
+    ]
+    assert blocked_transitions == []
+
+
+def test_selected_thinking_spawn_silent_completion_untrusted_audit_ignored(
+    state_path,
+) -> None:
+    """A forged ``[SM] thinking-spawn-started`` from an untrusted author
+    must NOT trip the silent-failure guard — otherwise an outside
+    commenter could force any sm:selected issue into sm:blocked just by
+    pasting the audit prefix (issue #202)."""
+    thinking_calls: list = []
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+
+    issues = [_make_issue(803, art_labels=("art:code",))]
+    comments = [
+        _audit_comment(
+            "[SM] thinking-spawn-started task=#803 artifact=art:code "
+            "phase=per_issue_design runtime=claude-agent-sdk:opus "
+            "spawn_id=spawn-803-forged ts=2026-05-13T15:21:00+00:00",
+            author="random-drive-by",
+        ),
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=True,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        list_comments=lambda _r, _n: comments,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        has_live_spawn=lambda _n: False,
+        count_running=lambda: 0,
+        spawn=_no_call,
+        has_live_thinking_spawn=lambda _n: False,
+        count_running_thinking=lambda: 0,
+        spawn_thinking=_track_spawn(thinking_calls),
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # Forged audit ignored → normal first-pass spawn fires.
+    assert report.spawned == 1
+    assert thinking_calls == [(803, "art:code", "spawn-803-stub")]
+    blocked_transitions = [
+        t for t in report.transitions if t[2] == "sm:blocked"
+    ]
+    assert blocked_transitions == []
+
+
 def test_phase2_audit_prefixes_distinct_across_personae() -> None:
     """The three spawn lanes post distinct ``[SM] *-spawn-started``
     prefixes so the comments module + viewer can disambiguate without a
