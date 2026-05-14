@@ -51,6 +51,7 @@ from .phase import (
     build_vault_snapshot,
     detect_commission_notes,
     detect_conflict_notes,
+    record_conflict_deferral,
     select_phase,
 )
 from .runtime import PhaseRunner, load_phase_config
@@ -202,12 +203,23 @@ def _run_conflict_resolution(
     The real resolution logic (Sonnet review of the contradictory
     facts, merge or fork, archive into
     ``cortex-memory/conflicts/.resolved/``) is deferred. Today the
-    runner stub returns a ``deferred`` verdict and we log it; the
-    conflict note stays open until the follow-up commit lands.
+    runner stub returns a ``deferred`` verdict and we log it.
+
+    Bookkeeping (issue #203): every deferral bumps ``defer_count`` on
+    the conflict note's frontmatter via
+    :func:`alice_thinking.phase.record_conflict_deferral`. When the
+    count crosses :data:`alice_thinking.phase.CONFLICT_DEFER_THRESHOLD`
+    the note's ``status`` flips to ``stale`` so
+    :func:`detect_conflict_notes` filters it out — the wake stops
+    preempting on this note and resumes normal cadence work. The note
+    still lives in ``cortex-memory/conflicts/`` and gets picked up
+    when the real resolver ships.
     """
 
     runner = PhaseRunner()
     result = runner._run_conflict_resolution(ctx=None)  # type: ignore[arg-type]
+
+    defer_count, marked_stale = record_conflict_deferral(conflict_note)
 
     emitter.emit(
         "conflict_resolution",
@@ -215,6 +227,8 @@ def _run_conflict_resolution(
         verdict=result.get("verdict", "deferred"),
         conflict_path=str(conflict_note),
         summary=result.get("summary", ""),
+        defer_count=defer_count,
+        marked_stale=marked_stale,
     )
 
 

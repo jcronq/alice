@@ -640,6 +640,16 @@ def detect_commission_notes(mind: pathlib.Path) -> list[pathlib.Path]:
 # ---------------------------------------------------------------------------
 
 
+# After this many consecutive ``deferred`` verdicts on the same conflict
+# note, :func:`record_conflict_deferral` flips ``status`` to ``stale`` so
+# :func:`detect_conflict_notes` drops it from the queue. Real resolution
+# logic ships separately (see ``wake.py``'s ``_run_conflict_resolution``
+# docstring); this is a guardrail against the stub eating every wake.
+# Five wakes is enough to surface the conflict in telemetry without
+# burning hours of cadence on a no-op preempt (issue #203).
+CONFLICT_DEFER_THRESHOLD = 5
+
+
 def detect_conflict_notes(vault_dir: pathlib.Path) -> list[pathlib.Path]:
     """Return open conflict notes from ``cortex-memory/conflicts/``.
 
@@ -678,3 +688,98 @@ def detect_conflict_notes(vault_dir: pathlib.Path) -> list[pathlib.Path]:
 
     out.sort(key=lambda f: f.stat().st_mtime if f.exists() else 0.0)
     return out
+
+
+def _write_frontmatter_fields(text: str, *, updates: dict[str, str]) -> str:
+    """Rewrite frontmatter with the supplied key/value updates.
+
+    Existing keys are replaced in-line (line position preserved); new
+    keys are appended at the end of the frontmatter block. If the file
+    has no frontmatter, a fresh block is prepended.
+
+    Pairs with :func:`_parse_frontmatter` — the writer doesn't preserve
+    YAML quoting/anchors because the parser doesn't either. Sufficient
+    for the small set of fields thinking owns on conflict notes.
+    """
+
+    m = _FRONTMATTER_RE.match(text)
+    if not m:
+        header = ["---"] + [f"{k}: {v}" for k, v in updates.items()] + ["---", ""]
+        return "\n".join(header) + text
+
+    body = text[m.end():]
+    seen: set[str] = set()
+    out_lines: list[str] = []
+    for line in m.group(1).splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or ":" not in stripped:
+            out_lines.append(line)
+            continue
+        key, _, _ = stripped.partition(":")
+        key = key.strip()
+        if key in updates and key not in seen:
+            out_lines.append(f"{key}: {updates[key]}")
+            seen.add(key)
+        else:
+            out_lines.append(line)
+    for k, v in updates.items():
+        if k not in seen:
+            out_lines.append(f"{k}: {v}")
+    return "---\n" + "\n".join(out_lines) + "\n---\n" + body
+
+
+def record_conflict_deferral(
+    conflict_note: pathlib.Path,
+    *,
+    threshold: int = CONFLICT_DEFER_THRESHOLD,
+) -> tuple[int, bool]:
+    """Bump ``defer_count`` on a conflict note; flip to ``stale`` at threshold.
+
+    Wake-eating mitigation for issue #203. The conflict-resolution
+    preempt in :mod:`alice_thinking.wake` is a stub that always returns
+    ``verdict="deferred"`` and today never updates the note. Without a
+    counter, every subsequent wake re-detects the same open conflict,
+    defers, and exits — an infinite loop until something external marks
+    the file resolved.
+
+    Each call:
+
+    - Reads ``defer_count`` from the note's frontmatter (defaulting to
+      ``0`` if absent or malformed) and bumps it by one.
+    - When the new count reaches ``threshold``, flips ``status`` to
+      ``stale``. :func:`detect_conflict_notes` only returns notes whose
+      status is ``open`` (or absent), so the stale note drops out of
+      the queue and the wake proceeds to its normal body next tick.
+    - Rewrites the file in place, preserving the body and any other
+      frontmatter fields.
+
+    Returns ``(new_count, marked_stale)``. Returns ``(0, False)`` when
+    the file can't be read.
+    """
+
+    try:
+        text = conflict_note.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0, False
+
+    fm = _parse_frontmatter(text)
+    raw_prev = fm.get("defer_count", "0").strip().strip('"').strip("'")
+    try:
+        prev = int(raw_prev) if raw_prev else 0
+    except ValueError:
+        prev = 0
+
+    new_count = prev + 1
+    marked_stale = new_count >= threshold
+
+    updates: dict[str, str] = {"defer_count": str(new_count)}
+    if marked_stale:
+        updates["status"] = "stale"
+
+    new_text = _write_frontmatter_fields(text, updates=updates)
+    try:
+        conflict_note.write_text(new_text, encoding="utf-8")
+    except OSError:
+        pass
+
+    return new_count, marked_stale

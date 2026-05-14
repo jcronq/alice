@@ -16,6 +16,7 @@ import pathlib
 import pytest
 
 from alice_thinking.phase import (
+    CONFLICT_DEFER_THRESHOLD,
     Phase,
     PhaseConfig,
     PromptFragmentLoader,
@@ -23,6 +24,7 @@ from alice_thinking.phase import (
     build_vault_snapshot,
     detect_commission_notes,
     detect_conflict_notes,
+    record_conflict_deferral,
     select_phase,
 )
 
@@ -651,6 +653,107 @@ def test_detect_conflict_notes_sorted_oldest_first(tmp_path: pathlib.Path) -> No
     os.utime(b, (2000, 2000))
     found = detect_conflict_notes(tmp_path)
     assert found == [a, b]
+
+
+def test_record_conflict_deferral_increments_count(
+    tmp_path: pathlib.Path,
+) -> None:
+    """First defer writes ``defer_count: 1``; status stays ``open``."""
+    conflict = tmp_path / "c.md"
+    conflict.write_text("---\nstatus: open\n---\n\nbody\n")
+
+    new_count, marked_stale = record_conflict_deferral(conflict)
+
+    assert (new_count, marked_stale) == (1, False)
+    text = conflict.read_text()
+    assert "defer_count: 1" in text
+    assert "status: open" in text
+
+
+def test_record_conflict_deferral_bumps_existing_count(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Existing ``defer_count`` is read, incremented, and rewritten."""
+    conflict = tmp_path / "c.md"
+    conflict.write_text("---\nstatus: open\ndefer_count: 2\n---\n\nbody\n")
+
+    new_count, marked_stale = record_conflict_deferral(conflict)
+
+    assert new_count == 3
+    assert marked_stale is False
+    assert "defer_count: 3" in conflict.read_text()
+
+
+def test_record_conflict_deferral_flips_to_stale_at_threshold(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Reaching the threshold flips ``status`` to ``stale``."""
+    conflict = tmp_path / "c.md"
+    prev = CONFLICT_DEFER_THRESHOLD - 1
+    conflict.write_text(
+        f"---\nstatus: open\ndefer_count: {prev}\n---\n\nbody\n"
+    )
+
+    new_count, marked_stale = record_conflict_deferral(conflict)
+
+    assert new_count == CONFLICT_DEFER_THRESHOLD
+    assert marked_stale is True
+    text = conflict.read_text()
+    assert f"defer_count: {CONFLICT_DEFER_THRESHOLD}" in text
+    assert "status: stale" in text
+    assert "status: open" not in text
+
+
+def test_record_conflict_deferral_threshold_drops_note_from_queue(
+    tmp_path: pathlib.Path,
+) -> None:
+    """After ``CONFLICT_DEFER_THRESHOLD`` deferrals the note no longer
+    shows up in :func:`detect_conflict_notes` — exactly the bail-out
+    behaviour issue #203 needs (the wake stops preempting on it).
+    """
+    conflicts = tmp_path / "conflicts"
+    conflicts.mkdir()
+    note = conflicts / "stuck.md"
+    note.write_text("---\nstatus: open\n---\n\nbody\n")
+
+    marked_stale = False
+    for _ in range(CONFLICT_DEFER_THRESHOLD):
+        _, marked_stale = record_conflict_deferral(note)
+    assert marked_stale is True
+
+    assert detect_conflict_notes(tmp_path) == []
+
+
+def test_record_conflict_deferral_handles_missing_frontmatter(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A note with no frontmatter still gets a counter; subsequent
+    detection treats absent ``status`` as open (existing semantics)
+    while ``defer_count`` accumulates toward the threshold.
+    """
+    conflict = tmp_path / "c.md"
+    conflict.write_text("just a body, no frontmatter\n")
+
+    new_count, marked_stale = record_conflict_deferral(conflict)
+
+    assert (new_count, marked_stale) == (1, False)
+    text = conflict.read_text()
+    assert "defer_count: 1" in text
+    assert "just a body" in text
+
+
+def test_record_conflict_deferral_custom_threshold(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``threshold`` is configurable per call (tests / future tuning)."""
+    conflict = tmp_path / "c.md"
+    conflict.write_text("---\nstatus: open\n---\n\nbody\n")
+
+    _, marked_stale = record_conflict_deferral(conflict, threshold=2)
+    assert marked_stale is False
+    _, marked_stale = record_conflict_deferral(conflict, threshold=2)
+    assert marked_stale is True
+    assert "status: stale" in conflict.read_text()
 
 
 def test_select_phase_does_not_dispatch_to_conflict_resolution() -> None:
