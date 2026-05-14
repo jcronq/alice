@@ -54,17 +54,18 @@ def _read_count(db_path: pathlib.Path, slug: str) -> int | None:
 
 
 def test_seed_populates_from_frontmatter(tmp_path: pathlib.Path):
-    """A fresh indexer build leaves every row at 0; seeding from a
-    vault with non-zero frontmatter values lifts them into the DB."""
+    """After PR #196 the indexer itself seeds access_count from
+    frontmatter at build time, so the seed step is a reconciliation
+    that confirms the same values are present (SET semantics)."""
     vault = tmp_path / "vault"
     _write_note(vault / "alpha.md", title="Alpha", access_count=7)
     _write_note(vault / "beta.md", title="Beta", access_count=3)
     db_path = tmp_path / "index.db"
     build(vault, db_path)
 
-    # Pre-condition: indexer left every row at 0.
-    assert _read_count(db_path, "alpha") == 0
-    assert _read_count(db_path, "beta") == 0
+    # Indexer (post-#196) already seeded from frontmatter.
+    assert _read_count(db_path, "alpha") == 7
+    assert _read_count(db_path, "beta") == 3
 
     stats = seed(vault, db_path)
 
@@ -115,11 +116,12 @@ def test_seed_dry_run_does_not_write(tmp_path: pathlib.Path):
     db_path = tmp_path / "index.db"
     build(vault, db_path)
 
-    assert _read_count(db_path, "alpha") == 0
+    # Indexer (post-#196) already seeded from frontmatter.
+    assert _read_count(db_path, "alpha") == 9
     stats = seed(vault, db_path, dry_run=True)
 
-    # DB unchanged.
-    assert _read_count(db_path, "alpha") == 0
+    # DB unchanged by the dry-run seed.
+    assert _read_count(db_path, "alpha") == 9
     # Stats still report what would have been written.
     assert stats["dry_run"] is True
     assert stats["max_access_count"] == 9
