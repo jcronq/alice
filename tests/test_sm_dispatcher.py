@@ -3960,6 +3960,323 @@ def test_render_study_hint_audit_shape() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Issue #212 — sm:needs_study vault auto-advance
+# ---------------------------------------------------------------------------
+
+
+def _write_research_note(
+    research_dir: pathlib.Path,
+    slug: str,
+    *,
+    frontmatter: str,
+    body: str = "Research findings go here.\n",
+) -> pathlib.Path:
+    """Write a vault-shaped research note for the #212 vault-scan tests.
+
+    ``frontmatter`` is the literal text between the ``---`` fences, not
+    including the fences themselves. ``slug`` is the file stem — the
+    dispatcher uses it verbatim when synthesizing the ``findings=[[..]]``
+    wikilink in the study-complete audit comment.
+    """
+    research_dir.mkdir(parents=True, exist_ok=True)
+    path = research_dir / f"{slug}.md"
+    path.write_text(f"---\n{frontmatter}\n---\n{body}")
+    return path
+
+
+def test_needs_study_auto_advances_on_resolves_issue_frontmatter(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """Frontmatter ``resolves_issue: N`` triggers the synthetic study-complete."""
+    notes_dir = tmp_path / "notes"
+    research_dir = tmp_path / "research"
+    _write_research_note(
+        research_dir,
+        slug="2026-05-14-issue-400-findings",
+        frontmatter="resolves_issue: 400\nauthor: thinking",
+    )
+    # Hint already emitted on a prior pass — focus the test on step 3.
+    existing_hint_audit = _audit_comment(
+        "[SM] study-hint-written task=#400 path=/tmp/x.md ts=2026-05-12T00:00:00Z"
+    )
+    issues = [_needs_study_issue(400, art_labels=("art:code",))]
+
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [existing_hint_audit],
+        post_comment=recorder,
+        edit_labels=label_rec,
+        notes_dir=notes_dir,
+        research_dir=research_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # The synthetic study-complete is the only thing posted this pass;
+    # the transition itself happens on the *next* pass via the
+    # existing comment-driven path (the freshly-posted comment isn't
+    # in the comments list we already fetched).
+    assert label_rec.calls == []
+    assert report.transitioned == 0
+    synth_bodies = [b for _r, _n, b in recorder.posted]
+    assert len(synth_bodies) == 1
+    body = synth_bodies[0]
+    assert body.startswith("[SM] study-complete ")
+    assert "art=art:research_note" in body
+    assert "findings=[[2026-05-14-issue-400-findings]]" in body
+    assert "auto-posted=true" in body
+    # Recorder also recorded the right issue number.
+    assert recorder.posted[0][1] == 400
+
+
+def test_needs_study_auto_advances_on_multi_issue_resolves_list(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """A single research note with ``resolves_issues: [A, B]`` matches both."""
+    notes_dir = tmp_path / "notes"
+    research_dir = tmp_path / "research"
+    _write_research_note(
+        research_dir,
+        slug="2026-05-14-cross-issue-survey",
+        frontmatter="resolves_issues: [401, 402]\nauthor: thinking",
+    )
+    issues = [
+        _needs_study_issue(401, art_labels=("art:code",)),
+        _needs_study_issue(402, art_labels=("art:code",)),
+    ]
+    hint_audit_401 = _audit_comment(
+        "[SM] study-hint-written task=#401 path=/tmp/x.md ts=2026-05-12T00:00:00Z"
+    )
+    hint_audit_402 = _audit_comment(
+        "[SM] study-hint-written task=#402 path=/tmp/x.md ts=2026-05-12T00:00:00Z"
+    )
+
+    def _comments_for(_repo: str, n: int) -> list[dict]:
+        return [hint_audit_401] if n == 401 else [hint_audit_402]
+
+    recorder = Recorder()
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=_comments_for,
+        post_comment=recorder,
+        edit_labels=LabelRecorder(),
+        notes_dir=notes_dir,
+        research_dir=research_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    posted_numbers = sorted(n for _r, n, _b in recorder.posted)
+    assert posted_numbers == [401, 402]
+    for _repo, _num, body in recorder.posted:
+        assert body.startswith("[SM] study-complete ")
+        assert "findings=[[2026-05-14-cross-issue-survey]]" in body
+        assert "auto-posted=true" in body
+
+
+def test_needs_study_no_resolving_note_preserves_existing_behavior(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """When no research note resolves the issue, step 3 is a no-op."""
+    notes_dir = tmp_path / "notes"
+    research_dir = tmp_path / "research"
+    # Vault contains a note, but it resolves a different issue.
+    _write_research_note(
+        research_dir,
+        slug="2026-05-14-some-other-thing",
+        frontmatter="resolves_issue: 999",
+    )
+    issues = [_needs_study_issue(410, art_labels=("art:code",))]
+    existing_hint_audit = _audit_comment(
+        "[SM] study-hint-written task=#410 path=/tmp/x.md ts=2026-05-12T00:00:00Z"
+    )
+
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [existing_hint_audit],
+        post_comment=recorder,
+        edit_labels=label_rec,
+        notes_dir=notes_dir,
+        research_dir=research_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # No synthetic comment, no label edit — existing
+    # "no parsed study-* comment yet" branch took over.
+    assert recorder.posted == []
+    assert label_rec.calls == []
+    assert report.transitioned == 0
+
+
+def test_needs_study_auto_advance_is_idempotent_after_auto_post(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """Second pass: synthetic comment is present → transition fires, no double-post."""
+    notes_dir = tmp_path / "notes"
+    research_dir = tmp_path / "research"
+    _write_research_note(
+        research_dir,
+        slug="2026-05-14-issue-420-findings",
+        frontmatter="resolves_issue: 420",
+    )
+    issues = [_needs_study_issue(420, art_labels=("art:code",))]
+    # Comments as they'd look on pass N+1: hint audit + the synthetic
+    # study-complete we posted on pass N.
+    prior_auto_post = _audit_comment(
+        "[SM] study-complete art=art:research_note "
+        "findings=[[2026-05-14-issue-420-findings]] auto-posted=true"
+    )
+    existing_hint_audit = _audit_comment(
+        "[SM] study-hint-written task=#420 path=/tmp/x.md ts=2026-05-12T00:00:00Z"
+    )
+
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [existing_hint_audit, prior_auto_post],
+        post_comment=recorder,
+        edit_labels=label_rec,
+        notes_dir=notes_dir,
+        research_dir=research_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # Transition fires this pass — comment-driven path matched.
+    assert report.transitioned == 1
+    assert (420, "sm:needs_study", "sm:selected") in report.transitions
+    # The only newly-posted comment is the [SM] transition audit;
+    # NO second [SM] study-complete (no double-post).
+    new_study_completes = [
+        b for _r, _n, b in recorder.posted if b.startswith("[SM] study-complete ")
+    ]
+    assert new_study_completes == []
+    transition_bodies = [
+        b for _r, _n, b in recorder.posted if "transition" in b and "study-complete" in b
+    ]
+    assert len(transition_bodies) == 1
+
+
+def test_needs_study_auto_advance_dry_run_does_not_post(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """Dry-run logs the intent but never touches GitHub."""
+    notes_dir = tmp_path / "notes"
+    research_dir = tmp_path / "research"
+    _write_research_note(
+        research_dir,
+        slug="2026-05-14-dry-run",
+        frontmatter="resolves_issue: 430",
+    )
+    issues = [_needs_study_issue(430, art_labels=("art:code",))]
+    existing_hint_audit = _audit_comment(
+        "[SM] study-hint-written task=#430 path=/tmp/x.md ts=2026-05-12T00:00:00Z"
+    )
+
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [existing_hint_audit],
+        post_comment=recorder,
+        edit_labels=label_rec,
+        notes_dir=notes_dir,
+        research_dir=research_dir,
+        dry_run=True,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert recorder.posted == []
+    assert label_rec.calls == []
+    assert report.transitioned == 0
+
+
+def test_find_resolving_research_note_returns_none_when_dir_missing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Missing ``research_dir`` is benign — the scan returns None."""
+    research_dir = tmp_path / "does-not-exist"
+    assert sm._find_resolving_research_note(42, research_dir) is None
+
+
+def test_find_resolving_research_note_skips_notes_without_frontmatter(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Plain-markdown files (no ``---`` fence) don't blow up the scan."""
+    research_dir = tmp_path / "research"
+    research_dir.mkdir()
+    (research_dir / "plain.md").write_text("# No frontmatter here\n\nJust text.\n")
+    _write_research_note(
+        research_dir,
+        slug="2026-05-14-real-note",
+        frontmatter="resolves_issue: 500",
+    )
+    found = sm._find_resolving_research_note(500, research_dir)
+    assert found is not None
+    assert found.name == "2026-05-14-real-note.md"
+
+
+def test_find_resolving_research_note_tolerates_string_int(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Frontmatter as ``resolves_issue: "#212"`` (octothorped string) still matches."""
+    research_dir = tmp_path / "research"
+    _write_research_note(
+        research_dir,
+        slug="2026-05-14-octothorped",
+        frontmatter='resolves_issue: "#212"',
+    )
+    found = sm._find_resolving_research_note(212, research_dir)
+    assert found is not None
+    assert found.name == "2026-05-14-octothorped.md"
+
+
+def test_render_auto_study_complete_comment_shape() -> None:
+    out = sm.render_auto_study_complete_comment("2026-05-14-slug")
+    assert out == (
+        "[SM] study-complete art=art:research_note "
+        "findings=[[2026-05-14-slug]] auto-posted=true"
+    )
+
+
 def test_dispatcher_state_carries_needs_study_field_across_load_save(
     state_path: pathlib.Path,
 ) -> None:

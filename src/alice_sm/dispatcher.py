@@ -152,6 +152,18 @@ STUDY_HINT_WRITTEN_PREFIX = "[SM] study-hint-written"
 # import cycle and to let tests override per-call.
 NEEDS_STUDY_HINT_DIR = pathlib.Path("/home/alice/alice-mind/inner/notes")
 
+# Issue #212 — directory the dispatcher scans for groomed research
+# notes when auto-advancing ``sm:needs_study`` issues. A note whose
+# YAML frontmatter contains ``resolves_issue: <N>`` (scalar) or
+# ``resolves_issues: [<N>, ...]`` (flow list) is treated as the
+# study-complete signal for issue ``N`` — the dispatcher synthesizes
+# the ``[SM] study-complete art=art:research_note findings=[[<slug>]]
+# auto-posted=true`` audit comment so the existing comment-driven
+# transition path fires on the next pass. Kept as a path constant for
+# the same reasons as :data:`NEEDS_STUDY_HINT_DIR` (test override,
+# avoid watcher → dispatcher import cycle).
+RESEARCH_NOTES_DIR = pathlib.Path("/home/alice/alice-mind/cortex-memory/research")
+
 # Issue #164 — design-pipeline handlers. The dispatcher caps design
 # revision iterations to prevent an infinite design/review loop; the
 # fourth ``[SM] design-revise`` comment trips the cap and the issue
@@ -3283,6 +3295,30 @@ def render_design_revisions_capped_comment(
     )
 
 
+def render_auto_study_complete_comment(
+    slug: str,
+    *,
+    art_label: str = "art:research_note",
+) -> str:
+    """Render the synthetic ``[SM] study-complete`` audit comment (issue #212).
+
+    Posted by the dispatcher when :func:`_find_resolving_research_note`
+    spots a vault note whose frontmatter resolves the issue. The
+    ``auto-posted=true`` field is the audit-trail marker so anyone
+    reading the comment trail can tell this transition was synthesized
+    from the vault rather than authored by thinking — the parser
+    happily ignores unknown key=value pairs.
+
+    The default ``art_label`` is ``art:research_note`` because the
+    synthesis path is, by construction, triggered by a research note
+    living in ``cortex-memory/research/``.
+    """
+    return (
+        f"[SM] study-complete art={art_label} "
+        f"findings=[[{slug}]] auto-posted=true"
+    )
+
+
 def render_study_hint_note_body(issue: dict[str, Any]) -> str:
     """Render the hint-file body for ``inner/notes/sm-needs-study-issue<N>.md``.
 
@@ -4743,6 +4779,80 @@ def _has_prior_study_hint_audit(
     return False
 
 
+def _matches_resolves_issue(value: Any, issue_number: int) -> bool:
+    """Compare a frontmatter ``resolves_issue[s]`` value against an issue number.
+
+    The vault's YAML frontmatter is hand-authored, so a single field can
+    show up as an int (``resolves_issue: 212``), a bare string
+    (``resolves_issue: 212``), or an octothorpe-prefixed string
+    (``resolves_issue: "#212"``). All three should match.
+    """
+    if isinstance(value, bool):
+        # Python booleans are ``int`` subclasses; ``True == 1`` would
+        # otherwise spuriously match issue #1.
+        return False
+    if isinstance(value, int):
+        return value == issue_number
+    if isinstance(value, str):
+        s = value.strip().lstrip("#").strip()
+        if not s:
+            return False
+        try:
+            return int(s) == issue_number
+        except ValueError:
+            return False
+    return False
+
+
+def _find_resolving_research_note(
+    issue_number: int,
+    research_dir: pathlib.Path,
+) -> pathlib.Path | None:
+    """Scan ``research_dir`` for a note whose frontmatter resolves ``issue_number``.
+
+    Issue #212. Recognises two frontmatter shapes:
+
+      * ``resolves_issue: <N>``  — scalar; matches when ``<N>`` parses
+        to ``issue_number``.
+      * ``resolves_issues: [<A>, <B>, ...]`` — flow list; matches when
+        any element parses to ``issue_number``.
+
+    Returns the lexicographically-first matching path so the result is
+    stable across passes (the typical vault filename starts with
+    ``YYYY-MM-DD``, so this is also chronologically-first in practice).
+    Returns ``None`` if ``research_dir`` is missing or contains no
+    matching note — the caller falls back to the existing comment-poll
+    behaviour.
+
+    Read failures on individual files are swallowed: a single
+    unreadable note must not block the rest of the scan.
+    """
+    if not research_dir.is_dir():
+        return None
+    # Local import — :mod:`alice_indexer.yaml_lite` lives in a sibling
+    # package and importing at module top would pull the indexer's
+    # dependency surface into every dispatcher session.
+    from alice_indexer.yaml_lite import split_frontmatter
+
+    for path in sorted(research_dir.glob("*.md")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fm, _body = split_frontmatter(text)
+        if not fm:
+            continue
+        scalar = fm.get("resolves_issue")
+        if scalar is not None and _matches_resolves_issue(scalar, issue_number):
+            return path
+        listed = fm.get("resolves_issues")
+        if isinstance(listed, list):
+            for v in listed:
+                if _matches_resolves_issue(v, issue_number):
+                    return path
+    return None
+
+
 def _current_art_label(
     issue: dict[str, Any], art_whitelist: frozenset[str]
 ) -> str | None:
@@ -4893,6 +5003,7 @@ def _process_needs_study(
     edit_labels: EditLabelsFn,
     list_comments: ListCommentsFn,
     notes_dir: pathlib.Path,
+    research_dir: pathlib.Path,
     trusted_authors: frozenset[str],
     art_whitelist: frozenset[str],
     dry_run: bool,
@@ -4901,7 +5012,7 @@ def _process_needs_study(
 ) -> None:
     """Hint emission + comment-driven transitions for one ``sm:needs_study`` issue.
 
-    Two-phase pass:
+    Three-phase pass:
 
       1. **Hint emission.** Idempotent on the ledger field
          ``DispatcherState.needs_study_hinted`` and defensively on the
@@ -4926,6 +5037,29 @@ def _process_needs_study(
          Comments that aren't ``[SM] study-*`` (audit comments,
          human prose) are ignored. The trust check inside each parser
          keeps a random commenter from forging a transition.
+
+      3. **Vault auto-advance (issue #212).** If step 2 finds no
+         parsed study-verb yet, scan ``research_dir`` for a note whose
+         frontmatter contains ``resolves_issue: <N>`` (scalar) or
+         ``resolves_issues: [<N>, ...]`` (flow list). On match the
+         dispatcher posts a synthetic
+         ``[SM] study-complete art=art:research_note
+         findings=[[<note-slug>]] auto-posted=true`` audit comment and
+         returns; the next pass picks the comment up via step 2 and
+         the issue transitions out of ``sm:needs_study`` naturally.
+
+         Rationale: thinking writes the groomed research note but
+         frequently forgets to post the audit comment, leaving the
+         issue parked indefinitely (cf. #198/#200/#201 on
+         2026-05-14). The mechanics belong in deterministic dispatcher
+         code, not the agent's prompt — see the feedback note
+         ``procedural-logic-in-code``.
+
+         Idempotency: once the synthetic comment is on the issue, the
+         next pass parses it as a real ``study-complete`` (parsers
+         tolerate the trailing ``auto-posted=true`` field) and step 2
+         transitions normally. Step 3 doesn't re-fire because step 2
+         no longer returns ``parsed_study is None``.
     """
     number = issue["number"]
 
@@ -5030,6 +5164,42 @@ def _process_needs_study(
             break
 
     if parsed_study is None:
+        # Step 3 — vault auto-advance (issue #212). Thinking's research
+        # note carries ``resolves_issue: <N>`` in its frontmatter; if
+        # we find one matching this issue, synthesize the
+        # study-complete audit comment that thinking forgot to post.
+        resolving_note = _find_resolving_research_note(number, research_dir)
+        if resolving_note is not None:
+            slug = resolving_note.stem
+            synth_body = render_auto_study_complete_comment(slug)
+            if dry_run:
+                log(
+                    f"[sm-dispatcher] DRY-RUN would auto-post "
+                    f"study-complete for #{number} from "
+                    f"{resolving_note} (slug={slug})"
+                )
+                return
+            try:
+                post_comment(repo, number, synth_body)
+            except GHCommandError as exc:
+                log(
+                    f"[sm-dispatcher] needs_study #{number}: "
+                    f"failed to auto-post study-complete: {exc}"
+                )
+                if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+                    raise
+                return
+            log(
+                f"[sm-dispatcher] needs_study #{number}: auto-posted "
+                f"study-complete from {resolving_note} (slug={slug}); "
+                f"transition fires on next pass"
+            )
+            # Intentional: the freshly-posted comment isn't in the
+            # ``comments`` list we already fetched, so the transition
+            # has to wait for the next pass. Returning here keeps the
+            # one-action-per-pass invariant the rest of the handler
+            # follows.
+            return
         log(
             f"[sm-dispatcher] needs_study #{number}: "
             f"no parsed study-* comment yet"
@@ -6435,6 +6605,7 @@ def run(
     enable_verify: bool = True,
     list_comments: ListCommentsFn | None = None,
     notes_dir: pathlib.Path = NEEDS_STUDY_HINT_DIR,
+    research_dir: pathlib.Path = RESEARCH_NOTES_DIR,
     trusted_authors: frozenset[str] = TRUSTED_AUTHORS,
     dry_run: bool = False,
     log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
@@ -6711,6 +6882,7 @@ def run(
                     edit_labels=edit_labels,
                     list_comments=list_comments,
                     notes_dir=notes_dir,
+                    research_dir=research_dir,
                     trusted_authors=trusted_authors,
                     art_whitelist=ART_LABEL_WHITELIST,
                     dry_run=dry_run,
