@@ -6074,20 +6074,67 @@ def _process_stale_closed(
     )
 
 
-def _has_exit_transition_comment(
+# Prefix the worker is instructed (by the ``(sm:selected, art:research_note)``
+# row of :data:`SPAWN_ARTIFACT_HANDLERS`) to post on completion:
+#
+#     [SM] transition from=selected to=done reason="research note at <path>"
+#
+# This is the canonical machine-readable "I finished writing the research
+# note" signal. Recognizing it as a valid close-gate input is what makes
+# issue #195's fix work — see :func:`_research_close_signal`.
+_RESEARCH_WORKER_DONE_PREFIX = "[SM] transition from=selected to=done"
+
+
+def _research_close_signal(
     repo: str,
     number: int,
     list_comments: ListCommentsFn,
     trusted_authors: frozenset[str],
     log: Callable[[str], None],
-) -> bool:
-    """Return True iff a trusted ``[SM] exit-transition`` comment exists on the issue.
+) -> tuple[bool, str | None]:
+    """Inspect issue comments for a trusted close-gate signal (issues #174, #195).
 
-    Issue #174. Used by :func:`_process_open_done` as the gating signal
-    on the research_note close path. We import :mod:`alice_sm.comments`
-    lazily inside the function to avoid the circular import (comments
-    imports ``TRUSTED_AUTHORS`` / ``ART_LABEL_WHITELIST`` from this
-    module at top level).
+    Returns ``(satisfied, reason_suffix)``:
+
+      * ``satisfied`` — True iff a trusted comment on the issue justifies
+        closing the OPEN + ``sm:done`` + ``art:research_note`` row.
+      * ``reason_suffix`` — short human-readable tag describing *which*
+        signal landed (``"exit-transition recorded"`` for the explicit
+        ``[SM] exit-transition=<value>`` form, ``"worker self-transition
+        to=done"`` for the worker's own ``[SM] transition`` audit
+        comment). Used by :func:`_process_open_done` to render the close
+        audit comment so the trail records why the gate opened.
+
+    Two signals are accepted (in priority order):
+
+    1. ``[SM] exit-transition=<value> findings=[[...]]?`` — the explicit
+       "what should happen to this note next" verb introduced by #174
+       (``disseminate`` | ``spawn-code`` | ``both``). Preferred when
+       present because the value carries downstream-action metadata.
+
+    2. ``[SM] transition from=selected to=done reason="..."`` — the
+       worker's own audit comment, posted as instructed by the
+       ``(sm:selected, art:research_note)`` dispatch row. This is the
+       canonical "research-writer worker finished" signal and the only
+       one any producer in this codebase actually emits today. Without
+       this fallback the close path is dead-on-arrival (see #195).
+
+    Pre-existing rows (closed manually after #181 shipped — #105, #178,
+    #179, #180) have only signal 2 because no producer of signal 1 was
+    ever wired up. The fallback closes them on the next dispatcher pass
+    so the migration story is "manual close was a transitional hack" and
+    not "manual close forever."
+
+    Why not relax further (e.g. accept human prose like
+    ``Exit-transition: disseminate``)? Because the rest of the SM
+    protocol is strict machine-readable shapes and adding loose
+    natural-language matching here invites false positives on adjacent
+    issue threads. Signal 2 is the worker's contract-mandated audit
+    comment from a trusted author — strict enough, broad enough.
+
+    We import :mod:`alice_sm.comments` lazily to avoid the import cycle
+    (comments imports ``TRUSTED_AUTHORS`` / ``ART_LABEL_WHITELIST`` from
+    this module at top level).
     """
     from alice_sm import comments as cm  # local import — avoid cycle
 
@@ -6096,11 +6143,13 @@ def _has_exit_transition_comment(
     except GHCommandError as exc:
         log(
             f"[sm-dispatcher] failed to list comments for #{number} while "
-            f"checking exit-transition: {exc}"
+            f"checking research-note close signal: {exc}"
         )
         if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
             raise
-        return False
+        return False, None
+
+    worker_done_seen = False
     for item in items:
         body = item.get("body")
         author = item.get("author")
@@ -6115,12 +6164,45 @@ def _has_exit_transition_comment(
             login = None
         if not isinstance(body, str):
             continue
+        # Signal 1 — explicit exit-transition verb (preferred). Take the
+        # first hit and short-circuit; the explicit verb wins over the
+        # implicit worker audit comment when both are present.
         parsed = cm.parse_exit_transition(
             body, login, trusted_authors=trusted_authors, log=lambda _m: None
         )
         if parsed is not None:
-            return True
-    return False
+            return True, "exit-transition recorded"
+        # Signal 2 — worker self-transition audit comment. Keep
+        # scanning so signal 1 still wins if it shows up later in the
+        # comment stream, but remember that we saw signal 2.
+        if (
+            body.startswith(_RESEARCH_WORKER_DONE_PREFIX)
+            and login in trusted_authors
+        ):
+            worker_done_seen = True
+
+    if worker_done_seen:
+        return True, "worker self-transition to=done"
+    return False, None
+
+
+def _has_exit_transition_comment(
+    repo: str,
+    number: int,
+    list_comments: ListCommentsFn,
+    trusted_authors: frozenset[str],
+    log: Callable[[str], None],
+) -> bool:
+    """Backwards-compatible boolean wrapper around :func:`_research_close_signal`.
+
+    Pre-existing callers / tests that only need a yes-or-no answer
+    continue to work. New code should use :func:`_research_close_signal`
+    directly so the reason suffix is preserved in the audit trail.
+    """
+    satisfied, _reason = _research_close_signal(
+        repo, number, list_comments, trusted_authors, log
+    )
+    return satisfied
 
 
 def _process_open_done(
@@ -6148,14 +6230,25 @@ def _process_open_done(
 
     Behaviour for ``art:research_note`` issues:
 
-      * If a ``[SM] exit-transition`` comment from a trusted author is
-        present (``disseminate`` | ``spawn-code`` | ``both``) → close
-        the issue and emit a ``[SM] transition from=done to=done
-        reason=...`` audit comment recording the close. Clears the
-        ``exit_required_posted`` ledger entry.
+      * If a trusted close-signal comment is present (see
+        :func:`_research_close_signal` — either ``[SM] exit-transition=
+        <value>`` or the worker's own ``[SM] transition from=selected
+        to=done`` audit comment) → close the issue and emit a
+        ``[SM] transition from=done to=done reason=...`` audit comment
+        recording the close. Clears the ``exit_required_posted`` ledger
+        entry.
       * If missing → post the ``[SM] exit-transition-required`` reminder
         once (deduped via the state ledger + a defensive comment scan
         so a state-file reset doesn't re-spam) and stay.
+
+    The two-signal gate (#195 follow-up to #174): the original #174
+    design required the explicit ``[SM] exit-transition=<value>`` verb,
+    but no producer in this codebase emits it — workers post the
+    ``[SM] transition from=selected to=done`` audit comment per the
+    ``(sm:selected, art:research_note)`` dispatch row. Without the
+    fallback, the close path was dead-on-arrival and every research-note
+    completion required ``gh issue close`` by hand (#105, #178, #179,
+    #180 on 2026-05-13).
 
     For any other artifact (``art:code`` / ``art:config_change`` /
     ``art:experiment``) an OPEN-at-``sm:done`` issue is a state-machine
@@ -6183,22 +6276,32 @@ def _process_open_done(
         )
         return
 
-    # art:research_note — gate on exit-transition from a trusted author.
+    # art:research_note — gate on a trusted close-signal comment. Two
+    # shapes are accepted (see :func:`_research_close_signal`):
+    #
+    #   1. ``[SM] exit-transition=<value>`` — explicit, preferred,
+    #      carries disseminate/spawn-code/both metadata. Issue #174.
+    #   2. ``[SM] transition from=selected to=done reason=...`` — the
+    #      worker's own audit comment. Per #195, this is the only signal
+    #      any producer in this codebase actually emits, so the close
+    #      path closes on it; otherwise the migration story is "manual
+    #      close forever" and that defeats the auto-sweep.
     try:
-        has_exit = _has_exit_transition_comment(
+        has_signal, signal_reason = _research_close_signal(
             repo, number, list_comments, trusted_authors, log
         )
     except GHCommandError:
         # Fatal gh error (auth / rate limit) — re-raised by helper.
         raise
 
-    if has_exit:
-        reason = "art:research_note + exit-transition recorded"
+    if has_signal:
+        suffix = signal_reason or "exit-transition recorded"
+        reason = f"art:research_note + {suffix}"
         body = render_transition_comment(DONE_SM_LABEL, DONE_SM_LABEL, reason)
         if dry_run:
             log(
                 f"[sm-dispatcher] DRY-RUN would close #{number}: "
-                f"art:research_note + exit-transition present"
+                f"art:research_note + {suffix}"
             )
             report.research_closed += 1
             return
@@ -6216,7 +6319,7 @@ def _process_open_done(
         report.research_closed += 1
         log(
             f"[sm-dispatcher] open-done closed #{number}: "
-            f"art:research_note + exit-transition recorded"
+            f"art:research_note + {suffix}"
         )
         return
 

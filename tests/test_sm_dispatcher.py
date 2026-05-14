@@ -6954,12 +6954,187 @@ def test_open_done_research_note_with_disseminate_value_closes(
     assert report.research_closed == 1
 
 
+def test_open_done_research_note_closes_on_worker_transition_audit_comment(
+    state_path: pathlib.Path,
+) -> None:
+    """Issue #195 regression.
+
+    The research-writer worker is instructed (per the
+    ``(sm:selected, art:research_note)`` dispatch row in
+    :data:`alice_sm.dispatcher.SPAWN_ARTIFACT_HANDLERS`) to post a
+    ``[SM] transition from=selected to=done reason="research note at
+    <path>"`` audit comment when it finishes. Pre-#195 the dispatcher's
+    close-path only accepted the never-emitted
+    ``[SM] exit-transition=<value>`` form, so the gate never fired and
+    every research-note completion required ``gh issue close`` by hand.
+    The fix recognizes the worker's own transition audit comment as a
+    valid close-signal. This test pins that behaviour: the worker
+    comment alone, from a trusted author, closes the issue.
+    """
+    recorder = Recorder()
+    close_rec = CloseRecorder()
+    open_done = [
+        _make_issue(
+            105,
+            sm_labels=("sm:done",),
+            art_labels=("art:research_note",),
+        )
+    ]
+    comments = [
+        _audit_comment(
+            "[SM] transition from=selected to=done "
+            'reason="research note at cortex-memory/research/note.md"'
+        )
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: [],
+        list_open_done=lambda _r: open_done,
+        list_comments=lambda _r, _n: comments,
+        post_comment=recorder,
+        close_issue=close_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # Close fires on the worker's transition audit comment.
+    assert close_rec.closed == [("jcronq/alice", 105)]
+    # Audit comment records *which* signal opened the gate so the
+    # trail explains the close.
+    bodies = [b for _r, _n, b in recorder.posted]
+    assert any(
+        "[SM] transition from=done to=done" in b
+        and "art:research_note + worker self-transition to=done" in b
+        for b in bodies
+    )
+    # No exit-transition-required nag — the gate was already satisfied.
+    assert not any(
+        b.startswith(sm.EXIT_TRANSITION_REQUIRED_PREFIX) for b in bodies
+    )
+    assert report.research_closed == 1
+    assert report.exit_required_posted == 0
+
+
+def test_open_done_research_note_worker_transition_must_be_trusted(
+    state_path: pathlib.Path,
+) -> None:
+    """Issue #195 safety check.
+
+    The worker self-transition audit comment only counts as a
+    close-signal when posted by a trusted author. A drive-by comment
+    with the same body shape from an untrusted author must NOT close
+    the issue; the dispatcher should fall back to posting the
+    exit-transition-required reminder.
+    """
+    recorder = Recorder()
+    close_rec = CloseRecorder()
+    open_done = [
+        _make_issue(
+            201,
+            sm_labels=("sm:done",),
+            art_labels=("art:research_note",),
+        )
+    ]
+    comments = [
+        _audit_comment(
+            "[SM] transition from=selected to=done "
+            'reason="research note at cortex-memory/research/note.md"',
+            author="drive-by",
+        )
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: [],
+        list_open_done=lambda _r: open_done,
+        list_comments=lambda _r, _n: comments,
+        post_comment=recorder,
+        close_issue=close_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert close_rec.closed == []  # NOT closed — author untrusted
+    # Reminder posted instead.
+    assert report.exit_required_posted == 1
+    assert report.research_closed == 0
+
+
+def test_open_done_research_note_explicit_exit_transition_wins(
+    state_path: pathlib.Path,
+) -> None:
+    """When both close-signals are present the explicit
+    ``[SM] exit-transition=<value>`` shape wins over the worker
+    transition audit comment, because it carries the
+    disseminate/spawn-code/both metadata. The audit-comment reason
+    string reflects the winning signal.
+    """
+    recorder = Recorder()
+    close_rec = CloseRecorder()
+    open_done = [
+        _make_issue(
+            202,
+            sm_labels=("sm:done",),
+            art_labels=("art:research_note",),
+        )
+    ]
+    comments = [
+        _audit_comment(
+            "[SM] transition from=selected to=done "
+            'reason="research note at cortex-memory/research/note.md"'
+        ),
+        _audit_comment("[SM] exit-transition=both findings=[[note]]"),
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: [],
+        list_open_done=lambda _r: open_done,
+        list_comments=lambda _r, _n: comments,
+        post_comment=recorder,
+        close_issue=close_rec,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert close_rec.closed == [("jcronq/alice", 202)]
+    bodies = [b for _r, _n, b in recorder.posted]
+    # Explicit verb wins — reason carries "exit-transition recorded".
+    assert any(
+        "art:research_note + exit-transition recorded" in b for b in bodies
+    )
+    assert not any(
+        "worker self-transition" in b for b in bodies
+    )
+    assert report.research_closed == 1
+
+
 def test_open_done_research_note_without_exit_transition_posts_reminder(
     state_path: pathlib.Path,
 ) -> None:
-    """art:research_note at sm:done + OPEN, no exit-transition →
+    """art:research_note at sm:done + OPEN, no close-signal at all →
     dispatcher posts ``[SM] exit-transition-required`` reminder once
-    and does NOT close the issue."""
+    and does NOT close the issue.
+
+    Issue #195: the previous fixture seeded a ``[SM] transition
+    from=selected to=done`` worker audit comment, which is now itself
+    a recognized close-signal (see :func:`_research_close_signal`). To
+    keep the "no signal → reminder" branch covered we drop that comment
+    and assert against an empty stream instead.
+    """
     recorder = Recorder()
     close_rec = CloseRecorder()
     open_done = [
@@ -6967,12 +7142,7 @@ def test_open_done_research_note_without_exit_transition_posts_reminder(
             149, sm_labels=("sm:done",), art_labels=("art:research_note",)
         )
     ]
-    comments = [
-        _audit_comment(
-            "[SM] transition from=selected to=done "
-            'reason="research note at cortex-memory/research/x.md"'
-        )
-    ]
+    comments: list[dict] = []  # no close-signal of any kind
 
     exit_code, report = sm.run(
         repo="jcronq/alice",
