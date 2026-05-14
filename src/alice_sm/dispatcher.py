@@ -4043,6 +4043,82 @@ def _process_selected(
         )
         return
 
+    # Issue #202 — silent thinking-spawn guard. The thinking lane has
+    # no equivalent of the worker lane's "open a PR" terminal signal at
+    # sm:selected; instead, the thinking-agent is expected to post
+    # ``[SM] design-ready`` once the design note is written. If a prior
+    # spawn already fired (audit comment present) but no design-ready
+    # ever followed AND no live spawn dir remains, the shim completed
+    # without doing anything useful — retrying just loops forever (the
+    # observed failure mode on #194: ~1125 respawns over 22h). Block
+    # the issue rather than re-spawning; an operator (or sub-issue 3
+    # shim replacement) can unblock once the underlying entrypoint is
+    # wired up. Scoped to ``persona == "thinking"`` so the v1 worker
+    # retry semantics above stay untouched.
+    if persona == "thinking":
+        saw_thinking_spawn_started = False
+        saw_design_ready = False
+        for c in sel_comments:
+            if not isinstance(c, dict):
+                continue
+            body = c.get("body")
+            if not isinstance(body, str):
+                continue
+            login = _comment_author_login(c)
+            if not isinstance(login, str) or login not in trusted_authors:
+                continue
+            if body.startswith(THINKING_SPAWN_STARTED_PREFIX):
+                saw_thinking_spawn_started = True
+            elif body.startswith("[SM] design-ready"):
+                # Matches both the agent-emitted ``[SM] design-ready``
+                # and the dispatcher's ``[SM] design-ready-audit`` echo;
+                # either is evidence that the design phase produced its
+                # terminal signal.
+                saw_design_ready = True
+        if saw_thinking_spawn_started and not saw_design_ready:
+            reason = (
+                "thinking-agent spawn exited without posting "
+                "[SM] design-ready (see #202)"
+            )
+            transition_body = render_transition_comment(
+                ACTIVE_SM_LABEL, BLOCKED_SM_LABEL, reason
+            )
+            if dry_run:
+                log(
+                    f"[sm-dispatcher] DRY-RUN would transition #{number}: "
+                    f"selected → blocked ({reason})"
+                )
+                report.transitioned += 1
+                report.transitions.append(
+                    (number, ACTIVE_SM_LABEL, BLOCKED_SM_LABEL)
+                )
+                return
+            try:
+                edit_labels(
+                    repo,
+                    number,
+                    add=[BLOCKED_SM_LABEL],
+                    remove=[ACTIVE_SM_LABEL],
+                )
+                post_comment(repo, number, transition_body)
+            except GHCommandError as exc:
+                log(
+                    f"[sm-dispatcher] selected #{number}: "
+                    f"failed silent-spawn-failure transition: {exc}"
+                )
+                if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+                    raise
+                return
+            report.transitioned += 1
+            report.transitions.append(
+                (number, ACTIVE_SM_LABEL, BLOCKED_SM_LABEL)
+            )
+            log(
+                f"[sm-dispatcher] transitioned #{number}: "
+                f"selected → blocked ({reason})"
+            )
+            return
+
     live = lane_count_running()
     if live >= lane_cap:
         log(
