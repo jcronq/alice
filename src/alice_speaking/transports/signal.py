@@ -280,6 +280,21 @@ class SignalTransport:
             channel = ChannelRef(transport="signal", address=env.source, durable=True)
             divert = getattr(ctx, "divert_to_mid_turn", None)
             if divert is not None and divert(channel, env.body or "", event):
+                # Mid-turn stitch: the message rolled into the active
+                # turn instead of starting a new one. Fire a reaction
+                # on the inbound so the sender sees "yes, caught it"
+                # immediately — otherwise there's no signal back to
+                # them until Alice's reply lands. Fire-and-forget;
+                # failure inside ``react`` is logged, never raised.
+                ack_emoji = ""
+                speaking_cfg = getattr(getattr(ctx, "cfg", None), "speaking", None)
+                if isinstance(speaking_cfg, dict):
+                    ack_emoji = speaking_cfg.get("inbound_stitch_ack_emoji", "") or ""
+                if ack_emoji:
+                    asyncio.create_task(
+                        self.react(channel, env.timestamp, ack_emoji),
+                        name="sig-stitch-ack",
+                    )
                 continue
             await self._inbox.put(event)
 
@@ -433,5 +448,41 @@ class SignalTransport:
                 "send_reaction failed (ts=%d state=%s): %s",
                 target_timestamp,
                 state,
+                exc,
+            )
+
+    async def react(
+        self,
+        channel: ChannelRef,
+        target_timestamp: int,
+        emoji: str,
+    ) -> None:
+        """React to a prior inbound message with an explicit emoji.
+
+        Companion to :meth:`set_message_state` — same wire protocol, but
+        the caller supplies the emoji rather than naming a state. Used
+        for the mid-turn stitch ack from :meth:`_produce`: when a
+        follow-up gets diverted into the active turn's context inbox,
+        the sender needs an immediate cue that the message was caught
+        (the eventual reply can be a minute or more out).
+
+        Empty emoji is a no-op so callers can pass the config value
+        through without an extra branch. RPC failures are logged, never
+        raised — reactions are cosmetic and must never trip a turn.
+        """
+        if not emoji:
+            return
+        try:
+            await self._signal.send_reaction(
+                recipient=channel.address,
+                target_author=channel.address,
+                target_timestamp=target_timestamp,
+                emoji=emoji,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "send_reaction failed (ts=%d emoji=%s): %s",
+                target_timestamp,
+                emoji,
                 exc,
             )

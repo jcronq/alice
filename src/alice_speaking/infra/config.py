@@ -59,6 +59,15 @@ SPEAKING_DEFAULTS: dict[str, Any] = {
     # appears to extend via prompt caching, so we leave generous headroom
     # rather than fire on phantom pressure.
     "context_compaction_threshold": 750_000,
+    # Mid-turn stitch acknowledgement emoji. When a Signal follow-up
+    # arrives while Alice is mid-turn for that same channel, the producer
+    # diverts it into the active turn's context inbox instead of starting
+    # a new turn. Without a visible ack, the sender has no signal that
+    # the follow-up was caught until Alice's reply lands (which can be a
+    # minute or more away). The transport fires this emoji as a reaction
+    # on the inbound message at stitch time. Set to "" to disable.
+    # Fire-and-forget — never blocks the stitch.
+    "inbound_stitch_ack_emoji": "\U0001f441",
     # Cue runner — pre-turn FTS retrieval against cortex-index.db.
     # See alice_speaking.retrieval.cue_runner. Default to disabled
     # so a fresh deploy doesn't query the DB until Jason flips this

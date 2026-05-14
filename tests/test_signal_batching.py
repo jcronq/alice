@@ -234,3 +234,279 @@ def test_drain_stops_produce_and_waits_for_inbox_to_empty():
                 pass
 
     asyncio.run(_exercise())
+
+
+# ----------------------------------------------------------------------
+# Mid-turn stitch acknowledgement (issue #199). When a follow-up arrives
+# while Alice is mid-turn for that same Signal channel, the producer
+# diverts it into the active turn's context inbox. The sender otherwise
+# has no signal back until Alice's reply lands (which can be a minute
+# or more away), so the transport fires a reaction emoji on the inbound
+# as a fire-and-forget cue.
+
+
+class _RecordingRPC(_FakeRPC):
+    """_FakeRPC + records every ``send_reaction`` call."""
+
+    def __init__(self, envelopes: list[SignalEnvelope]) -> None:
+        super().__init__(envelopes)
+        self.reactions: list[dict] = []
+        self.fail_next: bool = False
+
+    async def send_reaction(
+        self,
+        *,
+        recipient: str,
+        target_author: str,
+        target_timestamp: int,
+        emoji: str,
+    ) -> None:
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("signal-cli blip")
+        self.reactions.append(
+            {
+                "recipient": recipient,
+                "target_author": target_author,
+                "target_timestamp": target_timestamp,
+                "emoji": emoji,
+            }
+        )
+
+
+def test_react_calls_send_reaction_with_emoji():
+    """react() forwards the emoji to the underlying signal-cli RPC."""
+
+    async def _exercise() -> None:
+        rpc = _RecordingRPC([])
+        t = SignalTransport(signal_client=rpc)
+        channel = ChannelRef(
+            transport="signal", address="+15555550100", durable=True
+        )
+        await t.react(channel, target_timestamp=42, emoji="\U0001f441")
+        assert rpc.reactions == [
+            {
+                "recipient": "+15555550100",
+                "target_author": "+15555550100",
+                "target_timestamp": 42,
+                "emoji": "\U0001f441",
+            }
+        ]
+
+    asyncio.run(_exercise())
+
+
+def test_react_empty_emoji_is_noop():
+    """Empty emoji = no RPC call. Lets callers pass config through
+    without an extra branch when the operator disabled the ack."""
+
+    async def _exercise() -> None:
+        rpc = _RecordingRPC([])
+        t = SignalTransport(signal_client=rpc)
+        channel = ChannelRef(
+            transport="signal", address="+15555550100", durable=True
+        )
+        await t.react(channel, target_timestamp=42, emoji="")
+        assert rpc.reactions == []
+
+    asyncio.run(_exercise())
+
+
+def test_react_swallows_rpc_failure():
+    """Reactions are cosmetic; an RPC blip must not propagate as an
+    exception (or the stitch path would crash the daemon)."""
+
+    async def _exercise() -> None:
+        rpc = _RecordingRPC([])
+        rpc.fail_next = True
+        t = SignalTransport(signal_client=rpc)
+        channel = ChannelRef(
+            transport="signal", address="+15555550100", durable=True
+        )
+        # Must NOT raise.
+        await t.react(channel, target_timestamp=42, emoji="\U0001f441")
+        assert rpc.reactions == []
+
+    asyncio.run(_exercise())
+
+
+class _StitchCtx(_StubCtx):
+    """_StubCtx + a divert_to_mid_turn hook and a cfg.speaking dict.
+
+    Lets us exercise SignalTransport._produce's stitch path end-to-end
+    without standing up a real SpeakingDaemon.
+    """
+
+    class _Cfg:
+        def __init__(self, speaking: dict) -> None:
+            self.speaking = speaking
+
+    def __init__(self, ack_emoji: str = "\U0001f441") -> None:
+        super().__init__()
+        self.cfg = self._Cfg({"inbound_stitch_ack_emoji": ack_emoji})
+        # Channel the divert hook treats as in-flight. Anything matching
+        # it diverts; anything else falls through to the inbox.
+        self.in_flight_channel = None
+        self.diverted: list[tuple[ChannelRef, str]] = []
+
+    def divert_to_mid_turn(
+        self, channel: ChannelRef, text: str, _event
+    ) -> bool:
+        cur = self.in_flight_channel
+        if cur is None:
+            return False
+        if (cur.transport, cur.address) != (channel.transport, channel.address):
+            return False
+        self.diverted.append((channel, text))
+        return True
+
+
+def test_produce_fires_ack_reaction_on_mid_turn_stitch():
+    """When divert_to_mid_turn returns True, the producer must fire
+    a reaction on the inbound's timestamp using the configured emoji.
+    Issue #199 — visible 'seen' cue while the active turn is still
+    composing the reply."""
+
+    async def _exercise() -> None:
+        envelopes = [
+            SignalEnvelope(
+                timestamp=777, source="+15555550100", body="follow-up"
+            ),
+        ]
+        rpc = _RecordingRPC(envelopes)
+        t = SignalTransport(signal_client=rpc)
+
+        # Stub out _consume so the inbox doesn't try to run a real turn.
+        async def _noop_consume(_ctx) -> None:
+            while True:
+                await asyncio.sleep(3600)
+
+        t._consume = _noop_consume  # type: ignore[assignment]
+
+        ctx = _StitchCtx(ack_emoji="\U0001f441")
+        ctx.in_flight_channel = ChannelRef(
+            transport="signal", address="+15555550100", durable=True
+        )
+
+        run_task = t.producer(ctx)
+        assert run_task is not None
+        try:
+            # Wait until the reaction landed (fire-and-forget via
+            # asyncio.create_task, so spin briefly to settle the task).
+            for _ in range(50):
+                if rpc.reactions:
+                    break
+                await asyncio.sleep(0.01)
+
+            assert rpc.reactions == [
+                {
+                    "recipient": "+15555550100",
+                    "target_author": "+15555550100",
+                    "target_timestamp": 777,
+                    "emoji": "\U0001f441",
+                }
+            ]
+            # Diverted into the active turn — never queued to the inbox.
+            assert t._inbox.empty()
+            assert [text for _, text in ctx.diverted] == ["follow-up"]
+        finally:
+            run_task.cancel()
+            try:
+                await run_task
+            except (asyncio.CancelledError, BaseException):
+                pass
+
+    asyncio.run(_exercise())
+
+
+def test_produce_skips_ack_when_emoji_empty():
+    """Operator can disable the ack by setting the config to ''."""
+
+    async def _exercise() -> None:
+        envelopes = [
+            SignalEnvelope(
+                timestamp=888, source="+15555550100", body="follow-up"
+            ),
+        ]
+        rpc = _RecordingRPC(envelopes)
+        t = SignalTransport(signal_client=rpc)
+
+        async def _noop_consume(_ctx) -> None:
+            while True:
+                await asyncio.sleep(3600)
+
+        t._consume = _noop_consume  # type: ignore[assignment]
+
+        ctx = _StitchCtx(ack_emoji="")
+        ctx.in_flight_channel = ChannelRef(
+            transport="signal", address="+15555550100", durable=True
+        )
+
+        run_task = t.producer(ctx)
+        assert run_task is not None
+        try:
+            # Give the producer time to process the envelope.
+            for _ in range(30):
+                if ctx.diverted:
+                    break
+                await asyncio.sleep(0.01)
+            # Stitch happened, but no reaction fired.
+            assert ctx.diverted, "envelope should have been diverted"
+            # Settle any pending tasks; reaction list should stay empty.
+            await asyncio.sleep(0.05)
+            assert rpc.reactions == []
+        finally:
+            run_task.cancel()
+            try:
+                await run_task
+            except (asyncio.CancelledError, BaseException):
+                pass
+
+    asyncio.run(_exercise())
+
+
+def test_produce_does_not_ack_when_no_stitch():
+    """Turn-starting inbounds get a normal reply turn — they should
+    NOT get the stitch-ack reaction. The 'received' state emoji handled
+    via set_message_state still fires from the consumer side; that's a
+    different code path."""
+
+    async def _exercise() -> None:
+        envelopes = [
+            SignalEnvelope(
+                timestamp=999, source="+15555550100", body="fresh msg"
+            ),
+        ]
+        rpc = _RecordingRPC(envelopes)
+        t = SignalTransport(signal_client=rpc)
+
+        async def _noop_consume(_ctx) -> None:
+            while True:
+                await asyncio.sleep(3600)
+
+        t._consume = _noop_consume  # type: ignore[assignment]
+
+        ctx = _StitchCtx(ack_emoji="\U0001f441")
+        # No in-flight channel → divert returns False → normal queue path.
+        ctx.in_flight_channel = None
+
+        run_task = t.producer(ctx)
+        assert run_task is not None
+        try:
+            for _ in range(30):
+                if t._inbox.qsize() > 0:
+                    break
+                await asyncio.sleep(0.01)
+            assert t._inbox.qsize() == 1
+            # Settle and confirm no reaction was fired by the producer.
+            await asyncio.sleep(0.05)
+            assert rpc.reactions == []
+            assert ctx.diverted == []
+        finally:
+            run_task.cancel()
+            try:
+                await run_task
+            except (asyncio.CancelledError, BaseException):
+                pass
+
+    asyncio.run(_exercise())
