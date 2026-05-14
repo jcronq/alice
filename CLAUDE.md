@@ -58,9 +58,11 @@ Notes:
 ## Other bin wrappers
 
 `bin/alice-up`, `bin/alice-down`, `bin/alice-deploy` (blue/green swap),
-`bin/alice-shell` (exec into the live worker), `bin/alice-think` (trigger
-a thinking-hemisphere wake), `bin/alice-init` (first-run scaffold),
-`bin/event-log` (tail/query `memory/events.jsonl`).
+`bin/alice-shell` (exec into the live worker),
+`bin/alice-speaking-bounce` (rescue tool — reap orphan claude procs and
+`s6-svc -r` the speaking daemon when the CLI socket goes deaf),
+`bin/alice-think` (trigger a thinking-hemisphere wake), `bin/alice-init`
+(first-run scaffold), `bin/event-log` (tail/query `memory/events.jsonl`).
 
 ## Stage B (Consolidation) — google-adk workflow
 

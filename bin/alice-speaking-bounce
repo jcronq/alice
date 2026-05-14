@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# alice-speaking-bounce — rescue tool: restart the alice-speaking daemon,
+# reaping any orphan `claude` subprocesses left behind first.
+#
+# Why: the CLI transport socket has been observed to stop accepting
+# connections after long-running sessions while the daemon-poll lane
+# (Signal/Discord) keeps working — symptom is `bin/alice` hanging forever.
+# The graceful path via `request_worker_reload` MCP tool is currently a
+# silent no-op (issue #204 — the reload-watcher runs as `alice` but the
+# s6 supervise/control fifo is root-only). This script is the manual
+# kick.
+#
+# Order is load-bearing: reap orphan claudes (PPID=1, parented to init
+# after their speaking parent died) before `s6-svc -r`. If an orphan is
+# still holding the AF_UNIX socket fd, the respawned daemon will fail to
+# bind.
+#
+# Side effect: any in-flight claude turn the live speaking daemon is
+# running is killed. That's the deliberate trade-off — if you reach for
+# this script you've already concluded the daemon is wedged.
+set -euo pipefail
+
+"$(dirname "$0")/alice-up"
+
+pick_worker() {
+    local name
+    for name in $(docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null); do
+        if ! docker exec "$name" flock -n /state/worker/lease true 2>/dev/null; then
+            printf '%s\n' "$name"
+            return 0
+        fi
+    done
+    docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null | head -n1
+}
+
+WORKER="$(pick_worker)"
+if [ -z "$WORKER" ]; then
+    echo "alice-speaking-bounce: no worker container running. did alice-up succeed?" >&2
+    exit 1
+fi
+
+echo "alice-speaking-bounce: targeting worker=$WORKER" >&2
+
+# Run as root inside the container (no `-u alice`): s6-svc on the
+# alice-speaking service writes to the supervise/control fifo, which is
+# `prw------- root root`.
+docker exec "$WORKER" sh -c '
+    set -eu
+    PATH=/command:$PATH
+    LOG=/state/worker/speaking-stderr.log
+
+    reaped=0
+    for pid in $(pgrep -f "claude --output-format" 2>/dev/null || true); do
+        ppid=$(awk "/^PPid:/ {print \$2}" /proc/$pid/status 2>/dev/null || echo "")
+        [ "$ppid" = "1" ] || continue
+        start=$(stat -c %y /proc/$pid 2>/dev/null || echo "?")
+        cmd=$(tr "\0" " " < /proc/$pid/cmdline 2>/dev/null | cut -c1-200)
+        echo "alice-speaking-bounce: reaping orphan claude pid=$pid started=\"$start\" cmd=\"$cmd...\"" >&2
+        kill -KILL "$pid" 2>/dev/null || true
+        reaped=$((reaped + 1))
+    done
+    echo "alice-speaking-bounce: reaped=$reaped orphan claude procs" >&2
+
+    pre_size=0
+    [ -f "$LOG" ] && pre_size=$(wc -c <"$LOG")
+
+    s6-svc -r /run/service/alice-speaking
+    echo "alice-speaking-bounce: sent s6-svc -r to alice-speaking" >&2
+
+    deadline=$(( $(date +%s) + 30 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if [ -f "$LOG" ]; then
+            if tail -c +"$((pre_size + 1))" "$LOG" 2>/dev/null | grep -q "CLI transport listening"; then
+                echo "alice-speaking-bounce: CLI transport listening — bounce complete" >&2
+                exit 0
+            fi
+        fi
+        sleep 1
+    done
+    echo "alice-speaking-bounce: timed out after 30s waiting for CLI transport to relisten" >&2
+    exit 1
+'

@@ -210,9 +210,9 @@ optional — the CLI transport works without it; you can wire Signal and
 Discord later by editing `~/.config/alice/alice.env`.
 
 Bin wrappers (all in `bin/`): `alice`, `alice-up`, `alice-down`,
-`alice-deploy`, `alice-shell`, `alice-think`, `alice-init`,
-`alice-mind-autopush`, `alice-gh-watcher`, `event-log`. Each maps to a single
-shell script — open `install.sh` to see the order.
+`alice-deploy`, `alice-shell`, `alice-speaking-bounce`, `alice-think`,
+`alice-init`, `alice-mind-autopush`, `alice-gh-watcher`, `event-log`.
+Each maps to a single shell script — open `install.sh` to see the order.
 
 ---
 
