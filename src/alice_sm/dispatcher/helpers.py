@@ -20,10 +20,7 @@ from __future__ import annotations
 import pathlib
 from typing import Any, Callable
 
-from alice_sm.dispatcher.constants import (
-    EXIT_TRANSITION_PREFIX,
-    STUDY_HINT_WRITTEN_PREFIX,
-)
+from alice_sm.dispatcher.constants import STUDY_HINT_WRITTEN_PREFIX
 from alice_sm.dispatcher.errors import GHCommandError
 from alice_sm.dispatcher.trust import _label_names
 from alice_sm.dispatcher.types import ListCommentsFn
