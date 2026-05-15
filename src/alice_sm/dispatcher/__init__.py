@@ -38,31 +38,54 @@ right now it runs by hand via ``python -m alice_sm.dispatcher``. The
 ``--dry-run`` flag prints the comments / transitions / spawns that
 would be made without touching GitHub or launching subprocesses —
 useful for tests and manual verification.
+
+Layout
+------
+
+Issue #193 split the original 7K-line ``dispatcher.py`` into a
+sub-package. This file is a thin re-export shim so the public surface
+(``from alice_sm.dispatcher import X``) is unchanged for every callsite
+that existed pre-split:
+
+* :mod:`alice_sm.dispatcher.constants`  — labels, prefixes, paths,
+  caps, the SPAWN_MAP table, the ``_now_iso`` helper.
+* :mod:`alice_sm.dispatcher.errors`     — :class:`GHCommandError`.
+* :mod:`alice_sm.dispatcher.types`      — ``Callable`` type aliases.
+* :mod:`alice_sm.dispatcher.state`      — :class:`DispatcherState`,
+  load/save round-trip for the dedup ledger.
+* :mod:`alice_sm.dispatcher.report`     — :class:`RunReport`,
+  :class:`DependencyResolution`, :func:`resolve_dependencies`.
+* :mod:`alice_sm.dispatcher.trust`      — :class:`TrustDecision`,
+  :func:`evaluate_trust`, label-extraction helpers.
+* :mod:`alice_sm.dispatcher.gh`         — every ``gh`` CLI shim
+  (``gh_list_*``, ``gh_post_comment``, ``gh_edit_labels``, …).
+* :mod:`alice_sm.dispatcher.git_ops`    — ``_run_git``,
+  ``_post_merge_cleanup``, ``_attempt_auto_rebase``.
+* :mod:`alice_sm.dispatcher.spawn`      — three spawn lanes (worker,
+  thinking, speaking) plus rebase-spawn and shared liveness machinery.
+* :mod:`alice_sm.dispatcher.rendering`  — ``render_*`` audit-comment
+  renderers (incl. ``REBASE_*_PREFIX`` constants).
+* :mod:`alice_sm.dispatcher.verify`     — issue #128 viewer-route
+  smoke-test gate.
+* :mod:`alice_sm.dispatcher.helpers`    — shared internal helpers
+  (``_comment_author_login``, ``_find_parsed_comment_of_type`` …).
+* :mod:`alice_sm.dispatcher.handlers`   — one file per state-handler
+  (``selected``, ``reviewing``, ``draft``, ``needs_study``,
+  ``designing``, ``design_review``, ``designed``, ``compacting``,
+  ``building``, ``stale_closed``, ``open_done``). Each handler
+  imports the shared surface via
+  :mod:`alice_sm.dispatcher.handlers._common`.
+* :mod:`alice_sm.dispatcher.main`       — :func:`run` (one pass) and
+  :func:`main` (argparse + bin entrypoint).
 """
 
 from __future__ import annotations
 
-import argparse
-import datetime as dt
-import json
-import os
-import pathlib
-import re
-import shutil
-import subprocess
 import sys
-import tempfile
-import time
-import urllib.error
-import urllib.request
-import uuid
-from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable
 
 
 # ---------------------------------------------------------------------------
-# Constants — extracted to alice_sm.dispatcher.constants (issue #193).
-# Re-exported so ``from alice_sm.dispatcher import X`` keeps working.
+# Constants — re-exported from alice_sm.dispatcher.constants.
 #
 # If ``constants`` is already loaded when this package is re-executed
 # (``importlib.reload(alice_sm.dispatcher)``), reload it first so the
@@ -83,28 +106,51 @@ del _importlib, _constants_modname
 from alice_sm.dispatcher.constants import *  # noqa: F401, F403, E402
 from alice_sm.dispatcher.constants import _now_iso  # noqa: F401, E402
 
-
-
-# ---------------------------------------------------------------------------
-# Errors — extracted to alice_sm.dispatcher.errors (issue #193).
-# ---------------------------------------------------------------------------
+# Errors
 from alice_sm.dispatcher.errors import GHCommandError  # noqa: E402, F401
 
+# Callable type aliases
+from alice_sm.dispatcher.types import (  # noqa: E402, F401
+    CloseIssueFn,
+    EditLabelsFn,
+    FindLinkedPRFn,
+    FindUnspawnedFn,
+    GitRunFn,
+    ListCommentsFn,
+    ListIssuesFn,
+    MasterCIStatusFn,
+    PostCommentFn,
+    PostMergeCleanupFn,
+    PRFilesFn,
+    PRMergeableFn,
+    PRMergeStatusFn,
+    VerifyFn,
+)
 
-# ---------------------------------------------------------------------------
-# State load/save — extracted to alice_sm.dispatcher.state (issue #193).
-# ---------------------------------------------------------------------------
+# State persistence
 from alice_sm.dispatcher.state import (  # noqa: E402, F401
     DispatcherState,
     load_state,
     save_state,
 )
 
+# Run report + dependency resolution
+from alice_sm.dispatcher.report import (  # noqa: E402, F401
+    DependencyResolution,
+    RunReport,
+    resolve_dependencies,
+)
 
+# Trust filter
+from alice_sm.dispatcher.trust import (  # noqa: E402, F401
+    TrustDecision,
+    _author_login,
+    _current_sm_label,
+    _label_names,
+    evaluate_trust,
+)
 
-# ---------------------------------------------------------------------------
-# gh CLI shims — extracted to alice_sm.dispatcher.gh (issue #193).
-# ---------------------------------------------------------------------------
+# gh CLI shims
 from alice_sm.dispatcher.gh import (  # noqa: E402, F401
     _run_gh,
     _sort_oldest_first,
@@ -125,31 +171,7 @@ from alice_sm.dispatcher.gh import (  # noqa: E402, F401
     gh_post_comment,
 )
 
-
-
-
-# Callable type aliases — extracted to alice_sm.dispatcher.types (issue #193).
-from alice_sm.dispatcher.types import (  # noqa: E402, F401
-    CloseIssueFn,
-    EditLabelsFn,
-    FindLinkedPRFn,
-    FindUnspawnedFn,
-    GitRunFn,
-    ListCommentsFn,
-    ListIssuesFn,
-    MasterCIStatusFn,
-    PostCommentFn,
-    PostMergeCleanupFn,
-    PRFilesFn,
-    PRMergeableFn,
-    PRMergeStatusFn,
-    VerifyFn,
-)
-
-
-# ---------------------------------------------------------------------------
-# Git operations — extracted to alice_sm.dispatcher.git_ops (issue #193).
-# ---------------------------------------------------------------------------
+# Git operations
 from alice_sm.dispatcher.git_ops import (  # noqa: E402, F401
     _REBASE_CONFLICT_FILE_RE,
     _attempt_auto_rebase,
@@ -158,11 +180,7 @@ from alice_sm.dispatcher.git_ops import (  # noqa: E402, F401
     _run_git,
 )
 
-
-
-# ---------------------------------------------------------------------------
-# Spawn machinery — extracted to alice_sm.dispatcher.spawn (issue #193).
-# ---------------------------------------------------------------------------
+# Spawn machinery
 from alice_sm.dispatcher.spawn import (  # noqa: E402, F401
     _SPAWN_DIR_NAME_RE,
     _copy_session_jsonl_into_spawn,
@@ -193,25 +211,7 @@ from alice_sm.dispatcher.spawn import (  # noqa: E402, F401
     spawn_thinking_agent,
 )
 
-
-
-# ---------------------------------------------------------------------------
-# Trust filter — extracted to alice_sm.dispatcher.trust (issue #193).
-# ---------------------------------------------------------------------------
-from alice_sm.dispatcher.trust import (  # noqa: E402, F401
-    TrustDecision,
-    _author_login,
-    _current_sm_label,
-    _label_names,
-    evaluate_trust,
-)
-
-
-
-
-# ---------------------------------------------------------------------------
-# Comment rendering — extracted to alice_sm.dispatcher.rendering (issue #193).
-# ---------------------------------------------------------------------------
+# Comment rendering
 from alice_sm.dispatcher.rendering import (  # noqa: E402, F401
     REBASE_ESCALATED_PREFIX,
     REBASE_NEEDED_PREFIX,
@@ -230,10 +230,7 @@ from alice_sm.dispatcher.rendering import (  # noqa: E402, F401
     render_verify_comment,
 )
 
-
-# ---------------------------------------------------------------------------
-# Verification (issue #128) — extracted to alice_sm.dispatcher.verify.
-# ---------------------------------------------------------------------------
+# Verification (issue #128)
 from alice_sm.dispatcher.verify import (  # noqa: E402, F401
     _http_get_body,
     _touches_viewer,
@@ -242,28 +239,11 @@ from alice_sm.dispatcher.verify import (  # noqa: E402, F401
     verify_viewer_route,
 )
 
-
-
-
-# ---------------------------------------------------------------------------
-# Run report + dependency resolution — extracted to
-# alice_sm.dispatcher.report (issue #193).
-# ---------------------------------------------------------------------------
-from alice_sm.dispatcher.report import (  # noqa: E402, F401
-    DependencyResolution,
-    RunReport,
-    resolve_dependencies,
-)
-
-
-# ---------------------------------------------------------------------------
-# Shared handler helpers — extracted to alice_sm.dispatcher.helpers
-# (issue #193). The pre-split duplicate definition of
-# ``_find_parsed_comment_of_type`` (where the second def shadowed the
-# first at runtime) is collapsed to a single definition; behavior is
-# unchanged because no caller held a reference to the shadowed first
-# definition.
-# ---------------------------------------------------------------------------
+# Shared handler helpers. Pre-split, ``_find_parsed_comment_of_type``
+# had two definitions in dispatcher.py; the second shadowed the first
+# at runtime, so only the more general ``expected_types: type |
+# tuple[type, ...]`` form was ever called. The collapsed module retains
+# that single definition — no behavioral change.
 from alice_sm.dispatcher.helpers import (  # noqa: E402, F401
     _RESEARCH_WORKER_DONE_PREFIX,
     _comment_author_login,
@@ -276,12 +256,8 @@ from alice_sm.dispatcher.helpers import (  # noqa: E402, F401
     _research_close_signal,
 )
 
-
-# ---------------------------------------------------------------------------
-# State handlers — extracted to alice_sm.dispatcher.handlers.<state>
-# (issue #193). One file per state-transition handler so workers don't
-# have to read a 7K-line monolith to make a 30-line change.
-# ---------------------------------------------------------------------------
+# State handlers — one file per state-transition handler so workers
+# don't have to read a 7K-line monolith to make a 30-line change.
 from alice_sm.dispatcher.handlers.building import _process_building  # noqa: E402, F401
 from alice_sm.dispatcher.handlers.compacting import _process_compacting  # noqa: E402, F401
 from alice_sm.dispatcher.handlers.design_review import _process_design_review  # noqa: E402, F401
@@ -300,48 +276,11 @@ from alice_sm.dispatcher.handlers.reviewing import (  # noqa: E402, F401
 from alice_sm.dispatcher.handlers.selected import _process_selected  # noqa: E402, F401
 from alice_sm.dispatcher.handlers.stale_closed import _process_stale_closed  # noqa: E402, F401
 
-
-# ---------------------------------------------------------------------------
-# Dispatcher main pass + CLI — extracted to alice_sm.dispatcher.main
-# (issue #193). __init__.py keeps the ``run`` and ``main`` re-exports so
-# ``alice-sm = "alice_sm.dispatcher:main"`` (pyproject.toml) and any
-# caller of ``alice_sm.dispatcher.run(...)`` continue to work.
-# ---------------------------------------------------------------------------
+# Dispatcher main pass + CLI. Re-exporting ``main`` here is what makes
+# the ``alice-sm = "alice_sm.dispatcher:main"`` console-script entry in
+# ``pyproject.toml`` resolve, and what keeps ``alice_sm.dispatcher.run(...)``
+# importable for downstream callers.
 from alice_sm.dispatcher.main import main, run  # noqa: E402, F401
-
-
-
-
-
-
-# ---------------------------------------------------------------------------
-# Issue #157 — sm:needs_study handler
-# ---------------------------------------------------------------------------
-
-
-
-
-
-
-# ---------------------------------------------------------------------------
-# Issue #164 — sm:designing / design_review / designed / compacting / building
-# ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 if __name__ == "__main__":
