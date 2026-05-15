@@ -67,6 +67,22 @@ from alice_sm.dispatcher.trust import _author_login, _current_sm_label, _label_n
 from alice_sm.dispatcher.types import PostCommentFn
 
 
+def _current_spawn_map() -> dict[tuple[str, str], dict[str, str]]:
+    """Return the dispatcher module's live ``SPAWN_MAP`` attribute.
+
+    Tests override ``SPAWN_MAP`` via ``mock.patch.object(sm, "SPAWN_MAP", ...)``
+    (see ``test_phase2_unrecognized_artifact_label_skips_spawn``). Pre-split,
+    every consumer of ``SPAWN_MAP`` inside ``dispatcher.py`` resolved the
+    name via a global lookup in the dispatcher module's own ``__dict__``,
+    so the patch took effect. After the split, naive callers in this
+    submodule (and in ``handlers/``) would bind ``SPAWN_MAP`` from
+    ``constants`` at import time — invisible to the patch. This
+    indirection routes each access back through
+    ``sys.modules['alice_sm.dispatcher']``, restoring the contract.
+    """
+    return sys.modules["alice_sm.dispatcher"].SPAWN_MAP
+
+
 def resolve_claude_bin(
     *,
     preferred: str = CLAUDE_BIN_PREFERRED,
@@ -643,7 +659,7 @@ def spawn_agent(
     """
     if clock is None:
         clock = time.time
-    spawn_config = SPAWN_MAP.get((sm_state, art_label))
+    spawn_config = _current_spawn_map().get((sm_state, art_label))
     if spawn_config is None:
         log(
             f"[sm-dispatcher] no spawn config for artifact {art_label!r} "
