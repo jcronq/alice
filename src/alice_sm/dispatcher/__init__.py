@@ -86,50 +86,9 @@ from alice_sm.dispatcher.constants import _now_iso  # noqa: F401, E402
 
 
 # ---------------------------------------------------------------------------
-# Errors
+# Errors — extracted to alice_sm.dispatcher.errors (issue #193).
 # ---------------------------------------------------------------------------
-
-
-class GHCommandError(RuntimeError):
-    """Raised when a ``gh`` invocation exits non-zero.
-
-    Mirrors :class:`alice_watchers.github.GHCommandError` — we keep the
-    stderr around so the auth-failure / rate-limit heuristic has
-    something to sniff.
-    """
-
-    def __init__(self, returncode: int, stderr: str, args: list[str]) -> None:
-        super().__init__(f"gh exited {returncode}: {stderr.strip()[:400]}")
-        self.returncode = returncode
-        self.stderr = stderr
-        self.args = args
-
-    @property
-    def looks_like_auth_failure(self) -> bool:
-        msg = self.stderr.lower()
-        return any(
-            needle in msg
-            for needle in (
-                "401",
-                "403",
-                "bad credentials",
-                "requires authentication",
-                "must authenticate",
-                "auth login",
-            )
-        )
-
-    @property
-    def looks_like_rate_limit(self) -> bool:
-        msg = self.stderr.lower()
-        return any(
-            needle in msg
-            for needle in (
-                "rate limit",
-                "secondary rate limit",
-                "api rate limit exceeded",
-            )
-        )
+from alice_sm.dispatcher.errors import GHCommandError  # noqa: E402, F401
 
 
 # ---------------------------------------------------------------------------
@@ -1032,30 +991,23 @@ def gh_get_pr_files(
     return paths
 
 
-# Callable aliases — tests inject fakes here without monkeypatching the
-# module-level names.
-ListIssuesFn = Callable[[str], list[dict[str, Any]]]
-PostCommentFn = Callable[[str, int, str], None]
-EditLabelsFn = Callable[..., None]
-CloseIssueFn = Callable[[str, int], None]
-FindLinkedPRFn = Callable[[str, int], dict[str, Any] | None]
-PRMergeStatusFn = Callable[[str, int], dict[str, Any]]
-PRMergeableFn = Callable[[str, int], dict[str, Any]]
-MasterCIStatusFn = Callable[[str, str], dict[str, Any]]
-ListCommentsFn = Callable[[str, int], list[dict[str, Any]]]
-FindUnspawnedFn = Callable[[str], list[dict[str, Any]]]
-PRFilesFn = Callable[[str, int], list[str]]
-# Verifier contract: takes a PR number + the list of files it changed,
-# returns a verdict dict ``{outcome, reason, route}``. ``outcome`` is
-# one of ``"pass"`` / ``"skip"`` / ``"fail"`` — corresponding to the
-# three audit comment shapes. ``route`` is the URL hit on pass / fail
-# (None on skip).
-VerifyFn = Callable[[int, list[str]], dict[str, Any]]
-# (cmd_args, cwd) → CompletedProcess. ``cmd_args`` is the trailing
-# argv (no leading ``git``); ``cwd`` is the repo to operate in. Tests
-# inject a fake to avoid touching the real working tree.
-GitRunFn = Callable[[list[str], pathlib.Path], "subprocess.CompletedProcess[str]"]
-PostMergeCleanupFn = Callable[[str | None, int], None]
+# Callable type aliases — extracted to alice_sm.dispatcher.types (issue #193).
+from alice_sm.dispatcher.types import (  # noqa: E402, F401
+    CloseIssueFn,
+    EditLabelsFn,
+    FindLinkedPRFn,
+    FindUnspawnedFn,
+    GitRunFn,
+    ListCommentsFn,
+    ListIssuesFn,
+    MasterCIStatusFn,
+    PostCommentFn,
+    PostMergeCleanupFn,
+    PRFilesFn,
+    PRMergeableFn,
+    PRMergeStatusFn,
+    VerifyFn,
+)
 
 
 # ---------------------------------------------------------------------------
