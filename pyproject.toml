@@ -132,8 +132,9 @@ dev = [
 ignore_missing_imports = true
 
 [tool.ruff.lint.per-file-ignores]
-# Handlers deliberately glob-import the curated re-export bundle
-# in _common.py — one source of truth for shared symbols across
-# the (state, artifact) transition handlers. F403/F405 fire as
-# false positives on this idiom; exempt the handlers dir.
-"src/alice_sm/dispatcher/handlers/*.py" = ["F403", "F405"]
+# The dispatcher sub-package deliberately uses curated star imports
+# (handlers/_common.py and main.py both glob the shared symbol
+# bundle) as the cohesion pattern for the (state, artifact)
+# transition handlers. F403/F405 fire as false positives on this
+# idiom; exempt the whole sub-package rather than per-file.
+"src/alice_sm/dispatcher/**/*.py" = ["F403", "F405"]
