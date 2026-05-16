@@ -21,6 +21,16 @@ VENV_PY="/opt/alice-venv/bin/python"
 # packages (alice_core, alice_speaking, alice_thinking, alice_viewer).
 ALICE_SRC="${ALICE_SRC:-/home/alice/alice/src}"
 
+# Outer timeout (Phase 1 of wake-robustness design — see issue #105 and
+# cortex-memory/research/2026-05-07-wake-robustness-outer-timeout-design.md).
+# The Python interpreter can block indefinitely in post-return cleanup
+# (epoll_wait on a leaked SDK socket) and silently halt the entire wake
+# cadence by holding flock. `max_wake_seconds` only governs the inside of
+# the wake loop; this caps the whole process. SIGTERM at WAKE_TIMEOUT,
+# SIGKILL WAKE_KILL_GRACE seconds later if Python is still stuck.
+WAKE_TIMEOUT="${WAKE_TIMEOUT:-1200}"
+WAKE_KILL_GRACE="${WAKE_KILL_GRACE:-60}"
+
 if [ ! -x "$VENV_PY" ]; then
     echo "[alice-think] venv python missing at $VENV_PY" >&2
     exit 1
@@ -28,4 +38,4 @@ fi
 
 export PYTHONPATH="$ALICE_SRC"
 export PYTHONUNBUFFERED=1
-exec "$VENV_PY" -m alice_thinking "$@"
+exec timeout --kill-after="$WAKE_KILL_GRACE" "$WAKE_TIMEOUT" "$VENV_PY" -m alice_thinking "$@"
