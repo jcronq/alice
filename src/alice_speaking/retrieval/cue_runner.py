@@ -60,11 +60,18 @@ STATE_BOOST = 1.0
 BEHAVIOR_BOOST = 1.0
 BUCKET2_BOOST = 1.0
 BUCKET1_BOOST = 1.0
-# Trigger-keyword secondary boost: a no-op in v1 because no vault notes carry
-# `trigger_keywords` in frontmatter yet (proposed in
-# cortex-memory/research/2026-05-05-vault-behavior-notes-jit-retrieval.md but
-# not backfilled). Constant kept; re-evaluate after the backfill.
-TRIGGER_KEYWORD_EXTRA = 1.0
+# Trigger-keyword secondary boost: fires when a query token matches a note's
+# explicit `trigger_keywords` frontmatter. Per-note and query-conditional —
+# the boost only activates on a match, so unlike the category-wide
+# multiplicative boost killed by [[2026-05-06-fts-boost-antipattern]], this
+# cannot flood unrelated notes into the candidate set.
+#
+# Re-evaluated 2026-05-16 after the trigger_keywords backfill expanded
+# coverage to 48 notes (was 0 at v1, 23 at the May 11 re-eval design).
+# Ad-hoc 15-query survey across fitness/CozyHem/protocol/general:
+# 8/8 rank-change cases improved the correct note's position, 0 regressions.
+# Verdict: ship. See [[2026-05-16-trigger-keyword-re-eval-results]].
+TRIGGER_KEYWORD_EXTRA = 1.5
 
 _STATE_TYPES = {"daily", "state-snapshot", "skill"}
 _BUCKET2_TAGS = {
