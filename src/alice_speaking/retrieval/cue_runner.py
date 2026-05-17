@@ -37,6 +37,7 @@ import asyncio
 import datetime
 import json
 import logging
+import math
 import pathlib
 import re
 import sqlite3
@@ -72,6 +73,18 @@ BUCKET1_BOOST = 1.0
 # 8/8 rank-change cases improved the correct note's position, 0 regressions.
 # Verdict: ship. See [[2026-05-16-trigger-keyword-re-eval-results]].
 TRIGGER_KEYWORD_EXTRA = 1.5
+
+# Access-count recency boost (Phase 0 closure). Multiplies the post-boost
+# score by `1 + ACCESS_COUNT_ALPHA * log1p(min(access_count, CAP))` to
+# counteract the day-5 decay cliff (313 decayed notes, 18.3% accessed in
+# a 7-day window — evidence in
+# cortex-memory/research/2026-05-10-access-count-recency-boost-design.md).
+# Formula derivation + cap rationale: same doc. Cap=100 bounds the max
+# boost to ~1 + 0.15 * log1p(100) ≈ 1.70× regardless of how hot a note
+# gets, preventing popularity contests from drowning out topical
+# precision. Prerequisite for the Hebbian edge-weight ranking layer (#219).
+ACCESS_COUNT_ALPHA = 0.15
+ACCESS_COUNT_CAP = 100
 
 _STATE_TYPES = {"daily", "state-snapshot", "skill"}
 _BUCKET2_TAGS = {
@@ -514,6 +527,36 @@ def _query_fts(
     ]
 
 
+def _read_access_counts(
+    db_path: pathlib.Path, slugs: Iterable[str]
+) -> dict[str, int]:
+    """Return ``{slug: access_count}`` from ``note_metrics`` for the given
+    slugs. Slugs without a row (or any DB / table error) yield no entry.
+
+    The ``note_metrics`` table is written by :func:`_bump_access` and by
+    the indexer's seed pass. In freshly-seeded test DBs the table may
+    not exist at all — we tolerate that and return ``{}`` so the recency
+    boost simply collapses to 1.0 (no-op).
+    """
+    slug_list = [s for s in slugs if s]
+    if not slug_list:
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            placeholders = ",".join("?" * len(slug_list))
+            rows = conn.execute(
+                f"SELECT slug, access_count FROM note_metrics "
+                f"WHERE slug IN ({placeholders})",
+                slug_list,
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {}
+    return {row[0]: int(row[1] or 0) for row in rows}
+
+
 # ---------------------------------------------------------------------------
 # Reranker (Phase 2 — gated)
 
@@ -753,6 +796,13 @@ async def build_cue_packet(
             log.debug("cue_runner: FTS query timed out (%.0fms)", timeout_s * 1000)
             return ""
 
+        # Pull access_count from note_metrics for the recency boost.
+        # Off-thread because it opens a fresh sqlite connection. Missing
+        # rows / missing table collapse to {} → boost = 1.0 (no-op).
+        access_counts = await asyncio.to_thread(
+            _read_access_counts, resolved_db, [r[0] for r in rows]
+        )
+
         # Build candidates with type-aware boost.
         excluded = set(context_slugs or ())
         query_lower = query.lower()
@@ -770,11 +820,29 @@ async def build_cue_packet(
             kws = _read_trigger_keywords(resolved_vault, path) if path else []
             if kws and any(kw in query_lower for kw in kws):
                 boost *= TRIGGER_KEYWORD_EXTRA
+            # Access-count recency boost (closes Phase 0). Counteracts the
+            # decay cliff: notes the user touches repeatedly stay
+            # retrievable. Capped so popularity can't drown out topical
+            # match — see ACCESS_COUNT_ALPHA / ACCESS_COUNT_CAP block.
+            ac = access_counts.get(slug, 0)
+            recency_boost = 1.0 + ACCESS_COUNT_ALPHA * math.log1p(
+                min(ac, ACCESS_COUNT_CAP)
+            )
             # FTS5's default rank is negative (lower = more relevant);
             # invert so higher final_score = better, then multiply by
             # boost to keep the boost meaningful.
             base_score = -float(fts_rank)
-            final_score = base_score * boost
+            final_score = base_score * boost * recency_boost
+            log.debug(
+                "cue_runner: slug=%s fts_rank=%.4f type_boost=%.4f "
+                "access_count=%d recency_boost=%.4f final=%.4f",
+                slug,
+                fts_rank,
+                boost,
+                ac,
+                recency_boost,
+                final_score,
+            )
             matched = extract_matched_lines(body, tokens, max_n=line_cap)
             candidates.append(
                 _Candidate(
@@ -889,4 +957,6 @@ __all__ = [
     "BUCKET2_BOOST",
     "BUCKET1_BOOST",
     "TRIGGER_KEYWORD_EXTRA",
+    "ACCESS_COUNT_ALPHA",
+    "ACCESS_COUNT_CAP",
 ]

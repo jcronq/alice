@@ -24,6 +24,8 @@ import pytest
 
 from alice_speaking.retrieval import cue_runner
 from alice_speaking.retrieval.cue_runner import (
+    ACCESS_COUNT_ALPHA,
+    ACCESS_COUNT_CAP,
     BEHAVIOR_BOOST,
     BUCKET1_BOOST,
     BUCKET2_BOOST,
@@ -32,6 +34,7 @@ from alice_speaking.retrieval.cue_runner import (
     _build_fts_match,
     _Candidate,
     _format_packet,
+    _read_access_counts,
     _read_trigger_keywords,
     _tokenize_query,
     build_cue_packet,
@@ -731,3 +734,122 @@ async def test_bump_access_db_write_failure_does_not_block_frontmatter(
     # Should not raise; should still update frontmatter.
     await _bump_access(vault, "n.md", db_path=bogus_db, slug="n")
     assert "access_count: 2" in note.read_text()
+
+
+# ---------------------------------------------------------------------------
+# Access-count recency boost (Phase 0 closure)
+#
+# The bump writer was already wired (#90/#99/#196), but build_cue_packet
+# never read access_count back into the final score. These tests cover the
+# read path: _read_access_counts gracefully tolerates a missing table, and
+# build_cue_packet uses note_metrics.access_count to break ties on FTS
+# rank — promoting the hot note above its untouched neighbour.
+
+
+def test_read_access_counts_missing_table_returns_empty(tmp_path: pathlib.Path):
+    db = tmp_path / "no-metrics.db"
+    sqlite3.connect(str(db)).close()  # touch an empty DB
+    assert _read_access_counts(db, ["a", "b"]) == {}
+
+
+def test_read_access_counts_returns_only_requested_slugs(tmp_path: pathlib.Path):
+    db = tmp_path / "cortex-index.db"
+    _make_metrics_db(db, ["alpha", "beta", "gamma"])
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            "UPDATE note_metrics SET access_count = ? WHERE slug = ?", (7, "alpha")
+        )
+        conn.execute(
+            "UPDATE note_metrics SET access_count = ? WHERE slug = ?", (3, "beta")
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    out = _read_access_counts(db, ["alpha", "beta", "missing"])
+    assert out == {"alpha": 7, "beta": 3}
+
+
+def test_read_access_counts_empty_input_short_circuits(tmp_path: pathlib.Path):
+    # No DB needed — the helper must return {} without touching the path.
+    assert _read_access_counts(tmp_path / "never-opened.db", []) == {}
+
+
+@pytest.mark.asyncio
+async def test_build_cue_packet_access_count_promotes_hot_note(
+    tmp_path: pathlib.Path,
+):
+    """A note with non-zero access_count must outrank a tied-FTS-rank
+    neighbour with zero accesses. Uses two notes with identical bodies
+    so FTS gives them the same rank; the recency boost is the only
+    differentiator."""
+    db = tmp_path / "cortex-index.db"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    body = "cozyhem cozyhem cozyhem details about deployment\n"
+    notes = [
+        {"slug": "cold-note", "title": "Cold", "body": body},
+        {"slug": "hot-note", "title": "Hot", "body": body},
+    ]
+    _seed_db(db, notes)
+    _seed_vault(vault, notes)
+    # Seed metrics: hot-note has been accessed many times, cold-note never.
+    _make_metrics_db_inplace(db, [("cold-note", 0), ("hot-note", 50)])
+
+    cfg = {"enabled": True, "top_n": 2}
+    packet = await build_cue_packet("cozyhem", cfg, db_path=db, vault_root=vault)
+    # Recency boost must promote hot-note above cold-note.
+    assert packet.index("hot-note") < packet.index("cold-note")
+
+
+@pytest.mark.asyncio
+async def test_build_cue_packet_missing_note_metrics_table_is_noop(
+    tmp_path: pathlib.Path,
+):
+    """If note_metrics doesn't exist (legacy DB, fresh seed), the recency
+    boost collapses to 1.0 and the packet still builds successfully."""
+    db = tmp_path / "cortex-index.db"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    notes = [{"slug": "a", "title": "A", "body": "cozyhem details\n"}]
+    _seed_db(db, notes)  # No note_metrics table created.
+    _seed_vault(vault, notes)
+
+    cfg = {"enabled": True, "top_n": 1}
+    packet = await build_cue_packet("cozyhem", cfg, db_path=db, vault_root=vault)
+    assert "cozyhem details" in packet
+
+
+def test_access_count_constants_match_locked_design():
+    """Guardrail: the locked formula is alpha=0.15, cap=100 — drift
+    requires re-evaluation per the design doc."""
+    assert ACCESS_COUNT_ALPHA == 0.15
+    assert ACCESS_COUNT_CAP == 100
+
+
+def _make_metrics_db_inplace(
+    path: pathlib.Path, rows: list[tuple[str, int]]
+) -> None:
+    """Add a ``note_metrics`` table to an existing DB and seed it with
+    ``(slug, access_count)`` rows. Used by recency-boost integration
+    tests that already called ``_seed_db`` to lay down the notes table."""
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE note_metrics (
+                slug TEXT PRIMARY KEY,
+                access_count INTEGER NOT NULL DEFAULT 0,
+                last_queried TEXT,
+                speaking_accessed_at TEXT
+            )
+            """
+        )
+        for slug, ac in rows:
+            conn.execute(
+                "INSERT INTO note_metrics(slug, access_count) VALUES(?, ?)",
+                (slug, ac),
+            )
+        conn.commit()
+    finally:
+        conn.close()
