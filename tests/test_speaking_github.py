@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import pytest
-
 from alice_speaking import github as speaking_gh
 from alice_watchers import github as gh_watcher
 
