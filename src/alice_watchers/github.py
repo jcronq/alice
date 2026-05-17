@@ -63,6 +63,29 @@ RECENT_PR_LIMIT = 50
 # same loud message indefinitely.
 AUTH_ERROR_NOTE_INTERVAL_SECONDS = 6 * 3600
 
+# Marker Speaking embeds in issue bodies it files autonomously, so the
+# watcher can suppress the resulting ``new_issue`` event and avoid the
+# redundant thinking-analysis → attempt-issue-fix loop on Alice's own
+# tickets (issue #226). The string is short, fixed, and HTML-comment
+# wrapped so it survives the GitHub renderer untouched and won't collide
+# with any natural body content. Issue #226 documents the full flow.
+# The companion writer lives in ``alice_speaking.github`` so both sides
+# import the same constant.
+SELF_FILED_MARKER = "<!-- alice-self-filed -->"
+
+
+def _is_self_filed(issue: dict[str, Any]) -> bool:
+    """True iff the issue body carries the Alice self-filed marker.
+
+    Case-sensitive substring check — the marker is a fixed HTML comment
+    chosen so it can't collide with natural body content. Missing /
+    non-string bodies count as not self-filed.
+    """
+    body = issue.get("body")
+    if not isinstance(body, str):
+        return False
+    return SELF_FILED_MARKER in body
+
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -527,7 +550,17 @@ def poll_repo(
         # ask Alice — her own comment from inside the worker won't make
         # the issue "trusted" automatically, but you can always look
         # directly via gh.
-        if not first_run and issues_primed and author_trusted:
+        #
+        # Self-filed gate (issue #226): when Speaking files an issue
+        # autonomously via ``alice_speaking.github.create_issue`` she
+        # embeds ``SELF_FILED_MARKER`` in the body. The whole point of
+        # the watcher firing on a new issue is to route it through
+        # thinking → attempt-issue-fix; for issues Speaking already
+        # initiated, that loop is pure redundancy plus user-facing
+        # noise. State is still tracked so a later genuine state
+        # transition (if it ever matters) isn't lost.
+        self_filed = _is_self_filed(issue)
+        if not first_run and issues_primed and author_trusted and not self_filed:
             if prev_state and prev_state != new_state:
                 events.append(
                     Event(

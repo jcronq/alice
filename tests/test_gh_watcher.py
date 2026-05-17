@@ -641,3 +641,95 @@ def test_trusted_associations_configurable(
     notes = list((mind / "inner" / "notes").glob("*.md"))
     assert len(notes) == 1
     assert "From a contributor" in notes[0].read_text()
+
+
+# ---------------------------------------------------------------------------
+# Self-filed marker suppression (issue #226)
+# ---------------------------------------------------------------------------
+
+
+def test_self_filed_marker_suppresses_new_issue_note(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    """Issues Speaking files autonomously carry SELF_FILED_MARKER in the
+    body; the watcher must NOT emit a ``new_issue`` event for them, so the
+    thinking-analysis → attempt-issue-fix loop doesn't redundantly chase
+    work Speaking already initiated. Issue state is still tracked so the
+    issue isn't re-evaluated forever."""
+    api = FakeAPI()
+    api.issues = []
+    gh_watcher.run(
+        mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
+    )
+
+    api.issues = [
+        _make_issue(
+            number=226,
+            title="Speaking filed this herself",
+            user="jcronq",
+            body=(
+                "Some body content that mentions the fix plan.\n\n"
+                f"{gh_watcher.SELF_FILED_MARKER}"
+            ),
+        )
+    ]
+    api.issue_thread_comments[226] = []
+    gh_watcher.run(
+        mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
+    )
+
+    notes = list((mind_dir / "inner" / "notes").glob("*.md"))
+    assert notes == [], (
+        f"self-filed issue must not produce a new_issue note, "
+        f"got {[n.name for n in notes]}"
+    )
+    state = json.loads(state_path.read_text())
+    assert state["repos"]["acme/widgets"]["issue_state"]["226"] == "open", (
+        "self-filed issue state must still be tracked to prevent re-evaluation"
+    )
+
+
+def test_unmarked_jcronq_issue_still_fires_new_issue_note(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    """Sanity check that the suppression is marker-gated, not author-gated:
+    a manually-filed jcronq issue without the marker still produces a
+    note. The marker is the discriminator, not the author."""
+    api = FakeAPI()
+    api.issues = []
+    gh_watcher.run(
+        mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
+    )
+
+    api.issues = [
+        _make_issue(
+            number=227,
+            title="Jason filed this by hand",
+            user="jcronq",
+            body="No marker, just a regular issue body.",
+        )
+    ]
+    api.issue_thread_comments[227] = []
+    gh_watcher.run(
+        mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
+    )
+
+    notes = list((mind_dir / "inner" / "notes").glob("*.md"))
+    assert len(notes) == 1
+    assert "Jason filed this by hand" in notes[0].read_text()
+
+
+def test_is_self_filed_helper() -> None:
+    """Direct unit coverage for the marker check — substring match, case-
+    sensitive, missing/non-string bodies are treated as not self-filed."""
+    assert gh_watcher._is_self_filed({"body": gh_watcher.SELF_FILED_MARKER})
+    assert gh_watcher._is_self_filed(
+        {"body": f"some prose\n\n{gh_watcher.SELF_FILED_MARKER}\n"}
+    )
+    assert not gh_watcher._is_self_filed({"body": "no marker here"})
+    # Case-sensitive — the marker is fixed.
+    assert not gh_watcher._is_self_filed({"body": "<!-- ALICE-SELF-FILED -->"})
+    # Missing / non-string body.
+    assert not gh_watcher._is_self_filed({})
+    assert not gh_watcher._is_self_filed({"body": None})
+    assert not gh_watcher._is_self_filed({"body": 42})
