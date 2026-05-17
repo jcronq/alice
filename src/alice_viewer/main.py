@@ -137,6 +137,68 @@ def create_app(paths: Paths | None = None) -> FastAPI:
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+    def _configured_models(p: Paths) -> list[dict[str, Any]]:
+        """Build per-hemisphere model routing rows for the sidebar.
+
+        Reads ``mind/config/model.yml`` + ``mind/config/pi-models.json``
+        fresh on each call so swapping a hemisphere onto a different
+        backend (e.g. local pi endpoint) is visible the next time the
+        sidebar refreshes via ``sse:change``. Both files are KB-scale —
+        no caching needed.
+
+        For ``pi`` backends the model string is ``<provider>/<id>``;
+        resolve the provider to ``baseUrl`` and the entry's pretty
+        ``name`` from ``pi-models.json``. Missing or malformed config
+        files degrade to "show what we have" rather than raising —
+        the sidebar should never blow up the whole page render.
+        """
+        from alice_core.config.model import (
+            ModelConfigError,
+            load as load_model_config,
+        )
+
+        try:
+            cfg = load_model_config(p.mind_dir)
+        except ModelConfigError:
+            cfg = None
+
+        pi_providers: dict[str, dict[str, Any]] = {}
+        pi_path = p.mind_dir / "config" / "pi-models.json"
+        if pi_path.is_file():
+            try:
+                pi_providers = (
+                    json.loads(pi_path.read_text()).get("providers") or {}
+                )
+            except (json.JSONDecodeError, OSError):
+                pi_providers = {}
+
+        rows: list[dict[str, Any]] = []
+        for hemisphere in ("speaking", "thinking", "viewer"):
+            spec = cfg.hemisphere(hemisphere) if cfg else None
+            backend = spec.backend if spec else "subscription"
+            model = spec.model if spec else ""
+            row: dict[str, Any] = {
+                "agent": hemisphere,
+                "backend": backend,
+                "model": model,
+                "display_model": model,
+                "provider": None,
+                "endpoint": None,
+            }
+            if backend == "pi" and "/" in model:
+                provider_key, model_id = model.split("/", 1)
+                provider = pi_providers.get(provider_key) or {}
+                row["provider"] = provider_key
+                row["endpoint"] = provider.get("baseUrl") or None
+                for entry in provider.get("models", []) or []:
+                    if entry.get("id") == model_id:
+                        row["display_model"] = entry.get("name") or model_id
+                        break
+                else:
+                    row["display_model"] = model_id
+            rows.append(row)
+        return rows
+
     def _state_context() -> dict[str, Any]:
         p: Paths = app.state.paths
         events = sources.load_all(p)
@@ -157,6 +219,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
             "event_count": len(events),
             "speaking_usage": aggregators.latest_speaking_usage(events),
             "thinking_avg": aggregators.thinking_usage_average(events),
+            "configured_models": _configured_models(p),
         }
 
     # ------------------------------------------------------------------

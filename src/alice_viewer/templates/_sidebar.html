@@ -64,4 +64,23 @@
       <div class="metric muted">no objective set</div>
     {% endif %}
   </section>
+  <section>
+    <h3>configured models</h3>
+    {% if state.configured_models %}
+      {% for row in state.configured_models %}
+        <div class="metric">
+          <span class="k">{{ row.agent }}</span>
+          <span class="v">
+            {% if row.display_model %}{{ row.display_model }}{% else %}<span class="muted">unset</span>{% endif %}
+            <span class="muted">({{ row.backend }}{% if row.provider %} → {{ row.provider }}{% endif %})</span>
+          </span>
+        </div>
+        {% if row.endpoint %}
+          <div class="metric"><span class="k"></span><span class="v muted">{{ row.endpoint }}</span></div>
+        {% endif %}
+      {% endfor %}
+    {% else %}
+      <div class="metric muted">no model config</div>
+    {% endif %}
+  </section>
 </aside>
