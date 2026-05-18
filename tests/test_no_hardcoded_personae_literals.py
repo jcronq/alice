@@ -40,6 +40,18 @@ ALLOWLIST_FILES: frozenset[str] = frozenset(
     {
         # The placeholder personae is the source of the runtime default.
         "alice_core/config/personae.py",
+        # Speaking-quality eval harness hardcodes a fallback persona
+        # for when the mind-scaffold personae.yml isn't on disk
+        # (offline / test environments). The runtime path loads the
+        # scaffold; this is the explicit "last resort" branch.
+        "alice_eval/prompt.py",
+        # Rating UI's embedded HTML template uses "Alice" in the
+        # page <title> and headline. The rating UI is offline-only
+        # static markup, not part of the agent's prompt surface;
+        # substituting from personae here adds no value because the
+        # eval ships against the specific agent named in personae.yml
+        # already.
+        "alice_eval/rating_ui.py",
         # The package-level prompt loader's stand-in personae — same
         # role, mirrored across packages so cold-imports stay clean.
         "alice_prompts/__init__.py",

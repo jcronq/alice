@@ -1,0 +1,19 @@
+{
+  "candidates": [
+    {
+      "id": "opus",
+      "label": "Claude Opus 4.7",
+      "provider": "anthropic",
+      "model": "claude-opus-4-7-20260515",
+      "auth_env": ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]
+    },
+    {
+      "id": "qwen",
+      "label": "Qwen3.6-27B-Q4_K_M (local)",
+      "provider": "openai_compatible",
+      "model": "Qwen3.6-27B-Q4_K_M",
+      "base_url": "http://10.20.30.147:8033/v1",
+      "auth_env": []
+    }
+  ]
+}

@@ -76,6 +76,7 @@ build-backend = "hatchling.build"
 
 # Sibling Python packages under src/:
 #   alice_core      — agentic kernel (SDK lifecycle + observability + auth)
+#   alice_eval      — speaking-quality eval harness (Day-1 sample/replay/UI)
 #   alice_indexer   — vault SQLite/FTS5 indexer (CLI; cortex-memory tooling)
 #   alice_metrics   — stable vault-health metric implementations (replaces drift-prone bash)
 #   alice_pi        — Kernel impl backed by pi-coding-agent subprocess
@@ -89,6 +90,7 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = [
     "src/alice_core",
+    "src/alice_eval",
     "src/alice_indexer",
     "src/alice_metrics",
     "src/alice_pi",
