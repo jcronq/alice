@@ -31,6 +31,7 @@ from alice_metrics.vault_health import (
     count_productive_wakes,
     count_research_decay,
     count_research_notes_created_on,
+    count_shadow_and_dark,
     count_stage_c_candidates,
     count_surfaces_handled_today,
     count_surfaces_in_window,
@@ -505,6 +506,107 @@ def test_orphans_still_exclude_scaffolding_after_fix(tmp_path: Path) -> None:
     n, orphans = count_orphans(vault)
     assert n == 0
     assert orphans == []
+
+
+# ---------------------------------------------------------------------------
+# Shadow orphans + truly-dark notes
+# Design: cortex-memory/research/2026-05-18-vault-linking-protocol.md
+# Shadow orphan: 0 inbound, ≥1 outbound, ≥1 trigger_keyword.
+# Truly dark:    0 inbound, 0 trigger_keywords.
+# ---------------------------------------------------------------------------
+
+
+def test_shadow_orphan_has_triggers_and_outbound(tmp_path: Path) -> None:
+    """0 inbound + ≥1 outbound + ≥1 trigger_keyword → shadow orphan."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "ghost.md",
+        """
+        ---
+        slug: ghost
+        trigger_keywords: [phantom, spectre]
+        ---
+
+        Linking out to [[anchor]] but nothing links back.
+        """,
+    )
+    _write(
+        vault / "reference" / "anchor.md",
+        """
+        ---
+        slug: anchor
+        ---
+
+        Anchor body.
+        """,
+    )
+    counts = count_shadow_and_dark(vault)
+    assert counts["shadow_orphan_count"] == 1
+    # anchor.md has 1 inbound (from ghost), so it's not shadow/dark.
+    assert counts["truly_dark_count"] == 0
+
+
+def test_truly_dark_has_no_triggers(tmp_path: Path) -> None:
+    """0 inbound + 0 trigger_keywords → truly dark, regardless of outbound."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "void.md",
+        """
+        ---
+        slug: void
+        ---
+
+        Body with no trigger keywords and no inbound links.
+        """,
+    )
+    counts = count_shadow_and_dark(vault)
+    assert counts["truly_dark_count"] == 1
+    assert counts["shadow_orphan_count"] == 0
+
+
+def test_shadow_and_dark_exclude_dailies_and_scaffolding(tmp_path: Path) -> None:
+    """Dailies, archive, and scaffolding never count toward either bucket."""
+    vault = _make_vault(tmp_path)
+    (vault / "archive").mkdir()
+    _write(vault / "dailies" / "2026-05-18.md", "Daily with no triggers.\n")
+    _write(vault / "archive" / "ancient.md", "Archived note.\n")
+    _write(vault / "index.md", "")
+    _write(vault / "README.md", "")
+    _write(vault / "unresolved.md", "")
+    counts = count_shadow_and_dark(vault)
+    assert counts == {"shadow_orphan_count": 0, "truly_dark_count": 0}
+
+
+def test_shadow_and_dark_inbound_kills_both_buckets(tmp_path: Path) -> None:
+    """A single inbound link removes a note from both buckets."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "target.md",
+        """
+        ---
+        slug: target
+        trigger_keywords: [k]
+        ---
+
+        Target body.
+        """,
+    )
+    _write(
+        vault / "research" / "source.md",
+        """
+        ---
+        slug: source
+        trigger_keywords: [s]
+        ---
+
+        Points at [[target]].
+        """,
+    )
+    counts = count_shadow_and_dark(vault)
+    # target has 1 inbound → excluded. source has 0 inbound but ≥1 trigger
+    # and ≥1 outbound → shadow.
+    assert counts["shadow_orphan_count"] == 1
+    assert counts["truly_dark_count"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1169,6 +1271,8 @@ REQUIRED_EVENT_FIELDS = {
     "recovery_state",
     "research_decay_count",
     "decay_coverage",
+    "shadow_orphan_count",
+    "truly_dark_count",
 }
 
 

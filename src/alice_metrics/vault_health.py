@@ -358,6 +358,47 @@ def count_orphans(vault_dir: Path) -> tuple[int, list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Shadow orphans and truly-dark notes
+# Design: [[vault-linking-protocol]]
+# Shadow orphan: 0 inbound, ≥1 outbound, ≥1 trigger_keyword — reachable
+# via the cue runner but invisible to vault navigation.
+# Truly dark: 0 inbound, 0 trigger_keywords — no retrieval path at all.
+# ---------------------------------------------------------------------------
+
+
+def count_shadow_and_dark(vault_dir: Path) -> dict[str, int]:
+    """Count shadow orphans and truly-dark notes.
+
+    Returns ``{"shadow_orphan_count": int, "truly_dark_count": int}``.
+    Dailies, archive, and scaffolding (``index.md``, ``README.md``,
+    ``unresolved.md``) are excluded from both categories. Inbound counts
+    use the alias-resolved definition from ``count_inbound_links``.
+    """
+    inbound = count_inbound_links(vault_dir)
+    shadow = 0
+    dark = 0
+    for md in _iter_notes(vault_dir):
+        rel_parts = md.relative_to(vault_dir).parts
+        if rel_parts and (rel_parts[0] == "dailies" or rel_parts[0] == "archive"):
+            continue
+        if md.name in EXCLUDED_NAMES:
+            continue
+        rel = str(md.relative_to(vault_dir))
+        if inbound.get(rel, 0) > 0:
+            continue
+        text = _read_text(md)
+        fm, body = split_frontmatter(text)
+        triggers = fm.get("trigger_keywords")
+        trigger_count = len(triggers) if isinstance(triggers, list) else 0
+        outbound = _extract_targets(body)
+        if trigger_count >= 1 and len(outbound) >= 1:
+            shadow += 1
+        elif trigger_count == 0:
+            dark += 1
+    return {"shadow_orphan_count": shadow, "truly_dark_count": dark}
+
+
+# ---------------------------------------------------------------------------
 # Research note decay
 # Design: [[2026-05-09-research-note-decay-metric]]
 # Count research/ notes older than 60 days with fewer than 2 inbound links.
@@ -1549,6 +1590,7 @@ def build_vault_health_event(
 
     broken_count, _ = count_broken_wikilinks(vault_dir)
     orphan_count, _ = count_orphans(vault_dir)
+    shadow_dark = count_shadow_and_dark(vault_dir)
 
     event: dict[str, Any] = {
         "ts": ts,
@@ -1559,6 +1601,8 @@ def build_vault_health_event(
         "broken_wikilinks": broken_count,
         "orphan_notes": orphan_count,
         "orphan_dailies_excluded": True,
+        "shadow_orphan_count": shadow_dark["shadow_orphan_count"],
+        "truly_dark_count": shadow_dark["truly_dark_count"],
         "research_notes_last_night": count_research_notes_created_on(
             vault_dir, yesterday_midnight
         ),
@@ -1706,6 +1750,10 @@ def main(argv: list[str] | None = None) -> int:
     out["broken_wikilinks"] = broken_count
     orphan_count, _orphans = count_orphans(args.vault)
     out["orphan_notes"] = orphan_count
+
+    shadow_dark = count_shadow_and_dark(args.vault)
+    out["shadow_orphan_count"] = shadow_dark["shadow_orphan_count"]
+    out["truly_dark_count"] = shadow_dark["truly_dark_count"]
 
     # Research note decay: notes older than 60 days with < 2 inbound links.
     out["research_decay_count"] = count_research_decay(args.vault)
