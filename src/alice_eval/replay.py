@@ -52,7 +52,6 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Sequence

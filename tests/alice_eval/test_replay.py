@@ -15,7 +15,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from alice_eval import pii, replay
+from alice_eval import replay
 from alice_eval.replay import Candidate, ReplayResult
 
 
