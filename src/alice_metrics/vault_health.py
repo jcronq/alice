@@ -727,8 +727,9 @@ def count_tier1_ratio(
     if notes_7d_cutoff is None:
         notes_7d_cutoff = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
-    # Collect research/ notes with mtime ≥ 7 days ago.
-    cutoff_ts = notes_7d_cutoff.timestamp()
+    # Collect research/ notes created ≥ 7 days ago. Uses `created:` frontmatter,
+    # not mtime — bulk backfills (e.g. trigger_keyword) rewrite every file and
+    # would zero out the mtime-based age signal.
     old_notes: list[Path] = []
     research_dir = vault_dir / "research"
     if not research_dir.exists():
@@ -736,12 +737,11 @@ def count_tier1_ratio(
     for md in sorted(research_dir.rglob("*.md")):
         if md.name in EXCLUDED_NAMES:
             continue
-        try:
-            mtime = md.stat().st_mtime
-        except OSError:
-            continue
-        if mtime >= cutoff_ts:
-            continue  # too recent
+        text = _read_text(md)
+        fm, _body = split_frontmatter(text)
+        created = _parse_created_date(fm.get("created"))
+        if created is None or created >= notes_7d_cutoff:
+            continue  # too recent or no created: field
         old_notes.append(md)
 
     if not old_notes:
@@ -792,8 +792,10 @@ def count_output_rate_slope(
 ) -> dict[str, float | int]:
     """Compute the slope of daily research/ note creation over a window.
 
-    Counts notes in ``research/*.md`` by file mtime (in calendar-day
-    buckets), fits an OLS line, and returns the slope (notes/day/day).
+    Counts notes in ``research/*.md`` by `created:` frontmatter date (in
+    calendar-day buckets), fits an OLS line, and returns the slope
+    (notes/day/day). Frontmatter is used rather than mtime so bulk
+    backfills don't masquerade as a creation burst.
 
     Positive slope = output accelerating (burst).  Negative = output
     declining (recovery).  Near-zero = stable.
@@ -808,18 +810,19 @@ def count_output_rate_slope(
     ws = window_start.replace(tzinfo=None)
     we = window_end.replace(tzinfo=None)
 
-    # Bucket notes by calendar day of mtime.
+    # Bucket notes by calendar day of `created:` frontmatter date.
     daily: dict[datetime, int] = defaultdict(int)
     research_dir = vault_dir / "research"
     if research_dir.exists():
         for md in research_dir.rglob("*.md"):
             if md.name in EXCLUDED_NAMES:
                 continue
-            try:
-                mtime = datetime.fromtimestamp(md.stat().st_mtime)
-            except OSError:
+            text = _read_text(md)
+            fm, _body = split_frontmatter(text)
+            created = _parse_created_date(fm.get("created"))
+            if created is None:
                 continue
-            day = mtime.replace(hour=0, minute=0, second=0, microsecond=0)
+            day = created.replace(hour=0, minute=0, second=0, microsecond=0)
             if ws <= day < we:
                 daily[day] += 1
 
