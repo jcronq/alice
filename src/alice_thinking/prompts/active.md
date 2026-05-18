@@ -75,7 +75,7 @@ Fields:
   "research_notes_last_night": <count in research/ with created: yesterday>,
   "surfaces_written_last_night": <count inner/surface/ files timestamped 23:00-07:00>,
   "surfaces_handled_today": <count inner/surface/.handled/<today>/ files>,
-  "productive_wakes_last_night": <count inner/thoughts/<yesterday>/ wake files timestamped 23:00-07:00>,
+  "total_wakes_last_night": <count inner/thoughts/<yesterday>/ wake files timestamped 23:00-07:00>,
   "stage_c_candidates": {
     "bloated_notes": <count>,
     "stale_dailies": <count>,

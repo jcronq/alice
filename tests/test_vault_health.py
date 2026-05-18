@@ -1163,7 +1163,7 @@ REQUIRED_EVENT_FIELDS = {
     "research_notes_last_night",
     "surfaces_written_last_night",
     "surfaces_handled_today",
-    "productive_wakes_last_night",
+    "total_wakes_last_night",
     "stage_c_candidates",
     "wake_type_distribution",
     "recovery_state",

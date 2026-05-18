@@ -312,7 +312,7 @@ python3 -m alice_metrics.vault_health \
   --check-existing --append
 ```
 
-This checks if today's `vault_health` event already exists in `events.jsonl` and writes one if not. All fields — `total_notes`, `broken_wikilinks`, `orphan_notes`, `research_notes_last_night`, `surfaces_written_last_night`, `surfaces_handled_today`, `productive_wakes_last_night`, `stage_c_candidates`, `wake_type_distribution`, `recovery_state`, `research_decay_count` — are computed inside the module. Schema in `memory/EVENTS-SCHEMA.md §vault_health`.
+This checks if today's `vault_health` event already exists in `events.jsonl` and writes one if not. All fields — `total_notes`, `broken_wikilinks`, `orphan_notes`, `research_notes_last_night`, `surfaces_written_last_night`, `surfaces_handled_today`, `total_wakes_last_night`, `stage_c_candidates`, `wake_type_distribution`, `recovery_state`, `research_decay_count` — are computed inside the module. Schema in `memory/EVENTS-SCHEMA.md §vault_health`.
 
 Runs once per morning; the dedup is authoritative, so this command is safe to call unconditionally. If `stage_c_candidates.total` stays elevated or rises across consecutive days, Stage C is falling behind (debt accumulation — see [[2026-04-28-stage-c-debt-metric-design]]).
 

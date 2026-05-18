@@ -1395,6 +1395,7 @@ def _read_did_work(path: Path) -> bool:
     return False
 
 
+# Retained for backward compat; build_vault_health_event no longer calls this.
 def count_productive_wakes(
     thoughts_dir: Path, window_start: datetime, window_end: datetime
 ) -> int:
@@ -1417,6 +1418,35 @@ def count_productive_wakes(
                 continue
             if _read_did_work(md):
                 count += 1
+    return count
+
+
+def count_all_wakes_in_window(
+    thoughts_dir: Path, window_start: datetime, window_end: datetime
+) -> int:
+    """Count every wake file whose parsed start time falls in the window.
+
+    Same scanning logic as :func:`count_productive_wakes` but without the
+    ``did_work`` filter — useful for "how many wakes fired last night"
+    regardless of whether each wake produced work.
+    """
+    if not thoughts_dir.exists():
+        return 0
+    ws = _strip_tz(window_start)
+    we = _strip_tz(window_end)
+    count = 0
+    for date_dir in _intersecting_date_dirs(thoughts_dir, ws, we):
+        try:
+            dir_date = datetime.strptime(date_dir.name, "%Y-%m-%d")
+        except ValueError:
+            continue
+        for md in date_dir.glob("*.md"):
+            ts = _parse_wake_filename(md.name, dir_date)
+            if ts is None:
+                continue
+            if not (ws <= ts < we):
+                continue
+            count += 1
     return count
 
 
@@ -1536,7 +1566,7 @@ def build_vault_health_event(
             surface_dir, yesterday_23, today_07
         ),
         "surfaces_handled_today": count_surfaces_handled_today(surface_dir, today_midnight),
-        "productive_wakes_last_night": count_productive_wakes(
+        "total_wakes_last_night": count_all_wakes_in_window(
             thoughts_dir, yesterday_23, today_07
         ),
         "stage_c_candidates": count_stage_c_candidates(vault_dir, today=today_midnight),
