@@ -7,7 +7,6 @@ resulting pass-rate report.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 from unittest.mock import patch
@@ -16,7 +15,7 @@ import pytest
 
 from alice_eval import bench
 from alice_eval.bench import select_subset
-from alice_eval.replay import Candidate, ReplayResult
+from alice_eval.replay import ReplayResult
 
 
 def _sample_row(turn_id: str, category: str, outbound: str) -> dict:

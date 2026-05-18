@@ -29,7 +29,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path

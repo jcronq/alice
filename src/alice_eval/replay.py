@@ -106,6 +106,17 @@ class Candidate:
             value = os.environ.get(var)
             if value:
                 return value
+        # Fall back to the Claude Code OAuth credentials file: same long-lived
+        # token the speaking daemon already uses against api.anthropic.com.
+        creds = Path.home() / ".claude" / ".credentials.json"
+        if creds.is_file():
+            try:
+                data = json.loads(creds.read_text(encoding="utf-8"))
+                token = data.get("claudeAiOauth", {}).get("accessToken")
+                if token:
+                    return token
+            except (json.JSONDecodeError, OSError):
+                pass
         return None
 
 
@@ -267,21 +278,27 @@ async def _call_anthropic(
         )
     base = candidate.base_url or "https://api.anthropic.com"
     url = base.rstrip("/") + "/v1/messages"
+    # Anthropic accepts either an sk-ant-* API key (x-api-key) or a Claude
+    # Code OAuth bearer token. Detect by prefix so the same harness works
+    # under both auth modes.
     headers = {
-        "x-api-key": api_key,
         "anthropic-version": ANTHROPIC_API_VERSION,
         "content-type": "application/json",
     }
+    # OAuth tokens from Claude Code start with sk-ant-oat*; API keys start
+    # with sk-ant-api*. Anthropic routes them to different auth headers.
+    if api_key.startswith("sk-ant-oat"):
+        headers["authorization"] = f"Bearer {api_key}"
+        headers["anthropic-beta"] = "oauth-2025-04-20"
+    else:
+        headers["x-api-key"] = api_key
     body = {
         "model": candidate.model,
         "max_tokens": candidate.max_tokens,
         "system": system_prompt,
         "messages": messages,
     }
-    response = await client.post(
-        url, json=body, headers=headers, timeout=timeout_s
-    )
-    response.raise_for_status()
+    response = await _post_with_retry(client, url, body, headers, timeout_s)
     return response.json()
 
 
@@ -311,11 +328,48 @@ async def _call_openai_compatible(
         "messages": full_messages,
         "max_tokens": candidate.max_tokens,
     }
-    response = await client.post(
-        url, json=body, headers=headers, timeout=timeout_s
-    )
-    response.raise_for_status()
+    response = await _post_with_retry(client, url, body, headers, timeout_s)
     return response.json()
+
+
+async def _post_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    body: dict[str, Any],
+    headers: dict[str, str],
+    timeout_s: float,
+    *,
+    max_attempts: int = 5,
+) -> httpx.Response:
+    """POST with exponential backoff on transient failures (429/5xx).
+
+    Honours an upstream ``retry-after`` header when present.
+    """
+    delay = 2.0
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = await client.post(
+                url, json=body, headers=headers, timeout=timeout_s
+            )
+            if response.status_code in (429, 503, 529):
+                ra = response.headers.get("retry-after")
+                wait = float(ra) if ra and ra.isdigit() else delay
+                await asyncio.sleep(min(wait, 60.0))
+                delay *= 2
+                continue
+            response.raise_for_status()
+            return response
+        except httpx.HTTPStatusError as exc:
+            last_exc = exc
+            if exc.response.status_code in (429, 503, 529) and attempt < max_attempts:
+                await asyncio.sleep(min(delay, 60.0))
+                delay *= 2
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"exhausted {max_attempts} retries for {url}")
 
 
 def _extract_anthropic_text(payload: dict[str, Any]) -> str:
