@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
-# Stop Alice's sandbox. Use --rm to also remove containers (volumes persist
-# either way).
+# Stop Alice's sandbox. Use --rm to also remove the container
+# (named volumes / bind mounts persist either way).
+#
+# Single-container shape: there's one `alice` service to stop. The
+# stop honors compose's stop_grace_period (30m) so an in-flight
+# speaking turn or thinker wake gets the full drain window before
+# SIGKILL.
 set -euo pipefail
 
-cd "$(dirname "$0")/../sandbox"
+ALICE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=./_alice-env.sh
+. "$ALICE_ROOT/bin/_alice-env.sh"
+
+cd "$ALICE_ROOT/sandbox"
 
 if [ "${1:-}" = "--rm" ]; then
-    docker compose --profile blue --profile green down
+    docker compose down
 else
-    # Stop worker slots first (drains in-flight claude), then daemon.
-    for name in alice-worker-blue alice-worker-green; do
-        docker stop "$name" 2>/dev/null || true
-    done
-    docker stop alice-daemon 2>/dev/null || true
+    docker compose stop
 fi

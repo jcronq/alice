@@ -3,12 +3,12 @@
 # (the docker-exec wrapper around the agent-friendly alice-client).
 #
 # This script lives on the host. It launches a Node app under tui/ that
-# in turn spawns `docker exec -i WORKER alice-client --json` and renders
-# the event stream as a chat-style interface using Ink.
+# in turn spawns `docker exec -i $ALICE_CONTAINER alice-client --json`
+# and renders the event stream as a chat-style interface using Ink.
 #
 # Usage:
 #     alice-tui                    # interactive
-#     alice-tui --worker alice-worker-green
+#     alice-tui --worker some-other-name   # override $ALICE_CONTAINER
 #     alice-tui --help
 #
 # First run does an `npm install` + `tsc`; subsequent runs are instant.
@@ -17,6 +17,8 @@ set -euo pipefail
 
 ALICE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TUI_DIR="$ALICE_ROOT/tui"
+# shellcheck source=./_alice-env.sh
+. "$ALICE_ROOT/bin/_alice-env.sh"
 
 err() { printf "alice-tui: %s\n" "$*" >&2; exit 1; }
 
@@ -56,12 +58,13 @@ if [ "$needs_build" = "1" ]; then
     (cd "$TUI_DIR" && npm run --silent build) || err "tsc build failed"
 fi
 
-# ---- worker resolution ----------------------------------------------------
+# ---- container target -----------------------------------------------------
 
-# Mirror bin/alice's behavior: auto-run alice-up so the sandbox boots
-# behind the scenes, and pick the worker holding the lease so the TUI
-# follows blue/green slot swaps without arguments. (Skipped if the
-# user just wants --help.)
+# Auto-run alice-up so the sandbox boots behind the scenes, and pass
+# --worker $ALICE_CONTAINER through to the TUI so the Node app's
+# docker-exec lands on the right container. (Skipped if the user just
+# wants --help.) An explicit --worker NAME on the command line takes
+# precedence — useful for talking to a non-default install.
 help_only=0
 explicit_worker=0
 for arg in "$@"; do
@@ -75,21 +78,7 @@ if [ "$help_only" = "0" ]; then
     "$ALICE_ROOT/bin/alice-up"
 
     if [ "$explicit_worker" = "0" ]; then
-        # Lease-holder first, falling back to any worker that exists if we're
-        # mid-handoff and nobody currently holds the lease.
-        pick_worker() {
-            local name
-            for name in $(docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null); do
-                if ! docker exec "$name" flock -n /state/worker/lease true 2>/dev/null; then
-                    printf '%s\n' "$name"
-                    return 0
-                fi
-            done
-            docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null | head -n1
-        }
-        WORKER="$(pick_worker)"
-        [ -n "$WORKER" ] || err "no worker container running. did alice-up succeed?"
-        set -- --worker "$WORKER" "$@"
+        set -- --worker "$ALICE_CONTAINER" "$@"
     fi
 fi
 

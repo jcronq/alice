@@ -1,30 +1,26 @@
 #!/usr/bin/env bash
-# Drop into a bash shell inside Alice's sandbox (the lease-holding worker).
-# Pass "daemon" as first arg to shell into the daemon container instead.
+# Drop into a bash shell inside Alice's sandbox.
+#
+# Single-container shape: one `alice` container, no daemon/worker
+# split. The legacy `daemon` / `worker` positional is still accepted
+# (logs a one-liner) so muscle-memory invocations keep working.
 set -euo pipefail
 
-"$(dirname "$0")/alice-up"
+ALICE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=./_alice-env.sh
+. "$ALICE_ROOT/bin/_alice-env.sh"
 
-target="${1:-worker}"
+"$ALICE_ROOT/bin/alice-up"
 
-case "$target" in
-    daemon)
-        exec docker exec -u alice -it alice-daemon bash
-        ;;
-    worker|"")
-        # Pick the lease-holding worker (blue or green).
-        for name in $(docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null); do
-            if ! docker exec "$name" flock -n /state/worker/lease true 2>/dev/null; then
-                exec docker exec -u alice -it "$name" bash
-            fi
-        done
-        # No lease holder; pick any running worker.
-        any=$(docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null | head -n1)
-        [ -n "$any" ] && exec docker exec -u alice -it "$any" bash
-        echo "alice-shell: no worker running" >&2; exit 1
+case "${1:-}" in
+    ""|worker|daemon)
+        if [ "${1:-}" = "daemon" ] || [ "${1:-}" = "worker" ]; then
+            echo "alice-shell: '$1' is a legacy target; the consolidated container has no separate daemon/worker. Shelling into $ALICE_CONTAINER." >&2
+        fi
+        exec docker exec -u alice -it "$ALICE_CONTAINER" bash
         ;;
     *)
-        echo "alice-shell: unknown target '$target' (expected 'worker' or 'daemon')" >&2
+        echo "alice-shell: unknown target '$1' (no positional needed in single-container shape)" >&2
         exit 2
         ;;
 esac

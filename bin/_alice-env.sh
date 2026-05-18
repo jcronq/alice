@@ -36,6 +36,14 @@ export ALICE_REPO="${ALICE_REPO:-$ALICE_ROOT}"
 export ALICE_MIND="${ALICE_MIND:-$ALICE_ROOT/data/alice-mind}"
 export ALICE_TOOLS="${ALICE_TOOLS:-$ALICE_ROOT/data/alice-tools}"
 
+# Name of the single sandbox container. Matches `container_name:` in
+# sandbox/docker-compose.yml. Single-container shape (EKS Phase 2,
+# #160) collapsed the legacy alice-daemon + alice-worker-{blue,green}
+# trio into one `alice` container; the orchestration scripts target
+# this name. Overridable for ops that want a non-default install
+# (e.g. running two sandboxes side-by-side under different names).
+export ALICE_CONTAINER="${ALICE_CONTAINER:-alice}"
+
 # Source alice.env so any secrets the user keeps there (CLAUDE_*,
 # ANTHROPIC_*, GH_TOKEN, etc.) are visible to compose's variable
 # interpolation. The compose file only consumes the keys it explicitly

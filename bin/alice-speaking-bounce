@@ -20,31 +20,24 @@
 # this script you've already concluded the daemon is wedged.
 set -euo pipefail
 
-"$(dirname "$0")/alice-up"
+ALICE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=./_alice-env.sh
+. "$ALICE_ROOT/bin/_alice-env.sh"
 
-pick_worker() {
-    local name
-    for name in $(docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null); do
-        if ! docker exec "$name" flock -n /state/worker/lease true 2>/dev/null; then
-            printf '%s\n' "$name"
-            return 0
-        fi
-    done
-    docker ps --filter label=alice.role=worker --format '{{.Names}}' 2>/dev/null | head -n1
-}
+"$ALICE_ROOT/bin/alice-up"
 
-WORKER="$(pick_worker)"
-if [ -z "$WORKER" ]; then
-    echo "alice-speaking-bounce: no worker container running. did alice-up succeed?" >&2
+state="$(docker inspect -f '{{.State.Status}}' "$ALICE_CONTAINER" 2>/dev/null || echo missing)"
+if [ "$state" != "running" ]; then
+    echo "alice-speaking-bounce: container $ALICE_CONTAINER not running (state=$state). did alice-up succeed?" >&2
     exit 1
 fi
 
-echo "alice-speaking-bounce: targeting worker=$WORKER" >&2
+echo "alice-speaking-bounce: targeting $ALICE_CONTAINER" >&2
 
 # Run as root inside the container (no `-u alice`): s6-svc on the
 # alice-speaking service writes to the supervise/control fifo, which is
 # `prw------- root root`.
-docker exec "$WORKER" sh -c '
+docker exec "$ALICE_CONTAINER" sh -c '
     set -eu
     PATH=/command:$PATH
     LOG=/state/worker/speaking-stderr.log

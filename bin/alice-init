@@ -245,9 +245,9 @@ step=$((step + 1))
 
 if [ -n "$SIGNAL_ACCOUNT_VAL" ]; then
     cat <<EOF
-$step. Register Signal (once, interactive — the daemon must be up):
+$step. Register Signal (once, interactive — the sandbox must be up):
       alice-up
-      docker exec -it alice-daemon signal-cli -a "$SIGNAL_ACCOUNT_VAL" link -n "Alice"
+      docker exec -it alice signal-cli -a "$SIGNAL_ACCOUNT_VAL" link -n "Alice"
    Scan the QR code with your phone's Signal app.
 
 EOF
@@ -256,7 +256,7 @@ fi
 
 cat <<EOF
 $step. Bring up the sandbox and talk to her:
-      alice-up        # starts the daemon + worker + viewer
+      alice-up        # starts the consolidated alice container
       alice           # interactive CLI
       alice -p "ping" # one-shot
 

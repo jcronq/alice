@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# Start Alice's sandbox (daemon + one worker slot) if not already running.
-# Idempotent. Readiness = some worker holds the flock on /state/worker/lease.
+# Start Alice's sandbox if not already running. Idempotent.
+# Readiness = the single `alice` container is up and its compose
+# healthcheck reports `healthy` (viewer's `/` returning 200, per
+# sandbox/Dockerfile).
+#
+# Single-container shape (EKS Phase 2, #160): no daemon/worker split,
+# no blue/green, no worker-lease flock — one `alice` service supervised
+# by s6-overlay. Rebuild-and-relaunch lives in alice-deploy.
 set -euo pipefail
 
 ALICE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -30,49 +36,42 @@ mkdir -p \
     "$HOME/.local/state/alice" \
     "$HOME/.local/share/signal-cli"
 
-# Is a worker already up and holding the lease?
-for name in alice-worker-blue alice-worker-green; do
-    state="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || echo missing)"
-    if [ "$state" = "running" ]; then
-        if ! docker exec "$name" flock -n /state/worker/lease true 2>/dev/null; then
-            exit 0  # already live
-        fi
-    fi
-done
-
-# Build any image whose Dockerfile or build context changed since last
-# build. Cached layers stay cached, so a no-op warm start costs ~1-2s of
-# "everything cached" output. The previous "build only when no image
-# exists" gate skipped rebuilds after a `git pull` that changed a
-# Dockerfile, so a stale `:blue` from an earlier install kept being
-# reused — the daemon then crash-looped on whatever new dep the new
-# Dockerfile expected (issue #1). Building blue here also seeds it on
-# very first start. Green is left alone: alice-deploy is the path that
-# updates green, and pre-building both slots would double the cost
-# without benefit.
-docker compose --profile blue build alice-daemon alice-viewer alice-worker-blue >/dev/null
-
-# Bring up the daemon + observability viewer (always-on, host-side UI).
-docker compose up -d alice-daemon alice-viewer >/dev/null
-
-# Start whichever slot has a built image (prefer blue).
-if docker image inspect alice-worker:blue >/dev/null 2>&1; then
-    docker compose --profile blue up -d alice-worker-blue >/dev/null
-elif docker image inspect alice-worker:green >/dev/null 2>&1; then
-    docker compose --profile green up -d alice-worker-green >/dev/null
+# Is the container already up? Noop unless it's stuck unhealthy.
+state="$(docker inspect -f '{{.State.Status}}' "$ALICE_CONTAINER" 2>/dev/null || echo missing)"
+if [ "$state" = "running" ]; then
+    health="$(docker inspect -f '{{.State.Health.Status}}' "$ALICE_CONTAINER" 2>/dev/null || echo none)"
+    case "$health" in
+        healthy|starting|none) exit 0 ;;
+    esac
 fi
 
-# Wait for a worker to acquire the lease.
+# First-run build only. Routine rebuilds after a `git pull` belong to
+# alice-deploy — that path also re-tags the previous image as
+# `alice:premigration` so --rollback has an anchor; alice-up touching
+# the build would silently obliterate that anchor.
+if ! docker image inspect alice:latest >/dev/null 2>&1; then
+    docker compose build alice >/dev/null
+fi
+
+docker compose up -d alice >/dev/null
+
+# Wait for the docker healthcheck to flip to healthy. ~45 s matches the
+# worker-lease wait the legacy alice-up used; the viewer typically
+# reports 200 within ~5–10 s of an `up`.
 for _ in $(seq 1 90); do
-    for name in alice-worker-blue alice-worker-green; do
-        if docker ps --filter "name=^${name}$" --format '{{.Names}}' | grep -q .; then
-            if ! docker exec "$name" flock -n /state/worker/lease true 2>/dev/null; then
-                exit 0
-            fi
-        fi
-    done
+    state="$(docker inspect -f '{{.State.Status}}' "$ALICE_CONTAINER" 2>/dev/null || echo missing)"
+    if [ "$state" = "running" ]; then
+        health="$(docker inspect -f '{{.State.Health.Status}}' "$ALICE_CONTAINER" 2>/dev/null || echo none)"
+        case "$health" in
+            healthy) exit 0 ;;
+            unhealthy)
+                echo "alice-up: container $ALICE_CONTAINER reported unhealthy" >&2
+                exit 1
+                ;;
+        esac
+    fi
     sleep 0.5
 done
 
-echo "alice-up: no worker acquired the lease within 45s" >&2
+echo "alice-up: $ALICE_CONTAINER did not become healthy within 45s" >&2
 exit 1
