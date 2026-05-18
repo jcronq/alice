@@ -1,0 +1,24 @@
+# NVIDIA GPU pass-through for the in-container Qwen3-Embedding-4B
+# served from /state/sci-env. Stack this on top of docker-compose.yml
+# when the host has nvidia-container-toolkit installed and the nvidia
+# runtime registered in /etc/docker/daemon.json:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# alice-up and alice-deploy auto-include this file when the host's
+# docker daemon reports an `nvidia` runtime — see bin/_alice-env.sh.
+#
+# Hosts that consume the embedder over HTTP via ALICE_EMBED_URL don't
+# need this — the embedder s6 service sleeps in place when /state/sci-env
+# isn't installed, so the container is happy without GPU.
+
+services:
+  alice:
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

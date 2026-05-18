@@ -51,3 +51,28 @@ if [ -f "$_alice_env_file" ]; then
     set +a
 fi
 unset _alice_env_file
+
+# Compose file stack. The base file always applies; the personal override
+# (compose's auto-loaded second file) is included when present so we
+# don't lose it by setting COMPOSE_FILE explicitly. docker-compose.gpu.yml
+# stacks on top when the host has the nvidia runtime registered —
+# embedder needs CUDA when /state/sci-env is installed, but most hosts
+# reach the embedder over HTTP via ALICE_EMBED_URL and shouldn't pin
+# `runtime: nvidia` (compose v2 rejects unknown runtimes hard, which
+# breaks deploy on AMD or CPU-only boxes).
+#
+# Operator can short-circuit by exporting COMPOSE_FILE before invoking
+# alice-up / alice-deploy.
+if [ -z "${COMPOSE_FILE:-}" ]; then
+    _compose_files="$ALICE_ROOT/sandbox/docker-compose.yml"
+    if [ -f "$ALICE_ROOT/sandbox/docker-compose.override.yml" ]; then
+        _compose_files="$_compose_files:$ALICE_ROOT/sandbox/docker-compose.override.yml"
+    fi
+    if command -v docker >/dev/null 2>&1 \
+       && docker info --format '{{json .Runtimes}}' 2>/dev/null \
+            | grep -q '"nvidia"'; then
+        _compose_files="$_compose_files:$ALICE_ROOT/sandbox/docker-compose.gpu.yml"
+    fi
+    export COMPOSE_FILE="$_compose_files"
+    unset _compose_files
+fi

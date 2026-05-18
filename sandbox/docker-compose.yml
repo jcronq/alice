@@ -129,18 +129,11 @@ services:
       - ${HOME}/.config/gh:/home/alice/.config/gh:ro
       - ${HOME}/.ssh:/home/alice/.ssh:ro
     working_dir: /home/alice/alice-mind
-    # NVIDIA GPU passthrough. The embedder s6 service (Qwen3-Embedding-4B
-    # served from /state/sci-env) needs CUDA; the rest of the container
-    # is happy without. Requires (a) nvidia-container-toolkit on the
-    # host and (b) the nvidia runtime registered in /etc/docker/daemon.json.
-    # If those aren't set up, compose v2 ignores the unknown runtime
-    # hint, so the container still starts — just without /dev/nvidia*
-    # and the embedder falls into its idle/no-GPU branch.
-    runtime: nvidia
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    # GPU pass-through (for the in-container Qwen3-Embedding-4B served
+    # from /state/sci-env) lives in docker-compose.gpu.yml, not here.
+    # The default deploy assumes the embedder is reached over HTTP via
+    # ALICE_EMBED_URL, so no host GPU is required. Hosts running the
+    # local embedder opt in by composing the gpu file:
+    #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml ...
+    # alice-up and alice-deploy auto-include it when the nvidia runtime
+    # is registered on the host (see bin/_alice-env.sh).
