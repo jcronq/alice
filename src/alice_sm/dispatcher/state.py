@@ -73,6 +73,15 @@ class DispatcherState:
     research_note close path stays a no-op on subsequent passes until
     the worker (or a human) lands the exit-transition; the reminder
     must not re-fire every cadence.
+
+    ``triage_surfaced`` (issue #235) is the FIFO list of issue numbers
+    where the draft handler has already written a triage surface to
+    ``inner/surface/`` asking Speaking to decide ``[SM] route-to-study``
+    vs. close-as-rejected. Without this dedup the dispatcher would
+    re-emit a fresh surface every 60-second cadence, burying the
+    surface dispatcher. Cleared when the issue transitions out of
+    ``sm:draft`` so a future re-entry (e.g. operator manually labels a
+    closed issue back to draft) starts fresh.
     """
 
     version: int = STATE_VERSION
@@ -83,6 +92,7 @@ class DispatcherState:
     rebase_attempted: list[int] = field(default_factory=list)
     rebase_escalated_posted: list[int] = field(default_factory=list)
     exit_required_posted: list[int] = field(default_factory=list)
+    triage_surfaced: list[int] = field(default_factory=list)
 
     def has_hello(self, number: int) -> bool:
         return number in self.hello_commented
@@ -191,6 +201,25 @@ class DispatcherState:
         except ValueError:
             pass
 
+    def has_triage_surfaced(self, number: int) -> bool:
+        return number in self.triage_surfaced
+
+    def mark_triage_surfaced(self, number: int) -> None:
+        if number in self.triage_surfaced:
+            return
+        self.triage_surfaced.append(number)
+        if len(self.triage_surfaced) > SEEN_ISSUE_CAP:
+            overflow = len(self.triage_surfaced) - SEEN_ISSUE_CAP
+            del self.triage_surfaced[:overflow]
+
+    def clear_triage_surfaced(self, number: int) -> None:
+        # Called when the issue leaves ``sm:draft`` (Speaking routed or
+        # closed it). A future re-entry into draft should start fresh.
+        try:
+            self.triage_surfaced.remove(number)
+        except ValueError:
+            pass
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": self.version,
@@ -202,6 +231,7 @@ class DispatcherState:
             "rebase_attempted": list(self.rebase_attempted),
             "rebase_escalated_posted": list(self.rebase_escalated_posted),
             "exit_required_posted": list(self.exit_required_posted),
+            "triage_surfaced": list(self.triage_surfaced),
         }
 
 
@@ -256,6 +286,12 @@ def load_state(state_path: pathlib.Path) -> DispatcherState:
     # upgrade without a manual reset.
     raw_er = data.get("exit_required_posted") or []
     er_numbers: list[int] = [int(n) for n in raw_er if isinstance(n, int)]
+    # ``triage_surfaced`` was added in #235. Forward-compat
+    # default-to-empty so older state files keep working — the first
+    # pass after the upgrade will re-emit triage surfaces for any
+    # still-draft issues, which is the bug-fix behaviour we want.
+    raw_ts = data.get("triage_surfaced") or []
+    ts_numbers: list[int] = [int(n) for n in raw_ts if isinstance(n, int)]
     return DispatcherState(
         version=STATE_VERSION,
         hello_commented=numbers,
@@ -265,6 +301,7 @@ def load_state(state_path: pathlib.Path) -> DispatcherState:
         rebase_attempted=ra_numbers,
         rebase_escalated_posted=re_numbers,
         exit_required_posted=er_numbers,
+        triage_surfaced=ts_numbers,
     )
 
 
@@ -288,6 +325,9 @@ def save_state(state_path: pathlib.Path, state: DispatcherState) -> None:
     if len(state.exit_required_posted) > SEEN_ISSUE_CAP:
         overflow = len(state.exit_required_posted) - SEEN_ISSUE_CAP
         del state.exit_required_posted[:overflow]
+    if len(state.triage_surfaced) > SEEN_ISSUE_CAP:
+        overflow = len(state.triage_surfaced) - SEEN_ISSUE_CAP
+        del state.triage_surfaced[:overflow]
     state_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(
         dir=state_path.parent, prefix=".sm-dispatcher-", suffix=".json"

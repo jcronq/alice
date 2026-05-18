@@ -151,6 +151,7 @@ def test_empty_poll_writes_empty_state(state_path: pathlib.Path) -> None:
         "rebase_attempted": [],
         "rebase_escalated_posted": [],
         "exit_required_posted": [],
+        "triage_surfaced": [],
     }
 
 
@@ -4395,12 +4396,15 @@ def test_draft_route_to_study_swaps_art_label(state_path: pathlib.Path) -> None:
 
 
 def test_draft_route_to_study_unknown_art_does_not_transition(
-    state_path: pathlib.Path,
+    state_path: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
-    """``art:bogus`` is rejected by the parser → no transition."""
+    """``art:bogus`` is rejected by the parser → no transition. The
+    parser-rejected comment is functionally equivalent to no
+    RouteToStudy at all, so issue #235's triage surface still fires."""
     issues = [_draft_issue(402)]
     comments = [_audit_comment("[SM] route-to-study art=art:bogus")]
     logged: list[str] = []
+    surface_dir = tmp_path / "surface"
 
     label_rec = LabelRecorder()
     exit_code, report = sm.run(
@@ -4413,6 +4417,7 @@ def test_draft_route_to_study_unknown_art_does_not_transition(
         list_comments=lambda repo, n: comments,
         post_comment=Recorder(),
         edit_labels=label_rec,
+        triage_surface_dir=surface_dir,
         now_iso=_frozen_now,
         log=logged.append,
     )
@@ -4424,7 +4429,7 @@ def test_draft_route_to_study_unknown_art_does_not_transition(
 
 
 def test_draft_untrusted_comment_author_is_ignored(
-    state_path: pathlib.Path,
+    state_path: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
     """Forged route-to-study from a non-trusted commenter doesn't transition."""
     issues = [_draft_issue(403)]
@@ -4441,6 +4446,7 @@ def test_draft_untrusted_comment_author_is_ignored(
         list_comments=lambda repo, n: comments,
         post_comment=Recorder(),
         edit_labels=label_rec,
+        triage_surface_dir=tmp_path / "surface",
         now_iso=_frozen_now,
         log=lambda _m: None,
     )
@@ -4451,7 +4457,7 @@ def test_draft_untrusted_comment_author_is_ignored(
 
 
 def test_draft_with_no_route_to_study_comment_stays(
-    state_path: pathlib.Path,
+    state_path: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
     """Regression: a draft issue with only unrelated comments does not move."""
     issues = [_draft_issue(404)]
@@ -4468,6 +4474,7 @@ def test_draft_with_no_route_to_study_comment_stays(
         list_comments=lambda repo, n: comments,
         post_comment=Recorder(),
         edit_labels=label_rec,
+        triage_surface_dir=tmp_path / "surface",
         now_iso=_frozen_now,
         log=lambda _m: None,
     )
@@ -4534,6 +4541,187 @@ def test_draft_route_to_study_dry_run_records_intent_only(
     assert (406, "sm:draft", "sm:needs_study") in report.transitions
     assert recorder.posted == []
     assert label_rec.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #235 — sm:draft triage surface emission
+# ---------------------------------------------------------------------------
+
+
+def test_draft_no_route_to_study_emits_triage_surface(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """A draft with no trusted route-to-study comment gets a one-shot
+    triage surface so Speaking can decide instead of the issue sitting
+    silently (issue #235)."""
+    issues = [_draft_issue(410, title="FTS5 phase 3")]
+    issues[0]["body"] = "Wire up the FTS5 index for incremental refresh."
+    surface_dir = tmp_path / "surface"
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        triage_surface_dir=surface_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert report.triage_surfaced == 1
+    written = list(surface_dir.glob("*.md"))
+    assert len(written) == 1
+    contents = written[0].read_text()
+    # Frontmatter carries the discriminator + issue payload Speaking
+    # needs to decide without re-fetching.
+    assert "action: triage-sm-draft" in contents
+    assert "priority: triage" in contents
+    assert "issue_number: 410" in contents
+    assert "repo: jcronq/alice" in contents
+    assert "issue_url: https://github.com/jcronq/alice/issues/410" in contents
+    assert 'issue_title: "FTS5 phase 3"' in contents
+    assert "author: jcronq" in contents
+    assert "art_label: art:code" in contents
+    # Body is included verbatim for short payloads.
+    assert "Wire up the FTS5 index" in contents
+    # Ledger marked so re-runs dedup.
+    state_data = json.loads(state_path.read_text())
+    assert state_data["triage_surfaced"] == [410]
+
+
+def test_draft_triage_surface_deduped_on_second_pass(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """Second dispatcher pass against the same idle draft must not
+    write a duplicate triage surface (issue #235 — would otherwise
+    re-fire every 60-second cycle)."""
+    issues = [_draft_issue(411)]
+    surface_dir = tmp_path / "surface"
+
+    # First pass — surface fires.
+    sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        triage_surface_dir=surface_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+    first_pass_files = sorted(surface_dir.glob("*.md"))
+    assert len(first_pass_files) == 1
+
+    # Second pass — dedup ledger short-circuits, no new surface.
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        triage_surface_dir=surface_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.triage_surfaced == 0
+    assert sorted(surface_dir.glob("*.md")) == first_pass_files
+
+
+def test_draft_triage_surface_dry_run_does_not_write(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """Dry-run records the intent in the report but writes no surface
+    file and does not mark the ledger (so a real pass still fires)."""
+    issues = [_draft_issue(412)]
+    surface_dir = tmp_path / "surface"
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        triage_surface_dir=surface_dir,
+        dry_run=True,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.triage_surfaced == 1
+    assert not surface_dir.exists() or list(surface_dir.glob("*.md")) == []
+
+
+def test_draft_route_to_study_clears_triage_surfaced_ledger(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """A successful route-to-study transition clears the dedup ledger so
+    a future re-entry into sm:draft re-emits the triage surface (e.g.
+    operator manually re-labels a closed draft)."""
+    surface_dir = tmp_path / "surface"
+
+    # Seed the ledger by running an idle-draft pass first.
+    idle_issues = [_draft_issue(413)]
+    sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: idle_issues,
+        list_comments=lambda repo, n: [],
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        triage_surface_dir=surface_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+    state_data = json.loads(state_path.read_text())
+    assert state_data["triage_surfaced"] == [413]
+
+    # Speaking posts route-to-study; the next pass transitions and
+    # clears the ledger.
+    routed_comments = [_audit_comment("[SM] route-to-study")]
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: idle_issues,
+        list_comments=lambda repo, n: routed_comments,
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        triage_surface_dir=surface_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 1
+    state_data = json.loads(state_path.read_text())
+    assert state_data["triage_surfaced"] == []
 
 
 def test_selected_return_to_study_transitions_back_to_needs_study(

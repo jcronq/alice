@@ -77,6 +77,11 @@ class RunReport:
     # ``skipped_dedup`` / ``skipped_trust`` so the done-line shows the
     # queue is gated on dependencies, not auth / dedup.
     spawn_skipped_blocked_deps: int = 0
+    # Issue #235 — count of triage surfaces written this pass for
+    # ``sm:draft`` issues that lacked a trusted ``[SM] route-to-study``
+    # comment. Tracked separately so the operator can see at a glance
+    # whether the dispatcher woke Speaking on idle drafts.
+    triage_surfaced: int = 0
 
 
 @dataclass(frozen=True)

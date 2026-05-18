@@ -67,6 +67,8 @@ def run(
     list_comments: ListCommentsFn | None = None,
     notes_dir: pathlib.Path = NEEDS_STUDY_HINT_DIR,
     research_dir: pathlib.Path = RESEARCH_NOTES_DIR,
+    triage_surface_dir: pathlib.Path = TRIAGE_SURFACE_DIR,
+    triage_surface_body_char_limit: int = TRIAGE_SURFACE_BODY_CHAR_LIMIT,
     trusted_authors: frozenset[str] = TRUSTED_AUTHORS,
     dry_run: bool = False,
     log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
@@ -354,14 +356,18 @@ def run(
                 _process_draft(
                     issue=issue,
                     repo=repo,
+                    state=state,
                     report=report,
                     post_comment=post_comment,
                     edit_labels=edit_labels,
                     list_comments=list_comments,
                     trusted_authors=trusted_authors,
                     art_whitelist=ART_LABEL_WHITELIST,
+                    surface_dir=triage_surface_dir,
+                    body_char_limit=triage_surface_body_char_limit,
                     dry_run=dry_run,
                     log=log,
+                    now_iso=now_iso,
                 )
             elif sm_label == DESIGNING_SM_LABEL:
                 _process_designing(

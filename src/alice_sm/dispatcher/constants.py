@@ -111,6 +111,21 @@ STUDY_HINT_WRITTEN_PREFIX = "[SM] study-hint-written"
 # import cycle and to let tests override per-call.
 NEEDS_STUDY_HINT_DIR = pathlib.Path("/home/alice/alice-mind/inner/notes")
 
+# Issue #235 — directory where Speaking's surface_watcher polls. The
+# draft handler writes a triage surface here on the first cycle that
+# encounters an ``sm:draft`` issue without a trusted ``[SM] route-to-study``
+# comment, so Speaking can route the draft instead of having it sit
+# silently. Mirrors ``alice_mind / "inner/surface"`` — same rationale as
+# :data:`NEEDS_STUDY_HINT_DIR` for keeping it as a path constant rather
+# than importing.
+TRIAGE_SURFACE_DIR = pathlib.Path("/home/alice/alice-mind/inner/surface")
+
+# Issue #235 — cap on the issue body included in the triage surface.
+# Matches the auto-fix dispatch surface body budget (Part B of
+# ``2026-05-05-issue-dispatcher-design``) so Speaking gets enough context
+# to decide without re-fetching, while keeping the surface file small.
+TRIAGE_SURFACE_BODY_CHAR_LIMIT = 1500
+
 # Issue #212 — directory the dispatcher scans for groomed research
 # notes when auto-advancing ``sm:needs_study`` issues. A note whose
 # YAML frontmatter contains ``resolves_issue: <N>`` (scalar) or
