@@ -136,6 +136,25 @@ async def handle_signal(ctx: DaemonContext, batch: list["SignalEvent"]) -> None:
         await ctx._run_turn(prompt, turn_id=turn_id, outbound_recipient=source)
         if ctx._turn_did_send:
             terminal_state = "replied"
+        else:
+            # Missed-reply fallback: turn finished cleanly but Alice
+            # never called send_message. Send a plain-text apology so
+            # Jason doesn't see dead air. Bootstrap/compaction turns
+            # use silent=True and run through _run_turn directly (not
+            # this handler), so they can't trip this branch. Fallback
+            # send failures are non-critical — log and move on.
+            # Design: cortex-memory/research/2026-05-18-missed-reply-fallback-design.md
+            fallback = (
+                "I received your message but didn't have a response — "
+                "could you try rephrasing?"
+            )
+            try:
+                await ctx.signal_transport.send(
+                    OutboundMessage(destination=channel, text=fallback)
+                )
+                terminal_state = "replied"
+            except Exception:
+                log.exception("missed-reply fallback send failed for %s", sender_name)
     except Exception as exc:  # noqa: BLE001
         log.exception("turn failed for %s", sender_name)
         error = f"{type(exc).__name__}: {exc}"

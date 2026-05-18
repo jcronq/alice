@@ -615,3 +615,85 @@ def test_kernel_spec_includes_personae_system_prompt(cfg, monkeypatch) -> None:
     assert sp["preset"] == "claude_code"
     assert "Alice" in sp["append"]
     assert "the operator" in sp["append"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #215 — missed-reply fallback. When a Signal turn finishes without
+# Alice ever calling send_message, the dispatch handler emits a plain-text
+# apology on the originating channel so the user doesn't see dead air.
+
+
+def test_signal_handle_sends_fallback_on_missed_reply(cfg, monkeypatch) -> None:
+    """handle_signal: turn completes, _turn_did_send stays False → a plain-text
+    fallback lands on the originating Signal channel. Without this fallback,
+    Jason sees nothing back at all (issue #215)."""
+    from alice_speaking import _dispatch as _dispatch_module
+    from alice_speaking.infra.signal_rpc import SignalEnvelope
+    from alice_speaking.transports.signal import SignalEvent
+
+    d = _make_daemon(cfg, monkeypatch)
+
+    def msgs() -> list[Any]:
+        # Assistant text but no send_message tool call → _turn_did_send
+        # stays False, missed_reply event fires, fallback should land.
+        return [_assistant("internal monologue, no reply"), _result("s-missed")]
+
+    _patch_query(monkeypatch, msgs)
+
+    event = SignalEvent(
+        envelope=SignalEnvelope(
+            timestamp=1, source="+15555550100", body="you there?"
+        ),
+        sender_name="Owner",
+    )
+    ctx = _dispatch_module.DaemonContext(d)
+    asyncio.run(_dispatch_module.handle_signal(ctx, [event]))
+
+    # Exactly one outbound — the fallback — to the originating sender.
+    assert len(d.signal.sent) == 1
+    recipient, text = d.signal.sent[0]
+    assert recipient == "+15555550100"
+    assert "didn't have a response" in text
+
+
+def test_signal_handle_no_fallback_when_send_message_fired(cfg, monkeypatch) -> None:
+    """handle_signal: when the turn flips _turn_did_send=True (i.e. Alice
+    actually replied via send_message), the fallback must NOT fire — we
+    don't want a duplicate apology tacked onto every real reply."""
+    from alice_speaking import _dispatch as _dispatch_module
+    from alice_speaking.infra.signal_rpc import SignalEnvelope
+    from alice_speaking.transports.signal import SignalEvent
+
+    d = _make_daemon(cfg, monkeypatch)
+
+    def msgs() -> list[Any]:
+        return [_assistant("about to reply"), _result("s-replied")]
+
+    _patch_query(monkeypatch, msgs)
+
+    # Simulate send_message firing during the turn by flipping the flag
+    # at the kernel-call boundary. The fake query is sync-ish from the
+    # daemon's POV, so we patch _run_turn to flip the flag before it
+    # returns — same observable effect as the real send_message tool.
+    original_run_turn = d.turn_runner.run_turn
+
+    async def run_turn_then_flip(*args, **kwargs):
+        result = await original_run_turn(*args, **kwargs)
+        d._turn_did_send = True
+        return result
+
+    monkeypatch.setattr(d.turn_runner, "run_turn", run_turn_then_flip)
+
+    event = SignalEvent(
+        envelope=SignalEnvelope(
+            timestamp=2, source="+15555550100", body="hi"
+        ),
+        sender_name="Owner",
+    )
+    ctx = _dispatch_module.DaemonContext(d)
+    asyncio.run(_dispatch_module.handle_signal(ctx, [event]))
+
+    # Nothing went out via the fallback path — the real send_message would
+    # have written here, but we stubbed it; the assertion that matters is
+    # that NO fallback was tacked on after the turn closed.
+    assert d.signal.sent == []
