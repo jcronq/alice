@@ -1,5 +1,15 @@
 """Single-file blind-rating UI generator.
 
+.. deprecated::
+   Superseded by the SWE-Bench-style speaking-benchmark
+   (:mod:`alice_eval.bench`, :mod:`alice_eval.assertions`,
+   :mod:`alice_eval.score`) per
+   ``cortex-memory/research/2026-05-18-speaking-benchmark-design.md``
+   (issue #237). The blind-A/B rating UI is retained as the optional
+   *Verified-subset* rater for the small set of prose-only turns
+   where BLEU is informational only; it is no longer the primary
+   acceptance path.
+
 Reads ``eval_sample.jsonl`` and the per-candidate
 ``eval_outputs_<id>.jsonl`` files, embeds the data inline in an HTML
 file, and writes ``eval_rating.html``. The page is fully offline —

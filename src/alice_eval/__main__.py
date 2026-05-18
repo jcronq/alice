@@ -16,19 +16,29 @@ from __future__ import annotations
 import argparse
 import sys
 
-from alice_eval import rating_ui, replay, sampling
+from alice_eval import bench, rating_ui, replay, sampling
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
         prog="python -m alice_eval",
-        description="Speaking-quality eval — sample, replay, rating UI.",
+        description=(
+            "Speaking-quality eval. The legacy blind-A/B subcommands "
+            "(sample / replay / ui) remain available for the in-flight "
+            "rating UI but are superseded by the SWE-Bench-style "
+            "speaking-benchmark — see `speaking` group (issue #237)."
+        ),
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("sample", help="Stratified sample extraction", add_help=False)
     sub.add_parser("replay", help="Run candidates over a sample", add_help=False)
-    sub.add_parser("ui", help="Generate the rating UI HTML", add_help=False)
+    sub.add_parser("ui", help="Generate the rating UI HTML (legacy)", add_help=False)
+    sub.add_parser(
+        "speaking",
+        help="SWE-Bench-style speaking-benchmark (instances / run / score)",
+        add_help=False,
+    )
 
     if not argv:
         parser.print_help()
@@ -41,6 +51,8 @@ def main(argv: list[str] | None = None) -> int:
         return replay.main(rest)
     if cmd == "ui":
         return rating_ui.main(rest)
+    if cmd == "speaking":
+        return bench.main(rest)
 
     parser.print_help()
     return 2
