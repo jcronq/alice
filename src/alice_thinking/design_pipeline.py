@@ -779,8 +779,17 @@ def write_surface(
     body: str,
     now: Optional[_dt.datetime] = None,
     extra_frontmatter: Optional[dict[str, Any]] = None,
+    evidence: Optional[Any] = None,
 ) -> pathlib.Path:
-    """Write a surface note to ``inner/surface/<utcstamp>-<type>.md``."""
+    """Write a surface note to ``inner/surface/<utcstamp>-<type>.md``.
+
+    When ``extra_frontmatter`` declares ``priority: flash``, the surface
+    guard (:func:`alice_thinking.surface_guard.should_fire`) is consulted
+    against ``evidence`` before the write. On a failing check, priority is
+    downgraded to ``insight`` and ``guard_reason`` is stamped into the
+    frontmatter so Thinking can see why on the next wake. Insight-tier
+    surfaces pass through unguarded — the guard is flash-only.
+    """
     now = now or _dt.datetime.now()
     surface_dir = mind / "inner" / "surface"
     surface_dir.mkdir(parents=True, exist_ok=True)
@@ -797,6 +806,19 @@ def write_surface(
     if extra_frontmatter:
         for k, v in extra_frontmatter.items():
             fm[k] = v
+
+    # Surface guard — check claim verifiability before firing a flash surface.
+    if fm.get("priority") == "flash":
+        from alice_thinking.surface_guard import should_fire
+
+        can_fire, reason = should_fire(
+            target=surface_type,
+            evidence=evidence if evidence is not None else {},
+            priority="flash",
+        )
+        if not can_fire:
+            fm["priority"] = "insight"
+            fm["guard_reason"] = reason
 
     lines = ["---"]
     for k, v in fm.items():
