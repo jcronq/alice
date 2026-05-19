@@ -97,6 +97,27 @@ SPEAKING_DEFAULTS: dict[str, Any] = {
             "litellm_endpoint": "",
             "timeout_ms": 1500,
         },
+        # Hebbian edge-weight boost (#219, #254). Notes wikilinked
+        # from the user's STM context (most-recently-accessed slugs)
+        # get an additive boost proportional to their edge-weight
+        # sum. Structural edges (intentional wikilinks to tracked
+        # folders) weigh more than casual edges (incidental
+        # mentions). Same additive-floor shape as the fitness-domain
+        # recency boost — boost can only lift structurally-central
+        # notes, never displace higher-scoring topical hits. Backed
+        # by synthetic eval at +13.7% P@3, 0 regressions
+        # (cortex-memory/research/2026-05-18-hebbian-eval-harness-results.md).
+        # Opt-in (default off); flip ``enabled`` to True in
+        # alice.config.json once measurement is in place. See
+        # alice_speaking.retrieval.cue_runner.HEBBIAN_DEFAULTS for
+        # the in-module fallback constants.
+        "hebbian": {
+            "enabled": False,
+            "edge_boost": 0.4,
+            "structural_weight": 1.0,
+            "casual_weight": 0.25,
+            "min_edge_weight_sum": 8,
+        },
     },
 }
 

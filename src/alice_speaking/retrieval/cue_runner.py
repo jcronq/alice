@@ -86,6 +86,27 @@ TRIGGER_KEYWORD_EXTRA = 1.5
 ACCESS_COUNT_ALPHA = 0.15
 ACCESS_COUNT_CAP = 100
 
+# Hebbian edge-weight constants (#219, #254). Notes wikilinked from the
+# user's STM context (most-recently-accessed slugs) get an ADDITIVE boost
+# proportional to their edge-weight sum, with structural (intentional
+# wikilink) edges weighted heavier than casual (incidental mention) ones.
+# Same additive-floor shape as the fitness-domain recency boost — the
+# boost can only lift structurally-central notes, never displace
+# higher-scoring topical hits. Backed by synthetic eval at +13.7% P@3,
+# 0 regressions (cortex-memory/research/2026-05-18-hebbian-eval-harness-results.md)
+# and the decision memo at
+# cortex-memory/research/2026-05-18-hebbian-edge-weight-decision-memo.md.
+#
+# Defaults below are the conservative opt-in shape. Live cfg overrides
+# come from SPEAKING_DEFAULTS["cue_runner"]["hebbian"] (alice_speaking.infra.config).
+HEBBIAN_DEFAULTS: dict[str, Any] = {
+    "enabled": False,
+    "edge_boost": 0.4,
+    "structural_weight": 1.0,
+    "casual_weight": 0.25,
+    "min_edge_weight_sum": 8,
+}
+
 # Fitness-domain recency boost (#246). The static type-aware constants
 # above are calibrated to 1.0× across the board — a documented no-op
 # pending re-evaluation. For the fitness domain that no-op is load-bearing:
@@ -651,6 +672,96 @@ def _read_access_counts(
     return {row[0]: int(row[1] or 0) for row in rows}
 
 
+def _read_stm_context_slugs(
+    db_path: pathlib.Path,
+    limit: int = 20,
+) -> list[str]:
+    """Return the N most recently accessed note slugs (the STM context).
+
+    Used by the Hebbian edge-weight boost (#219, #254) to identify the
+    "source side" of the link traversal — i.e. notes the user has been
+    looking at recently. Edge weights from these notes' outbound
+    wikilinks promote their targets in the candidate ranking.
+
+    Tries ``speaking_accessed_at`` first (the timestamp column added
+    for Hebbian context); falls back to ``access_count DESC`` when the
+    column doesn't exist (legacy / freshly-seeded DBs). Returns ``[]``
+    on any DB error — graceful degradation, the caller substitutes the
+    FTS candidate slugs as the STM proxy.
+    """
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            # Prefer the explicit timestamp column. Fallback to popularity
+            # when the column doesn't exist (legacy seeded DBs).
+            try:
+                rows = conn.execute(
+                    "SELECT slug FROM note_metrics "
+                    "ORDER BY speaking_accessed_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = conn.execute(
+                    "SELECT slug FROM note_metrics "
+                    "ORDER BY access_count DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            return [r[0] for r in rows]
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+
+
+def _query_edge_weights(
+    db_path: pathlib.Path,
+    context_slugs: Iterable[str],
+    *,
+    structural_weight: float = 1.0,
+    casual_weight: float = 0.25,
+) -> dict[str, float]:
+    """Compute ``edge_weight_sum`` per target candidate from the
+    ``links`` table for a given STM context.
+
+    Sums per-target weighted edges where the source is one of the
+    context slugs. Structural (intentional wikilink) edges contribute
+    ``structural_weight`` each; casual (incidental text) edges
+    contribute ``casual_weight``. Only resolved targets (``resolved=1``)
+    count — unresolved/broken links never boost anything.
+
+    Returns ``{target_slug: edge_weight_sum}`` with only targets whose
+    sum is strictly positive. Returns ``{}`` on any DB error or empty
+    context — same graceful-degradation pattern as
+    :func:`_read_access_counts`.
+    """
+    slug_list = [s for s in context_slugs if s]
+    if not slug_list:
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            placeholders = ",".join("?" * len(slug_list))
+            # Structural edges (intentional wikilink to a tracked folder)
+            # weigh more than casual mentions; both gated on resolved=1.
+            rows = conn.execute(
+                f"""
+                SELECT target_slug,
+                       SUM(CASE WHEN is_structural=1 THEN ? ELSE ? END)
+                           AS edge_weight_sum
+                FROM links
+                WHERE resolved=1 AND source_slug IN ({placeholders})
+                GROUP BY target_slug
+                HAVING edge_weight_sum > 0
+                """,
+                (structural_weight, casual_weight, *slug_list),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {}
+    return {row[0]: float(row[1]) for row in rows}
+
+
 # ---------------------------------------------------------------------------
 # Reranker (Phase 2 — gated)
 
@@ -897,6 +1008,54 @@ async def build_cue_packet(
             _read_access_counts, resolved_db, [r[0] for r in rows]
         )
 
+        # Hebbian edge-weight boost (#219, #254). Same additive-floor
+        # shape as the fitness-domain recency boost — boost can only
+        # lift structurally-central notes, never displace higher-scoring
+        # topical hits. Gated behind cfg["hebbian"]["enabled"]; the
+        # surrounding try/except still catches any unexpected error
+        # and falls back to the pre-Hebbian ranking.
+        hebbian_cfg = cfg.get("hebbian") or {}
+        if hebbian_cfg.get("enabled", HEBBIAN_DEFAULTS["enabled"]):
+            edge_boost = float(
+                hebbian_cfg.get("edge_boost", HEBBIAN_DEFAULTS["edge_boost"])
+            )
+            structural_w = float(
+                hebbian_cfg.get(
+                    "structural_weight", HEBBIAN_DEFAULTS["structural_weight"]
+                )
+            )
+            casual_w = float(
+                hebbian_cfg.get("casual_weight", HEBBIAN_DEFAULTS["casual_weight"])
+            )
+            min_floor = float(
+                hebbian_cfg.get(
+                    "min_edge_weight_sum", HEBBIAN_DEFAULTS["min_edge_weight_sum"]
+                )
+            )
+            # Prefer the explicit STM context: notes the user is
+            # actively reading. Fall back to the FTS candidate slugs
+            # when the caller didn't pass any AND note_metrics is empty —
+            # at least it gives the link traversal something to chew on.
+            stm_context = [s for s in (context_slugs or ()) if s]
+            if not stm_context:
+                stm_context = await asyncio.to_thread(
+                    _read_stm_context_slugs, resolved_db, 20
+                )
+            if not stm_context:
+                stm_context = [r[0] for r in rows]
+            edge_weights = await asyncio.to_thread(
+                _query_edge_weights,
+                resolved_db,
+                stm_context,
+                structural_weight=structural_w,
+                casual_weight=casual_w,
+            )
+        else:
+            edge_boost = 0.0
+            edge_weights = {}
+            # Effectively disable the structural floor when Hebbian is off.
+            min_floor = float("inf")
+
         # Build candidates with type-aware boost.
         excluded = set(context_slugs or ())
         query_lower = query.lower()
@@ -928,6 +1087,23 @@ async def build_cue_packet(
             # boost to keep the boost meaningful.
             base_score = -float(fts_rank)
             final_score = base_score * boost * recency_boost
+            # Hebbian edge-weight boost (#219, #254). Additive on top
+            # of the multiplicative score; zero unless Hebbian is
+            # enabled AND the candidate has positive edge weight from
+            # the STM context. Pure floor: cannot displace higher-
+            # scoring topical hits, only lift structurally-connected
+            # neighbours into the candidate set.
+            hebbian_bonus = 0.0
+            if edge_boost > 0 and slug in edge_weights:
+                ew = edge_weights[slug]
+                hebbian_bonus = edge_boost * ew
+                # Structural floor: notes that are highly central in
+                # the wikilink graph (edge_weight_sum >= min_floor)
+                # get a small extra bump so the most-cited reference
+                # nodes don't get buried behind fresher daily notes.
+                if ew >= min_floor:
+                    hebbian_bonus += edge_boost * 2.0
+                final_score += hebbian_bonus
             # Fitness-domain recency boost (#246). Additive on top of
             # the multiplicative score; zero when the note isn't
             # fitness-tagged or hasn't been touched inside the recency
@@ -944,13 +1120,14 @@ async def build_cue_packet(
                     final_score += fitness_bonus
             log.debug(
                 "cue_runner: slug=%s fts_rank=%.4f type_boost=%.4f "
-                "access_count=%d recency_boost=%.4f fitness_bonus=%.4f "
-                "final=%.4f",
+                "access_count=%d recency_boost=%.4f hebbian_bonus=%.4f "
+                "fitness_bonus=%.4f final=%.4f",
                 slug,
                 fts_rank,
                 boost,
                 ac,
                 recency_boost,
+                hebbian_bonus,
                 fitness_bonus,
                 final_score,
             )
@@ -1074,4 +1251,5 @@ __all__ = [
     "FITNESS_RECENCY_WINDOW_DAYS",
     "FITNESS_RECENCY_COEFFICIENT",
     "FITNESS_RECENCY_CAP",
+    "HEBBIAN_DEFAULTS",
 ]

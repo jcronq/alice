@@ -35,14 +35,17 @@ from alice_speaking.retrieval.cue_runner import (
     FITNESS_RECENCY_CAP,
     FITNESS_RECENCY_COEFFICIENT,
     FITNESS_RECENCY_WINDOW_DAYS,
+    HEBBIAN_DEFAULTS,
     STATE_BOOST,
     _bump_access,
     _build_fts_match,
     _Candidate,
     _fitness_recency_score,
     _format_packet,
+    _query_edge_weights,
     _read_access_counts,
     _read_last_accessed,
+    _read_stm_context_slugs,
     _read_trigger_keywords,
     _tokenize_query,
     build_cue_packet,
@@ -1232,3 +1235,274 @@ def test_fitness_recency_constants_match_locked_design():
     assert FITNESS_RECENCY_WINDOW_DAYS == 7
     assert FITNESS_RECENCY_CAP == 100
     assert FITNESS_RECENCY_COEFFICIENT == 0.4
+
+
+# ---------------------------------------------------------------------------
+# Hebbian edge-weight boost (#219, #254)
+#
+# Notes wikilinked from the user's STM context get an additive boost
+# proportional to their edge-weight sum, with structural edges weighted
+# heavier than casual ones. Tests cover: (a) the SQL helper computes
+# weighted sums correctly, (b) graceful degradation on missing/empty
+# context, (c) STM context retrieval prefers speaking_accessed_at,
+# (d) the build_cue_packet integration is gated, additive-only, and
+# uses the structural floor.
+
+
+def _make_links_db_inplace(
+    path: pathlib.Path,
+    rows: list[tuple[str, str, int]],
+) -> None:
+    """Add a ``links`` table to an existing DB and seed it with
+    ``(source_slug, target_slug, is_structural)`` rows, all resolved=1.
+
+    Shape mirrors :mod:`alice_indexer.build_index` — source_slug,
+    target_slug, is_structural (0/1), resolved (0/1).
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE links (
+                source_slug TEXT NOT NULL,
+                target_slug TEXT NOT NULL,
+                target_raw TEXT,
+                is_structural INTEGER NOT NULL DEFAULT 0,
+                resolved INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX idx_links_source ON links(source_slug);
+            CREATE INDEX idx_links_target ON links(target_slug);
+            """
+        )
+        for source, target, is_structural in rows:
+            conn.execute(
+                "INSERT INTO links(source_slug, target_slug, target_raw, "
+                "is_structural, resolved) VALUES(?, ?, ?, ?, 1)",
+                (source, target, target, is_structural),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_hebbian_defaults_match_decision_memo():
+    """Guardrail: the in-module fallback config must match the
+    decision memo's recommended values. Drift requires re-eval."""
+    assert HEBBIAN_DEFAULTS["enabled"] is False
+    assert HEBBIAN_DEFAULTS["edge_boost"] == 0.4
+    assert HEBBIAN_DEFAULTS["structural_weight"] == 1.0
+    assert HEBBIAN_DEFAULTS["casual_weight"] == 0.25
+    assert HEBBIAN_DEFAULTS["min_edge_weight_sum"] == 8
+
+
+def test_query_edge_weights_sums_structural_and_casual(tmp_path: pathlib.Path):
+    db = tmp_path / "cortex-index.db"
+    _seed_db(db, [{"slug": "a", "title": "A", "body": "x"}])
+    _make_links_db_inplace(
+        db,
+        [
+            ("hub", "target-a", 1),  # structural
+            ("hub", "target-a", 0),  # casual
+            ("hub", "target-b", 1),  # structural
+            ("other", "target-a", 1),  # different source
+        ],
+    )
+    # context = [hub] → target-a = 1.0 + 0.25 = 1.25, target-b = 1.0
+    weights = _query_edge_weights(
+        db,
+        ["hub"],
+        structural_weight=1.0,
+        casual_weight=0.25,
+    )
+    assert weights == {"target-a": 1.25, "target-b": 1.0}
+
+
+def test_query_edge_weights_empty_context_returns_empty(tmp_path: pathlib.Path):
+    db = tmp_path / "cortex-index.db"
+    _seed_db(db, [{"slug": "a", "title": "A", "body": "x"}])
+    _make_links_db_inplace(db, [("hub", "target-a", 1)])
+    assert _query_edge_weights(db, []) == {}
+    assert _query_edge_weights(db, [""]) == {}
+
+
+def test_query_edge_weights_missing_table_returns_empty(tmp_path: pathlib.Path):
+    db = tmp_path / "cortex-index.db"
+    _seed_db(db, [{"slug": "a", "title": "A", "body": "x"}])
+    # No links table created — graceful degradation.
+    assert _query_edge_weights(db, ["hub"]) == {}
+
+
+def test_query_edge_weights_skips_unresolved_links(tmp_path: pathlib.Path):
+    db = tmp_path / "cortex-index.db"
+    _seed_db(db, [{"slug": "a", "title": "A", "body": "x"}])
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE links (
+                source_slug TEXT NOT NULL,
+                target_slug TEXT NOT NULL,
+                target_raw TEXT,
+                is_structural INTEGER NOT NULL DEFAULT 0,
+                resolved INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        # One resolved, one unresolved.
+        conn.execute(
+            "INSERT INTO links(source_slug, target_slug, target_raw, "
+            "is_structural, resolved) VALUES('hub', 'target-a', 'x', 1, 1)"
+        )
+        conn.execute(
+            "INSERT INTO links(source_slug, target_slug, target_raw, "
+            "is_structural, resolved) VALUES('hub', 'target-b', 'x', 1, 0)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    weights = _query_edge_weights(db, ["hub"])
+    assert weights == {"target-a": 1.0}
+
+
+def test_read_stm_context_slugs_prefers_speaking_accessed_at(
+    tmp_path: pathlib.Path,
+):
+    db = tmp_path / "cortex-index.db"
+    _seed_db(db, [{"slug": "a", "title": "A", "body": "x"}])
+    _make_metrics_db_inplace(db, [("cold", 10), ("hot", 1)])
+    # Set speaking_accessed_at so 'cold' is older than 'hot'.
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            "UPDATE note_metrics SET speaking_accessed_at = ? WHERE slug = ?",
+            ("2026-05-01 10:00:00", "cold"),
+        )
+        conn.execute(
+            "UPDATE note_metrics SET speaking_accessed_at = ? WHERE slug = ?",
+            ("2026-05-19 10:00:00", "hot"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    slugs = _read_stm_context_slugs(db, limit=10)
+    # 'hot' should come first (most recent speaking_accessed_at).
+    assert slugs[0] == "hot"
+
+
+def test_read_stm_context_slugs_falls_back_to_access_count(
+    tmp_path: pathlib.Path,
+):
+    db = tmp_path / "cortex-index.db"
+    _seed_db(db, [{"slug": "a", "title": "A", "body": "x"}])
+    # Create a note_metrics table WITHOUT speaking_accessed_at.
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            "CREATE TABLE note_metrics (slug TEXT PRIMARY KEY, "
+            "access_count INTEGER NOT NULL DEFAULT 0)"
+        )
+        conn.execute("INSERT INTO note_metrics VALUES('cold', 1)")
+        conn.execute("INSERT INTO note_metrics VALUES('hot', 100)")
+        conn.commit()
+    finally:
+        conn.close()
+    slugs = _read_stm_context_slugs(db, limit=10)
+    assert slugs[0] == "hot"
+
+
+def test_read_stm_context_slugs_missing_table_returns_empty(
+    tmp_path: pathlib.Path,
+):
+    db = tmp_path / "cortex-index.db"
+    _seed_db(db, [{"slug": "a", "title": "A", "body": "x"}])
+    assert _read_stm_context_slugs(db) == []
+
+
+@pytest.mark.asyncio
+async def test_build_cue_packet_hebbian_disabled_is_noop(
+    tmp_path: pathlib.Path,
+):
+    """With hebbian.enabled=False, the ranking must match the
+    pre-Hebbian behaviour exactly even if the links table is present."""
+    db = tmp_path / "cortex-index.db"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    body = "cozyhem details about deployment\n"
+    notes = [
+        {"slug": "boring", "title": "Boring", "body": body},
+        {"slug": "linked", "title": "Linked", "body": body},
+    ]
+    _seed_db(db, notes)
+    _seed_vault(vault, notes)
+    _make_links_db_inplace(db, [("hub", "linked", 1)] * 20)
+
+    cfg_no_hebb = {"enabled": True, "top_n": 2}
+    cfg_hebb_off = {
+        "enabled": True,
+        "top_n": 2,
+        "hebbian": {"enabled": False, "edge_boost": 0.4},
+    }
+    p1 = await build_cue_packet("cozyhem", cfg_no_hebb, db_path=db, vault_root=vault)
+    p2 = await build_cue_packet(
+        "cozyhem", cfg_hebb_off, db_path=db, vault_root=vault
+    )
+    assert p1 == p2
+
+
+@pytest.mark.asyncio
+async def test_build_cue_packet_hebbian_promotes_linked_note(
+    tmp_path: pathlib.Path,
+):
+    """A note that's the target of many structural links from the
+    STM context must outrank an otherwise-identical unlinked sibling."""
+    db = tmp_path / "cortex-index.db"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    body = "cozyhem details about deployment\n"
+    notes = [
+        {"slug": "unlinked", "title": "Unlinked", "body": body},
+        {"slug": "linked", "title": "Linked", "body": body},
+    ]
+    _seed_db(db, notes)
+    _seed_vault(vault, notes)
+    # Seed metrics so STM context = [hub] (not in the candidate set
+    # itself, just the source of the wikilinks).
+    _make_metrics_db_inplace(db, [("hub", 100)])
+    # Hub points at 'linked' with 20 structural edges → boost dominates.
+    _make_links_db_inplace(db, [("hub", "linked", 1)] * 20)
+
+    cfg = {
+        "enabled": True,
+        "top_n": 2,
+        "hebbian": {
+            "enabled": True,
+            "edge_boost": 0.4,
+            "structural_weight": 1.0,
+            "casual_weight": 0.25,
+            "min_edge_weight_sum": 8,
+        },
+    }
+    packet = await build_cue_packet("cozyhem", cfg, db_path=db, vault_root=vault)
+    assert packet.index("linked") < packet.index("unlinked")
+
+
+@pytest.mark.asyncio
+async def test_build_cue_packet_hebbian_missing_links_table_is_noop(
+    tmp_path: pathlib.Path,
+):
+    """If the links table is missing (legacy DB), the Hebbian path
+    degrades to zero boost and the packet still builds."""
+    db = tmp_path / "cortex-index.db"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    notes = [{"slug": "a", "title": "A", "body": "cozyhem details\n"}]
+    _seed_db(db, notes)
+    _seed_vault(vault, notes)
+
+    cfg = {
+        "enabled": True,
+        "top_n": 1,
+        "hebbian": {"enabled": True, "edge_boost": 0.4},
+    }
+    packet = await build_cue_packet("cozyhem", cfg, db_path=db, vault_root=vault)
+    assert "cozyhem details" in packet
