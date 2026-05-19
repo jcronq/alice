@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sys
 from collections import defaultdict
@@ -37,6 +38,15 @@ from pathlib import Path
 from typing import Any
 
 from alice_indexer.yaml_lite import extract_wikilinks, split_frontmatter
+
+logger = logging.getLogger(__name__)
+
+# Sanity-check threshold for the truly_dark_count field. With trigger-keyword
+# backfill complete across the vault (1593/1593 notes as of 2026-05-19), a
+# real truly_dark_count above this ceiling is statistically implausible and
+# almost always indicates silent frontmatter parse failures upstream.
+# See issue #249 / cortex-memory/research/2026-05-19-vault-health-shadow-dark-swap.md.
+_TRULY_DARK_SUSPECT_THRESHOLD = 10
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -369,14 +379,22 @@ def count_orphans(vault_dir: Path) -> tuple[int, list[str]]:
 def count_shadow_and_dark(vault_dir: Path) -> dict[str, int]:
     """Count shadow orphans and truly-dark notes.
 
-    Returns ``{"shadow_orphan_count": int, "truly_dark_count": int}``.
+    Returns ``{"shadow_orphan_count": int, "truly_dark_count": int,
+    "frontmatter_parse_failures": int}``.
     Dailies, archive, and scaffolding (``index.md``, ``README.md``,
     ``unresolved.md``) are excluded from both categories. Inbound counts
     use the alias-resolved definition from ``count_inbound_links``.
+
+    ``frontmatter_parse_failures`` counts notes whose first line is the
+    ``---`` frontmatter fence but ``split_frontmatter`` returned an empty
+    dict (unclosed fence or otherwise malformed). Without this counter,
+    such notes silently fall into ``truly_dark_count`` because
+    ``trigger_keywords`` parses as ``None``. See issue #249.
     """
     inbound = count_inbound_links(vault_dir)
     shadow = 0
     dark = 0
+    parse_failures = 0
     for md in _iter_notes(vault_dir):
         rel_parts = md.relative_to(vault_dir).parts
         if rel_parts and (rel_parts[0] == "dailies" or rel_parts[0] == "archive"):
@@ -388,6 +406,18 @@ def count_shadow_and_dark(vault_dir: Path) -> dict[str, int]:
             continue
         text = _read_text(md)
         fm, body = split_frontmatter(text)
+        # Detect silent frontmatter parse failures: the note opens with a
+        # ``---`` fence but parsing returned an empty dict. This is the
+        # failure mode from #249 — a missing closing fence or a malformed
+        # header silently produces an empty fm, which then makes the note
+        # look "truly dark" (no trigger_keywords).
+        if not fm and text.lstrip().startswith("---"):
+            parse_failures += 1
+            logger.warning(
+                "frontmatter parse failure (note classified as truly dark "
+                "by default): %s",
+                rel,
+            )
         triggers = fm.get("trigger_keywords")
         trigger_count = len(triggers) if isinstance(triggers, list) else 0
         outbound = _extract_targets(body)
@@ -395,7 +425,11 @@ def count_shadow_and_dark(vault_dir: Path) -> dict[str, int]:
             shadow += 1
         elif trigger_count == 0:
             dark += 1
-    return {"shadow_orphan_count": shadow, "truly_dark_count": dark}
+    return {
+        "shadow_orphan_count": shadow,
+        "truly_dark_count": dark,
+        "frontmatter_parse_failures": parse_failures,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1603,6 +1637,7 @@ def build_vault_health_event(
         "orphan_dailies_excluded": True,
         "shadow_orphan_count": shadow_dark["shadow_orphan_count"],
         "truly_dark_count": shadow_dark["truly_dark_count"],
+        "frontmatter_parse_failures": shadow_dark["frontmatter_parse_failures"],
         "research_notes_last_night": count_research_notes_created_on(
             vault_dir, yesterday_midnight
         ),
@@ -1630,6 +1665,20 @@ def build_vault_health_event(
         window_end=today_midnight,
         events_path=events_path,
     )
+
+    # Sanity-check: with trigger-keyword backfill complete, a real
+    # truly_dark_count above 10 is statistically implausible. Tag the
+    # event so downstream consumers (vault_linking_protocol, dashboards)
+    # can distinguish a suspect reading from a clean one. See #249.
+    if event["truly_dark_count"] > _TRULY_DARK_SUSPECT_THRESHOLD:
+        logger.warning(
+            "vault_health: truly_dark_count=%d exceeds suspect threshold (%d); "
+            "tagging event parse_quality=suspect (likely silent frontmatter "
+            "parse failures upstream — see issue #249)",
+            event["truly_dark_count"],
+            _TRULY_DARK_SUSPECT_THRESHOLD,
+        )
+        event["parse_quality"] = "suspect"
 
     return event
 
@@ -1754,6 +1803,7 @@ def main(argv: list[str] | None = None) -> int:
     shadow_dark = count_shadow_and_dark(args.vault)
     out["shadow_orphan_count"] = shadow_dark["shadow_orphan_count"]
     out["truly_dark_count"] = shadow_dark["truly_dark_count"]
+    out["frontmatter_parse_failures"] = shadow_dark["frontmatter_parse_failures"]
 
     # Research note decay: notes older than 60 days with < 2 inbound links.
     out["research_decay_count"] = count_research_decay(args.vault)

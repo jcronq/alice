@@ -574,7 +574,11 @@ def test_shadow_and_dark_exclude_dailies_and_scaffolding(tmp_path: Path) -> None
     _write(vault / "README.md", "")
     _write(vault / "unresolved.md", "")
     counts = count_shadow_and_dark(vault)
-    assert counts == {"shadow_orphan_count": 0, "truly_dark_count": 0}
+    assert counts == {
+        "shadow_orphan_count": 0,
+        "truly_dark_count": 0,
+        "frontmatter_parse_failures": 0,
+    }
 
 
 def test_shadow_and_dark_inbound_kills_both_buckets(tmp_path: Path) -> None:
@@ -607,6 +611,119 @@ def test_shadow_and_dark_inbound_kills_both_buckets(tmp_path: Path) -> None:
     # and ≥1 outbound → shadow.
     assert counts["shadow_orphan_count"] == 1
     assert counts["truly_dark_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Regression: issue #249 — silent frontmatter parse failures used to make
+# notes look "truly dark" because trigger_keywords parsed as None. The fix
+# exposes the failure both as a per-note WARNING log and as a counter on
+# the count_shadow_and_dark return / vault_health event payload.
+# ---------------------------------------------------------------------------
+
+
+def test_frontmatter_parse_failure_counted_when_fence_unclosed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A note with an opening ``---`` fence but no closing fence is a
+    parse failure: ``split_frontmatter`` returns an empty dict, so the
+    note used to silently fall into ``truly_dark_count``. The counter
+    must surface it AND a WARNING must be logged."""
+    vault = _make_vault(tmp_path)
+    # Note: this has an opening fence but no closing fence. yaml_lite
+    # treats that as "no frontmatter" — returns ({}, text). Pre-fix this
+    # was indistinguishable from a real no-frontmatter note.
+    (vault / "research" / "broken.md").write_text(
+        "---\nslug: broken\ntrigger_keywords: [phantom]\n\nbody without a closing fence\n",
+        encoding="utf-8",
+    )
+    with caplog.at_level("WARNING", logger="alice_metrics.vault_health"):
+        counts = count_shadow_and_dark(vault)
+    assert counts["frontmatter_parse_failures"] == 1
+    # The parse failure also flips classification: with no parsed fm,
+    # trigger_keywords is None → trigger_count is 0 → counted as dark.
+    # That's the documented inversion from #249 — the counter is what
+    # makes it visible.
+    assert counts["truly_dark_count"] == 1
+    assert any(
+        "frontmatter parse failure" in rec.message and "broken.md" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_frontmatter_parse_failure_not_counted_for_legitimately_empty_frontmatter(
+    tmp_path: Path,
+) -> None:
+    """A note that legitimately has no frontmatter (no opening fence)
+    must NOT count toward parse failures."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "no_fm.md",
+        "Just a note with no frontmatter at all.\n",
+    )
+    counts = count_shadow_and_dark(vault)
+    assert counts["frontmatter_parse_failures"] == 0
+
+
+def test_build_vault_health_event_includes_frontmatter_parse_failures(
+    tmp_path: Path,
+) -> None:
+    """The morning-scan event must surface ``frontmatter_parse_failures``
+    so consumers can distinguish a clean read from a degraded one."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    event = build_vault_health_event(
+        vault_dir=vault,
+        thoughts_dir=thoughts,
+        events_path=events,
+        surface_dir=surface,
+    )
+    assert "frontmatter_parse_failures" in event
+    assert event["frontmatter_parse_failures"] == 0
+    # No suspect tag on a clean vault.
+    assert "parse_quality" not in event
+
+
+def test_build_vault_health_event_tags_suspect_when_truly_dark_exceeds_threshold(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When ``truly_dark_count`` exceeds the sanity threshold, the event
+    must be tagged ``parse_quality: "suspect"`` AND a WARNING logged.
+    Vault context: with trigger-keyword backfill complete, >10 truly
+    dark notes is statistically implausible — the 07:49 EDT 2026-05-19
+    event that recorded shadow_orphan:1, truly_dark:20 is the reference
+    failure mode (issue #249)."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    # Seed 11 notes that have no frontmatter at all → each counts as
+    # truly dark. 11 > the threshold of 10.
+    for i in range(11):
+        _write(
+            vault / "research" / f"dark_{i}.md",
+            f"Note {i} with no frontmatter and no triggers.\n",
+        )
+
+    with caplog.at_level("WARNING", logger="alice_metrics.vault_health"):
+        event = build_vault_health_event(
+            vault_dir=vault,
+            thoughts_dir=thoughts,
+            events_path=events,
+            surface_dir=surface,
+        )
+    assert event["truly_dark_count"] >= 11
+    assert event.get("parse_quality") == "suspect"
+    assert any(
+        "exceeds suspect threshold" in rec.message for rec in caplog.records
+    )
 
 
 # ---------------------------------------------------------------------------
