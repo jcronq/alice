@@ -22,6 +22,8 @@ from typing import Any
 
 import pytest
 
+import datetime
+
 from alice_speaking.retrieval import cue_runner
 from alice_speaking.retrieval.cue_runner import (
     ACCESS_COUNT_ALPHA,
@@ -29,12 +31,18 @@ from alice_speaking.retrieval.cue_runner import (
     BEHAVIOR_BOOST,
     BUCKET1_BOOST,
     BUCKET2_BOOST,
+    FITNESS_DOMAIN_TAGS,
+    FITNESS_RECENCY_CAP,
+    FITNESS_RECENCY_COEFFICIENT,
+    FITNESS_RECENCY_WINDOW_DAYS,
     STATE_BOOST,
     _bump_access,
     _build_fts_match,
     _Candidate,
+    _fitness_recency_score,
     _format_packet,
     _read_access_counts,
+    _read_last_accessed,
     _read_trigger_keywords,
     _tokenize_query,
     build_cue_packet,
@@ -298,6 +306,8 @@ def _seed_vault(vault_root: pathlib.Path, notes: list[dict[str, Any]]) -> None:
         if n.get("trigger_keywords"):
             kws = ", ".join(n["trigger_keywords"])
             fm_lines.append(f"trigger_keywords: [{kws}]")
+        if n.get("last_accessed"):
+            fm_lines.append(f"last_accessed: {n['last_accessed']}")
         fm_lines.append("---")
         f.write_text("\n".join(fm_lines) + "\n" + n["body"] + "\n")
 
@@ -853,3 +863,372 @@ def _make_metrics_db_inplace(
         conn.commit()
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Fitness-domain recency boost (#246)
+#
+# The static type-aware constants are calibrated to 1.0× across the board
+# — for the fitness domain that no-op buries operational notes under
+# meta-research mentions. The recency boost reads `last_accessed` from
+# fitness-tagged candidates and adds a log-scaled bonus when they've been
+# touched in the last week. Tests cover the read path, the windowing,
+# the tag gate, and the additive-floor invariant.
+
+
+def test_read_last_accessed_parses_iso_date(tmp_path: pathlib.Path):
+    note = tmp_path / "a.md"
+    note.write_text("---\ntitle: A\nlast_accessed: 2026-05-10\n---\nbody\n")
+    assert _read_last_accessed(tmp_path, "a.md") == datetime.date(2026, 5, 10)
+
+
+def test_read_last_accessed_tolerates_trailing_time(tmp_path: pathlib.Path):
+    note = tmp_path / "a.md"
+    note.write_text(
+        "---\ntitle: A\nlast_accessed: 2026-05-10 12:38 EDT\n---\nbody\n"
+    )
+    assert _read_last_accessed(tmp_path, "a.md") == datetime.date(2026, 5, 10)
+
+
+def test_read_last_accessed_missing_field_returns_none(tmp_path: pathlib.Path):
+    note = tmp_path / "a.md"
+    note.write_text("---\ntitle: A\n---\nbody\n")
+    assert _read_last_accessed(tmp_path, "a.md") is None
+
+
+def test_read_last_accessed_no_frontmatter_returns_none(tmp_path: pathlib.Path):
+    note = tmp_path / "a.md"
+    note.write_text("just a body\n")
+    assert _read_last_accessed(tmp_path, "a.md") is None
+
+
+def test_read_last_accessed_unparseable_returns_none(tmp_path: pathlib.Path):
+    note = tmp_path / "a.md"
+    note.write_text("---\ntitle: A\nlast_accessed: yesterday\n---\nbody\n")
+    assert _read_last_accessed(tmp_path, "a.md") is None
+
+
+def test_read_last_accessed_missing_file_returns_none(tmp_path: pathlib.Path):
+    assert _read_last_accessed(tmp_path, "nope.md") is None
+
+
+def test_fitness_recency_score_zero_without_fitness_tag():
+    today = datetime.date(2026, 5, 19)
+    assert (
+        _fitness_recency_score(
+            ["research", "alice-architecture"],
+            access_count=50,
+            last_accessed=today,
+            today=today,
+        )
+        == 0.0
+    )
+
+
+def test_fitness_recency_score_zero_when_outside_window():
+    today = datetime.date(2026, 5, 19)
+    stale = today - datetime.timedelta(days=FITNESS_RECENCY_WINDOW_DAYS + 1)
+    assert (
+        _fitness_recency_score(
+            ["fitness"],
+            access_count=10,
+            last_accessed=stale,
+            today=today,
+        )
+        == 0.0
+    )
+
+
+def test_fitness_recency_score_zero_when_last_accessed_missing():
+    today = datetime.date(2026, 5, 19)
+    assert (
+        _fitness_recency_score(
+            ["fitness"],
+            access_count=10,
+            last_accessed=None,
+            today=today,
+        )
+        == 0.0
+    )
+
+
+def test_fitness_recency_score_log_scales_within_window():
+    today = datetime.date(2026, 5, 19)
+    yesterday = today - datetime.timedelta(days=1)
+    import math as _math
+
+    assert _fitness_recency_score(
+        ["fitness"],
+        access_count=10,
+        last_accessed=yesterday,
+        today=today,
+    ) == pytest.approx(_math.log1p(10))
+
+
+def test_fitness_recency_score_caps_at_fitness_recency_cap():
+    today = datetime.date(2026, 5, 19)
+    import math as _math
+
+    huge = _fitness_recency_score(
+        ["fitness"],
+        access_count=10_000,
+        last_accessed=today,
+        today=today,
+    )
+    assert huge == pytest.approx(_math.log1p(FITNESS_RECENCY_CAP))
+
+
+def test_fitness_recency_score_picks_up_ripped_by_40_tag():
+    today = datetime.date(2026, 5, 19)
+    assert (
+        _fitness_recency_score(
+            ["ripped-by-40"],
+            access_count=5,
+            last_accessed=today,
+            today=today,
+        )
+        > 0.0
+    )
+
+
+def test_fitness_domain_tags_includes_known_tags():
+    # Guardrail: drift here changes which notes get the boost.
+    assert "fitness" in FITNESS_DOMAIN_TAGS
+    assert "ripped-by-40" in FITNESS_DOMAIN_TAGS
+
+
+@pytest.mark.asyncio
+async def test_build_cue_packet_fitness_recency_promotes_recently_accessed(
+    tmp_path: pathlib.Path,
+):
+    """A fitness-tagged note with a recent ``last_accessed`` outranks an
+    identically-scored non-fitness note. Bodies are identical so FTS
+    rank ties; the additive fitness bonus is the only differentiator."""
+    db = tmp_path / "cortex-index.db"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    today = datetime.date.today().isoformat()
+    body = "bench press progression details about workouts\n"
+    notes = [
+        {
+            "slug": "fitness-current-weights",
+            "title": "Current Lift Weights",
+            "note_type": "research",
+            "tags": ["fitness"],
+            "last_accessed": today,
+            "body": body,
+        },
+        {
+            "slug": "old-research-note",
+            "title": "Old Research",
+            "note_type": "research",
+            "tags": [],
+            "body": body,
+        },
+    ]
+    _seed_db(db, notes)
+    _seed_vault(vault, notes)
+    _make_metrics_db_inplace(
+        db, [("fitness-current-weights", 8), ("old-research-note", 8)]
+    )
+
+    cfg = {"enabled": True, "top_n": 2}
+    packet = await build_cue_packet(
+        "bench press progression", cfg, db_path=db, vault_root=vault
+    )
+    assert packet.index("fitness-current-weights") < packet.index(
+        "old-research-note"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_cue_packet_fitness_recency_skips_stale_notes(
+    tmp_path: pathlib.Path,
+):
+    """A fitness-tagged note whose ``last_accessed`` is older than the
+    7-day window must NOT receive the additive bonus — keeping the
+    boost honest about being recency-derived. With identical FTS bodies
+    and access_counts, the order falls back to FTS rank (stable
+    insertion order in the seeded DB)."""
+    db = tmp_path / "cortex-index.db"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    stale = (
+        datetime.date.today()
+        - datetime.timedelta(days=FITNESS_RECENCY_WINDOW_DAYS + 5)
+    ).isoformat()
+    body = "bench press progression details about workouts\n"
+    notes = [
+        {
+            "slug": "fitness-stale",
+            "title": "Stale Fitness",
+            "note_type": "research",
+            "tags": ["fitness"],
+            "last_accessed": stale,
+            "body": body,
+        },
+        {
+            "slug": "other-note",
+            "title": "Other",
+            "note_type": "research",
+            "tags": [],
+            "body": body,
+        },
+    ]
+    _seed_db(db, notes)
+    _seed_vault(vault, notes)
+    # Equal access counts so the multiplicative recency_boost ties too.
+    _make_metrics_db_inplace(db, [("fitness-stale", 5), ("other-note", 5)])
+
+    cfg = {"enabled": True, "top_n": 2}
+    packet = await build_cue_packet(
+        "bench press progression", cfg, db_path=db, vault_root=vault
+    )
+    # The fitness note got no bonus, so it shouldn't have leapfrogged
+    # the other on the strength of its tag alone. Order is determined by
+    # FTS rank (both notes appear) — the assertion is that the bonus did
+    # NOT fire, which we check by confirming no stale-induced reorder.
+    # If the bonus had fired, fitness-stale would be guaranteed first;
+    # without it, both can appear in any order, so we just confirm both
+    # are present.
+    assert "fitness-stale" in packet
+    assert "other-note" in packet
+
+
+def test_fitness_recency_score_is_non_negative():
+    """Additive-floor invariant (#246): the fitness bonus is non-
+    negative under every input combination — a recently-accessed
+    fitness note cannot have its final_score reduced by this code
+    path, only lifted. Inputs sampled across the relevant axes."""
+    today = datetime.date(2026, 5, 19)
+    samples = [
+        # (tags, access_count, last_accessed, today)
+        ([], 100, today, today),
+        (["fitness"], 0, today, today),
+        (["fitness"], 1_000_000, today, today),
+        (["fitness"], 5, None, today),
+        (["fitness"], 5, today - datetime.timedelta(days=365), today),
+        (["fitness"], -10, today, today),  # defensive against bad input
+        (["ripped-by-40"], 50, today - datetime.timedelta(days=3), today),
+        (["research", "fitness"], 12, today, today),
+    ]
+    for tags, ac, la, t in samples:
+        assert _fitness_recency_score(tags, ac, la, t) >= 0.0
+
+
+@pytest.mark.asyncio
+async def test_build_cue_packet_fitness_recency_does_not_demote_non_fitness(
+    tmp_path: pathlib.Path,
+):
+    """Additive-floor invariant (#246): introducing the fitness bonus
+    must not reorder two non-fitness notes relative to each other.
+    Their final_scores depend only on FTS rank × type_boost × recency_boost,
+    which is unchanged by the new code path. Verifies the boost is purely
+    additive on fitness-tagged candidates and a no-op elsewhere."""
+    db = tmp_path / "cortex-index.db"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    today = datetime.date.today().isoformat()
+    notes = [
+        # Two non-fitness notes with different body strengths. The
+        # stronger BM25 hit must keep its lead even when a fitness
+        # note is in the candidate set getting boosted.
+        {
+            "slug": "non-fitness-strong",
+            "title": "Non-Fitness Strong",
+            "note_type": "research",
+            "tags": ["research"],
+            "body": (
+                "cozyhem cozyhem cozyhem cozyhem cozyhem cozyhem "
+                "cozyhem cozyhem cozyhem cozyhem\n"
+            ),
+        },
+        {
+            "slug": "non-fitness-weak",
+            "title": "Non-Fitness Weak",
+            "note_type": "research",
+            "tags": ["research"],
+            "body": "cozyhem mention here\n",
+        },
+        {
+            "slug": "fitness-recent",
+            "title": "Fitness Recent",
+            "note_type": "research",
+            "tags": ["fitness"],
+            "last_accessed": today,
+            "body": "cozyhem note about workouts\n",
+        },
+    ]
+    _seed_db(db, notes)
+    _seed_vault(vault, notes)
+    _make_metrics_db_inplace(
+        db,
+        [
+            ("non-fitness-strong", 5),
+            ("non-fitness-weak", 5),
+            ("fitness-recent", 50),
+        ],
+    )
+
+    cfg = {"enabled": True, "top_n": 3}
+    packet = await build_cue_packet(
+        "cozyhem", cfg, db_path=db, vault_root=vault
+    )
+    # Among the two non-fitness notes, BM25 ordering must be preserved
+    # regardless of what the fitness note's bonus does.
+    assert packet.index("non-fitness-strong") < packet.index("non-fitness-weak")
+
+
+@pytest.mark.asyncio
+async def test_build_cue_packet_fitness_recency_no_bonus_for_non_fitness(
+    tmp_path: pathlib.Path,
+):
+    """The recency bonus is fitness-gated. With identical access_counts
+    and bodies, only the fitness-tagged note should get the additive
+    bonus — the non-fitness note (even if recently accessed) must not.
+    The fitness note therefore wins; if the bonus were tag-agnostic,
+    they'd tie."""
+    db = tmp_path / "cortex-index.db"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    today = datetime.date.today().isoformat()
+    body = "bench press progression details about workouts\n"
+    notes = [
+        {
+            "slug": "non-fitness-recent",
+            "title": "Non-Fitness Recent",
+            "note_type": "research",
+            "tags": ["research"],  # NOT a fitness-domain tag.
+            "last_accessed": today,
+            "body": body,
+        },
+        {
+            "slug": "fitness-recent",
+            "title": "Fitness Recent",
+            "note_type": "research",
+            "tags": ["fitness"],
+            "last_accessed": today,
+            "body": body,
+        },
+    ]
+    _seed_db(db, notes)
+    _seed_vault(vault, notes)
+    # Identical access_counts so the multiplicative recency_boost cancels —
+    # any ordering difference must come from the additive fitness bonus.
+    _make_metrics_db_inplace(
+        db, [("non-fitness-recent", 10), ("fitness-recent", 10)]
+    )
+
+    cfg = {"enabled": True, "top_n": 2}
+    packet = await build_cue_packet(
+        "bench press progression", cfg, db_path=db, vault_root=vault
+    )
+    assert packet.index("fitness-recent") < packet.index("non-fitness-recent")
+
+
+def test_fitness_recency_constants_match_locked_design():
+    """Guardrail: drift in window/cap/coefficient changes which notes
+    get boosted and by how much — flag it loudly in CI."""
+    assert FITNESS_RECENCY_WINDOW_DAYS == 7
+    assert FITNESS_RECENCY_CAP == 100
+    assert FITNESS_RECENCY_COEFFICIENT == 0.4

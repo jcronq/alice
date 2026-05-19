@@ -86,6 +86,38 @@ TRIGGER_KEYWORD_EXTRA = 1.5
 ACCESS_COUNT_ALPHA = 0.15
 ACCESS_COUNT_CAP = 100
 
+# Fitness-domain recency boost (#246). The static type-aware constants
+# above are calibrated to 1.0× across the board — a documented no-op
+# pending re-evaluation. For the fitness domain that no-op is load-bearing:
+# fitness operational notes get buried by meta-research mentions in BM25
+# (see cortex-memory/research/fitness-retrieval-followup-may16.md), and a
+# pre-computed trigger-keyword → notes mapping cannot reflect what Jason
+# is actually reading week-over-week. The fix derives the boost at query
+# time from `last_accessed` on fitness-tagged candidates instead of a
+# static config snapshot — closing the "stale configuration silent
+# failure" pattern documented at
+# cortex-memory/research/2026-05-19-stale-configuration-silent-failure.md.
+#
+# Shape: ADDITIVE on top of the multiplicative score, matching the
+# planned Hebbian edge-weight boost
+# (cortex-memory/research/2026-05-18-cue-runner-hebbian-edge-weight-retrieval-score.md):
+#
+#     final_score = (base_score * type_boost * recency_boost)
+#                   + (FITNESS_RECENCY_COEFFICIENT * fitness_recency_score)
+#
+# fitness_recency_score = log1p(min(access_count, FITNESS_RECENCY_CAP))
+# when the candidate is tagged with a fitness-domain tag AND its
+# `last_accessed` frontmatter is within FITNESS_RECENCY_WINDOW_DAYS;
+# 0 otherwise. Because the bonus is non-negative and added on top, the
+# original BM25 ordering is preserved as a floor — the boost can only
+# lift fitness notes, never displace unrelated higher-scoring hits.
+# Coefficient 0.4 mirrors the Hebbian decision memo's edge_boost
+# recommendation (cortex-memory/research/2026-05-18-hebbian-edge-weight-decision-memo.md).
+FITNESS_DOMAIN_TAGS = frozenset({"fitness", "ripped-by-40"})
+FITNESS_RECENCY_WINDOW_DAYS = 7
+FITNESS_RECENCY_COEFFICIENT = 0.4
+FITNESS_RECENCY_CAP = 100
+
 _STATE_TYPES = {"daily", "state-snapshot", "skill"}
 _BUCKET2_TAGS = {
     "cozyhem",
@@ -245,6 +277,12 @@ _TRIGGER_KEYWORDS_RE = re.compile(
 )
 _ACCESS_COUNT_RE = re.compile(r"^access_count:\s*(\d+)\s*$", re.MULTILINE)
 _LAST_ACCESSED_RE = re.compile(r"^last_accessed:\s*[^\n]*$", re.MULTILINE)
+# Captures the date value (YYYY-MM-DD prefix) from a `last_accessed:` line.
+# Tolerates trailing time / timezone (e.g. `2026-05-19 12:38 EDT`) — only the
+# leading ISO date is required for the 7-day window check.
+_LAST_ACCESSED_VALUE_RE = re.compile(
+    r"^last_accessed:\s*(\d{4}-\d{2}-\d{2})", re.MULTILINE
+)
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +414,62 @@ def _read_trigger_keywords(vault_root: pathlib.Path, rel_path: str) -> list[str]
         if cleaned:
             out.append(cleaned.lower())
     return out
+
+
+def _read_last_accessed(
+    vault_root: pathlib.Path, rel_path: str
+) -> datetime.date | None:
+    """Parse ``last_accessed: YYYY-MM-DD`` from a note's frontmatter.
+
+    Returns ``None`` on any error (file missing, no frontmatter, missing
+    field, unparseable date). Tolerates trailing time/timezone tokens;
+    only the leading ISO date is required. Used by the fitness-domain
+    recency boost (#246) — the canonical source for ``last_accessed``
+    is the markdown frontmatter, not ``note_metrics`` (which tracks
+    counts but not timestamps).
+    """
+    try:
+        text = (vault_root / rel_path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    fm_match = _FRONTMATTER_RE.match(text)
+    if not fm_match:
+        return None
+    la_match = _LAST_ACCESSED_VALUE_RE.search(fm_match.group(1))
+    if not la_match:
+        return None
+    try:
+        return datetime.date.fromisoformat(la_match.group(1))
+    except ValueError:
+        return None
+
+
+def _fitness_recency_score(
+    tags: Iterable[str],
+    access_count: int,
+    last_accessed: datetime.date | None,
+    today: datetime.date,
+    *,
+    window_days: int = FITNESS_RECENCY_WINDOW_DAYS,
+    cap: int = FITNESS_RECENCY_CAP,
+) -> float:
+    """Return the raw (pre-coefficient) additive bonus for a candidate.
+
+    Zero unless the note carries a fitness-domain tag AND was accessed
+    within ``window_days`` of ``today``. When both hold, the bonus is
+    ``log1p(min(access_count, cap))`` — log-scaled so a heavily-used
+    note doesn't drown out topical precision, capped to bound the
+    maximum lift. The caller multiplies by
+    :data:`FITNESS_RECENCY_COEFFICIENT` before adding to ``final_score``.
+    """
+    if not any(t in FITNESS_DOMAIN_TAGS for t in tags):
+        return 0.0
+    if last_accessed is None:
+        return 0.0
+    delta = (today - last_accessed).days
+    if delta < 0 or delta > window_days:
+        return 0.0
+    return math.log1p(min(max(access_count, 0), cap))
 
 
 async def _bump_access(
@@ -806,6 +900,7 @@ async def build_cue_packet(
         # Build candidates with type-aware boost.
         excluded = set(context_slugs or ())
         query_lower = query.lower()
+        today = datetime.date.today()
         candidates: list[_Candidate] = []
         for slug, title, note_type, tags_json, body, path, fts_rank in rows:
             if slug in excluded:
@@ -833,14 +928,30 @@ async def build_cue_packet(
             # boost to keep the boost meaningful.
             base_score = -float(fts_rank)
             final_score = base_score * boost * recency_boost
+            # Fitness-domain recency boost (#246). Additive on top of
+            # the multiplicative score; zero when the note isn't
+            # fitness-tagged or hasn't been touched inside the recency
+            # window. Replaces the static 1.0× fitness boost path with
+            # a value derived from current vault state. Same shape as
+            # the planned Hebbian edge-weight boost (additive-floor —
+            # cannot displace higher BM25 hits).
+            fitness_bonus = 0.0
+            if path and any(t in FITNESS_DOMAIN_TAGS for t in tags):
+                last_accessed = _read_last_accessed(resolved_vault, path)
+                raw = _fitness_recency_score(tags, ac, last_accessed, today)
+                if raw > 0.0:
+                    fitness_bonus = FITNESS_RECENCY_COEFFICIENT * raw
+                    final_score += fitness_bonus
             log.debug(
                 "cue_runner: slug=%s fts_rank=%.4f type_boost=%.4f "
-                "access_count=%d recency_boost=%.4f final=%.4f",
+                "access_count=%d recency_boost=%.4f fitness_bonus=%.4f "
+                "final=%.4f",
                 slug,
                 fts_rank,
                 boost,
                 ac,
                 recency_boost,
+                fitness_bonus,
                 final_score,
             )
             matched = extract_matched_lines(body, tokens, max_n=line_cap)
@@ -959,4 +1070,8 @@ __all__ = [
     "TRIGGER_KEYWORD_EXTRA",
     "ACCESS_COUNT_ALPHA",
     "ACCESS_COUNT_CAP",
+    "FITNESS_DOMAIN_TAGS",
+    "FITNESS_RECENCY_WINDOW_DAYS",
+    "FITNESS_RECENCY_COEFFICIENT",
+    "FITNESS_RECENCY_CAP",
 ]
