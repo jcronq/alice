@@ -54,10 +54,15 @@ For each note, decide what it becomes (these aren't exclusive — a note often h
 **Special case — `new_issue` notes from `alice-gh-watcher`:** When the note's body contains a GitHub issue event (`kind: new_issue` or frontmatter `note_type: github_issue`), run the issue-dispatcher intake playbook ([[2026-05-05-issue-dispatcher-design]] Part A) instead of the generic routing above:
 
 1. **Log activity** → today's daily (always, same as any note).
-2. **Vault lookup** → FTS `cortex-index.db` for the repo slug + issue keywords; read top 1–2 matching notes. If DB unavailable, `Grep cortex-memory/` for the repo slug.
-3. **Brief analysis** → 3–5 sentences: what the issue is, likely files/components, prior art, confidence (low / medium / high).
-4. **Write dispatch surface** → `inner/surface/<utcstamp>-issue-dispatch-<repo-slug>-<N>.md` using the format in [[2026-05-05-issue-dispatcher-design]] Part B.
-5. **Consume the note** → `inner/notes/.consumed/<today>/` with the standard processing trailer.
+2. **GitHub-state mirror check** → read `cortex-memory/gh-state/<repo-slug>-<N>.md` (where `<N>` is the issue number). Behaviors:
+   - File exists AND `type: deferred` → **let-pass**. Issue was put on hold by Speaking or Thinking. Log to daily: "Issue `<repo>#<N>` deferred — `<reason>` (deferred by `<who>`)." Consume the note and stop — do NOT write a dispatch surface. The only way to clear a deferred state is an explicit lift by whoever set the hold. See [[2026-05-19-stale-cycle-dispatcher-gap]] for why this gate exists.
+   - File exists AND `type: pr` AND `state: open` → **let-pass**. The issue already has an in-flight PR. Log to daily: "Issue `<repo>#<N>` has an in-flight PR (`[[gh-state/<repo>-<N>]]`) — let-pass." Consume the note and stop.
+   - File exists AND `type: pr` AND `state: closed` AND `merged: true` → **let-pass**. Issue already resolved. Log to daily and consume.
+   - Anything else (file missing, or `type: issue` only) → proceed to step 3.
+3. **Vault lookup** → FTS `cortex-index.db` for the repo slug + issue keywords; read top 1–2 matching notes. If DB unavailable, `Grep cortex-memory/` for the repo slug.
+4. **Brief analysis** → 3–5 sentences: what the issue is, likely files/components, prior art, confidence (low / medium / high). If your analysis concludes the issue cannot be fixed right now (e.g., "blocked on target module not on master", "needs human decision"), call `alice_daemon.gh_state_mirror.write_deferred(repo, number, reason, deferred_by="thinking", title=...)` and skip step 5 — this prevents the next dispatcher run from re-surfacing the same issue.
+5. **Write dispatch surface** → `inner/surface/<utcstamp>-issue-dispatch-<repo-slug>-<N>.md` using the format in [[2026-05-05-issue-dispatcher-design]] Part B.
+6. **Consume the note** → `inner/notes/.consumed/<today>/` with the standard processing trailer.
 
 Null-analysis case: if the issue body is too vague (< 10 words, pure question with no error detail), note low confidence in the analysis and still write the dispatch surface — Speaking reads the full issue via `gh issue view`; the confidence flag sets her expectations.
 

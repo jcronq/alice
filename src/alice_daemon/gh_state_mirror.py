@@ -36,6 +36,132 @@ def gh(*args: str) -> str:
     return result.stdout
 
 
+def _atomic_write(note_path: Path, content: str) -> None:
+    """Write `content` to `note_path` via tempfile + rename (atomic on same fs).
+
+    The tempfile is created next to the destination so ``os.replace`` is
+    a same-directory rename (atomic on POSIX). When ``repo`` contains a
+    slash (``"jcronq/alice"``), the per-owner subdirectory under
+    ``GH_STATE_DIR`` is created on demand so the rename target's parent
+    always exists.
+    """
+    GH_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    note_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=note_path.parent, suffix=".tmp")
+    try:
+        try:
+            os.write(fd, content.encode())
+        finally:
+            os.close(fd)
+        os.replace(tmp_path, note_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def write_deferred(
+    repo: str,
+    number: int,
+    reason: str,
+    deferred_by: str,
+    title: str = "",
+) -> Path:
+    """Write a ``type: deferred`` gh-state note.
+
+    Used by Speaking or Thinking when an issue should not be dispatched
+    (e.g. blocked on missing dependency, target code not yet on master,
+    requires human decision). The dispatcher reads this state and
+    skips writing a fresh dispatch surface until it is explicitly lifted.
+
+    Args:
+        repo: ``"owner/name"`` slug, matching the gh CLI form.
+        number: issue number.
+        reason: short human-readable explanation of why the issue is on hold.
+        deferred_by: ``"speaking"``, ``"thinking"``, or a username like
+            ``"jcronq"`` — captures who put the hold in place.
+        title: optional issue title; included verbatim in the frontmatter
+            and heading when provided.
+
+    Returns:
+        The path to the written note.
+    """
+    note_path = GH_STATE_DIR / f"{repo}-{number}.md"
+    now = datetime.now(timezone.utc).isoformat()
+    title_text = (title or "").strip()
+    title_heading = f"{repo}#{number} — {title_text}" if title_text else f"{repo}#{number}"
+    # Escape any embedded double-quotes in reason so the YAML stays valid.
+    safe_reason = reason.replace('"', '\\"')
+    content = (
+        f'---\n'
+        f'slug: gh-state-{repo}-{number}\n'
+        f'title: {title_heading}\n'
+        f'tags: [gh-state]\n'
+        f'note_type: gh-state\n'
+        f'repo: {repo}\n'
+        f'number: {number}\n'
+        f'type: deferred\n'
+        f'issue_number: {number}\n'
+        f'reason: "{safe_reason}"\n'
+        f'deferred_by: {deferred_by}\n'
+        f'deferred_at: "{now}"\n'
+        f'updated_at: "{now}"\n'
+        f'---\n\n'
+        f'# {title_heading}\n\n'
+        f'Deferred. {reason}.\n'
+    )
+    _atomic_write(note_path, content)
+    return note_path
+
+
+def read_state(repo: str, number: int) -> dict | None:
+    """Return a small dict describing the current gh-state for an issue/PR.
+
+    Returns ``None`` if no gh-state note exists. Otherwise returns a dict
+    with at least ``{"type": ..., "path": Path}`` plus any of ``state``,
+    ``merged``, ``draft``, ``reason``, ``deferred_by`` parsed from the
+    frontmatter when present. The parser is intentionally tiny: it looks
+    for ``key: value`` lines inside the leading ``---`` block, since the
+    notes we write are flat YAML.
+
+    The dispatcher uses this to skip writing a dispatch surface when an
+    issue is already in flight (``type: pr``, ``state: open``) or has
+    been put on hold (``type: deferred``).
+    """
+    note_path = GH_STATE_DIR / f"{repo}-{number}.md"
+    if not note_path.exists():
+        return None
+    try:
+        text = note_path.read_text()
+    except OSError:
+        return None
+    # Strip frontmatter block.
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    if end < 0:
+        return None
+    block = text[3:end].strip("\n")
+    state: dict = {"path": note_path}
+    for line in block.splitlines():
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        value = value.strip().strip('"')
+        if key in {"type", "state", "merged", "draft", "reason", "deferred_by", "deferred_at", "repo", "number", "issue_number"}:
+            state[key] = value
+    return state
+
+
+def is_deferred(repo: str, number: int) -> bool:
+    """Return True iff a gh-state note marks this issue as ``type: deferred``."""
+    s = read_state(repo, number)
+    return bool(s and s.get("type") == "deferred")
+
+
 def write_note_atomic(repo: str, number: int, item: dict) -> None:
     """Write or update a thin state note. Uses temp-file + rename for atomicity."""
     note_path = GH_STATE_DIR / f"{repo}-{number}.md"
@@ -87,21 +213,7 @@ def write_note_atomic(repo: str, number: int, item: dict) -> None:
             f"Merged: {str(merged).lower()}.\n"
         )
 
-    GH_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    # Atomic write: write to temp file, then rename
-    fd, tmp_path = tempfile.mkstemp(dir=GH_STATE_DIR, suffix=".tmp")
-    try:
-        try:
-            os.write(fd, content.encode())
-        finally:
-            os.close(fd)
-        os.replace(tmp_path, note_path)  # atomic on same filesystem
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except FileNotFoundError:
-            pass
-        raise
+    _atomic_write(note_path, content)
 
 
 def main() -> None:
@@ -185,6 +297,16 @@ def main() -> None:
                     with open(note_path) as f:
                         content = f.read()
                 except FileNotFoundError:
+                    continue
+
+                # Deferred notes are written by Speaking/Thinking, not by
+                # this script. They have no GitHub-side counterpart, so the
+                # open-issues/open-PRs comparison below would always treat
+                # them as stale. Preserve them unconditionally — the only
+                # way to clear a deferred state is an explicit lift by
+                # whoever set the hold. See research note
+                # [[2026-05-19-stale-cycle-dispatcher-gap]].
+                if "type: deferred" in content:
                     continue
 
                 if "type: issue" in content:
