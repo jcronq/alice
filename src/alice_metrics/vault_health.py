@@ -405,6 +405,13 @@ def count_shadow_and_dark(vault_dir: Path) -> dict[str, int]:
         if inbound.get(rel, 0) > 0:
             continue
         text = _read_text(md)
+        # Redirect stubs are bare-slug wikilink resolvers — by design they
+        # carry zero inbound links (they are pointed *at*, not *from*). The
+        # ``redirect: <canonical-slug>`` body marker is the structural
+        # signature. Counting them as shadow orphans inflates the metric
+        # past the real signal — see issue #251.
+        if "redirect:" in text:
+            continue
         fm, body = split_frontmatter(text)
         # Detect silent frontmatter parse failures: the note opens with a
         # ``---`` fence but parsing returned an empty dict. This is the

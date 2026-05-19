@@ -614,6 +614,92 @@ def test_shadow_and_dark_inbound_kills_both_buckets(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Regression: issue #251 — redirect stubs are bare-slug wikilink resolvers.
+# By design they have zero inbound links (pointed at, not from) and trigger
+# keywords matching the canonical slug, which used to make them look like
+# shadow orphans. The fix detects them via the ``redirect:`` body marker
+# and excludes them from both shadow/dark buckets.
+# ---------------------------------------------------------------------------
+
+
+def test_redirect_stub_excluded_from_shadow_orphan(tmp_path: Path) -> None:
+    """A redirect stub (zero inbound, trigger_keywords, ``redirect:`` body
+    marker) must not count as a shadow orphan."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "graph-models-for-cortex.md",
+        """
+        ---
+        slug: graph-models-for-cortex
+        trigger_keywords: [graph-models, cortex]
+        ---
+
+        redirect: [[2026-05-10-graph-models-for-cortex]]
+
+        Redirect stub — canonical note is `[[2026-05-10-graph-models-for-cortex]]`.
+        """,
+    )
+    counts = count_shadow_and_dark(vault)
+    assert counts["shadow_orphan_count"] == 0
+    assert counts["truly_dark_count"] == 0
+
+
+def test_non_stub_mentioning_redirect_word_still_counted(tmp_path: Path) -> None:
+    """Sanity: a real note that mentions the word ``redirect`` (without the
+    structural ``redirect:`` marker) is NOT treated as a stub."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "real_note.md",
+        """
+        ---
+        slug: real_note
+        trigger_keywords: [routing]
+        ---
+
+        The handler will redirect the user to [[login]] on auth failure.
+        """,
+    )
+    counts = count_shadow_and_dark(vault)
+    # Real note, 0 inbound, ≥1 trigger, ≥1 outbound → still a shadow orphan.
+    assert counts["shadow_orphan_count"] == 1
+    assert counts["truly_dark_count"] == 0
+
+
+def test_redirect_stub_and_genuine_shadow_orphan_coexist(tmp_path: Path) -> None:
+    """A vault with both a redirect stub and a genuine shadow orphan must
+    report only the genuine one — mirrors the production scenario from
+    issue #251 (21 stubs + 1 real shadow orphan)."""
+    vault = _make_vault(tmp_path)
+    # Redirect stub — must be excluded.
+    _write(
+        vault / "research" / "measurement-self-contamination.md",
+        """
+        ---
+        slug: measurement-self-contamination
+        trigger_keywords: [measurement-self-contamination]
+        ---
+
+        redirect: [[2026-05-12-measurement-self-contamination]]
+        """,
+    )
+    # Genuine shadow orphan — must be counted.
+    _write(
+        vault / "reference" / "2026-05-08-degradation-api-design.md",
+        """
+        ---
+        slug: 2026-05-08-degradation-api-design
+        trigger_keywords: [degradation, api-design]
+        ---
+
+        Design references [[graceful-degradation-pattern]] but nothing links back.
+        """,
+    )
+    counts = count_shadow_and_dark(vault)
+    assert counts["shadow_orphan_count"] == 1
+    assert counts["truly_dark_count"] == 0
+
+
+# ---------------------------------------------------------------------------
 # Regression: issue #249 — silent frontmatter parse failures used to make
 # notes look "truly dark" because trigger_keywords parsed as None. The fix
 # exposes the failure both as a per-note WARNING log and as a counter on
