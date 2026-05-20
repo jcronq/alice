@@ -84,6 +84,16 @@ reply_expected: true | false
 
 Threshold: you'd pass up good sleep to share this. Otherwise it's a thought, not a surface.
 
+### Quality bar — surfaces about external state
+
+When a surface claims something is broken outside the vault (CI is red, a PR is failing, master has a regression, a service is down), the claim must be grounded in current observable evidence — not in source-tree theorizing about what *would* happen if a code path ran. Concretely:
+
+- **CI claims**: cite the `gh run` ID and the failing step name from `gh run view <id> --json jobs` output you ran this wake. "CI has been failing since X" must be checkable against `gh run list --branch <b> --limit 5` — include that listing inline if the surface is `priority: flash`.
+- **Code-fix claims**: include the actual error line or test output, not a theory about why the code "should" fail. If the only evidence is structural (a function imports a module that imports a dep that *might* break on Python 3.11), say so explicitly.
+- **Hypothesis-only material**: never `priority: flash`. Use `priority: insight`, open the body with "Hypothesis (unverified):", and name what evidence would confirm or falsify it.
+
+A `priority: flash` surface that turns out stale or wrong costs Speaking a worker dispatch. Three misdiagnoses in a row earlier this evening (2026-05-20 02:20–07:56 EDT) all shared the same failure mode: structural reasoning from the source tree without checking the actual CI step, with stale "failing since X" framing pulled from memory of a prior incident. The fix is mechanical — run `gh run view --log-failed` (or equivalent for the system) *this wake*, then quote what you see. If the claim doesn't survive the check, it's not surface-worthy yet.
+
 ## Step 5 — close clean
 
 Append a few more lines to your step-1 thought file summarizing what you actually did.
