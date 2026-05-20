@@ -56,7 +56,7 @@ __all__ = [
 
 # Mirrors :data:`alice_thinking.vault_state.STAGE_D_NIGHTLY_CAP`. Re-declared
 # here so ``select_phase()`` doesn't import the legacy snapshot module.
-STAGE_D_NIGHTLY_CAP = 3
+STAGE_D_NIGHTLY_CAP = 5
 
 
 class Phase(enum.Enum):

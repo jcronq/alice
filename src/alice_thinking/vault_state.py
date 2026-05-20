@@ -27,7 +27,7 @@ from typing import Iterable, Optional
 # ``inner/directive.md`` Step 0; kept here as a constant so tests +
 # the selector see the same value. If the operator tunes the cap
 # in the directive, sync this constant.
-STAGE_D_NIGHTLY_CAP = 3
+STAGE_D_NIGHTLY_CAP = 5
 
 
 @dataclass(frozen=True)
