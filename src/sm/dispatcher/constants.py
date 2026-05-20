@@ -14,8 +14,12 @@ file for no readability win.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import pathlib
+import sys
+from dataclasses import dataclass
+from typing import Any, Callable
 
 
 # ---------------------------------------------------------------------------
@@ -25,6 +29,13 @@ import pathlib
 DEFAULT_REPO = "jcronq/alice"
 DEFAULT_STATE_DIR = pathlib.Path("/state/worker")
 DEFAULT_STATE_FILE = "sm-dispatcher-state.json"
+
+# Path to ``alice.config.json``. Mirrors :data:`alice_watchers.github.DEFAULT_MIND`
+# / ``"config" / "alice.config.json"`` — kept as a constant rather than
+# imported to avoid a watcher → dispatcher import cycle and to let tests
+# override per-call via :func:`load_dispatcher_repos(config_path=...)`.
+DEFAULT_MIND_DIR = pathlib.Path("/home/alice/alice-mind")
+DEFAULT_DISPATCHER_CONFIG_PATH = DEFAULT_MIND_DIR / "config" / "alice.config.json"
 
 # Cap on the dedup list. Issue numbers are monotonic, so dropping the
 # oldest first is safe — once an issue is closed and "seen," it stays
@@ -519,3 +530,141 @@ VERIFY_ENABLED_ENV = "ALICE_VERIFY_ENABLED"
 # this constant becomes per-spawn config.
 WORKER_REPO_PATH = pathlib.Path("/home/alice/alice")
 BASE_BRANCH = "master"
+
+
+# ---------------------------------------------------------------------------
+# Issue #261 — per-repo dispatcher config (multi-repo support)
+# ---------------------------------------------------------------------------
+#
+# Pre-#261 the dispatcher hardcoded ``DEFAULT_REPO`` + ``WORKER_REPO_PATH``
+# and only operated on ``jcronq/alice``. Multi-repo support (e.g. wiring
+# ``jcronq/cozyhem-engine`` into the same dispatcher process) needs a
+# per-repo lookup of ``(slug → checkout path, labels-configured flag)``.
+# We read that mapping from the same ``alice.config.json`` the github
+# watcher already uses, under a new ``sm_dispatcher.repos`` block so the
+# two readers stay independently configurable.
+#
+# Backwards compat: when the config file is missing OR the
+# ``sm_dispatcher`` block is absent, :func:`load_dispatcher_repos`
+# falls back to a single :class:`RepoConfig` for ``DEFAULT_REPO`` /
+# ``WORKER_REPO_PATH`` with ``labels_configured=True``. The alice flow
+# is byte-identical to pre-#261 in that case.
+
+
+@dataclass(frozen=True)
+class RepoConfig:
+    """One repo's dispatcher wiring.
+
+    * ``slug`` — full ``owner/name`` GitHub identifier (e.g. ``jcronq/alice``).
+    * ``checkout_path`` — local worker checkout. Workers spawned on this
+      repo's issues operate inside this tree (matches the pre-#261
+      :data:`WORKER_REPO_PATH` semantics on a per-repo basis).
+    * ``labels_configured`` — True iff the repo carries the SM v2 ``sm:*``
+      label taxonomy. When False (``cozyhem-engine``-style), the
+      dispatcher runs in "relaxed mode" and does not log the trust-filter
+      rejection for issues missing the strict label set — labels become
+      a Speaking/Thinking convenience rather than a gate.
+    """
+
+    slug: str
+    checkout_path: pathlib.Path
+    labels_configured: bool = False
+
+
+def _coerce_repo_entry(entry: Any) -> RepoConfig | None:
+    """Coerce one raw config dict into a :class:`RepoConfig`.
+
+    Returns None for malformed entries (missing slug or checkout_path) so
+    the caller can log and skip without crashing the whole loop. Accepts
+    either a dict with explicit keys or a bare string (treated as ``slug``
+    with checkout_path defaulting to ``DEFAULT_MIND_DIR.parent / <name>``
+    — useful for tests but explicit dicts are preferred in production).
+    """
+    if isinstance(entry, str):
+        slug = entry.strip()
+        if "/" not in slug:
+            return None
+        _, name = slug.split("/", 1)
+        return RepoConfig(
+            slug=slug,
+            checkout_path=pathlib.Path("/home/alice") / name,
+            labels_configured=False,
+        )
+    if not isinstance(entry, dict):
+        return None
+    slug = entry.get("slug")
+    checkout_path = entry.get("checkout_path")
+    if not isinstance(slug, str) or "/" not in slug:
+        return None
+    if not isinstance(checkout_path, str) or not checkout_path.strip():
+        return None
+    labels_configured = bool(entry.get("labels_configured", False))
+    return RepoConfig(
+        slug=slug.strip(),
+        checkout_path=pathlib.Path(checkout_path).expanduser(),
+        labels_configured=labels_configured,
+    )
+
+
+def load_dispatcher_repos(
+    *,
+    config_path: pathlib.Path = DEFAULT_DISPATCHER_CONFIG_PATH,
+    log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
+) -> list[RepoConfig]:
+    """Read the ``sm_dispatcher.repos`` block from alice.config.json.
+
+    Returns a list of :class:`RepoConfig`. Missing file, unreadable file,
+    or missing ``sm_dispatcher`` block ⇒ a single-element fallback list
+    pointing at ``DEFAULT_REPO`` + ``WORKER_REPO_PATH`` with
+    ``labels_configured=True``. This preserves pre-#261 single-repo
+    behavior whenever the config is absent.
+
+    Expected JSON shape::
+
+        {
+          "sm_dispatcher": {
+            "repos": [
+              {"slug": "jcronq/alice",
+               "checkout_path": "/home/alice/alice",
+               "labels_configured": true},
+              {"slug": "jcronq/cozyhem-engine",
+               "checkout_path": "/home/alice/cozyhem-engine",
+               "labels_configured": false}
+            ]
+          }
+        }
+
+    Malformed entries are logged and skipped — a single bad row must not
+    silently drop the whole repo list. If the result would be empty
+    (every entry malformed), the fallback applies.
+    """
+    fallback = [
+        RepoConfig(
+            slug=DEFAULT_REPO,
+            checkout_path=WORKER_REPO_PATH,
+            labels_configured=True,
+        )
+    ]
+    if not config_path.is_file():
+        return fallback
+    try:
+        raw = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        log(f"[sm-dispatcher] failed to read {config_path}: {exc}")
+        return fallback
+    block = (raw or {}).get("sm_dispatcher")
+    if not isinstance(block, dict):
+        return fallback
+    entries = block.get("repos")
+    if not isinstance(entries, list) or not entries:
+        return fallback
+    out: list[RepoConfig] = []
+    for entry in entries:
+        coerced = _coerce_repo_entry(entry)
+        if coerced is None:
+            log(f"[sm-dispatcher] skipping malformed repo entry: {entry!r}")
+            continue
+        out.append(coerced)
+    if not out:
+        return fallback
+    return out

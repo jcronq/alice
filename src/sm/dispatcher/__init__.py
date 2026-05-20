@@ -105,6 +105,12 @@ del _importlib, _constants_modname
 
 from sm.dispatcher.constants import *  # noqa: F401, F403, E402
 from sm.dispatcher.constants import _now_iso  # noqa: F401, E402
+from sm.dispatcher.constants import (  # noqa: F401, E402
+    DEFAULT_DISPATCHER_CONFIG_PATH,
+    DEFAULT_MIND_DIR,
+    RepoConfig,
+    load_dispatcher_repos,
+)
 
 # Errors
 from sm.dispatcher.errors import GHCommandError  # noqa: E402, F401

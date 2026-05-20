@@ -71,6 +71,7 @@ def run(
     triage_surface_body_char_limit: int = TRIAGE_SURFACE_BODY_CHAR_LIMIT,
     trusted_authors: frozenset[str] = TRUSTED_AUTHORS,
     dry_run: bool = False,
+    labels_configured: bool = True,
     log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
     now_iso: Callable[[], str] = _now_iso,
 ) -> tuple[int, RunReport]:
@@ -278,6 +279,17 @@ def run(
             # non-canonical ones like ``sm:bogus``). Treated as a
             # trust-filter rejection — same v0 semantics, just hoisted
             # to the outer loop now that we route by label.
+            #
+            # Issue #261 — relaxed mode: when this repo isn't on the
+            # SM v2 label taxonomy (``labels_configured=False``, set
+            # in ``alice.config.json``), the label gate is bypassed.
+            # The dispatcher silently skips issues without canonical
+            # labels rather than logging a noisy "expected exactly
+            # one sm:* label" rejection for every cozyhem-engine
+            # ticket. Labels stay a Speaking/Thinking convenience,
+            # not a gate.
+            if not labels_configured:
+                continue
             names = _label_names(issue)
             sm_labels_seen = [n for n in names if n.startswith("sm:")]
             log(
@@ -587,8 +599,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     parser.add_argument(
         "--repo",
-        default=DEFAULT_REPO,
-        help=f"GitHub repo in <org>/<name> form (default: {DEFAULT_REPO})",
+        default=None,
+        help=(
+            "GitHub repo in <org>/<name> form. Single-repo override — when "
+            "set, the dispatcher runs one pass against this repo only and "
+            "ignores the sm_dispatcher.repos config block. When omitted, "
+            "the dispatcher iterates over every repo configured in "
+            f"alice.config.json (default: {DEFAULT_REPO} when no config)."
+        ),
     )
     parser.add_argument(
         "--state",
@@ -603,9 +621,51 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    exit_code, _ = run(
-        repo=args.repo,
-        state_path=pathlib.Path(args.state),
-        dry_run=args.dry_run,
-    )
-    return exit_code
+    state_path = pathlib.Path(args.state)
+    log = lambda s: print(s, file=sys.stderr)  # noqa: E731
+
+    # Issue #261 — when ``--repo`` is set, behave like pre-#261: one pass
+    # against the named repo with the legacy ``WORKER_REPO_PATH`` checkout
+    # and ``labels_configured=True`` (alice's contract). When unset, read
+    # the multi-repo config and iterate.
+    if args.repo is not None:
+        repos = [
+            RepoConfig(
+                slug=args.repo,
+                checkout_path=WORKER_REPO_PATH,
+                labels_configured=True,
+            )
+        ]
+    else:
+        repos = load_dispatcher_repos(log=log)
+
+    worst_exit = 0
+    for repo_cfg in repos:
+        if not repo_cfg.checkout_path.is_dir():
+            # Config can point at a checkout that hasn't been cloned yet
+            # (e.g. cozyhem-engine on a fresh worker). Log + skip rather
+            # than crashing the whole loop — other repos in the list
+            # must still process.
+            log(
+                f"[sm-dispatcher] skipping {repo_cfg.slug}: checkout path "
+                f"{repo_cfg.checkout_path} does not exist"
+            )
+            continue
+        try:
+            exit_code, _ = run(
+                repo=repo_cfg.slug,
+                state_path=state_path,
+                worker_repo_path=repo_cfg.checkout_path,
+                labels_configured=repo_cfg.labels_configured,
+                dry_run=args.dry_run,
+                log=log,
+            )
+        except Exception as exc:  # noqa: BLE001 — defense for one-repo failures
+            # An unhandled exception in one repo's pass must not abort
+            # the remaining repos. Log + flag a non-zero exit so the
+            # supervisor sees the failure on the next cadence.
+            log(f"[sm-dispatcher] {repo_cfg.slug} pass crashed: {exc!r}")
+            worst_exit = max(worst_exit, 1)
+            continue
+        worst_exit = max(worst_exit, exit_code)
+    return worst_exit

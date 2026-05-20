@@ -34,6 +34,8 @@ from sm.dispatcher.constants import (
     ACTIVE_SM_LABEL,
     ART_LABEL_WHITELIST,
     BASE_BRANCH,
+    RepoConfig,
+    load_dispatcher_repos,
     BLOCKED_SM_LABEL,
     BUILDING_SM_LABEL,
     COMPACTING_SM_LABEL,
@@ -191,6 +193,7 @@ __all__ = [
     "Any", "Callable", "Iterable",
     # constants
     "ACTIVE_SM_LABEL", "ART_LABEL_WHITELIST", "BASE_BRANCH", "BLOCKED_SM_LABEL",
+    "RepoConfig", "load_dispatcher_repos",
     "BUILDING_SM_LABEL", "COMPACTING_SM_LABEL", "COMPACT_SIGNAL_FILENAME",
     "DEFAULT_REPO", "DEFAULT_STATE_DIR", "DEFAULT_STATE_FILE",
     "DESIGN_READY_AUDIT_PREFIX", "DESIGN_REVIEW_SM_LABEL", "DESIGN_REVISION_CAP",
