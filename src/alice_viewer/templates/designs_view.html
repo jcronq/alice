@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}{{ design.title }}{% endblock %}
+{% block body %}
+  <article class="designs-paper">
+    <header class="designs-paper-head">
+      <p class="muted">
+        <a href="/designs">← designs index</a>
+        <span class="designs-paper-slug">/designs/{{ design.slug }}</span>
+      </p>
+      <h1>{{ design.title }}</h1>
+    </header>
+    <section class="designs-paper-body" id="design-body">
+      <pre id="design-raw" style="display:none">{{ design.body }}</pre>
+    </section>
+  </article>
+
+  {# Markdown rendering reuses the same client-side marked + DOMPurify
+     pipeline that ``canvas_paper.html`` uses for flagged research
+     papers — loaded once in ``base.html``. Mermaid blocks get the same
+     post-process pass. #}
+  <script>
+    (async function () {
+      const raw = document.getElementById("design-raw").textContent;
+      const body = document.getElementById("design-body");
+      if (window.marked && window.DOMPurify) {
+        const rendered = window.marked.parse(raw, { breaks: true });
+        body.innerHTML = window.DOMPurify.sanitize(rendered, { ADD_TAGS: ["foreignObject"] });
+        if (window.renderMermaid) await window.renderMermaid(body);
+      } else {
+        const pre = document.createElement("pre");
+        pre.textContent = raw;
+        body.innerHTML = "";
+        body.appendChild(pre);
+      }
+    })();
+  </script>
+
+  <style>
+    .designs-paper { max-width: 820px; margin: 0 auto; padding: 0 12px 60px; }
+    .designs-paper-head { margin: 16px 0 24px; }
+    .designs-paper-head h1 { margin: 8px 0 0; font-size: 26px; }
+    .designs-paper-head p { font-size: 12px; }
+    .designs-paper-slug { margin-left: 14px; font-family: var(--mono, monospace); opacity: 0.6; }
+    .designs-paper-body { line-height: 1.55; font-size: 15px; }
+    .designs-paper-body h1, .designs-paper-body h2, .designs-paper-body h3 {
+      margin-top: 1.4em; margin-bottom: 0.4em;
+    }
+    .designs-paper-body h1 { font-size: 22px; }
+    .designs-paper-body h2 { font-size: 18px; }
+    .designs-paper-body h3 { font-size: 16px; }
+    .designs-paper-body p { margin: 0.6em 0; }
+    .designs-paper-body pre {
+      background: var(--panel-2, #1a1a1a); padding: 10px 14px; border-radius: 4px;
+      overflow-x: auto; font-size: 12px; line-height: 1.4;
+    }
+    .designs-paper-body code {
+      background: var(--panel-2, #1a1a1a); padding: 1px 4px; border-radius: 3px;
+      font-size: 0.92em;
+    }
+    .designs-paper-body pre code { background: none; padding: 0; }
+    .designs-paper-body table {
+      border-collapse: collapse; margin: 0.8em 0;
+      font-size: 13px;
+    }
+    .designs-paper-body th, .designs-paper-body td {
+      border: 1px solid var(--border); padding: 4px 10px;
+    }
+    .designs-paper-body th { background: var(--panel-2, #1a1a1a); }
+    .designs-paper-body blockquote {
+      border-left: 3px solid var(--accent); padding-left: 12px; margin: 0.8em 0;
+      color: var(--muted);
+    }
+    .designs-paper-body hr {
+      border: 0; border-top: 1px solid var(--border); margin: 1.4em 0;
+    }
+  </style>
+{% endblock %}

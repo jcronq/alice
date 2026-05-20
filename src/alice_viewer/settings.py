@@ -23,6 +23,14 @@ class Paths:
     def memory(self) -> pathlib.Path:
         return self.mind_dir / "memory"
 
+    @property
+    def designs_dir(self) -> pathlib.Path:
+        """Drafts of design docs Alice authors live here as plain
+        markdown — moved from ``cortex-memory/`` in alice-mind commit
+        ``34d6959d``. The ``/designs`` viewer route surfaces them with
+        full markdown rendering (no slideshow framing)."""
+        return self.mind_dir / "inner" / "designs"
+
 
 def load() -> Paths:
     home = pathlib.Path.home()

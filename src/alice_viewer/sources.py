@@ -777,6 +777,36 @@ def _extract_section_paragraph(text: str, heading_name: str) -> str | None:
 
 
 _CANVAS_SLUG_RE = __import__("re").compile(r"^[a-z0-9][a-z0-9_-]*$")
+_HTML_TITLE_RE = __import__("re").compile(
+    r"<title[^>]*>(.*?)</title>", __import__("re").IGNORECASE | __import__("re").DOTALL
+)
+_HTML_H1_RE = __import__("re").compile(
+    r"<h1[^>]*>(.*?)</h1>", __import__("re").IGNORECASE | __import__("re").DOTALL
+)
+_HTML_TAG_STRIP_RE = __import__("re").compile(r"<[^>]+>")
+
+
+def _extract_title(text: str, ext: str, fallback: str) -> str:
+    """Pull a display title out of a canvas source file.
+
+    ``ext`` is ``.html`` for raw-HTML decks under ``inner/canvas/`` or
+    ``.md`` for markdown experiment cards. Falls back to ``fallback``
+    (typically the slug) when no title is found."""
+    if ext == ".html":
+        m = _HTML_TITLE_RE.search(text) or _HTML_H1_RE.search(text)
+        if m:
+            inner_text = _HTML_TAG_STRIP_RE.sub("", m.group(1)).strip()
+            if inner_text:
+                return inner_text
+        return fallback
+    # Markdown: skip frontmatter / blank prelude, take first ``# H1``.
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            return stripped[2:].strip()
+        if stripped.startswith("---") or stripped == "":
+            continue
+    return fallback
 
 
 def _canvas_dir(inner: pathlib.Path) -> pathlib.Path:
@@ -789,20 +819,28 @@ def _experiment_card_dir(mind_dir: pathlib.Path) -> pathlib.Path:
 
 def _canvas_source_dirs(
     inner: pathlib.Path, mind_dir: pathlib.Path | None
-) -> list[tuple[str, pathlib.Path]]:
-    """Ordered list of ``(source_label, dir)`` for canvas scanning.
+) -> list[tuple[str, pathlib.Path, str]]:
+    """Ordered list of ``(source_label, dir, extension)`` for canvas scanning.
 
     ``canvas`` (authored) is first so a hand-authored slug wins over
     an auto-promoted experiment card if they happen to collide.
+
+    Per Jason's 2026-05-20 directive ("if there's a slide show, it's
+    just a raw html file"), authored decks under ``inner/canvas/`` are
+    now raw ``.html`` files — markdown design drafts live under
+    ``/designs`` instead. Experiment cards remain markdown because they
+    are programmatically auto-promoted from research notes.
 
     Research notes are picked up by a separate path (``_list_research_papers``
     / ``_find_research_paper``) because we only want the ones explicitly
     flagged with ``canvas_paper: true`` in frontmatter — scanning every
     research note on every render would be wasteful and noisy.
     """
-    out: list[tuple[str, pathlib.Path]] = [("canvas", _canvas_dir(inner))]
+    out: list[tuple[str, pathlib.Path, str]] = [
+        ("canvas", _canvas_dir(inner), ".html"),
+    ]
     if mind_dir is not None:
-        out.append(("experiment", _experiment_card_dir(mind_dir)))
+        out.append(("experiment", _experiment_card_dir(mind_dir), ".md"))
     return out
 
 
@@ -950,17 +988,23 @@ def list_canvases(
     ``"experiment"`` for auto-promoted experiment cards under
     ``cortex-memory/experiments/`` (when ``mind_dir`` is provided).
 
-    Title is parsed from the first ``# H1`` line if present, else
-    derived from the slug. Missing source dirs are skipped silently.
-    Slug collisions are resolved by the order returned from
+    Title is parsed from the first ``# H1`` (markdown sources) or
+    ``<title>``/``<h1>`` tag (html sources) if present, else derived
+    from the slug. Missing source dirs are skipped silently. Slug
+    collisions are resolved by the order returned from
     ``_canvas_source_dirs`` (canvas wins over experiment).
+
+    Authored decks under ``inner/canvas/`` are scanned for ``*.html``
+    only — ``*.md`` design drafts moved to ``inner/designs/`` and are
+    served by the ``/designs`` route. Obsidian ``*.canvas`` files are
+    ignored.
     """
     out: list[dict[str, Any]] = []
     seen_slugs: set[str] = set()
-    for source_label, cdir in _canvas_source_dirs(inner, mind_dir):
+    for source_label, cdir, ext in _canvas_source_dirs(inner, mind_dir):
         if not cdir.is_dir():
             continue
-        for path in cdir.glob("*.md"):
+        for path in cdir.glob(f"*{ext}"):
             slug = path.stem
             if not _CANVAS_SLUG_RE.match(slug):
                 continue
@@ -971,14 +1015,7 @@ def list_canvases(
                 stat = path.stat()
             except OSError:
                 continue
-            title = slug
-            for line in text.splitlines():
-                stripped = line.strip()
-                if stripped.startswith("# "):
-                    title = stripped[2:].strip()
-                    break
-                if stripped.startswith("---") or stripped == "":
-                    continue
+            title = _extract_title(text, ext, slug)
             seen_slugs.add(slug)
             out.append(
                 {
@@ -1005,8 +1042,12 @@ def read_canvas(
     mind_dir: pathlib.Path | None = None,
 ) -> dict[str, Any] | None:
     """Read a single canvas by slug. Returns None if slug is invalid
-    or the file doesn't exist in any configured source dir. Strips YAML
-    frontmatter from body if present (between leading ``---`` lines).
+    or the file doesn't exist in any configured source dir.
+
+    Authored decks under ``inner/canvas/`` are now raw HTML files (per
+    Jason's 2026-05-20 directive); their body is returned as-is so the
+    viewer can serve them directly. Experiment cards remain markdown
+    and have YAML frontmatter stripped from the returned body.
 
     When ``mind_dir`` is provided, auto-promoted experiment cards under
     ``cortex-memory/experiments/`` become readable too. Authored canvas
@@ -1014,8 +1055,8 @@ def read_canvas(
     """
     if not _CANVAS_SLUG_RE.match(slug):
         return None
-    for source_label, cdir in _canvas_source_dirs(inner, mind_dir):
-        path = cdir / f"{slug}.md"
+    for source_label, cdir, ext in _canvas_source_dirs(inner, mind_dir):
+        path = cdir / f"{slug}{ext}"
         try:
             path = path.resolve()
             cdir_resolved = cdir.resolve()
@@ -1027,16 +1068,11 @@ def read_canvas(
             continue
         text = path.read_text(encoding="utf-8")
         body = text
-        title = slug
-        if text.startswith("---\n"):
+        if ext == ".md" and text.startswith("---\n"):
             end = text.find("\n---\n", 4)
             if end != -1:
                 body = text[end + 5 :]
-        for line in body.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("# "):
-                title = stripped[2:].strip()
-                break
+        title = _extract_title(body if ext == ".md" else text, ext, slug)
         return {
             "slug": slug,
             "title": title,
@@ -1049,6 +1085,14 @@ def read_canvas(
     # even if their slug matches; the unflagged fallback for /canvas/<slug>
     # lives in ``read_research_note`` so this strict path stays available
     # for callers that need the opt-in semantics.
+    #
+    # NOTE: the ``canvas_paper: true`` research-paper path and the
+    # ``read_research_note`` fallback are now the only markdown-in-canvas
+    # case left. Their markdown is rendered to HTML client-side by the
+    # ``canvas_paper.html`` template (via marked + DOMPurify, loaded in
+    # ``base.html``). Authored decks under ``inner/canvas/`` are raw
+    # HTML; markdown design drafts moved to ``inner/designs/`` and the
+    # ``/designs`` route.
     if mind_dir is not None:
         return _find_research_paper(mind_dir, slug)
     return None
@@ -1100,6 +1144,124 @@ def read_research_note(
         "body": body,
         "path": str(path_resolved),
         "source": "research",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Designs — plain-markdown design drafts under ``inner/designs/``.
+#
+# Moved out of ``cortex-memory/`` in alice-mind commit ``34d6959d``. The
+# ``/designs`` route renders them as standard markdown (no slideshow
+# framing) using the same client-side marked + DOMPurify pipeline that
+# ``canvas_paper.html`` uses for research papers.
+
+
+def _designs_dir(mind_dir: pathlib.Path) -> pathlib.Path:
+    return mind_dir / "inner" / "designs"
+
+
+def _first_paragraph(text: str) -> str:
+    """Return the first non-empty, non-heading paragraph of a markdown
+    document — used as the card excerpt on the ``/designs`` index. Skips
+    YAML frontmatter, blank lines, and ``# H1`` headings."""
+    lines = text.splitlines()
+    i = 0
+    if lines and lines[0].strip() == "---":
+        for j in range(1, len(lines)):
+            if lines[j].strip() == "---":
+                i = j + 1
+                break
+    para: list[str] = []
+    seen_heading = False
+    for line in lines[i:]:
+        stripped = line.strip()
+        if not stripped:
+            if para:
+                break
+            continue
+        if stripped.startswith("# ") and not seen_heading:
+            seen_heading = True
+            continue
+        if stripped.startswith("#"):
+            # Skip subsequent headings until we find prose.
+            if para:
+                break
+            continue
+        para.append(stripped)
+    return " ".join(para)
+
+
+def list_designs(mind_dir: pathlib.Path) -> list[dict[str, Any]]:
+    """Return design-draft index entries sorted by mtime descending.
+
+    Each entry: ``{slug, title, excerpt, mtime, size, path}``. ``title``
+    is the first ``# H1`` if present, else the slug. ``excerpt`` is the
+    first non-empty prose paragraph after the H1 (frontmatter stripped),
+    truncated for display by the template.
+    """
+    ddir = _designs_dir(mind_dir)
+    if not ddir.is_dir():
+        return []
+    out: list[dict[str, Any]] = []
+    for path in ddir.glob("*.md"):
+        slug = path.stem
+        if not _CANVAS_SLUG_RE.match(slug):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+            stat = path.stat()
+        except OSError:
+            continue
+        title = _extract_title(text, ".md", slug)
+        out.append(
+            {
+                "slug": slug,
+                "title": title,
+                "excerpt": _first_paragraph(text),
+                "mtime": stat.st_mtime,
+                "size": stat.st_size,
+                "path": str(path),
+            }
+        )
+    out.sort(key=lambda d: d["mtime"], reverse=True)
+    return out
+
+
+def read_design(
+    mind_dir: pathlib.Path, slug: str
+) -> dict[str, Any] | None:
+    """Read a single design draft by slug. Returns ``None`` if the slug
+    is invalid or the file doesn't exist. YAML frontmatter (if present)
+    is stripped from the returned ``body`` so the markdown renderer
+    doesn't choke on it."""
+    if not _CANVAS_SLUG_RE.match(slug):
+        return None
+    ddir = _designs_dir(mind_dir)
+    path = ddir / f"{slug}.md"
+    try:
+        path_resolved = path.resolve()
+        ddir_resolved = ddir.resolve()
+    except OSError:
+        return None
+    if not str(path_resolved).startswith(str(ddir_resolved) + "/"):
+        return None
+    if not path_resolved.is_file():
+        return None
+    try:
+        text = path_resolved.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    body = text
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end != -1:
+            body = text[end + 5 :]
+    title = _extract_title(body, ".md", slug)
+    return {
+        "slug": slug,
+        "title": title,
+        "body": body,
+        "path": str(path_resolved),
     }
 
 

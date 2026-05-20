@@ -890,27 +890,58 @@ def create_app(paths: Paths | None = None) -> FastAPI:
                 f"<p><a href='/canvas'>← back to index</a></p>",
                 status_code=404,
             )
-        # Authored canvas decks → reveal.js slideshow.
+        # Authored canvas decks under ``inner/canvas/`` are now raw
+        # HTML (per Jason's 2026-05-20 directive: "if there's a slide
+        # show, it's just a raw html file"). Serve them straight to the
+        # browser — no template wrapping, no markdown conversion.
+        #
         # Everything else (experiment cards, auto-promoted research
         # papers, unflagged research fallbacks) → plain markdown paper
-        # view. Reveal.js treats every standalone `---` as a slide
-        # break, which slices research-paper frontmatter into nonsense
-        # slides, so only hand-authored canvas decks (where the author
-        # intentionally wrote slide separators) get the slideshow
-        # treatment.
-        template = (
-            "canvas_view.html"
-            if canvas.get("source") == "canvas"
-            else "canvas_paper.html"
-        )
+        # view rendered client-side via marked + DOMPurify.
+        if canvas.get("source") == "canvas":
+            return HTMLResponse(canvas["body"])
         return templates.TemplateResponse(
             request,
-            template,
+            "canvas_paper.html",
             {
                 "canvas": canvas,
                 "fallback_banner": fallback_banner,
                 "state": _state_context(),
                 "active": "canvas",
+            },
+        )
+
+    @app.get("/designs", response_class=HTMLResponse)
+    async def designs_index(request: Request):
+        p: Paths = app.state.paths
+        designs = sources.list_designs(p.mind_dir)
+        return templates.TemplateResponse(
+            request,
+            "designs_index.html",
+            {
+                "designs": designs,
+                "state": _state_context(),
+                "active": "designs",
+            },
+        )
+
+    @app.get("/designs/{slug}", response_class=HTMLResponse)
+    async def designs_view(request: Request, slug: str):
+        p: Paths = app.state.paths
+        design = sources.read_design(p.mind_dir, slug)
+        if design is None:
+            return HTMLResponse(
+                f"<h1>design not found: {slug}</h1>"
+                f"<p><a href='/designs'>← back to index</a></p>",
+                status_code=404,
+            )
+        return templates.TemplateResponse(
+            request,
+            "designs_view.html",
+            {
+                "design": design,
+                "state": _state_context(),
+                "active": "designs",
             },
         )
 

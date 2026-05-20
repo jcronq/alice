@@ -340,7 +340,12 @@ def test_jobs_sorted_newest_first(tmp_path):
 def test_list_canvases_picks_up_experiment_cards(tmp_path):
     p = _paths(tmp_path)
     (p.inner / "canvas").mkdir(parents=True)
-    (p.inner / "canvas" / "authored-deck.md").write_text("# Hand authored\n")
+    # Authored decks under inner/canvas/ are raw HTML now (per Jason's
+    # 2026-05-20 directive). Markdown design drafts moved to /designs.
+    (p.inner / "canvas" / "authored-deck.html").write_text(
+        "<html><head><title>Hand authored</title></head>"
+        "<body><h1>Hand authored</h1></body></html>"
+    )
     exp_dir = p.mind_dir / "cortex-memory" / "experiments"
     exp_dir.mkdir(parents=True)
     (exp_dir / "exp-2026-05-11-001.md").write_text(
@@ -355,8 +360,8 @@ def test_list_canvases_picks_up_experiment_cards(tmp_path):
 def test_list_canvases_authored_wins_on_collision(tmp_path):
     p = _paths(tmp_path)
     (p.inner / "canvas").mkdir(parents=True)
-    (p.inner / "canvas" / "exp-same-slug.md").write_text(
-        "# Authored override\nbody\n"
+    (p.inner / "canvas" / "exp-same-slug.html").write_text(
+        "<h1>Authored override</h1><p>body</p>"
     )
     exp_dir = p.mind_dir / "cortex-memory" / "experiments"
     exp_dir.mkdir(parents=True)
@@ -477,7 +482,7 @@ def test_canvas_wins_over_research_on_slug_collision(tmp_path):
     """Same precedence rule as the canvas/experiment collision."""
     p = _paths(tmp_path)
     (p.inner / "canvas").mkdir(parents=True)
-    (p.inner / "canvas" / "shared.md").write_text("# Canvas wins\n")
+    (p.inner / "canvas" / "shared.html").write_text("<h1>Canvas wins</h1>")
     _make_research(
         p, "shared", "---\ncanvas_paper: true\n---\n# Research loses\n"
     )
@@ -689,9 +694,10 @@ def test_canvas_route_unknown_slug_still_404s(tmp_path):
     assert "canvas not found" in r.text
 
 
-def test_canvas_route_authored_canvas_uses_slideshow(tmp_path):
-    """Regression: authored canvas decks still use canvas_view.html
-    (reveal.js), not the markdown paper template."""
+def test_canvas_route_authored_canvas_serves_raw_html(tmp_path):
+    """Regression: authored canvas decks under ``inner/canvas/`` are
+    served as raw HTML (per Jason's 2026-05-20 directive). The viewer
+    no longer wraps them in a markdown→slideshow template."""
     from fastapi.testclient import TestClient
 
     from alice_viewer.main import create_app
@@ -700,14 +706,17 @@ def test_canvas_route_authored_canvas_uses_slideshow(tmp_path):
     paths.mind_dir.mkdir(parents=True, exist_ok=True)
     paths.state_dir.mkdir(parents=True, exist_ok=True)
     (paths.inner / "canvas").mkdir(parents=True, exist_ok=True)
-    (paths.inner / "canvas" / "authored-deck.md").write_text(
-        "# Deck\n\n---\n\nslide two\n"
+    raw_html = (
+        "<!doctype html><html><head><title>Deck</title></head>"
+        "<body><h1>Hand authored slideshow</h1>"
+        "<p>raw html content</p></body></html>"
     )
+    (paths.inner / "canvas" / "authored-deck.html").write_text(raw_html)
     app = create_app(paths=paths)
     client = TestClient(app)
     r = client.get("/canvas/authored-deck")
     assert r.status_code == 200
-    # canvas_view.html (reveal slideshow) — not canvas_paper.html.
-    # The slideshow template loads reveal.js; the paper one doesn't.
-    assert "reveal" in r.text.lower()
+    assert "Hand authored slideshow" in r.text
+    assert "raw html content" in r.text
+    # No paper-template chrome — the body is the file, verbatim.
     assert "rendering as plain markdown" not in r.text
