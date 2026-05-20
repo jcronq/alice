@@ -14,6 +14,7 @@ Bug map:
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -23,6 +24,7 @@ import pytest
 
 from alice_metrics.vault_health import (
     build_vault_health_event,
+    compute_continuous_checks,
     compute_decay_coverage,
     count_broken_wikilinks,
     count_inbound_links,
@@ -1899,3 +1901,130 @@ def test_decay_coverage_missing_access_count_skipped(tmp_path: Path) -> None:
     )
     result = compute_decay_coverage(vault, today=_TODAY, activation_date=_ACTIVATION)
     assert result["total_decayed_notes"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Continuous structural-health checks
+# Design: [[2026-05-20-continuous-structural-health-check]] (Task 1).
+# - zero_edge_notes: shadow_orphan subset surfaced with slug list.
+# - trigger_gap_notes: research/ notes >14d old, no triggers, ≥2 outbound.
+# - --continuous flag: opt-in; baseline output unchanged when omitted.
+# ---------------------------------------------------------------------------
+
+
+_CONTINUOUS_TODAY = datetime(2026, 5, 20)
+
+
+def test_compute_continuous_checks_detects_zero_edge_note(tmp_path: Path) -> None:
+    """A note with ≥1 trigger keyword, ≥1 outbound, 0 inbound is a
+    zero_edge_note and must appear in the slug list."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "ghost.md",
+        """
+        ---
+        slug: ghost
+        trigger_keywords: [phantom]
+        created: 2026-05-01
+        ---
+
+        Linking out to [[anchor]] but nothing links back.
+        """,
+    )
+    _write(
+        vault / "reference" / "anchor.md",
+        """
+        ---
+        slug: anchor
+        ---
+
+        Anchor body.
+        """,
+    )
+    result = compute_continuous_checks(vault, today=_CONTINUOUS_TODAY)
+    assert result["zero_edge_notes"]["count"] == 1
+    assert result["zero_edge_notes"]["slugs"] == ["ghost"]
+    # anchor has 1 inbound + no outbound + no triggers → neither bucket.
+    assert result["trigger_gap_notes"]["count"] == 0
+
+
+def test_compute_continuous_checks_detects_trigger_gap_note(tmp_path: Path) -> None:
+    """A research/ note older than 14 days with 0 trigger keywords and
+    ≥2 outbound wikilinks must appear as a trigger_gap_note. A younger
+    note with the same shape must not."""
+    vault = _make_vault(tmp_path)
+    # Old + 2 outbound + no triggers → trigger_gap.
+    _write(
+        vault / "research" / "old-gap.md",
+        """
+        ---
+        slug: old-gap
+        created: 2026-04-01
+        ---
+
+        References [[anchor-a]] and [[anchor-b]] but is itself undiscoverable.
+        """,
+    )
+    # Young + 2 outbound + no triggers → not yet eligible.
+    _write(
+        vault / "research" / "young-gap.md",
+        """
+        ---
+        slug: young-gap
+        created: 2026-05-18
+        ---
+
+        References [[anchor-a]] and [[anchor-b]] but is recent.
+        """,
+    )
+    # Old + 1 outbound + no triggers → below outbound threshold.
+    _write(
+        vault / "research" / "old-single.md",
+        """
+        ---
+        slug: old-single
+        created: 2026-04-01
+        ---
+
+        Only one outbound: [[anchor-a]].
+        """,
+    )
+    _write(vault / "reference" / "anchor-a.md", "anchor a\n")
+    _write(vault / "reference" / "anchor-b.md", "anchor b\n")
+    result = compute_continuous_checks(vault, today=_CONTINUOUS_TODAY)
+    assert result["trigger_gap_notes"]["count"] == 1
+    assert result["trigger_gap_notes"]["slugs"] == ["old-gap"]
+
+
+def test_continuous_flag_does_not_change_baseline_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Omitting --continuous must leave the legacy CLI output free of a
+    ``continuous_checks`` key. Passing --continuous must add exactly that
+    key without disturbing other fields."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "ghost.md",
+        """
+        ---
+        slug: ghost
+        trigger_keywords: [phantom]
+        created: 2026-05-01
+        ---
+
+        Linking out to [[anchor]].
+        """,
+    )
+    _write(vault / "reference" / "anchor.md", "anchor body\n")
+
+    vault_health_main(["--vault", str(vault)])
+    baseline = json.loads(capsys.readouterr().out)
+    assert "continuous_checks" not in baseline
+
+    vault_health_main(["--vault", str(vault), "--continuous"])
+    with_flag = json.loads(capsys.readouterr().out)
+    assert "continuous_checks" in with_flag
+    # The opt-in key is the only additive change.
+    assert {k: with_flag[k] for k in baseline} == baseline
+    assert with_flag["continuous_checks"]["zero_edge_notes"]["count"] == 1
+    assert with_flag["continuous_checks"]["zero_edge_notes"]["slugs"] == ["ghost"]

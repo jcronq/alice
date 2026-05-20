@@ -440,6 +440,90 @@ def count_shadow_and_dark(vault_dir: Path) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
+# Continuous structural-health checks
+# Design: [[2026-05-20-continuous-structural-health-check]] (Task 1).
+# Two structural-absence detectors that surface grooming candidates with
+# slug lists (the existing shadow/dark counters report only aggregates):
+#   - zero_edge_notes: 0 inbound, ≥1 outbound, ≥1 trigger_keyword. The
+#     shadow_orphan subset; reachable via the cue runner but invisible to
+#     vault navigation.
+#   - trigger_gap_notes: research/ notes older than 14 days with 0 trigger
+#     keywords and ≥2 outbound wikilinks. Referenced by others but not
+#     themselves discoverable via the cue runner — keyword-backfill
+#     candidates.
+# ---------------------------------------------------------------------------
+
+
+CONTINUOUS_TRIGGER_GAP_AGE_DAYS = 14
+CONTINUOUS_TRIGGER_GAP_MIN_OUTBOUND = 2
+
+
+def compute_continuous_checks(
+    vault_dir: Path,
+    today: datetime | None = None,
+    trigger_gap_age_days: int = CONTINUOUS_TRIGGER_GAP_AGE_DAYS,
+    trigger_gap_min_outbound: int = CONTINUOUS_TRIGGER_GAP_MIN_OUTBOUND,
+) -> dict[str, Any]:
+    """Continuous structural-absence checks (Task 1 of the design note).
+
+    Returns ``{"zero_edge_notes": {"count": int, "slugs": [str]},
+    "trigger_gap_notes": {"count": int, "slugs": [str]}}``.
+
+    Dailies, archive, scaffolding files, and redirect stubs are excluded
+    from both buckets (same conventions as :func:`count_shadow_and_dark`).
+    Reuses the inbound link graph from :func:`count_inbound_links` and
+    the wikilink extractor from :func:`_extract_targets`, so the regex
+    walk isn't duplicated.
+    """
+    if today is None:
+        today = _local_now().replace(hour=0, minute=0, second=0, microsecond=0)
+    today = today.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+    cutoff = today - timedelta(days=trigger_gap_age_days)
+
+    inbound = count_inbound_links(vault_dir)
+    zero_edge: list[str] = []
+    trigger_gap: list[str] = []
+
+    for md in _iter_notes(vault_dir):
+        rel_parts = md.relative_to(vault_dir).parts
+        if rel_parts and (rel_parts[0] == "dailies" or rel_parts[0] == "archive"):
+            continue
+        rel = str(md.relative_to(vault_dir))
+        text = _read_text(md)
+        # Redirect stubs are bare-slug resolvers — by design they have 0
+        # inbound + trigger_keywords. Excluding them matches the shadow/dark
+        # contract (see issue #251).
+        if "redirect:" in text:
+            continue
+        fm, body = split_frontmatter(text)
+        triggers = fm.get("trigger_keywords")
+        trigger_count = len(triggers) if isinstance(triggers, list) else 0
+        outbound_count = len(_extract_targets(body))
+        inbound_count = inbound.get(rel, 0)
+        slug = _slug_from_fm(fm, md.stem)
+
+        if inbound_count == 0 and trigger_count >= 1 and outbound_count >= 1:
+            zero_edge.append(slug)
+
+        if (
+            rel_parts
+            and rel_parts[0] == "research"
+            and trigger_count == 0
+            and outbound_count >= trigger_gap_min_outbound
+        ):
+            created = _parse_created_date(fm.get("created"))
+            if created is not None and created < cutoff:
+                trigger_gap.append(slug)
+
+    zero_edge.sort()
+    trigger_gap.sort()
+    return {
+        "zero_edge_notes": {"count": len(zero_edge), "slugs": zero_edge},
+        "trigger_gap_notes": {"count": len(trigger_gap), "slugs": trigger_gap},
+    }
+
+
+# ---------------------------------------------------------------------------
 # Research note decay
 # Design: [[2026-05-09-research-note-decay-metric]]
 # Count research/ notes older than 60 days with fewer than 2 inbound links.
@@ -1764,6 +1848,15 @@ def main(argv: list[str] | None = None) -> int:
             "vault_health write path — no shell-side JSON assembly."
         ),
     )
+    parser.add_argument(
+        "--continuous",
+        action="store_true",
+        help=(
+            "Emit continuous structural-health checks (zero_edge_notes, "
+            "trigger_gap_notes) under a top-level `continuous_checks` key. "
+            "See design note [[2026-05-20-continuous-structural-health-check]]."
+        ),
+    )
     args = parser.parse_args(argv)
 
     # Single-command morning-scan mode: when --check-existing or --append
@@ -1791,6 +1884,10 @@ def main(argv: list[str] | None = None) -> int:
             surface_dir=args.surface,
             now=now,
         )
+        if args.continuous:
+            event["continuous_checks"] = compute_continuous_checks(
+                args.vault, today=now,
+            )
 
         if args.append:
             _append_event(args.events, event)
@@ -1835,6 +1932,8 @@ def main(argv: list[str] | None = None) -> int:
             window_end=_recovery_we,
             events_path=args.events,
         )
+    if args.continuous:
+        out["continuous_checks"] = compute_continuous_checks(args.vault)
     print(json.dumps(out, indent=2, sort_keys=True))
     return 0
 
