@@ -87,6 +87,89 @@ def _is_self_filed(issue: dict[str, Any]) -> bool:
     return SELF_FILED_MARKER in body
 
 
+# Label the SM v2 dispatcher uses as the lifecycle entry point. The
+# dispatcher's GitHub query (``src/alice_sm/dispatcher/gh.py``) filters
+# by ``label:sm:draft,sm:needs_study,...`` — an unlabeled trusted-author
+# issue is invisible to the dispatcher and stalls indefinitely. The
+# watcher applies this on ``new_issue`` intake so every fresh trusted
+# issue enters the SM lifecycle automatically. Re-stated here rather
+# than imported from ``alice_sm.dispatcher.constants`` to keep the
+# watcher decoupled from the dispatcher package.
+SM_DRAFT_LABEL = "sm:draft"
+SM_LABEL_PREFIX = "sm:"
+
+
+def _extract_label_names(labels: Any) -> list[str]:
+    """Pull ``name`` strings out of the GitHub-API labels payload.
+
+    ``gh api`` returns labels as a list of dicts ``{"id":..., "name":...,
+    "color":...}``. Be tolerant of bare strings (older fixtures / future
+    schema drift) and skip anything that doesn't yield a usable name.
+    """
+    if not isinstance(labels, list):
+        return []
+    names: list[str] = []
+    for entry in labels:
+        if isinstance(entry, dict):
+            name = entry.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
+        elif isinstance(entry, str) and entry:
+            names.append(entry)
+    return names
+
+
+def _apply_sm_draft_label(
+    repo: str,
+    number: int,
+    current_labels: list[str],
+    *,
+    gh_bin: str = "gh",
+    log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
+) -> bool:
+    """Best-effort: stamp ``sm:draft`` on a freshly-emitted issue.
+
+    Returns True iff the label was actually applied. Idempotency: if the
+    issue already carries any ``sm:*`` label it's already inside the SM
+    lifecycle and we leave it alone (don't clobber ``sm:needs_study`` or
+    later states a human pre-set).
+
+    Failures (gh missing, network blip, label-doesn't-exist-yet) are
+    logged and swallowed — labeling must never block the ``new_issue``
+    note emission, which is the primary product of this loop.
+    """
+    if any(lbl.startswith(SM_LABEL_PREFIX) for lbl in current_labels):
+        return False
+    args = [
+        gh_bin,
+        "issue",
+        "edit",
+        str(number),
+        "--repo",
+        repo,
+        "--add-label",
+        SM_DRAFT_LABEL,
+    ]
+    try:
+        result = subprocess.run(
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"[gh-watcher] {repo}#{number}: sm:draft label apply failed — {exc}")
+        return False
+    if result.returncode != 0:
+        log(
+            f"[gh-watcher] {repo}#{number}: sm:draft label apply exited "
+            f"{result.returncode} — {(result.stderr or result.stdout).strip()[:200]}"
+        )
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
@@ -317,6 +400,7 @@ def poll_repo(
     *,
     trusted: frozenset[str] = frozenset(DEFAULT_TRUSTED_ASSOCIATIONS),
     api: Callable[[str], Any] = gh_api,
+    label_apply: Callable[[str, int, list[str]], bool] = _apply_sm_draft_label,
 ) -> list[Event]:
     """Poll one repo, mutate ``repo_state`` in place, return new events.
 
@@ -583,6 +667,25 @@ def poll_repo(
                         payload={"issue": issue},
                     )
                 )
+                # Best-effort SM v2 intake: stamp ``sm:draft`` so the
+                # dispatcher's labeled-issue query can see it. Skips if
+                # the issue already carries any ``sm:*`` label (a human
+                # may have pre-routed it). Any failure here is logged
+                # inside ``_apply_sm_draft_label`` and must not block
+                # the note emission above — issues #247/#258/#260/#261
+                # are the structural backlog that motivated this.
+                try:
+                    label_apply(
+                        repo,
+                        n,
+                        _extract_label_names(issue.get("labels")),
+                    )
+                except Exception:  # noqa: BLE001
+                    # Defensive: even a buggy injected labeler must not
+                    # tank the watcher pass. Already-logged failures
+                    # come back as False; this catches programming
+                    # errors in label_apply itself.
+                    pass
         issue_state_map[str(n)] = new_state
 
         # Same skip-the-detail-fetch shortcut as PRs: closed-and-unchanged
@@ -864,6 +967,7 @@ def run(
     state_path: pathlib.Path,
     api: Callable[[str], Any] = gh_api,
     log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
+    label_apply: Callable[[str, int, list[str]], bool] = _apply_sm_draft_label,
 ) -> int:
     """Run one watcher pass. Returns the desired process exit code.
 
@@ -891,6 +995,7 @@ def run(
                 repo_state,
                 trusted=cfg.trusted_associations,
                 api=api,
+                label_apply=label_apply,
             )
         except GHCommandError as exc:
             log(f"[gh-watcher] {repo}: gh failed — {exc}")

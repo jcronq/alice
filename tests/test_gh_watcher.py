@@ -73,6 +73,7 @@ def _make_issue(
     body: str = "",
     user: str = "alice",
     author_association: str = "OWNER",
+    labels: list[dict] | None = None,
 ) -> dict:
     return {
         "number": number,
@@ -83,8 +84,24 @@ def _make_issue(
         "user": {"login": user},
         "author_association": author_association,
         "created_at": "2026-04-29T12:00:00Z",
+        "labels": labels if labels is not None else [],
         # No ``pull_request`` key — pure issue.
     }
+
+
+class FakeLabeler:
+    """Replaces ``_apply_sm_draft_label`` for tests. Records every call
+    and honors the same idempotency rule (skip if any sm:* present) so
+    tests can assert on the outcome the same way production behaves."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int, list[str]]] = []
+
+    def __call__(self, repo: str, number: int, current_labels: list[str]) -> bool:
+        self.calls.append((repo, number, list(current_labels)))
+        if any(lbl.startswith("sm:") for lbl in current_labels):
+            return False
+        return True
 
 
 class FakeAPI:
@@ -733,3 +750,245 @@ def test_is_self_filed_helper() -> None:
     assert not gh_watcher._is_self_filed({})
     assert not gh_watcher._is_self_filed({"body": None})
     assert not gh_watcher._is_self_filed({"body": 42})
+
+
+# ---------------------------------------------------------------------------
+# sm:draft auto-labeling on new_issue intake
+#
+# The SM v2 dispatcher's GitHub query filters by ``label:sm:draft,...`` —
+# unlabeled trusted-author issues are invisible to it and stall. The
+# watcher closes that gap by stamping ``sm:draft`` whenever it emits a
+# ``new_issue`` event. These tests pin the load-bearing behaviors:
+# fires on fresh issues, idempotent against pre-existing sm:* labels,
+# and gated by the same emit condition (no fire for self-filed,
+# untrusted authors, first run, or unprimed issue side).
+# ---------------------------------------------------------------------------
+
+
+def test_labeler_fires_on_fresh_trusted_new_issue(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    """The structural fix: a trusted-author new issue with no labels gets
+    ``sm:draft`` stamped so the SM v2 dispatcher can pick it up."""
+    api = FakeAPI()
+    api.issues = []
+    labeler = FakeLabeler()
+    gh_watcher.run(
+        mind_dir=mind_dir,
+        state_path=state_path,
+        api=api,
+        log=lambda _: None,
+        label_apply=labeler,
+    )
+    # Prime pass — labeler must not fire because no new_issue event.
+    assert labeler.calls == []
+
+    api.issues = [
+        _make_issue(number=247, title="Real issue", user="jcronq", labels=[])
+    ]
+    api.issue_thread_comments[247] = []
+    gh_watcher.run(
+        mind_dir=mind_dir,
+        state_path=state_path,
+        api=api,
+        log=lambda _: None,
+        label_apply=labeler,
+    )
+    assert labeler.calls == [("acme/widgets", 247, [])]
+
+
+def test_labeler_skips_when_issue_already_has_sm_label(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    """If the issue already carries ``sm:needs_study`` (a human pre-routed
+    it past draft), the labeler must not clobber that state. The fake
+    labeler honors the same idempotency rule as production so we can
+    assert on its return value via the call record."""
+    api = FakeAPI()
+    api.issues = []
+    labeler = FakeLabeler()
+    gh_watcher.run(
+        mind_dir=mind_dir,
+        state_path=state_path,
+        api=api,
+        log=lambda _: None,
+        label_apply=labeler,
+    )
+
+    api.issues = [
+        _make_issue(
+            number=260,
+            title="Pre-routed",
+            user="jcronq",
+            labels=[
+                {"id": 1, "name": "sm:needs_study", "color": "ffffff"},
+                {"id": 2, "name": "bug", "color": "000000"},
+            ],
+        )
+    ]
+    api.issue_thread_comments[260] = []
+    gh_watcher.run(
+        mind_dir=mind_dir,
+        state_path=state_path,
+        api=api,
+        log=lambda _: None,
+        label_apply=labeler,
+    )
+    # Labeler was invoked (the new_issue path runs it) but bailed early
+    # because of the existing sm:* label. The call record carries the
+    # extracted label names so we can verify the idempotency input.
+    assert len(labeler.calls) == 1
+    repo, number, names = labeler.calls[0]
+    assert (repo, number) == ("acme/widgets", 260)
+    assert "sm:needs_study" in names and "bug" in names
+
+    # Direct check on the real production helper: same input ⇒ no apply.
+    assert (
+        gh_watcher._apply_sm_draft_label("acme/widgets", 260, names) is False
+    )
+
+
+def test_labeler_gated_by_new_issue_emit_condition(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    """The labeler is wired inside the same branch that emits the
+    ``new_issue`` event: it must not fire when emission is suppressed by
+    first-run priming, the issues_primed gate, untrusted authors, or the
+    self-filed marker. Covers all four suppressors in one pass."""
+    api = FakeAPI()
+    labeler = FakeLabeler()
+
+    # Case 1 — first run: prime pass with two issues already present
+    # must not fire the labeler (no new_issue event during priming).
+    api.issues = [
+        _make_issue(number=1, title="Pre-existing trusted", user="jcronq"),
+    ]
+    api.issue_thread_comments[1] = []
+    gh_watcher.run(
+        mind_dir=mind_dir,
+        state_path=state_path,
+        api=api,
+        log=lambda _: None,
+        label_apply=labeler,
+    )
+    assert labeler.calls == [], "first-run prime must not invoke the labeler"
+
+    # Case 2 — untrusted author: a rando-opened issue must not be labeled.
+    api.issues = [
+        _make_issue(number=1, title="Pre-existing trusted", user="jcronq"),
+        _make_issue(
+            number=2,
+            title="Rando issue",
+            user="rando",
+            author_association="NONE",
+        ),
+    ]
+    api.issue_thread_comments[2] = []
+    gh_watcher.run(
+        mind_dir=mind_dir,
+        state_path=state_path,
+        api=api,
+        log=lambda _: None,
+        label_apply=labeler,
+    )
+    assert labeler.calls == [], "untrusted-author new issue must not be labeled"
+
+    # Case 3 — self-filed marker: Speaking-filed issues are suppressed at
+    # the emit branch, so the labeler must not run.
+    api.issues = [
+        _make_issue(number=1, title="Pre-existing trusted", user="jcronq"),
+        _make_issue(
+            number=2,
+            title="Rando issue",
+            user="rando",
+            author_association="NONE",
+        ),
+        _make_issue(
+            number=3,
+            title="Self-filed",
+            user="jcronq",
+            body=f"plan stuff\n\n{gh_watcher.SELF_FILED_MARKER}",
+        ),
+    ]
+    api.issue_thread_comments[3] = []
+    gh_watcher.run(
+        mind_dir=mind_dir,
+        state_path=state_path,
+        api=api,
+        log=lambda _: None,
+        label_apply=labeler,
+    )
+    assert labeler.calls == [], "self-filed issue must not be labeled"
+
+    # Sanity: a legitimately fresh trusted non-self-filed issue on the
+    # next poll DOES fire — proves the test isn't a no-op.
+    api.issues = [
+        _make_issue(number=1, title="Pre-existing trusted", user="jcronq"),
+        _make_issue(
+            number=2,
+            title="Rando issue",
+            user="rando",
+            author_association="NONE",
+        ),
+        _make_issue(
+            number=3,
+            title="Self-filed",
+            user="jcronq",
+            body=f"plan stuff\n\n{gh_watcher.SELF_FILED_MARKER}",
+        ),
+        _make_issue(number=4, title="Real fresh", user="jcronq"),
+    ]
+    api.issue_thread_comments[4] = []
+    gh_watcher.run(
+        mind_dir=mind_dir,
+        state_path=state_path,
+        api=api,
+        log=lambda _: None,
+        label_apply=labeler,
+    )
+    assert labeler.calls == [("acme/widgets", 4, [])]
+
+
+def test_extract_label_names_helper() -> None:
+    """Tolerant of dict entries (gh api shape), bare strings (older
+    fixtures), and junk (silently dropped)."""
+    assert gh_watcher._extract_label_names(
+        [
+            {"id": 1, "name": "sm:draft", "color": "ffffff"},
+            {"id": 2, "name": "bug"},
+            "legacy-string-label",
+            {"id": 3},  # no name — skipped
+            42,  # not a dict or str — skipped
+        ]
+    ) == ["sm:draft", "bug", "legacy-string-label"]
+    assert gh_watcher._extract_label_names(None) == []
+    assert gh_watcher._extract_label_names([]) == []
+
+
+def test_labeler_failure_does_not_block_new_issue_note(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    """Best-effort contract: if the labeler raises, the watcher must
+    still write the ``new_issue`` note. Labeling is a nice-to-have on
+    top of the primary thinking → attempt-issue-fix path."""
+    api = FakeAPI()
+    api.issues = []
+    gh_watcher.run(
+        mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
+    )
+
+    def boom(_repo: str, _number: int, _labels: list[str]) -> bool:
+        raise RuntimeError("gh: command not found")
+
+    api.issues = [_make_issue(number=261, title="Has to land", user="jcronq")]
+    api.issue_thread_comments[261] = []
+    gh_watcher.run(
+        mind_dir=mind_dir,
+        state_path=state_path,
+        api=api,
+        log=lambda _: None,
+        label_apply=boom,
+    )
+    notes = list((mind_dir / "inner" / "notes").glob("*.md"))
+    assert len(notes) == 1
+    assert "Has to land" in notes[0].read_text()
