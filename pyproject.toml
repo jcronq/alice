@@ -79,7 +79,9 @@ build-backend = "hatchling.build"
 #   alice_eval      — speaking-quality eval harness (Day-1 sample/replay/UI)
 #   alice_indexer   — vault SQLite/FTS5 indexer (CLI; cortex-memory tooling)
 #   alice_metrics   — stable vault-health metric implementations (replaces drift-prone bash)
-#   alice_pi        — Kernel impl backed by pi-coding-agent subprocess
+#   alice_pi        — pi-coding-agent backend support (translator, transport,
+#                     models_staging, native extensions). The kernel itself
+#                     lives at alice_core.kernel.pi alongside AnthropicKernel.
 #   alice_prompts   — Jinja2 templates the runtime renders into model prompts
 #   alice_skills    — registry over .claude/skills/ markdown (plan 07)
 #   alice_sm        — State Machine dispatcher (poll → trust-filter → comment)

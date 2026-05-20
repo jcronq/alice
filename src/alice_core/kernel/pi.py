@@ -34,18 +34,14 @@ import asyncio
 from importlib import resources
 from typing import Any, Optional
 
-from alice_core.events import EventEmitter
-from alice_core.kernel import (
-    BlockHandler,
-    KernelResult,
-    KernelSpec,
-    ThinkingLevel,
-)
+from alice_pi import transport as _transport_mod
+from alice_pi.models_staging import ensure_pi_models_json
+from alice_pi.transport import stream_pi_events
+from alice_pi.translator import PiEventTranslator
 
-from . import transport as _transport_mod
-from .models_staging import ensure_pi_models_json
-from .transport import stream_pi_events
-from .translator import PiEventTranslator
+from ..events import EventEmitter
+from .protocol import BlockHandler
+from .types import KernelResult, KernelSpec, ThinkingLevel
 
 
 __all__ = ["PiKernel"]
@@ -225,7 +221,7 @@ class PiKernel:
     def _build_argv(self, prompt: str, spec: KernelSpec) -> list[str]:
         # Read PI_BIN dynamically so test fixtures + runtime env
         # changes (ALICE_PI_BIN) take effect without needing a
-        # module reload of alice_pi.kernel.
+        # module reload of alice_core.kernel.pi.
         argv: list[str] = [
             _transport_mod.pi_bin(),
             "--mode",

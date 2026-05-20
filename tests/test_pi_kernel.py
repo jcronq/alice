@@ -1,4 +1,4 @@
-"""End-to-end-ish tests for alice_pi.kernel.PiKernel.
+"""End-to-end-ish tests for alice_core.kernel.pi.PiKernel.
 
 Uses a tmp shell script as the ``pi`` binary that emits a recorded
 JSONL stream — exercises argv construction, JSONL parsing, event
@@ -14,8 +14,7 @@ import pytest
 
 from alice_core.events import CapturingEmitter
 from alice_core.kernel import KernelSpec, NullHandler, TurnSummary
-
-from alice_pi.kernel import PiKernel
+from alice_core.kernel.pi import PiKernel
 
 
 def _write_fake_pi(

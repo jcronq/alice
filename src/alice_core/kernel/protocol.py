@@ -56,7 +56,7 @@ class Kernel(Protocol):
     """Backend-agnostic kernel contract.
 
     Impls live in :mod:`alice_core.kernel.anthropic` and
-    :mod:`alice_pi.kernel`. Agent code never instantiates these
+    :mod:`alice_core.kernel.pi`. Agent code never instantiates these
     directly — call :func:`alice_core.kernel.factory.make_kernel`.
     """
 

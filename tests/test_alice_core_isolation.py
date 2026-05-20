@@ -35,6 +35,17 @@ ALLOWED_TOPLEVEL = _STDLIB | {
     # (auth, personae, model) use it to parse YAML files in the mind.
     # Sibling packages still aren't allowed.
     "yaml",
+    # ``alice_pi`` is the one explicit exception. The Pi kernel impl
+    # was pulled into ``alice_core/kernel/pi.py`` so both backend
+    # impls (Anthropic + Pi) live side by side, but the Pi support
+    # modules (translator, transport, models_staging, extensions)
+    # stay in ``alice_pi/``. ``alice_core.kernel.pi`` therefore
+    # imports them via ``from alice_pi.* import ...``. Per Jason's
+    # directive 2026-05-20: "alice_anthropic is a kernel. Seems
+    # appropriate for the other to be pulled in instead." A fuller
+    # per-backend subpackage reorg is queued as a separate
+    # DRY/SOLID audit; until then this is the documented exception.
+    "alice_pi",
 }
 
 
