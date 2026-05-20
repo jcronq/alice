@@ -174,16 +174,22 @@ This whole sequence happens whether Jason is at his desk or on a run.
 └───────────────────────────┘  └──────────────────────┘  └──────────────┘
 ```
 
-Three containers, supervised by s6 inside Docker:
+One container named `alice`, s6-overlay supervises every service inside:
 
-- **`alice-daemon`** — singleton. Runs signal-cli in JSON-RPC mode on :8080.
-  No Claude here.
-- **`alice-worker-blue` / `alice-worker-green`** — blue/green worker slots,
-  exactly one live at a time, holding an exclusive `flock` on the worker
-  lease. `alice-deploy` swaps them.
+- **`signal-daemon`** — signal-cli in JSON-RPC mode on `localhost:8080`
+  (also published on the host).
+- **`alice-speaking`** — the Claude-backed talking hemisphere.
+- **`alice-thinker`** — the reflection / vault-grooming hemisphere.
 - **`alice-viewer`** — read-only introspection UI on
-  [http://localhost:7777](http://localhost:7777). Shows turns, surfaces,
-  notes, vault state, recent Stage D syntheses.
+  [http://localhost:7777](http://localhost:7777). Turns, surfaces, notes,
+  vault state, recent Stage D syntheses.
+- **Housekeeping** — `gh-watcher`, `sm-dispatcher`, `autopush`,
+  `embedder`, `reload-watcher`, `thinker-watchdog`.
+
+The previous 3-container split (`alice-daemon` + `alice-worker-blue/green`)
+was EKS Phase 1; the single-container cutover (Phase 2) collapses everything
+behind one `localhost` boundary. `sandbox/legacy-3svc.yml` is the explicit
+rollback artifact and is not the live shape.
 
 Full breakdown: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 

@@ -20,18 +20,16 @@ Recipient resolution (Phase 3 — address-book backed):
   not in the book.
 - anything else — error.
 
-Attachment path strategy (cross-container)
-==========================================
+Attachment path strategy
+========================
 
-signal-cli runs in the **alice-daemon** container. The MCP tool
-(``send_message``) runs in the **alice-worker** container. The two are
-separate Docker containers; they share two host directories that matter
-for outbox flow:
+signal-cli and the MCP tool (``send_message``) both run inside the single
+``alice`` container — signal-cli as an s6 service, the MCP tool inside the
+speaking process. Same container, same filesystem, same paths. Outbox
+flow uses two host bind mounts that matter:
 
-- worker has ``${HOME}:/host-home:ro`` — read-only view of the host
-  home, including ``alice-mind/``. The daemon does NOT mount this, so
-  any worker-only path (``/host-home/...``, ``/home/alice/alice-mind/...``)
-  is invisible to signal-cli.
+- ``${HOME}:/host-home:ro`` — read-only view of the host home, including
+  ``alice-mind/``. signal-cli sees the same path.
 - both containers mount ``${HOME}/.local/state/alice:/state:rw``. ``/state``
   is the only filesystem location that is (a) writable from the worker
   and (b) visible at the same path inside the daemon.
@@ -74,9 +72,10 @@ from ..transports.base import ChannelRef
 log = logging.getLogger(__name__)
 
 
-# Directory shared between alice-worker and alice-daemon containers.
-# Both mount ${HOME}/.local/state/alice at /state, so /state/outbox/ is
-# writable from worker and readable from daemon at the same path.
+# Outbox directory inside the alice container. Both the speaking process
+# (which writes here) and signal-cli (which reads here for attachments)
+# resolve the same path; the container mounts ${HOME}/.local/state/alice
+# at /state so the same outbox is accessible from the host as well.
 DEFAULT_OUTBOX_DIR = pathlib.Path(os.environ.get("ALICE_OUTBOX_DIR", "/state/outbox"))
 
 

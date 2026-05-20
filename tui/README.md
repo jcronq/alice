@@ -6,15 +6,15 @@ agent-friendly minimalist).
 ## Architecture
 
 The TUI is a host-side Node app. It spawns
-`docker exec -i alice-worker-blue alice-client --json` as a child process
+`docker exec -i alice alice-client --json` as a child process
 and renders the newline-delimited JSON event stream as a chat-style
-interface. No changes to the worker image, no daemon-side socket
+interface. No changes to the container image, no daemon-side socket
 plumbing — the existing CLI protocol is fully reused.
 
 ```
 ┌──────────────┐    docker exec -i    ┌────────────────────┐
 │  alice-tui   │  ───────────────────▶│  alice-client      │
-│  (host node) │  ◀───────────────────│  (in worker)       │
+│  (host node) │  ◀───────────────────│  (in alice ctr)    │
 │              │      NDJSON          │  ↕ /tmp/alice.sock │
 └──────────────┘                      └────────────────────┘
 ```
@@ -22,8 +22,8 @@ plumbing — the existing CLI protocol is fully reused.
 ## Run
 
 ```bash
-~/dev/alice/bin/alice-tui                # default: alice-worker-blue
-~/dev/alice/bin/alice-tui --worker alice-worker-green
+~/dev/alice/bin/alice-tui                # default: alice container
+~/dev/alice/bin/alice-tui --container alice
 ~/dev/alice/bin/alice-tui --help
 ```
 
