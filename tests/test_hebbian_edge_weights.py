@@ -10,7 +10,13 @@ Design reference:
 """
 from __future__ import annotations
 
-import json, math, pathlib, re, sqlite3, sys, tempfile
+import json
+import math
+import pathlib
+import re
+import sqlite3
+import sys
+import tempfile
 from dataclasses import dataclass
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "src"))
@@ -107,14 +113,20 @@ QUERY_SET: list[tuple[str, list[str], bool]] = [
 
 @dataclass
 class RankingResult:
-    query: str; mode: str; retrieved: list[str]; ground_truth: list[str]; ndcg: float
+    query: str
+    mode: str
+    retrieved: list[str]
+    ground_truth: list[str]
+    ndcg: float
 
 def precision_at_k(r: list[str], gt: list[str], k=3):
-    if not r: return 0.0
+    if not r:
+        return 0.0
     return sum(1 for s in r[:min(k,len(r))] if s in gt) / min(k, len(r))
 
 def recall_at_k(r: list[str], gt: list[str], k=3):
-    if not gt: return 0.0
+    if not gt:
+        return 0.0
     return sum(1 for s in r[:min(k,len(r))] if s in gt) / len(gt)
 
 def dcg_at_k(r: list[str], gt: list[str], k=3):
@@ -126,9 +138,11 @@ def ndcg_at_k(r: list[str], gt: list[str], k=3):
     return d / idcg if idcg > 0 else 0.0
 
 def survival_rate(all_r: list[list[str]], cands: list[str]):
-    if not cands: return 0.0
+    if not cands:
+        return 0.0
     seen = set()
-    for r in all_r: seen.update(r)
+    for r in all_r:
+        seen.update(r)
     return sum(1 for s in cands if s in seen) / len(cands)
 
 # ---------------------------------------------------------------------------
@@ -145,9 +159,12 @@ _STOPWORDS = frozenset({"a","an","and","are","as","at","be","but","by","do","doe
     "same","since","such","through","though","too","under","until","up","us","very","whether","whose"})
 
 def _classify(n, tags):
-    if n in _STATE_TYPES: return 1.0
-    if n == "behavior": return 1.0
-    if n == "finding" or any(t in _BUCKET2_TAGS for t in tags): return 1.0
+    if n in _STATE_TYPES:
+        return 1.0
+    if n == "behavior":
+        return 1.0
+    if n == "finding" or any(t in _BUCKET2_TAGS for t in tags):
+        return 1.0
     return 1.0
 
 def _tokenize(q):
@@ -164,7 +181,8 @@ class Scorer:
 
     def score(self, query, hebbian=False):
         tokens = _tokenize(query)
-        if not tokens: return []
+        if not tokens:
+            return []
         fts = _build_fts(tokens)
         conn = sqlite3.connect(f"file:{self.db}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
@@ -193,14 +211,15 @@ class Scorer:
             conn.close()
         scored = []
         for r in rows:
-            slug, title, nt, tj, body, rank = r["slug"], r["title"], r["note_type"], r["tags_json"], r["body"], r["rank"]
+            slug, _title, nt, tj, _body, rank = r["slug"], r["title"], r["note_type"], r["tags_json"], r["body"], r["rank"]
             tags = json.loads(tj) if tj else []
             boost = _classify(nt, tags)
             ac = counts.get(slug, 0)
             recency = 1.0 + 0.15 * math.log1p(min(ac, 100))
             base = -float(rank)
             sc = base * boost * recency
-            if hebbian: sc += self.eb * ew.get(slug, 0)
+            if hebbian:
+                sc += self.eb * ew.get(slug, 0)
             scored.append((slug, sc))
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored
@@ -220,21 +239,25 @@ def run_eval(vault_root, db_path, edge_boost=0.3):
         ht = [s for s,_ in hs[:3]]
         p_results.append(RankingResult(query, "plain", pt, gt, ndcg_at_k(pt, gt)))
         h_results.append(RankingResult(query, "hebbian", ht, gt, ndcg_at_k(ht, gt)))
-        p_all.append(pt); h_all.append(ht)
+        p_all.append(pt)
+        h_all.append(ht)
     def agg(res):
-        n = len(res); tp = sum(precision_at_k(r.retrieved, r.ground_truth) for r in res)
+        n = len(res)
+        tp = sum(precision_at_k(r.retrieved, r.ground_truth) for r in res)
         tr = sum(recall_at_k(r.retrieved, r.ground_truth) for r in res)
         tn = sum(r.ndcg for r in res)
         p, r_val = tp/n if n else 0, tr/n if n else 0
         return {"precision@3": p, "recall@3": r_val, "F1@3": 2*p*r_val/(p+r_val) if (p+r_val) else 0, "ndcg@3": tn/n if n else 0}
     pa, ha = agg(p_results), agg(h_results)
     # Regression: non-hebbian queries, any GT note dropped from top-3?
-    regs = 0; rc = 0
+    regs = 0
+    rc = 0
     for pr, hr in zip(p_results, h_results):
         if any(q[0] == pr.query and not q[2] for q in QUERY_SET):
             rc += 1
             for g in pr.ground_truth:
-                if g in pr.retrieved and g not in hr.retrieved: regs += 1
+                if g in pr.retrieved and g not in hr.retrieved:
+                    regs += 1
     # Hebbian query details
     details = []
     for pr, hr in zip(p_results, h_results):
@@ -264,7 +287,9 @@ def create_db(vr, dp):
     for slug, fm, body in VAULT_NOTES:
         title = slug.replace("-"," ").title()
         for line in fm.split("\n"):
-            if line.startswith("title: "): title = line[7:].strip().strip('"'); break
+            if line.startswith("title: "):
+                title = line[7:].strip().strip('"')
+                break
         tags = ["research"]
         for line in fm.split("\n"):
             if line.startswith("tags: ["):
@@ -276,14 +301,18 @@ def create_db(vr, dp):
         ac = 0
         for line in fm.split("\n"):
             if line.startswith("access_count:"):
-                try: ac = int(line.split(":")[1].strip())
-                except: pass
+                try:
+                    ac = int(line.split(":")[1].strip())
+                except Exception:
+                    pass
         c.execute("INSERT INTO notes VALUES(?,?,?,?,?,?)", (slug, title, "research", json.dumps(tags), body, p))
         c.execute("INSERT INTO notes_fts VALUES(?,?,?)", (slug, title, body))
-        if ac > 0: c.execute("INSERT INTO note_metrics VALUES(?,?)", (slug, ac))
+        if ac > 0:
+            c.execute("INSERT INTO note_metrics VALUES(?,?)", (slug, ac))
         for m in re.findall(r"\[\[([a-z0-9_-]+)\]\]", body):
             c.execute("INSERT INTO note_edges VALUES(?,?,1)", (slug, m))
-    conn.commit(); conn.close()
+    conn.commit()
+    conn.close()
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -291,7 +320,8 @@ def create_db(vr, dp):
 def test_plain_fts_returns_results():
     with tempfile.TemporaryDirectory() as td:
         vr, dp = pathlib.Path(td)/"cortex-memory", pathlib.Path(td)/"state"/"cortex-index.db"
-        dp.parent.mkdir(parents=True, exist_ok=True); create_db(vr, dp)
+        dp.parent.mkdir(parents=True, exist_ok=True)
+        create_db(vr, dp)
         scored = Scorer(dp, 0.0).score("cozyhem architecture")
         assert len(scored) > 0
         assert "cozyhem-arch" in [s for s,_ in scored]
@@ -299,7 +329,8 @@ def test_plain_fts_returns_results():
 def test_hebbian_promotes_structurally_connected():
     with tempfile.TemporaryDirectory() as td:
         vr, dp = pathlib.Path(td)/"cortex-memory", pathlib.Path(td)/"state"/"cortex-index.db"
-        dp.parent.mkdir(parents=True, exist_ok=True); create_db(vr, dp)
+        dp.parent.mkdir(parents=True, exist_ok=True)
+        create_db(vr, dp)
         q = "retrieval architecture system study"
         plain = Scorer(dp, 0.0).score(q)
         hebbian = Scorer(dp, 0.5).score(q, True)
@@ -316,8 +347,10 @@ def test_hebbian_promotes_structurally_connected():
 def test_edge_weight_additive():
     with tempfile.TemporaryDirectory() as td:
         vr, dp = pathlib.Path(td)/"cortex-memory", pathlib.Path(td)/"state"/"cortex-index.db"
-        dp.parent.mkdir(parents=True, exist_ok=True); create_db(vr, dp)
-        s05 = Scorer(dp, 0.5); s10 = Scorer(dp, 1.0)
+        dp.parent.mkdir(parents=True, exist_ok=True)
+        create_db(vr, dp)
+        s05 = Scorer(dp, 0.5)
+        s10 = Scorer(dp, 1.0)
         q = "retrieval architecture"
         p = {s: sc for s, sc in s05.score(q)}
         h05 = {s: sc for s, sc in s05.score(q, True)}
@@ -330,14 +363,16 @@ def test_edge_weight_additive():
 def test_hebbian_disabled_by_default():
     with tempfile.TemporaryDirectory() as td:
         vr, dp = pathlib.Path(td)/"cortex-memory", pathlib.Path(td)/"state"/"cortex-index.db"
-        dp.parent.mkdir(parents=True, exist_ok=True); create_db(vr, dp)
+        dp.parent.mkdir(parents=True, exist_ok=True)
+        create_db(vr, dp)
         s = Scorer(dp, 0.0)
         assert s.score("cliff") == s.score("cliff", True)
 
 def test_harness_metrics():
     with tempfile.TemporaryDirectory() as td:
         vr, dp = pathlib.Path(td)/"cortex-memory", pathlib.Path(td)/"state"/"cortex-index.db"
-        dp.parent.mkdir(parents=True, exist_ok=True); create_db(vr, dp)
+        dp.parent.mkdir(parents=True, exist_ok=True)
+        create_db(vr, dp)
         r = run_eval(vr, dp, 0.5)
         assert r["hebbian"]["ndcg@3"] >= r["plain"]["ndcg@3"], \
             f"NDCG: hebbian={r['hebbian']['ndcg@3']:.3f} < plain={r['plain']['ndcg@3']:.3f}"
@@ -345,14 +380,16 @@ def test_harness_metrics():
 def test_regression_guard():
     with tempfile.TemporaryDirectory() as td:
         vr, dp = pathlib.Path(td)/"cortex-memory", pathlib.Path(td)/"state"/"cortex-index.db"
-        dp.parent.mkdir(parents=True, exist_ok=True); create_db(vr, dp)
+        dp.parent.mkdir(parents=True, exist_ok=True)
+        create_db(vr, dp)
         r = run_eval(vr, dp, 0.5)
         assert r["regressions"] == 0, f"Regresions: {r['regressions']}/{r['regression_checks']}"
 
 def test_hebbian_query_improvement():
     with tempfile.TemporaryDirectory() as td:
         vr, dp = pathlib.Path(td)/"cortex-memory", pathlib.Path(td)/"state"/"cortex-index.db"
-        dp.parent.mkdir(parents=True, exist_ok=True); create_db(vr, dp)
+        dp.parent.mkdir(parents=True, exist_ok=True)
+        create_db(vr, dp)
         r = run_eval(vr, dp, 0.5)
         improved = sum(1 for d in r["details"] if d["improved"])
         assert improved > 0, f"No Hebbian query improved: details={[(d['query'],d['plain'],d['hebbian']) for d in r['details']]}"
@@ -360,7 +397,8 @@ def test_hebbian_query_improvement():
 def test_edge_boost_sensitivity():
     with tempfile.TemporaryDirectory() as td:
         vr, dp = pathlib.Path(td)/"cortex-memory", pathlib.Path(td)/"state"/"cortex-index.db"
-        dp.parent.mkdir(parents=True, exist_ok=True); create_db(vr, dp)
+        dp.parent.mkdir(parents=True, exist_ok=True)
+        create_db(vr, dp)
         r_low = run_eval(vr, dp, 0.1)
         r_high = run_eval(vr, dp, 1.0)
         assert r_high["h_survival"] >= r_low["h_survival"], \
@@ -377,7 +415,8 @@ def test_metrics_helpers():
 def test_vault_note_count():
     with tempfile.TemporaryDirectory() as td:
         vr, dp = pathlib.Path(td)/"cortex-memory", pathlib.Path(td)/"state"/"cortex-index.db"
-        dp.parent.mkdir(parents=True, exist_ok=True); create_db(vr, dp)
+        dp.parent.mkdir(parents=True, exist_ok=True)
+        create_db(vr, dp)
         c = sqlite3.connect(str(dp))
         assert c.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == len(VAULT_NOTES)
         assert c.execute("SELECT COUNT(*) FROM note_edges").fetchone()[0] > 0
@@ -390,7 +429,8 @@ def test_standalone_run():
     for eb in [0.0, 0.3, 0.5, 1.0]:
         with tempfile.TemporaryDirectory() as td:
             vr, dp = pathlib.Path(td)/"cortex-memory", pathlib.Path(td)/"state"/"cortex-index.db"
-            dp.parent.mkdir(parents=True, exist_ok=True); create_db(vr, dp)
+            dp.parent.mkdir(parents=True, exist_ok=True)
+            create_db(vr, dp)
             r = run_eval(vr, dp, eb)
             print(f"\nedge_boost={eb}")
             print(f"  Plain:  P@3={r['plain']['precision@3']:.3f} R@3={r['plain']['recall@3']:.3f} "
