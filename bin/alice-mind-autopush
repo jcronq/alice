@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 # Auto-commit + push for alice-mind. Intended to run from a systemd timer.
 # No-op if there's nothing to commit.
+#
+# Hook integration (2026-05-20): the alice-mind repo now ships a pre-commit
+# hook that lints markdown frontmatter. If the hook fails we must NOT
+# silently --no-verify (defeats the purpose) and must NOT stash the broken
+# file (could lose work). Instead we capture the lint output, append a JSONL
+# record to inner/state/auto-commit-failures.jsonl, and leave the working
+# tree untouched. The next manual `git commit` will catch the lint error
+# and Jason can fix it interactively.
 
 set -euo pipefail
 
 REPO="${REPO:-$HOME/alice-mind}"
 cd "$REPO"
+
+FAILURE_LOG="$REPO/inner/state/auto-commit-failures.jsonl"
 
 # Quick no-op check: nothing staged, nothing unstaged, nothing untracked.
 if git diff --quiet \
@@ -31,5 +41,33 @@ fi
 count=$(git diff --cached --name-only | wc -l)
 msg="auto: $(date -Iseconds) — ${count} file(s)"
 
-git commit -m "$msg"
-git push
+# Capture commit output (and exit code) so we can route lint failures to a
+# visible log instead of silently swallowing them. The hook runs as part of
+# `git commit` and prints diagnostics to stderr; we tee both streams into a
+# variable for the JSONL record.
+commit_output=$(git commit -m "$msg" 2>&1) && commit_rc=0 || commit_rc=$?
+
+if [[ $commit_rc -eq 0 ]]; then
+    git push
+    exit 0
+fi
+
+# Commit failed. The most common failure is the pre-commit lint hook
+# rejecting bad frontmatter. Unstage so the working-tree state is exactly
+# what it was before this run (the broken file stays on disk for Jason to
+# fix), then record the failure to a visible JSONL log.
+git reset --mixed HEAD >/dev/null 2>&1 || true
+
+mkdir -p "$(dirname "$FAILURE_LOG")"
+# Stage list might not exist post-reset; capture staged-before-reset by
+# re-running diff against HEAD (working tree still has the changes).
+staged_files=$(git diff --name-only HEAD | tr '\n' ',' | sed 's/,$//')
+# JSON-escape the commit output for safe embedding.
+escaped=$(printf '%s' "$commit_output" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+timestamp=$(date -Iseconds)
+printf '{"timestamp":"%s","exit_code":%d,"files":"%s","output":%s}\n' \
+    "$timestamp" "$commit_rc" "$staged_files" "$escaped" >> "$FAILURE_LOG"
+
+echo "auto-push: commit failed (rc=$commit_rc) — see $FAILURE_LOG" >&2
+echo "auto-push: working tree left intact; next manual commit will hit the same error." >&2
+exit "$commit_rc"

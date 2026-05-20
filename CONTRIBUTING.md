@@ -3,19 +3,30 @@
 Thanks for your interest in alice. **The project is not currently accepting
 external contributions.**
 
-## After cloning — wire the pre-push secret scanner
+## After cloning — wire the hooks
 
-This repo ships a pre-push hook at `.githooks/pre-push` that scans pushes
-for known secret patterns (Anthropic / GitHub / Slack / AWS keys, etc.).
+This repo ships two tracked git hooks under `.githooks/`:
+
+- `pre-commit` — lints staged markdown files for valid YAML frontmatter
+  (see `scripts/lint_markdown.py`). Catches the kind of bug that landed
+  in alice-mind on 2026-05-20 (unquoted multi-word value with embedded
+  colons → unparseable frontmatter → broken render on GitHub).
+- `pre-push` — scans pushes for known secret patterns (Anthropic / GitHub
+  / Slack / AWS keys, etc.).
+
 Git won't auto-enable hooks from a tracked path (security feature), so
 each clone has to opt in:
 
 ```bash
-git config core.hooksPath .githooks
+./scripts/install-hooks.sh
 ```
 
-Run it once after cloning. It's cheap insurance against pasting a key
-into a commit by accident.
+That runs `git config core.hooksPath .githooks` and makes the hooks
+executable. Idempotent — safe to re-run.
+
+The markdown lint is best-effort layered: PyYAML's `safe_load` is the
+must-have check; `markdownlint-cli2` is invoked if installed (`npm i -g
+markdownlint-cli2`), otherwise skipped with a one-line note.
 
 ## What helps right now
 

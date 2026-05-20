@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Pre-commit: lint staged markdown files for YAML-frontmatter validity.
+#
+# Motivated by alice-mind commit 4f180ad (2026-05-20), where an unquoted
+# multi-word value containing colons slipped through into master because
+# nothing parsed the frontmatter at commit time.
+#
+# Companion: scripts/lint_markdown.py. The hook only fans staged paths in;
+# the Python script does the actual checking and prints diagnostics.
+
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+
+# Collect staged markdown files (Added / Copied / Modified / Renamed).
+staged=$(git diff --cached --name-only --diff-filter=ACMR \
+    | grep -E '\.(md|markdown)$' || true)
+
+if [[ -z "$staged" ]]; then
+    exit 0
+fi
+
+# Pipe paths into the linter on stdin (handles spaces / large lists cleanly).
+printf "%s\n" "$staged" | python3 "$repo_root/scripts/lint_markdown.py"
