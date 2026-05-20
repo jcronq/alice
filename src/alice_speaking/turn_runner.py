@@ -60,7 +60,7 @@ from .pipeline.handlers import (
     SessionHandler,
     TurnLifecycleHandler,
 )
-from .retrieval import build_cue_packet
+from .retrieval import CueContext, build_cue_context
 from .transports import ChannelRef
 
 
@@ -160,6 +160,19 @@ class TurnRunner:
         self._hooks = hooks
         self.session_id: Optional[str] = None
         self._pending_preamble: Optional[str] = None
+        # Most recent cue-runner packet (verbatim text injected at the
+        # top of the turn's prompt). Reset to ``None`` at the start of
+        # each non-silent turn and set after :meth:`_build_cue_packet`
+        # returns a non-empty packet. ``_dispatch`` reads this to attach
+        # the vault context to the turn_log entry. Stays ``None`` for
+        # silent turns and for turns the cue runner skipped.
+        self.last_vault_context: Optional[str] = None
+        # Structured form of the same retrieval: one dict per candidate
+        # that made the final top-N cut, with ``slug`` / ``title`` /
+        # ``score`` / ``matched_lines`` / ``why_relevant``. ``_dispatch``
+        # persists this alongside ``last_vault_context`` so the per-turn
+        # log captures *what* was retrieved, not just the rendered text.
+        self.last_vault_candidates: Optional[list[dict]] = None
 
     # ------------------------------------------------------------------
     # Bootstrap preamble (Layer 2)
@@ -220,18 +233,19 @@ class TurnRunner:
     # ------------------------------------------------------------------
     # Cue runner (pre-turn vault retrieval)
 
-    async def _build_cue_packet(self, query: str) -> str:
-        """Query ``cortex-index.db`` and return a vault-context preamble.
+    async def _build_cue_packet(self, query: str) -> CueContext:
+        """Query ``cortex-index.db`` and return a vault-context bundle.
 
-        Always returns a string (possibly empty). Failure must NEVER
-        break the turn — :func:`build_cue_packet` enforces this with
-        a top-level try/except. The check here keeps the gating
-        cheap for the common ``cue_runner.enabled = False`` path.
+        Always returns a :class:`CueContext` (possibly empty). Failure
+        must NEVER break the turn — :func:`build_cue_context` enforces
+        this with a top-level try/except. The check here keeps the
+        gating cheap for the common ``cue_runner.enabled = False``
+        path.
         """
         cue_cfg = self._cfg.speaking.get("cue_runner", {})
         if not cue_cfg.get("enabled", False):
-            return ""
-        return await build_cue_packet(
+            return CueContext(text="", candidates=[])
+        return await build_cue_context(
             query,
             cue_cfg,
             vault_root=(
@@ -352,11 +366,15 @@ class TurnRunner:
         # (bootstrap / compaction) skip the cue runner — there's no
         # user query to retrieve against, and the DB lookup would be
         # noise on the hot internal-turn path.
+        self.last_vault_context = None
+        self.last_vault_candidates = None
         if not silent:
-            cue_packet = await self._build_cue_packet(prompt)
-            if cue_packet:
+            cue_ctx = await self._build_cue_packet(prompt)
+            if cue_ctx.text:
+                self.last_vault_context = cue_ctx.text
+                self.last_vault_candidates = cue_ctx.candidates or None
                 self._pending_preamble = (
-                    cue_packet + "\n\n" + (self._pending_preamble or "")
+                    cue_ctx.text + "\n\n" + (self._pending_preamble or "")
                 )
         final_prompt = self.compose_prompt(prompt)
         spec = self._build_spec()

@@ -27,6 +27,24 @@ from .domain.turn_log import new_turn
 from .pipeline.quiet_hours import is_quiet_hours
 from .transports import ChannelRef, DaemonContext, OutboundMessage
 
+
+def _vault_snapshot(ctx: DaemonContext) -> tuple[Optional[str], Optional[list[dict]]]:
+    """Read the last cue-runner result off the turn runner so it can be
+    attached to the next ``new_turn(...)`` entry.
+
+    ``getattr`` defensively in case the runner shape varies in tests or
+    during a partial refactor; ``last_vault_context``/
+    ``last_vault_candidates`` are the canonical attributes set by
+    :class:`alice_speaking.turn_runner.TurnRunner`.
+    """
+    runner = getattr(ctx, "turn_runner", None)
+    if runner is None:
+        return None, None
+    return (
+        getattr(runner, "last_vault_context", None),
+        getattr(runner, "last_vault_candidates", None),
+    )
+
 if TYPE_CHECKING:
     from .daemon import (
         A2AEvent,
@@ -187,14 +205,21 @@ async def handle_signal(ctx: DaemonContext, batch: list["SignalEvent"]) -> None:
         # in the batch carries the outbound text — earlier envelopes
         # get None so render_for_prompt() doesn't emit duplicate
         # `[alice]` lines for what was a single reply.
+        vault_context, vault_candidates = _vault_snapshot(ctx)
         for i, ev in enumerate(batch):
+            is_last = i == len(batch) - 1
             ctx.turns.append(
                 new_turn(
                     sender_number=ev.envelope.source,
                     sender_name=sender_name,
                     inbound=ev.envelope.body,
-                    outbound=(ctx._turn_last_outbound if i == len(batch) - 1 else None),
+                    outbound=(ctx._turn_last_outbound if is_last else None),
                     error=error,
+                    # Only the last envelope drove the actual SDK turn,
+                    # so only it carries the vault retrieval that fed
+                    # the prompt; earlier envelopes get None.
+                    vault_context=vault_context if is_last else None,
+                    vault_candidates=vault_candidates if is_last else None,
                 )
             )
         ctx.events.emit(
@@ -279,6 +304,7 @@ async def handle_cli(ctx: DaemonContext, event: "CLIEvent") -> None:
         ctx._current_turn_kind = prev_kind
         ctx._current_reply_channel = prev_channel
         ctx._current_principal_display_name = prev_display_name
+        vault_context, vault_candidates = _vault_snapshot(ctx)
         ctx.turns.append(
             new_turn(
                 sender_number=msg.principal.native_id,
@@ -286,6 +312,8 @@ async def handle_cli(ctx: DaemonContext, event: "CLIEvent") -> None:
                 inbound=msg.text,
                 outbound=ctx._turn_last_outbound,
                 error=error,
+                vault_context=vault_context,
+                vault_candidates=vault_candidates,
             )
         )
         ctx.events.emit(
@@ -358,6 +386,7 @@ async def handle_discord(ctx: DaemonContext, event: "DiscordEvent") -> None:
         ctx._current_turn_kind = prev_kind
         ctx._current_reply_channel = prev_channel
         ctx._current_principal_display_name = prev_display_name
+        vault_context, vault_candidates = _vault_snapshot(ctx)
         ctx.turns.append(
             new_turn(
                 sender_number=msg.principal.native_id,
@@ -365,6 +394,8 @@ async def handle_discord(ctx: DaemonContext, event: "DiscordEvent") -> None:
                 inbound=msg.text,
                 outbound=ctx._turn_last_outbound,
                 error=error,
+                vault_context=vault_context,
+                vault_candidates=vault_candidates,
             )
         )
         ctx.events.emit(
@@ -454,6 +485,7 @@ async def handle_viewer_chat(ctx: DaemonContext, event: "ViewerChatEvent") -> No
         ctx._current_turn_kind = prev_kind
         ctx._current_reply_channel = prev_channel
         ctx._current_principal_display_name = prev_display_name
+        vault_context, vault_candidates = _vault_snapshot(ctx)
         ctx.turns.append(
             new_turn(
                 sender_number=msg.principal.native_id,
@@ -461,6 +493,8 @@ async def handle_viewer_chat(ctx: DaemonContext, event: "ViewerChatEvent") -> No
                 inbound=msg.text,
                 outbound=ctx._turn_last_outbound,
                 error=error,
+                vault_context=vault_context,
+                vault_candidates=vault_candidates,
             )
         )
         ctx.events.emit(
@@ -534,6 +568,7 @@ async def handle_a2a(ctx: DaemonContext, event: "A2AEvent") -> None:
         ctx._current_turn_kind = prev_kind
         ctx._current_reply_channel = prev_channel
         ctx._current_principal_display_name = prev_display_name
+        vault_context, vault_candidates = _vault_snapshot(ctx)
         ctx.turns.append(
             new_turn(
                 sender_number=msg.principal.native_id,
@@ -541,6 +576,8 @@ async def handle_a2a(ctx: DaemonContext, event: "A2AEvent") -> None:
                 inbound=msg.text,
                 outbound=ctx._turn_last_outbound,
                 error=error,
+                vault_context=vault_context,
+                vault_candidates=vault_candidates,
             )
         )
         ctx.events.emit(

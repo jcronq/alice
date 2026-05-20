@@ -11,7 +11,7 @@ import json
 import pathlib
 import time
 from dataclasses import asdict, dataclass
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 
 @dataclass
@@ -22,6 +22,17 @@ class Turn:
     inbound: str
     outbound: Optional[str]  # None when we didn't reply (error, empty, skipped)
     error: Optional[str] = None
+    # Cue-runner retrieval that was injected at the top of this turn's
+    # prompt, captured so the per-turn log shows *what* the vault
+    # surfaced. ``vault_context`` is the verbatim "VAULT CONTEXT" block
+    # (rendered text). ``vault_candidates`` is the structured form —
+    # one dict per top-N candidate with ``slug``/``title``/``score``/
+    # ``matched_lines``/``why_relevant``. Both ``None`` for silent
+    # turns, cue-runner-disabled turns, and turns that returned no
+    # matches. Older log lines without these fields still parse cleanly
+    # via the defaults.
+    vault_context: Optional[str] = None
+    vault_candidates: Optional[list[dict[str, Any]]] = None
 
 
 class TurnLog:
@@ -40,6 +51,7 @@ class TurnLog:
             return []
         lines = self.path.read_text().splitlines()[-n:]
         out: list[Turn] = []
+        known = {f.name for f in Turn.__dataclass_fields__.values()}
         for raw in lines:
             raw = raw.strip()
             if not raw:
@@ -48,7 +60,13 @@ class TurnLog:
                 obj = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            out.append(Turn(**obj))
+            # Drop unknown keys so future field additions don't break
+            # the reader; missing keys fall back to dataclass defaults.
+            filtered = {k: v for k, v in obj.items() if k in known}
+            try:
+                out.append(Turn(**filtered))
+            except TypeError:
+                continue
         return out
 
 
@@ -58,6 +76,8 @@ def new_turn(
     inbound: str,
     outbound: Optional[str] = None,
     error: Optional[str] = None,
+    vault_context: Optional[str] = None,
+    vault_candidates: Optional[list[dict[str, Any]]] = None,
 ) -> Turn:
     return Turn(
         ts=time.time(),
@@ -66,6 +86,8 @@ def new_turn(
         inbound=inbound,
         outbound=outbound,
         error=error,
+        vault_context=vault_context,
+        vault_candidates=vault_candidates,
     )
 
 

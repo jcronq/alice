@@ -935,16 +935,49 @@ def _format_packet(candidates: list[_Candidate], packet_token_ceiling: int) -> s
 # Public entry point
 
 
-async def build_cue_packet(
+@dataclass
+class CueContext:
+    """Result of a cue-runner build.
+
+    ``text`` is the rendered prompt-prefix block (or ``""`` when the
+    cue runner short-circuits). ``candidates`` is a list of JSON-safe
+    dicts (``slug``, ``title``, ``score``, ``matched_lines``,
+    ``why_relevant``) — one per note that made the final top-N cut.
+    Empty list when ``text`` is empty.
+    """
+
+    text: str
+    candidates: list[dict[str, Any]]
+
+
+def _candidate_to_log_dict(c: _Candidate) -> dict[str, Any]:
+    """Project a ``_Candidate`` down to JSON-safe fields suitable for
+    persistence in the per-turn log. ``matched_lines`` is already a
+    list of ``{"n": int, "text": str}`` dicts so it passes through.
+    """
+    return {
+        "slug": c.slug,
+        "title": c.title,
+        "score": c.final_score,
+        "matched_lines": c.matched_lines,
+        "why_relevant": c.why_relevant,
+    }
+
+
+_EMPTY_CUE_CONTEXT = CueContext(text="", candidates=[])
+
+
+async def build_cue_context(
     query: str,
     cfg: dict[str, Any],
     *,
     db_path: pathlib.Path | None = None,
     vault_root: pathlib.Path | None = None,
     context_slugs: Iterable[str] = (),
-) -> str:
-    """Return a vault-context preamble for ``query`` or ``""`` on any
-    error.
+) -> CueContext:
+    """Return a ``CueContext`` for ``query`` (rendered packet + the
+    structured candidate list that fed it), or an empty context on
+    any error.
 
     The cue runner sits in the hot path of every Speaking turn — an
     uncaught exception here is a Speaking-down event. Every code path
@@ -972,17 +1005,17 @@ async def build_cue_packet(
     """
     try:
         if not cfg.get("enabled", False):
-            return ""
+            return _EMPTY_CUE_CONTEXT
 
         tokens = _tokenize_query(query)
         if not tokens:
-            return ""
+            return _EMPTY_CUE_CONTEXT
 
         resolved_db = _resolve_db_path(cfg, db_path)
         resolved_vault = _resolve_vault_root(vault_root)
         if not resolved_db.exists():
             log.debug("cue_runner: db_path %s does not exist", resolved_db)
-            return ""
+            return _EMPTY_CUE_CONTEXT
 
         timeout_s = cfg.get("timeout_ms", _DEFAULT_TIMEOUT_MS) / 1000.0
         line_cap = int(cfg.get("per_note_line_cap", _DEFAULT_LINE_CAP))
@@ -999,7 +1032,7 @@ async def build_cue_packet(
             )
         except asyncio.TimeoutError:
             log.debug("cue_runner: FTS query timed out (%.0fms)", timeout_s * 1000)
-            return ""
+            return _EMPTY_CUE_CONTEXT
 
         # Pull access_count from note_metrics for the recency boost.
         # Off-thread because it opens a fresh sqlite connection. Missing
@@ -1148,7 +1181,7 @@ async def build_cue_packet(
             )
 
         if not candidates:
-            return ""
+            return _EMPTY_CUE_CONTEXT
 
         # Sort by boosted score (descending).
         candidates.sort(key=lambda c: c.final_score, reverse=True)
@@ -1163,7 +1196,7 @@ async def build_cue_packet(
         final = candidates[:top_n]
         packet = _format_packet(final, packet_ceiling)
         if not packet:
-            return ""
+            return _EMPTY_CUE_CONTEXT
 
         # Fire-and-forget access_count bumps. Don't await — the bumps
         # don't block the turn. Wrap each in a logged background task
@@ -1176,10 +1209,37 @@ async def build_cue_packet(
             if c.path:
                 _spawn_bump(resolved_vault, c.path, db_path=resolved_db, slug=c.slug)
 
-        return packet
+        return CueContext(
+            text=packet,
+            candidates=[_candidate_to_log_dict(c) for c in final],
+        )
     except Exception:  # noqa: BLE001
         log.exception("cue_runner: unexpected error; returning empty packet")
-        return ""
+        return _EMPTY_CUE_CONTEXT
+
+
+async def build_cue_packet(
+    query: str,
+    cfg: dict[str, Any],
+    *,
+    db_path: pathlib.Path | None = None,
+    vault_root: pathlib.Path | None = None,
+    context_slugs: Iterable[str] = (),
+) -> str:
+    """Backwards-compatible wrapper around :func:`build_cue_context`.
+
+    Returns only the rendered packet text. Callers that need the
+    structured candidate list (e.g. the per-turn log) should call
+    :func:`build_cue_context` directly.
+    """
+    ctx = await build_cue_context(
+        query,
+        cfg,
+        db_path=db_path,
+        vault_root=vault_root,
+        context_slugs=context_slugs,
+    )
+    return ctx.text
 
 
 # ---------------------------------------------------------------------------
@@ -1236,6 +1296,8 @@ def _log_bump_failure(task: "asyncio.Task[Any]") -> None:
 
 
 __all__ = [
+    "CueContext",
+    "build_cue_context",
     "build_cue_packet",
     "classify_note",
     "extract_matched_lines",

@@ -11,7 +11,7 @@ Public entry point:
   on any failure (cue runner failure must never break a turn).
 """
 
-from .cue_runner import build_cue_packet
+from .cue_runner import CueContext, build_cue_context, build_cue_packet
 
 
-__all__ = ["build_cue_packet"]
+__all__ = ["CueContext", "build_cue_context", "build_cue_packet"]
