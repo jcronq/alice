@@ -14,7 +14,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # ─── Config ───────────────────────────────────────────────────────────
@@ -162,6 +162,84 @@ def is_deferred(repo: str, number: int) -> bool:
     return bool(s and s.get("type") == "deferred")
 
 
+def write_dispatched_inflight(
+    repo: str,
+    number: int,
+    worker_id: str,
+    title: str = "",
+) -> Path:
+    """Write a ``type: dispatched-in-flight`` gh-state note.
+
+    Used by Speaking at worker-spawn time to close the dispatcher race
+    window described in [[2026-05-19-dispatch-race-gap]]: when a worker
+    has been spawned but hasn't yet pushed a branch / opened a PR, the
+    issue has no GitHub-visible trace, so Thinking's dispatcher scan
+    would otherwise produce a duplicate ``attempt-issue-fix`` surface.
+    Thinking reads this state via :func:`is_dispatched_inflight` and
+    skips writing a dispatch surface for in-flight work.
+
+    The record is ephemeral. Two cleanup paths cover the lifecycle:
+
+    * **Normal path** — when the worker pushes a branch and opens a PR,
+      the next cron pass overwrites the dispatched-inflight note with a
+      ``type: pr`` note. No explicit teardown needed.
+    * **Stuck-worker path** — if the worker crashes or hangs and never
+      opens a PR, the cleanup pass in :func:`main` removes any
+      dispatched-inflight note whose ``created`` timestamp is older than
+      :data:`DISPATCHED_INFLIGHT_TIMEOUT_HOURS` (4h by default), letting
+      the dispatcher re-process the issue on the next cycle.
+
+    Args:
+        repo: ``"owner/name"`` slug, matching the gh CLI form.
+        number: issue number.
+        worker_id: the subagent / worker identifier that Speaking
+            spawned. Gives Speaking attribution in the audit trail.
+        title: optional issue title; included verbatim in the
+            frontmatter and heading when provided.
+
+    Returns:
+        The path to the written note.
+    """
+    note_path = GH_STATE_DIR / f"{repo}-{number}.md"
+    now = datetime.now(timezone.utc).isoformat()
+    title_text = (title or "").strip()
+    title_heading = f"{repo}#{number} — {title_text}" if title_text else f"{repo}#{number}"
+    content = (
+        f'---\n'
+        f'slug: gh-state-{repo}-{number}\n'
+        f'title: {title_heading}\n'
+        f'tags: [gh-state]\n'
+        f'note_type: gh-state\n'
+        f'repo: {repo}\n'
+        f'number: {number}\n'
+        f'type: dispatched-in-flight\n'
+        f'issue_number: {number}\n'
+        f'worker_id: {worker_id}\n'
+        f'created: "{now}"\n'
+        f'updated: "{now}"\n'
+        f'---\n\n'
+        f'# {title_heading}\n\n'
+        f'Dispatched-in-flight. Worker `{worker_id}`. Created {now}.\n'
+    )
+    _atomic_write(note_path, content)
+    return note_path
+
+
+def is_dispatched_inflight(repo: str, number: int) -> bool:
+    """Return True iff a gh-state note marks this issue as ``type: dispatched-in-flight``."""
+    s = read_state(repo, number)
+    return bool(s and s.get("type") == "dispatched-in-flight")
+
+
+# Timeout (hours) for ``type: dispatched-in-flight`` notes. After this
+# window the cleanup pass in :func:`main` removes the note so the
+# dispatcher can re-process the issue. The race window the record exists
+# to close is seconds-to-minutes; 4h is generous for any legitimate
+# long-running worker without leaving a permanent suppression on a
+# crashed dispatch.
+DISPATCHED_INFLIGHT_TIMEOUT_HOURS = 4
+
+
 def write_note_atomic(repo: str, number: int, item: dict) -> None:
     """Write or update a thin state note. Uses temp-file + rename for atomicity."""
     note_path = GH_STATE_DIR / f"{repo}-{number}.md"
@@ -268,6 +346,62 @@ def main() -> None:
                 created += 1
             write_note_atomic(repo, number, {**pr, "_type": "pr"})
 
+        # ── Dispatched-in-flight timeout cleanup ──────────────────────
+        # Ephemeral records written by Speaking at worker-spawn time
+        # (see :func:`write_dispatched_inflight`). If a worker is stuck
+        # and never opens a PR, the record should expire so the
+        # dispatcher can re-process the issue. Timeout:
+        # :data:`DISPATCHED_INFLIGHT_TIMEOUT_HOURS` from ``created``.
+        #
+        # Runs BEFORE the deferred/dispatched-in-flight preservation
+        # check below so surviving notes still get preserved on this
+        # pass but stale ones are dropped. See
+        # [[2026-05-19-dispatched-inflight-write-path]].
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(
+                hours=DISPATCHED_INFLIGHT_TIMEOUT_HOURS
+            )
+            for note_path in list(GH_STATE_DIR.glob(f"{repo}-*.md")):
+                if not note_path.exists():
+                    continue
+                try:
+                    content = note_path.read_text()
+                except FileNotFoundError:
+                    continue
+                if "type: dispatched-in-flight" not in content:
+                    continue
+                # Parse the `created` field from frontmatter.
+                # Format: created: "2026-05-19T20:10:00+00:00"
+                for line in content.splitlines():
+                    if line.strip().startswith("created:"):
+                        created_str = line.partition(":")[2].strip().strip('"')
+                        try:
+                            created = datetime.fromisoformat(created_str)
+                        except ValueError:
+                            # Malformed timestamp — treat as expired so the
+                            # record doesn't wedge the dispatcher forever.
+                            _log(
+                                f"[{_ts()}] Removing malformed dispatched-inflight: "
+                                f"{note_path} (created={created_str!r})\n"
+                            )
+                            note_path.unlink()
+                            removed += 1
+                            break
+                        if created < cutoff:
+                            _log(
+                                f"[{_ts()}] Removing stale dispatched-inflight: "
+                                f"{note_path} (created {created_str}, "
+                                f"timeout {DISPATCHED_INFLIGHT_TIMEOUT_HOURS}h)\n"
+                            )
+                            note_path.unlink()
+                            removed += 1
+                        break
+        except Exception as e:
+            _log(
+                f"[{_ts()}] ERROR during dispatched-inflight cleanup for {repo}: {e}\n"
+            )
+            errors += 1
+
         # Cleanup: remove notes for closed issues/PRs
         # Strategy: check what's currently open via API, compare to what's on disk.
         # This is cheaper than calling `gh issue/PR view` per file.
@@ -276,7 +410,7 @@ def main() -> None:
             open_issues = {i["number"] for i in issues}
             open_prs = {p["number"] for p in prs}
 
-            for note_path in GH_STATE_DIR.glob(f"{repo}-*.md"):
+            for note_path in list(GH_STATE_DIR.glob(f"{repo}-*.md")):
                 if not note_path.exists():
                     continue
                 stem = note_path.stem  # e.g. "cozyhem-engine-227"
@@ -299,14 +433,17 @@ def main() -> None:
                 except FileNotFoundError:
                     continue
 
-                # Deferred notes are written by Speaking/Thinking, not by
-                # this script. They have no GitHub-side counterpart, so the
-                # open-issues/open-PRs comparison below would always treat
-                # them as stale. Preserve them unconditionally — the only
-                # way to clear a deferred state is an explicit lift by
-                # whoever set the hold. See research note
-                # [[2026-05-19-stale-cycle-dispatcher-gap]].
-                if "type: deferred" in content:
+                # Deferred and dispatched-in-flight notes are written by
+                # Speaking/Thinking, not by this script. They have no
+                # GitHub-side counterpart, so the open-issues/open-PRs
+                # comparison below would always treat them as stale.
+                # Preserve them unconditionally — the only way to clear a
+                # deferred state is an explicit lift; dispatched-in-flight
+                # is cleared by the timeout pass above (or overwritten by
+                # the next mirror cycle once the worker pushes a PR). See
+                # [[2026-05-19-stale-cycle-dispatcher-gap]] and
+                # [[2026-05-19-dispatched-inflight-write-path]].
+                if "type: deferred" in content or "type: dispatched-in-flight" in content:
                     continue
 
                 if "type: issue" in content:

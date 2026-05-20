@@ -4,10 +4,16 @@ These are the regression tests for #253: the dispatcher kept re-surfacing
 issues that Speaking had already deferred because there was no write or
 read path for ``type: deferred`` and the cleanup loop would have killed
 manually-created ones. The tests below pin all three fixes.
+
+The ``dispatched-in-flight`` tests pin the equivalent write/read/cleanup
+contract introduced by [[2026-05-19-dispatched-inflight-write-path]] —
+Speaking writes a record at worker-spawn time so Thinking's dispatcher
+can skip the race window before a branch / PR exists.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -251,3 +257,205 @@ def test_dispatcher_proceeds_when_only_open_issue_state(gh_state_dir: Path) -> N
         },
     )
     assert gh_state_mirror.is_deferred("jcronq/alice", 300) is False
+
+
+# ─── write_dispatched_inflight ────────────────────────────────────────
+
+
+def test_write_dispatched_inflight_produces_correct_frontmatter(
+    gh_state_dir: Path,
+) -> None:
+    path = gh_state_mirror.write_dispatched_inflight(
+        "jcronq/alice",
+        260,
+        worker_id="bg-bdd502eaf9ef",
+        title="CozyHemEventSubscriber",
+    )
+    assert path.exists()
+    text = path.read_text()
+    assert text.startswith("---\n")
+    assert "type: dispatched-in-flight\n" in text
+    assert "issue_number: 260\n" in text
+    assert "repo: jcronq/alice\n" in text
+    assert "worker_id: bg-bdd502eaf9ef\n" in text
+    assert "created:" in text
+    assert "updated:" in text
+    assert "slug: gh-state-jcronq/alice-260\n" in text
+    assert "tags: [gh-state]\n" in text
+    assert "note_type: gh-state\n" in text
+    assert "# jcronq/alice#260 — CozyHemEventSubscriber\n" in text
+    assert "Dispatched-in-flight. Worker `bg-bdd502eaf9ef`." in text
+
+
+def test_write_dispatched_inflight_without_title_omits_title_suffix(
+    gh_state_dir: Path,
+) -> None:
+    path = gh_state_mirror.write_dispatched_inflight(
+        "jcronq/alice", 99, worker_id="bg-test"
+    )
+    text = path.read_text()
+    assert "title: jcronq/alice#99\n" in text
+    assert "# jcronq/alice#99\n" in text
+
+
+def test_write_dispatched_inflight_is_idempotent_overwrite(gh_state_dir: Path) -> None:
+    """Writing twice updates the file in place — no orphan tempfiles left."""
+    gh_state_mirror.write_dispatched_inflight("jcronq/alice", 260, "bg-first")
+    gh_state_mirror.write_dispatched_inflight("jcronq/alice", 260, "bg-second")
+    note = gh_state_dir / "jcronq/alice-260.md"
+    assert note.exists()
+    text = note.read_text()
+    assert "worker_id: bg-second\n" in text
+    assert "worker_id: bg-first\n" not in text
+    leftovers = [p for p in gh_state_dir.iterdir() if p.suffix == ".tmp"]
+    assert leftovers == []
+
+
+# ─── is_dispatched_inflight ───────────────────────────────────────────
+
+
+def test_is_dispatched_inflight_returns_false_when_missing(gh_state_dir: Path) -> None:
+    assert gh_state_mirror.is_dispatched_inflight("jcronq/alice", 999) is False
+
+
+def test_is_dispatched_inflight_true_after_write(gh_state_dir: Path) -> None:
+    gh_state_mirror.write_dispatched_inflight("jcronq/alice", 260, "bg-x", "title")
+    assert gh_state_mirror.is_dispatched_inflight("jcronq/alice", 260) is True
+
+
+def test_is_dispatched_inflight_false_for_deferred_note(gh_state_dir: Path) -> None:
+    gh_state_mirror.write_deferred("jcronq/alice", 247, "blocked", "speaking")
+    assert gh_state_mirror.is_dispatched_inflight("jcronq/alice", 247) is False
+    assert gh_state_mirror.is_deferred("jcronq/alice", 247) is True
+
+
+def test_is_dispatched_inflight_false_for_open_issue_note(gh_state_dir: Path) -> None:
+    gh_state_mirror.write_note_atomic(
+        "jcronq/alice",
+        300,
+        {
+            "_type": "issue",
+            "state": "open",
+            "title": "fresh",
+            "createdAt": "2026-05-19T00:00:00Z",
+            "updatedAt": "2026-05-19T00:00:00Z",
+        },
+    )
+    assert gh_state_mirror.is_dispatched_inflight("jcronq/alice", 300) is False
+
+
+# ─── cleanup: dispatched-in-flight timeout + preservation ─────────────
+
+
+def _write_dispatched_inflight_with_created(
+    gh_state_dir: Path, repo: str, number: int, worker_id: str, created: datetime
+) -> Path:
+    """Helper: write a dispatched-inflight note with an explicit ``created``
+    timestamp so cleanup-pass timeout tests can plant aged records."""
+    note_path = gh_state_dir / f"{repo}-{number}.md"
+    note_path.parent.mkdir(parents=True, exist_ok=True)
+    created_iso = created.isoformat()
+    note_path.write_text(
+        "---\n"
+        f"slug: gh-state-{repo}-{number}\n"
+        f"title: {repo}#{number}\n"
+        "tags: [gh-state]\n"
+        "note_type: gh-state\n"
+        f"repo: {repo}\n"
+        f"number: {number}\n"
+        "type: dispatched-in-flight\n"
+        f"issue_number: {number}\n"
+        f"worker_id: {worker_id}\n"
+        f'created: "{created_iso}"\n'
+        f'updated: "{created_iso}"\n'
+        "---\n\n"
+        f"# {repo}#{number}\n\n"
+        f"Dispatched-in-flight. Worker `{worker_id}`.\n"
+    )
+    return note_path
+
+
+def test_cleanup_removes_stale_dispatched_inflight(
+    gh_state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dispatched-inflight note older than the timeout window must be removed."""
+    stale = _write_dispatched_inflight_with_created(
+        gh_state_dir,
+        "jcronq/alice",
+        260,
+        "bg-stuck",
+        created=datetime.now(timezone.utc)
+        - timedelta(hours=gh_state_mirror.DISPATCHED_INFLIGHT_TIMEOUT_HOURS + 1),
+    )
+    assert stale.exists()
+
+    monkeypatch.setattr(gh_state_mirror, "REPOS", ["jcronq/alice"])
+    monkeypatch.setattr(gh_state_mirror, "gh", _fake_gh_list_empty)
+
+    gh_state_mirror.main()
+
+    assert not stale.exists()
+
+
+def test_cleanup_preserves_fresh_dispatched_inflight(
+    gh_state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recent dispatched-inflight note must survive both the timeout
+    pass and the open-issues comparison (no GitHub-side counterpart)."""
+    fresh = _write_dispatched_inflight_with_created(
+        gh_state_dir,
+        "jcronq/alice",
+        260,
+        "bg-inflight",
+        created=datetime.now(timezone.utc) - timedelta(minutes=5),
+    )
+    assert fresh.exists()
+
+    monkeypatch.setattr(gh_state_mirror, "REPOS", ["jcronq/alice"])
+    monkeypatch.setattr(gh_state_mirror, "gh", _fake_gh_list_empty)
+
+    gh_state_mirror.main()
+
+    assert fresh.exists()
+    text = fresh.read_text()
+    assert "type: dispatched-in-flight\n" in text
+    assert "worker_id: bg-inflight\n" in text
+
+
+def test_cleanup_removes_malformed_created_timestamp(
+    gh_state_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dispatched-inflight note with an unparseable ``created`` field is
+    treated as expired — otherwise a malformed timestamp would wedge the
+    dispatcher forever."""
+    note = gh_state_dir / "jcronq/alice-260.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text(
+        "---\n"
+        "slug: gh-state-jcronq/alice-260\n"
+        "type: dispatched-in-flight\n"
+        "issue_number: 260\n"
+        "worker_id: bg-broken\n"
+        'created: "not-a-real-timestamp"\n'
+        "---\n\n"
+        "# jcronq/alice#260\n"
+    )
+
+    monkeypatch.setattr(gh_state_mirror, "REPOS", ["jcronq/alice"])
+    monkeypatch.setattr(gh_state_mirror, "gh", _fake_gh_list_empty)
+
+    gh_state_mirror.main()
+
+    assert not note.exists()
+
+
+def test_dispatcher_read_path_skip_when_dispatched_inflight(
+    gh_state_dir: Path,
+) -> None:
+    """Models the thinking-side dispatcher's pre-surface check:
+    before writing a dispatch surface for ``<repo>#<N>``, call
+    :func:`is_dispatched_inflight`. If True, let-pass."""
+    repo, number = "jcronq/alice", 260
+    assert gh_state_mirror.is_dispatched_inflight(repo, number) is False
+    gh_state_mirror.write_dispatched_inflight(repo, number, "bg-xyz")
+    assert gh_state_mirror.is_dispatched_inflight(repo, number) is True
