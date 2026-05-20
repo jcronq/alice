@@ -52,6 +52,7 @@ from alice_core.config.auth import ensure_auth_env
 from alice_core.kernel import KernelSpec, make_kernel
 from claude_agent_sdk import HookMatcher
 from . import _dispatch as _dispatch_module
+from . import auto_fix as auto_fix_module
 from . import factory as factory_module
 from . import tools as tools_module
 from .domain import principals as principals_module
@@ -1232,6 +1233,16 @@ class SpeakingDaemon:
             channel_address=(channel.address if channel else None),
             instruction_chars=len(instructions),
         )
+
+        # Auto-fix race-window suppression: when the subagent prompt
+        # matches the auto-fix worker template, write a
+        # ``type: dispatched-in-flight`` gh-state record BEFORE the
+        # worker spawns so Thinking's dispatcher scan doesn't surface
+        # a duplicate ``attempt-issue-fix`` before the worker pushes a
+        # branch. Non-auto-fix dispatches are a no-op. See
+        # cortex-memory/research/2026-05-19-dispatched-inflight-speaking-wiring.md
+        # and PR #262 (write path).
+        auto_fix_module.record_auto_fix_inflight(instructions, handle)
 
         async def _run_subagent() -> None:
             result_text = ""
