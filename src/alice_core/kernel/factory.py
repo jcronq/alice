@@ -6,23 +6,15 @@ Agent code (turn_runner, kernel_adapter, wake) calls
 the impl lives here and ONLY here. Adding a backend means a new
 branch in :func:`make_kernel` and nothing else in agent code.
 
-PiKernel (and any future sibling-package kernel) is loaded via
-:func:`importlib.import_module` rather than a static ``from ...``
-import. Two reasons:
-
-1. **Dependency direction.** :mod:`alice_core` must not statically
-   import sibling packages — that's enforced by
-   ``tests/test_alice_core_isolation.py``. The dynamic-import
-   pattern is the idiomatic plugin-loader shape.
-2. **Optional deps.** A deployment that doesn't use pi shouldn't
-   need :mod:`alice_pi` installed. Static imports would crash at
-   ``alice_core`` import time; dynamic imports surface the missing
-   package only when the operator actually selects ``backend: pi``.
+PiKernel now lives in :mod:`alice_core.kernel.pi` (a subpackage of
+the kernel layer), so the factory imports it statically — no more
+sibling-package dynamic lookup. The dependency-direction CI guard
+(``tests/test_alice_core_isolation.py``) is happy because pi is
+inside alice_core.
 """
 
 from __future__ import annotations
 
-import importlib
 from typing import Optional
 
 from ..events import EventEmitter
@@ -30,14 +22,6 @@ from .protocol import Kernel
 
 
 __all__ = ["make_kernel"]
-
-
-# Backend name -> "module:attribute" path for sibling-package
-# kernel impls. Lookup is dynamic so alice_core stays free of
-# static sibling-package imports.
-_SIBLING_KERNELS: dict[str, str] = {
-    "pi": "alice_pi.kernel:PiKernel",
-}
 
 
 def make_kernel(
@@ -57,8 +41,7 @@ def make_kernel(
 
     Lookup:
     - ``harness="pi-mono"`` / ``backend="pi"`` →
-      :class:`alice_pi.kernel.PiKernel` via
-      :func:`importlib.import_module`.
+      :class:`alice_core.kernel.pi.PiKernel`.
     - ``"subscription"``, ``"api"``, ``"bedrock"`` →
       :class:`AnthropicKernel` (claude_agent_sdk under the hood).
     - Anything else falls through to AnthropicKernel; bad config
@@ -67,11 +50,10 @@ def make_kernel(
     """
     harness = getattr(backend, "harness", "")
     name = "pi" if harness == "pi-mono" else getattr(backend, "backend", "subscription")
-    sibling = _SIBLING_KERNELS.get(name)
-    if sibling is not None:
-        module_path, attr = sibling.split(":", 1)
-        kernel_cls = getattr(importlib.import_module(module_path), attr)
-        return kernel_cls(
+    if name == "pi":
+        from .pi import PiKernel
+
+        return PiKernel(
             emitter,
             correlation_id=correlation_id,
             silent=silent,

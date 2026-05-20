@@ -1,4 +1,4 @@
-"""End-to-end-ish tests for alice_pi.kernel.PiKernel.
+"""End-to-end-ish tests for alice_core.kernel.pi.kernel.PiKernel.
 
 Uses a tmp shell script as the ``pi`` binary that emits a recorded
 JSONL stream — exercises argv construction, JSONL parsing, event
@@ -15,7 +15,7 @@ import pytest
 from alice_core.events import CapturingEmitter
 from alice_core.kernel import KernelSpec, NullHandler, TurnSummary
 
-from alice_pi.kernel import PiKernel
+from alice_core.kernel.pi.kernel import PiKernel
 
 
 def _write_fake_pi(
@@ -278,7 +278,7 @@ def test_pi_kernel_argv_maps_send_message_mcp_tool_to_extension() -> None:
     assert argv[idx + 1] == "bash,send_message"
     assert "--extension" in argv
     ext = argv[argv.index("--extension") + 1]
-    assert ext.endswith("alice_pi/extensions/send-message.js")
+    assert ext.endswith("alice_core/kernel/pi/extensions/send-message.js")
 
 
 @pytest.mark.asyncio

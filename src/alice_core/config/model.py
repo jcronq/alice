@@ -8,7 +8,7 @@ LLM backends:
 - ``bedrock`` — AWS Bedrock via ``CLAUDE_CODE_USE_BEDROCK=1``.
 - ``pi`` — pi-coding-agent subprocess; routes to ChatGPT/Codex
   subscription via the codex→pi auth bridge. See
-  :mod:`alice_pi.kernel` and ``docs/refactor/10-pi-kernel.md``.
+  :mod:`alice_core.kernel.pi.kernel` and ``docs/refactor/10-pi-kernel.md``.
 
 Each hemisphere (speaking, thinking, viewer) picks its own backend +
 model. ``mind/config/model.yml`` is the source of truth; if missing,

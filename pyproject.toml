@@ -79,7 +79,6 @@ build-backend = "hatchling.build"
 #   alice_eval      — speaking-quality eval harness (Day-1 sample/replay/UI)
 #   alice_indexer   — vault SQLite/FTS5 indexer (CLI; cortex-memory tooling)
 #   alice_metrics   — stable vault-health metric implementations (replaces drift-prone bash)
-#   alice_pi        — Kernel impl backed by pi-coding-agent subprocess
 #   alice_prompts   — Jinja2 templates the runtime renders into model prompts
 #   alice_skills    — registry over .claude/skills/ markdown (plan 07)
 #   alice_sm        — State Machine dispatcher (poll → trust-filter → comment)
@@ -93,7 +92,6 @@ packages = [
     "src/alice_eval",
     "src/alice_indexer",
     "src/alice_metrics",
-    "src/alice_pi",
     "src/alice_prompts",
     "src/alice_skills",
     "src/alice_sm",
@@ -112,7 +110,7 @@ packages = [
 [tool.hatch.build.targets.wheel.force-include]
 "src/alice_prompts/templates" = "alice_prompts/templates"
 "src/alice_skills/defaults" = "alice_skills/defaults"
-"src/alice_pi/extensions" = "alice_pi/extensions"
+"src/alice_core/kernel/pi/extensions" = "alice_core/kernel/pi/extensions"
 "src/alice_thinking/prompts" = "alice_thinking/prompts"
 "src/alice_thinking/workflows/stage_b/prompts" = "alice_thinking/workflows/stage_b/prompts"
 

@@ -1,4 +1,4 @@
-"""alice_pi — Kernel impl backed by pi-coding-agent subprocess.
+"""alice_core.kernel.pi — Kernel impl backed by pi-coding-agent subprocess.
 
 Public API:
 

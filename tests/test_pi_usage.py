@@ -1,8 +1,8 @@
-"""Tests for alice_pi.usage.pi_usage_to_info."""
+"""Tests for alice_core.kernel.pi.usage.pi_usage_to_info."""
 
 from __future__ import annotations
 
-from alice_pi.usage import pi_usage_to_info
+from alice_core.kernel.pi.usage import pi_usage_to_info
 
 
 def test_round_trips_pi_shape_to_usage_info() -> None:

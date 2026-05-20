@@ -9,6 +9,7 @@ Public API:
   :data:`ThinkingLevel` — normalized handler-input + result types.
 - :class:`BlockHandler` Protocol + :class:`NullHandler` base class.
 - :class:`AnthropicKernel` — first impl (claude_agent_sdk-backed).
+- :class:`PiKernel` — second impl (pi-coding-agent subprocess).
 - :func:`make_kernel` — single switch point for backend selection
   (lives in :mod:`alice_core.kernel.factory`; re-exported here for
   ergonomics once Phase B lands).
@@ -19,6 +20,7 @@ concrete impl. Use :func:`make_kernel` to construct.
 
 from .anthropic import AnthropicKernel
 from .factory import make_kernel
+from .pi import PiKernel
 from .protocol import BlockHandler, Kernel, NullHandler
 from .types import (
     KernelResult,
@@ -37,6 +39,7 @@ __all__ = [
     "KernelResult",
     "KernelSpec",
     "NullHandler",
+    "PiKernel",
     "SystemEvent",
     "ThinkingLevel",
     "TurnSummary",

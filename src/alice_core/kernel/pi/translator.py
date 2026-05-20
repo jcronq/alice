@@ -26,13 +26,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from alice_core.kernel import (
-    BlockHandler,
-    KernelResult,
-    SystemEvent,
-    TurnSummary,
-    UsageInfo,
-)
+from ..protocol import BlockHandler
+from ..types import KernelResult, SystemEvent, TurnSummary, UsageInfo
 
 from .usage import pi_usage_to_info
 

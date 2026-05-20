@@ -13,10 +13,10 @@ Models registry: pi reads ``~/.pi/agent/models.json`` for its
 provider/model list. Alice's source-of-truth registry lives in
 the vault at ``~/alice-mind/config/pi-models.json``. PiKernel.run()
 stages vault → pi runtime location via
-:func:`alice_pi.models_staging.ensure_pi_models_json` at the start
-of every run. Idempotent (skips when content matches) and
-fail-soft (warning event, no raise) — pi can always fall back to
-its built-in providers.
+:func:`alice_core.kernel.pi.models_staging.ensure_pi_models_json`
+at the start of every run. Idempotent (skips when content matches)
+and fail-soft (warning event, no raise) — pi can always fall back
+to its built-in providers.
 
 Skills: PiKernel passes ``--skill <rendered_dir>`` (the per-hemisphere
 ephemeral skills dir from Plan 07 P3). Pi auto-discovery falls back
@@ -34,13 +34,9 @@ import asyncio
 from importlib import resources
 from typing import Any, Optional
 
-from alice_core.events import EventEmitter
-from alice_core.kernel import (
-    BlockHandler,
-    KernelResult,
-    KernelSpec,
-    ThinkingLevel,
-)
+from ...events import EventEmitter
+from ..protocol import BlockHandler
+from ..types import KernelResult, KernelSpec, ThinkingLevel
 
 from . import transport as _transport_mod
 from .models_staging import ensure_pi_models_json
@@ -225,7 +221,7 @@ class PiKernel:
     def _build_argv(self, prompt: str, spec: KernelSpec) -> list[str]:
         # Read PI_BIN dynamically so test fixtures + runtime env
         # changes (ALICE_PI_BIN) take effect without needing a
-        # module reload of alice_pi.kernel.
+        # module reload of alice_core.kernel.pi.kernel.
         argv: list[str] = [
             _transport_mod.pi_bin(),
             "--mode",
@@ -277,4 +273,8 @@ class PiKernel:
 
 
 def _send_message_extension_path() -> str:
-    return str(resources.files("alice_pi").joinpath("extensions", "send-message.js"))
+    return str(
+        resources.files("alice_core.kernel.pi").joinpath(
+            "extensions", "send-message.js"
+        )
+    )
