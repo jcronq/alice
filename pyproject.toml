@@ -43,7 +43,7 @@ dependencies = [
 ]
 
 [project.scripts]
-alice-viewer = "alice_viewer.main:run"
+alice-viewer = "viewer.main:run"
 # Synchronous CLI wrapper around alice_thinking.experiments.ExperimentRunner.
 # Exists because pi-mono (the local Qwen runtime that drives thinking's
 # sleep wakes) strips mcp__-prefixed tools, so the run_experiment MCP tool
@@ -53,17 +53,17 @@ alice-experiment = "alice_thinking.cli.experiment:main"
 # One-shot State Machine v0 dispatcher — polls jcronq/alice for sm:selected
 # issues, trust-filters them, and posts a dispatcher-hello comment. Invoke
 # on a cadence (later: s6 supervisor); for now it's manual.
-alice-sm = "alice_sm.dispatcher:main"
+alice-sm = "sm.dispatcher:main"
 # One-shot reconciliation: copy access_count from vault frontmatter into
 # the cortex-index note_metrics table. Used to bootstrap historical
 # counts after wiring the cue runner's DB write path.
-alice-seed-access-counts = "alice_indexer.seed_access_counts:main"
+alice-seed-access-counts = "indexer.seed_access_counts:main"
 # Shell-side debugging wrapper around the request_host_claude MCP tool:
 # drop a task spec into /state/worker/host-claude/inbox/ from the CLI
 # instead of going through the MCP server. See sandbox/host-claude-watcher/.
 alice-host-claude-request = "alice_speaking.tools.host_claude:main"
 # Per-issue thinking-agent entrypoint (#163). Invoked by
-# alice_sm.dispatcher.spawn_thinking_agent for each (sm:selected, art:code)
+# sm.dispatcher.spawn_thinking_agent for each (sm:selected, art:code)
 # issue — reads <spawn-dir>/prompt.txt, resolves Phase from frontmatter,
 # drives the kernel through alice_thinking.runtime.PhaseRunner. The
 # scripts/sm-thinking-perissue.py shim is a thin file-path wrapper around
@@ -75,44 +75,44 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 # Sibling Python packages under src/:
-#   alice_core      — agentic kernel (SDK lifecycle + observability + auth)
-#   alice_eval      — speaking-quality eval harness (Day-1 sample/replay/UI)
-#   alice_indexer   — vault SQLite/FTS5 indexer (CLI; cortex-memory tooling)
-#   alice_metrics   — stable vault-health metric implementations (replaces drift-prone bash)
+#   core      — agentic kernel (SDK lifecycle + observability + auth)
+#   eval      — speaking-quality eval harness (Day-1 sample/replay/UI)
+#   indexer   — vault SQLite/FTS5 indexer (CLI; cortex-memory tooling)
+#   metrics   — stable vault-health metric implementations (replaces drift-prone bash)
 #   kernels.pi      — Kernel impl backed by pi-coding-agent subprocess
 #   kernels.anthropic — Kernel impl backed by claude_agent_sdk
-#   alice_prompts   — Jinja2 templates the runtime renders into model prompts
-#   alice_skills    — registry over .claude/skills/ markdown (plan 07)
-#   alice_sm        — State Machine dispatcher (poll → trust-filter → comment)
+#   prompts   — Jinja2 templates the runtime renders into model prompts
+#   skills    — registry over .claude/skills/ markdown (plan 07)
+#   sm        — State Machine dispatcher (poll → trust-filter → comment)
 #   alice_speaking  — Signal daemon (composes kernel with producers/handlers/outbox)
 #   alice_thinking  — one-shot wake (python -m alice_thinking)
-#   alice_viewer    — FastAPI observability UI (serves /state logs)
-#   alice_watchers  — one-shot pollers feeding inner/notes/ (github, …)
+#   viewer    — FastAPI observability UI (serves /state logs)
+#   watchers  — one-shot pollers feeding inner/notes/ (github, …)
 [tool.hatch.build.targets.wheel]
 packages = [
-    "src/alice_core",
-    "src/alice_eval",
-    "src/alice_indexer",
-    "src/alice_metrics",
+    "src/core",
+    "src/eval",
+    "src/indexer",
+    "src/metrics",
     "src/kernels",
-    "src/alice_prompts",
-    "src/alice_skills",
-    "src/alice_sm",
+    "src/prompts",
+    "src/skills",
+    "src/sm",
     "src/alice_speaking",
     "src/alice_thinking",
-    "src/alice_viewer",
-    "src/alice_watchers",
+    "src/viewer",
+    "src/watchers",
 ]
 
-# alice_prompts ships .md.j2 template files alongside its Python
+# prompts ships .md.j2 template files alongside its Python
 # modules; hatch needs the include-pattern to bundle them in the
-# wheel. alice_skills bundles its runtime-default SKILL.md files
+# wheel. skills bundles its runtime-default SKILL.md files
 # the same way (plan 07 phase 6). alice_thinking ships the
 # per-phase prompt fragments under prompts/ — loaded via
 # importlib.resources, see alice_thinking.phase.PromptFragmentLoader.
 [tool.hatch.build.targets.wheel.force-include]
-"src/alice_prompts/templates" = "alice_prompts/templates"
-"src/alice_skills/defaults" = "alice_skills/defaults"
+"src/prompts/templates" = "prompts/templates"
+"src/skills/defaults" = "skills/defaults"
 "src/kernels/pi/extensions" = "kernels/pi/extensions"
 "src/alice_thinking/prompts" = "alice_thinking/prompts"
 "src/alice_thinking/workflows/stage_b/prompts" = "alice_thinking/workflows/stage_b/prompts"
@@ -140,4 +140,4 @@ ignore_missing_imports = true
 # bundle) as the cohesion pattern for the (state, artifact)
 # transition handlers. F403/F405 fire as false positives on this
 # idiom; exempt the whole sub-package rather than per-file.
-"src/alice_sm/dispatcher/**/*.py" = ["F403", "F405"]
+"src/sm/dispatcher/**/*.py" = ["F403", "F405"]

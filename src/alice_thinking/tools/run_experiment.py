@@ -32,7 +32,7 @@ from typing import Any, Optional
 
 from claude_agent_sdk import SdkMcpTool, tool
 
-from alice_core.events import EventEmitter
+from core.events import EventEmitter
 
 from ..experiments import ExperimentDispatchError, ExperimentRunner
 

@@ -39,16 +39,16 @@ def _isolate_pi_models_staging(tmp_path_factory, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _reset_alice_prompts_default_loader():
-    """Reset the alice_prompts package-level loader after every test.
+    """Reset the prompts package-level loader after every test.
 
-    Tests that mutate the singleton (via :func:`alice_prompts.set_default_loader`
+    Tests that mutate the singleton (via :func:`prompts.set_default_loader`
     or :func:`alice_thinking.wake._install_prompt_loader`) used to leak
     state into subsequent tests — the ``test_prompts.py`` cases that
     rely on the placeholder personae (``"the operator"``) failed when
     a thinking-wake test ran first and replaced the loader with one
     pointing at a tmp-dir override path.
     """
-    import alice_prompts as _prompts
+    import prompts as _prompts
 
     yield
     _prompts._default_loader = None

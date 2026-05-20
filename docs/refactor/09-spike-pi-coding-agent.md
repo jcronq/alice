@@ -205,7 +205,7 @@ The description contains `"lunch: X"` — strict YAML parses the
 inner colon as starting a nested mapping. Claude Code's loader
 is lenient enough to accept it (Alice's own
 `_parse_frontmatter_lenient` in
-`src/alice_skills/skill.py` handles this); pi's isn't. The other
+`src/skills/skill.py` handles this); pi's isn't. The other
 three Alice skills happen to pass because their inline examples
 don't contain colons.
 
@@ -345,7 +345,7 @@ type AgentEvent =
   | { type: "tool_execution_end"; toolCallId: string; toolName: string; result: any; isError: boolean };
 ```
 
-Mapping to Alice's existing kernel events (`alice_core/kernel.py`):
+Mapping to Alice's existing kernel events (`core/kernel.py`):
 
 | Alice event | Pi source | Notes |
 |---|---|---|
@@ -478,11 +478,11 @@ container deployment we mount this file from host into the worker.
 ## Architectural plan (next document)
 
 Given the verdict, the next plan extracts a `Kernel` Protocol
-from `alice_core/kernel.py:AgentKernel` and adds a `PiKernel` impl
+from `core/kernel.py:AgentKernel` and adds a `PiKernel` impl
 in a new `kernels/pi/` package. Sketch:
 
 ```
-src/alice_core/kernel.py    Kernel Protocol (extracted, not new)
+src/core/kernel.py    Kernel Protocol (extracted, not new)
                             AgentKernel       (Anthropic via claude_agent_sdk)
 src/kernels/pi/kernel.py      PiKernel          (subprocess pi --mode json)
 src/kernels/pi/transport.py   subprocess + JSONL parser

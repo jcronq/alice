@@ -49,7 +49,7 @@ import sys
 import time
 from typing import Any, Callable, Optional
 
-from alice_core.events import EventEmitter
+from core.events import EventEmitter
 
 from .card import (
     DEFAULT_VAULT_EXPERIMENTS_DIR,

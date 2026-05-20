@@ -10,7 +10,7 @@
 # invocation in `flock -n /state/worker/sm-dispatcher.lock` so a slow
 # poll can't double-fire.
 #
-# Exit codes (from alice_sm.dispatcher):
+# Exit codes (from sm.dispatcher):
 #   0  poll OK (zero or more comments posted)
 #   non-zero  auth / rate-limit / internal error — supervisor sleeps
 #             one cadence and tries again, same as alice-gh-watcher.
@@ -26,4 +26,4 @@ fi
 
 export PYTHONPATH="$ALICE_SRC"
 export PYTHONUNBUFFERED=1
-exec "$VENV_PY" -m alice_sm.dispatcher "$@"
+exec "$VENV_PY" -m sm.dispatcher "$@"

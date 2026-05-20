@@ -1,7 +1,7 @@
-"""Phase 1 of plan 08: alice_indexer smoke tests.
+"""Phase 1 of plan 08: indexer smoke tests.
 
 The vault indexer was previously untested; the move from
-``alice_core/cortex_index/`` → ``alice_indexer/`` is the right time
+``core/cortex_index/`` → ``indexer/`` is the right time
 to add a small smoke. Three contracts:
 
 1. ``yaml_lite.split_frontmatter`` parses a markdown body with a
@@ -20,8 +20,8 @@ import sqlite3
 
 import pytest
 
-from alice_indexer.build_index import build, needs_rebuild
-from alice_indexer.yaml_lite import extract_wikilinks, split_frontmatter
+from indexer.build_index import build, needs_rebuild
+from indexer.yaml_lite import extract_wikilinks, split_frontmatter
 
 
 # ---------------------------------------------------------------------------

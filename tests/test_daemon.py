@@ -95,7 +95,7 @@ def _patch_query(monkeypatch: pytest.MonkeyPatch, messages_fn: Callable[[], list
     """Replace the SDK's query() with a factory producing the given messages.
 
     As of the kernel refactor (step 7), query() is invoked from inside
-    :mod:`alice_core.kernel`, not from daemon.py. We patch it there so the
+    :mod:`core.kernel`, not from daemon.py. We patch it there so the
     daemon's kernel-driven turns see our fakes.
 
     ``messages_fn`` is a zero-arg callable so each turn can return a fresh

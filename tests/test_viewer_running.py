@@ -21,8 +21,8 @@ import time
 
 import pytest
 
-from alice_viewer import sources
-from alice_viewer.settings import Paths
+from viewer import sources
+from viewer.settings import Paths
 
 
 def _paths(tmp_path: pathlib.Path) -> Paths:
@@ -634,7 +634,7 @@ def test_canvas_route_renders_unflagged_research_with_banner(tmp_path):
     and the note's markdown body."""
     from fastapi.testclient import TestClient
 
-    from alice_viewer.main import create_app
+    from viewer.main import create_app
 
     paths = _paths(tmp_path)
     paths.mind_dir.mkdir(parents=True, exist_ok=True)
@@ -659,7 +659,7 @@ def test_canvas_route_flagged_research_has_no_banner(tmp_path):
     path and don't get the fallback banner."""
     from fastapi.testclient import TestClient
 
-    from alice_viewer.main import create_app
+    from viewer.main import create_app
 
     paths = _paths(tmp_path)
     paths.mind_dir.mkdir(parents=True, exist_ok=True)
@@ -682,7 +682,7 @@ def test_canvas_route_unknown_slug_still_404s(tmp_path):
     the existing 'canvas not found' page."""
     from fastapi.testclient import TestClient
 
-    from alice_viewer.main import create_app
+    from viewer.main import create_app
 
     paths = _paths(tmp_path)
     paths.mind_dir.mkdir(parents=True, exist_ok=True)
@@ -700,7 +700,7 @@ def test_canvas_route_authored_canvas_serves_raw_html(tmp_path):
     no longer wraps them in a markdown→slideshow template."""
     from fastapi.testclient import TestClient
 
-    from alice_viewer.main import create_app
+    from viewer.main import create_app
 
     paths = _paths(tmp_path)
     paths.mind_dir.mkdir(parents=True, exist_ok=True)

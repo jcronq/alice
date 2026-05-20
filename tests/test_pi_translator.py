@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 
-from alice_core.kernel import NullHandler, TurnSummary
+from core.kernel import NullHandler, TurnSummary
 
 from kernels.pi.translator import PiEventTranslator
 

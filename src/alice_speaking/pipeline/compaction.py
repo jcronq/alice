@@ -33,7 +33,7 @@ DEFAULT_THRESHOLD = 150_000
 
 
 # The compaction prompt template lives at
-# ``alice_prompts/templates/speaking/compact.md.j2`` (Plan 04
+# ``prompts/templates/speaking/compact.md.j2`` (Plan 04
 # Phase 2). Loaded lazily inside ``CompactionTrigger.run`` so the
 # import graph stays clean.
 
@@ -206,7 +206,7 @@ class CompactionTrigger:
         explicit.
         """
         # Lazy imports — these create cycles if pulled at module top.
-        from alice_prompts import load as load_prompt
+        from prompts import load as load_prompt
         from ..domain import session_state
 
         turn_id = f"compact-{uuid.uuid4().hex[:8]}"

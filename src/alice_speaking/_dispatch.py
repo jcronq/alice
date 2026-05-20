@@ -21,7 +21,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Optional
 
-from alice_core.sdk_compat import _short
+from core.sdk_compat import _short
 
 from .domain.turn_log import new_turn
 from .pipeline.quiet_hours import is_quiet_hours
@@ -611,7 +611,7 @@ async def handle_surface(ctx: DaemonContext, event: "SurfaceEvent") -> None:
         chars=len(body),
         body=_short(body),
     )
-    from alice_prompts import load as load_prompt
+    from prompts import load as load_prompt
 
     prompt = load_prompt(
         "speaking.turn.surface",
@@ -691,7 +691,7 @@ async def handle_emergency(ctx: DaemonContext, event: "EmergencyEvent") -> None:
         return
     recipient = emergency_channel.address
 
-    from alice_prompts import load as load_prompt
+    from prompts import load as load_prompt
 
     prompt = load_prompt(
         "speaking.turn.emergency",

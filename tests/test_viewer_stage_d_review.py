@@ -1,4 +1,4 @@
-"""Tests for ``alice_viewer.stage_d_store`` — focused on the
+"""Tests for ``viewer.stage_d_store`` — focused on the
 pairs-log read path that backs ``/stage-d-review``.
 
 Regression target: #134 — the viewer used to read only the rich
@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import pathlib
 
-from alice_viewer import stage_d_store
+from viewer import stage_d_store
 
 
 def _write_jsonl(path: pathlib.Path, records: list[dict]) -> None:

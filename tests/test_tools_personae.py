@@ -12,7 +12,7 @@ from __future__ import annotations
 import pathlib
 from dataclasses import dataclass
 
-from alice_core.config.personae import (
+from core.config.personae import (
     AgentPersona,
     Personae,
     UserPersona,

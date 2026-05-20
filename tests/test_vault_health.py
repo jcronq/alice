@@ -1,4 +1,4 @@
-"""Eval-contract tests for ``alice_metrics.vault_health``.
+"""Eval-contract tests for ``metrics.vault_health``.
 
 Each metric used to be inline LLM-generated bash that drifted between
 wakes. The contract here is: every test that exercises a metric also
@@ -22,7 +22,7 @@ from textwrap import dedent
 
 import pytest
 
-from alice_metrics.vault_health import (
+from metrics.vault_health import (
     build_vault_health_event,
     compute_continuous_checks,
     compute_decay_coverage,
@@ -724,7 +724,7 @@ def test_frontmatter_parse_failure_counted_when_fence_unclosed(
         "---\nslug: broken\ntrigger_keywords: [phantom]\n\nbody without a closing fence\n",
         encoding="utf-8",
     )
-    with caplog.at_level("WARNING", logger="alice_metrics.vault_health"):
+    with caplog.at_level("WARNING", logger="metrics.vault_health"):
         counts = count_shadow_and_dark(vault)
     assert counts["frontmatter_parse_failures"] == 1
     # The parse failure also flips classification: with no parsed fm,
@@ -800,7 +800,7 @@ def test_build_vault_health_event_tags_suspect_when_truly_dark_exceeds_threshold
             f"Note {i} with no frontmatter and no triggers.\n",
         )
 
-    with caplog.at_level("WARNING", logger="alice_metrics.vault_health"):
+    with caplog.at_level("WARNING", logger="metrics.vault_health"):
         event = build_vault_health_event(
             vault_dir=vault,
             thoughts_dir=thoughts,
@@ -816,7 +816,7 @@ def test_build_vault_health_event_tags_suspect_when_truly_dark_exceeds_threshold
 
 # ---------------------------------------------------------------------------
 # Regression: double-backtick code spans (``[[wikilink]]``) leaked through
-# the inline-code stripper in alice_indexer.yaml_lite. Markdown allows
+# the inline-code stripper in indexer.yaml_lite. Markdown allows
 # longer tick runs to delimit spans containing inner ticks; widest first
 # is the right strip order.
 # ---------------------------------------------------------------------------

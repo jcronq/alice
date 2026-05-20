@@ -23,7 +23,7 @@ import json
 import pathlib
 from typing import Any, Optional
 
-from alice_core.events import CapturingEmitter
+from core.events import CapturingEmitter
 from alice_thinking.cli import experiment as cli
 from alice_thinking.experiments import (
     CardContent,

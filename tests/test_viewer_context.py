@@ -21,7 +21,7 @@ import pytest
 
 from alice_speaking.diagnostics import ContextProbe
 from alice_speaking.transports.cli import CLITransport
-from alice_viewer import context_probe_client
+from viewer import context_probe_client
 
 
 # ----------------------------------------------------------------------------
@@ -214,8 +214,8 @@ def test_context_page_renders(tmp_path, monkeypatch):
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
 
-    from alice_viewer.main import create_app
-    from alice_viewer.settings import Paths
+    from viewer.main import create_app
+    from viewer.settings import Paths
 
     # Minimal Paths fixture pointing at a tempdir; the route doesn't
     # actually touch any of these files unless _state_context() does.

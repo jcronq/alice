@@ -21,7 +21,7 @@ from typing import Any
 
 from claude_agent_sdk import SdkMcpTool, tool
 
-from alice_core.config.personae import Personae, placeholder as placeholder_personae
+from core.config.personae import Personae, placeholder as placeholder_personae
 
 from ..infra.config import Config
 

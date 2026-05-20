@@ -5,7 +5,7 @@
 The runtime supports exactly two auth/backend paths today, and the
 selection happens implicitly via env-var presence:
 
-`src/alice_core/auth.py:14-17`:
+`src/core/auth.py:14-17`:
 
 > The mode is picked implicitly: presence of `ANTHROPIC_BASE_URL` or
 > `ANTHROPIC_API_KEY` selects `api`; otherwise `subscription`. When
@@ -62,7 +62,7 @@ config-driven, not implicit-from-env-vars.
    for cost, you also have to swap the model name, which lives in a
    different file. Two-step config change for one logical operation.
 
-5. **The viewer makes its own LLM calls.** `alice_viewer/narrative.py`
+5. **The viewer makes its own LLM calls.** `viewer/narrative.py`
    directly imports `claude_agent_sdk` and calls `query()`. It honors
    the same env vars (so it'll go through whatever auth the daemon
    uses), but its model name is hardcoded — `narrative.py:211, 402`
@@ -288,7 +288,7 @@ the appropriate `model.yml`.
 
 ### Viewer
 
-`alice_viewer/narrative.py:200, 395` and `run_summary.py:154 region`
+`viewer/narrative.py:200, 395` and `run_summary.py:154 region`
 have hardcoded model strings. After this plan they read from
 `model.yml`'s `viewer:` block. Mechanism: viewer's `main.py`
 loads `model.yml` at startup, exposes via `app.state.model_config`,
@@ -341,7 +341,7 @@ narrative + run_summary read from it.
 **Goal:** Configuration shape exists. Nothing consumes it yet.
 
 **Changes:**
-- `src/alice_core/model_config.py` — `ModelConfig` dataclass +
+- `src/core/model_config.py` — `ModelConfig` dataclass +
   `load(mind_path: Path) -> ModelConfig`.
 - `templates/mind-scaffold/config/model.yml.example` — commented
   example.
@@ -420,7 +420,7 @@ existing minds.
 
 **Changes:**
 - `wake.py` reads `thinking.backend` + `thinking.model`.
-- `alice_viewer/main.py` loads `model.yml` at startup; exposes via
+- `viewer/main.py` loads `model.yml` at startup; exposes via
   `app.state.model_config`.
 - `narrative.py` + `run_summary.py` read model strings from
   `app.state.model_config.viewer.*` instead of hardcoded constants.

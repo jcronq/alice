@@ -155,12 +155,12 @@ class SignalTransport:
         """Compose the per-turn prompt for one or more Signal envelopes.
 
         Body lives in
-        ``alice_prompts/templates/speaking/turn.signal.md.j2``
+        ``prompts/templates/speaking/turn.signal.md.j2``
         (Plan 04 Phase 5). Pre-flattens the batch into a list of
         ``{body, attachments, timestamp_str}`` dicts so the template
         owns the single-vs-multi rendering branch.
         """
-        from alice_prompts import load as load_prompt
+        from prompts import load as load_prompt
         from ..domain.render import capability_prompt_fragment
 
         messages = []

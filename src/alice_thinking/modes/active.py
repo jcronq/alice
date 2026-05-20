@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional
 
-from alice_core.kernel import KernelSpec
+from core.kernel import KernelSpec
 
 from ..phase import Phase, PhaseConfig
 from ..runtime import PhaseRunner

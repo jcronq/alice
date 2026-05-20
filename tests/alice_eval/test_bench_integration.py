@@ -13,9 +13,9 @@ from unittest.mock import patch
 
 import pytest
 
-from alice_eval import bench
-from alice_eval.bench import select_subset
-from alice_eval.replay import ReplayResult
+from eval import bench
+from eval.bench import select_subset
+from eval.replay import ReplayResult
 
 
 def _sample_row(turn_id: str, category: str, outbound: str) -> dict:
@@ -126,8 +126,8 @@ def test_instances_then_run_then_score(
             request_ts=0.0,
         )
 
-    with patch("alice_eval.bench.replay_turn", side_effect=fake_replay_turn), \
-         patch("alice_eval.bench.build_system_prompt", return_value="sys-prompt"):
+    with patch("eval.bench.replay_turn", side_effect=fake_replay_turn), \
+         patch("eval.bench.build_system_prompt", return_value="sys-prompt"):
         out_path = tmp_path / "eval_results.jsonl"
         rows = bench.main_run(
             candidate_id="fake",
@@ -181,8 +181,8 @@ def test_bad_candidate_fails_assertions(
             request_ts=0.0,
         )
 
-    with patch("alice_eval.bench.replay_turn", side_effect=fake_replay_turn), \
-         patch("alice_eval.bench.build_system_prompt", return_value="sys"):
+    with patch("eval.bench.replay_turn", side_effect=fake_replay_turn), \
+         patch("eval.bench.build_system_prompt", return_value="sys"):
         out_path = tmp_path / "eval_results.jsonl"
         bench.main_run(
             candidate_id="fake",

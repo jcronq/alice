@@ -15,7 +15,7 @@ import pathlib
 
 import pytest
 
-from alice_core.config.model import (
+from core.config.model import (
     BackendSpec,
     ModelConfig,
     ModelConfigError,

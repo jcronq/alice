@@ -14,8 +14,8 @@ from typing import Any
 
 import pytest
 
-from alice_core.events import CapturingEmitter
-from alice_core.kernel import KernelSpec, NullHandler
+from core.events import CapturingEmitter
+from core.kernel import KernelSpec, NullHandler
 from kernels.anthropic import AnthropicKernel
 
 

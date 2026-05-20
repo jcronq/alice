@@ -12,7 +12,7 @@ import textwrap
 
 import pytest
 
-from alice_skills import (
+from skills import (
     DEFAULTS_DIR,
     Skill,
     SkillError,
@@ -89,7 +89,7 @@ def test_parse_skill_accepts_legacy_top_level_scope_with_warning(
     skill_md = _write_skill(
         tmp_path, "log-meal", scope="speaking", legacy_scope=True
     )
-    with caplog.at_level("WARNING", logger="alice_skills.skill"):
+    with caplog.at_level("WARNING", logger="skills.skill"):
         s = Skill.parse(skill_md)
     assert s.scope == "speaking"
     assert any(
@@ -313,7 +313,7 @@ def test_from_mind_override_wins_over_default(tmp_path: pathlib.Path) -> None:
 
 
 def test_describe_for_substitutes_user_name(tmp_path: pathlib.Path) -> None:
-    from alice_core.config.personae import (
+    from core.config.personae import (
         AgentPersona,
         Personae,
         UserPersona,
@@ -334,7 +334,7 @@ def test_describe_for_substitutes_user_name(tmp_path: pathlib.Path) -> None:
 
 
 def test_describe_for_handles_agent_name(tmp_path: pathlib.Path) -> None:
-    from alice_core.config.personae import (
+    from core.config.personae import (
         AgentPersona,
         Personae,
         UserPersona,

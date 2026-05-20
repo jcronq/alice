@@ -300,7 +300,7 @@ class ViewerChatTransport:
     # ------------------------------------------------------------------
     # Prompt assembly — reuses CLI templates. Phase 6c of plan 01 puts
     # transport-specific prompt bodies under
-    # ``alice_prompts/templates/speaking/turn.<name>.md.j2``. Viewer
+    # ``prompts/templates/speaking/turn.<name>.md.j2``. Viewer
     # chat reuses the CLI prompt + CLI capability fragment because the
     # interactive-terminal framing is the right model for it too (full
     # markdown, user waiting at the keyboard, no proactive prelude).
@@ -312,7 +312,7 @@ class ViewerChatTransport:
         stamp: str,
         text: str,
     ) -> str:
-        from alice_prompts import load as load_prompt
+        from prompts import load as load_prompt
         from ..domain.render import capability_prompt_fragment
 
         return load_prompt(

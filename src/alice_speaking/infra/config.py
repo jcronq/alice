@@ -164,7 +164,7 @@ class Config:
     discord_bot_token: str = ""
 
     # API-key auth mode. When ``anthropic_base_url`` or ``anthropic_api_key``
-    # is set, alice_core.auth picks "api" mode and routes the CLI through
+    # is set, core.auth picks "api" mode and routes the CLI through
     # this endpoint instead of the default Claude subscription flow. Used
     # for LiteLLM proxies (or direct Anthropic API).
     anthropic_base_url: str = ""
@@ -254,7 +254,7 @@ def load() -> Config:
     # here means "let the SDK find it on disk."
     oauth_token = from_any("CLAUDE_CODE_OAUTH_TOKEN", "") or ""
     # API-key mode (LiteLLM or direct Anthropic API). All three optional;
-    # presence of base_url or api_key flips alice_core.auth into "api" mode.
+    # presence of base_url or api_key flips core.auth into "api" mode.
     anthropic_base_url = from_any("ANTHROPIC_BASE_URL", "") or ""
     anthropic_api_key = from_any("ANTHROPIC_API_KEY", "") or ""
     anthropic_auth_token = from_any("ANTHROPIC_AUTH_TOKEN", "") or ""

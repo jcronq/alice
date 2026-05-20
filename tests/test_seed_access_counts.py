@@ -1,4 +1,4 @@
-"""Tests for alice_indexer.seed_access_counts.
+"""Tests for indexer.seed_access_counts.
 
 The seed is a one-time reconciliation step: copy ``access_count`` from
 vault frontmatter into the ``note_metrics`` table that the cue runner
@@ -20,8 +20,8 @@ import sqlite3
 
 import pytest
 
-from alice_indexer.build_index import build
-from alice_indexer.seed_access_counts import seed
+from indexer.build_index import build
+from indexer.seed_access_counts import seed
 
 
 def _write_note(

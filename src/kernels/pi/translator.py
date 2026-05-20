@@ -26,7 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from alice_core.kernel import (
+from core.kernel import (
     BlockHandler,
     KernelResult,
     SystemEvent,
@@ -45,7 +45,7 @@ _DEFAULT_CAP = 2000
 
 
 def _short(value: Any, cap: int = _DEFAULT_CAP) -> Any:
-    """Mirror :func:`alice_core.sdk_compat._short` for stringification."""
+    """Mirror :func:`core.sdk_compat._short` for stringification."""
     import json as _json
 
     try:

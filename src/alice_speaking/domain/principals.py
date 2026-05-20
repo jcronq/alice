@@ -30,7 +30,7 @@ import yaml
 from ..transports.base import ChannelRef, InboundMessage
 
 if TYPE_CHECKING:
-    from alice_core.config.personae import Personae
+    from core.config.personae import Personae
 
 
 log = logging.getLogger(__name__)

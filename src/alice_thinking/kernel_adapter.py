@@ -7,7 +7,7 @@ applies to every mode.
 
 The mode picks the spec; this module runs it. Modes can do
 post-run work via :meth:`Mode.post_run`. The kernel impl is chosen
-by :func:`alice_core.kernel.make_kernel` based on
+by :func:`core.kernel.make_kernel` based on
 ``model_config.thinking.backend`` so thinking can route through
 AnthropicKernel (claude_agent_sdk) or PiKernel (pi-coding-agent
 subprocess) without any code change here.
@@ -18,12 +18,12 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Optional
 
-from alice_core.kernel import make_kernel
+from core.kernel import make_kernel
 
 
 if TYPE_CHECKING:
-    from alice_core.config.model import BackendSpec
-    from alice_core.events import EventLogger
+    from core.config.model import BackendSpec
+    from core.events import EventLogger
 
     from .modes.base import Mode, WakeContext
 
@@ -53,7 +53,7 @@ async def run_wake(
     for callers that haven't migrated to phase-aware dispatch yet.
     """
     if backend is None:
-        from alice_core.config.model import BackendSpec
+        from core.config.model import BackendSpec
 
         backend = BackendSpec(backend="subscription")
 

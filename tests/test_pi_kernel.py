@@ -12,8 +12,8 @@ import stat
 
 import pytest
 
-from alice_core.events import CapturingEmitter
-from alice_core.kernel import KernelSpec, NullHandler, TurnSummary
+from core.events import CapturingEmitter
+from core.kernel import KernelSpec, NullHandler, TurnSummary
 
 from kernels.pi.kernel import PiKernel
 

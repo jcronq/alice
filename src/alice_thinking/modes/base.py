@@ -18,8 +18,8 @@ from typing import TYPE_CHECKING, Optional, Protocol
 
 
 if TYPE_CHECKING:
-    from alice_core.config.personae import Personae
-    from alice_core.kernel import KernelResult, KernelSpec
+    from core.config.personae import Personae
+    from core.kernel import KernelResult, KernelSpec
 
 
 @dataclass(frozen=True)

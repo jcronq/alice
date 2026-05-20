@@ -19,7 +19,7 @@ from alice_speaking.review import (
     CODE_REVIEWER_SYSTEM_PROMPT,
     CodeReviewResult,
 )
-from alice_sm import dispatcher as sm
+from sm import dispatcher as sm
 
 
 # ---------------------------------------------------------------------------
@@ -241,12 +241,12 @@ def test_parse_json_drops_non_dict_feedback_entries() -> None:
 
 
 def test_spawn_map_has_reviewing_code_entry() -> None:
-    """The dispatcher integration point lives in alice_sm.SPAWN_MAP."""
+    """The dispatcher integration point lives in sm.SPAWN_MAP."""
     assert ("sm:reviewing", "art:code") in sm.SPAWN_MAP
     entry = sm.SPAWN_MAP[("sm:reviewing", "art:code")]
     # The entry references the new reviewer's system prompt by dotted
     # path so the future dispatcher loader can resolve it without
-    # alice_sm taking a hard import on alice_speaking.
+    # sm taking a hard import on alice_speaking.
     assert (
         entry["system_prompt_module"]
         == "alice_speaking.review.code_reviewer:CODE_REVIEWER_SYSTEM_PROMPT"

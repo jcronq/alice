@@ -4,7 +4,7 @@ The SM v2 pipeline revision post-amendment
 (``cortex-memory/research/2026-05-13-sm-v2-pipeline-revision.md``,
 Jason 2026-05-13 09:51 EDT) moved the build phase onto a
 stimulus-spawned speaking-instance. The dispatcher
-(:func:`alice_sm.dispatcher.spawn_speaking_agent`, filed separately as
+(:func:`sm.dispatcher.spawn_speaking_agent`, filed separately as
 issue #184) writes ``prompt.txt`` into a per-issue spawn dir with
 frontmatter pointing at the approved design note; this module composes
 the build-time prompt and kernel spec the entrypoint
@@ -33,7 +33,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from alice_core.kernel import KernelSpec
+from core.kernel import KernelSpec
 
 
 __all__ = [

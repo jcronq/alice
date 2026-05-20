@@ -30,14 +30,14 @@ import time
 from datetime import datetime
 from typing import Any, Optional
 
-from alice_core.config.auth import ensure_auth_env
-from alice_core.config.model import load as load_model_config
-from alice_core.config.personae import (
+from core.config.auth import ensure_auth_env
+from core.config.model import load as load_model_config
+from core.config.personae import (
     PersonaeError,
     load as load_personae,
     placeholder as placeholder_personae,
 )
-from alice_core.events import EventLogger
+from core.events import EventLogger
 
 from . import backoff
 from ._prompt_assembly import WAKE_TZ
@@ -312,13 +312,13 @@ def _load_personae(mind: pathlib.Path):
 
 
 def _install_prompt_loader(mind: pathlib.Path, personae) -> None:
-    """Wire a mind-aware PromptLoader as the alice_prompts singleton
+    """Wire a mind-aware PromptLoader as the prompts singleton
     so the wake template's ``{{agent.name}}`` substitutions resolve
     and any per-mind override at
     ``.alice/prompts/thinking/wake.active.md.j2`` applies.
     """
-    import alice_prompts as _prompts
-    from alice_prompts import DEFAULTS_DIR, PromptLoader
+    import prompts as _prompts
+    from prompts import DEFAULTS_DIR, PromptLoader
 
     loader = PromptLoader(
         defaults_path=DEFAULTS_DIR,
@@ -330,7 +330,7 @@ def _install_prompt_loader(mind: pathlib.Path, personae) -> None:
 
 def _render_system_prompt(personae) -> str:
     """Render meta.system_persona for the wake's ``append_system_prompt``."""
-    from alice_prompts import load as load_prompt
+    from prompts import load as load_prompt
 
     return load_prompt("meta.system_persona", **personae.as_template_context())
 
@@ -358,8 +358,8 @@ def _build_context(args: argparse.Namespace, personae) -> WakeContext:
         tools = [t.strip() for t in args.tools.split(",") if t.strip()]
         # Plan 07 P3 / plan-pi Phase C: render thinking-scope skills
         # to the per-hemisphere ephemeral dir, then point cwd there.
-        from alice_skills.registry import SkillRegistry
-        from alice_skills.render import render_to_disk
+        from skills.registry import SkillRegistry
+        from skills.render import render_to_disk
 
         cwd = state_dir / "alice-skills" / "thinking"
         registry = SkillRegistry.from_mind(mind)
@@ -462,7 +462,7 @@ def main() -> int:
         # Plan-pi Phase E: ad-hoc backend override for smoke testing.
         # Reuse the model.yml-resolved model + region/profile/base_url
         # but flip the backend value.
-        from alice_core.config.model import BackendSpec
+        from core.config.model import BackendSpec
 
         thinking_spec = BackendSpec(
             backend=args.backend,

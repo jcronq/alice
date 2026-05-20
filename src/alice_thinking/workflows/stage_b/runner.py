@@ -24,7 +24,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from alice_core.events import EventEmitter, EventLogger
+from core.events import EventEmitter, EventLogger
 
 from .agents import (
     bind_run_context,

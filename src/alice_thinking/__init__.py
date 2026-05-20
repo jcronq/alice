@@ -1,6 +1,6 @@
 """alice_thinking — the quiet hemisphere.
 
-One-shot wake semantics, driven by :mod:`alice_core.kernel`. Fired
+One-shot wake semantics, driven by :mod:`core.kernel`. Fired
 periodically by the ``alice-thinker`` s6 service via
 ``/usr/local/bin/alice-think``.
 

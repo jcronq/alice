@@ -71,7 +71,7 @@ import pathlib
 import sys
 from typing import Any, Optional
 
-from alice_core.events import EventEmitter, EventLogger
+from core.events import EventEmitter, EventLogger
 
 from ..experiments import (
     ExperimentDispatchError,

@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from alice_daemon import gh_state_mirror
+from sm import gh_state_mirror
 
 
 @pytest.fixture

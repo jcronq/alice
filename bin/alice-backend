@@ -22,4 +22,4 @@ else
 fi
 
 export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$ALICE_ROOT/src"
-exec "$PY" -m alice_core.config.cli "$@"
+exec "$PY" -m core.config.cli "$@"

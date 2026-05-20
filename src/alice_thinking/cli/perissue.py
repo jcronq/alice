@@ -1,7 +1,7 @@
 """Per-issue thinking-agent entrypoint — sub-issue 3 of SM v2 pipeline revision.
 
-Replaces the :mod:`alice_sm.thinking_shim` placeholder shipped in #156.
-Invoked by :func:`alice_sm.dispatcher.spawn_thinking_agent` for each
+Replaces the :mod:`sm.thinking_shim` placeholder shipped in #156.
+Invoked by :func:`sm.dispatcher.spawn_thinking_agent` for each
 ``(sm:selected, art:code)`` issue. Reads the spawn dir's ``prompt.txt``,
 resolves the configured :class:`alice_thinking.phase.Phase` from
 frontmatter (or a ``--mode`` override), composes the prompt + kernel
@@ -32,7 +32,7 @@ from datetime import datetime
 from typing import Any, Callable, Iterable, Optional
 from zoneinfo import ZoneInfo
 
-from alice_core.config.personae import placeholder as placeholder_personae
+from core.config.personae import placeholder as placeholder_personae
 
 from ..modes.base import WakeContext
 from ..phase import Phase
@@ -195,7 +195,7 @@ async def _drive_kernel(
     *,
     log: Callable[[str], None],
 ) -> int:
-    """Default kernel-driver: run the spec via :func:`alice_core.kernel.make_kernel`.
+    """Default kernel-driver: run the spec via :func:`core.kernel.make_kernel`.
 
     Mirrors :func:`alice_thinking.kernel_adapter.run_wake` minus the
     event-log envelope — per-issue spawns capture their session via
@@ -207,9 +207,9 @@ async def _drive_kernel(
     otherwise. Replaceable in tests via the ``kernel_runner`` arg on
     :func:`main`.
     """
-    from alice_core.config.model import BackendSpec
-    from alice_core.events import EventLogger
-    from alice_core.kernel import make_kernel
+    from core.config.model import BackendSpec
+    from core.events import EventLogger
+    from core.kernel import make_kernel
 
     backend = BackendSpec(backend="subscription")
     emitter = EventLogger(pathlib.Path("/dev/null"))

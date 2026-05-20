@@ -257,10 +257,10 @@ class CLITransport:
         """Compose the prompt for a single CLI message.
 
         Body lives in
-        ``alice_prompts/templates/speaking/turn.cli.md.j2``
+        ``prompts/templates/speaking/turn.cli.md.j2``
         (Plan 04 Phase 5).
         """
-        from alice_prompts import load as load_prompt
+        from prompts import load as load_prompt
         from ..domain.render import capability_prompt_fragment
 
         return load_prompt(

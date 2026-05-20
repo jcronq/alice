@@ -10,7 +10,7 @@ live LLM is hit. Exercises:
   exactly 2 JSONL lines, retry_history populated
 - 3-attempt persistent disagreement → outcome
   ``dropped_disagreement_exhausted``, exactly 3 lines
-- JSONL line shape matches ``src/alice_viewer/STAGE_D_SCHEMA.md`` field-for-field
+- JSONL line shape matches ``src/viewer/STAGE_D_SCHEMA.md`` field-for-field
 - ``update_shipped_slug`` rewrites the most recent matching line in place
 """
 

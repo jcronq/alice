@@ -13,7 +13,7 @@ import pathlib
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from alice_core.config.personae import placeholder
+from core.config.personae import placeholder
 from alice_thinking.modes import ActiveMode, Mode, WakeContext
 from alice_thinking.selector import select_mode
 

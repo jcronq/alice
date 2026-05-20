@@ -13,7 +13,7 @@ templating system, and no index. Concretely:
   a kernel call.
 - **`src/alice_thinking/wake.py:50`** — `QUICK_PROMPT = "Reply exactly:
   QUICK-OK"`.
-- **`src/alice_viewer/narrative.py:128, 353, 481`** — four full
+- **`src/viewer/narrative.py:128, 353, 481`** — four full
   multi-paragraph LLM-summary prompts, each constructed in an f-string
   that interpolates the digest data and hardcodes "Alice" and
   "owner" by name.
@@ -52,7 +52,7 @@ After this plan:
   `thinking.wake.bootstrap`, `viewer.narrative.daily`).
 - **Prompts are templates** — Jinja2 (already a project dependency
   via the viewer) — with named placeholders for context.
-- **One loader** — `alice_prompts.load(name, **context) -> str` — is
+- **One loader** — `prompts.load(name, **context) -> str` — is
   the only sanctioned way to build a prompt at runtime.
 - **Prompts are testable** — the loader is pure-function-shaped, so
   tests assert "given context X, the rendered prompt has substring Y."
@@ -62,13 +62,13 @@ After this plan:
 
 ## Design
 
-### The package: `src/alice_prompts/`
+### The package: `src/prompts/`
 
-A new top-level package, sibling to `alice_core`, `alice_speaking`,
+A new top-level package, sibling to `core`, `alice_speaking`,
 etc. Layout:
 
 ```
-src/alice_prompts/
+src/prompts/
 ├── __init__.py                # public API: load(), list(), reload()
 ├── loader.py                  # PromptLoader (Jinja2 + file resolution)
 ├── registry.py                # discovers prompt files at startup
@@ -107,7 +107,7 @@ class PromptLoader:
         `name` is dot-separated (e.g. "speaking.compact"). The loader
         looks up the corresponding file in registered search paths in
         order, falling back to the runtime defaults under
-        `src/alice_prompts/templates/`. The merged context is
+        `src/prompts/templates/`. The merged context is
         `self.context_defaults | context`.
 
         Raises PromptNotFound if no template matches.
@@ -128,7 +128,7 @@ Templates resolve in priority order:
 1. **`mind/.alice/prompts/`** — user-overrides (per-mind). Shipped as
    empty directory in the scaffold; users add files here to override
    defaults without touching the runtime package.
-2. **`src/alice_prompts/templates/`** — the runtime defaults.
+2. **`src/prompts/templates/`** — the runtime defaults.
 
 Override resolution is by name. If `mind/.alice/prompts/speaking/compact.md.j2`
 exists, it wins. If it doesn't, the runtime default is used. This
@@ -217,14 +217,14 @@ collisions are visible.
 
 ### Phase 1 — Skeleton: package, loader, one migrated prompt
 
-**Goal:** `alice_prompts` exists, has a loader, has one template
+**Goal:** `prompts` exists, has a loader, has one template
 (`thinking/quick.md.j2`), and `wake.py` reads it.
 
 **Changes:**
-- Create `src/alice_prompts/` package with `loader.py`, `registry.py`,
+- Create `src/prompts/` package with `loader.py`, `registry.py`,
   `__init__.py`, `templates/`.
 - Add `pyproject.toml` `[tool.hatch.build.targets.wheel].packages`
-  entry: `"src/alice_prompts"`.
+  entry: `"src/prompts"`.
 - Migrate `wake.py:50:QUICK_PROMPT` to `templates/thinking/quick.md.j2`
   (one line: `Reply exactly: QUICK-OK`). `wake.py` calls
   `prompts.load("thinking.quick")`.
@@ -500,10 +500,10 @@ review.
    it's content, not a template. The wake template includes it
    verbatim via `{% include 'directive' %}` if present.
 
-2. **Where does `alice_prompts` live in the dependency graph?**
+2. **Where does `prompts` live in the dependency graph?**
    Top-level package alongside the others. Imports nothing from
-   `alice_speaking` / `alice_thinking` / `alice_viewer`; they import
-   from `alice_prompts`. Keep one-way.
+   `alice_speaking` / `alice_thinking` / `viewer`; they import
+   from `prompts`. Keep one-way.
 
 3. **Should the loader be a singleton?**
    The daemon needs one shared loader (so reload is meaningful).

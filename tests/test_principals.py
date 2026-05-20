@@ -263,7 +263,7 @@ def test_load_default_cli_principal_uses_user_name(tmp_path: pathlib.Path):
     """When personae is supplied and the explicit fallback args stay
     on their legacy defaults, the synthesized CLI principal id +
     display draw from ``personae.user.name`` instead of "owner"."""
-    from alice_core.config.personae import (
+    from core.config.personae import (
         AgentPersona,
         Personae,
         UserPersona,
@@ -288,7 +288,7 @@ def test_explicit_fallback_args_win_over_personae(tmp_path: pathlib.Path):
     """If the caller pins a custom fallback id (e.g. for tests) and
     personae is also supplied, the explicit value wins — personae only
     fills the slot when the legacy 'owner' default is in place."""
-    from alice_core.config.personae import (
+    from core.config.personae import (
         AgentPersona,
         Personae,
         UserPersona,

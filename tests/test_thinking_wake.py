@@ -36,7 +36,7 @@ def _make_ctx(tmp_path: pathlib.Path, *, system_prompt: str = "") -> WakeContext
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
-    from alice_core.config.personae import placeholder
+    from core.config.personae import placeholder
 
     return WakeContext(
         mind_dir=tmp_path,
@@ -203,15 +203,15 @@ def _stub_main_dependencies(monkeypatch, tmp_path, *, phase_value):
     monkeypatch.setattr(wake_module, "EventLogger", _MemoryLogger)
 
     # Skip personae rendering side effects.
-    from alice_core.config.personae import placeholder
+    from core.config.personae import placeholder
 
     monkeypatch.setattr(wake_module, "_load_personae", lambda mind: placeholder())
     monkeypatch.setattr(wake_module, "_install_prompt_loader", lambda *a, **kw: None)
     monkeypatch.setattr(wake_module, "_render_system_prompt", lambda *a, **kw: "")
 
     # Skip skill-rendering side effects in _build_context.
-    import alice_skills.registry as registry_mod
-    import alice_skills.render as render_mod
+    import skills.registry as registry_mod
+    import skills.render as render_mod
 
     monkeypatch.setattr(
         registry_mod.SkillRegistry,
@@ -392,8 +392,8 @@ def test_viewer_loads_model_config_at_startup(tmp_path: pathlib.Path) -> None:
     """Plan 06 Phase 4: viewer's create_app pulls mind/config/model.yml
     into app.state.model_config so narrative + run_summary can read
     backend + model from there in the future."""
-    from alice_viewer.main import create_app
-    from alice_viewer.settings import Paths
+    from viewer.main import create_app
+    from viewer.settings import Paths
 
     cfg_dir = tmp_path / "config"
     cfg_dir.mkdir(parents=True, exist_ok=True)

@@ -46,7 +46,7 @@ RUN python3 -m venv /opt/alice-venv \
         'discord.py>=2.4' \
         'a2a-sdk[http-server]>=1.0.2' \
         'jinja2>=3.1'
-# jinja2 is the prompt-template engine for ``alice_prompts``
+# jinja2 is the prompt-template engine for ``prompts``
 # (Plan 04 of the runtime refactor). Listed alongside the other
 # runtime deps because the worker bypasses ``uv sync`` and
 # pip-installs directly, so pyproject.toml's deps don't reach

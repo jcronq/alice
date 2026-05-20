@@ -25,7 +25,7 @@ from typing import Any, Optional
 
 import pytest
 
-from alice_core.events import CapturingEmitter
+from core.events import CapturingEmitter
 from alice_thinking.experiments import (
     CardContent,
     ExperimentDispatchError,

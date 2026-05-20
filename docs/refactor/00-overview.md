@@ -71,12 +71,12 @@ the code (not by speculation):
    templating with the user's actual name, no test harness, and no
    override / inheritance story. → [07-skills.md](07-skills.md)
 
-9. **`alice_core/` claims to be a pure library and isn't.**
+9. **`core/` claims to be a pure library and isn't.**
    Its own docstring says "pure library, no daemon, no entry point" —
    but `cortex_index/build_index.py` is a 407-line runnable CLI that
    walks a vault. Three new files arrive from plans 05 + 06
    (`personae.py`, `model_config.py`) without a structural home, and
-   nothing prevents `alice_core` from inverting its dependency
+   nothing prevents `core` from inverting its dependency
    direction (importing from `alice_speaking`, etc.) on the day a
    convenient field assignment makes it tempting. The kernel package
    needs the same intent-communicating layout the refactor brings to
@@ -94,7 +94,7 @@ the code (not by speculation):
                                           │            │ structure being in place
                                           │
 03 (alice_thinking layout)  ─ independent (small)
-08 (alice_core organization) ─ independent; ship before 05 + 06 so
+08 (core organization) ─ independent; ship before 05 + 06 so
                               their new files land into config/ directly
 06 (backend selection)      ─ independent; depends on plan 08 for
                               landing model.py into config/
@@ -117,7 +117,7 @@ the code (not by speculation):
 ```
 
 `08` slots in after `04` and before `05`/`06` so the latter two land
-their new config files directly into `alice_core/config/`. `05` and
+their new config files directly into `core/config/`. `05` and
 `06` can ship in parallel after `08`. `03` follows `05` (it consumes
 plan 04's templates and plan 05's personae). `07` is last (depends on
 04, 05, and indirectly on 08).
@@ -183,7 +183,7 @@ deferred to a later plan:
    - Every file in `transports/` (other than `base.py`/`registry.py`)
      contains exactly one class implementing the `Transport` protocol.
    - Same for `internal/` and `InternalSource`.
-   - Same for `alice_skills/` once plan 07 lands and `Skill`.
+   - Same for `skills/` once plan 07 lands and `Skill`.
    Turns "you forgot to wire the new transport" from a runtime
    surprise into a CI failure.
 
@@ -301,7 +301,7 @@ bootstrap is two distinct things mashed together:
 
 1. **Immutable structural instructions** — wake-cycle skeleton, mode
    selection algorithm. Should become per-stage templates in
-   `src/alice_prompts/templates/thinking/`. Owned by plan 04 Phase 6.
+   `src/prompts/templates/thinking/`. Owned by plan 04 Phase 6.
 2. **`inner/directive.md`** — Jason-edited operational standing
    orders. Lives in the mind, not in the prompts package, even after
    migration. Loaded as a runtime variable; injected into the active
@@ -312,12 +312,12 @@ land. The migration handoff: plan 04 ships first, plan 03 Phase 5
 consumes its templates. Mark plan 04 Phase 6 as a gate for plan 03
 Phase 5.
 
-### `alice_core/` rationalization (now plan 08)
+### `core/` rationalization (now plan 08)
 
 This was originally framed as a "may emerge later" gap. Alice's
 review of plans 02–07 (her cortex-memory research notes, 2026-04-29)
 correctly identified that **doing it later costs more** — plans 05
-and 06 will deposit their new config files into `alice_core/`'s
+and 06 will deposit their new config files into `core/`'s
 top level, and we'll then have to migrate them into a `config/`
 subpackage retroactively. Cheaper sequencing: do plan 08 first, let
 plans 05 and 06 land their files into the right structure on

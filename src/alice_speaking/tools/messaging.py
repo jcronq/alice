@@ -61,7 +61,7 @@ from typing import Any, Awaitable, Callable, Optional, Union
 
 from claude_agent_sdk import SdkMcpTool, tool
 
-from alice_core.config.personae import Personae
+from core.config.personae import Personae
 
 from ..domain.principals import AddressBook
 from ..infra.config import Config

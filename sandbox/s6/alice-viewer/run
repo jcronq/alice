@@ -13,4 +13,4 @@ set -e
 export PYTHONPATH=/home/alice/alice/src
 export PYTHONUNBUFFERED=1
 
-exec s6-setuidgid alice /opt/alice-venv/bin/python -m alice_viewer.main
+exec s6-setuidgid alice /opt/alice-venv/bin/python -m viewer.main

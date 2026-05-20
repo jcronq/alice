@@ -23,13 +23,13 @@ from __future__ import annotations
 import logging
 from typing import Iterable, Optional
 
-from alice_core.config.model import BackendSpec, ModelConfig
-from alice_core.config.model import load as load_model_config
-from alice_core.config.personae import Personae, PersonaeError
-from alice_core.config.personae import load as load_personae
-from alice_core.config.personae import placeholder as placeholder_personae
-from alice_prompts import DEFAULTS_DIR as PROMPT_DEFAULTS_DIR
-from alice_prompts import PromptLoader
+from core.config.model import BackendSpec, ModelConfig
+from core.config.model import load as load_model_config
+from core.config.personae import Personae, PersonaeError
+from core.config.personae import load as load_personae
+from core.config.personae import placeholder as placeholder_personae
+from prompts import DEFAULTS_DIR as PROMPT_DEFAULTS_DIR
+from prompts import PromptLoader
 
 from .infra.config import Config
 from .internal import (
@@ -83,7 +83,7 @@ def build_prompt_loader(cfg: Config, personae: Personae) -> PromptLoader:
     the wheel.
 
     Plan 05 Phase 3: ``context_defaults`` carries the resolved
-    ``agent`` / ``user`` mappings, so every ``alice_prompts.load(...)``
+    ``agent`` / ``user`` mappings, so every ``prompts.load(...)``
     call site picks them up automatically. Templates that reference
     ``{{ agent.name }}`` / ``{{ user.name }}`` (compaction, narrative,
     capability sheets, the new system_persona) substitute the real
@@ -122,12 +122,12 @@ def build_system_prompt(personae: Personae) -> str:
     """Render the ``meta.system_persona`` template into a string
     suitable for ``KernelSpec.append_system_prompt``.
 
-    Uses the package-level ``alice_prompts`` loader, which the daemon
+    Uses the package-level ``prompts`` loader, which the daemon
     has already pointed at this mind via :func:`build_prompt_loader`
-    + :func:`alice_prompts.set_default_loader`. So per-mind overrides
+    + :func:`prompts.set_default_loader`. So per-mind overrides
     of ``meta/system_persona.md.j2`` apply.
     """
-    from alice_prompts import load as load_prompt
+    from prompts import load as load_prompt
 
     return load_prompt("meta.system_persona", **personae.as_template_context())
 

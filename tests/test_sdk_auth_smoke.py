@@ -21,7 +21,7 @@ import os
 
 import pytest
 
-from alice_core.config.auth import ensure_auth_env
+from core.config.auth import ensure_auth_env
 
 
 MARKER = "SDK-AUTH-OK"
@@ -47,7 +47,7 @@ def test_sdk_auth_smoke() -> None:
             "or ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY)"
         )
 
-    from alice_prompts import load as load_prompt
+    from prompts import load as load_prompt
 
     async def go() -> str:
         opts = ClaudeAgentOptions(

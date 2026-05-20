@@ -15,7 +15,7 @@ import pathlib
 
 import pytest
 
-from alice_core.config.auth import (
+from core.config.auth import (
     ensure_auth_env,
     find_auth_env,
 )

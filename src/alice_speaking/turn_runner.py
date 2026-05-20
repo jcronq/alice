@@ -43,9 +43,9 @@ import logging
 import pathlib
 from typing import Any, Awaitable, Callable, Optional
 
-from alice_core.config.model import BackendSpec
-from alice_core.kernel import KernelSpec, NullHandler, make_kernel
-from alice_core.sdk_compat import (
+from core.config.model import BackendSpec
+from core.kernel import KernelSpec, NullHandler, make_kernel
+from core.sdk_compat import (
     looks_like_missing_session as _looks_like_missing_session,
 )
 

@@ -7,7 +7,7 @@ The active-mode prompt is built from two pieces:
    brittle (the bootstrap instruction can drift out of sync with
    mode/stage logic).
 2. The bootstrap body — a Jinja template at
-   ``alice_prompts/templates/thinking/wake.active.md.j2`` (Plan 04
+   ``prompts/templates/thinking/wake.active.md.j2`` (Plan 04
    Phase 6). The mind's ``inner/directive.md`` is injected as a
    template variable, not as part of the template, so the
    directive stays operator-edited while the bootstrap stays
@@ -55,7 +55,7 @@ def build_wake_prompt(
     and apply automatically (the wake's PromptLoader carries that
     path).
     """
-    from alice_prompts import load as load_prompt
+    from prompts import load as load_prompt
 
     directive_text = ""
     if directive_path is not None and directive_path.is_file():

@@ -4,12 +4,12 @@ The single canonical wrapper around ``gh issue create`` for issues
 Speaking files autonomously. Always call this instead of shelling out
 to ``gh issue create`` directly so the body picks up
 :data:`SELF_FILED_MARKER` — the marker the watcher
-(:mod:`alice_watchers.github`) keys off to suppress the redundant
+(:mod:`watchers.github`) keys off to suppress the redundant
 ``new_issue`` → thinking-analysis → attempt-issue-fix loop on Alice's
 own tickets (issue #226).
 
 The marker is duplicated as a constant in both modules deliberately:
-``alice_speaking`` and ``alice_watchers`` don't import each other in
+``alice_speaking`` and ``watchers`` don't import each other in
 the runtime, so a shared constant would mean a new shared module and
 extra import surface for one short string. The pair is covered by
 unit tests on both sides — if one drifts, the watcher test that round-
@@ -22,7 +22,7 @@ import subprocess
 from typing import Iterable
 
 
-# Keep in sync with ``alice_watchers.github.SELF_FILED_MARKER``.
+# Keep in sync with ``watchers.github.SELF_FILED_MARKER``.
 SELF_FILED_MARKER = "<!-- alice-self-filed -->"
 
 

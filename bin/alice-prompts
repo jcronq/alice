@@ -12,7 +12,7 @@
 #
 # Runs from the host's editable venv (the one used for tests).
 # Inside the worker container the same module is invokable as
-#   /opt/alice-venv/bin/python -m alice_prompts.cli <args>
+#   /opt/alice-venv/bin/python -m prompts.cli <args>
 #
 # We pick a Python interpreter the same way bin/alice-think does:
 # venv first, fall back to system python3 if the user runs this on
@@ -31,4 +31,4 @@ else
 fi
 
 export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$ALICE_ROOT/src"
-exec "$PY" -m alice_prompts.cli "$@"
+exec "$PY" -m prompts.cli "$@"

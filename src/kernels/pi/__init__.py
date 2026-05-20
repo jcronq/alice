@@ -2,13 +2,13 @@
 
 Public API:
 
-- :class:`PiKernel` — implements :class:`alice_core.kernel.Kernel`
+- :class:`PiKernel` — implements :class:`core.kernel.Kernel`
   by spawning the ``pi`` Node binary with ``--mode json`` and
   translating its JSONL event stream to backend-agnostic handler
   calls + a :class:`KernelResult`.
 
 Agent code never imports this directly — use
-:func:`alice_core.kernel.factory.make_kernel` with
+:func:`core.kernel.factory.make_kernel` with
 ``BackendSpec(backend="pi")``.
 """
 

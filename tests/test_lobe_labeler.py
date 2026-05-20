@@ -1,4 +1,4 @@
-"""Unit tests for ``alice_viewer.lobe_labeler``.
+"""Unit tests for ``viewer.lobe_labeler``.
 
 The Qwen call is never exercised — every test passes a stub via
 ``llm_call`` so we don't depend on the LAN endpoint or google-adk
@@ -12,7 +12,7 @@ import pathlib
 
 import pytest
 
-from alice_viewer import lobe_labeler
+from viewer import lobe_labeler
 
 
 # ---------------------------------------------------------------------------

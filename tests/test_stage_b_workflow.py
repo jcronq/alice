@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from alice_core.events import CapturingEmitter
+from core.events import CapturingEmitter
 
 from alice_thinking.workflows.stage_b import (
     AppendToDaily,

@@ -14,7 +14,7 @@ Skills today are **markdown files in a directory the runtime cannot
 see**. They work, but only because Claude Code's CLI auto-discovers
 `<cwd>/.claude/skills/<name>/SKILL.md` files and exposes them to the
 agent. The Alice runtime — `alice_speaking`, `alice_thinking`,
-`alice_viewer`, `alice_watchers` — does not know skills exist.
+`viewer`, `watchers` — does not know skills exist.
 
 Concretely:
 
@@ -182,12 +182,12 @@ After this plan:
 
 ## Design
 
-### `src/alice_skills/` package
+### `src/skills/` package
 
 A new top-level package. Layout:
 
 ```
-src/alice_skills/
+src/skills/
 ├── __init__.py                # public API: load_registry(), Skill, ScopeError
 ├── registry.py                # SkillRegistry class
 ├── skill.py                   # Skill dataclass + frontmatter parsing
@@ -317,7 +317,7 @@ add explicit `scope:` over time.
 
 The SDK doesn't emit a "skill loaded" event the runtime can hook
 directly. Instead, the speaking daemon's `BlockHandler` (the kernel
-observer pattern from `alice_core.kernel`) intercepts the agent's
+observer pattern from `core.kernel`) intercepts the agent's
 `Read` tool calls against `.claude/skills/<name>/SKILL.md`. When the
 agent reads a SKILL.md, that's a strong signal she's about to invoke
 that skill. The handler emits `skill_invoked: <name>`.
@@ -456,13 +456,13 @@ README that subagents inherit unless the skill says otherwise.
 Nothing uses the registry yet.
 
 **Changes:**
-- `src/alice_skills/` package with `skill.py`, `registry.py`,
+- `src/skills/` package with `skill.py`, `registry.py`,
   `discovery.py`, `__init__.py`.
 - `Skill.parse()` reads frontmatter (already YAML), validates
   required fields, captures body.
 - `SkillRegistry` walks the search paths, resolves overrides,
   exposes `all()` / `for_hemisphere()` / `find()`.
-- `pyproject.toml`: `"src/alice_skills"` in
+- `pyproject.toml`: `"src/skills"` in
   `[tool.hatch.build.targets.wheel].packages`.
 
 **Validation:** `tests/test_skills.py`:
@@ -621,7 +621,7 @@ Viewer renders it.
 - Provider adapter (Claude Agent SDK) intercepts `Read` tool calls
   whose target matches a skill's `source_path` and emits
   `skill_invoked: <skill name>`.
-- `alice_core.events` documents the new event type.
+- `core.events` documents the new event type.
 - Viewer's `aggregators.py` adds a `skill_invocations` view.
 - `bin/alice skills history --since=24h` queries the event log.
 
@@ -646,7 +646,7 @@ override individual skills.
   to ship as a default — it's not part of the scaffold seed but a
   runtime-default skill.
 - (Or keep `templates/mind-scaffold` as the seed and introduce a
-  new `src/alice_skills/defaults/` directory — see open questions.)
+  new `src/skills/defaults/` directory — see open questions.)
 - `SkillRegistry` registers the runtime-default search path with
   the lowest priority.
 - The mind's `.claude/skills/` continues to override.
@@ -818,7 +818,7 @@ merges) and fails loudly if production routing diverges.
      the rest of the scaffold; matches existing convention. **But:**
      scaffold files seed a *new* mind; defaults that should override-
      into existing minds need a different home.
-   - `src/alice_skills/defaults/` — clearly a runtime concern, separate
+   - `src/skills/defaults/` — clearly a runtime concern, separate
      from scaffolding. **Recommended.**
    - Both — scaffold has its seed, runtime has its defaults. Probably
      overkill.
@@ -845,7 +845,7 @@ merges) and fails loudly if production routing diverges.
 
 5. **Where do skill telemetry events sit relative to `kernel`
    events?**
-   Same channel. `alice_core.events.EventEmitter` already handles
+   Same channel. `core.events.EventEmitter` already handles
    the structured event log. Add a `skill_invoked` event type with
    `skill_name`, `correlation_id`, optional `match_confidence`.
 
@@ -884,7 +884,7 @@ merges) and fails loudly if production routing diverges.
    the scaffold copy, which is priority 1 once `alice-init` runs).
    That replays the same anti-pattern as `templates/mind-scaffold/HEMISPHERES.md`:
    user scaffolds once, freezes a copy, and the runtime can never
-   push updates. **Phase 6 must commit to `src/alice_skills/defaults/`
+   push updates. **Phase 6 must commit to `src/skills/defaults/`
    as the source of runtime defaults**, never `templates/mind-scaffold/.claude/skills/`.
    Mind-scaffold may seed user-editable starter skills (e.g.
    `log-journal`); those are for the user to keep or delete.

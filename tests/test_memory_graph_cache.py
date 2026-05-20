@@ -19,7 +19,7 @@ import pathlib
 
 import pytest
 
-from alice_viewer import sources
+from viewer import sources
 
 
 @pytest.fixture(autouse=True)

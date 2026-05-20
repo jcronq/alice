@@ -25,7 +25,7 @@ from typing import Any
 
 import pytest
 
-from alice_core.events import CapturingEmitter
+from core.events import CapturingEmitter
 from alice_thinking import wake_hooks
 from alice_thinking.phase import Phase
 

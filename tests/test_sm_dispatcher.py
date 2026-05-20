@@ -1,4 +1,4 @@
-"""Tests for ``alice_sm.dispatcher`` — the v0 State Machine dispatcher.
+"""Tests for ``sm.dispatcher`` — the v0 State Machine dispatcher.
 
 Exercised end-to-end with injectable ``list_issues`` / ``post_comment``
 callables in place of the ``gh`` CLI. Covers the v0 contract:
@@ -19,7 +19,7 @@ import subprocess
 
 import pytest
 
-from alice_sm import dispatcher as sm
+from sm import dispatcher as sm
 
 
 # ---------------------------------------------------------------------------
@@ -2837,11 +2837,11 @@ def test_verify_viewer_route_pass_passes_through(state_path: pathlib.Path) -> No
     issues = [_make_issue(200, sm_labels=("sm:reviewing",))]
 
     def pr_files(_repo: str, _n: int) -> list[str]:
-        return ["src/alice_viewer/main.py", "tests/test_viewer_x.py"]
+        return ["src/viewer/main.py", "tests/test_viewer_x.py"]
 
     def verifier(pr_number: int, files: list[str]) -> dict:
         assert pr_number == 200
-        assert "src/alice_viewer/main.py" in files
+        assert "src/viewer/main.py" in files
         return {
             "outcome": "pass",
             "reason": "viewer marker present",
@@ -2909,7 +2909,7 @@ def test_verify_skip_when_no_viewer_files_still_transitions(
     issues = [_make_issue(201, sm_labels=("sm:reviewing",))]
 
     def pr_files(_repo: str, _n: int) -> list[str]:
-        return ["src/alice_sm/dispatcher.py", "tests/test_sm_dispatcher.py"]
+        return ["src/sm/dispatcher.py", "tests/test_sm_dispatcher.py"]
 
     # Verifier returns skip — its decision, not the dispatcher's.
     def verifier(_pr: int, _files: list[str]) -> dict:
@@ -2956,7 +2956,7 @@ def test_verify_failed_halts_at_reviewing(state_path: pathlib.Path) -> None:
     issues = [_make_issue(202, sm_labels=("sm:reviewing",))]
 
     def pr_files(_repo: str, _n: int) -> list[str]:
-        return ["src/alice_viewer/main.py"]
+        return ["src/viewer/main.py"]
 
     def verifier(_pr: int, _files: list[str]) -> dict:
         return {
@@ -3005,7 +3005,7 @@ def test_verify_failed_dedup_does_not_spam(state_path: pathlib.Path) -> None:
     issues = [_make_issue(203, sm_labels=("sm:reviewing",))]
 
     def pr_files(_repo: str, _n: int) -> list[str]:
-        return ["src/alice_viewer/main.py"]
+        return ["src/viewer/main.py"]
 
     def verifier(_pr: int, _files: list[str]) -> dict:
         return {"outcome": "fail", "reason": "viewer probe timeout", "route": None}
@@ -3074,7 +3074,7 @@ def test_verifier_exception_treated_as_failed(state_path: pathlib.Path) -> None:
     issues = [_make_issue(204, sm_labels=("sm:reviewing",))]
 
     def pr_files(_repo: str, _n: int) -> list[str]:
-        return ["src/alice_viewer/main.py"]
+        return ["src/viewer/main.py"]
 
     def verifier(_pr: int, _files: list[str]) -> dict:
         raise RuntimeError("network on fire")
@@ -3122,7 +3122,7 @@ def test_verify_disabled_via_kwarg_skips_gate(state_path: pathlib.Path) -> None:
 
     def pr_files(_repo: str, _n: int) -> list[str]:
         sentinel.append("pr_files")
-        return ["src/alice_viewer/main.py"]
+        return ["src/viewer/main.py"]
 
     def verifier(_pr: int, _files: list[str]) -> dict:
         sentinel.append("verifier")
@@ -3167,7 +3167,7 @@ def test_verify_recovery_clears_state_ledger(state_path: pathlib.Path) -> None:
     ])
 
     def pr_files(_repo: str, _n: int) -> list[str]:
-        return ["src/alice_viewer/main.py"]
+        return ["src/viewer/main.py"]
 
     def verifier(_pr: int, _files: list[str]) -> dict:
         return next(outcomes)
@@ -3268,7 +3268,7 @@ def test_verify_viewer_route_connection_refused_is_fail() -> None:
 def test_default_verifier_skips_when_no_viewer_files() -> None:
     verdict = sm.default_verifier(
         99,
-        ["src/alice_sm/dispatcher.py"],
+        ["src/sm/dispatcher.py"],
         viewer_url="http://unused/",
         viewer_marker="</html>",
         http_get=lambda _u: (_ for _ in ()).throw(AssertionError("must not call")),
@@ -3286,7 +3286,7 @@ def test_default_verifier_runs_recipe_when_viewer_files_present() -> None:
 
     verdict = sm.default_verifier(
         99,
-        ["src/alice_viewer/templates/timeline.html"],
+        ["src/viewer/templates/timeline.html"],
         viewer_url="http://probe/",
         viewer_marker="</html>",
         http_get=fake_get,
@@ -3311,7 +3311,7 @@ def test_verify_env_kill_switch_disables_default_verifier(
 
     def pr_files(_repo: str, _n: int) -> list[str]:
         sentinel.append("pr_files")
-        return ["src/alice_viewer/main.py"]
+        return ["src/viewer/main.py"]
 
     def verifier(_pr: int, _files: list[str]) -> dict:
         sentinel.append("verifier")
@@ -3383,14 +3383,14 @@ def test_gh_get_pr_files_parses_payload(monkeypatch: pytest.MonkeyPatch) -> None
         assert "files" in args[args.index("--json") + 1].split(",")
         return json.dumps({
             "files": [
-                {"path": "src/alice_viewer/main.py"},
+                {"path": "src/viewer/main.py"},
                 {"path": "tests/test_x.py"},
             ]
         })
 
     monkeypatch.setattr(sm, "_run_gh", fake_run_gh)
     out = sm.gh_get_pr_files("jcronq/alice", 200)
-    assert out == ["src/alice_viewer/main.py", "tests/test_x.py"]
+    assert out == ["src/viewer/main.py", "tests/test_x.py"]
 
 
 # ---------------------------------------------------------------------------
@@ -5797,7 +5797,7 @@ def test_thinking_spawn_writes_correctly_formed_spawn_dir(tmp_path) -> None:
 
 
 def test_thinking_spawn_invokes_python_shim_with_args(tmp_path) -> None:
-    """Popen is called with the venv python + ``-m alice_sm.thinking_shim``
+    """Popen is called with the venv python + ``-m sm.thinking_shim``
     + spawn-dir + session-id + mode=design, detached via
     ``start_new_session=True``."""
     spawn_dir = tmp_path / "thinking-spawns"
@@ -5828,7 +5828,7 @@ def test_thinking_spawn_invokes_python_shim_with_args(tmp_path) -> None:
     assert len(popens) == 1
     cmd = popens[0].args
     assert cmd[0] == "/opt/alice-venv/bin/python"
-    assert cmd[1:3] == ["-m", "alice_sm.thinking_shim"]
+    assert cmd[1:3] == ["-m", "sm.thinking_shim"]
     # --spawn-dir / --session-id / --mode passed through. The shim
     # contract (sub-issue 3) consumes these.
     assert "--spawn-dir" in cmd
@@ -6008,7 +6008,7 @@ def test_thinking_spawn_dir_is_separate_from_worker_default() -> None:
 
 def test_thinking_spawn_started_prefix_distinct_from_worker_prefix() -> None:
     """The audit prefixes are distinct so the comments dedup module
-    (centralized in alice_sm.comments per sub-issue 5) can disambiguate."""
+    (centralized in sm.comments per sub-issue 5) can disambiguate."""
     assert sm.THINKING_SPAWN_STARTED_PREFIX == "[SM] thinking-spawn-started"
     assert sm.SPAWN_STARTED_PREFIX == "[SM] spawn-started"
     assert sm.THINKING_SPAWN_STARTED_PREFIX != sm.SPAWN_STARTED_PREFIX
@@ -6119,7 +6119,7 @@ def test_thinking_shim_module_is_importable_and_exits_cleanly() -> None:
     replaces this with the real PhaseRunner dispatch."""
     import importlib
 
-    shim = importlib.import_module("alice_sm.thinking_shim")
+    shim = importlib.import_module("sm.thinking_shim")
     assert hasattr(shim, "main")
 
 
@@ -6127,7 +6127,7 @@ def test_thinking_shim_main_exits_zero_with_valid_args(tmp_path) -> None:
     """Calling thinking_shim.main with a valid --spawn-dir / --session-id
     / --mode returns 0 (placeholder behavior — sub-issue 3 swaps in the
     real entrypoint)."""
-    from alice_sm import thinking_shim
+    from sm import thinking_shim
 
     spawn_dir = tmp_path / "spawn-dir"
     spawn_dir.mkdir()
@@ -6148,7 +6148,7 @@ def test_thinking_shim_main_exits_zero_with_valid_args(tmp_path) -> None:
 def test_thinking_shim_main_exits_nonzero_when_prompt_missing(tmp_path) -> None:
     """A spawn dir without ``prompt.txt`` is malformed → the shim exits
     non-zero so the reaper sees a clean failure."""
-    from alice_sm import thinking_shim
+    from sm import thinking_shim
 
     spawn_dir = tmp_path / "spawn-dir"
     spawn_dir.mkdir()
@@ -6240,7 +6240,7 @@ def test_speaking_spawn_writes_correctly_formed_spawn_dir(tmp_path) -> None:
 
 
 def test_speaking_spawn_invokes_python_shim_with_args(tmp_path) -> None:
-    """Popen is called with the venv python + ``-m alice_sm.speaking_shim``
+    """Popen is called with the venv python + ``-m sm.speaking_shim``
     + spawn-dir + session-id + mode=build, detached via
     ``start_new_session=True``."""
     spawn_dir = tmp_path / "speaking-spawns"
@@ -6271,7 +6271,7 @@ def test_speaking_spawn_invokes_python_shim_with_args(tmp_path) -> None:
     assert len(popens) == 1
     cmd = popens[0].args
     assert cmd[0] == "/opt/alice-venv/bin/python"
-    assert cmd[1:3] == ["-m", "alice_sm.speaking_shim"]
+    assert cmd[1:3] == ["-m", "sm.speaking_shim"]
     # --spawn-dir / --session-id / --mode passed through.
     assert "--spawn-dir" in cmd
     assert "--session-id" in cmd
@@ -6586,14 +6586,14 @@ def test_speaking_shim_module_is_importable_and_exits_cleanly() -> None:
     dispatch + Task-tool sub-agent invocation."""
     import importlib
 
-    shim = importlib.import_module("alice_sm.speaking_shim")
+    shim = importlib.import_module("sm.speaking_shim")
     assert hasattr(shim, "main")
 
 
 def test_speaking_shim_main_exits_zero_with_valid_args(tmp_path) -> None:
     """Calling speaking_shim.main with a valid --spawn-dir / --session-id
     / --mode returns 0 (placeholder behavior)."""
-    from alice_sm import speaking_shim
+    from sm import speaking_shim
 
     spawn_dir = tmp_path / "spawn-dir"
     spawn_dir.mkdir()
@@ -6614,7 +6614,7 @@ def test_speaking_shim_main_exits_zero_with_valid_args(tmp_path) -> None:
 def test_speaking_shim_main_exits_nonzero_when_prompt_missing(tmp_path) -> None:
     """A spawn dir without ``prompt.txt`` is malformed → the shim exits
     non-zero so the reaper sees a clean failure."""
-    from alice_sm import speaking_shim
+    from sm import speaking_shim
 
     spawn_dir = tmp_path / "spawn-dir"
     spawn_dir.mkdir()
@@ -6861,7 +6861,7 @@ def test_reviewing_pr_conflicting_tier2_spawns_on_rebase_failure(
     def attempt_rebase(_branch: str) -> dict:
         return {
             "ok": False,
-            "reason": "auto-rebase failed at src/alice_sm/dispatcher.py",
+            "reason": "auto-rebase failed at src/sm/dispatcher.py",
         }
 
     def spawn_rebase(
@@ -6896,7 +6896,7 @@ def test_reviewing_pr_conflicting_tier2_spawns_on_rebase_failure(
             173,
             "jcronq/alice",
             "feat/work-173",
-            "auto-rebase failed at src/alice_sm/dispatcher.py",
+            "auto-rebase failed at src/sm/dispatcher.py",
         )
     ]
     # ``[SM] rebase-needed`` audit comment was posted.
@@ -6904,7 +6904,7 @@ def test_reviewing_pr_conflicting_tier2_spawns_on_rebase_failure(
     assert len(bodies) == 1
     assert bodies[0].startswith(sm.REBASE_NEEDED_PREFIX)
     assert "branch=feat/work-173" in bodies[0]
-    assert 'reason="auto-rebase failed at src/alice_sm/dispatcher.py"' in bodies[0]
+    assert 'reason="auto-rebase failed at src/sm/dispatcher.py"' in bodies[0]
     # Label/close untouched — the rebase spawn handles the next move.
     assert label_rec.calls == []
     assert close_rec.closed == []
@@ -7184,7 +7184,7 @@ def test_attempt_auto_rebase_aborts_on_conflict(
     calls: list[list[str]] = []
     rebase_stderr = (
         "Auto-merging dispatcher.py\n"
-        "CONFLICT (content): Merge conflict in src/alice_sm/dispatcher.py\n"
+        "CONFLICT (content): Merge conflict in src/sm/dispatcher.py\n"
     )
 
     def fake_git(args: list[str], _cwd: pathlib.Path) -> subprocess.CompletedProcess:
@@ -7204,7 +7204,7 @@ def test_attempt_auto_rebase_aborts_on_conflict(
     )
 
     assert result["ok"] is False
-    assert "src/alice_sm/dispatcher.py" in result["reason"]
+    assert "src/sm/dispatcher.py" in result["reason"]
     assert ["rebase", "--abort"] in calls
     assert ["checkout", "master"] in calls
 
@@ -7466,7 +7466,7 @@ def test_open_done_research_note_closes_on_worker_transition_audit_comment(
 
     The research-writer worker is instructed (per the
     ``(sm:selected, art:research_note)`` dispatch row in
-    :data:`alice_sm.dispatcher.SPAWN_ARTIFACT_HANDLERS`) to post a
+    :data:`sm.dispatcher.SPAWN_ARTIFACT_HANDLERS`) to post a
     ``[SM] transition from=selected to=done reason="research note at
     <path>"`` audit comment when it finishes. Pre-#195 the dispatcher's
     close-path only accepted the never-emitted

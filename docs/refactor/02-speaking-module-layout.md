@@ -60,7 +60,7 @@ After this plan:
   with `transports/signal.py`.
 - `_sanity.py` lives somewhere appropriate to a smoke test.
 - Existing imports in code outside `alice_speaking` (notably:
-  `alice_thinking`, `alice_viewer`, the `bin/` scripts, `tests/`) are
+  `alice_thinking`, `viewer`, the `bin/` scripts, `tests/`) are
   preserved by **temporary re-export shims** during the refactor and
   cleaned up before the plan closes.
 - All tests pass after every phase. No behavior change.
@@ -186,7 +186,7 @@ External callers today (verified by grep, see Phase 0 below):
   speaking-side concerns (the agent's outbound capabilities during a
   speaking turn). Keep them under `alice_speaking/`.
 
-- **Use `core/` instead of `infra/`.** Rejected because `alice_core/` is
+- **Use `core/` instead of `infra/`.** Rejected because `core/` is
   already a sibling top-level package. Two `core/` directories invite
   confusion.
 
@@ -204,10 +204,10 @@ this plan.)
 
 **The grep commands to run:**
 ```
-grep -rn "from alice_speaking\." src/alice_thinking/ src/alice_viewer/ \
-    src/alice_watchers/ tests/ bin/
-grep -rn "import alice_speaking" src/alice_thinking/ src/alice_viewer/ \
-    src/alice_watchers/ tests/ bin/
+grep -rn "from alice_speaking\." src/alice_thinking/ src/viewer/ \
+    src/watchers/ tests/ bin/
+grep -rn "import alice_speaking" src/alice_thinking/ src/viewer/ \
+    src/watchers/ tests/ bin/
 # Also ad-hoc imports from skills/hooks running Python:
 grep -rn "alice_speaking" data/alice-mind/.claude/ data/alice-mind/scripts/ \
     data/alice-tools/
@@ -292,7 +292,7 @@ tests/test_daemon.py` plus full `pytest`.
 ### Phase 4 — Update internal imports to new paths
 
 **Goal:** Every import inside `alice_speaking/` uses the new paths.
-Sibling packages (`alice_thinking`, `alice_viewer`) and tests keep using
+Sibling packages (`alice_thinking`, `viewer`) and tests keep using
 the public root-level paths via shims.
 
 **Changes:**
@@ -361,12 +361,12 @@ with `-W error::DeprecationWarning`.
 
 ### Phase 7 — Migrate sibling-package + test imports; drop shims
 
-**Goal:** Update `alice_thinking`, `alice_viewer`, `bin/`, and `tests/` to
+**Goal:** Update `alice_thinking`, `viewer`, `bin/`, and `tests/` to
 use the new paths. Remove the shims.
 
 **Changes:**
-- `grep -rn "from alice_speaking\." src/alice_thinking/ src/alice_viewer/
-  src/alice_watchers/ tests/ bin/` to find every callsite.
+- `grep -rn "from alice_speaking\." src/alice_thinking/ src/viewer/
+  src/watchers/ tests/ bin/` to find every callsite.
 - Rewrite each to the new path.
 - Delete the shim files (`alice_speaking/compaction.py`, `dedup.py`,
   `quiet_hours.py`, `handlers.py`, `principals.py`, `render.py`,
@@ -414,11 +414,11 @@ the entire suite. Nothing should fail at any point.
   it somewhere. Don't — it's a domain noun and it'll grow.
 
 - **`handlers.py` is `BlockHandler` implementations** (per
-  `alice_core.kernel`'s observer protocol), which is *pipeline*
+  `core.kernel`'s observer protocol), which is *pipeline*
   conceptually but lives in `alice_speaking` because the handlers
   are speaking-side (session persistence, compaction-armer, missed-
   reply detector). This is correct; don't try to push them into
-  `alice_core/`.
+  `core/`.
 
 - **Deprecation warnings noise.** Phase 6 adds `DeprecationWarning`
   emission on shim imports. This will spam during Phase 6/7 before
@@ -438,8 +438,8 @@ the entire suite. Nothing should fail at any point.
   during phases 1-6.
 - **Not splitting `tools/`** — already its own subpackage.
 - **Not moving anything between `alice_speaking` and other top-level
-  packages** (`alice_core`, `alice_thinking`, `alice_viewer`,
-  `alice_watchers`).
+  packages** (`core`, `alice_thinking`, `viewer`,
+  `watchers`).
 - **Not introducing `__all__` or other re-export ceremony** beyond what's
   already there.
 
@@ -454,7 +454,7 @@ the entire suite. Nothing should fail at any point.
      bin entry to maintain.
 
 2. **Should we use `core/` or `infra/`?**
-   `core/` clashes with the top-level `alice_core` package. `infra/` is
+   `core/` clashes with the top-level `core` package. `infra/` is
    slightly clinical but unambiguous. **Recommendation: `infra/`.**
 
 3. **Should we promote `pyproject.toml`'s `[tool.hatch.build.targets.wheel]`

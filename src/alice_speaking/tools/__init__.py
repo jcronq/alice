@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 from claude_agent_sdk import McpSdkServerConfig, create_sdk_mcp_server
 
-from alice_core.config.personae import Personae, placeholder as placeholder_personae
+from core.config.personae import Personae, placeholder as placeholder_personae
 
 from ..domain.principals import AddressBook
 from ..infra.config import Config
@@ -118,7 +118,7 @@ def build(
     daemon can track whether a turn produced any outbound (missed_reply
     detection).
 
-    ``personae`` is an :class:`alice_core.config.personae.Personae`; its
+    ``personae`` is an :class:`core.config.personae.Personae`; its
     agent + user names interpolate into tool descriptions (Plan 05 Phase 5).
     Defaults to the placeholder personae so existing callers (tests, the
     think-hemisphere harness) don't have to load one.

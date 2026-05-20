@@ -80,7 +80,7 @@ class Phase(enum.Enum):
     # Per-issue, stimulus-spawned modes (sub-issue 3 of SM v2 pipeline
     # revision, ``[[2026-05-13-sm-v2-pipeline-revision]]``). The
     # thinking-agent is spawned by
-    # :func:`alice_sm.dispatcher.spawn_thinking_agent` to handle one
+    # :func:`sm.dispatcher.spawn_thinking_agent` to handle one
     # ``(sm:selected, art:code)`` issue end-to-end: design first, then
     # — after Speaking's review + a compaction step — build. Both
     # phases share the spawn dir; the entrypoint script

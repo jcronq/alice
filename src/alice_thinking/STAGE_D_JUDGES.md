@@ -8,7 +8,7 @@ Design source of truth:
 - `cortex-memory/research/2026-05-08-stage-d-dual-judge-protocol.md` (§2.3 reassess loop)
 - `cortex-memory/research/2026-05-09-stage-d-judge-prompts.md` (per-model prompts)
 - `cortex-memory/research/2026-05-09-stage-d-labeling-pipeline.md` (firehose log)
-- Receive-side schema: `src/alice_viewer/STAGE_D_SCHEMA.md`
+- Receive-side schema: `src/viewer/STAGE_D_SCHEMA.md`
 
 ## Modules
 
@@ -142,7 +142,7 @@ slug filled in. Idempotent; no-op if the id isn't found.
 - Encoding: UTF-8, no BOM, line-delimited JSON, no trailing comma.
 - Atomic: per-line append within typical sizes (< pipe buffer). The
   writer opens, writes, flushes, closes per line.
-- Schema: matches `src/alice_viewer/STAGE_D_SCHEMA.md` field-for-field —
+- Schema: matches `src/viewer/STAGE_D_SCHEMA.md` field-for-field —
   `id`, `pair`, `synthesis_text`, `draft_attempt_n`, `qwen_verdict`,
   `haiku_verdict`, `outcome`, `retry_history`, `created_at`,
   `shipped_slug`. `Verdict.novel` is emitted as a bool (the schema doc

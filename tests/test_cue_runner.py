@@ -1256,7 +1256,7 @@ def _make_links_db_inplace(
     """Add a ``links`` table to an existing DB and seed it with
     ``(source_slug, target_slug, is_structural)`` rows, all resolved=1.
 
-    Shape mirrors :mod:`alice_indexer.build_index` — source_slug,
+    Shape mirrors :mod:`indexer.build_index` — source_slug,
     target_slug, is_structural (0/1), resolved (0/1).
     """
     conn = sqlite3.connect(str(path))

@@ -88,10 +88,10 @@ services:
       # Hot-reload on bind-mounted Python source changes — keeps the
       # viewer in parity with the worker, where `alice-reload-watcher`
       # already re-execs alice-speaking on source edits. Scoped to
-      # src/alice_viewer/ inside the run() entrypoint. Issue #130.
+      # src/viewer/ inside the run() entrypoint. Issue #130.
       ALICE_VIEWER_RELOAD: "1"
       # Opt into LLM-derived display labels for memory-graph lobes
-      # (alice_viewer.lobe_labeler). Cached in registry.json keyed on
+      # (viewer.lobe_labeler). Cached in registry.json keyed on
       # member-set signature, so flipping this on doesn't burn tokens
       # on every page load — only on minted/drifted lobes.
       ALICE_LOBE_LLM_LABELS: "1"

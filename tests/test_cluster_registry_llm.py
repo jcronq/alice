@@ -1,4 +1,4 @@
-"""Tests for the LLM-label hooks added to ``alice_viewer.cluster_registry``.
+"""Tests for the LLM-label hooks added to ``viewer.cluster_registry``.
 
 Covers three behaviours:
 
@@ -11,7 +11,7 @@ Covers three behaviours:
 
 from __future__ import annotations
 
-from alice_viewer import cluster_registry
+from viewer import cluster_registry
 
 
 def _empty_prev() -> dict:

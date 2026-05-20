@@ -7,7 +7,7 @@ reassess protocol from
 and the firehose-logging directive from
 ``cortex-memory/research/2026-05-09-stage-d-labeling-pipeline.md`` (§8).
 
-Outcomes (mirrors :file:`src/alice_viewer/STAGE_D_SCHEMA.md`):
+Outcomes (mirrors :file:`src/viewer/STAGE_D_SCHEMA.md`):
 
 - ``shipped`` — both judges agree ``ship`` on some attempt.
 - ``dropped_agreement_reject`` — both judges agree ``reject`` on the
@@ -25,7 +25,7 @@ JSONL contract:
   just per pipeline run. Firehose, not sampling.
 - File is opened ``mode='a'``, line written + flushed, file closed.
   Append-on-line is atomic for typical line sizes (< pipe buffer).
-- Schema matches :file:`src/alice_viewer/STAGE_D_SCHEMA.md` field-for-field.
+- Schema matches :file:`src/viewer/STAGE_D_SCHEMA.md` field-for-field.
 - ``shipped_slug`` is ``None`` when the pipeline returns; the caller
   writes the vault note and is expected to update the most recent JSONL
   line with the slug. See :func:`update_shipped_slug` for the helper.
@@ -93,7 +93,7 @@ DEFAULT_VAULT_ROOT = pathlib.Path.home() / "alice-mind/cortex-memory"
 class AttemptRecord:
     """One Stage D pipeline run's final state.
 
-    Fields match :file:`src/alice_viewer/STAGE_D_SCHEMA.md`. The pipeline
+    Fields match :file:`src/viewer/STAGE_D_SCHEMA.md`. The pipeline
     writes one JSONL line per attempt during the run; this record
     represents the final run-level state the caller sees.
     """

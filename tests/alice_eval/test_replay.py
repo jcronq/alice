@@ -15,8 +15,8 @@ from pathlib import Path
 import httpx
 import pytest
 
-from alice_eval import replay
-from alice_eval.replay import Candidate, ReplayResult
+from eval import replay
+from eval.replay import Candidate, ReplayResult
 
 
 @pytest.fixture

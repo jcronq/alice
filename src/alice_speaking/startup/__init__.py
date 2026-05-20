@@ -18,7 +18,7 @@ fresh install with no mind data still boots:
 - :class:`MesoStateStartup` — load ``memory/fitness/MESO-STATE.md``
   (when present).
 - :class:`CortexIndexFreshnessStartup` — rebuild the FTS index
-  via ``alice_core.cortex_index`` if stale.
+  via ``core.cortex_index`` if stale.
 
 Plan 04's cue runner will add a ``CortexL1Startup`` here once the
 prompt-template loader lands.

@@ -1,4 +1,4 @@
-"""Phase A of the personae plan: ``alice_core.config.personae``.
+"""Phase A of the personae plan: ``core.config.personae``.
 
 Covers the loader's parsing surface end-to-end:
 
@@ -19,7 +19,7 @@ import pathlib
 import pytest
 import yaml
 
-from alice_core.config.personae import (
+from core.config.personae import (
     AgentPersona,
     Personae,
     PersonaeError,
@@ -159,7 +159,7 @@ def test_system_persona_template_renders_with_personae() -> None:
     """The meta.system_persona template renders cleanly given a
     full Personae's context. Smoke-checks the template + loader
     integration end-to-end."""
-    from alice_prompts import load as load_prompt
+    from prompts import load as load_prompt
 
     p = Personae(
         agent=AgentPersona(

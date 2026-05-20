@@ -1,7 +1,7 @@
 # Stage B → google-adk workflow — sketch
 
 > **status:** active. Speaking-side draft 2026-05-08, after PR #18 landed
-> the first stable-script-in-code pattern (alice_metrics.vault_health).
+> the first stable-script-in-code pattern (metrics.vault_health).
 > The ADK port (this PR) supersedes the native-Python prototype in
 > the now-closed PR #19.
 

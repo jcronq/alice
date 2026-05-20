@@ -16,8 +16,8 @@ import os
 import pathlib
 import time
 
-from alice_viewer import aggregators, sources
-from alice_viewer.settings import Paths
+from viewer import aggregators, sources
+from viewer.settings import Paths
 
 
 def _paths(tmp_path: pathlib.Path) -> Paths:

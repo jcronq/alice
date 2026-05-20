@@ -18,7 +18,7 @@ set -u
 
 VENV_PY="/opt/alice-venv/bin/python"
 # Monorepo root is bind-mounted at /home/alice/alice; src/ holds all four
-# packages (alice_core, alice_speaking, alice_thinking, alice_viewer).
+# packages (core, alice_speaking, alice_thinking, viewer).
 ALICE_SRC="${ALICE_SRC:-/home/alice/alice/src}"
 
 # Outer timeout (Phase 1 of wake-robustness design — see issue #105 and

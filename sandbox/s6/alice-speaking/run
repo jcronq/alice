@@ -30,7 +30,7 @@ fi
 
 export ALICE_CONFIG=/home/alice/.config/alice/alice.env
 # Monorepo root bind-mounted at /home/alice/alice — src/ holds all Python
-# packages (alice_core, alice_speaking, alice_thinking, alice_viewer).
+# packages (core, alice_speaking, alice_thinking, viewer).
 export PYTHONPATH=/home/alice/alice/src
 # Unbuffered stdout so s6 can see logs in real time.
 export PYTHONUNBUFFERED=1

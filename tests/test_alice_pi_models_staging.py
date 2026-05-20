@@ -13,8 +13,8 @@ from unittest import mock
 
 import pytest
 
-from alice_core.events import CapturingEmitter
-from alice_core.kernel import KernelSpec
+from core.events import CapturingEmitter
+from core.kernel import KernelSpec
 from kernels.pi import models_staging
 from kernels.pi.kernel import PiKernel
 from kernels.pi.models_staging import ensure_pi_models_json

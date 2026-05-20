@@ -1,9 +1,9 @@
-"""Tests for :mod:`alice_sm.comments` — the ``[SM]`` comment-shape parsers.
+"""Tests for :mod:`sm.comments` — the ``[SM]`` comment-shape parsers.
 
 Each parser gets a happy-path test and a malformed-comment matrix
 (missing fields, malformed wikilink, unknown verdict, untrusted author,
 trailing junk). Verdict resolution is exercised via the
-:func:`alice_sm.comments.parse_comment` dispatch wrapper.
+:func:`sm.comments.parse_comment` dispatch wrapper.
 
 Malformed comments must return ``None`` AND log a defensive warning; the
 log assertions use an injectable ``log`` callable so the test doesn't
@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import pytest
 
-from alice_sm import comments as cm
-from alice_sm.dispatcher import ART_LABEL_WHITELIST
+from sm import comments as cm
+from sm.dispatcher import ART_LABEL_WHITELIST
 
 
 # ---------------------------------------------------------------------------

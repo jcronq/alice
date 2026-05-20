@@ -497,7 +497,7 @@ def intervene(
 def _append_event(events_log: pathlib.Path, payload: dict) -> None:
     """Append one JSONL line. Best-effort — observability never raises.
 
-    We mirror :class:`alice_core.events.EventLogger`'s on-disk shape
+    We mirror :class:`core.events.EventLogger`'s on-disk shape
     (``ts``, ``event``, plus payload fields) so the viewer can tail
     both ``thinking.log`` and ``memory/events.jsonl`` with the same
     parser.

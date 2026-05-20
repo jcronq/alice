@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from alice_core.kernel import UsageInfo
+from core.kernel import UsageInfo
 
 
 __all__ = ["pi_usage_to_info"]

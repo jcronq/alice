@@ -1,4 +1,4 @@
-"""Tests for ``alice_watchers.github`` — the GitHub repo watcher.
+"""Tests for ``watchers.github`` — the GitHub repo watcher.
 
 Exercised end-to-end with a fake ``api`` callable (in place of ``gh api``)
 pointed at a tmp mind + state dir. The watcher's load-bearing behaviors:
@@ -20,7 +20,7 @@ import pathlib
 
 import pytest
 
-from alice_watchers import github as gh_watcher
+from watchers import github as gh_watcher
 
 
 @pytest.fixture

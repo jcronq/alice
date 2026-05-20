@@ -48,8 +48,8 @@ if TYPE_CHECKING:
     from .transports.a2a import A2ATransport
     from .transports.discord import DiscordTransport
 
-from alice_core.config.auth import ensure_auth_env
-from alice_core.kernel import KernelSpec, make_kernel
+from core.config.auth import ensure_auth_env
+from core.kernel import KernelSpec, make_kernel
 from claude_agent_sdk import HookMatcher
 from . import _dispatch as _dispatch_module
 from . import auto_fix as auto_fix_module
@@ -361,11 +361,11 @@ class SpeakingDaemon:
         # turns; here we only resolve the spec.
         self._model_config = factory_module.build_model_config(cfg)
         # Plan 04 Phase 7: install the mind-aware prompt loader as
-        # the package-level singleton so every ``alice_prompts.load(...)``
+        # the package-level singleton so every ``prompts.load(...)``
         # call site (compaction, transport build_prompt, surface /
         # emergency handlers) sees this mind's override path.
         # ``self._personae`` was resolved earlier (before tools_module.build).
-        import alice_prompts as _prompts
+        import prompts as _prompts
 
         _prompts.set_default_loader(
             factory_module.build_prompt_loader(cfg, self._personae)
@@ -380,8 +380,8 @@ class SpeakingDaemon:
         # cwd). Kernel cwd swaps to this dir so the SDK auto-loader /
         # pi auto-discovery sees only in-scope, Jinja-rendered,
         # strict-YAML SKILL.md files.
-        from alice_skills.registry import SkillRegistry
-        from alice_skills.render import render_to_disk
+        from skills.registry import SkillRegistry
+        from skills.render import render_to_disk
 
         skill_registry = SkillRegistry.from_mind(cfg.mind_dir)
         render_to_disk(

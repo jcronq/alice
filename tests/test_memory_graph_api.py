@@ -20,8 +20,8 @@ pytest.importorskip("httpx")
 
 from fastapi.testclient import TestClient
 
-from alice_viewer.main import create_app
-from alice_viewer.settings import Paths
+from viewer.main import create_app
+from viewer.settings import Paths
 
 
 def _make_paths(tmp_path: pathlib.Path) -> Paths:
@@ -95,7 +95,7 @@ def test_memory_graph_route_runs_llm_when_flag_on(
     monkeypatch.setenv("ALICE_LOBE_LLM_LABELS", "1")
     monkeypatch.setenv("ALICE_VIEWER_CACHE_DIR", str(tmp_path / "vcache"))
 
-    from alice_viewer import lobe_labeler
+    from viewer import lobe_labeler
 
     seen_member_count: list[int] = []
 

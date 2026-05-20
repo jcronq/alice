@@ -1,6 +1,6 @@
 """Rebuild the cortex-memory FTS index at startup if it's stale.
 
-``alice_core.cortex_index.build_index`` exposes ``needs_rebuild``
+``core.cortex_index.build_index`` exposes ``needs_rebuild``
 (the same predicate ``--check`` uses) and ``build`` (the rebuild
 itself). At session start we ask the predicate; if the index is
 stale we rebuild in-process, otherwise we skip with a debug log.
@@ -54,7 +54,7 @@ class CortexIndexFreshnessStartup:
     async def run_once(self, ctx: DaemonContext) -> None:
         # Lazy import keeps the cortex_index module out of the
         # speaking import path when this startup source isn't wired.
-        from alice_indexer.build_index import build, needs_rebuild
+        from indexer.build_index import build, needs_rebuild
 
         if not self._vault.is_dir():
             log.debug(

@@ -1,4 +1,4 @@
-"""Tests for alice_skills.render.render_to_disk.
+"""Tests for skills.render.render_to_disk.
 
 Pin the strict-YAML output (the killer bug from the pi spike), the
 hemisphere filtering, the README.md exclusion, and the atomic
@@ -12,8 +12,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from alice_skills.registry import SkillRegistry
-from alice_skills.render import render_to_disk
+from skills.registry import SkillRegistry
+from skills.render import render_to_disk
 
 
 def _write_skill(skills_dir: pathlib.Path, name: str, body: str) -> None:
@@ -22,7 +22,7 @@ def _write_skill(skills_dir: pathlib.Path, name: str, body: str) -> None:
 
 
 def _personae():
-    """Stand-in for alice_core.config.personae.Personae — only need
+    """Stand-in for core.config.personae.Personae — only need
     the as_template_context() shape."""
     return SimpleNamespace(
         as_template_context=lambda: {
@@ -48,7 +48,7 @@ def mind(tmp_path: pathlib.Path) -> pathlib.Path:
         "---\n"
         "name: log-meal\n"
         # The colon-inside-quoted-string case that breaks strict YAML;
-        # parsed leniently by alice_skills, must be re-emitted strict.
+        # parsed leniently by skills, must be re-emitted strict.
         'description: Use when {{ user.name }} reports eating ("lunch: X").\n'
         "scope: speaking\n"
         "---\n"

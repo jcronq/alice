@@ -60,7 +60,7 @@ For each note, decide what it becomes (these aren't exclusive — a note often h
    - File exists AND `type: pr` AND `state: closed` AND `merged: true` → **let-pass**. Issue already resolved. Log to daily and consume.
    - Anything else (file missing, or `type: issue` only) → proceed to step 3.
 3. **Vault lookup** → FTS `cortex-index.db` for the repo slug + issue keywords; read top 1–2 matching notes. If DB unavailable, `Grep cortex-memory/` for the repo slug.
-4. **Brief analysis** → 3–5 sentences: what the issue is, likely files/components, prior art, confidence (low / medium / high). If your analysis concludes the issue cannot be fixed right now (e.g., "blocked on target module not on master", "needs human decision"), call `alice_daemon.gh_state_mirror.write_deferred(repo, number, reason, deferred_by="thinking", title=...)` and skip step 5 — this prevents the next dispatcher run from re-surfacing the same issue.
+4. **Brief analysis** → 3–5 sentences: what the issue is, likely files/components, prior art, confidence (low / medium / high). If your analysis concludes the issue cannot be fixed right now (e.g., "blocked on target module not on master", "needs human decision"), call `sm.gh_state_mirror.write_deferred(repo, number, reason, deferred_by="thinking", title=...)` and skip step 5 — this prevents the next dispatcher run from re-surfacing the same issue.
 5. **Write dispatch surface** → `inner/surface/<utcstamp>-issue-dispatch-<repo-slug>-<N>.md` using the format in [[2026-05-05-issue-dispatcher-design]] Part B.
 6. **Consume the note** → `inner/notes/.consumed/<today>/` with the standard processing trailer.
 

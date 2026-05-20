@@ -6,7 +6,7 @@ import io
 import pathlib
 from contextlib import redirect_stdout
 
-from alice_core.config.cli import main as backend_cli
+from core.config.cli import main as backend_cli
 
 
 def test_show_handles_missing_model_yml(tmp_path: pathlib.Path) -> None:

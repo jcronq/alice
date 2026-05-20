@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from alice_eval import assertions
-from alice_eval.assertions import (
+from eval import assertions
+from eval.assertions import (
     AssertionFile,
     bleu4,
     evaluate_assertion,

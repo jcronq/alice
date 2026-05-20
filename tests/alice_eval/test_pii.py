@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from alice_eval.pii import redact
+from eval.pii import redact
 
 
 def test_redact_e164_phone_number():

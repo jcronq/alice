@@ -34,7 +34,7 @@ from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events.event import Event
 from google.genai import types as gtypes
 
-from alice_core.events import EventEmitter
+from core.events import EventEmitter
 
 from . import steps as _steps
 from .types import StepError, StepResult, WakeState

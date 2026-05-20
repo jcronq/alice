@@ -47,8 +47,8 @@ from typing import TYPE_CHECKING, Any, Optional
 
 
 if TYPE_CHECKING:
-    from alice_core.config.model import BackendSpec
-    from alice_core.kernel import KernelSpec
+    from core.config.model import BackendSpec
+    from core.kernel import KernelSpec
     from alice_thinking.runtime import PhaseRunner
 
 
@@ -519,8 +519,8 @@ class _QwenReviser:
         Other kernel errors propagate; the caller treats them as
         ``malformed`` and records the raw payload.
         """
-        from alice_core.kernel import make_kernel
-        from alice_core.events import CapturingEmitter
+        from core.kernel import make_kernel
+        from core.events import CapturingEmitter
 
         backend = self._get_backend_spec()
         # CapturingEmitter is a quiet sink — kernel-level events emitted
@@ -553,7 +553,7 @@ class _QwenReviser:
         Single owner — :class:`DesignPipelineRunner` has no parallel
         backend-loading method (D2 of the design).
         """
-        from alice_core.config.model import load as load_model_config
+        from core.config.model import load as load_model_config
 
         mind = pathlib.Path(
             os.environ.get("ALICE_MIND")
@@ -582,7 +582,7 @@ class _QwenReviser:
         if self._wake_context is not None:
             return self._wake_context
 
-        from alice_core.config.personae import placeholder
+        from core.config.personae import placeholder
         from alice_thinking.modes.base import WakeContext
 
         backend = self._get_backend_spec()

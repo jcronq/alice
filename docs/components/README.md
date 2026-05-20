@@ -6,7 +6,7 @@ Per-package documentation. One file per top-level package under `src/alice_*`. T
 
 - `alice_speaking.md` — the Speaking hemisphere (user-facing daemon, turn handling, MCP tooling).
 - `alice_thinking.md` — the Thinking hemisphere (background reasoning, vault grooming, wake loop).
-- `alice_sm.md` — the idea state machine.
-- `alice_watchers.md` — repository / event watchers that surface work to Thinking and Speaking.
+- `sm.md` — the idea state machine.
+- `watchers.md` — repository / event watchers that surface work to Thinking and Speaking.
 
-Other packages (`alice_core`, `alice_daemon`, `alice_eval`, `alice_indexer`, `alice_metrics`, `kernels.pi`, `alice_prompts`, `alice_skills`, `alice_viewer`) don't have stubs yet — add one here the first time you write a PR that needs to point at one.
+Other packages (`core`, `sm`, `eval`, `indexer`, `metrics`, `kernels.pi`, `prompts`, `skills`, `viewer`) don't have stubs yet — add one here the first time you write a PR that needs to point at one.

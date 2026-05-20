@@ -10,7 +10,7 @@ Each startup source must satisfy two invariants:
    can consult it without re-opening the file.
 
 The cortex-index freshness source has a third invariant: it
-shells out to :mod:`alice_core.cortex_index` only when the vault
+shells out to :mod:`core.cortex_index` only when the vault
 exists, and tolerates the kernel module raising on a malformed db.
 """
 
@@ -152,7 +152,7 @@ def test_cortex_index_calls_kernel_when_vault_present(
     rebuild_calls: list[tuple[pathlib.Path, pathlib.Path]] = []
     needs_calls: list[tuple[pathlib.Path, pathlib.Path]] = []
 
-    import alice_indexer.build_index as bi
+    import indexer.build_index as bi
 
     def fake_needs(v, db, **kw):
         needs_calls.append((v, db))
@@ -180,7 +180,7 @@ def test_cortex_index_skips_rebuild_when_fresh(tmp_path: pathlib.Path, monkeypat
 
     rebuild_called = False
 
-    import alice_indexer.build_index as bi
+    import indexer.build_index as bi
 
     def fake_needs(v, db, **kw):
         return False
@@ -205,7 +205,7 @@ def test_cortex_index_swallows_oserror_from_check(tmp_path: pathlib.Path, monkey
     vault = tmp_path / "cortex-memory"
     vault.mkdir()
 
-    import alice_indexer.build_index as bi
+    import indexer.build_index as bi
 
     def fake_needs(*a, **kw):
         raise OSError("bad sqlite")

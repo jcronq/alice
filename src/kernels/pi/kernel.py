@@ -34,8 +34,8 @@ import asyncio
 from importlib import resources
 from typing import Any, Optional
 
-from alice_core.events import EventEmitter
-from alice_core.kernel import (
+from core.events import EventEmitter
+from core.kernel import (
     BlockHandler,
     KernelResult,
     KernelSpec,

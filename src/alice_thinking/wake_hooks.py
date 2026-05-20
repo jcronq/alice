@@ -35,7 +35,7 @@ import logging
 import pathlib
 from typing import Any
 
-from alice_core.events import EventEmitter
+from core.events import EventEmitter
 
 from .phase import Phase
 

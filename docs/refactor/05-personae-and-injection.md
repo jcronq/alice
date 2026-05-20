@@ -20,7 +20,7 @@ Two intertwined problems, called out by the user:
 **This is a lie about the implementation.** A grep across the runtime
 for `system_prompt=` and `append_system_prompt=` returns one hit —
 `src/alice_speaking/_sanity.py:31`, a smoke test. The kernel
-(`src/alice_core/kernel.py`) never sets either field on
+(`src/core/kernel.py`) never sets either field on
 `ClaudeAgentOptions`. The mechanism that actually keeps the agent
 "in character" is:
 
@@ -135,7 +135,7 @@ All fields except `agent.name` and `user.name` are optional. Defaults
 are sensible no-ops (e.g. missing `voice.rules` → no rules section in
 the rendered system prompt).
 
-### `src/alice_core/personae.py`
+### `src/core/personae.py`
 
 ```
 @dataclass(frozen=True)
@@ -210,7 +210,7 @@ Six places consume personae:
    call gets `agent` and `user` automatically (per plan 04 §"Context
    defaults").
 
-4. **Viewer Jinja context** — `alice_viewer.main` adds
+4. **Viewer Jinja context** — `viewer.main` adds
    `app.state.personae = load_personae()` at startup; templates read
    `{{ personae.agent.name }}`, `{{ personae.user.name }}`.
 
@@ -283,7 +283,7 @@ Two compatibility moves:
 consumes it yet.
 
 **Changes:**
-- `src/alice_core/personae.py` — `Personae`, `AgentPersona`,
+- `src/core/personae.py` — `Personae`, `AgentPersona`,
   `UserPersona`, `load()`, `system_prompt()`.
 - `templates/mind-scaffold/personae.yml` — example with `agent.name:
   Alice` and `user.name: Friend` (placeholder).
@@ -413,7 +413,7 @@ or user's name except via the personae-rendered output.
 `events.js` text use the personae.
 
 **Changes:**
-- `alice_viewer/main.py` loads personae at startup, exposes via
+- `viewer/main.py` loads personae at startup, exposes via
   `request.app.state.personae`.
 - `templates/base.html` renders title as `{{ personae.agent.name }} Viewer`.
 - `templates/memory.html`, `templates/narrative.html`, etc. swap
@@ -441,7 +441,7 @@ the prompts package in plan 04 Phase 4) have their hardcoded "Alice" /
 "owner" replaced with `{{ agent.name }}` / `{{ user.name }}`.
 
 **Changes:**
-- Edit the templates in `src/alice_prompts/templates/viewer/`.
+- Edit the templates in `src/prompts/templates/viewer/`.
 - No code changes — the loader's context defaults already include
   `agent` and `user`.
 
@@ -485,7 +485,7 @@ Sweep for any "Alice" / "owner" literals missed.
 
 **Changes:**
 - `grep -rn '\bAlice\b' src/` → all remaining hits should be
-  module/package names (`alice_speaking`, `alice_core`), docstrings
+  module/package names (`alice_speaking`, `core`), docstrings
   (acceptable as project codename), or literals in tests with explicit
   fixtures.
 - Same for `\bowner\b` and `\bOwner\b` — should be zero hits in the
@@ -496,7 +496,7 @@ Sweep for any "Alice" / "owner" literals missed.
 
 **Validation:** A new test in `tests/test_invariants.py`. **Note: a
 naive `grep -rn '\bAlice\b' src/` won't work** — it trips on every
-`from alice_speaking import …`, every `alice_core.*` reference, and
+`from alice_speaking import …`, every `core.*` reference, and
 the docstrings the plan explicitly says are acceptable. Two
 implementation paths:
 
@@ -685,13 +685,13 @@ back-compat alias is gone; the allowlist is small and reviewed.
    `user.name`.
 
 6. **Where does `personae.py` live in `src/`?**
-   Proposal: `alice_core/personae.py`. But `alice_core` is filling up
+   Proposal: `core/personae.py`. But `core` is filling up
    (kernel, auth, events, session, sdk_compat, cortex_index, plus
    plan 06's `model_config.py`). Alternatives:
-   - `alice_core/config/personae.py` — sub-package alongside auth.
+   - `core/config/personae.py` — sub-package alongside auth.
    - New top-level `alice_config/` — separates configuration loaders
      from the kernel.
-   This is the kind of question plan 08 (alice_core rationalization,
+   This is the kind of question plan 08 (core rationalization,
    per plan 00 §"Cross-plan handoffs") will ultimately settle.
-   **Recommendation for this plan:** `alice_core/personae.py` for
+   **Recommendation for this plan:** `core/personae.py` for
    now; revisit when plan 08 is written.

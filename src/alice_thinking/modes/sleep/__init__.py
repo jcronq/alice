@@ -24,7 +24,7 @@ from ...runtime import PhaseRunner
 
 
 if TYPE_CHECKING:
-    from alice_core.kernel import KernelResult, KernelSpec
+    from core.kernel import KernelResult, KernelSpec
 
 
 __all__ = ["SleepMode"]

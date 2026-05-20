@@ -11,8 +11,8 @@
 
 from __future__ import annotations
 
-from alice_viewer import aggregators, sources
-from alice_viewer.sources import UnifiedEvent
+from viewer import aggregators, sources
+from viewer.sources import UnifiedEvent
 
 
 # ---------------------------------------------------------------------------

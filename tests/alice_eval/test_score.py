@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from alice_eval.score import (
+from eval.score import (
     DECISION_THRESHOLD,
     format_report,
     main_score,

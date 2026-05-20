@@ -1,0 +1,313 @@
+"""Haiku-generated single-sentence summaries for completed thinking wakes.
+
+The timeline shows one row per run. Wake rows used to label themselves
+with the first non-empty thinking/text block — raw reasoning that often
+read mid-sentence and didn't capture what the wake actually did. This
+module replaces that with a one-shot Haiku summary call per wake.
+
+- Cache: ``$ALICE_VIEWER_CACHE_DIR/run-summaries/<run_id>.json`` (default
+  ``~/.local/state/alice/viewer-cache/run-summaries``).
+- Generation: ``schedule(run_id, events)`` fires a fire-and-forget
+  background task on the running event loop. The first render after a
+  wake ends shows the fallback summary; subsequent renders pick up the
+  cached Haiku summary.
+- Cache survives indefinitely — wake events are immutable once ended,
+  so the summary stays valid forever. Delete the file by hand to
+  re-summarize.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import pathlib
+import time
+from typing import Any
+
+
+HAIKU_MODEL = "claude-haiku-4-5"
+
+# Bump when the prompt or output shape changes — cached entries with a
+# lower schema are treated as missing so summaries regenerate lazily.
+# Schema 5: drop the "you ARE the agent / first person" framing —
+# Haiku was reading it as a role-assignment and refusing the prompt
+# with meta-replies like "I'm Claude Code, not a vault-management
+# agent." Third-person framing about "the agent" lands cleanly.
+CACHE_SCHEMA = 5
+
+
+def cache_dir() -> pathlib.Path:
+    override = os.environ.get("ALICE_VIEWER_CACHE_DIR")
+    base = (
+        pathlib.Path(override)
+        if override
+        else (pathlib.Path.home() / ".local/state/alice/viewer-cache")
+    )
+    return base / "run-summaries"
+
+
+def _cache_path(run_id: str) -> pathlib.Path:
+    # Sanitize: run ids are short hex strings or "wake-<int>" — safe by
+    # construction, but be paranoid about path traversal.
+    safe = run_id.replace("/", "_").replace("..", "__")
+    return cache_dir() / f"{safe}.json"
+
+
+def read(run_id: str) -> str | None:
+    """Return the cached summary for ``run_id``, or None.
+
+    Returns None for entries written under an older CACHE_SCHEMA so that
+    a prompt/format change naturally re-summarizes wakes on next view.
+    """
+    path = _cache_path(run_id)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if data.get("schema", 1) < CACHE_SCHEMA:
+        return None
+    summary = data.get("summary")
+    return summary if isinstance(summary, str) and summary else None
+
+
+def write(run_id: str, summary: str, *, cost_usd: float | None = None) -> None:
+    path = _cache_path(run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "summary": summary,
+        "generated_at": time.time(),
+        "model": HAIKU_MODEL,
+        "schema": CACHE_SCHEMA,
+    }
+    if cost_usd is not None:
+        payload["cost_usd"] = cost_usd
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False))
+    tmp.replace(path)
+
+
+# In-flight set keeps async tasks alive until they finish. asyncio's
+# create_task() can be GC'd if no strong reference is kept; we hold one
+# here and discard on completion.
+_inflight: set[asyncio.Task] = set()
+
+# Concurrency cap. Without this, a CACHE_SCHEMA bump (or a fresh
+# viewer-cache wipe) lets the timeline render trigger a parallel
+# burst — one Haiku subprocess per uncached wake — that pegs the
+# host with hundreds of `claude` subprocesses (observed: 239 after
+# the schema 2 → 3 bump). The semaphore queues schedules without
+# blocking the FastAPI request, so the timeline still paints
+# instantly; summaries fill in serially behind the scenes.
+# Concurrency cap. Without this, a CACHE_SCHEMA bump (or a fresh
+# /wakes page render after a viewer recreate) fires a stampede of
+# Haiku calls — bounded but pointless. Was 2; bumped to 8 because at
+# 2, a 50-row page took ~2 min to fully populate ("all summarising…"
+# for the operator). 8 fills a page in ~15-30s, and the Anthropic
+# Haiku endpoint is rate-limit-tolerant + cheap.
+_MAX_CONCURRENT = int(os.environ.get("ALICE_RUN_SUMMARY_CONCURRENCY", "8"))
+_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    """Lazy-create the semaphore on the running event loop. Cannot be
+    constructed at module import — there's no loop yet."""
+    global _semaphore
+    if _semaphore is None:
+        _semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
+    return _semaphore
+
+
+def schedule(run_id: str, events: list) -> None:
+    """Fire-and-forget summary generation for ``run_id``.
+
+    Idempotent: if a summary is cached or a generation is already
+    in-flight for this id, this is a no-op. Safe to call from a sync
+    context that lives inside a FastAPI request — uses the running event
+    loop. If no loop is running (e.g. during an aggregator unit test),
+    the task is silently skipped.
+    """
+    if read(run_id):
+        return
+    if any(getattr(t, "_alice_run_id", None) == run_id for t in _inflight):
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return  # no loop — caller is sync (e.g. test harness)
+    task = loop.create_task(_generate(run_id, events))
+    setattr(task, "_alice_run_id", run_id)
+    _inflight.add(task)
+    task.add_done_callback(_inflight.discard)
+
+
+def _build_prompt(events: list) -> str:
+    """Compact narrative of a wake's events as a Haiku prompt.
+
+    Samples the wake's thinking across its full arc — first thought, a
+    middle thought, and the last two — plus all tool calls and the final
+    assistant_text. The previous version only fed the FIRST thinking
+    block as "Initial intent", which biased Haiku toward describing what
+    the wake set out to do rather than what it actually accomplished
+    end-to-end.
+    """
+    thoughts: list[str] = []
+    text_parts: list[str] = []
+    tool_lines: list[str] = []
+    for ev in events:
+        if ev.kind == "thinking":
+            t = (ev.detail.get("text") or "").strip()
+            if t:
+                thoughts.append(t[:500])
+        elif ev.kind == "assistant_text":
+            t = ev.detail.get("text") or ""
+            if t:
+                text_parts.append(t)
+        elif ev.kind == "tool_use":
+            name = ev.detail.get("name", "?")
+            raw_input = ev.detail.get("input", "")
+            primary = _tool_primary(name, raw_input)
+            tool_lines.append(f"- {name}" + (f": {primary[:200]}" if primary else ""))
+
+    sampled_thoughts = _sample_thoughts(thoughts)
+
+    parts = [
+        "Below is a transcript fragment from a personal-AI agent's",
+        "scheduled wake — the agent (named Alice) periodically wakes",
+        "up to groom her own knowledge vault, react to surfaced events,",
+        "and report back. You are NOT the agent; you are summarising",
+        "her wake for the operator who reads these summaries to decide",
+        "whether anything in this wake is worth digging into.",
+        "",
+        "Write the summary in third person, past tense ('Alice did X',",
+        "'she found Y'). Most wakes are routine: standard vault check,",
+        "no problems, frontmatter touch-ups, no active threads. For a",
+        "routine wake, output ONE short phrase — examples:",
+        "  • 'routine; vault clean.'",
+        "  • 'routine; 3 broken wikilinks logged, no other signal.'",
+        "  • 'routine groom; nothing notable.'",
+        "DO NOT recite the standard checklist (initialised wake /",
+        "verified state / audited vault / fixed frontmatter / closed",
+        "wake). The operator already knows those happen every wake;",
+        "they are noise.",
+        "",
+        "When the wake DID something interesting, lead with it — what",
+        "Alice found, decided, or shipped. 1–3 short sentences, ~240",
+        "chars max, in distinct phases if it spanned several. Examples:",
+        "  • 'Caught a stale stage_d_pairs file from 2 weeks back; archived.'",
+        "  • 'Found 41 broken wikilinks all in dailies — logged for later.'",
+        "  • 'Drafted the run_experiment design doc and surfaced it.'",
+        "",
+        "Output only the summary text. No quotes, no preamble like 'In",
+        "this wake' or 'Summary:', no meta-comment about being an AI.",
+        "",
+    ]
+    if sampled_thoughts:
+        parts.append("Thinking samples (across the wake, in order):")
+        for i, t in enumerate(sampled_thoughts, 1):
+            parts.append(f"[{i}] {t}")
+        parts.append("")
+    if tool_lines:
+        parts.append(f"Tool calls in order ({len(tool_lines)}):")
+        parts.extend(tool_lines[:40])
+        if len(tool_lines) > 40:
+            parts.append(f"…and {len(tool_lines) - 40} more")
+        parts.append("")
+    # Concatenate all assistant_text events instead of taking only
+    # the last. Pi-routed wakes used to emit one event per 2-5 char
+    # delta (pre-text_end fix); without concatenation the prompt
+    # captured only the trailing fragment ("OK" for "QUICK-OK"),
+    # leaving the summarizer with no context. Anthropic-side wakes
+    # emit one event per TextBlock so concatenation just runs them
+    # together with no separator — the deltas already carry their
+    # own leading whitespace.
+    final_text = "".join(text_parts).strip()[:1200]
+    if final_text:
+        parts.append(f"Closing text: {final_text}")
+
+    return "\n".join(parts)
+
+
+def _sample_thoughts(thoughts: list[str]) -> list[str]:
+    """Pick first, middle, and last two thoughts so the prompt covers the
+    full arc rather than only the opening intent."""
+    n = len(thoughts)
+    if n <= 4:
+        return thoughts
+    return [thoughts[0], thoughts[n // 2], thoughts[-2], thoughts[-1]]
+
+
+def _tool_primary(name: str, raw_input: Any) -> str:
+    """Best-effort one-line description of what a tool call did."""
+    if not raw_input:
+        return ""
+    if isinstance(raw_input, str):
+        try:
+            parsed = json.loads(raw_input)
+        except (json.JSONDecodeError, ValueError):
+            return raw_input[:200]
+    else:
+        parsed = raw_input
+    if not isinstance(parsed, dict):
+        return str(parsed)[:200]
+    for key in (
+        "file_path",
+        "command",
+        "pattern",
+        "url",
+        "query",
+        "content",
+        "message",
+    ):
+        v = parsed.get(key)
+        if isinstance(v, str) and v:
+            return v
+    return ""
+
+
+async def _generate(run_id: str, events: list) -> None:
+    # Defer the actual work behind a semaphore — see _get_semaphore.
+    # The body double-checks the cache after acquiring the slot in
+    # case another scheduling produced the summary while we waited.
+    async with _get_semaphore():
+        if read(run_id):
+            return
+        prompt = _build_prompt(events)
+        try:
+            from core.config.auth import ensure_auth_env
+            from core.kernel import KernelSpec
+            from core.events import CapturingEmitter
+            from kernels.anthropic import AnthropicKernel
+        except ImportError:
+            return
+        ensure_auth_env()
+
+        emitter = CapturingEmitter()
+        kernel = AnthropicKernel(
+            emitter, correlation_id=f"summary-{run_id}", silent=True
+        )
+        spec = KernelSpec(
+            model=HAIKU_MODEL,
+            allowed_tools=[],
+            cwd=pathlib.Path("/tmp"),
+        )
+        try:
+            result = await kernel.run(prompt, spec)
+        except Exception:  # noqa: BLE001
+            return
+        summary = (result.text or "").strip()
+        if not summary:
+            return
+        # Strip surrounding quotes if Haiku added them despite the instruction.
+        if (summary.startswith('"') and summary.endswith('"')) or (
+            summary.startswith("'") and summary.endswith("'")
+        ):
+            summary = summary[1:-1]
+        summary = summary.replace("\n", " ").strip()[:280]
+        write(run_id, summary, cost_usd=result.cost_usd)
+
+
+__all__ = ["read", "write", "schedule", "cache_dir"]

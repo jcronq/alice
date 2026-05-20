@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from alice_core.events import EventEmitter
+from core.events import EventEmitter
 
 from .run_experiment import build_run_experiment_tool
 

@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN npm install -g @anthropic-ai/claude-code@latest
 
-# claude-agent-sdk is needed by alice_viewer.run_summary, which spins up
+# claude-agent-sdk is needed by viewer.run_summary, which spins up
 # a tiny Haiku agent to summarize each completed wake.
 RUN python3 -m venv /opt/alice-venv \
     && /opt/alice-venv/bin/pip install --no-cache-dir --upgrade pip \
@@ -44,4 +44,4 @@ EXPOSE 7777
 HEALTHCHECK --interval=15s --timeout=3s --retries=3 --start-period=10s \
     CMD curl -sf http://127.0.0.1:7777/ >/dev/null || exit 1
 
-CMD ["/opt/alice-venv/bin/python", "-m", "alice_viewer.main"]
+CMD ["/opt/alice-venv/bin/python", "-m", "viewer.main"]

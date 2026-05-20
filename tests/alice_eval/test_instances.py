@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from alice_eval.assertions import load_assertion_file
-from alice_eval.instances import (
+from eval.assertions import load_assertion_file
+from eval.instances import (
     DEFAULT_KNOWN_TOOLS,
     derive_assertion_file,
     main_instances,

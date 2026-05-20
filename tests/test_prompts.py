@@ -3,7 +3,7 @@
 Three contracts:
 
 1. The default loader finds the templates shipped with the package
-   under ``src/alice_prompts/templates/``.
+   under ``src/prompts/templates/``.
 2. A render context (kwargs to :meth:`PromptLoader.load`) substitutes
    ``{{var}}`` placeholders correctly.
 3. An override path (``mind/.alice/prompts/``) wins over the package
@@ -18,7 +18,7 @@ import pathlib
 
 import pytest
 
-from alice_prompts import (
+from prompts import (
     DEFAULTS_DIR,
     PromptLoader,
     PromptNotFound,
@@ -27,7 +27,7 @@ from alice_prompts import (
 
 
 # ---------------------------------------------------------------------------
-# Default-loader path (the singleton inside ``alice_prompts.__init__``)
+# Default-loader path (the singleton inside ``prompts.__init__``)
 
 
 def test_loader_finds_default_template():
@@ -38,7 +38,7 @@ def test_loader_finds_default_template():
 
 
 def test_default_loader_lists_quick_template():
-    from alice_prompts import list_prompts
+    from prompts import list_prompts
 
     assert "thinking.quick" in list_prompts()
 
@@ -399,7 +399,7 @@ def test_daemon_loader_uses_mind_override(tmp_path):
         speaking=dict(SPEAKING_DEFAULTS),
     )
 
-    from alice_core.config.personae import placeholder as placeholder_personae
+    from core.config.personae import placeholder as placeholder_personae
 
     loader = build_prompt_loader(cfg, placeholder_personae())
     rendered = loader.load("speaking.compact")

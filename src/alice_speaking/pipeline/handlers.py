@@ -1,6 +1,6 @@
 """BlockHandlers for the speaking daemon.
 
-Compose-time extensions to :class:`alice_core.kernel.Kernel` that
+Compose-time extensions to :class:`core.kernel.Kernel` that
 encode speaking-specific semantics the kernel doesn't know about:
 
 - :class:`SessionHandler` — on each :class:`TurnSummary`, update the
@@ -26,8 +26,8 @@ import logging
 import pathlib
 from typing import Callable
 
-from alice_core.kernel import NullHandler, TurnSummary
-from alice_core import session as session_state
+from core.kernel import NullHandler, TurnSummary
+from core import session as session_state
 
 from . import compaction as compaction_module  # sibling within pipeline/
 

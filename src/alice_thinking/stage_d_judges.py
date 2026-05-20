@@ -57,7 +57,7 @@ class Verdict(TypedDict):
     """One judge's verdict on one synthesis attempt.
 
     Fields match the JSONL schema in
-    ``src/alice_viewer/STAGE_D_SCHEMA.md`` ; ``novel`` is a bool here per
+    ``src/viewer/STAGE_D_SCHEMA.md`` ; ``novel`` is a bool here per
     the judge-prompts design and is stored as-is by the pipeline.
     """
 

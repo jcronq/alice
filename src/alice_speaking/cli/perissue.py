@@ -2,7 +2,7 @@
 
 Counterpart of :mod:`alice_thinking.cli.perissue` for the build half
 of the SM v2 pipeline. Invoked by
-:func:`alice_sm.dispatcher.spawn_speaking_agent` (filed separately
+:func:`sm.dispatcher.spawn_speaking_agent` (filed separately
 as #184) for each ``(sm:designed, art:code)`` issue. Reads the
 spawn dir's ``prompt.txt`` (which carries ``issue=#N``,
 ``design_note=<vault-path>``, ``art=<art-label>`` frontmatter +
@@ -132,7 +132,7 @@ def post_comment_via_gh(repo: str, issue_number: int, body: str) -> None:
     """Default audit-comment poster — shells out to ``gh issue comment``.
 
     Replaceable in tests via the ``post_comment`` kwarg on
-    :func:`main`. We don't import :func:`alice_sm.dispatcher.gh_post_comment`
+    :func:`main`. We don't import :func:`sm.dispatcher.gh_post_comment`
     here to avoid pulling the entire dispatcher module into a worker
     process (the dispatcher imports heavy gh-watcher plumbing).
     """
@@ -175,9 +175,9 @@ async def _drive_kernel_async(
     124 on kernel-reported timeout, 1 otherwise. The caller parses
     ``result_text`` for the PR URL.
     """
-    from alice_core.config.model import BackendSpec
-    from alice_core.events import EventLogger
-    from alice_core.kernel import make_kernel
+    from core.config.model import BackendSpec
+    from core.events import EventLogger
+    from core.kernel import make_kernel
 
     backend = BackendSpec(backend="subscription")
     emitter = EventLogger(pathlib.Path("/dev/null"))

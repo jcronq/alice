@@ -42,7 +42,7 @@ Companion Designs in
 
 Per-issue phases (:attr:`Phase.PER_ISSUE_DESIGN` /
 :attr:`Phase.PER_ISSUE_BUILD`) are stimulus-spawned by
-:func:`alice_sm.dispatcher.spawn_thinking_agent` rather than picked by
+:func:`sm.dispatcher.spawn_thinking_agent` rather than picked by
 the wake cadence selector. They route through the same
 :meth:`PhaseRunner.run` path as cadence-driven phases — the caller is
 the ``scripts/sm-thinking-perissue.py`` entrypoint, which reads the
@@ -59,7 +59,7 @@ import json
 import pathlib
 from typing import TYPE_CHECKING, Any, Optional
 
-from alice_core.kernel import KernelSpec
+from core.kernel import KernelSpec
 
 from ._prompt_assembly import wake_timestamp_header
 from .phase import Phase, PhaseConfig, PromptFragmentLoader
@@ -214,7 +214,7 @@ class PhaseRunner:
         forward-compatible STM/LTM seam (no-op today).
         """
         if phase == Phase.QUICK or ctx.quick:
-            from alice_prompts import load as load_prompt
+            from prompts import load as load_prompt
 
             return load_prompt("thinking.quick")
         if ctx.inline_prompt:

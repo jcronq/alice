@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from alice_eval import sampling
+from eval import sampling
 
 
 def _make_turn(

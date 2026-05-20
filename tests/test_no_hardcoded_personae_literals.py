@@ -3,7 +3,7 @@
 
 The point: code paths the agent eventually sees (tool descriptions,
 system prompts, recipient examples) must derive identity from
-:mod:`alice_core.config.personae` rather than baking in the
+:mod:`core.config.personae` rather than baking in the
 runtime's default. New offenses fail in CI before merge.
 
 The walker is intentionally simple:
@@ -39,22 +39,22 @@ FORBIDDEN = ("Alice", "owner", "Owner")
 ALLOWLIST_FILES: frozenset[str] = frozenset(
     {
         # The placeholder personae is the source of the runtime default.
-        "alice_core/config/personae.py",
+        "core/config/personae.py",
         # Speaking-quality eval harness hardcodes a fallback persona
         # for when the mind-scaffold personae.yml isn't on disk
         # (offline / test environments). The runtime path loads the
         # scaffold; this is the explicit "last resort" branch.
-        "alice_eval/prompt.py",
+        "eval/prompt.py",
         # Rating UI's embedded HTML template uses "Alice" in the
         # page <title> and headline. The rating UI is offline-only
         # static markup, not part of the agent's prompt surface;
         # substituting from personae here adds no value because the
         # eval ships against the specific agent named in personae.yml
         # already.
-        "alice_eval/rating_ui.py",
+        "eval/rating_ui.py",
         # The package-level prompt loader's stand-in personae — same
         # role, mirrored across packages so cold-imports stay clean.
-        "alice_prompts/__init__.py",
+        "prompts/__init__.py",
         # principals.load() takes 'owner' as the legacy default fallback;
         # personae overrides it when supplied (Phase L).
         "alice_speaking/domain/principals.py",
@@ -68,7 +68,7 @@ ALLOWLIST_FILES: frozenset[str] = frozenset(
         # These are descriptive prose for the summariser model, not
         # config defaults — substituting from personae would hurt prompt
         # quality without changing behaviour.
-        "alice_viewer/run_summary.py",
+        "viewer/run_summary.py",
     }
 )
 
@@ -133,7 +133,7 @@ def test_no_hardcoded_personae_literals(py_file: pathlib.Path) -> None:
     assert not violations, (
         f"{rel} contains hardcoded persona literals: "
         + ", ".join(f"line {ln}: {v!r}" for ln, v in violations[:5])
-        + "\nUse alice_core.config.personae instead, or extend the "
+        + "\nUse core.config.personae instead, or extend the "
         "allowlist in tests/test_no_hardcoded_personae_literals.py "
         "if the literal is genuinely a default fallback."
     )

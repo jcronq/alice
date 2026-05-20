@@ -29,7 +29,7 @@ import logging
 import pathlib
 from typing import Any, Optional
 
-from alice_core.events import EventEmitter
+from core.events import EventEmitter
 
 
 __all__ = [
@@ -137,7 +137,7 @@ def emit_completion_event(
 
     The viewer subscribes to ``experiment-card`` events on the thinking
     event log (it already tails ``thinking.log`` via
-    :mod:`alice_viewer.sources`). When this event fires the viewer can
+    :mod:`viewer.sources`). When this event fires the viewer can
     render the card in the canvas pane (see spec §UI canvas presentation).
 
     ``extra`` lets the runner attach optional debug context (e.g.

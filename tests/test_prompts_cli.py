@@ -1,6 +1,6 @@
 """Phase 8 of plan 04: bin/alice-prompts inventory CLI.
 
-Tests against ``alice_prompts.cli.main`` directly (rather than
+Tests against ``prompts.cli.main`` directly (rather than
 shelling out to the bash wrapper) — the wrapper just selects a
 Python interpreter and exec's the same entry point. Coverage
 matches the three subcommands.
@@ -13,7 +13,7 @@ import pathlib
 
 import pytest
 
-from alice_prompts import cli
+from prompts import cli
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +112,7 @@ def test_render_rejects_non_mapping_context(tmp_path: pathlib.Path):
 
 
 def test_validate_all_shipped_templates(capsys):
-    """Every template in ``src/alice_prompts/templates/`` must
+    """Every template in ``src/prompts/templates/`` must
     parse cleanly. Recurrence guard for syntax bugs that ship
     through to runtime."""
     rc = cli.main(["validate"])
@@ -124,7 +124,7 @@ def test_validate_catches_syntax_error(tmp_path: pathlib.Path, monkeypatch, caps
     """A template with broken Jinja syntax surfaces in stderr and
     exits non-zero. We point the package-level loader at a tmp
     tree containing one bad template."""
-    import alice_prompts as ap
+    import prompts as ap
 
     # Reset the package-level loader so it picks up the tmp
     # defaults dir on next access.

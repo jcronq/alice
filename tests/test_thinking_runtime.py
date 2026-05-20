@@ -15,7 +15,7 @@ import pathlib
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from alice_core.config.personae import placeholder
+from core.config.personae import placeholder
 from alice_thinking.modes import WakeContext
 from alice_thinking.phase import Phase, PhaseConfig
 from alice_thinking.runtime import (

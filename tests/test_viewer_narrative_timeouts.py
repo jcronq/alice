@@ -1,4 +1,4 @@
-"""Tests for the timeout-hardening in :mod:`alice_viewer.narrative` (issue #135).
+"""Tests for the timeout-hardening in :mod:`viewer.narrative` (issue #135).
 
 Two guarantees are exercised:
 
@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from alice_viewer import narrative as nmod
+from viewer import narrative as nmod
 
 
 # ---------------------------------------------------------------------------

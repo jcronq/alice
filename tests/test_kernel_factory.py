@@ -1,4 +1,4 @@
-"""Tests for alice_core.kernel.factory.make_kernel.
+"""Tests for core.kernel.factory.make_kernel.
 
 The factory is the single switch point that turns a BackendSpec
 into a concrete Kernel impl. These tests pin: (a) subscription /
@@ -12,9 +12,9 @@ from __future__ import annotations
 
 import pytest
 
-from alice_core.config.model import BackendSpec
-from alice_core.events import CapturingEmitter
-from alice_core.kernel import Kernel, make_kernel
+from core.config.model import BackendSpec
+from core.events import CapturingEmitter
+from core.kernel import Kernel, make_kernel
 from kernels.anthropic import AnthropicKernel
 
 

@@ -1,7 +1,7 @@
 """Tests for the viewer-side /chat + /api/chat/* routes.
 
 The viewer's chat routes are thin proxies to the speaking daemon's
-viewer-chat HTTP ingress. We stub :mod:`alice_viewer.chat_client` so
+viewer-chat HTTP ingress. We stub :mod:`viewer.chat_client` so
 the route handlers exercise their own logic without bringing up a
 daemon. The chat-page HTML route is smoke-tested for status + key
 markers.
@@ -15,8 +15,8 @@ import pathlib
 import pytest
 from fastapi.testclient import TestClient
 
-from alice_viewer.main import create_app
-from alice_viewer.settings import Paths
+from viewer.main import create_app
+from viewer.settings import Paths
 
 
 @pytest.fixture
@@ -76,7 +76,7 @@ def test_api_chat_history_proxies_to_daemon(client, monkeypatch):
             "messages": [{"role": "user", "text": "hi", "ts": 1.0}],
         }
 
-    from alice_viewer import chat_client
+    from viewer import chat_client
 
     monkeypatch.setattr(chat_client, "fetch_history", fake_history)
     r = client.get("/api/chat/history")
@@ -91,7 +91,7 @@ def test_api_chat_history_returns_502_on_daemon_error(client, monkeypatch):
     async def fake_history(*, channel=None, limit=100, timeout=10.0):
         raise RuntimeError("daemon said no")
 
-    from alice_viewer import chat_client
+    from viewer import chat_client
 
     monkeypatch.setattr(chat_client, "fetch_history", fake_history)
     r = client.get("/api/chat/history")
@@ -105,7 +105,7 @@ def test_api_chat_history_returns_503_on_unreachable_daemon(client, monkeypatch)
     async def fake_history(*, channel=None, limit=100, timeout=10.0):
         raise ConnectionError("connect refused")
 
-    from alice_viewer import chat_client
+    from viewer import chat_client
 
     monkeypatch.setattr(chat_client, "fetch_history", fake_history)
     r = client.get("/api/chat/history")
@@ -148,7 +148,7 @@ def test_api_chat_send_proxies_to_daemon(client, monkeypatch):
         captured["channel"] = channel
         return {"ok": True, "channel": channel or "viewer-chat-main"}
 
-    from alice_viewer import chat_client
+    from viewer import chat_client
 
     monkeypatch.setattr(chat_client, "send_message", fake_send)
     r = client.post("/api/chat/send", json={"text": "hello"})
@@ -165,7 +165,7 @@ def test_api_chat_send_passes_explicit_channel(client, monkeypatch):
         captured["channel"] = channel
         return {"ok": True, "channel": channel}
 
-    from alice_viewer import chat_client
+    from viewer import chat_client
 
     monkeypatch.setattr(chat_client, "send_message", fake_send)
     r = client.post(
@@ -179,7 +179,7 @@ def test_api_chat_send_502_on_daemon_error(client, monkeypatch):
     async def fake_send(text, *, channel=None, timeout=10.0):
         raise RuntimeError("queue full")
 
-    from alice_viewer import chat_client
+    from viewer import chat_client
 
     monkeypatch.setattr(chat_client, "send_message", fake_send)
     r = client.post("/api/chat/send", json={"text": "hello"})
@@ -205,7 +205,7 @@ def test_api_chat_stream_relays_daemon_events(client, monkeypatch):
         ]:
             yield ev
 
-    from alice_viewer import chat_client
+    from viewer import chat_client
 
     monkeypatch.setattr(chat_client, "stream_events", fake_stream)
     with client.stream("GET", "/api/chat/stream") as resp:
@@ -230,7 +230,7 @@ def test_api_chat_stream_emits_error_event_on_failure(client, monkeypatch):
         raise RuntimeError("daemon dead")
         yield  # unreachable; makes this an async generator
 
-    from alice_viewer import chat_client
+    from viewer import chat_client
 
     monkeypatch.setattr(chat_client, "stream_events", fake_stream)
     with client.stream("GET", "/api/chat/stream") as resp:

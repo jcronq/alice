@@ -21,8 +21,8 @@ import pathlib
 
 from fastapi.testclient import TestClient
 
-from alice_viewer.main import create_app
-from alice_viewer.settings import Paths
+from viewer.main import create_app
+from viewer.settings import Paths
 
 
 def _paths(tmp_path: pathlib.Path) -> Paths:

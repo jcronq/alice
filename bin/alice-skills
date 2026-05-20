@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # alice-skills — inventory + validate skills the runtime sees.
 #
-# Plan 07 Phase 2. Wraps alice_skills.cli with the same venv-
+# Plan 07 Phase 2. Wraps skills.cli with the same venv-
 # resolution logic as bin/alice-prompts and bin/alice-backend.
 #
 # Usage:
@@ -23,4 +23,4 @@ else
 fi
 
 export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$ALICE_ROOT/src"
-exec "$PY" -m alice_skills.cli "$@"
+exec "$PY" -m skills.cli "$@"

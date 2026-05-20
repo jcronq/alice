@@ -48,11 +48,11 @@ def capability_prompt_fragment(transport_name: str, caps: Capabilities) -> str:
 
     Appended to the system prompt for the duration of one turn. Plan
     04 Phase 3 of the runtime refactor moved the per-transport
-    bodies into ``alice_prompts/templates/speaking/capability.<name>.md.j2``;
+    bodies into ``prompts/templates/speaking/capability.<name>.md.j2``;
     this function is now a thin loader-call so existing callers
     don't need to change.
     """
-    from alice_prompts import load as load_prompt
+    from prompts import load as load_prompt
 
     return load_prompt(f"speaking.capability.{transport_name}", caps=caps).rstrip()
 
