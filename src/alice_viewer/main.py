@@ -11,7 +11,7 @@ import time
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sse_starlette.sse import EventSourceResponse
@@ -850,7 +850,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
     @app.get("/canvas", response_class=HTMLResponse)
     async def canvas_index(request: Request, page: int = 1, page_size: int = 20):
         p: Paths = app.state.paths
-        all_canvases = sources.list_canvases(p.inner, p.mind_dir)
+        all_canvases = sources.list_canvases(p.inner)
         page_size = max(1, min(page_size, 100))
         total = len(all_canvases)
         last_page = max(1, (total + page_size - 1) // page_size)
@@ -874,40 +874,79 @@ def create_app(paths: Paths | None = None) -> FastAPI:
     @app.get("/canvas/{slug}", response_class=HTMLResponse)
     async def canvas_view(request: Request, slug: str):
         p: Paths = app.state.paths
-        canvas = sources.read_canvas(p.inner, slug, p.mind_dir)
-        # Fallback (issue #175): worker-generated /canvas/<slug> links
-        # routinely point at research notes that didn't opt into
-        # ``canvas_paper: true``. Rather than 404ing, render them as
-        # plain markdown with a small banner explaining the format.
+        # HTML slide decks under ``inner/canvas/`` — serve raw.
+        canvas = sources.read_canvas(p.inner, slug)
+        if canvas is not None:
+            return HTMLResponse(canvas["body"])
+        # Markdown content moved to /research-papers (2026-05-20 nav
+        # split). Redirect any stale slug that still resolves over there
+        # so worker-generated /canvas/<slug> links keep working.
+        if p.mind_dir is not None:
+            paper = sources.read_research_paper(p.mind_dir, slug)
+            if paper is not None:
+                return RedirectResponse(
+                    url=f"/research-papers/{slug}", status_code=307
+                )
+            # Unflagged research-note fallback (issue #175) — same
+            # redirect target; ``research_papers_view`` renders the
+            # banner.
+            fallback = sources.read_research_note(p.mind_dir, slug)
+            if fallback is not None:
+                return RedirectResponse(
+                    url=f"/research-papers/{slug}", status_code=307
+                )
+        return HTMLResponse(
+            f"<h1>canvas not found: {slug}</h1>"
+            f"<p><a href='/canvas'>← back to index</a></p>",
+            status_code=404,
+        )
+
+    @app.get("/research-papers", response_class=HTMLResponse)
+    async def research_papers_index(request: Request):
+        p: Paths = app.state.paths
+        papers = (
+            sources.list_research_papers(p.mind_dir)
+            if p.mind_dir is not None
+            else []
+        )
+        return templates.TemplateResponse(
+            request,
+            "research_papers_index.html",
+            {
+                "papers": papers,
+                "state": _state_context(),
+                "active": "research-papers",
+            },
+        )
+
+    @app.get("/research-papers/{slug}", response_class=HTMLResponse)
+    async def research_papers_view(request: Request, slug: str):
+        p: Paths = app.state.paths
+        paper = None
         fallback_banner = False
-        if canvas is None and p.mind_dir is not None:
-            canvas = sources.read_research_note(p.mind_dir, slug)
-            if canvas is not None:
-                fallback_banner = True
-        if canvas is None:
+        if p.mind_dir is not None:
+            paper = sources.read_research_paper(p.mind_dir, slug)
+            # Issue #175 fallback: unflagged research notes still render
+            # with a small "this isn't canvas-paper format" banner so
+            # backlinks don't 404.
+            if paper is None:
+                paper = sources.read_research_note(p.mind_dir, slug)
+                if paper is not None:
+                    fallback_banner = True
+        if paper is None:
             return HTMLResponse(
-                f"<h1>canvas not found: {slug}</h1>"
-                f"<p><a href='/canvas'>← back to index</a></p>",
+                f"<h1>research paper not found: {slug}</h1>"
+                f"<p><a href='/research-papers'>← back to index</a></p>",
                 status_code=404,
             )
-        # Authored canvas decks under ``inner/canvas/`` are now raw
-        # HTML (per Jason's 2026-05-20 directive: "if there's a slide
-        # show, it's just a raw html file"). Serve them straight to the
-        # browser — no template wrapping, no markdown conversion.
-        #
-        # Everything else (experiment cards, auto-promoted research
-        # papers, unflagged research fallbacks) → plain markdown paper
-        # view rendered client-side via marked + DOMPurify.
-        if canvas.get("source") == "canvas":
-            return HTMLResponse(canvas["body"])
         return templates.TemplateResponse(
             request,
             "canvas_paper.html",
             {
-                "canvas": canvas,
+                "canvas": paper,
                 "fallback_banner": fallback_banner,
                 "state": _state_context(),
-                "active": "canvas",
+                "active": "research-papers",
             },
         )
 

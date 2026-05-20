@@ -334,14 +334,17 @@ def test_jobs_sorted_newest_first(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Canvas auto-promote
+# Canvas / research-paper split (2026-05-20 nav restructure).
+#
+# After PR #271 + the Canvas dropdown rework, ``list_canvases`` only
+# walks raw HTML decks under ``inner/canvas/``. Experiment cards +
+# flagged/auto-detected research notes moved to
+# ``list_research_papers`` / ``read_research_paper``.
 
 
-def test_list_canvases_picks_up_experiment_cards(tmp_path):
+def test_list_canvases_only_lists_html_decks(tmp_path):
     p = _paths(tmp_path)
     (p.inner / "canvas").mkdir(parents=True)
-    # Authored decks under inner/canvas/ are raw HTML now (per Jason's
-    # 2026-05-20 directive). Markdown design drafts moved to /designs.
     (p.inner / "canvas" / "authored-deck.html").write_text(
         "<html><head><title>Hand authored</title></head>"
         "<body><h1>Hand authored</h1></body></html>"
@@ -353,34 +356,30 @@ def test_list_canvases_picks_up_experiment_cards(tmp_path):
     )
     out = sources.list_canvases(p.inner, p.mind_dir)
     slugs_by_source = {(c["slug"], c["source"]) for c in out}
-    assert ("authored-deck", "canvas") in slugs_by_source
+    # Only HTML decks count — experiment cards moved to /research-papers.
+    assert slugs_by_source == {("authored-deck", "canvas")}
+
+
+def test_list_research_papers_picks_up_experiment_cards(tmp_path):
+    p = _paths(tmp_path)
+    exp_dir = p.mind_dir / "cortex-memory" / "experiments"
+    exp_dir.mkdir(parents=True)
+    (exp_dir / "exp-2026-05-11-001.md").write_text(
+        "# Experiment result\nbody body\n"
+    )
+    out = sources.list_research_papers(p.mind_dir)
+    slugs_by_source = {(c["slug"], c["source"]) for c in out}
     assert ("exp-2026-05-11-001", "experiment") in slugs_by_source
 
 
-def test_list_canvases_authored_wins_on_collision(tmp_path):
-    p = _paths(tmp_path)
-    (p.inner / "canvas").mkdir(parents=True)
-    (p.inner / "canvas" / "exp-same-slug.html").write_text(
-        "<h1>Authored override</h1><p>body</p>"
-    )
-    exp_dir = p.mind_dir / "cortex-memory" / "experiments"
-    exp_dir.mkdir(parents=True)
-    (exp_dir / "exp-same-slug.md").write_text("# Experiment loser\nbody\n")
-    out = sources.list_canvases(p.inner, p.mind_dir)
-    rows = [c for c in out if c["slug"] == "exp-same-slug"]
-    assert len(rows) == 1
-    assert rows[0]["source"] == "canvas"
-    assert rows[0]["title"] == "Authored override"
-
-
-def test_read_canvas_finds_experiment_card(tmp_path):
+def test_read_research_paper_finds_experiment_card(tmp_path):
     p = _paths(tmp_path)
     exp_dir = p.mind_dir / "cortex-memory" / "experiments"
     exp_dir.mkdir(parents=True)
     (exp_dir / "exp-readable.md").write_text(
         "---\nstatus: complete\n---\n# Readable\nbody\n"
     )
-    out = sources.read_canvas(p.inner, "exp-readable", p.mind_dir)
+    out = sources.read_research_paper(p.mind_dir, "exp-readable")
     assert out is not None
     assert out["source"] == "experiment"
     assert out["title"] == "Readable"
@@ -406,29 +405,29 @@ def _make_research(p, slug: str, body: str) -> None:
     (rdir / f"{slug}.md").write_text(body)
 
 
-def test_list_canvases_includes_flagged_research(tmp_path):
+def test_list_research_papers_includes_flagged_research(tmp_path):
     p = _paths(tmp_path)
     _make_research(
         p,
         "2026-05-11-flagged",
         "---\ncanvas_paper: true\n---\n# Flagged\nbody\n",
     )
-    out = sources.list_canvases(p.inner, p.mind_dir)
+    out = sources.list_research_papers(p.mind_dir)
     rows = [c for c in out if c["source"] == "research"]
     assert len(rows) == 1
     assert rows[0]["slug"] == "2026-05-11-flagged"
     assert rows[0]["title"] == "Flagged"
 
 
-def test_list_canvases_excludes_unflagged_research(tmp_path):
+def test_list_research_papers_excludes_unflagged_research(tmp_path):
     p = _paths(tmp_path)
     _make_research(p, "2026-05-11-noisy", "---\ntitle: Hidden\n---\n# Hidden\n")
     _make_research(p, "2026-05-11-noflag", "# No frontmatter\nbody\n")
-    out = sources.list_canvases(p.inner, p.mind_dir)
+    out = sources.list_research_papers(p.mind_dir)
     assert [c for c in out if c["source"] == "research"] == []
 
 
-def test_list_canvases_research_flag_variants(tmp_path):
+def test_list_research_papers_research_flag_variants(tmp_path):
     """Accept ``true`` / ``yes`` / ``1`` (case-insensitively) as truthy;
     reject everything else. Slug regex is lowercase-only by separate
     constraint (see _CANVAS_SLUG_RE), so the truthy cases all use
@@ -447,49 +446,50 @@ def test_list_canvases_research_flag_variants(tmp_path):
         ("rp-nope", "nope"),
     ]:
         _make_research(p, slug, f"---\ncanvas_paper: {value}\n---\n# {slug}\n")
-    out = sources.list_canvases(p.inner, p.mind_dir)
+    out = sources.list_research_papers(p.mind_dir)
     research_slugs = {c["slug"] for c in out if c["source"] == "research"}
     assert research_slugs == {"rp-true", "rp-yes", "rp-one", "rp-true-caps"}
 
 
-def test_read_canvas_finds_flagged_research_paper(tmp_path):
+def test_read_research_paper_finds_flagged_research_paper(tmp_path):
     p = _paths(tmp_path)
     _make_research(
         p,
         "2026-05-11-readable-paper",
         "---\ncanvas_paper: true\n---\n# Paper\nbody body\n",
     )
-    out = sources.read_canvas(p.inner, "2026-05-11-readable-paper", p.mind_dir)
+    out = sources.read_research_paper(p.mind_dir, "2026-05-11-readable-paper")
     assert out is not None
     assert out["source"] == "research"
     assert out["title"] == "Paper"
     assert "body body" in out["body"]
 
 
-def test_read_canvas_rejects_unflagged_research_paper(tmp_path):
-    """``read_canvas`` itself returns None for an unflagged research
-    note — preserves the strict opt-in semantics for callers that need
-    them (e.g. canvas-index listing). The /canvas/<slug> route layers a
-    fallback on top via ``read_research_note`` (see issue #175 tests
-    below); this test only pins the function's own behaviour."""
+def test_read_research_paper_rejects_unflagged_research_paper(tmp_path):
+    """``read_research_paper`` preserves the strict opt-in semantics —
+    unflagged research notes return ``None``. The
+    ``/research-papers/{slug}`` route layers a fallback on top via
+    ``read_research_note`` (issue #175); this test pins the function's
+    own behaviour."""
     p = _paths(tmp_path)
     _make_research(p, "2026-05-11-private", "---\ntitle: Private\n---\n# X\n")
-    out = sources.read_canvas(p.inner, "2026-05-11-private", p.mind_dir)
+    out = sources.read_research_paper(p.mind_dir, "2026-05-11-private")
     assert out is None
 
 
-def test_canvas_wins_over_research_on_slug_collision(tmp_path):
-    """Same precedence rule as the canvas/experiment collision."""
+def test_experiment_wins_over_research_on_slug_collision(tmp_path):
+    """Experiment cards beat flagged research notes when slugs collide."""
     p = _paths(tmp_path)
-    (p.inner / "canvas").mkdir(parents=True)
-    (p.inner / "canvas" / "shared.html").write_text("<h1>Canvas wins</h1>")
+    exp_dir = p.mind_dir / "cortex-memory" / "experiments"
+    exp_dir.mkdir(parents=True)
+    (exp_dir / "shared.md").write_text("# Experiment wins\nbody\n")
     _make_research(
         p, "shared", "---\ncanvas_paper: true\n---\n# Research loses\n"
     )
-    out = sources.list_canvases(p.inner, p.mind_dir)
+    out = sources.list_research_papers(p.mind_dir)
     rows = [c for c in out if c["slug"] == "shared"]
     assert len(rows) == 1
-    assert rows[0]["source"] == "canvas"
+    assert rows[0]["source"] == "experiment"
 
 
 # ---------------------------------------------------------------------------
@@ -505,7 +505,7 @@ def test_auto_detect_via_experiment_tag(tmp_path):
         "auto-by-tag",
         "---\ntags: [research, retrieval, experiment, gcn]\n---\n# Auto by tag\n",
     )
-    out = sources.list_canvases(p.inner, p.mind_dir)
+    out = sources.list_research_papers(p.mind_dir)
     rows = [c for c in out if c["source"] == "research"]
     assert any(c["slug"] == "auto-by-tag" for c in rows)
 
@@ -521,7 +521,7 @@ def test_auto_detect_via_note_type(tmp_path):
         ("nt-results", "results"),
     ]:
         _make_research(p, slug, f"---\nnote_type: {t}\n---\n# {slug}\n")
-    out = sources.list_canvases(p.inner, p.mind_dir)
+    out = sources.list_research_papers(p.mind_dir)
     research_slugs = {c["slug"] for c in out if c["source"] == "research"}
     assert research_slugs >= {
         "nt-experiment",
@@ -544,7 +544,7 @@ def test_auto_detect_excludes_design_tag(tmp_path):
         "just-investigation",
         "---\nnote_type: investigation\n---\n# Investigation\n",
     )
-    out = sources.list_canvases(p.inner, p.mind_dir)
+    out = sources.list_research_papers(p.mind_dir)
     research_slugs = {c["slug"] for c in out if c["source"] == "research"}
     assert "just-design" not in research_slugs
     assert "just-investigation" not in research_slugs
@@ -557,7 +557,7 @@ def test_read_auto_detected_paper(tmp_path):
         "auto-readable",
         "---\nnote_type: experiment\n---\n# Auto Readable\nbody\n",
     )
-    out = sources.read_canvas(p.inner, "auto-readable", p.mind_dir)
+    out = sources.read_research_paper(p.mind_dir, "auto-readable")
     assert out is not None
     assert out["source"] == "research"
     assert out["title"] == "Auto Readable"

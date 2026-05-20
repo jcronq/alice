@@ -822,26 +822,36 @@ def _canvas_source_dirs(
 ) -> list[tuple[str, pathlib.Path, str]]:
     """Ordered list of ``(source_label, dir, extension)`` for canvas scanning.
 
-    ``canvas`` (authored) is first so a hand-authored slug wins over
-    an auto-promoted experiment card if they happen to collide.
-
-    Per Jason's 2026-05-20 directive ("if there's a slide show, it's
-    just a raw html file"), authored decks under ``inner/canvas/`` are
-    now raw ``.html`` files — markdown design drafts live under
-    ``/designs`` instead. Experiment cards remain markdown because they
-    are programmatically auto-promoted from research notes.
-
-    Research notes are picked up by a separate path (``_list_research_papers``
-    / ``_find_research_paper``) because we only want the ones explicitly
-    flagged with ``canvas_paper: true`` in frontmatter — scanning every
-    research note on every render would be wasteful and noisy.
+    Per Jason's 2026-05-20 09:57 EDT directive, the Canvas dropdown
+    splits into three sub-routes — ``/canvas`` for raw HTML slide
+    decks, ``/designs`` for prose markdown drafts, and
+    ``/research-papers`` for auto-promoted experiment cards plus
+    research notes flagged ``canvas_paper: true``. ``list_canvases``
+    only walks the HTML deck dir; markdown sources are served by
+    ``list_research_papers`` and ``list_designs`` instead.
     """
     out: list[tuple[str, pathlib.Path, str]] = [
         ("canvas", _canvas_dir(inner), ".html"),
     ]
-    if mind_dir is not None:
-        out.append(("experiment", _experiment_card_dir(mind_dir), ".md"))
     return out
+
+
+def _research_paper_source_dirs(
+    mind_dir: pathlib.Path,
+) -> list[tuple[str, pathlib.Path]]:
+    """Ordered list of ``(source_label, dir)`` for research-paper scanning.
+
+    Both source dirs hold ``.md`` files. ``experiment`` wins on slug
+    collision (matches the prior ``list_canvases`` ordering before the
+    Canvas/Designs/Research-Papers split). Research notes are filtered
+    by ``_research_paper_signal`` before inclusion; experiment cards
+    are picked up unconditionally because they are programmatically
+    auto-promoted into a dedicated dir.
+    """
+    return [
+        ("experiment", _experiment_card_dir(mind_dir)),
+        ("research", _research_dir(mind_dir)),
+    ]
 
 
 def _research_dir(mind_dir: pathlib.Path) -> pathlib.Path:
@@ -876,132 +886,27 @@ def _research_paper_signal(fm: dict[str, str]) -> str | None:
     return None
 
 
-def _list_research_papers(
-    mind_dir: pathlib.Path,
-    skip_slugs: set[str],
-) -> list[dict[str, Any]]:
-    """Scan ``cortex-memory/research/`` for notes that belong on the
-    canvas index. Two acceptance paths — see ``_research_paper_signal``.
-
-    Returns the same entry shape as ``list_canvases``. ``skip_slugs``
-    is the set of slugs already claimed by the canvas/experiment scans
-    — those win on collision.
-    """
-    rdir = _research_dir(mind_dir)
-    if not rdir.is_dir():
-        return []
-    out: list[dict[str, Any]] = []
-    for path in rdir.glob("*.md"):
-        slug = path.stem
-        if not _CANVAS_SLUG_RE.match(slug):
-            continue
-        if slug in skip_slugs:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        fm = _parse_frontmatter(text)
-        if not fm:
-            continue
-        if _research_paper_signal(fm) is None:
-            continue
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        title = fm.get("title", "").strip() or slug
-        # Override with first H1 if present (matches behaviour of the
-        # canvas + experiment scans).
-        for line in text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("# "):
-                title = stripped[2:].strip()
-                break
-            if stripped.startswith("---") or stripped == "":
-                continue
-        out.append(
-            {
-                "slug": slug,
-                "title": title,
-                "mtime": stat.st_mtime,
-                "size": stat.st_size,
-                "path": str(path),
-                "source": "research",
-            }
-        )
-    return out
-
-
-def _find_research_paper(
-    mind_dir: pathlib.Path, slug: str
-) -> dict[str, Any] | None:
-    """Look up a single canvas-eligible research paper by slug. Mirrors
-    ``read_canvas`` but only returns notes that pass
-    ``_research_paper_signal`` (explicit flag or auto-detected tag/
-    note_type)."""
-    rdir = _research_dir(mind_dir)
-    path = rdir / f"{slug}.md"
-    try:
-        path_resolved = path.resolve()
-        rdir_resolved = rdir.resolve()
-    except OSError:
-        return None
-    if not str(path_resolved).startswith(str(rdir_resolved) + "/"):
-        return None
-    if not path_resolved.is_file():
-        return None
-    text = path_resolved.read_text(encoding="utf-8")
-    fm = _parse_frontmatter(text)
-    if not fm:
-        return None
-    if _research_paper_signal(fm) is None:
-        return None
-    body = text
-    title = slug
-    if text.startswith("---\n"):
-        end = text.find("\n---\n", 4)
-        if end != -1:
-            body = text[end + 5 :]
-    for line in body.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("# "):
-            title = stripped[2:].strip()
-            break
-    return {
-        "slug": slug,
-        "title": title,
-        "body": body,
-        "path": str(path_resolved),
-        "source": "research",
-    }
-
-
 def list_canvases(
     inner: pathlib.Path,
     mind_dir: pathlib.Path | None = None,
 ) -> list[dict[str, Any]]:
     """Return canvas index entries sorted by mtime descending.
 
-    Each entry: {slug, title, mtime, size, path, source}. ``source`` is
-    ``"canvas"`` for hand-authored decks under ``inner/canvas/`` or
-    ``"experiment"`` for auto-promoted experiment cards under
-    ``cortex-memory/experiments/`` (when ``mind_dir`` is provided).
+    Each entry: ``{slug, title, mtime, size, path, source}``. After the
+    2026-05-20 Canvas/Designs/Research-Papers split, this only walks
+    raw HTML slide decks under ``inner/canvas/``. Experiment cards and
+    flagged research notes moved to ``list_research_papers``; markdown
+    design drafts live under ``list_designs``. ``mind_dir`` is still
+    accepted for signature stability but is ignored.
 
-    Title is parsed from the first ``# H1`` (markdown sources) or
-    ``<title>``/``<h1>`` tag (html sources) if present, else derived
-    from the slug. Missing source dirs are skipped silently. Slug
-    collisions are resolved by the order returned from
-    ``_canvas_source_dirs`` (canvas wins over experiment).
-
-    Authored decks under ``inner/canvas/`` are scanned for ``*.html``
-    only — ``*.md`` design drafts moved to ``inner/designs/`` and are
-    served by the ``/designs`` route. Obsidian ``*.canvas`` files are
-    ignored.
+    Title is parsed from ``<title>`` or ``<h1>`` if present, else
+    derived from the slug. Missing source dir → empty list. Obsidian
+    ``*.canvas`` files are ignored.
     """
+    del mind_dir  # signature-stable kwarg; unused after the route split
     out: list[dict[str, Any]] = []
     seen_slugs: set[str] = set()
-    for source_label, cdir, ext in _canvas_source_dirs(inner, mind_dir):
+    for source_label, cdir, ext in _canvas_source_dirs(inner, None):
         if not cdir.is_dir():
             continue
         for path in cdir.glob(f"*{ext}"):
@@ -1027,13 +932,105 @@ def list_canvases(
                     "source": source_label,
                 }
             )
-    # Research notes flagged ``canvas_paper: true`` join the index too.
-    # Skip slugs already claimed by the canvas/experiment dirs — same
-    # collision rule (canvas wins over experiment wins over research).
-    if mind_dir is not None:
-        out.extend(_list_research_papers(mind_dir, skip_slugs=seen_slugs))
     out.sort(key=lambda d: d["mtime"], reverse=True)
     return out
+
+
+def list_research_papers(mind_dir: pathlib.Path) -> list[dict[str, Any]]:
+    """Return research-paper index entries sorted by mtime descending.
+
+    Union of two sources, in priority order (experiment wins on slug
+    collision): auto-promoted experiment cards under
+    ``cortex-memory/experiments/*.md`` (unconditional include), and
+    research notes under ``cortex-memory/research/*.md`` filtered by
+    ``_research_paper_signal`` (explicit ``canvas_paper: true`` flag
+    or auto-detected experiment-y tag/note_type).
+
+    Entry shape matches ``list_canvases``: ``{slug, title, mtime, size,
+    path, source}``. ``source`` is ``"experiment"`` or ``"research"``.
+    """
+    out: list[dict[str, Any]] = []
+    seen_slugs: set[str] = set()
+    for source_label, cdir in _research_paper_source_dirs(mind_dir):
+        if not cdir.is_dir():
+            continue
+        for path in cdir.glob("*.md"):
+            slug = path.stem
+            if not _CANVAS_SLUG_RE.match(slug):
+                continue
+            if slug in seen_slugs:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+                stat = path.stat()
+            except OSError:
+                continue
+            if source_label == "research":
+                fm = _parse_frontmatter(text)
+                if not fm or _research_paper_signal(fm) is None:
+                    continue
+            title = _extract_title(text, ".md", slug)
+            seen_slugs.add(slug)
+            out.append(
+                {
+                    "slug": slug,
+                    "title": title,
+                    "mtime": stat.st_mtime,
+                    "size": stat.st_size,
+                    "path": str(path),
+                    "source": source_label,
+                }
+            )
+    out.sort(key=lambda d: d["mtime"], reverse=True)
+    return out
+
+
+def read_research_paper(
+    mind_dir: pathlib.Path, slug: str
+) -> dict[str, Any] | None:
+    """Read a single research paper (experiment card or flagged research
+    note) by slug. Returns ``None`` if the slug is invalid, the file
+    doesn't exist, or a research note isn't flagged for canvas
+    presentation. Experiment cards win on slug collision.
+
+    Body is the markdown text with YAML frontmatter stripped. The
+    ``canvas_paper.html`` template renders it client-side.
+    """
+    if not _CANVAS_SLUG_RE.match(slug):
+        return None
+    for source_label, cdir in _research_paper_source_dirs(mind_dir):
+        path = cdir / f"{slug}.md"
+        try:
+            path_resolved = path.resolve()
+            cdir_resolved = cdir.resolve()
+        except OSError:
+            continue
+        if not str(path_resolved).startswith(str(cdir_resolved) + "/"):
+            continue
+        if not path_resolved.is_file():
+            continue
+        try:
+            text = path_resolved.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if source_label == "research":
+            fm = _parse_frontmatter(text)
+            if not fm or _research_paper_signal(fm) is None:
+                continue
+        body = text
+        if text.startswith("---\n"):
+            end = text.find("\n---\n", 4)
+            if end != -1:
+                body = text[end + 5 :]
+        title = _extract_title(body, ".md", slug)
+        return {
+            "slug": slug,
+            "title": title,
+            "body": body,
+            "path": str(path_resolved),
+            "source": source_label,
+        }
+    return None
 
 
 def read_canvas(
@@ -1041,60 +1038,39 @@ def read_canvas(
     slug: str,
     mind_dir: pathlib.Path | None = None,
 ) -> dict[str, Any] | None:
-    """Read a single canvas by slug. Returns None if slug is invalid
-    or the file doesn't exist in any configured source dir.
+    """Read a single canvas HTML deck by slug. Returns ``None`` if the
+    slug is invalid or no matching ``*.html`` file exists under
+    ``inner/canvas/``.
 
-    Authored decks under ``inner/canvas/`` are now raw HTML files (per
-    Jason's 2026-05-20 directive); their body is returned as-is so the
-    viewer can serve them directly. Experiment cards remain markdown
-    and have YAML frontmatter stripped from the returned body.
-
-    When ``mind_dir`` is provided, auto-promoted experiment cards under
-    ``cortex-memory/experiments/`` become readable too. Authored canvas
-    decks win on slug collision (same order as ``list_canvases``).
+    After the 2026-05-20 Canvas/Designs/Research-Papers split, this
+    only resolves raw HTML decks. Experiment cards + flagged research
+    notes live behind ``read_research_paper``; the unflagged research
+    fallback (issue #175) lives in ``read_research_note``. ``mind_dir``
+    is accepted for signature stability but ignored.
     """
+    del mind_dir  # signature-stable kwarg; unused after the route split
     if not _CANVAS_SLUG_RE.match(slug):
         return None
-    for source_label, cdir, ext in _canvas_source_dirs(inner, mind_dir):
+    for source_label, cdir, ext in _canvas_source_dirs(inner, None):
         path = cdir / f"{slug}{ext}"
         try:
-            path = path.resolve()
+            path_resolved = path.resolve()
             cdir_resolved = cdir.resolve()
         except OSError:
             continue
-        if not str(path).startswith(str(cdir_resolved) + "/"):
+        if not str(path_resolved).startswith(str(cdir_resolved) + "/"):
             continue
-        if not path.is_file():
+        if not path_resolved.is_file():
             continue
-        text = path.read_text(encoding="utf-8")
-        body = text
-        if ext == ".md" and text.startswith("---\n"):
-            end = text.find("\n---\n", 4)
-            if end != -1:
-                body = text[end + 5 :]
-        title = _extract_title(body if ext == ".md" else text, ext, slug)
+        text = path_resolved.read_text(encoding="utf-8")
+        title = _extract_title(text, ext, slug)
         return {
             "slug": slug,
             "title": title,
-            "body": body,
-            "path": str(path),
+            "body": text,
+            "path": str(path_resolved),
             "source": source_label,
         }
-    # Fall through to flagged research notes — only those that opted in
-    # via ``canvas_paper: true``. Unflagged research notes return None
-    # even if their slug matches; the unflagged fallback for /canvas/<slug>
-    # lives in ``read_research_note`` so this strict path stays available
-    # for callers that need the opt-in semantics.
-    #
-    # NOTE: the ``canvas_paper: true`` research-paper path and the
-    # ``read_research_note`` fallback are now the only markdown-in-canvas
-    # case left. Their markdown is rendered to HTML client-side by the
-    # ``canvas_paper.html`` template (via marked + DOMPurify, loaded in
-    # ``base.html``). Authored decks under ``inner/canvas/`` are raw
-    # HTML; markdown design drafts moved to ``inner/designs/`` and the
-    # ``/designs`` route.
-    if mind_dir is not None:
-        return _find_research_paper(mind_dir, slug)
     return None
 
 

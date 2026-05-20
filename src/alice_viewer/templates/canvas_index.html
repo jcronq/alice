@@ -1,12 +1,14 @@
 {% extends "base.html" %}
 {% block title %}canvas{% endblock %}
 {% block body %}
-  <h1>canvas</h1>
+  <h1>slide deck</h1>
   <p class="muted">
-    Slideshows and free-form pages {{ personae.agent.name }} authors when prose isn't enough.
-    Each canvas is a raw HTML file in <code>~/alice-mind/inner/canvas/</code>.
-    Prose design drafts live under <a href="/designs">/designs</a>.
-    Direct-link a canvas with <code>/canvas/&lt;slug&gt;</code>.
+    Slideshows {{ personae.agent.name }} authors when prose isn't enough.
+    Each deck is a raw HTML file in <code>~/alice-mind/inner/canvas/</code>.
+    Prose design drafts live under <a href="/designs">/designs</a>;
+    auto-promoted experiment cards + flagged research notes live under
+    <a href="/research-papers">/research-papers</a>.
+    Direct-link a deck with <code>/canvas/&lt;slug&gt;</code>.
   </p>
 
   {% if canvases %}
@@ -36,7 +38,10 @@
       {% endif %}
     </nav>
   {% else %}
-    <p class="muted"><em>No canvases yet. {{ personae.agent.name }} hasn't authored any.</em></p>
+    <p class="muted"><em>
+      No HTML slide decks yet — drop <code>.html</code> files in
+      <code>~/alice-mind/inner/canvas/</code> to populate this view.
+    </em></p>
   {% endif %}
 
   <style>

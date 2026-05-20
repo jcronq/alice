@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}research papers{% endblock %}
+{% block body %}
+  <h1>research papers</h1>
+  <p class="muted">
+    Markdown reports {{ personae.agent.name }} surfaces for paper-style review.
+    Sourced from auto-promoted experiment cards in
+    <code>~/alice-mind/cortex-memory/experiments/</code> and research notes
+    flagged <code>canvas_paper: true</code> in
+    <code>~/alice-mind/cortex-memory/research/</code>.
+    Each entry renders through <code>canvas_paper.html</code>.
+    Direct-link with <code>/research-papers/&lt;slug&gt;</code>.
+  </p>
+
+  {% if papers %}
+    <ul class="papers-list">
+      {% for p in papers %}
+        <li>
+          <a href="/research-papers/{{ p.slug }}" class="papers-row">
+            <span class="papers-title">{{ p.title }}</span>
+            <span class="papers-slug">/research-papers/{{ p.slug }}</span>
+            <span class="papers-meta">{{ p.mtime | localtime }} · {{ p.source }} · {{ p.size }} bytes</span>
+          </a>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="muted"><em>
+      No research papers yet — flag a research note with
+      <code>canvas_paper: true</code> or auto-promote an experiment card.
+    </em></p>
+  {% endif %}
+
+  <style>
+    .papers-list { list-style: none; padding: 0; margin: 1.5em 0; max-width: 820px; }
+    .papers-list li { margin: 0; }
+    .papers-row {
+      display: grid; grid-template-columns: 1fr auto; grid-template-rows: auto auto;
+      gap: 2px 16px; padding: 12px 16px; border: 1px solid var(--border); border-radius: 6px;
+      margin-bottom: 8px; background: var(--panel); text-decoration: none; color: inherit;
+      transition: border-color 0.1s, background 0.1s;
+    }
+    .papers-row:hover { border-color: var(--accent); background: var(--panel-2); }
+    .papers-title {
+      grid-column: 1; grid-row: 1; font-size: 15px; font-weight: 600; color: var(--text);
+    }
+    .papers-slug {
+      grid-column: 2; grid-row: 1; font-family: var(--mono, monospace); font-size: 12px;
+      color: var(--accent); align-self: center;
+    }
+    .papers-meta {
+      grid-column: 1 / -1; grid-row: 2; font-size: 12px; color: var(--muted);
+      font-family: var(--mono, monospace);
+    }
+  </style>
+{% endblock %}

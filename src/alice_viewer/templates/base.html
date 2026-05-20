@@ -46,6 +46,7 @@
       <span>{{ personae.agent.name }} Viewer</span>
     </div>
     {% set history_active = active in ('timeline', 'wakes', 'turns', 'runs', 'interactions', 'narrative') %}
+    {% set canvas_active = active in ('canvas', 'designs', 'research-papers') %}
     <nav>
       <a href="/chat"       class="{% if active == 'chat' %}on{% endif %}">chat</a>
       <details class="nav-dropdown {% if history_active %}on{% endif %}">
@@ -59,8 +60,14 @@
           <a href="/narrative"    class="{% if active == 'narrative' %}on{% endif %}">narrative</a>
         </div>
       </details>
-      <a href="/canvas"     class="{% if active == 'canvas' %}on{% endif %}">canvas</a>
-      <a href="/designs"    class="{% if active == 'designs' %}on{% endif %}">designs</a>
+      <details class="nav-dropdown {% if canvas_active %}on{% endif %}">
+        <summary>canvas{% if canvas_active %} · {{ active }}{% endif %} ▾</summary>
+        <div class="nav-dropdown-menu">
+          <a href="/canvas"          class="{% if active == 'canvas' %}on{% endif %}">slide deck</a>
+          <a href="/designs"         class="{% if active == 'designs' %}on{% endif %}">designs</a>
+          <a href="/research-papers" class="{% if active == 'research-papers' %}on{% endif %}">research papers</a>
+        </div>
+      </details>
       <a href="/graph"      class="{% if active == 'graph' %}on{% endif %}">flow graph</a>
       <a href="/memory"     class="{% if active == 'memory' %}on{% endif %}">memory graph</a>
       <a href="/activity"   class="{% if active == 'activity' %}on{% endif %}">activity</a>
