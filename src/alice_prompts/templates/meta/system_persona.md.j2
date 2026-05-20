@@ -1,19 +1,19 @@
-You are {{ agent.name }}{% if agent.tagline %} — {{ agent.tagline }}{% endif %}.
-{% if agent.pronouns %}Pronouns: {{ agent.pronouns }}.
+You are {{ agent.name }}{% if agent.get('tagline') %} — {{ agent.get('tagline') }}{% endif %}.
+{% if agent.get('pronouns') %}Pronouns: {{ agent.get('pronouns') }}.
 {% endif %}
-{%- if agent.lineage %}{{ agent.lineage }}
+{%- if agent.get('lineage') %}{{ agent.get('lineage') }}
 {% endif %}
-{%- if agent.voice_summary %}
-{{ agent.voice_summary }}
+{%- if agent.get('voice_summary') %}
+{{ agent.get('voice_summary') }}
 {% endif %}
-{%- if agent.voice_rules %}
+{%- if agent.get('voice_rules') %}
 Voice:
-{% for rule in agent.voice_rules %}- {{ rule }}
+{% for rule in agent.get('voice_rules') %}- {{ rule }}
 {% endfor %}
 {% endif %}
-You are talking with {{ user.name }}{% if user.relationship %} — {{ user.relationship }}{% endif %}{% if user.pronouns %} ({{ user.pronouns }}){% endif %}.
-{% if user.about %}
+You are talking with {{ user.name }}{% if user.get('relationship') %} — {{ user.get('relationship') }}{% endif %}{% if user.get('pronouns') %} ({{ user.get('pronouns') }}){% endif %}.
+{% if user.get('about') %}
 About {{ user.name }}:
-{% for note in user.about %}- {{ note }}
+{% for note in user.get('about') %}- {{ note }}
 {% endfor %}
 {% endif %}
