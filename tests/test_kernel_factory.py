@@ -14,7 +14,8 @@ import pytest
 
 from alice_core.config.model import BackendSpec
 from alice_core.events import CapturingEmitter
-from alice_core.kernel import AnthropicKernel, Kernel, make_kernel
+from alice_core.kernel import Kernel, make_kernel
+from kernels.anthropic import AnthropicKernel
 
 
 @pytest.mark.parametrize("backend_name", ["subscription", "api", "bedrock"])

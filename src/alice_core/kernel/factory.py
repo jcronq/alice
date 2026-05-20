@@ -4,20 +4,21 @@ Agent code (turn_runner, kernel_adapter, wake) calls
 :func:`make_kernel` with a :class:`BackendSpec` and gets back a
 :class:`Kernel` Protocol instance. The match statement that picks
 the impl lives here and ONLY here. Adding a backend means a new
-branch in :func:`make_kernel` and nothing else in agent code.
+entry in :data:`_SIBLING_KERNELS` and nothing else in agent code.
 
-PiKernel (and any future sibling-package kernel) is loaded via
-:func:`importlib.import_module` rather than a static ``from ...``
-import. Two reasons:
+Every backend (and any future sibling-package kernel) is loaded
+via :func:`importlib.import_module` rather than a static
+``from ...`` import. Two reasons:
 
 1. **Dependency direction.** :mod:`alice_core` must not statically
    import sibling packages — that's enforced by
-   ``tests/test_alice_core_isolation.py``. The dynamic-import
-   pattern is the idiomatic plugin-loader shape.
-2. **Optional deps.** A deployment that doesn't use pi shouldn't
-   need :mod:`alice_pi` installed. Static imports would crash at
-   ``alice_core`` import time; dynamic imports surface the missing
-   package only when the operator actually selects ``backend: pi``.
+   ``tests/test_core_isolation.py``. The dynamic-import pattern is
+   the idiomatic plugin-loader shape.
+2. **Optional deps.** A deployment that doesn't use a backend
+   shouldn't need the backend's package installed. Static imports
+   would crash at :mod:`alice_core` import time; dynamic imports
+   surface the missing package only when the operator actually
+   selects that backend.
 """
 
 from __future__ import annotations
@@ -36,7 +37,8 @@ __all__ = ["make_kernel"]
 # kernel impls. Lookup is dynamic so alice_core stays free of
 # static sibling-package imports.
 _SIBLING_KERNELS: dict[str, str] = {
-    "pi": "alice_pi.kernel:PiKernel",
+    "anthropic": "kernels.anthropic.kernel:AnthropicKernel",
+    "pi": "kernels.pi.kernel:PiKernel",
 }
 
 
@@ -57,29 +59,23 @@ def make_kernel(
 
     Lookup:
     - ``harness="pi-mono"`` / ``backend="pi"`` →
-      :class:`alice_pi.kernel.PiKernel` via
-      :func:`importlib.import_module`.
+      :class:`kernels.pi.kernel.PiKernel`.
     - ``"subscription"``, ``"api"``, ``"bedrock"`` →
-      :class:`AnthropicKernel` (claude_agent_sdk under the hood).
+      :class:`kernels.anthropic.kernel.AnthropicKernel`
+      (claude_agent_sdk under the hood).
     - Anything else falls through to AnthropicKernel; bad config
       surfaces later via the auth layer rather than at construct
       time.
     """
     harness = getattr(backend, "harness", "")
     name = "pi" if harness == "pi-mono" else getattr(backend, "backend", "subscription")
-    sibling = _SIBLING_KERNELS.get(name)
-    if sibling is not None:
-        module_path, attr = sibling.split(":", 1)
-        kernel_cls = getattr(importlib.import_module(module_path), attr)
-        return kernel_cls(
-            emitter,
-            correlation_id=correlation_id,
-            silent=silent,
-            short_cap=short_cap,
-        )
-    from .anthropic import AnthropicKernel
-
-    return AnthropicKernel(
+    # Anthropic-SDK backends share one impl.
+    if name in {"subscription", "api", "bedrock"}:
+        name = "anthropic"
+    sibling = _SIBLING_KERNELS.get(name, _SIBLING_KERNELS["anthropic"])
+    module_path, attr = sibling.split(":", 1)
+    kernel_cls = getattr(importlib.import_module(module_path), attr)
+    return kernel_cls(
         emitter,
         correlation_id=correlation_id,
         silent=silent,

@@ -447,7 +447,7 @@ __all__ = ["BUILTIN_TOOLS", "SUMMARY_TAIL_TURNS", "TurnRunner"]
 class PiSendMessageHandler(NullHandler):
     """Bridge pi's native ``send_message`` tool back into Alice outbox.
 
-    Pi has no MCP client, so :class:`alice_pi.kernel.PiKernel` exposes a
+    Pi has no MCP client, so :class:`kernels.pi.kernel.PiKernel` exposes a
     tiny extension-defined tool named ``send_message``. When pi emits the
     tool call, this handler executes the same Python sender used by the MCP
     tool in the Claude-Code harness.

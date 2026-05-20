@@ -13,7 +13,7 @@ Models registry: pi reads ``~/.pi/agent/models.json`` for its
 provider/model list. Alice's source-of-truth registry lives in
 the vault at ``~/alice-mind/config/pi-models.json``. PiKernel.run()
 stages vault → pi runtime location via
-:func:`alice_pi.models_staging.ensure_pi_models_json` at the start
+:func:`kernels.pi.models_staging.ensure_pi_models_json` at the start
 of every run. Idempotent (skips when content matches) and
 fail-soft (warning event, no raise) — pi can always fall back to
 its built-in providers.
@@ -225,7 +225,7 @@ class PiKernel:
     def _build_argv(self, prompt: str, spec: KernelSpec) -> list[str]:
         # Read PI_BIN dynamically so test fixtures + runtime env
         # changes (ALICE_PI_BIN) take effect without needing a
-        # module reload of alice_pi.kernel.
+        # module reload of kernels.pi.kernel.
         argv: list[str] = [
             _transport_mod.pi_bin(),
             "--mode",
@@ -277,4 +277,4 @@ class PiKernel:
 
 
 def _send_message_extension_path() -> str:
-    return str(resources.files("alice_pi").joinpath("extensions", "send-message.js"))
+    return str(resources.files("kernels.pi").joinpath("extensions", "send-message.js"))

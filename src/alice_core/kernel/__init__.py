@@ -1,4 +1,4 @@
-"""Kernel layer — backend-agnostic Protocol + impls.
+"""Kernel layer — backend-agnostic Protocol + types + factory.
 
 Public API:
 
@@ -8,16 +8,18 @@ Public API:
 - :class:`UsageInfo`, :class:`TurnSummary`, :class:`SystemEvent`,
   :data:`ThinkingLevel` — normalized handler-input + result types.
 - :class:`BlockHandler` Protocol + :class:`NullHandler` base class.
-- :class:`AnthropicKernel` — first impl (claude_agent_sdk-backed).
 - :func:`make_kernel` — single switch point for backend selection
   (lives in :mod:`alice_core.kernel.factory`; re-exported here for
-  ergonomics once Phase B lands).
+  ergonomics).
 
 Agent code should import the Protocol + types only — never a
-concrete impl. Use :func:`make_kernel` to construct.
+concrete impl. Use :func:`make_kernel` to construct. Concrete
+backends live in sibling packages: :mod:`kernels.anthropic`,
+:mod:`kernels.pi`. They are loaded dynamically through
+:func:`make_kernel` and must not be imported statically here —
+``tests/test_core_isolation.py`` enforces the boundary.
 """
 
-from .anthropic import AnthropicKernel
 from .factory import make_kernel
 from .protocol import BlockHandler, Kernel, NullHandler
 from .types import (
@@ -31,7 +33,6 @@ from .types import (
 
 
 __all__ = [
-    "AnthropicKernel",
     "BlockHandler",
     "Kernel",
     "KernelResult",

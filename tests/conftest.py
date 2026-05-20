@@ -16,7 +16,7 @@ from alice_speaking.domain.principals import (
 
 @pytest.fixture(autouse=True)
 def _isolate_pi_models_staging(tmp_path_factory, monkeypatch):
-    """Redirect alice_pi.models_staging at tmp paths for every test.
+    """Redirect kernels.pi.models_staging at tmp paths for every test.
 
     The PiKernel.run() integration stages
     ``~/alice-mind/config/pi-models.json`` → ``~/.pi/agent/models.json``

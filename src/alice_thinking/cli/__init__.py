@@ -1,6 +1,6 @@
 """Thinking-side command-line entry points.
 
-Pi-mono (alice_pi.kernel.PiKernel) strips ``mcp__``-prefixed tools at
+Pi-mono (kernels.pi.kernel.PiKernel) strips ``mcp__``-prefixed tools at
 permission-translation time, so the ``run_experiment`` MCP tool the
 AnthropicKernel exposes is invisible to the local Qwen runtime that
 drives thinking's sleep wakes. This package exposes the same dispatch

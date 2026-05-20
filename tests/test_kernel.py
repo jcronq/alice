@@ -15,7 +15,8 @@ from typing import Any
 import pytest
 
 from alice_core.events import CapturingEmitter
-from alice_core.kernel import AnthropicKernel, KernelSpec, NullHandler
+from alice_core.kernel import KernelSpec, NullHandler
+from kernels.anthropic import AnthropicKernel
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +73,7 @@ class _FakeSystemMessage:
 @pytest.fixture
 def patched_sdk(monkeypatch):
     """Replace kernel's SDK imports with our fakes."""
-    import alice_core.kernel.anthropic as k
+    import kernels.anthropic.kernel as k
 
     monkeypatch.setattr(k, "AssistantMessage", _FakeAssistantMessage)
     monkeypatch.setattr(k, "UserMessage", _FakeUserMessage)
@@ -86,7 +87,7 @@ def patched_sdk(monkeypatch):
 
 def _install_fake_query(monkeypatch, messages):
     """Install a fake query() that yields the given messages in order."""
-    import alice_core.kernel.anthropic as k
+    import kernels.anthropic.kernel as k
 
     async def fake_query(*, prompt, options):
         for msg in messages:
@@ -210,7 +211,7 @@ async def test_kernel_timeout_returns_error_result(patched_sdk, monkeypatch):
         if False:
             yield None
 
-    import alice_core.kernel.anthropic as k
+    import kernels.anthropic.kernel as k
 
     monkeypatch.setattr(k, "query", slow_query)
 
@@ -261,7 +262,7 @@ async def test_kernel_resume_passes_through_to_options(patched_sdk, monkeypatch)
         captured["options"] = options
         yield _FakeResultMessage(session_id="s")
 
-    import alice_core.kernel.anthropic as k
+    import kernels.anthropic.kernel as k
 
     monkeypatch.setattr(k, "query", capturing_query)
 
@@ -290,7 +291,7 @@ async def test_kernel_passes_append_system_prompt_to_options(patched_sdk, monkey
         captured["options"] = options
         yield _FakeResultMessage(session_id="s")
 
-    import alice_core.kernel.anthropic as k
+    import kernels.anthropic.kernel as k
 
     monkeypatch.setattr(k, "query", capturing_query)
 
@@ -323,7 +324,7 @@ async def test_kernel_omits_append_system_prompt_when_none(patched_sdk, monkeypa
         captured["options"] = options
         yield _FakeResultMessage(session_id="s")
 
-    import alice_core.kernel.anthropic as k
+    import kernels.anthropic.kernel as k
 
     monkeypatch.setattr(k, "query", capturing_query)
 

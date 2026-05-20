@@ -1,4 +1,4 @@
-"""Tests for alice_pi.translator.PiEventTranslator.
+"""Tests for kernels.pi.translator.PiEventTranslator.
 
 Drives the translator with hand-crafted JSONL fixtures (mirroring
 the spike's captured stream against gpt-5.3-codex) and asserts:
@@ -17,7 +17,7 @@ import asyncio
 
 from alice_core.kernel import NullHandler, TurnSummary
 
-from alice_pi.translator import PiEventTranslator
+from kernels.pi.translator import PiEventTranslator
 
 
 def _emit_recorder():

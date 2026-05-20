@@ -278,8 +278,9 @@ async def _generate(run_id: str, events: list) -> None:
         prompt = _build_prompt(events)
         try:
             from alice_core.config.auth import ensure_auth_env
-            from alice_core.kernel import AnthropicKernel, KernelSpec
+            from alice_core.kernel import KernelSpec
             from alice_core.events import CapturingEmitter
+            from kernels.anthropic import AnthropicKernel
         except ImportError:
             return
         ensure_auth_env()

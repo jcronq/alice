@@ -70,10 +70,9 @@ from claude_agent_sdk import (
     query,
 )
 
-from ..events import EventEmitter
-from ..sdk_compat import _short
-from .protocol import BlockHandler
-from .types import (
+from alice_core.events import EventEmitter
+from alice_core.kernel.protocol import BlockHandler
+from alice_core.kernel.types import (
     KernelResult,
     KernelSpec,
     SystemEvent,
@@ -81,6 +80,7 @@ from .types import (
     TurnSummary,
     UsageInfo,
 )
+from alice_core.sdk_compat import _short
 
 
 __all__ = ["AnthropicKernel"]

@@ -40,7 +40,7 @@ class UsageInfo:
     Field names mirror Anthropic's wire format because existing
     event-log consumers (``alice_viewer.aggregators._usage_breakdown``)
     parse those exact keys from JSONL. Pi-side usage dicts map to
-    these names in :func:`alice_pi.usage.pi_usage_to_info`.
+    these names in :func:`kernels.pi.usage.pi_usage_to_info`.
 
     Top-level fields are cumulative across the agent loop's internal
     API calls (Claude Code aggregates them in ``ResultMessage.usage``).

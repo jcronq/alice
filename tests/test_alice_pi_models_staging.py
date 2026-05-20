@@ -1,4 +1,4 @@
-"""Tests for alice_pi.models_staging.
+"""Tests for kernels.pi.models_staging.
 
 The helper stages the vault's ``pi-models.json`` into pi's runtime
 location at ``~/.pi/agent/models.json`` (or ``$PI_AGENT_DIR/...``).
@@ -15,9 +15,9 @@ import pytest
 
 from alice_core.events import CapturingEmitter
 from alice_core.kernel import KernelSpec
-from alice_pi import models_staging
-from alice_pi.kernel import PiKernel
-from alice_pi.models_staging import ensure_pi_models_json
+from kernels.pi import models_staging
+from kernels.pi.kernel import PiKernel
+from kernels.pi.models_staging import ensure_pi_models_json
 
 
 _SAMPLE_REGISTRY = {
@@ -279,7 +279,7 @@ async def test_pi_kernel_run_invokes_models_staging_once(
         calls.append({"source": source, "dest": dest, "emit": emit})
         return False
 
-    import alice_pi.kernel as kernel_mod
+    import kernels.pi.kernel as kernel_mod
 
     monkeypatch.setattr(kernel_mod, "ensure_pi_models_json", _stub)
 
@@ -322,7 +322,7 @@ async def test_pi_kernel_run_does_not_raise_on_staging_failure(
             emit("pi_models_stage_failed", reason="stubbed")
         return False
 
-    import alice_pi.kernel as kernel_mod
+    import kernels.pi.kernel as kernel_mod
 
     monkeypatch.setattr(kernel_mod, "ensure_pi_models_json", _boom)
 
