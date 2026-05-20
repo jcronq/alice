@@ -17,6 +17,7 @@ import pytest
 
 from alice_thinking.phase import (
     CONFLICT_DEFER_THRESHOLD,
+    STAGE_D_NIGHTLY_CAP,
     Phase,
     PhaseConfig,
     PromptFragmentLoader,
@@ -380,7 +381,7 @@ def test_build_vault_snapshot_detects_stage_d_cap_exhaustion(
     today = _now().date().isoformat()
     pairs = state_dir / f"stage-d-pairs-{today}.jsonl"
     pairs.write_text(
-        "\n".join(f'{{"ts": "x", "synthesis": "s{i}"}}' for i in range(3)) + "\n"
+        "\n".join(f'{{"ts": "x", "synthesis": "s{i}"}}' for i in range(STAGE_D_NIGHTLY_CAP)) + "\n"
     )
     snap = build_vault_snapshot(tmp_path, now=_now(), state_dir=state_dir)
     assert snap.stage_d_cap_exhausted is True
