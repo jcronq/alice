@@ -1,9 +1,17 @@
 """Skill dataclass + SKILL.md frontmatter parser.
 
 A skill is a directory under ``.claude/skills/`` containing a
-``SKILL.md`` with YAML frontmatter. Required frontmatter: ``name``
-+ ``description``. Optional: ``scope`` (``speaking`` / ``thinking``
-/ ``both``; default ``both``), ``ops`` (declared composite ops).
+``SKILL.md`` with YAML frontmatter conforming to the agentskills.io
+spec. Required frontmatter: ``name`` + ``description``. The spec
+reserves six top-level fields (``name``, ``description``,
+``license``, ``compatibility``, ``metadata``, ``allowed-tools``);
+client-specific extensions live under ``metadata``.
+
+Alice uses one such extension: ``metadata.scope`` (``speaking`` /
+``thinking`` / ``both``; default ``both``) — the hemisphere a skill
+is available to. Pre-spec skills used a top-level ``scope:`` key;
+that path is still accepted with a deprecation warning for one
+release. New skills must use ``metadata.scope``.
 
 Composite skills (``cortex-memory``) ship sub-procedure markdown
 files under ``ops/``. Phase 1 models ops as nested :class:`Skill`
@@ -13,11 +21,14 @@ frontmatter requirement, so they match the existing on-disk shape.
 
 from __future__ import annotations
 
+import logging
 import pathlib
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping
 
+
+log = logging.getLogger(__name__)
 
 SkillScope = Literal["speaking", "thinking", "both"]
 _VALID_SCOPES: frozenset[str] = frozenset({"speaking", "thinking", "both"})
@@ -76,8 +87,11 @@ def _parse_frontmatter_lenient(
     Bool-ish values normalize to ``True`` / ``False``.
 
     This handles the common case where a user-authored skill
-    description has unquoted colons. The cost: nested mappings
-    aren't supported here (skills don't currently use them).
+    description has unquoted colons. A single level of nesting is
+    supported: when a key has an empty value and is followed by
+    indented ``subkey: value`` lines, the parent becomes a dict.
+    That's enough for the agentskills.io ``metadata:`` block; we
+    deliberately don't try to be a general YAML parser.
     """
     out: dict[str, Any] = {}
     current_key: str | None = None
@@ -86,10 +100,22 @@ def _parse_frontmatter_lenient(
             current_key = None
             continue
         if line.startswith((" ", "\t")) and current_key is not None:
-            # Continuation of the previous key's value.
             existing = out[current_key]
+            stripped = line.strip()
+            # Indented ``subkey: value`` under a parent with empty
+            # (or already-nested) value becomes a nested mapping —
+            # supports agentskills.io ``metadata:`` blocks.
+            if (existing == "" or isinstance(existing, dict)) and ":" in stripped:
+                subkey, _, subval = stripped.partition(":")
+                subkey = subkey.strip()
+                if subkey:
+                    nested = existing if isinstance(existing, dict) else {}
+                    nested[subkey] = _coerce_scalar(subval.strip())
+                    out[current_key] = nested
+                    continue
+            # Otherwise: string continuation of the previous value.
             if isinstance(existing, str):
-                out[current_key] = (existing + " " + line.strip()).strip()
+                out[current_key] = (existing + " " + stripped).strip()
             continue
         if ":" not in line:
             current_key = None
@@ -99,7 +125,7 @@ def _parse_frontmatter_lenient(
         if not key:
             continue
         value = value.strip()
-        out[key] = _coerce_scalar(value)
+        out[key] = _coerce_scalar(value) if value else ""
         current_key = key
     if not out:
         raise SkillError(
@@ -115,6 +141,42 @@ def _coerce_scalar(value: str) -> Any:
     if value.lower() in ("false", "no"):
         return False
     return value
+
+
+def _validate_scope(scope_raw: Any, *, source: pathlib.Path) -> SkillScope:
+    """Reject anything outside the SkillScope literal. Preserved
+    error message shape so existing callers still match on ``scope``."""
+    if scope_raw not in _VALID_SCOPES:
+        raise SkillError(
+            f"{source}: scope = {scope_raw!r}; expected one of "
+            f"{sorted(_VALID_SCOPES)}"
+        )
+    return scope_raw  # type: ignore[return-value]
+
+
+def _extract_scope(
+    frontmatter: Mapping[str, Any],
+    *,
+    source: pathlib.Path,
+    default: SkillScope = "both",
+) -> SkillScope:
+    """Resolve the skill scope per the agentskills.io spec.
+
+    Preferred path: ``metadata.scope``. One release of backcompat
+    for top-level ``scope:`` — the old shape still parses but logs
+    a deprecation warning so authors know to migrate.
+    """
+    metadata = frontmatter.get("metadata")
+    if isinstance(metadata, Mapping) and "scope" in metadata:
+        return _validate_scope(metadata["scope"], source=source)
+    if "scope" in frontmatter:
+        log.warning(
+            "%s: top-level `scope:` is deprecated; move it under "
+            "`metadata.scope:` for agentskills.io spec compliance",
+            source,
+        )
+        return _validate_scope(frontmatter["scope"], source=source)
+    return default
 
 
 @dataclass(frozen=True)
@@ -197,13 +259,7 @@ class Skill:
                 f"{skill_md}: 'description' is required (non-empty string)"
             )
 
-        scope_raw = fm.get("scope", "both")
-        if scope_raw not in _VALID_SCOPES:
-            raise SkillError(
-                f"{skill_md}: scope = {scope_raw!r}; expected one of "
-                f"{sorted(_VALID_SCOPES)}"
-            )
-        scope: SkillScope = scope_raw  # type: ignore[assignment]
+        scope = _extract_scope(fm, source=skill_md)
 
         fires_in_quiet = bool(fm.get("fires_in_quiet_hours", True))
         emit_telemetry = bool(fm.get("emit_telemetry", True))
@@ -246,12 +302,7 @@ def _parse_op(op_path: pathlib.Path, *, parent_scope: SkillScope) -> Skill:
     if not isinstance(desc, str):
         raise SkillError(f"{op_path}: 'description' must be a string if present")
 
-    scope_raw = fm.get("scope", parent_scope)
-    if scope_raw not in _VALID_SCOPES:
-        raise SkillError(
-            f"{op_path}: scope = {scope_raw!r}; expected one of {sorted(_VALID_SCOPES)}"
-        )
-    scope: SkillScope = scope_raw  # type: ignore[assignment]
+    scope = _extract_scope(fm, source=op_path, default=parent_scope)
 
     return Skill(
         name=name.strip(),

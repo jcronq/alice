@@ -26,16 +26,26 @@ def _write_skill(
     *,
     description: str = "Use when the user does X.",
     scope: str | None = None,
+    legacy_scope: bool = False,
     body: str = "# title\n\nbody.\n",
     extra_frontmatter: dict | None = None,
     add_op: str | None = None,
 ) -> pathlib.Path:
-    """Drop a skill at ``<root>/<name>/SKILL.md``. Returns the SKILL.md path."""
+    """Drop a skill at ``<root>/<name>/SKILL.md``. Returns the SKILL.md path.
+
+    ``scope`` writes the agentskills.io-compliant ``metadata.scope``
+    block. ``legacy_scope=True`` switches to the pre-spec top-level
+    ``scope:`` shape so backcompat tests can exercise that path.
+    """
     d = root / name
     d.mkdir(parents=True, exist_ok=True)
     fm_lines = [f"name: {name}", f"description: {description}"]
     if scope is not None:
-        fm_lines.append(f"scope: {scope}")
+        if legacy_scope:
+            fm_lines.append(f"scope: {scope}")
+        else:
+            fm_lines.append("metadata:")
+            fm_lines.append(f"  scope: {scope}")
     for k, v in (extra_frontmatter or {}).items():
         fm_lines.append(f"{k}: {v}")
     skill_md = d / "SKILL.md"
@@ -64,8 +74,46 @@ def test_parse_skill_with_minimal_frontmatter(tmp_path: pathlib.Path) -> None:
 
 
 def test_parse_skill_reads_optional_scope(tmp_path: pathlib.Path) -> None:
+    """agentskills.io-spec shape: scope lives under metadata."""
     skill_md = _write_skill(tmp_path, "log-meal", scope="speaking")
     assert Skill.parse(skill_md).scope == "speaking"
+
+
+def test_parse_skill_accepts_legacy_top_level_scope_with_warning(
+    tmp_path: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One release of backcompat: pre-spec ``scope:`` at the top
+    level still parses, but logs a deprecation warning telling the
+    author to move it under ``metadata.scope:``."""
+    skill_md = _write_skill(
+        tmp_path, "log-meal", scope="speaking", legacy_scope=True
+    )
+    with caplog.at_level("WARNING", logger="alice_skills.skill"):
+        s = Skill.parse(skill_md)
+    assert s.scope == "speaking"
+    assert any(
+        "top-level `scope:` is deprecated" in r.message for r in caplog.records
+    )
+
+
+def test_parse_skill_prefers_metadata_scope_over_top_level(
+    tmp_path: pathlib.Path,
+) -> None:
+    """If both shapes are present, metadata.scope wins and no
+    deprecation warning fires (the author is already migrated)."""
+    d = tmp_path / "log-meal"
+    d.mkdir()
+    (d / "SKILL.md").write_text(
+        "---\n"
+        "name: log-meal\n"
+        "description: Log a meal.\n"
+        "scope: speaking\n"
+        "metadata:\n"
+        "  scope: thinking\n"
+        "---\n\nbody.\n"
+    )
+    assert Skill.parse(d / "SKILL.md").scope == "thinking"
 
 
 def test_parse_skill_with_full_frontmatter(tmp_path: pathlib.Path) -> None:
@@ -106,9 +154,49 @@ def test_parse_skill_raises_on_missing_description(tmp_path: pathlib.Path) -> No
 
 
 def test_parse_skill_raises_on_unknown_scope(tmp_path: pathlib.Path) -> None:
+    """Invalid scope under metadata produces the same error message
+    as the legacy top-level shape did — callers matching on ``scope``
+    in the message still work."""
     skill_md = _write_skill(tmp_path, "weird", scope="viewer")
-    with pytest.raises(SkillError, match="scope"):
+    with pytest.raises(SkillError, match="scope = 'viewer'"):
         Skill.parse(skill_md)
+
+
+def test_parse_skill_raises_on_unknown_legacy_scope(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Legacy top-level invalid scope: same error message."""
+    skill_md = _write_skill(tmp_path, "weird", scope="viewer", legacy_scope=True)
+    with pytest.raises(SkillError, match="scope = 'viewer'"):
+        Skill.parse(skill_md)
+
+
+def test_parse_skill_lenient_fallback_handles_metadata_scope(
+    tmp_path: pathlib.Path,
+) -> None:
+    """log-meal-style descriptions (unquoted colons) trip strict
+    YAML and fall through to the lenient parser. The lenient
+    parser must still resolve nested ``metadata.scope:``."""
+    d = tmp_path / "log-meal"
+    d.mkdir()
+    (d / "SKILL.md").write_text(
+        "---\n"
+        "name: log-meal\n"
+        'description: Use when user reports eating ("I ate X", "lunch: X").\n'
+        "metadata:\n"
+        "  scope: speaking\n"
+        "---\n\nbody.\n"
+    )
+    s = Skill.parse(d / "SKILL.md")
+    assert s.scope == "speaking"
+    assert "lunch: X" in s.description_template
+
+
+def test_parse_skill_defaults_to_both_when_scope_absent(
+    tmp_path: pathlib.Path,
+) -> None:
+    skill_md = _write_skill(tmp_path, "no-scope")
+    assert Skill.parse(skill_md).scope == "both"
 
 
 def test_parse_skill_tolerates_unquoted_colons_in_description(

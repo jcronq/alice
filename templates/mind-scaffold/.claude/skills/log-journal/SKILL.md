@@ -1,7 +1,8 @@
 ---
 name: log-journal
 description: Use when {{ user.name }} shares something they want remembered but that doesn't fit a structured event type ("btw I'm feeling off today", "started reading X", "thinking about quitting Y"). Appends a dated note to the daily log AND a generic note event to events.jsonl. Don't use this for food/workouts/weights — those have their own skills.
-scope: speaking
+metadata:
+  scope: speaking
 ---
 
 # log-journal
