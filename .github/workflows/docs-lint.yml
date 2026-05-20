@@ -1,0 +1,36 @@
+name: docs-lint
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  docs-lint:
+    runs-on: ubuntu-latest
+    # Initial rollout: warn-only. The script itself is configured to
+    # exit 0 in warn mode (see .github/scripts/docs_lint.py, MODE
+    # constant), and the job carries continue-on-error: true as a
+    # belt-and-suspenders so the surrounding workflow never blocks a
+    # merge while we build docs coverage. Both knobs will flip together
+    # when we escalate to hard-block.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Run docs lint
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/docs_lint.py
