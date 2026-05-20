@@ -21,6 +21,15 @@ backends live in sibling packages: :mod:`kernels.anthropic`,
 """
 
 from .factory import make_kernel
+from .hooks import (
+    AgentHook,
+    BaseAgentHook,
+    LoggingReporter,
+    Reporter,
+    ToolResult,
+    ToolUse,
+    TurnResult,
+)
 from .protocol import BlockHandler, Kernel, NullHandler
 from .types import (
     KernelResult,
@@ -33,13 +42,20 @@ from .types import (
 
 
 __all__ = [
+    "AgentHook",
+    "BaseAgentHook",
     "BlockHandler",
     "Kernel",
     "KernelResult",
     "KernelSpec",
+    "LoggingReporter",
     "NullHandler",
+    "Reporter",
     "SystemEvent",
     "ThinkingLevel",
+    "ToolResult",
+    "ToolUse",
+    "TurnResult",
     "TurnSummary",
     "UsageInfo",
     "make_kernel",
