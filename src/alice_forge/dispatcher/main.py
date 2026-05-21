@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from alice_forge.dispatcher.handlers._common import *  # noqa: F401, F403
+from alice_forge.sm.ledger import EmittedLedger, load_or_migrate
 
 # State-handler functions live in sibling modules under
 # ``alice_forge.dispatcher.handlers``. They can't be re-exported via
@@ -25,10 +26,35 @@ from alice_forge.dispatcher.handlers.selected import _process_selected
 from alice_forge.dispatcher.handlers.stale_closed import _process_stale_closed
 
 
+def _save_ledger_best_effort(
+    ledger: EmittedLedger,
+    ledger_path: pathlib.Path,
+    log: Callable[[str], None],
+) -> None:
+    """Persist the v3 emit ledger; log + swallow on I/O failure.
+
+    The dispatcher's primary contract is the v1 ``state_path`` save;
+    the v3 ledger is shadowed alongside it during Phase 1 + 2 and a
+    persistence failure here must NOT abort the cadence (which would
+    drop the v1 state save too). When a v3 handler becomes
+    load-bearing on the ledger (Phase 2 cutover per state), the
+    error becomes a real failure mode; for now it's strictly
+    best-effort.
+    """
+    try:
+        ledger.save(ledger_path)
+    except OSError as exc:
+        log(
+            f"[sm-dispatcher] failed to save v3 emit ledger at "
+            f"{ledger_path}: {exc} (Phase 1: best-effort)"
+        )
+
+
 def run(
     *,
     repo: str = DEFAULT_REPO,
     state_path: pathlib.Path,
+    ledger_path: pathlib.Path | None = None,
     list_issues: ListIssuesFn | None = None,
     list_stale_closed: ListIssuesFn | None = None,
     list_open_done: ListIssuesFn | None = None,
@@ -264,6 +290,25 @@ def run(
         return 1, report
 
     state = load_state(state_path)
+
+    # SM v3 Phase 1: load the unified emit ledger alongside v1's
+    # DispatcherState. v1 handlers continue to use ``state``; v3
+    # handlers (Phase 2 onward) will read+write ``ledger``. Until any
+    # v3 handler is wired, the ledger is loaded and saved but
+    # otherwise unused — the round-trip exercises the persistence
+    # path on every cadence so a corrupt file surfaces immediately
+    # rather than at first Phase 2 deploy.
+    if ledger_path is None:
+        ledger_path = state_path.parent / "sm-emit-ledger.json"
+    try:
+        ledger = load_or_migrate(ledger_path, v1_state_path=state_path)
+    except (OSError, ValueError) as exc:
+        log(
+            f"[sm-dispatcher] failed to load v3 emit ledger at "
+            f"{ledger_path}: {exc} — starting empty"
+        )
+        ledger = EmittedLedger()
+
     report.polled = len(issues)
 
     fatal_exit = False
@@ -566,10 +611,12 @@ def run(
         # hello posts isn't lost.
         if not dry_run:
             save_state(state_path, state)
+            _save_ledger_best_effort(ledger, ledger_path, log)
         return 1, report
 
     if not dry_run:
         save_state(state_path, state)
+        _save_ledger_best_effort(ledger, ledger_path, log)
 
     log(
         f"[sm-dispatcher] done — polled={report.polled} "
