@@ -22,8 +22,6 @@ import json
 from dataclasses import dataclass, field
 from typing import Optional
 
-import pytest
-
 from alice_speaking._dispatch import handle_cozyhem_event
 from alice_speaking.internal.cozyhem import (
     BACKOFF_INITIAL_SECONDS,

@@ -66,7 +66,6 @@ from .infra.signal_rpc import SignalRPC as SignalClient
 from .internal import (
     BackgroundTaskCompleteEvent,
     BackgroundTaskCompletionSource,
-    CozyHemEvent,
     CozyHemEventSubscriber,
     EmergencyEvent,
     EmergencyWatcher,
