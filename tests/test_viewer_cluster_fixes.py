@@ -96,6 +96,68 @@ def test_unknown_kind_still_falls_through():
     assert turns[0].kind == "unknown"
 
 
+def test_bg_handle_classified_as_alice_forge():
+    """alice_forge / background-task subagent dispatches run with
+    ``correlation_id`` = ``bg-<12hex>`` and never emit a ``*_turn_start``
+    event. They previously stuck at the default ``unknown`` kind with
+    all Signal-flavored columns blank (#283); now we recognise the
+    bg-handle prefix and tag the turn ``alice_forge``."""
+    events = [
+        _speaking_event(
+            "user_message",
+            ts=400,
+            turn_id="bg-700dc958ae8f",
+            content="You are an auto-fix worker for issue #999 in jcronq/alice",
+        ),
+        _speaking_event(
+            "tool_use",
+            ts=401,
+            turn_id="bg-700dc958ae8f",
+            name="Bash",
+        ),
+        _speaking_event(
+            "result",
+            ts=410,
+            turn_id="bg-700dc958ae8f",
+            total_cost_usd=0.12,
+        ),
+    ]
+    turns = aggregators.group_turns(events)
+    assert len(turns) == 1
+    t = turns[0]
+    assert t.kind == "alice_forge"
+    assert t.turn_id == "bg-700dc958ae8f"
+    assert "Bash" in t.tools
+    # Summariser should produce a meaningful row label, not the bare kind.
+    summary = aggregators.summarize_turn(t)
+    assert summary.startswith("alice_forge · ")
+    assert "auto-fix worker" in summary
+
+
+def test_bg_handle_real_start_event_still_wins():
+    """If a future code path ever emits a real ``*_turn_start`` on a
+    bg-handle correlation_id, the explicit classifier still overrides
+    the prefix default."""
+    events = [
+        _speaking_event(
+            "tool_use",
+            ts=500,
+            turn_id="bg-cafebabef00d",
+            name="Read",
+        ),
+        _speaking_event(
+            "signal_turn_start",
+            ts=501,
+            turn_id="bg-cafebabef00d",
+            sender_name="Jason",
+            inbound="hi",
+        ),
+    ]
+    turns = aggregators.group_turns(events)
+    assert len(turns) == 1
+    assert turns[0].kind == "signal"
+
+
 # ---------------------------------------------------------------------------
 # read_current_objective
 

@@ -359,6 +359,20 @@ def summarize_turn(t: Turn) -> str:
         if t.end_ts is None:
             return "context compaction · running…"
         return "context compaction"
+    if t.kind == "alice_forge":
+        # bg-handle subagent dispatch — the first user_message carries the
+        # worker's prompt; surface its first line so the row isn't blank.
+        for ev in t.events:
+            if ev.kind == "user_message":
+                text = (ev.detail or {}).get("content") or (ev.detail or {}).get(
+                    "text"
+                ) or ""
+                if isinstance(text, str):
+                    head = text.strip().splitlines()[0] if text.strip() else ""
+                    if head:
+                        return f"alice_forge · {head[:140]}"
+                break
+        return f"alice_forge · {t.turn_id}"
     return t.kind
 
 
@@ -436,11 +450,23 @@ def group_turns(events: list[UnifiedEvent]) -> list[Turn]:
         tid = ev.correlation_id
         turn = by_id.get(tid)
         if turn is None:
+            # alice_forge / background-task subagent dispatches run with
+            # correlation_id = ``bg-<12hex>`` (see
+            # ``alice_speaking.daemon._dispatch_subagent``). They emit
+            # kernel events (tool_use, thinking, result, …) but never a
+            # ``*_turn_start`` event, so without this prefix-match they
+            # would stick at the default "unknown" with all Signal-flavored
+            # columns blank (#283). A real start event below still
+            # overrides this if one ever arrives.
+            initial_kind = (
+                "alice_forge" if isinstance(tid, str) and tid.startswith("bg-")
+                else "unknown"
+            )
             turn = Turn(
                 turn_id=tid,
                 start_ts=ev.ts,
                 end_ts=None,
-                kind="unknown",
+                kind=initial_kind,
                 sender_name=None,
                 surface_id=None,
                 emergency_id=None,
