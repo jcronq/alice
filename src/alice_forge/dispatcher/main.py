@@ -589,6 +589,22 @@ def run(
                     now_iso=now_iso,
                 )
             elif sm_label == DESIGNING_SM_LABEL:
+                if DESIGNING_SM_LABEL in v3_dry_run_states:
+                    from alice_forge.sm.handlers.designing import handle as _h_designing
+                    from alice_forge.sm.states import SMState as _SMState
+                    _v3_dry_run(
+                        handler=_h_designing,
+                        state_for_log=_SMState.DESIGNING,
+                        issue=issue,
+                        repo=repo,
+                        cycle_id=_cycle_id,
+                        ledger=ledger,
+                        list_comments=list_comments,
+                        trusted_authors=trusted_authors,
+                        log_dir=v3_dry_run_log_dir,
+                        now_iso=now_iso,
+                        log=log,
+                    )
                 _process_designing(
                     issue=issue,
                     repo=repo,
@@ -602,6 +618,22 @@ def run(
                     now_iso=now_iso,
                 )
             elif sm_label == DESIGN_REVIEW_SM_LABEL:
+                if DESIGN_REVIEW_SM_LABEL in v3_dry_run_states:
+                    from alice_forge.sm.handlers.design_review import handle as _h_dr
+                    from alice_forge.sm.states import SMState as _SMState
+                    _v3_dry_run(
+                        handler=_h_dr,
+                        state_for_log=_SMState.DESIGN_REVIEW,
+                        issue=issue,
+                        repo=repo,
+                        cycle_id=_cycle_id,
+                        ledger=ledger,
+                        list_comments=list_comments,
+                        trusted_authors=trusted_authors,
+                        log_dir=v3_dry_run_log_dir,
+                        now_iso=now_iso,
+                        log=log,
+                    )
                 _process_design_review(
                     issue=issue,
                     repo=repo,
@@ -616,6 +648,22 @@ def run(
                     now_iso=now_iso,
                 )
             elif sm_label == DESIGNED_SM_LABEL:
+                if DESIGNED_SM_LABEL in v3_dry_run_states:
+                    from alice_forge.sm.handlers.designed import handle as _h_designed
+                    from alice_forge.sm.states import SMState as _SMState
+                    _v3_dry_run(
+                        handler=_h_designed,
+                        state_for_log=_SMState.DESIGNED,
+                        issue=issue,
+                        repo=repo,
+                        cycle_id=_cycle_id,
+                        ledger=ledger,
+                        list_comments=list_comments,
+                        trusted_authors=trusted_authors,
+                        log_dir=v3_dry_run_log_dir,
+                        now_iso=now_iso,
+                        log=log,
+                    )
                 _process_designed(
                     issue=issue,
                     repo=repo,
