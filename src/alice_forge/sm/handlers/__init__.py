@@ -17,6 +17,7 @@ Phase 2 ports states one at a time in this order:
 
 from __future__ import annotations
 
+from alice_forge.sm.handlers.compacting import handle as handle_compacting
 from alice_forge.sm.handlers.draft import handle as handle_draft
 
-__all__ = ["handle_draft"]
+__all__ = ["handle_draft", "handle_compacting"]

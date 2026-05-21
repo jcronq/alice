@@ -63,8 +63,10 @@ def _generate_cycle_id(now_iso_str: str) -> str:
     return f"{now_iso_str}-{secrets.token_hex(4)}"
 
 
-def _v3_dry_run_draft(
+def _v3_dry_run(
     *,
+    handler: Callable[..., Any],
+    state_for_log: "SMState",
     issue: dict[str, Any],
     repo: str,
     cycle_id: str,
@@ -75,12 +77,14 @@ def _v3_dry_run_draft(
     now_iso: Callable[[], str],
     log: Callable[[str], None],
 ) -> None:
-    """Dual-run shim: invoke v3 handler in dry-run mode for sm:draft.
+    """Dual-run shim: invoke a v3 handler in dry-run mode.
 
-    The handler is pure — it returns a HandlerResult without
-    touching GitHub. The shim renders the result to the
-    ``v3-predicted.jsonl`` log so the diff job can compare against
-    v1's actual action on the same cycle.
+    Generic across states. Caller supplies the handler function
+    (``alice_forge.sm.handlers.<state>.handle``) and the
+    :class:`SMState` value to record in the log. The shim renders
+    the handler's :class:`HandlerResult` to
+    ``v3-predicted.jsonl`` so the diff job can compare against v1's
+    actual action on the same cycle.
 
     Failures inside the v3 handler are logged but never re-raised:
     Phase 2 dual-run must not destabilize v1's hot path.
@@ -91,9 +95,7 @@ def _v3_dry_run_draft(
     import datetime as _dt
 
     from alice_forge.sm.dual_run import log_entry as _log_entry
-    from alice_forge.sm.handlers.draft import handle as _handle_draft
     from alice_forge.sm.services import HandlerServices
-    from alice_forge.sm.states import SMState
 
     number = issue.get("number")
     if not isinstance(number, int):
@@ -120,11 +122,11 @@ def _v3_dry_run_draft(
             now=_now_dt,
             log=log,
         )
-        result = _handle_draft(issue, services)
+        result = handler(issue, services)
     except Exception as exc:  # noqa: BLE001 — defense for v3 bugs
         log(
-            f"[sm-v3] dry-run handle_draft #{number} raised: "
-            f"{type(exc).__name__}: {exc}"
+            f"[sm-v3] dry-run {handler.__module__}.{handler.__name__} "
+            f"#{number} raised: {type(exc).__name__}: {exc}"
         )
         return
 
@@ -135,7 +137,7 @@ def _v3_dry_run_draft(
             lane="v3-predicted",
             repo=repo,
             issue_number=number,
-            state=SMState.DRAFT,
+            state=state_for_log,
             result=result,
             now=_now_dt(),
         )
@@ -520,7 +522,11 @@ def run(
                 # the actual side-effects. The diff job (separate
                 # tool) compares the two streams.
                 if DRAFT_SM_LABEL in v3_dry_run_states:
-                    _v3_dry_run_draft(
+                    from alice_forge.sm.handlers.draft import handle as _h_draft
+                    from alice_forge.sm.states import SMState as _SMState
+                    _v3_dry_run(
+                        handler=_h_draft,
+                        state_for_log=_SMState.DRAFT,
                         issue=issue,
                         repo=repo,
                         cycle_id=_cycle_id,
@@ -590,6 +596,23 @@ def run(
                     log=log,
                 )
             elif sm_label == COMPACTING_SM_LABEL:
+                # SM v3 Phase 2.2: dual-run the v3 compacting handler.
+                if COMPACTING_SM_LABEL in v3_dry_run_states:
+                    from alice_forge.sm.handlers.compacting import handle as _h_compacting
+                    from alice_forge.sm.states import SMState as _SMState
+                    _v3_dry_run(
+                        handler=_h_compacting,
+                        state_for_log=_SMState.COMPACTING,
+                        issue=issue,
+                        repo=repo,
+                        cycle_id=_cycle_id,
+                        ledger=ledger,
+                        list_comments=list_comments,
+                        trusted_authors=trusted_authors,
+                        log_dir=v3_dry_run_log_dir,
+                        now_iso=now_iso,
+                        log=log,
+                    )
                 _process_compacting(
                     issue=issue,
                     repo=repo,
