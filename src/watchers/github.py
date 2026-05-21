@@ -88,12 +88,12 @@ def _is_self_filed(issue: dict[str, Any]) -> bool:
 
 
 # Label the SM v2 dispatcher uses as the lifecycle entry point. The
-# dispatcher's GitHub query (``src/sm/dispatcher/gh.py``) filters
+# dispatcher's GitHub query (``src/forge/dispatcher/gh.py``) filters
 # by ``label:sm:draft,sm:needs_study,...`` — an unlabeled trusted-author
 # issue is invisible to the dispatcher and stalls indefinitely. The
 # watcher applies this on ``new_issue`` intake so every fresh trusted
 # issue enters the SM lifecycle automatically. Re-stated here rather
-# than imported from ``sm.dispatcher.constants`` to keep the
+# than imported from ``forge.dispatcher.constants`` to keep the
 # watcher decoupled from the dispatcher package.
 SM_DRAFT_LABEL = "sm:draft"
 SM_LABEL_PREFIX = "sm:"

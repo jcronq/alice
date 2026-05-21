@@ -1,6 +1,6 @@
 """Speaking-side wiring for the ``dispatched-in-flight`` gh-state record.
 
-PR #262 added :func:`sm.gh_state_mirror.write_dispatched_inflight`
+PR #262 added :func:`forge.gh_state_mirror.write_dispatched_inflight`
 so Thinking's dispatcher can suppress duplicate ``attempt-issue-fix``
 surfaces while a worker is mid-flight but hasn't yet pushed a branch /
 opened a PR. The race-window write happens here: when Speaking's
@@ -27,7 +27,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from sm import gh_state_mirror
+from forge import gh_state_mirror
 
 
 log = logging.getLogger(__name__)

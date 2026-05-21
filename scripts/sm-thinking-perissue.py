@@ -3,7 +3,7 @@
 
 Sub-issue 3 of the SM v2 pipeline revision
 ([[2026-05-13-sm-v2-pipeline-revision]]). Invoked by
-:func:`sm.dispatcher.spawn_thinking_agent` for each
+:func:`forge.dispatcher.spawn_thinking_agent` for each
 ``(sm:selected, art:code)`` issue. Reads the spawn dir's ``prompt.txt``,
 resolves the configured :class:`alice_thinking.phase.Phase` from
 frontmatter, and drives the kernel via

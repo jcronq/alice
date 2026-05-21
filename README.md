@@ -79,7 +79,7 @@ A typical run:
 1. Speaking files an idea as a GitHub issue with `sm:draft`.
 2. Thinking reviews drafts on her own cadence and promotes the good ones to
    `sm:selected`.
-3. The dispatcher (`alice_sm.dispatcher`) sees `sm:selected`, spawns a
+3. The dispatcher (`forge.dispatcher`) sees `sm:selected`, spawns a
    detached `claude` agent in the worker, and posts a "spawn-started" audit
    comment.
 4. The agent writes the diff, opens a **draft PR**, transitions the issue to
@@ -89,7 +89,7 @@ A typical run:
 
 Jason is escalation-only. The pipeline runs without him.
 
-> Source: [`src/alice_sm/dispatcher.py`](src/alice_sm/dispatcher.py).
+> Source: [`src/forge/dispatcher/`](src/forge/dispatcher/).
 
 ### Signal as the surface, not a chat window
 

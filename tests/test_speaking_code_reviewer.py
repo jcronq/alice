@@ -19,7 +19,7 @@ from alice_speaking.review import (
     CODE_REVIEWER_SYSTEM_PROMPT,
     CodeReviewResult,
 )
-from sm import dispatcher as sm
+from forge import dispatcher as sm
 
 
 # ---------------------------------------------------------------------------

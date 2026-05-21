@@ -25,7 +25,7 @@ different category whitelist tuned for implementation quality:
 The dispatcher integration that consumes the verdict
 (``sm:reviewing → sm:done`` on approval, ``sm:reviewing → sm:building``
 on needs_revision) is wired separately; see issue #107's integration
-section and the spawn-map entry in ``sm.dispatcher``.
+section and the spawn-map entry in ``forge.dispatcher``.
 """
 
 from __future__ import annotations

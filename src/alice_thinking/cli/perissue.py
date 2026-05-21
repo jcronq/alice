@@ -1,7 +1,7 @@
 """Per-issue thinking-agent entrypoint — sub-issue 3 of SM v2 pipeline revision.
 
-Replaces the :mod:`sm.thinking_shim` placeholder shipped in #156.
-Invoked by :func:`sm.dispatcher.spawn_thinking_agent` for each
+Replaces the :mod:`forge.thinking_shim` placeholder shipped in #156.
+Invoked by :func:`forge.dispatcher.spawn_thinking_agent` for each
 ``(sm:selected, art:code)`` issue. Reads the spawn dir's ``prompt.txt``,
 resolves the configured :class:`alice_thinking.phase.Phase` from
 frontmatter (or a ``--mode`` override), composes the prompt + kernel

@@ -6,7 +6,7 @@ race window described in
 when Speaking's ``_dispatch_subagent`` is about to spawn a worker for a
 prompt that matches the auto-fix template,
 :func:`alice_speaking.auto_fix.record_auto_fix_inflight` must call
-:func:`sm.gh_state_mirror.write_dispatched_inflight` BEFORE
+:func:`forge.gh_state_mirror.write_dispatched_inflight` BEFORE
 the asyncio task starts.
 
 The integration is exercised end-to-end via the parser + record helper.
