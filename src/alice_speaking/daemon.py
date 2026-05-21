@@ -40,6 +40,7 @@ import contextlib
 import logging
 import os
 import signal as _signal
+import threading
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, Optional
@@ -650,13 +651,59 @@ class SpeakingDaemon:
 
         loop = asyncio.get_event_loop()
 
+        # Force-stop hard budget: once the second signal fires we
+        # guarantee the process exits within this many seconds, even
+        # if asyncio cancellation is being swallowed somewhere (e.g.
+        # an in-flight subagent's CLI subprocess that ignores
+        # CancelledError, or a transport.stop() blocked in sync I/O).
+        # Override via env for ops; floor at 1s.
+        force_stop_budget_env = os.environ.get(
+            "ALICE_SPEAKING_FORCE_STOP_BUDGET", ""
+        ).strip()
+        try:
+            force_stop_budget = (
+                float(force_stop_budget_env)
+                if force_stop_budget_env
+                else 8.0
+            )
+        except ValueError:
+            log.warning(
+                "ignoring non-numeric ALICE_SPEAKING_FORCE_STOP_BUDGET=%r",
+                force_stop_budget_env,
+            )
+            force_stop_budget = 8.0
+        force_stop_budget = max(1.0, force_stop_budget)
+
+        def _hard_kill_after_budget() -> None:
+            # Runs on a plain daemon thread so it survives even if
+            # the event loop is wedged. If we get here the shutdown
+            # sequence didn't finish in time — exit hard. Non-zero
+            # because this is an abnormal exit; init/Docker will
+            # restart the container.
+            log.error(
+                "force-stop budget (%.1fs) elapsed; calling os._exit(1)",
+                force_stop_budget,
+            )
+            os._exit(1)
+
         def _on_signal() -> None:
             if not self._drain.is_set():
                 log.info("signal received; entering drain mode")
                 self._drain.set()
             else:
-                log.warning("second signal received; force-stopping")
+                log.warning(
+                    "second signal received; force-stopping (hard kill in %.1fs)",
+                    force_stop_budget,
+                )
                 self._stop.set()
+                # Arm the wall-clock guard exactly once.
+                if not getattr(self, "_hard_kill_armed", False):
+                    self._hard_kill_armed = True
+                    t = threading.Timer(
+                        force_stop_budget, _hard_kill_after_budget
+                    )
+                    t.daemon = True
+                    t.start()
 
         for sig in (_signal.SIGTERM, _signal.SIGINT):
             loop.add_signal_handler(sig, _on_signal)
@@ -748,7 +795,10 @@ class SpeakingDaemon:
                 # Force-stop path: SIGTERM with no preceding drain
                 # (_drain not set first), or a second signal during
                 # drain. Cancel everything now; in-flight turn dies
-                # via CancelledError.
+                # via CancelledError — but bound the await so a task
+                # that swallows CancelledError can't wedge shutdown.
+                # The wall-clock timer armed in _on_signal is the
+                # last-resort backstop (os._exit after budget).
                 log.warning("force-stop: cancelling all tasks")
                 cancel_set: list[asyncio.Task] = [
                     *producers,
@@ -757,12 +807,32 @@ class SpeakingDaemon:
                 ]
                 if signal_run_task is not None:
                     cancel_set.append(signal_run_task)
+                # Subagent tasks (the most likely offender: their
+                # claude CLI subprocess may not honor CancelledError
+                # promptly). Cancel these too on force-stop.
+                cancel_set.extend(
+                    t for t in self._subagent_tasks.values() if not t.done()
+                )
                 for task in cancel_set:
                     if not task.done():
                         task.cancel()
-                for task in cancel_set:
+                # Bounded join: ``asyncio.wait(timeout=N)`` is
+                # genuinely bounded -- it returns (done, pending)
+                # without awaiting pending tasks. ``wait_for(gather(...))``
+                # is NOT: if any child swallows CancelledError, the
+                # inner ``_cancel_and_wait`` hangs indefinitely. The
+                # wall-clock os._exit guard armed in _on_signal is
+                # the absolute backstop either way.
+                if cancel_set:
                     with contextlib.suppress(BaseException):
-                        await task
+                        await asyncio.wait(cancel_set, timeout=3.0)
+                stragglers = [t for t in cancel_set if not t.done()]
+                if stragglers:
+                    log.warning(
+                        "force-stop: %d task(s) did not honor cancel in 3s: %s",
+                        len(stragglers),
+                        [t.get_name() for t in stragglers],
+                    )
             else:
                 # Drain path. Triggered by SIGTERM (drain_task done)
                 # or by an upstream task crashing — either way the
@@ -800,12 +870,30 @@ class SpeakingDaemon:
                         "drain: cancelling %d in-flight subagent task(s)",
                         len(self._subagent_tasks),
                     )
-                    for task in list(self._subagent_tasks.values()):
+                    subagent_snapshot = list(self._subagent_tasks.values())
+                    for task in subagent_snapshot:
                         if not task.done():
                             task.cancel()
-                    for task in list(self._subagent_tasks.values()):
+                    # Bounded await: ``asyncio.wait(timeout=N)`` returns
+                    # (done, pending) without re-awaiting pending tasks.
+                    # A subagent whose claude CLI subprocess swallows
+                    # CancelledError stays in ``pending``; we log and
+                    # move on rather than wedge.
+                    if subagent_snapshot:
                         with contextlib.suppress(BaseException):
-                            await task
+                            await asyncio.wait(
+                                subagent_snapshot, timeout=3.0
+                            )
+                    stragglers = [
+                        t for t in subagent_snapshot if not t.done()
+                    ]
+                    if stragglers:
+                        log.warning(
+                            "drain: %d subagent task(s) did not honor "
+                            "cancel in 3s: %s",
+                            len(stragglers),
+                            [t.get_name() for t in stragglers],
+                        )
 
                 log.info("drain: waiting for in-flight turn + queued events")
                 drain_timeout_env = os.environ.get(
@@ -865,27 +953,63 @@ class SpeakingDaemon:
                 for task in cancel_set:
                     if not task.done():
                         task.cancel()
-                for task in cancel_set:
+                # Bounded await: ``asyncio.wait(timeout=N)`` is the
+                # only genuinely bounded primitive when cancellation
+                # may be swallowed. The wall-clock timer armed by a
+                # subsequent SIGTERM is the absolute backstop.
+                if cancel_set:
                     with contextlib.suppress(BaseException):
-                        await task
+                        await asyncio.wait(cancel_set, timeout=5.0)
+                stragglers = [t for t in cancel_set if not t.done()]
+                if stragglers:
+                    log.warning(
+                        "drain: %d consumer task(s) did not honor "
+                        "cancel in 5s: %s",
+                        len(stragglers),
+                        [t.get_name() for t in stragglers],
+                    )
         finally:
+            # Bounded transport teardown: any single stop() that
+            # blocks in sync I/O could otherwise wedge shutdown
+            # indefinitely. Per-call cap is small; the wall-clock
+            # force-stop guard is the absolute backstop.
+            async def _stop_with_timeout(name: str, coro_factory) -> None:
+                try:
+                    await asyncio.wait_for(coro_factory(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "shutdown: %s.stop() exceeded 3s timeout", name
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "shutdown: %s.stop() raised %s: %s",
+                        name,
+                        type(exc).__name__,
+                        exc,
+                    )
+
             if self.signal_transport is not None:
-                with contextlib.suppress(Exception):
-                    await self.signal_transport.stop()
+                await _stop_with_timeout(
+                    "signal_transport", self.signal_transport.stop
+                )
             if self.signal is not None:
-                await self.signal.aclose()
+                await _stop_with_timeout("signal", self.signal.aclose)
             if self.cli_transport is not None:
-                with contextlib.suppress(Exception):
-                    await self.cli_transport.stop()
+                await _stop_with_timeout(
+                    "cli_transport", self.cli_transport.stop
+                )
             if self.discord_transport is not None:
-                with contextlib.suppress(Exception):
-                    await self.discord_transport.stop()
+                await _stop_with_timeout(
+                    "discord_transport", self.discord_transport.stop
+                )
             if self.a2a_transport is not None:
-                with contextlib.suppress(Exception):
-                    await self.a2a_transport.stop()
+                await _stop_with_timeout(
+                    "a2a_transport", self.a2a_transport.stop
+                )
             if self.viewer_chat_transport is not None:
-                with contextlib.suppress(Exception):
-                    await self.viewer_chat_transport.stop()
+                await _stop_with_timeout(
+                    "viewer_chat_transport", self.viewer_chat_transport.stop
+                )
             self.events.emit("shutdown")
             log.info("shutdown complete")
 
