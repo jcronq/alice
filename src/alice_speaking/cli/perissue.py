@@ -2,7 +2,7 @@
 
 Counterpart of :mod:`alice_thinking.cli.perissue` for the build half
 of the SM v2 pipeline. Invoked by
-:func:`forge.dispatcher.spawn_speaking_agent` (filed separately
+:func:`alice_forge.dispatcher.spawn_speaking_agent` (filed separately
 as #184) for each ``(sm:designed, art:code)`` issue. Reads the
 spawn dir's ``prompt.txt`` (which carries ``issue=#N``,
 ``design_note=<vault-path>``, ``art=<art-label>`` frontmatter +
@@ -132,7 +132,7 @@ def post_comment_via_gh(repo: str, issue_number: int, body: str) -> None:
     """Default audit-comment poster — shells out to ``gh issue comment``.
 
     Replaceable in tests via the ``post_comment`` kwarg on
-    :func:`main`. We don't import :func:`forge.dispatcher.gh_post_comment`
+    :func:`main`. We don't import :func:`alice_forge.dispatcher.gh_post_comment`
     here to avoid pulling the entire dispatcher module into a worker
     process (the dispatcher imports heavy gh-watcher plumbing).
     """

@@ -53,7 +53,7 @@ alice-experiment = "alice_thinking.cli.experiment:main"
 # One-shot State Machine v0 dispatcher — polls jcronq/alice for sm:selected
 # issues, trust-filters them, and posts a dispatcher-hello comment. Invoke
 # on a cadence (later: s6 supervisor); for now it's manual.
-alice-sm = "forge.dispatcher:main"
+alice-sm = "alice_forge.dispatcher:main"
 # One-shot reconciliation: copy access_count from vault frontmatter into
 # the cortex-index note_metrics table. Used to bootstrap historical
 # counts after wiring the cue runner's DB write path.
@@ -63,7 +63,7 @@ alice-seed-access-counts = "indexer.seed_access_counts:main"
 # instead of going through the MCP server. See sandbox/host-claude-watcher/.
 alice-host-claude-request = "alice_speaking.tools.host_claude:main"
 # Per-issue thinking-agent entrypoint (#163). Invoked by
-# forge.dispatcher.spawn_thinking_agent for each (sm:selected, art:code)
+# alice_forge.dispatcher.spawn_thinking_agent for each (sm:selected, art:code)
 # issue — reads <spawn-dir>/prompt.txt, resolves Phase from frontmatter,
 # drives the kernel through alice_thinking.runtime.PhaseRunner. The
 # scripts/sm-thinking-perissue.py shim is a thin file-path wrapper around
@@ -83,7 +83,7 @@ build-backend = "hatchling.build"
 #   kernels.anthropic — Kernel impl backed by claude_agent_sdk
 #   prompts   — Jinja2 templates the runtime renders into model prompts
 #   skills    — registry over .claude/skills/ markdown (plan 07)
-#   forge     — State Machine dispatcher for alice_forge (poll → trust-filter → comment)
+#   alice_forge     — State Machine dispatcher for alice_forge (poll → trust-filter → comment)
 #   alice_speaking  — Signal daemon (composes kernel with producers/handlers/outbox)
 #   alice_thinking  — one-shot wake (python -m alice_thinking)
 #   viewer    — FastAPI observability UI (serves /state logs)
@@ -97,7 +97,7 @@ packages = [
     "src/kernels",
     "src/prompts",
     "src/skills",
-    "src/forge",
+    "src/alice_forge",
     "src/alice_speaking",
     "src/alice_thinking",
     "src/viewer",
@@ -140,4 +140,4 @@ ignore_missing_imports = true
 # bundle) as the cohesion pattern for the (state, artifact)
 # transition handlers. F403/F405 fire as false positives on this
 # idiom; exempt the whole sub-package rather than per-file.
-"src/forge/dispatcher/**/*.py" = ["F403", "F405"]
+"src/alice_forge/dispatcher/**/*.py" = ["F403", "F405"]

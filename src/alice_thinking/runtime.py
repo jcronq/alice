@@ -42,7 +42,7 @@ Companion Designs in
 
 Per-issue phases (:attr:`Phase.PER_ISSUE_DESIGN` /
 :attr:`Phase.PER_ISSUE_BUILD`) are stimulus-spawned by
-:func:`forge.dispatcher.spawn_thinking_agent` rather than picked by
+:func:`alice_forge.dispatcher.spawn_thinking_agent` rather than picked by
 the wake cadence selector. They route through the same
 :meth:`PhaseRunner.run` path as cadence-driven phases — the caller is
 the ``scripts/sm-thinking-perissue.py`` entrypoint, which reads the

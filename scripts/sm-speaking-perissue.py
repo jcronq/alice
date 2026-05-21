@@ -3,7 +3,7 @@
 
 Issue #184 of the SM v2 pipeline revision post-amendment
 ([[2026-05-13-sm-v2-pipeline-revision]]). Invoked by
-:func:`forge.dispatcher.spawn_speaking_agent` for each
+:func:`alice_forge.dispatcher.spawn_speaking_agent` for each
 ``(sm:designed, art:code)`` issue. Reads the spawn dir's ``prompt.txt``,
 resolves the configured :class:`alice_thinking.phase.Phase` from
 frontmatter (``per_issue_build``), loads the approved design note
@@ -11,9 +11,9 @@ referenced by frontmatter, and dispatches the Task / Agent tool with the
 design + relevant context so a sub-agent can implement and open a draft
 PR.
 
-Thin wrapper around :mod:`forge.speaking_shim` — the real
+Thin wrapper around :mod:`alice_forge.speaking_shim` — the real
 PhaseRunner-based logic lands in the follow-up sub-issue that replaces
-the placeholder shim. Both entry forms (``python -m forge.speaking_shim``
+the placeholder shim. Both entry forms (``python -m alice_forge.speaking_shim``
 and this script) share the same dispatch logic so the dispatcher can
 invoke whichever is closer at hand.
 """
@@ -28,7 +28,7 @@ def _ensure_src_on_path() -> None:
     """Allow running the script without ``pip install -e .`` in dev shells.
 
     Inserts the repo's ``src/`` next to this script onto ``sys.path``
-    so ``import forge`` resolves to the in-tree package. The venv
+    so ``import alice_forge`` resolves to the in-tree package. The venv
     install path (where the package is already on ``sys.path``) is
     unaffected.
     """
@@ -40,7 +40,7 @@ def _ensure_src_on_path() -> None:
 
 def main() -> int:
     _ensure_src_on_path()
-    from forge.speaking_shim import main as _main
+    from alice_forge.speaking_shim import main as _main
 
     return _main()
 

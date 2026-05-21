@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from forge import gh_state_mirror
+from alice_forge import gh_state_mirror
 
 
 @pytest.fixture

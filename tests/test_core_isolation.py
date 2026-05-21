@@ -75,7 +75,7 @@ def test_core_imports_only_sdk_stdlib_or_self(py_file: pathlib.Path):
     Claude Agent SDK, or another ``core`` module. Sibling
     packages (``alice_speaking``, ``alice_thinking``, ``kernels``,
     ``viewer``, ``watchers``, ``prompts``, ``indexer``, ``skills``,
-    ``forge``, ``metrics``, ``eval``) are forbidden — the
+    ``alice_forge``, ``metrics``, ``eval``) are forbidden — the
     dependency direction is one-way."""
     tree = ast.parse(py_file.read_text())
     for name in _toplevel_imports(tree):
