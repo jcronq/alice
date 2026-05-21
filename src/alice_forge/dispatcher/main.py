@@ -461,6 +461,23 @@ def run(
 
         try:
             if sm_label == ACTIVE_SM_LABEL:
+                if ACTIVE_SM_LABEL in v3_dry_run_states:
+                    from alice_forge.sm.handlers.selected import handle as _h_selected
+                    from alice_forge.sm.states import SMState as _SMState
+                    _v3_dry_run(
+                        handler=_h_selected,
+                        state_for_log=_SMState.SELECTED,
+                        issue=issue,
+                        repo=repo,
+                        cycle_id=_cycle_id,
+                        ledger=ledger,
+                        list_comments=list_comments,
+                        find_linked_pr=find_linked_pr,
+                        trusted_authors=trusted_authors,
+                        log_dir=v3_dry_run_log_dir,
+                        now_iso=now_iso,
+                        log=log,
+                    )
                 _process_selected(
                     issue=issue,
                     repo=repo,
