@@ -72,10 +72,13 @@ def _v3_dry_run(
     cycle_id: str,
     ledger: EmittedLedger,
     list_comments: Callable[..., list[dict[str, Any]]],
-    trusted_authors: frozenset[str],
-    log_dir: pathlib.Path | None,
-    now_iso: Callable[[], str],
-    log: Callable[[str], None],
+    find_linked_pr: Callable[..., dict[str, Any] | None] | None = None,
+    pr_merge_status: Callable[..., Any] | None = None,
+    master_ci_status: Callable[..., Any] | None = None,
+    trusted_authors: frozenset[str] = frozenset(),
+    log_dir: pathlib.Path | None = None,
+    now_iso: Callable[[], str] = lambda: "",
+    log: Callable[[str], None] = lambda s: None,
 ) -> None:
     """Dual-run shim: invoke a v3 handler in dry-run mode.
 
@@ -108,16 +111,20 @@ def _v3_dry_run(
             return _dt.datetime.now(_dt.timezone.utc)
 
     try:
+        # Read-only IO (list_comments, find_linked_pr, ...) gets the
+        # real callables so the handler sees true world state. Write
+        # IO (post_comment, edit_labels, close_issue) is stubbed —
+        # the dry-run must never modify GitHub.
         services = HandlerServices(
             ledger=ledger,
             repo=repo,
-            post_comment=lambda *a, **kw: None,  # dry-run: no IO
+            post_comment=lambda *a, **kw: None,  # write — stubbed
             list_comments=list_comments,
-            edit_labels=lambda *a, **kw: None,
-            close_issue=lambda *a, **kw: None,
-            find_linked_pr=lambda *a, **kw: None,
-            pr_merge_status=lambda *a, **kw: None,
-            master_ci_status=lambda *a, **kw: None,
+            edit_labels=lambda *a, **kw: None,  # write — stubbed
+            close_issue=lambda *a, **kw: None,  # write — stubbed
+            find_linked_pr=find_linked_pr if find_linked_pr else lambda *a, **kw: None,
+            pr_merge_status=pr_merge_status if pr_merge_status else lambda *a, **kw: None,
+            master_ci_status=master_ci_status if master_ci_status else lambda *a, **kw: None,
             trusted_authors=trusted_authors,
             now=_now_dt,
             log=log,
@@ -626,6 +633,24 @@ def run(
                     log=log,
                 )
             elif sm_label == BUILDING_SM_LABEL:
+                # SM v3 Phase 2.3: dual-run the v3 building handler.
+                if BUILDING_SM_LABEL in v3_dry_run_states:
+                    from alice_forge.sm.handlers.building import handle as _h_building
+                    from alice_forge.sm.states import SMState as _SMState
+                    _v3_dry_run(
+                        handler=_h_building,
+                        state_for_log=_SMState.BUILDING,
+                        issue=issue,
+                        repo=repo,
+                        cycle_id=_cycle_id,
+                        ledger=ledger,
+                        list_comments=list_comments,
+                        find_linked_pr=find_linked_pr,
+                        trusted_authors=trusted_authors,
+                        log_dir=v3_dry_run_log_dir,
+                        now_iso=now_iso,
+                        log=log,
+                    )
                 _process_building(
                     issue=issue,
                     repo=repo,
