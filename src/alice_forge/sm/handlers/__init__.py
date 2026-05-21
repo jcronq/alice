@@ -24,6 +24,7 @@ from alice_forge.sm.handlers.design_review import handle as handle_design_review
 from alice_forge.sm.handlers.designing import handle as handle_designing
 from alice_forge.sm.handlers.draft import handle as handle_draft
 from alice_forge.sm.handlers.needs_study import handle as handle_needs_study
+from alice_forge.sm.handlers.reviewing import handle as handle_reviewing
 from alice_forge.sm.handlers.selected import handle as handle_selected
 
 __all__ = [
@@ -35,4 +36,5 @@ __all__ = [
     "handle_design_review",
     "handle_designed",
     "handle_selected",
+    "handle_reviewing",
 ]
