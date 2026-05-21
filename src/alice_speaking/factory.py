@@ -34,6 +34,7 @@ from prompts import PromptLoader
 from .infra.config import Config
 from .internal import (
     BackgroundTaskCompletionSource,
+    CozyHemEventSubscriber,
     EmergencyWatcher,
     SurfaceWatcher,
 )
@@ -139,6 +140,7 @@ def build_registry(
     surface_watcher: SurfaceWatcher,
     emergency_watcher: EmergencyWatcher,
     background_task_source: Optional[BackgroundTaskCompletionSource] = None,
+    cozyhem_subscriber: Optional[CozyHemEventSubscriber] = None,
 ) -> SourceRegistry:
     """Assemble a :class:`SourceRegistry` for one daemon session.
 
@@ -165,6 +167,8 @@ def build_registry(
     registry.register_internal(emergency_watcher)
     if background_task_source is not None:
         registry.register_internal(background_task_source)
+    if cozyhem_subscriber is not None:
+        registry.register_internal(cozyhem_subscriber)
     # Startup sources are individually fail-soft — register them
     # all. The dispatcher's startup phase iterates ``all_startup_sources``
     # and runs each, swallowing exceptions per-source.

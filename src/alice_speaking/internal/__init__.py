@@ -26,12 +26,15 @@ from .background_task import (
     BackgroundTaskCompletionSource,
 )
 from .base import InternalSource
+from .cozyhem import CozyHemEvent, CozyHemEventSubscriber
 from .emergency import EmergencyEvent, EmergencyWatcher
 from .surfaces import SurfaceEvent, SurfaceWatcher
 
 __all__ = [
     "BackgroundTaskCompleteEvent",
     "BackgroundTaskCompletionSource",
+    "CozyHemEvent",
+    "CozyHemEventSubscriber",
     "EmergencyEvent",
     "EmergencyWatcher",
     "InternalSource",

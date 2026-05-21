@@ -56,6 +56,7 @@ if TYPE_CHECKING:
         ViewerChatEvent,
     )
     from .internal.background_task import BackgroundTaskCompleteEvent
+    from .internal.cozyhem import CozyHemEvent
 
 
 log = logging.getLogger("alice_speaking._dispatch")
@@ -842,3 +843,88 @@ async def handle_background_task_complete(
             error=error,
             duration_ms=int((time.time() - started) * 1000),
         )
+
+
+# ---------------------------------------------------------------------------
+# CozyHem event handler — routes typed home-automation events by ``kind``.
+
+
+async def handle_cozyhem_event(ctx: DaemonContext, event: "CozyHemEvent") -> None:
+    """Dispatch one :class:`CozyHemEvent` by its ``kind``.
+
+    First concrete consumer is ``doorbell_pressed`` (cozyhem-engine
+    PR 2 / PR 3 of the doorbell chain): notify the address book's
+    emergency recipient (Jason, in production) with a short ping.
+    Quiet hours are bypassed — a doorbell ring is the kind of thing
+    you want to know about even at 2am.
+
+    Unknown kinds are logged + dropped on purpose: cozyhem-engine
+    may emit event types this build of Alice doesn't know about
+    yet, and silently dropping them is preferable to crashing the
+    consumer. Adding a new kind = adding a new branch here.
+    """
+    ctx.events.emit(
+        "cozyhem_event",
+        kind=event.kind,
+        entity_id=event.entity_id,
+        received_at=event.received_at,
+    )
+
+    if event.kind == "doorbell_pressed":
+        await _handle_doorbell_pressed(ctx, event)
+        return
+
+    log.info(
+        "cozyhem: dropping unknown event kind=%r (entity_id=%s)",
+        event.kind,
+        event.entity_id,
+    )
+
+
+async def _handle_doorbell_pressed(
+    ctx: DaemonContext, event: "CozyHemEvent"
+) -> None:
+    """Send a doorbell-press ping to the emergency recipient.
+
+    Direct send rather than a kernel turn: v1 is fire-and-forget
+    "someone's at the door." Future iterations (snapshot fetch,
+    image classification) will add a turn so Alice can decide what
+    to say based on who's there.
+    """
+    recipient = ctx.address_book.emergency_recipient()
+    if recipient is None:
+        log.warning(
+            "cozyhem doorbell_pressed: no emergency recipient configured; "
+            "skipping notification"
+        )
+        ctx.events.emit(
+            "cozyhem_doorbell_no_recipient",
+            entity_id=event.entity_id,
+        )
+        return
+
+    text = "Doorbell pressed."
+    entity_id = event.entity_id or ""
+    if entity_id:
+        text = f"Doorbell pressed ({entity_id})."
+    try:
+        await ctx._dispatch_outbound(
+            recipient,
+            text,
+            None,
+            emergency=False,
+            bypass_quiet=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("cozyhem doorbell_pressed: send failed")
+        ctx.events.emit(
+            "cozyhem_doorbell_send_error",
+            entity_id=event.entity_id,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return
+    ctx.events.emit(
+        "cozyhem_doorbell_voiced",
+        entity_id=event.entity_id,
+        recipient=recipient.address,
+    )

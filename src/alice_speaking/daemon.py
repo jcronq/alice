@@ -66,6 +66,8 @@ from .infra.signal_rpc import SignalRPC as SignalClient
 from .internal import (
     BackgroundTaskCompleteEvent,
     BackgroundTaskCompletionSource,
+    CozyHemEvent,
+    CozyHemEventSubscriber,
     EmergencyEvent,
     EmergencyWatcher,
     SurfaceEvent,
@@ -354,6 +356,16 @@ class SpeakingDaemon:
         # registers them by reference.
         self._surface_watcher = SurfaceWatcher(cfg.mind_dir)
         self._emergency_watcher = EmergencyWatcher(cfg.mind_dir)
+        # CozyHem SSE subscriber — optional. Empty URL disables the
+        # subscriber entirely (operator opted out, or there's no
+        # CozyHem deployed on this network). Non-empty URL means
+        # construct the subscriber; the producer reconnects on its
+        # own if CozyHem itself is unreachable.
+        self._cozyhem_subscriber: Optional[CozyHemEventSubscriber] = (
+            CozyHemEventSubscriber(events_url=cfg.cozyhem_events_url)
+            if cfg.cozyhem_events_url
+            else None
+        )
         # Plan 06 Phase 3: load model.yml so the daemon knows which
         # backend speaking will run on. Missing → subscription default
         # (today's behaviour). The auth env-mutation happens in
@@ -402,6 +414,7 @@ class SpeakingDaemon:
             surface_watcher=self._surface_watcher,
             emergency_watcher=self._emergency_watcher,
             background_task_source=self._background_task_source,
+            cozyhem_subscriber=self._cozyhem_subscriber,
         )
         # Phase 6a of plan 01: outbound dispatch + quiet-queue
         # routing + canonical send-event emission live in

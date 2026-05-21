@@ -181,6 +181,14 @@ class Config:
     viewer_chat_principal: str = "jason"
     viewer_chat_principal_display_name: str = "Jason"
 
+    # CozyHem event subscriber — optional. The speaking-side subscriber
+    # opens a long-lived SSE connection to this URL and turns each frame
+    # into a typed :class:`CozyHemEvent` for the dispatcher. Default
+    # points at the canonical aimax1 endpoint; override via the env
+    # var ``COZYHEM_EVENTS_URL`` to point at a different host (or empty
+    # string to disable the subscriber entirely).
+    cozyhem_events_url: str = "http://aimax1:8000/api/v1/events"
+
     # A2A transport — optional. When ``a2a_enabled`` is False the daemon
     # skips construction. A2A lets external (Google A2A protocol)
     # agents submit tasks to Alice over HTTP/JSON-RPC; the worker
@@ -314,6 +322,11 @@ def load() -> Config:
         from_any("ALICE_VIEWER_CHAT_PRINCIPAL_DISPLAY_NAME", "Jason") or "Jason"
     ).strip()
 
+    cozyhem_events_url = (
+        from_any("COZYHEM_EVENTS_URL", "http://aimax1:8000/api/v1/events")
+        or "http://aimax1:8000/api/v1/events"
+    ).strip()
+
     a2a_enabled_raw = (from_any("ALICE_A2A_ENABLED", "0") or "0").strip().lower()
     a2a_enabled = a2a_enabled_raw in {"1", "true", "yes", "on"}
     try:
@@ -357,4 +370,5 @@ def load() -> Config:
         a2a_host=a2a_host,
         a2a_principal=a2a_principal,
         a2a_external_url=a2a_external_url,
+        cozyhem_events_url=cozyhem_events_url,
     )
