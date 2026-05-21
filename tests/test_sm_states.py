@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import pytest
 
-from alice_forge.sm.states import STATE_META, SMState, StateMeta
+from alice_forge.sm.states import STATE_META, SMState
 
 
 class TestSMStateEnum:

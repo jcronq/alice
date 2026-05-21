@@ -19,9 +19,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Iterable
 
-from alice_forge.sm.states import SMState
 from alice_forge.sm.transitions import Verbs
 
 # Reuse v1's trust set so the cutover doesn't change who can drive

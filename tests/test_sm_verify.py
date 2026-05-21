@@ -7,10 +7,8 @@ import pytest
 from alice_forge.sm.states import SMState
 from alice_forge.sm.transitions import (
     EventTransition,
-    SelfLoop,
     TransitionTo,
     TRANSITIONS,
-    Verbs,
 )
 from alice_forge.sm.verify import (
     StateMachineInvariantError,

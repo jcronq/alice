@@ -22,8 +22,8 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import pathlib
-from dataclasses import asdict, dataclass, field
-from typing import Any, Iterable
+from dataclasses import dataclass, field
+from typing import Any
 
 SCHEMA_VERSION = 1
 

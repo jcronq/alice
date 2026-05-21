@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 
 from alice_forge.sm.comments import (
     Continue,

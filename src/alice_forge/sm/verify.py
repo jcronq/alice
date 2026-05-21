@@ -15,12 +15,10 @@ run surfaces all problems at once — no whack-a-mole.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Iterable
 
 from alice_forge.sm.states import SMState, STATE_META
 from alice_forge.sm.transitions import (
     EventTransition,
-    SelfLoop,
     TransitionTo,
     TRANSITIONS,
 )
