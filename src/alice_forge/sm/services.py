@@ -66,3 +66,9 @@ class HandlerServices:
     trusted_authors: frozenset[str]
     now: Callable[[], _dt.datetime]
     log: Callable[[str], None]
+    # Optional read-only callable: given an issue number, returns the
+    # slug of a vault research note whose frontmatter declares
+    # ``resolves_issue: <number>`` (or None). Used by the
+    # sm:needs_study handler to synthesize a study-complete when
+    # thinking writes the note but forgets the audit comment (#212).
+    research_resolver: Callable[[int], str | None] | None = None

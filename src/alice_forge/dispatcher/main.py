@@ -75,6 +75,7 @@ def _v3_dry_run(
     find_linked_pr: Callable[..., dict[str, Any] | None] | None = None,
     pr_merge_status: Callable[..., Any] | None = None,
     master_ci_status: Callable[..., Any] | None = None,
+    research_resolver: Callable[[int], str | None] | None = None,
     trusted_authors: frozenset[str] = frozenset(),
     log_dir: pathlib.Path | None = None,
     now_iso: Callable[[], str] = lambda: "",
@@ -128,6 +129,7 @@ def _v3_dry_run(
             trusted_authors=trusted_authors,
             now=_now_dt,
             log=log,
+            research_resolver=research_resolver,
         )
         result = handler(issue, services)
     except Exception as exc:  # noqa: BLE001 — defense for v3 bugs
@@ -506,6 +508,32 @@ def run(
                     now_iso=now_iso,
                 )
             elif sm_label == NEEDS_STUDY_SM_LABEL:
+                # SM v3 Phase 2.4: dual-run the v3 needs_study handler.
+                if NEEDS_STUDY_SM_LABEL in v3_dry_run_states:
+                    from alice_forge.sm.handlers.needs_study import handle as _h_ns
+                    from alice_forge.sm.states import SMState as _SMState
+
+                    def _v3_resolve(n: int) -> str | None:
+                        try:
+                            note = _find_resolving_research_note(n, research_dir)
+                        except Exception:
+                            return None
+                        return note.stem if note is not None else None
+
+                    _v3_dry_run(
+                        handler=_h_ns,
+                        state_for_log=_SMState.NEEDS_STUDY,
+                        issue=issue,
+                        repo=repo,
+                        cycle_id=_cycle_id,
+                        ledger=ledger,
+                        list_comments=list_comments,
+                        research_resolver=_v3_resolve,
+                        trusted_authors=trusted_authors,
+                        log_dir=v3_dry_run_log_dir,
+                        now_iso=now_iso,
+                        log=log,
+                    )
                 _process_needs_study(
                     issue=issue,
                     repo=repo,

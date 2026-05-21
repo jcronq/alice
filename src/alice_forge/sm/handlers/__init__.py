@@ -20,5 +20,11 @@ from __future__ import annotations
 from alice_forge.sm.handlers.building import handle as handle_building
 from alice_forge.sm.handlers.compacting import handle as handle_compacting
 from alice_forge.sm.handlers.draft import handle as handle_draft
+from alice_forge.sm.handlers.needs_study import handle as handle_needs_study
 
-__all__ = ["handle_draft", "handle_compacting", "handle_building"]
+__all__ = [
+    "handle_draft",
+    "handle_compacting",
+    "handle_building",
+    "handle_needs_study",
+]
