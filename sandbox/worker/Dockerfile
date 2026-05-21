@@ -80,23 +80,13 @@ COPY --chown=alice:alice sandbox/entrypoint.sh   /usr/local/bin/entrypoint.sh
 COPY --chown=alice:alice sandbox/alice.gitconfig /home/alice/.gitconfig
 COPY sandbox/worker/s6/ /etc/s6-overlay/s6-rc.d/
 
-# Runtime scripts baked into the image (host-side wrappers stay on host).
-COPY --chown=alice:alice bin/alice-mind-autopush     /usr/local/bin/alice-mind-autopush
-COPY --chown=alice:alice bin/event-log               /usr/local/bin/event-log
-COPY --chown=alice:alice bin/alice-think             /usr/local/bin/alice-think
-COPY --chown=alice:alice bin/alice-thinker-watchdog  /usr/local/bin/alice-thinker-watchdog
-COPY --chown=alice:alice bin/alice-client            /usr/local/bin/alice-client
-COPY --chown=alice:alice bin/alice-gh-watcher        /usr/local/bin/alice-gh-watcher
-COPY --chown=alice:alice bin/alice-sm-dispatcher     /usr/local/bin/alice-sm-dispatcher
+# App wrappers are NOT baked into the image — entrypoint.sh symlinks them
+# from /home/alice/alice/bin/ (the bind-mounted monorepo) into
+# /usr/local/bin/ at container start. Keeps renames / module-path edits
+# (e.g. the alice_forge rename that broke sm-dispatcher in #291) from
+# requiring a docker rebuild.
 
 RUN chmod +x /usr/local/bin/entrypoint.sh \
-        /usr/local/bin/alice-mind-autopush \
-        /usr/local/bin/event-log \
-        /usr/local/bin/alice-think \
-        /usr/local/bin/alice-thinker-watchdog \
-        /usr/local/bin/alice-client \
-        /usr/local/bin/alice-gh-watcher \
-        /usr/local/bin/alice-sm-dispatcher \
     && find /etc/s6-overlay/s6-rc.d \( -name 'run' -o -name 'up' -o -name 'finish' \) | xargs -r chmod +x
 
 ENV HOME=/home/alice

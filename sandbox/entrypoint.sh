@@ -5,6 +5,24 @@ set -e
 # Ensure the mount points exist even before volumes attach.
 mkdir -p "$HOME/alice-mind" "$HOME/alice-tools" "$HOME/.config"
 
+# Wrapper symlinks: /usr/local/bin/<name> -> /home/alice/alice/bin/<name>.
+# The s6 services and other code reference these via the canonical
+# /usr/local/bin/ path; the actual scripts live on the bind-mounted
+# monorepo so edits + renames propagate to running containers without
+# a docker rebuild. Issue #291: the alice_forge rename silently broke
+# the sm-dispatcher in production because the baked-in wrapper still
+# pointed at the retired `sm.dispatcher` module path. -f overwrites
+# any stale baked-in copy left over from a pre-fix image.
+for wrapper in alice-mind-autopush event-log alice-think \
+               alice-thinker-watchdog alice-client \
+               alice-gh-watcher alice-sm-dispatcher; do
+    if [ -x "/home/alice/alice/bin/$wrapper" ]; then
+        ln -sf "/home/alice/alice/bin/$wrapper" "/usr/local/bin/$wrapper"
+    else
+        echo "[entrypoint] WARNING: /home/alice/alice/bin/$wrapper missing or not executable" >&2
+    fi
+done
+
 # Claude auth — resolved through the host's directory mounts so token
 # refreshes on the host (via /login) become visible here without a
 # container restart. See sandbox/docker-compose.yml for rationale.

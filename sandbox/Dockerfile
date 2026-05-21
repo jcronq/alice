@@ -121,26 +121,19 @@ RUN groupadd -o -g ${GROUP_ID} alice \
 COPY --chown=alice:alice sandbox/entrypoint.sh   /usr/local/bin/entrypoint.sh
 COPY --chown=alice:alice sandbox/alice.gitconfig /home/alice/.gitconfig
 
-# App scripts baked into the image (host-side wrappers stay on host).
-COPY --chown=alice:alice bin/alice-mind-autopush     /usr/local/bin/alice-mind-autopush
-COPY --chown=alice:alice bin/event-log               /usr/local/bin/event-log
-COPY --chown=alice:alice bin/alice-think             /usr/local/bin/alice-think
-COPY --chown=alice:alice bin/alice-thinker-watchdog  /usr/local/bin/alice-thinker-watchdog
-COPY --chown=alice:alice bin/alice-client            /usr/local/bin/alice-client
-COPY --chown=alice:alice bin/alice-gh-watcher        /usr/local/bin/alice-gh-watcher
-COPY --chown=alice:alice bin/alice-sm-dispatcher     /usr/local/bin/alice-sm-dispatcher
+# App wrappers are NOT baked into the image. They're symlinked from
+# /home/alice/alice/bin/ (the bind-mounted monorepo) into /usr/local/bin/
+# by entrypoint.sh at container start, so renames / module-path edits in
+# the wrappers propagate to running containers without a docker rebuild.
+# Issue #291: the alice_forge rename silently broke the sm-dispatcher
+# because the baked-in /usr/local/bin/alice-sm-dispatcher still pointed
+# at the old `sm.dispatcher` module path while the host source had
+# already been updated to `alice_forge.dispatcher`.
 
 # Merged s6 tree — daemon + worker + new alice-viewer unit.
 COPY sandbox/s6/ /etc/s6-overlay/s6-rc.d/
 
 RUN chmod +x /usr/local/bin/entrypoint.sh \
-        /usr/local/bin/alice-mind-autopush \
-        /usr/local/bin/event-log \
-        /usr/local/bin/alice-think \
-        /usr/local/bin/alice-thinker-watchdog \
-        /usr/local/bin/alice-client \
-        /usr/local/bin/alice-gh-watcher \
-        /usr/local/bin/alice-sm-dispatcher \
     && find /etc/s6-overlay/s6-rc.d \( -name 'run' -o -name 'up' -o -name 'finish' \) | xargs -r chmod +x
 
 ENV HOME=/home/alice
