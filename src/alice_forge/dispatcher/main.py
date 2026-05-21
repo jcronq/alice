@@ -50,11 +50,109 @@ def _save_ledger_best_effort(
         )
 
 
+def _generate_cycle_id(now_iso_str: str) -> str:
+    """Generate a stable per-cadence id for dual-run log pairing.
+
+    Format: ``<utc-iso-second>-<8-hex>`` — enough resolution to
+    distinguish overlapping cycles in tests and a hex suffix to
+    avoid collisions if two repos happen to start a cycle in the
+    same second. The id is opaque to the diff job; pair = same id.
+    """
+    import secrets
+
+    return f"{now_iso_str}-{secrets.token_hex(4)}"
+
+
+def _v3_dry_run_draft(
+    *,
+    issue: dict[str, Any],
+    repo: str,
+    cycle_id: str,
+    ledger: EmittedLedger,
+    list_comments: Callable[..., list[dict[str, Any]]],
+    trusted_authors: frozenset[str],
+    log_dir: pathlib.Path | None,
+    now_iso: Callable[[], str],
+    log: Callable[[str], None],
+) -> None:
+    """Dual-run shim: invoke v3 handler in dry-run mode for sm:draft.
+
+    The handler is pure — it returns a HandlerResult without
+    touching GitHub. The shim renders the result to the
+    ``v3-predicted.jsonl`` log so the diff job can compare against
+    v1's actual action on the same cycle.
+
+    Failures inside the v3 handler are logged but never re-raised:
+    Phase 2 dual-run must not destabilize v1's hot path.
+    """
+    if log_dir is None:
+        return  # no log target configured; skip the dry-run entirely
+
+    import datetime as _dt
+
+    from alice_forge.sm.dual_run import log_entry as _log_entry
+    from alice_forge.sm.handlers.draft import handle as _handle_draft
+    from alice_forge.sm.services import HandlerServices
+    from alice_forge.sm.states import SMState
+
+    number = issue.get("number")
+    if not isinstance(number, int):
+        return
+
+    def _now_dt() -> _dt.datetime:
+        try:
+            return _dt.datetime.fromisoformat(now_iso())
+        except ValueError:
+            return _dt.datetime.now(_dt.timezone.utc)
+
+    try:
+        services = HandlerServices(
+            ledger=ledger,
+            repo=repo,
+            post_comment=lambda *a, **kw: None,  # dry-run: no IO
+            list_comments=list_comments,
+            edit_labels=lambda *a, **kw: None,
+            close_issue=lambda *a, **kw: None,
+            find_linked_pr=lambda *a, **kw: None,
+            pr_merge_status=lambda *a, **kw: None,
+            master_ci_status=lambda *a, **kw: None,
+            trusted_authors=trusted_authors,
+            now=_now_dt,
+            log=log,
+        )
+        result = _handle_draft(issue, services)
+    except Exception as exc:  # noqa: BLE001 — defense for v3 bugs
+        log(
+            f"[sm-v3] dry-run handle_draft #{number} raised: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return
+
+    try:
+        _log_entry(
+            log_dir / "sm-v3-predicted.jsonl",
+            cycle_id=cycle_id,
+            lane="v3-predicted",
+            repo=repo,
+            issue_number=number,
+            state=SMState.DRAFT,
+            result=result,
+            now=_now_dt(),
+        )
+    except OSError as exc:
+        log(
+            f"[sm-v3] failed to write v3-predicted log entry for "
+            f"#{number}: {exc} (Phase 2: best-effort)"
+        )
+
+
 def run(
     *,
     repo: str = DEFAULT_REPO,
     state_path: pathlib.Path,
     ledger_path: pathlib.Path | None = None,
+    v3_dry_run_states: frozenset[str] = frozenset(),
+    v3_dry_run_log_dir: pathlib.Path | None = None,
     list_issues: ListIssuesFn | None = None,
     list_stale_closed: ListIssuesFn | None = None,
     list_open_done: ListIssuesFn | None = None,
@@ -311,6 +409,12 @@ def run(
 
     report.polled = len(issues)
 
+    # SM v3 Phase 2: stable per-cadence id used to pair v1-actual and
+    # v3-predicted log entries in the dual-run diff job. Generated
+    # once per run() call; every issue processed in this cadence
+    # shares the same cycle_id.
+    _cycle_id = _generate_cycle_id(now_iso())
+
     fatal_exit = False
     for issue in issues:
         number = issue.get("number")
@@ -410,6 +514,23 @@ def run(
                     now_iso=now_iso,
                 )
             elif sm_label == DRAFT_SM_LABEL:
+                # SM v3 Phase 2.1: dual-run the v3 draft handler in
+                # dry-run mode when this state is in the flag set.
+                # v3 just logs its predicted action; v1 still applies
+                # the actual side-effects. The diff job (separate
+                # tool) compares the two streams.
+                if DRAFT_SM_LABEL in v3_dry_run_states:
+                    _v3_dry_run_draft(
+                        issue=issue,
+                        repo=repo,
+                        cycle_id=_cycle_id,
+                        ledger=ledger,
+                        list_comments=list_comments,
+                        trusted_authors=trusted_authors,
+                        log_dir=v3_dry_run_log_dir,
+                        now_iso=now_iso,
+                        log=log,
+                    )
                 _process_draft(
                     issue=issue,
                     repo=repo,

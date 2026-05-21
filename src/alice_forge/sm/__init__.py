@@ -32,8 +32,19 @@ from alice_forge.sm.transitions import (
     EventTransition,
 )
 from alice_forge.sm.ledger import EmittedRecord, EmittedLedger
-from alice_forge.sm.comments import parse_comment, ParsedVerb, ParseError, Continue
+from alice_forge.sm.comments import parse_comment, ParsedVerb, ParseError
+from alice_forge.sm.comments import Continue as ParsedContinue
 from alice_forge.sm.verify import verify_state_machine, StateMachineInvariantError
+from alice_forge.sm.result import (
+    BlockedByTTL,
+    Continue,
+    EmitParseError,
+    HandlerResult,
+    NoProgress,
+    SideEffect,
+    Transition,
+)
+from alice_forge.sm.services import HandlerServices
 
 __all__ = [
     "SMState",
@@ -49,7 +60,16 @@ __all__ = [
     "parse_comment",
     "ParsedVerb",
     "ParseError",
-    "Continue",
+    "ParsedContinue",
     "verify_state_machine",
     "StateMachineInvariantError",
+    # HandlerResult variants
+    "HandlerResult",
+    "Transition",
+    "Continue",
+    "SideEffect",
+    "NoProgress",
+    "BlockedByTTL",
+    "EmitParseError",
+    "HandlerServices",
 ]
