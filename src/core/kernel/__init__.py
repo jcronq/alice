@@ -30,6 +30,12 @@ from .hooks import (
     ToolUse,
     TurnResult,
 )
+from .hooks_registry import (
+    CompositeAgentHook,
+    get_all_hooks,
+    hooks_for,
+    register_agent_hook,
+)
 from .protocol import BlockHandler, Kernel, NullHandler
 from .types import (
     KernelResult,
@@ -45,6 +51,7 @@ __all__ = [
     "AgentHook",
     "BaseAgentHook",
     "BlockHandler",
+    "CompositeAgentHook",
     "Kernel",
     "KernelResult",
     "KernelSpec",
@@ -58,5 +65,8 @@ __all__ = [
     "TurnResult",
     "TurnSummary",
     "UsageInfo",
+    "get_all_hooks",
+    "hooks_for",
     "make_kernel",
+    "register_agent_hook",
 ]
