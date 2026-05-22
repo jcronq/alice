@@ -215,6 +215,16 @@ def _now_iso() -> str:
 #     lanes).
 #   * ``phase`` (optional) — per-issue phase the SDK lanes pass to the
 #     shim entrypoint. Unused for the v1 worker pool.
+#   * ``agent_spec`` — canonical reference to a registered
+#     :class:`core.agent_library.AgentSpec` name in
+#     :data:`core.agent_library.registry.default_registry`. Phase 3 of
+#     #194 made this the source-of-truth for tool policy + behavioral
+#     constraints. The remaining ``system_prompt_role`` /
+#     ``instruction_trailer`` / ``system_prompt_module`` fields persist
+#     for byte-identical v1 worker prompt composition; the registry
+#     entry's behavioral_constraints carry the equivalent semantics in
+#     the kernel-spec append_system_prompt path. Phase 4 (#321) collapses
+#     the duplicated keys once every call site reads from the registry.
 #   * ``system_prompt_role`` — short role label rendered into the
 #     v1 worker prompt header (the claude-cli runtime). Ignored by the
 #     SDK lanes — those compose their own prompts in
@@ -243,10 +253,12 @@ SPAWN_MAP: dict[tuple[str, str], dict[str, str]] = {
         "persona": "thinking",
         "runtime": "claude-agent-sdk:opus",
         "phase": "per_issue_design",
+        "agent_spec": "designer",
     },
     ("sm:selected", "art:config_change"): {
         "persona": "worker",
         "runtime": "claude-cli",
+        "agent_spec": "config-worker",
         "system_prompt_role": "code-worker",
         "instruction_trailer": (
             "Open a PR titled appropriately with `Closes #{issue_number}` "
@@ -256,6 +268,7 @@ SPAWN_MAP: dict[tuple[str, str], dict[str, str]] = {
     ("sm:selected", "art:research_note"): {
         "persona": "worker",
         "runtime": "claude-cli",
+        "agent_spec": "research-writer",
         "system_prompt_role": "research-writer",
         "instruction_trailer": (
             "Produce a research note at "
@@ -269,6 +282,7 @@ SPAWN_MAP: dict[tuple[str, str], dict[str, str]] = {
     ("sm:selected", "art:experiment"): {
         "persona": "worker",
         "runtime": "claude-cli",
+        "agent_spec": "research-writer",
         "system_prompt_role": "research-writer",
         "instruction_trailer": (
             "Same as research_note for v1. Produce a note with "
@@ -286,6 +300,7 @@ SPAWN_MAP: dict[tuple[str, str], dict[str, str]] = {
         "persona": "speaking",
         "runtime": "claude-agent-sdk:opus",
         "phase": "per_issue_build",
+        "agent_spec": "speaking",
     },
     # Issue #107 — code-quality reviewer for PRs at sm:reviewing. The
     # ``system_prompt_module`` is the dotted import path to
@@ -296,6 +311,7 @@ SPAWN_MAP: dict[tuple[str, str], dict[str, str]] = {
     ("sm:reviewing", "art:code"): {
         "persona": "reviewer",
         "runtime": "claude-agent-sdk:sonnet",
+        "agent_spec": "reviewer",
         "system_prompt_role": "code-reviewer",
         "system_prompt_module": (
             "alice_speaking.review.code_reviewer:CODE_REVIEWER_SYSTEM_PROMPT"
