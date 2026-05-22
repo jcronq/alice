@@ -61,6 +61,31 @@ async def run_agent(
     the tool policy leaves no tools available. The runner does not
     catch it — the caller decides whether that's a fatal error or a
     fallback signal.
+
+    **Per-call overrides.** Registered specs are immutable
+    (``@dataclass(frozen=True)``) by design; per-call tweaks go
+    through :func:`dataclasses.replace`. Wrap the registry entry
+    rather than mutating it:
+
+    .. code-block:: python
+
+        from dataclasses import replace
+        from core.agent_library import default_registry, run_agent
+
+        spec = default_registry.get("reviewer")
+        # Bump the model + per-turn time cap for this dispatch only.
+        kernel = replace(spec.kernel_spec, model="claude-opus-4-7", max_seconds=120)
+        agent = replace(spec, kernel_spec=kernel)
+        result = await run_agent(agent, prompt="...", emitter=emitter)
+
+    Common override targets: ``kernel_spec.model`` (downgrade /
+    upgrade), ``kernel_spec.max_seconds`` (per-turn budget),
+    ``kernel_spec.allowed_tools`` (narrow the surface — pair with
+    ``tool_policy=None`` so the registered policy's allowlist does
+    not reintroduce dropped tools at :meth:`AgentSpec.effective_tools`
+    time), ``kernel_spec.append_system_prompt`` (inject a caller-
+    specific prompt body; the registered behavioral_constraints still
+    merge in after the base via :meth:`AgentSpec.assembled_system_prompt`).
     """
     spec = agent.build_spec()
 
