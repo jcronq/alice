@@ -45,6 +45,24 @@ from alice_forge.sm.result import (
     Transition,
 )
 from alice_forge.sm.services import HandlerServices
+from alice_forge.sm.enforcement import (
+    ENFORCEMENT_ENV_VAR,
+    GRACE_TRANSITION_BODY,
+    GRACE_TRANSITION_SIDE_EFFECT,
+    STRIKE_1_TEMPLATE,
+    STRIKE_2_TEMPLATE,
+    STRIKE_3_AUDIT_TEMPLATE,
+    STRIKE_LIMIT,
+    STRIKES_SIDE_EFFECT,
+    StrikeAction,
+    apply_enforcement,
+    clear_strikes,
+    compute_grace_block,
+    grace_pass_over_issues,
+    is_duplicate_continue,
+    is_enforcement_enabled,
+    record_continue,
+)
 
 __all__ = [
     "SMState",
@@ -72,4 +90,21 @@ __all__ = [
     "BlockedByTTL",
     "EmitParseError",
     "HandlerServices",
+    # Phase 3: continue-verb enforcement
+    "ENFORCEMENT_ENV_VAR",
+    "GRACE_TRANSITION_BODY",
+    "GRACE_TRANSITION_SIDE_EFFECT",
+    "STRIKE_1_TEMPLATE",
+    "STRIKE_2_TEMPLATE",
+    "STRIKE_3_AUDIT_TEMPLATE",
+    "STRIKE_LIMIT",
+    "STRIKES_SIDE_EFFECT",
+    "StrikeAction",
+    "apply_enforcement",
+    "clear_strikes",
+    "compute_grace_block",
+    "grace_pass_over_issues",
+    "is_duplicate_continue",
+    "is_enforcement_enabled",
+    "record_continue",
 ]

@@ -7,6 +7,11 @@ from __future__ import annotations
 
 from alice_forge.dispatcher.handlers._common import *  # noqa: F401, F403
 from alice_forge.sm.ledger import EmittedLedger, load_or_migrate
+from alice_forge.sm.states import SMState
+from alice_forge.sm.enforcement import (
+    grace_pass_over_issues as _v3_grace_pass,
+    is_enforcement_enabled as _v3_enforcement_enabled,
+)
 
 # State-handler functions live in sibling modules under
 # ``alice_forge.dispatcher.handlers``. They can't be re-exported via
@@ -155,6 +160,111 @@ def _v3_dry_run(
             f"[sm-v3] failed to write v3-predicted log entry for "
             f"#{number}: {exc} (Phase 2: best-effort)"
         )
+
+
+def _apply_v3_grace_pass(
+    *,
+    issues: list[dict[str, Any]],
+    repo: str,
+    ledger: EmittedLedger,
+    edit_labels: Callable[..., None],
+    post_comment: Callable[[str, int, str], None],
+    dry_run: bool,
+    now_iso: Callable[[], str],
+    log: Callable[[str], None],
+) -> None:
+    """One-time grace transition pass — Phase 3.
+
+    When ``SM_REQUIRE_CONTINUE=1`` flips ON, in-flight issues whose
+    last activity is older than the new TTL get a one-time transition
+    to ``sm:blocked``. Idempotent via the ledger's
+    ``grace-transition`` side-effect — re-running the pass against
+    an already-graced issue is a no-op.
+
+    Best-effort: a failure here must NOT abort the main poll. The
+    enforcement is additive; the worst case is the issue waits one
+    more cadence for the grace block to fire.
+    """
+    import datetime as _dt
+
+    try:
+        now = _dt.datetime.fromisoformat(now_iso())
+    except ValueError:
+        now = _dt.datetime.now(_dt.timezone.utc)
+
+    triples: list[tuple[int, SMState, _dt.datetime]] = []
+    for issue in issues:
+        number = issue.get("number")
+        if not isinstance(number, int):
+            continue
+        label = _current_sm_label(issue)
+        if label is None:
+            continue
+        state = SMState.from_label(label)
+        if state is None:
+            continue
+        # Use updatedAt as the activity proxy. gh CLI returns
+        # ``updatedAt`` (camelCase) on issue payloads.
+        last_activity_raw = (
+            issue.get("updatedAt")
+            or issue.get("updated_at")
+            or issue.get("createdAt")
+            or issue.get("created_at")
+        )
+        if not last_activity_raw:
+            continue
+        try:
+            last_activity = _dt.datetime.fromisoformat(
+                str(last_activity_raw).replace("Z", "+00:00")
+            )
+        except ValueError:
+            continue
+        triples.append((number, state, last_activity))
+
+    try:
+        graces = _v3_grace_pass(
+            issues=triples,
+            ledger=ledger,
+            now=now,
+        )
+    except Exception as exc:  # noqa: BLE001 — Phase 3 defensive guard
+        log(f"[sm-v3] grace pass raised: {type(exc).__name__}: {exc}")
+        return
+
+    for number, transition in graces:
+        prior = transition.metadata.get("prior_state", "unknown")
+        audit_body = transition.metadata.get("audit_body", "")
+        log(
+            f"[sm-v3] grace-block #{number}: prior={prior} → sm:blocked "
+            f"(SM_REQUIRE_CONTINUE one-time enforcement)"
+        )
+        if dry_run:
+            continue
+        # Apply the label swap + audit comment via the existing v1
+        # transport callables. Failures here are logged but not
+        # re-raised — the v3 grace pass is additive over the main
+        # loop and must not abort it.
+        try:
+            edit_labels(
+                repo,
+                number,
+                add=[SMState.BLOCKED.value],
+                remove=[prior] if prior != "unknown" else [],
+            )
+        except Exception as exc:  # noqa: BLE001
+            log(
+                f"[sm-v3] grace-block #{number}: edit_labels failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            continue
+        if audit_body:
+            try:
+                post_comment(repo, number, audit_body)
+            except Exception as exc:  # noqa: BLE001
+                log(
+                    f"[sm-v3] grace-block #{number}: post_comment failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
 
 
 def run(
@@ -425,6 +535,25 @@ def run(
     # once per run() call; every issue processed in this cadence
     # shares the same cycle_id.
     _cycle_id = _generate_cycle_id(now_iso())
+
+    # SM v3 Phase 3: continue-verb enforcement is gated by the
+    # ``SM_REQUIRE_CONTINUE`` env var. Default OFF in the Phase 3 PR.
+    # When ON, the dispatcher runs a one-time grace pass per issue
+    # (idempotent via the ledger) that transitions in-flight issues
+    # to ``sm:blocked`` if their last activity precedes the TTL.
+    # Strike-3 escalations are detected per-cycle inside the v3
+    # handlers' dual-run shim once Phase 4 retires v1.
+    if _v3_enforcement_enabled():
+        _apply_v3_grace_pass(
+            issues=issues,
+            repo=repo,
+            ledger=ledger,
+            edit_labels=edit_labels,
+            post_comment=post_comment,
+            dry_run=dry_run,
+            now_iso=now_iso,
+            log=log,
+        )
 
     fatal_exit = False
     for issue in issues:

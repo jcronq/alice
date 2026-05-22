@@ -77,11 +77,13 @@ class StateMeta:
     ``role`` — human-readable one-liner used in audit comments and
     surface payloads. Mirrors v1's ``constants.py`` table.
 
-    First-cut TTL numbers from the design doc
-    (``inner/designs/2026-05-21-sm-v3-design.md`` § "TTL defaults —
-    TODO before locking in"). These will be revised against the
-    actual time-in-state distribution from the last 30 days as part
-    of Phase 2's data pull.
+    Phase 3 (2026-05-22) revised these numbers against the
+    time-in-state distribution from the last 30 days of GitHub
+    timeline events on `jcronq/alice`. See
+    ``docs/designs/sm-v3-ttl-distribution.md`` for the data and
+    rationale. States with n=1 keep the first-cut number until a
+    follow-up pull yields a denser sample (the design lane and
+    legacy `sm:compacting` are the sparse ones).
     """
 
     terminal: bool
@@ -91,50 +93,73 @@ class StateMeta:
 
 # Per-state metadata table. Editing this is a real protocol change —
 # pair with a doc update in 2026-05-21-sm-v3-design.md.
+#
+# TTL numbers are data-validated against the last 30 days of
+# time-in-state distribution; see `docs/designs/sm-v3-ttl-distribution.md`
+# for the per-state median / p75 / p95 table and the n=1 sparse-data
+# caveats. The rule is "TTL >= p95 with headroom" — the goal is to
+# escalate the stuck issues without false-positiving the slow-but-
+# progressing ones.
 STATE_META: Mapping[SMState, StateMeta] = {
     SMState.DRAFT: StateMeta(
         terminal=False,
-        default_continue_ttl_seconds=24 * 3600,
+        # p75 13.6h, p95 3.2d (n=41). 48h covers two business days,
+        # escalates the ones sitting unloved past a weekend.
+        default_continue_ttl_seconds=48 * 3600,
         role="Initial — awaiting triage",
     ),
     SMState.NEEDS_STUDY: StateMeta(
         terminal=False,
-        default_continue_ttl_seconds=7 * 24 * 3600,
+        # p75 17.0h, p95 3.5d (n=32). Flatten the first-cut two-stage
+        # "7d → 24h" to a single 4d budget that comfortably covers
+        # thinking's deepest investigations.
+        default_continue_ttl_seconds=4 * 24 * 3600,
         role="Thinking is investigating",
     ),
     SMState.SELECTED: StateMeta(
         terminal=False,
-        default_continue_ttl_seconds=60 * 60,
+        # p75 27.7min, p95 1.7h (n=66). 2h matches p95 with margin
+        # for the spawn-in-flight tail.
+        default_continue_ttl_seconds=2 * 3600,
         role="Approved, awaiting design/build",
     ),
     SMState.DESIGNING: StateMeta(
         terminal=False,
+        # n=1; keeping first-cut. Re-validate after design lane has
+        # 30+ days of real traffic post-cutover.
         default_continue_ttl_seconds=2 * 3600,
         role="Thinking is producing design",
     ),
     SMState.DESIGN_REVIEW: StateMeta(
         terminal=False,
+        # n=1; keeping first-cut.
         default_continue_ttl_seconds=1 * 3600,
         role="Speaking is reviewing design",
     ),
     SMState.DESIGNED: StateMeta(
         terminal=False,
+        # n=1; keeping first-cut.
         default_continue_ttl_seconds=30 * 60,
         role="Design approved, awaiting build",
     ),
     SMState.COMPACTING: StateMeta(
         terminal=False,
+        # n=1; legacy lane, low traffic. First-cut stands.
         default_continue_ttl_seconds=30 * 60,
         role="Legacy: agent compacting context",
     ),
     SMState.BUILDING: StateMeta(
         terminal=False,
+        # n=1; will be the most-trafficked state post-cutover.
+        # First-cut stands; re-validate after 30 days of dual-run.
         default_continue_ttl_seconds=60 * 60,
         role="Worker producing PR",
     ),
     SMState.REVIEWING: StateMeta(
         terminal=False,
-        default_continue_ttl_seconds=2 * 3600,
+        # p75 5.0min, p95 2.8h (n=39). Bump from first-cut 2h to 3h
+        # to cover CI + verify slow tail.
+        default_continue_ttl_seconds=3 * 3600,
         role="PR open, CI + verify + review",
     ),
     SMState.DONE: StateMeta(
