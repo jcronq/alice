@@ -542,3 +542,48 @@ def _process_selected(
         return
     report.spawned += 1
     report.spawn_records.append((number, art_label, spawn_id))
+
+    # Issue #295 — spawn-dispatch-art-code EventTransition. The v3
+    # transition table (sm/transitions.py, SELECTED row) declares this
+    # implicit transition: dispatching the thinking-agent swaps
+    # sm:selected → sm:designing so the agent's eventual
+    # ``[SM] design-ready`` lands at sm:designing, where the DESIGNING
+    # handler advances it to sm:design_review. Without this swap the
+    # design-ready arrives at sm:selected — orphaned — and the
+    # dispatcher re-spawns the design phase every poll (228-respawn
+    # loop on #295). Scoped to ``persona == "thinking"`` because the
+    # other art lanes (config_change / experiment / research_note) go
+    # selected → reviewing via PR-open and don't pass through
+    # designing.
+    if persona == "thinking":
+        reason = (
+            f"spawn-dispatch-art-code: thinking-agent dispatched "
+            f"(spawn_id={spawn_id})"
+        )
+        transition_body = render_transition_comment(
+            ACTIVE_SM_LABEL, DESIGNING_SM_LABEL, reason
+        )
+        try:
+            edit_labels(
+                repo,
+                number,
+                add=[DESIGNING_SM_LABEL],
+                remove=[ACTIVE_SM_LABEL],
+            )
+            post_comment(repo, number, transition_body)
+        except GHCommandError as exc:
+            log(
+                f"[sm-dispatcher] selected #{number}: failed "
+                f"spawn-dispatch-art-code transition: {exc}"
+            )
+            if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+                raise
+            return
+        report.transitioned += 1
+        report.transitions.append(
+            (number, ACTIVE_SM_LABEL, DESIGNING_SM_LABEL)
+        )
+        log(
+            f"[sm-dispatcher] transitioned #{number}: "
+            f"selected → designing ({reason})"
+        )

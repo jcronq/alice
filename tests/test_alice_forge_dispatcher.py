@@ -9308,6 +9308,14 @@ def test_selected_thinking_spawn_first_pass_no_prior_audit_spawns(
         t for t in report.transitions if t[2] == "sm:blocked"
     ]
     assert blocked_transitions == []
+    # spawn-dispatch-art-code EventTransition: after a successful
+    # first-pass thinking spawn the dispatcher swaps
+    # sm:selected → sm:designing so design-ready lands at the
+    # state that knows how to advance it.
+    assert (802, "sm:selected", "sm:designing") in report.transitions
+    edit = label_rec.calls[-1]
+    assert edit["add"] == ["sm:designing"]
+    assert edit["remove"] == ["sm:selected"]
 
 
 def test_selected_thinking_spawn_silent_completion_untrusted_audit_ignored(
@@ -9356,13 +9364,117 @@ def test_selected_thinking_spawn_silent_completion_untrusted_audit_ignored(
     )
 
     assert exit_code == 0
-    # Forged audit ignored → normal first-pass spawn fires.
+    # Forged audit ignored → normal first-pass spawn fires +
+    # spawn-dispatch-art-code transition fires.
     assert report.spawned == 1
     assert thinking_calls == [(803, "art:code", "spawn-803-stub")]
     blocked_transitions = [
         t for t in report.transitions if t[2] == "sm:blocked"
     ]
     assert blocked_transitions == []
+    assert (803, "sm:selected", "sm:designing") in report.transitions
+
+
+def test_thinking_spawn_dispatch_transitions_to_designing(state_path) -> None:
+    """Successful thinking-agent spawn for (sm:selected, art:code) must
+    atomically swap sm:selected → sm:designing (the
+    ``spawn-dispatch-art-code`` EventTransition declared in
+    ``sm/transitions.py``). Without this, design-ready arrives at
+    sm:selected and the dispatcher re-spawns the design phase every
+    poll — the 228-respawn loop observed on #295.
+    """
+    thinking_calls: list = []
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+
+    issues = [_make_issue(900, art_labels=("art:code",))]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=True,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        list_comments=lambda _r, _n: [],
+        post_comment=recorder,
+        edit_labels=label_rec,
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        has_live_spawn=lambda _n: False,
+        count_running=lambda: 0,
+        spawn=_no_call,
+        has_live_thinking_spawn=lambda _n: False,
+        count_running_thinking=lambda: 0,
+        spawn_thinking=_track_spawn(thinking_calls),
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 1
+    assert thinking_calls == [(900, "art:code", "spawn-900-stub")]
+    assert report.transitioned == 1
+    assert (900, "sm:selected", "sm:designing") in report.transitions
+    edit = label_rec.calls[-1]
+    assert edit["add"] == ["sm:designing"]
+    assert edit["remove"] == ["sm:selected"]
+    bodies = [b for _r, _n, b in recorder.posted]
+    assert any(
+        "from=selected to=designing" in b
+        and "spawn-dispatch-art-code" in b
+        and "spawn-900-stub" in b
+        for b in bodies
+    ), bodies
+
+
+def test_thinking_spawn_dispatch_no_transition_for_worker_persona(
+    state_path,
+) -> None:
+    """Non-thinking spawns (art:config_change / art:experiment /
+    art:research_note → worker persona) must NOT trigger the
+    spawn-dispatch-art-code transition — those lanes go
+    sm:selected → sm:reviewing via PR-open, not through sm:designing.
+    """
+    worker_calls: list = []
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+
+    issues = [_make_issue(901, art_labels=("art:config_change",))]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=True,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        list_comments=lambda _r, _n: [],
+        post_comment=recorder,
+        edit_labels=label_rec,
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        has_live_spawn=lambda _n: False,
+        count_running=lambda: 0,
+        spawn=_track_spawn(worker_calls),
+        has_live_thinking_spawn=lambda _n: False,
+        count_running_thinking=lambda: 0,
+        spawn_thinking=_no_call,
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 1
+    assert worker_calls == [(901, "art:config_change", "spawn-901-stub")]
+    designing_transitions = [
+        t for t in report.transitions if t[2] == "sm:designing"
+    ]
+    assert designing_transitions == []
 
 
 def test_phase2_audit_prefixes_distinct_across_personae() -> None:
