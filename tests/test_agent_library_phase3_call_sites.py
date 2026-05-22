@@ -22,10 +22,7 @@ test suite can run without network access.
 
 from __future__ import annotations
 
-import asyncio
-from dataclasses import replace
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 
@@ -33,7 +30,7 @@ from alice_forge.dispatcher import constants as sm_constants
 from alice_forge.dispatcher import spawn as spawn_module
 from alice_thinking import design_pipeline
 from core.agent_library import default_registry
-from core.kernel import KernelResult, KernelSpec, UsageInfo
+from core.kernel import KernelResult, UsageInfo
 
 
 # ---------------------------------------------------------------------------
