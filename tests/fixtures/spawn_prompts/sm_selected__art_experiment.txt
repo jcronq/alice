@@ -1,0 +1,19 @@
+You are a research-writer agent working on an SM task.
+
+Issue: #42
+Title: Example task title
+Source: source:jcronq
+Artifact type: art:experiment
+
+Issue body:
+Example issue body that the worker reads.
+
+Your task: produce the research note described above. Read prior art in the vault, write the note with proper frontmatter and wikilinks, then post the SM transition comment when finished.
+
+## Constraint: write-research-note-under-vault
+Produce a research note at ``~/alice-mind/cortex-memory/research/<date>-<slug>.md`` with YAML frontmatter. For ``art:experiment`` tasks the frontmatter must carry ``hypothesis``, ``null``, and ``verdict`` keys.
+
+## Constraint: transition-to-done-on-completion
+When the note is committed, relabel the linked issue ``sm:selected`` → ``sm:done`` and post an audit comment of the form ``[SM] transition from=selected to=done reason="research note at <path>"``. The dispatcher uses that comment to close the issue.
+
+Operate as a real engineer would: read the relevant code first, test before merging, do not bypass CI hooks. Self-merge when CI is green (for code work) or post the transition comment (for research work).

@@ -536,26 +536,42 @@ def proactive_reap_dead_spawns(
 def _resolve_agent_spec(spawn_config: dict[str, str]) -> Any:
     """Return the :class:`AgentSpec` for the row's ``agent_spec`` name.
 
-    Phase 3 of #194: every SPAWN_MAP row that targets a worker-pool
-    lane now carries an ``agent_spec`` field naming a registered
-    :class:`core.agent_library.AgentSpec`. The lookup goes through
-    :data:`core.agent_library.default_registry` so the registry stays
-    the canonical source of truth for tool policy + behavioral
-    constraints. Rows without an ``agent_spec`` field (e.g., pre-#194
-    test fixtures) return ``None`` so the caller can fall back to the
-    inline ``system_prompt_role`` / ``instruction_trailer`` fields.
+    Phase 4 of #194 (#321): the ``agent_spec`` field is now mandatory
+    on every SPAWN_MAP row that reaches :func:`compose_spawn_prompt`,
+    and the registered spec is the *only* source of behavioral rules
+    for the v1 worker prompt. Missing or unknown names raise
+    :class:`KeyError` — there is no longer a legacy inline-field
+    fallback path to drop into. Callers that need to test compose
+    behavior must pass a row with a registered ``agent_spec``.
     """
-    name = spawn_config.get("agent_spec")
+    try:
+        name = spawn_config["agent_spec"]
+    except KeyError as exc:
+        raise KeyError(
+            "SPAWN_MAP row is missing required ``agent_spec`` field "
+            "(Phase 4 of #194: behavioral rules now flow exclusively "
+            "through core.agent_library.default_registry)"
+        ) from exc
     if not name:
-        return None
+        raise KeyError(
+            "SPAWN_MAP row carries an empty ``agent_spec`` field "
+            "(Phase 4 of #194: every row must name a registered "
+            "AgentSpec)"
+        )
     # Lazy import so this module stays importable in test paths that
     # stub out the registry.
     from core.agent_library import default_registry
 
-    try:
-        return default_registry.get(name)
-    except KeyError:
-        return None
+    return default_registry.get(name)
+
+
+# Persona-axis values whose v1 worker prompt frames the task as
+# "produce a research note." Anything else falls through to the
+# code-edit framing. Centralised so a future persona (e.g. a
+# documentation-writer flavor) can opt into the research framing by
+# declaring the right persona on its :class:`AgentSpec` without
+# adding another branch here.
+_RESEARCH_FRAMING_PERSONAS: frozenset[str] = frozenset({"research-writer"})
 
 
 def compose_spawn_prompt(
@@ -565,21 +581,24 @@ def compose_spawn_prompt(
     """Render the full prompt text fed to the spawned ``claude`` agent.
 
     The prompt embeds the issue body verbatim, the artifact label, the
-    issue source (author identity), and the role-specific instruction
-    trailer with ``{issue_number}`` substituted.
+    issue source (author identity), and the registered
+    :class:`AgentSpec`'s assembled system prompt (the rendered
+    ``## Constraint: <id>`` blocks from each
+    :attr:`AgentSpec.behavioral_constraints` rule).
 
-    Phase 3 of #194: the ``agent_spec`` field on ``spawn_config``
-    references a registered :class:`AgentSpec`. The registry entry is
-    the canonical source for tool policy + behavioral constraints
-    (consumed when this lane evolves to construct a kernel rather
-    than shelling out to claude-cli). For the v1 worker-pool prompt
-    text we still read ``system_prompt_role`` and
-    ``instruction_trailer`` from the row — the trailers don't have a
-    byte-identical equivalent inside the registered spec's
-    behavioral_constraints (the constraint text is semantically
-    equivalent but rendered as ``## Constraint: <id>`` blocks).
-    Phase 4 (#321) folds the duplicated fields away once the worker
-    prompt is composed from the spec's assembled system prompt.
+    Phase 4 of #194 (#321): the inline ``system_prompt_role`` /
+    ``instruction_trailer`` fields on the SPAWN_MAP row are gone —
+    every worker-pool row now references a registered AgentSpec via
+    ``agent_spec``, and behavioral rules flow exclusively through the
+    spec's :meth:`AgentSpec.assembled_system_prompt`. The role tag in
+    the prompt header derives from :attr:`AgentSpec.name`; the task
+    framing branches on :attr:`AgentSpec.persona` (research-writer →
+    "produce the research note" framing, everything else → "implement
+    the change" framing).
+
+    Raises :class:`KeyError` when the row is missing a recognised
+    ``agent_spec`` — :func:`_resolve_agent_spec` enforces the
+    invariant.
     """
     number = issue.get("number")
     title = issue.get("title") or "(no title)"
@@ -592,34 +611,38 @@ def compose_spawn_prompt(
     login = _author_login(issue) or "(unknown)"
     source_label = f"source:{login}"
 
-    # Resolve the registered AgentSpec by name for side-effect
-    # validation; the worker-prompt text still flows through the
-    # inline fields until Phase 4 collapses them. Missing or unknown
-    # ``agent_spec`` falls through with ``spec=None``.
-    _resolve_agent_spec(spawn_config)
+    # Hard lookup — every SPAWN_MAP row that reaches compose must
+    # carry a registered ``agent_spec``. KeyError propagates so a
+    # misconfigured row fails loud rather than silently producing a
+    # prompt without behavioral rules.
+    spec = _resolve_agent_spec(spawn_config)
 
-    role = spawn_config["system_prompt_role"]
-    trailer = spawn_config["instruction_trailer"].format(issue_number=number)
+    role = spec.name
+    # Rendered behavioral-rule blocks. ``None`` when the spec has no
+    # constraints AND no base ``append_system_prompt`` — render as the
+    # empty string so the prompt body still parses, but a registered
+    # worker spec without rules is almost certainly a misconfig.
+    trailer = spec.assembled_system_prompt() or ""
 
-    if role == "code-worker":
-        task_framing = (
-            "Your task: implement the change described above. Read the "
-            "relevant code first, write a focused diff, run tests, and "
-            "open a PR."
-        )
-    else:
+    if spec.persona in _RESEARCH_FRAMING_PERSONAS:
         task_framing = (
             "Your task: produce the research note described above. "
             "Read prior art in the vault, write the note with proper "
             "frontmatter and wikilinks, then post the SM transition "
             "comment when finished."
         )
+    else:
+        task_framing = (
+            "Your task: implement the change described above. Read the "
+            "relevant code first, write a focused diff, run tests, and "
+            "open a PR."
+        )
 
     # The agent name itself is intentionally left out of the literal
     # prompt — the SM task is repo-anchored, not persona-anchored, and
     # the runtime persona system owns identity rendering. The role
-    # label (``code-worker`` / ``research-writer``) carries the
-    # behavioral framing.
+    # label (the spec's ``name``: ``code-worker`` / ``config-worker``
+    # / ``research-writer`` / ...) carries the behavioral framing.
     return (
         f"You are a {role} agent working on an SM task.\n"
         f"\n"

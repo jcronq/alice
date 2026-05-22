@@ -241,7 +241,13 @@ def test_parse_json_drops_non_dict_feedback_entries() -> None:
 
 
 def test_spawn_map_has_reviewing_code_entry() -> None:
-    """The dispatcher integration point lives in sm.SPAWN_MAP."""
+    """The dispatcher integration point lives in sm.SPAWN_MAP.
+
+    Post-Phase 4 of #194 (#321) the row carries ``agent_spec`` (the
+    registered :class:`AgentSpec` name) plus the structured-output
+    sub-agent's ``system_prompt_module`` dotted-path reference. The
+    earlier ``system_prompt_role`` field is gone — the role tag is
+    derived from the registered spec's ``name`` when needed."""
     assert ("sm:reviewing", "art:code") in sm.SPAWN_MAP
     entry = sm.SPAWN_MAP[("sm:reviewing", "art:code")]
     # The entry references the new reviewer's system prompt by dotted
@@ -251,7 +257,7 @@ def test_spawn_map_has_reviewing_code_entry() -> None:
         entry["system_prompt_module"]
         == "alice_speaking.review.code_reviewer:CODE_REVIEWER_SYSTEM_PROMPT"
     )
-    assert entry["system_prompt_role"] == "code-reviewer"
+    assert entry["agent_spec"] == "reviewer"
 
 
 def test_spawn_map_preserves_existing_selected_entries() -> None:

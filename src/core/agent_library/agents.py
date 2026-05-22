@@ -29,18 +29,21 @@ in-process invocations. Per-call overrides remain the caller's job
 :meth:`AgentSpec.build_spec`); Phase 2 lifts that into a richer
 runtime override mechanism.
 
-Source-of-truth for Phase 2 specs:
+Source-of-truth for the registered specs (post-Phase 4 of #194, #321):
 
-* The instruction trailers / system prompt roles come from
-  :data:`alice_forge.dispatcher.constants.SPAWN_MAP`. We mirror the
-  text rather than import — :mod:`core` cannot import sibling
-  packages (see ``tests/test_core_isolation.py``).
+* Behavioral rules ARE the source. Pre-Phase 4 each SPAWN_MAP row in
+  :data:`alice_forge.dispatcher.constants.SPAWN_MAP` carried an inline
+  ``instruction_trailer`` / ``system_prompt_role`` pair and the
+  registered specs mirrored that prose. Phase 4 deleted those inline
+  fields; the dispatcher's :func:`compose_spawn_prompt` now reads
+  :meth:`AgentSpec.assembled_system_prompt` directly. Edit a rule
+  here and the next dispatcher run sees it.
 * The reviewer's structured-JSON contract comes from
   :data:`alice_speaking.review.code_reviewer.CODE_REVIEWER_SYSTEM_PROMPT`.
-  Same constraint applies: we record the dotted reference as the
-  :class:`OutputSchema` ``name`` so a future Phase 2+ validator can
-  resolve it at registration time without leaking the import into
-  ``core``.
+  We record the dotted reference as the :class:`OutputSchema` ``name``
+  so a future validator can resolve it at registration time without
+  leaking the import into ``core`` (which cannot import sibling
+  packages — see ``tests/test_core_isolation.py``).
 """
 
 from __future__ import annotations
@@ -120,13 +123,14 @@ _SPEAKING_RULES = (
 # ---------------------------------------------------------------------------
 
 
-# code-worker rules — mirror the v1 claude-cli worker instruction
-# trailer in SPAWN_MAP[(sm:selected, art:code)] pre-cutover. Source:
-# :data:`alice_forge.dispatcher.constants.SPAWN_MAP` (the
-# ``(sm:selected, art:config_change)`` row carries the closest
-# verbatim "open PR with Closes #N, self-merge once CI green, no
-# --no-verify" trailer; the ``art:code`` row post-cutover routes to
-# the per-issue designer/builder lanes).
+# code-worker rules — v1 claude-cli worker behavioral surface.
+# Post-Phase 4 of #194 (#321), these rules are the SOLE source for
+# the worker prompt body; :func:`compose_spawn_prompt` reads them via
+# :meth:`AgentSpec.assembled_system_prompt`. Pre-cutover the rule set
+# mirrored the inline ``instruction_trailer`` on the SPAWN_MAP row,
+# which has since been deleted. (At sm:selected, ``art:code`` now
+# routes to the per-issue designer/builder lanes — these rules apply
+# wherever the v1 worker pool is still the spawn lane.)
 _CODE_WORKER_RULES = (
     BehavioralRule(
         id="open-pr-closes-issue",
@@ -157,11 +161,14 @@ _CODE_WORKER_RULES = (
 )
 
 
-# research-writer rules — mirror the ``art:research_note`` and
-# ``art:experiment`` trailers from SPAWN_MAP. Both write a markdown
-# note under cortex-memory/research/ and post a
-# ``[SM] transition from=selected to=done`` audit comment to drive the
-# state machine forward.
+# research-writer rules — drive the ``art:research_note`` and
+# ``art:experiment`` worker lanes. Post-Phase 4 of #194 (#321),
+# :func:`compose_spawn_prompt` reads these rules verbatim; the
+# previous mirrored ``instruction_trailer`` fields on the SPAWN_MAP
+# rows have been deleted. Both flavors write a markdown note under
+# ``cortex-memory/research/`` and post a ``[SM] transition
+# from=selected to=done`` audit comment to drive the state machine
+# forward.
 _RESEARCH_WRITER_RULES = (
     BehavioralRule(
         id="write-research-note-under-vault",

@@ -218,25 +218,21 @@ def _now_iso() -> str:
 #   * ``agent_spec`` — canonical reference to a registered
 #     :class:`core.agent_library.AgentSpec` name in
 #     :data:`core.agent_library.registry.default_registry`. Phase 3 of
-#     #194 made this the source-of-truth for tool policy + behavioral
-#     constraints. The remaining ``system_prompt_role`` /
-#     ``instruction_trailer`` / ``system_prompt_module`` fields persist
-#     for byte-identical v1 worker prompt composition; the registry
-#     entry's behavioral_constraints carry the equivalent semantics in
-#     the kernel-spec append_system_prompt path. Phase 4 (#321) collapses
-#     the duplicated keys once every call site reads from the registry.
-#   * ``system_prompt_role`` — short role label rendered into the
-#     v1 worker prompt header (the claude-cli runtime). Ignored by the
-#     SDK lanes — those compose their own prompts in
-#     :func:`compose_thinking_spawn_prompt` and
-#     :func:`compose_speaking_spawn_prompt`.
-#   * ``instruction_trailer`` — final instructions appended after the
-#     issue body in the v1 worker prompt. ``{issue_number}`` is the
-#     substitution token. Ignored by the SDK lanes.
+#     #194 introduced the field as the source-of-truth for tool policy +
+#     behavioral constraints. Phase 4 (#321) made it mandatory: the v1
+#     worker-pool prompt (:func:`compose_spawn_prompt`) now reads the
+#     registered spec's :meth:`AgentSpec.assembled_system_prompt` as the
+#     ENTIRE behavioral-rules section, and the previous inline
+#     ``system_prompt_role`` / ``instruction_trailer`` fields are gone.
+#     A row with a missing or unknown ``agent_spec`` fails loud at
+#     compose time (KeyError) rather than degrading silently.
 #   * ``system_prompt_module`` (optional) — dotted path to a system
 #     prompt constant when the agent is a structured-output sub-agent
 #     (e.g., the code reviewer). Consumed by the
-#     ``(sm:reviewing, art:code)`` reviewer wiring (separate sub-issue).
+#     ``(sm:reviewing, art:code)`` reviewer wiring (which dispatches
+#     via :func:`core.agent_library.run_agent` rather than the
+#     claude-cli spawn lane, so it never calls
+#     :func:`compose_spawn_prompt`).
 #
 # Sub-issue 7 (#186) — SM v2 SPAWN_MAP cutover. The
 # ``(sm:selected, art:code)`` row routes to the per-issue thinking-agent
@@ -259,36 +255,16 @@ SPAWN_MAP: dict[tuple[str, str], dict[str, str]] = {
         "persona": "worker",
         "runtime": "claude-cli",
         "agent_spec": "config-worker",
-        "system_prompt_role": "code-worker",
-        "instruction_trailer": (
-            "Open a PR titled appropriately with `Closes #{issue_number}` "
-            "in the body. Self-merge once CI is green. Do not --no-verify."
-        ),
     },
     ("sm:selected", "art:research_note"): {
         "persona": "worker",
         "runtime": "claude-cli",
         "agent_spec": "research-writer",
-        "system_prompt_role": "research-writer",
-        "instruction_trailer": (
-            "Produce a research note at "
-            "~/alice-mind/cortex-memory/research/<date>-<slug>.md. After "
-            "writing the note, edit issue #{issue_number} to relabel "
-            "sm:selected → sm:done and post a "
-            "`[SM] transition from=selected to=done reason=\"research "
-            "note at <path>\"` comment."
-        ),
     },
     ("sm:selected", "art:experiment"): {
         "persona": "worker",
         "runtime": "claude-cli",
         "agent_spec": "research-writer",
-        "system_prompt_role": "research-writer",
-        "instruction_trailer": (
-            "Same as research_note for v1. Produce a note with "
-            "hypothesis/null/verdict frontmatter; transition to done "
-            "when complete."
-        ),
     },
     # SM v2 build lane. The per-issue speaking-agent loads the approved
     # design note, dispatches the actual code change to a sub-agent via
@@ -312,17 +288,8 @@ SPAWN_MAP: dict[tuple[str, str], dict[str, str]] = {
         "persona": "reviewer",
         "runtime": "claude-agent-sdk:sonnet",
         "agent_spec": "reviewer",
-        "system_prompt_role": "code-reviewer",
         "system_prompt_module": (
             "alice_speaking.review.code_reviewer:CODE_REVIEWER_SYSTEM_PROMPT"
-        ),
-        "instruction_trailer": (
-            "Review the PR linked from issue #{issue_number}. Return a "
-            "single STRICT JSON object matching the schema in your system "
-            "prompt — no markdown fences, no prose. ``verdict: approved`` "
-            "means the dispatcher will close the issue at "
-            "sm:reviewing → sm:done; ``verdict: needs_revision`` means "
-            "sm:reviewing → sm:building."
         ),
     },
 }

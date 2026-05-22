@@ -1412,11 +1412,18 @@ def test_phase2_spawn_fires_on_code_artifact_with_no_prior_spawn(
     # And it matches the value passed to --session-id.
     assert sid_file.read_text().strip() == cmd[sid_idx + 1]
     prompt = (spawn_subdirs[0] / "prompt.txt").read_text()
-    # Code-worker framing.
-    assert "code-worker" in prompt
+    # Config-worker framing. Phase 4 of #194 (#321) made the role tag
+    # derive from the registered AgentSpec's ``name`` (config-worker
+    # for the art:config_change row) — the legacy ``code-worker``
+    # label is gone. ``Closes #200`` is no longer interpolated into
+    # the rule text; the worker reads the issue number from the
+    # ``Issue: #200`` header instead. Compare with the golden fixture
+    # in ``tests/fixtures/spawn_prompts/`` for the exact rendering.
+    assert "config-worker" in prompt
     assert "open a pr" in prompt.lower()
-    assert "Closes #200" in prompt
-    assert "Do not --no-verify" in prompt
+    assert "Issue: #200" in prompt
+    assert "Closes #<issue_number>" in prompt
+    assert "Never pass ``--no-verify``" in prompt
 
 
 def test_phase2_spawn_fires_on_research_note_with_writer_template(
@@ -1478,9 +1485,16 @@ def test_phase2_spawn_fires_on_research_note_with_writer_template(
         d for d in spawn_dir.iterdir() if d.is_dir() and d.name.startswith("spawn-")
     ]
     prompt = (spawn_subdirs[0] / "prompt.txt").read_text()
+    # Phase 4 of #194 (#321) made the role tag derive from the
+    # registered AgentSpec's ``name`` (``research-writer``) and the
+    # behavioral-rule blocks come from
+    # :data:`core.agent_library.agents._RESEARCH_WRITER_RULES`. The
+    # "transition selected → done" instruction now lives inside the
+    # ``transition-to-done-on-completion`` constraint block — see the
+    # golden fixture for the exact rendering.
     assert "research-writer" in prompt
     assert "research note at" in prompt
-    assert "sm:selected → sm:done" in prompt
+    assert "``sm:selected`` → ``sm:done``" in prompt
     started = [
         b for _r, n, b in recorder.posted if n == 201 and "spawn-started" in b
     ][0]
@@ -8625,9 +8639,14 @@ def test_deps_blocked_dep_dry_run_does_not_post(state_path) -> None:
 
 def test_spawn_map_selected_art_code_row_targets_thinking_persona() -> None:
     """The (sm:selected, art:code) row carries persona=thinking after the
-    cutover; the v1 ``system_prompt_role``/``instruction_trailer`` keys
-    are not present on this row because the thinking-agent composes its
-    own prompt in :func:`compose_thinking_spawn_prompt`."""
+    cutover. The thinking-agent composes its own prompt in
+    :func:`compose_thinking_spawn_prompt`, not :func:`compose_spawn_prompt`.
+
+    Post-Phase 4 of #194 (#321) the v1 worker-prompt inline fields
+    (``system_prompt_role`` / ``instruction_trailer``) are gone from
+    every row — see
+    :func:`test_spawn_map_legacy_inline_fields_removed_post_phase4` in
+    ``test_agent_library_phase3_call_sites`` for the global assertion."""
     row = sm.SPAWN_MAP[("sm:selected", "art:code")]
     assert row["persona"] == "thinking"
     assert row["runtime"] == "claude-agent-sdk:opus"
@@ -8649,14 +8668,16 @@ def test_spawn_map_designed_art_code_row_targets_speaking_persona() -> None:
 def test_spawn_map_reviewing_art_code_row_preserved() -> None:
     """The (sm:reviewing, art:code) row from PR #109 must survive the
     cutover (regression). Its ``system_prompt_module`` is what the
-    Sonnet code-reviewer wiring (separate sub-issue) consumes."""
+    Sonnet code-reviewer wiring consumes; its ``agent_spec`` resolves
+    to the registered ``reviewer`` :class:`AgentSpec` so the role tag
+    (post-Phase 4 of #194) flows from the registry."""
     row = sm.SPAWN_MAP[("sm:reviewing", "art:code")]
     assert row["persona"] == "reviewer"
+    assert row["agent_spec"] == "reviewer"
     assert (
         row["system_prompt_module"]
         == "alice_speaking.review.code_reviewer:CODE_REVIEWER_SYSTEM_PROMPT"
     )
-    assert "code-reviewer" in row["system_prompt_role"]
 
 
 def test_spawn_map_worker_rows_still_carry_claude_cli_runtime() -> None:

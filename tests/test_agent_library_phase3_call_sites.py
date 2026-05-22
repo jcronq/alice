@@ -74,19 +74,15 @@ def test_spawn_map_row_pins_specific_agent_spec(
     assert row.get("agent_spec") == expected_name
 
 
-def test_spawn_map_legacy_fields_preserved_for_worker_rows() -> None:
-    """Phase 4 territory: the v1 worker rows still carry
-    ``system_prompt_role`` and ``instruction_trailer`` so
-    :func:`compose_spawn_prompt` stays byte-identical. Phase 3 must
-    NOT drop these fields — only Phase 4 (#321) collapses them."""
-    for key in (
-        ("sm:selected", "art:config_change"),
-        ("sm:selected", "art:research_note"),
-        ("sm:selected", "art:experiment"),
-    ):
-        row = sm_constants.SPAWN_MAP[key]
-        assert "system_prompt_role" in row, key
-        assert "instruction_trailer" in row, key
+def test_spawn_map_legacy_inline_fields_removed_post_phase4() -> None:
+    """Phase 4 (#321) collapsed the duplicated inline behavioral-rule
+    fields away. ``system_prompt_role`` and ``instruction_trailer``
+    must NOT exist on any SPAWN_MAP row — the registered
+    :class:`AgentSpec` named by ``agent_spec`` is now the sole source
+    for the v1 worker prompt body."""
+    for key, row in sm_constants.SPAWN_MAP.items():
+        assert "system_prompt_role" not in row, key
+        assert "instruction_trailer" not in row, key
 
 
 # ---------------------------------------------------------------------------
@@ -103,23 +99,34 @@ def test_resolve_agent_spec_returns_registered_spec() -> None:
     assert spec.name == "research-writer"
 
 
-def test_resolve_agent_spec_returns_none_for_missing_field() -> None:
-    """Pre-#194 rows / test fixtures without ``agent_spec`` get a
-    ``None`` so the caller can fall through to the inline fields."""
-    assert spawn_module._resolve_agent_spec({}) is None
+def test_resolve_agent_spec_raises_on_missing_field() -> None:
+    """Phase 4 (#321): rows must carry ``agent_spec``. Missing field
+    is a hard error — there is no longer a legacy inline-field
+    fallback to drop into."""
+    with pytest.raises(KeyError, match="agent_spec"):
+        spawn_module._resolve_agent_spec({})
 
 
-def test_resolve_agent_spec_returns_none_for_unknown_name() -> None:
-    """An unknown agent name doesn't raise — returns ``None`` so the
-    legacy worker-prompt path keeps working while the migration is in
-    flight."""
-    assert spawn_module._resolve_agent_spec({"agent_spec": "ghost"}) is None
+def test_resolve_agent_spec_raises_on_empty_field() -> None:
+    """Phase 4 (#321): empty ``agent_spec`` is treated the same as
+    missing — raises :class:`KeyError`."""
+    with pytest.raises(KeyError, match="agent_spec"):
+        spawn_module._resolve_agent_spec({"agent_spec": ""})
 
 
-def test_compose_spawn_prompt_still_byte_identical_for_worker_row() -> None:
-    """The compose_spawn_prompt output for a v1 worker row must not
-    regress on the Phase 3 migration — the instruction trailer + role
-    label are still consumed from the inline fields."""
+def test_resolve_agent_spec_raises_on_unknown_name() -> None:
+    """Phase 4 (#321): an unknown agent name propagates the
+    registry's :class:`KeyError` rather than silently returning
+    ``None``. Misconfigured rows fail loud at compose time."""
+    with pytest.raises(KeyError):
+        spawn_module._resolve_agent_spec({"agent_spec": "ghost"})
+
+
+def test_compose_spawn_prompt_renders_spec_constraints_for_config_worker_row() -> None:
+    """Phase 4 (#321): the v1 worker prompt body is the registered
+    :class:`AgentSpec`'s :meth:`assembled_system_prompt`. The config
+    worker row should surface the config-files-only, smaller-diff,
+    and open-pr-closes-issue rules verbatim from the spec."""
     row = sm_constants.SPAWN_MAP[("sm:selected", "art:config_change")]
     issue = {
         "number": 42,
@@ -129,10 +136,30 @@ def test_compose_spawn_prompt_still_byte_identical_for_worker_row() -> None:
         "user": {"login": "jcronq"},
     }
     out = spawn_module.compose_spawn_prompt(issue, row)
-    assert "You are a code-worker agent" in out
-    assert "Closes #42" in out
-    assert "Self-merge once CI is green" in out
-    assert "Do not --no-verify" in out
+    # Role tag derives from the spec's name, not an inline field.
+    assert "You are a config-worker agent" in out
+    # Constraint blocks from _CONFIG_WORKER_RULES.
+    assert "## Constraint: config-files-only" in out
+    assert "## Constraint: smaller-diff-threshold" in out
+    assert "## Constraint: open-pr-closes-issue" in out
+    # The "no --no-verify" injunction lives inside the
+    # open-pr-closes-issue block on the config-worker spec.
+    assert "Never pass ``--no-verify``" in out
+
+
+def test_compose_spawn_prompt_raises_on_row_missing_agent_spec() -> None:
+    """Phase 4 (#321): compose refuses to render a row that doesn't
+    name a registered AgentSpec. KeyError surfaces immediately
+    rather than producing a prompt without behavioral rules."""
+    issue = {
+        "number": 99,
+        "title": "x",
+        "body": "y",
+        "labels": [{"name": "art:code"}],
+        "user": {"login": "jcronq"},
+    }
+    with pytest.raises(KeyError, match="agent_spec"):
+        spawn_module.compose_spawn_prompt(issue, {})
 
 
 # ---------------------------------------------------------------------------
