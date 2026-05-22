@@ -5797,7 +5797,7 @@ def test_thinking_spawn_writes_correctly_formed_spawn_dir(tmp_path) -> None:
 
 
 def test_thinking_spawn_invokes_python_shim_with_args(tmp_path) -> None:
-    """Popen is called with the venv python + ``-m alice_forge.thinking_shim``
+    """Popen is called with the venv python + ``-m alice_thinking.cli.perissue``
     + spawn-dir + session-id + mode=design, detached via
     ``start_new_session=True``."""
     spawn_dir = tmp_path / "thinking-spawns"
@@ -5828,9 +5828,9 @@ def test_thinking_spawn_invokes_python_shim_with_args(tmp_path) -> None:
     assert len(popens) == 1
     cmd = popens[0].args
     assert cmd[0] == "/opt/alice-venv/bin/python"
-    assert cmd[1:3] == ["-m", "alice_forge.thinking_shim"]
-    # --spawn-dir / --session-id / --mode passed through. The shim
-    # contract (sub-issue 3) consumes these.
+    assert cmd[1:3] == ["-m", "alice_thinking.cli.perissue"]
+    # --spawn-dir / --session-id / --mode passed through. The
+    # entrypoint contract (sub-issue 3 of #149) consumes these.
     assert "--spawn-dir" in cmd
     assert "--session-id" in cmd
     assert "--mode" in cmd
