@@ -1212,7 +1212,9 @@ def compose_speaking_spawn_prompt(
 
     return (
         f"---\n"
+        f"issue: #{number}\n"
         f"phase: {SPEAKING_PHASE_PER_ISSUE_BUILD}\n"
+        f"art: {art_label}\n"
         f"design_note: {design_note_value}\n"
         f"---\n"
         f"You are a speaking-agent working on SM task #{number} in "
