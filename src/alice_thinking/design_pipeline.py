@@ -26,6 +26,15 @@ container). The narrative in
 nominates ``claude-agent-sdk``; we pick that for parity with
 Speaking's auth path. No new secret, no new compose volume.
 
+As of Phase 3 of #194 the dispatch path no longer constructs
+:class:`ClaudeAgentOptions` inline — it looks up the registered
+``"reviewer"`` :class:`AgentSpec` from
+:data:`core.agent_library.default_registry` and dispatches via
+:func:`core.agent_library.run_agent`. The Sonnet model + structured-
+JSON behavior is preserved byte-identically via a per-call
+:func:`dataclasses.replace` that swaps the registry's code-reviewer
+system prompt for this module's design-reviewer prompt.
+
 State is in-memory — nothing persists until the final commit (or
 cap-hit surface). Per the design doc, wake duration of ~30 minutes
 is acceptable for commission tasks.
@@ -233,28 +242,54 @@ class SubAgentRunner:
         """Drive ``claude-agent-sdk`` with no tool access; return the
         concatenated assistant text. Override this in tests.
         """
-        return asyncio.run(self._review_via_sdk(prompt))
+        return asyncio.run(self._review_via_agent_library(prompt))
 
-    async def _review_via_sdk(self, prompt: str) -> str:
-        from claude_agent_sdk import (  # type: ignore[import-not-found]
-            AssistantMessage,
-            ClaudeAgentOptions,
-            TextBlock,
-            query,
-        )
+    async def _review_via_agent_library(self, prompt: str) -> str:
+        """Dispatch the review turn through :func:`run_agent` against the
+        registered ``"reviewer"`` :class:`AgentSpec`.
 
-        options = ClaudeAgentOptions(
+        Phase 3 of #194 replaced the inline :class:`ClaudeAgentOptions`
+        construction with a registry lookup. The registered spec carries
+        the Sonnet model + read-only tool policy + verdict-gate
+        behavioral rules; we override ``append_system_prompt`` with this
+        runner's :attr:`system_prompt` (the design-doc reviewer prompt,
+        which differs from the code-reviewer canonical prompt the
+        registered spec references). The override is the per-call
+        pattern documented in :func:`core.agent_library.runner.run_agent`.
+        """
+        from dataclasses import replace
+
+        from core.agent_library import default_registry, run_agent
+        from core.events import CapturingEmitter
+
+        spec = default_registry.get("reviewer")
+        # Per-call override: swap in this runner's model + system prompt
+        # without mutating the registered spec. The design-pipeline
+        # reviewer reviews design *drafts* against a commission spec —
+        # different prompt body than the code-reviewer the registry
+        # entry points to. Allowed_tools stays empty via the
+        # registered read_only policy (Read/Glob/Grep) clamped by the
+        # explicit override below — we want zero tool access for the
+        # structured-JSON verdict turn.
+        kernel = replace(
+            spec.kernel_spec,
             model=self.model,
+            max_seconds=self.max_seconds,
             allowed_tools=[],
-            system_prompt={"type": "preset", "preset": "claude_code", "append": self.system_prompt},
+            append_system_prompt=self.system_prompt,
         )
-        parts: list[str] = []
-        async for msg in query(prompt=prompt, options=options):
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, TextBlock):
-                        parts.append(block.text)
-        return "".join(parts).strip()
+        # Drop the tool_policy too — the override above already pinned
+        # allowed_tools to []; the policy's allowlist would reintroduce
+        # the read-only tools at effective_tools() time.
+        agent = replace(spec, kernel_spec=kernel, tool_policy=None)
+
+        result = await run_agent(
+            agent,
+            prompt=prompt,
+            emitter=CapturingEmitter(),
+            correlation_id="design-pipeline-reviewer",
+        )
+        return (result.text or "").strip()
 
 
 # ---------------------------------------------------------------------------
