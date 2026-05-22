@@ -58,9 +58,17 @@ _WAKE_TZ = ZoneInfo("America/New_York")
 # Maps the ``phase:`` frontmatter value (and ``--mode`` CLI flag) onto
 # the runtime enum. Kept narrow on purpose — only per-issue phases are
 # valid entry points for this script.
+#
+# Short-form aliases (``design`` / ``build``) match the dispatcher's
+# spawn invocation (``alice_forge.dispatcher.spawn_thinking_agent`` /
+# ``spawn_speaking_agent`` pass ``--mode design`` / ``--mode build``).
+# The full-name keys remain valid for direct invocation and for the
+# ``phase:`` frontmatter that compose_thinking_spawn_prompt renders.
 PHASE_BY_NAME: dict[str, Phase] = {
     Phase.PER_ISSUE_DESIGN.value: Phase.PER_ISSUE_DESIGN,
     Phase.PER_ISSUE_BUILD.value: Phase.PER_ISSUE_BUILD,
+    "design": Phase.PER_ISSUE_DESIGN,
+    "build": Phase.PER_ISSUE_BUILD,
 }
 
 

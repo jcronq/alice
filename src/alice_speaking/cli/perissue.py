@@ -50,8 +50,14 @@ __all__ = [
 # Maps the ``phase:`` frontmatter value (and ``--mode`` CLI flag) onto
 # the speaking-side Phase enum. Kept narrow on purpose — only the
 # build phase is a valid speaking entrypoint.
+#
+# The short-form ``build`` alias matches the dispatcher's spawn
+# invocation (``alice_forge.dispatcher.spawn_speaking_agent`` passes
+# ``--mode build``). The full-name key remains valid for direct
+# invocation and for the ``phase:`` frontmatter.
 PHASE_BY_NAME: dict[str, Phase] = {
     Phase.PER_ISSUE_BUILD.value: Phase.PER_ISSUE_BUILD,
+    "build": Phase.PER_ISSUE_BUILD,
 }
 
 

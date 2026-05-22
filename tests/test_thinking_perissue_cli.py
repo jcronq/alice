@@ -103,10 +103,13 @@ def test_resolve_phase_raises_on_unknown_override() -> None:
 def test_phase_by_name_covers_both_per_issue_phases() -> None:
     """Lock the public mapping — adding a new per-issue phase must
     extend ``PHASE_BY_NAME`` here, otherwise the entrypoint silently
-    refuses to dispatch into it."""
+    refuses to dispatch into it. The short-form aliases (``design`` /
+    ``build``) match the dispatcher's spawn invocation."""
     assert PHASE_BY_NAME == {
         "per_issue_design": Phase.PER_ISSUE_DESIGN,
         "per_issue_build": Phase.PER_ISSUE_BUILD,
+        "design": Phase.PER_ISSUE_DESIGN,
+        "build": Phase.PER_ISSUE_BUILD,
     }
 
 

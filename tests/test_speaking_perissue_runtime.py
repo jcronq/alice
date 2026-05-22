@@ -50,9 +50,14 @@ from alice_speaking.runtime import (
 
 def test_phase_enum_includes_per_issue_build() -> None:
     """Lock the public enum surface — adding a new phase should
-    extend PHASE_BY_NAME so the entrypoint stays narrow."""
+    extend PHASE_BY_NAME so the entrypoint stays narrow. The
+    short-form ``build`` alias matches the dispatcher's spawn
+    invocation."""
     assert Phase.PER_ISSUE_BUILD.value == "per_issue_build"
-    assert PHASE_BY_NAME == {"per_issue_build": Phase.PER_ISSUE_BUILD}
+    assert PHASE_BY_NAME == {
+        "per_issue_build": Phase.PER_ISSUE_BUILD,
+        "build": Phase.PER_ISSUE_BUILD,
+    }
 
 
 def test_parse_pr_url_finds_canonical_pr_link() -> None:
