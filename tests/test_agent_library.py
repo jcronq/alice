@@ -16,7 +16,6 @@ Phase 1 of issue #194. Covers:
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
