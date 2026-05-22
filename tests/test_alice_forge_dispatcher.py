@@ -9187,13 +9187,21 @@ def test_selected_thinking_spawn_silent_completion_transitions_to_blocked(
     ), bodies
 
 
-def test_selected_thinking_spawn_with_design_ready_does_not_block(
+def test_selected_thinking_spawn_with_design_ready_transitions_to_design_review(
     state_path,
 ) -> None:
     """If a prior ``[SM] design-ready`` follows the thinking-spawn-started
-    audit, the silent-failure guard must NOT fire — the design phase
-    produced its terminal signal, so the loop-detection precondition
-    isn't met (issue #202)."""
+    audit, the dispatcher must transition ``sm:selected → sm:design_review``
+    and NOT re-spawn another design-phase agent.
+
+    Pre-#295 behaviour was: silent-spawn guard skipped, no forward
+    transition, dispatcher re-spawned the design phase on every poll.
+    That produced the 228-respawn loop on issue #295. The recovery
+    transition closes the loop by adopting the design-ready as the
+    terminal signal for the (orphaned) DESIGNING phase, exactly as the
+    DESIGNING handler would have if the ``spawn-dispatch-art-code``
+    EventTransition had ever been wired.
+    """
     thinking_calls: list = []
     recorder = Recorder()
     label_rec = LabelRecorder()
@@ -9209,6 +9217,12 @@ def test_selected_thinking_spawn_with_design_ready_does_not_block(
             "[SM] design-ready note=[[2026-05-13-issue801-foo]] author=alice"
         ),
     ]
+
+    def spawn_thinking_unused(*_a, **_kw):  # pragma: no cover — must not fire
+        raise AssertionError(
+            "orphan-design-ready recovery did not transition; "
+            "dispatcher re-spawned the design phase (loop)"
+        )
 
     exit_code, report = sm.run(
         repo="jcronq/alice",
@@ -9228,22 +9242,27 @@ def test_selected_thinking_spawn_with_design_ready_does_not_block(
         spawn=_no_call,
         has_live_thinking_spawn=lambda _n: False,
         count_running_thinking=lambda: 0,
-        spawn_thinking=_track_spawn(thinking_calls),
+        spawn_thinking=spawn_thinking_unused,
         proactive_reap=lambda: (0, 0),
         now_iso=_frozen_now,
         log=lambda _m: None,
     )
 
     assert exit_code == 0
-    # Guard did NOT trip: no transition to sm:blocked.
-    blocked_transitions = [
-        t for t in report.transitions if t[2] == "sm:blocked"
-    ]
-    assert blocked_transitions == []
-    # Existing behaviour (re-spawn until a downstream handler relabels
-    # off sm:selected) is preserved — the guard is intentionally narrow.
-    assert report.spawned == 1
-    assert thinking_calls == [(801, "art:code", "spawn-801-stub")]
+    assert report.spawned == 0
+    assert thinking_calls == []
+    assert report.transitioned == 1
+    assert (801, "sm:selected", "sm:design_review") in report.transitions
+    edit = label_rec.calls[-1]
+    assert edit["add"] == ["sm:design_review"]
+    assert edit["remove"] == ["sm:selected"]
+    bodies = [b for _r, _n, b in recorder.posted]
+    assert any(
+        "from=selected to=design_review" in b
+        and "orphan design-ready" in b
+        and "2026-05-13-issue801-foo" in b
+        for b in bodies
+    ), bodies
 
 
 def test_selected_thinking_spawn_first_pass_no_prior_audit_spawns(

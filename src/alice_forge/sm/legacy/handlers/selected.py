@@ -378,6 +378,7 @@ def _process_selected(
     if persona == "thinking":
         saw_thinking_spawn_started = False
         saw_design_ready = False
+        design_ready_note: str | None = None
         for c in sel_comments:
             if not isinstance(c, dict):
                 continue
@@ -395,6 +396,70 @@ def _process_selected(
                 # either is evidence that the design phase produced its
                 # terminal signal.
                 saw_design_ready = True
+                if design_ready_note is None:
+                    m = re.search(r"note=\[\[([^\]]+)\]\]", body)
+                    if m:
+                        design_ready_note = m.group(1)
+
+        # Issue #295 — orphan design-ready recovery. The v3 transition
+        # table declares an EventTransition ``spawn-dispatch-art-code``
+        # SELECTED → DESIGNING that's meant to fire when this branch
+        # posts ``thinking-spawn-started``. That label swap is not
+        # wired anywhere, so when the agent posts ``[SM] design-ready``
+        # the issue is still labeled sm:selected and neither the
+        # SELECTED nor the DESIGNING handler advances it. The
+        # dispatcher then re-spawns the design phase every cadence —
+        # observed as 228 spawn-started comments on #295 inside one
+        # day. Transition straight to sm:design_review (same target
+        # the DESIGNING handler would have picked on design-ready)
+        # and let Speaking's review gate fire.
+        if saw_thinking_spawn_started and saw_design_ready:
+            reason = (
+                "orphan design-ready (see #295): spawn-dispatch-art-code "
+                "EventTransition skipped during spawn; advancing to "
+                "design_review on the agent's design-ready"
+            )
+            if design_ready_note:
+                reason += f' note=[[{design_ready_note}]]'
+            transition_body = render_transition_comment(
+                ACTIVE_SM_LABEL, DESIGN_REVIEW_SM_LABEL, reason
+            )
+            if dry_run:
+                log(
+                    f"[sm-dispatcher] DRY-RUN would transition #{number}: "
+                    f"selected → design_review ({reason})"
+                )
+                report.transitioned += 1
+                report.transitions.append(
+                    (number, ACTIVE_SM_LABEL, DESIGN_REVIEW_SM_LABEL)
+                )
+                return
+            try:
+                edit_labels(
+                    repo,
+                    number,
+                    add=[DESIGN_REVIEW_SM_LABEL],
+                    remove=[ACTIVE_SM_LABEL],
+                )
+                post_comment(repo, number, transition_body)
+            except GHCommandError as exc:
+                log(
+                    f"[sm-dispatcher] selected #{number}: "
+                    f"failed orphan-design-ready transition: {exc}"
+                )
+                if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+                    raise
+                return
+            report.transitioned += 1
+            report.transitions.append(
+                (number, ACTIVE_SM_LABEL, DESIGN_REVIEW_SM_LABEL)
+            )
+            log(
+                f"[sm-dispatcher] transitioned #{number}: "
+                f"selected → design_review ({reason})"
+            )
+            return
+
         if saw_thinking_spawn_started and not saw_design_ready:
             reason = (
                 "thinking-agent spawn exited without posting "
