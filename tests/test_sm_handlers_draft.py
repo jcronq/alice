@@ -88,6 +88,35 @@ class TestRouteToStudy:
         assert result.target is SMState.NEEDS_STUDY
 
 
+class TestSelect:
+    def test_bare_select(self):
+        result = handle(
+            _issue(), _services(comments=[_comment("[SM] select")])
+        )
+        assert isinstance(result, Transition)
+        assert result.target is SMState.SELECTED
+        assert result.art_swap is None
+
+    def test_with_art_swap(self):
+        result = handle(
+            _issue(),
+            _services(comments=[_comment("[SM] select art=art:code")]),
+        )
+        assert isinstance(result, Transition)
+        assert result.target is SMState.SELECTED
+        assert result.art_swap == "art:code"
+
+    def test_trailing_prose_does_not_block(self):
+        body = (
+            "[SM] select art=art:config_change\n"
+            "Triager: trivial 3-line config fix, no study needed."
+        )
+        result = handle(_issue(), _services(comments=[_comment(body)]))
+        assert isinstance(result, Transition)
+        assert result.target is SMState.SELECTED
+        assert result.art_swap == "art:config_change"
+
+
 class TestReject:
     def test_reject_with_reason(self):
         result = handle(

@@ -36,6 +36,7 @@ class Verbs(enum.Enum):
 
     # sm:draft outgoing
     ROUTE_TO_STUDY = "route-to-study"
+    SELECT = "select"
     REJECT = "reject"
 
     # sm:needs_study outgoing
@@ -122,6 +123,7 @@ TRANSITIONS: Mapping[
 ] = {
     SMState.DRAFT: {
         Verbs.ROUTE_TO_STUDY: TransitionTo(SMState.NEEDS_STUDY, art_swap=True),
+        Verbs.SELECT: TransitionTo(SMState.SELECTED, art_swap=True),
         Verbs.REJECT: TransitionTo(SMState.REJECTED),
         Verbs.CONTINUE: SelfLoop(),
     },

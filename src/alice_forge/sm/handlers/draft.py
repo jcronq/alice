@@ -4,7 +4,13 @@ Replicates v1's ``_process_draft`` semantics:
 
   * On a trusted ``[SM] route-to-study`` comment, transition to
     ``sm:needs_study``. Optional ``art=<label>`` swaps the art label
-    during the transition.
+    during the transition. Reserved for research-type artifacts that
+    genuinely need a study phase.
+  * On a trusted ``[SM] select`` comment, transition directly to
+    ``sm:selected``, skipping ``sm:needs_study``. Optional
+    ``art=<label>`` swaps the art label during the transition. The
+    default path for non-research artifacts (code, config_change,
+    experiment) where triage already knows the work.
   * On a trusted ``[SM] reject reason=<...>``, transition to
     ``sm:rejected``.
   * On a trusted ``[SM] continue reason=<...>`` self-loop, record
@@ -99,6 +105,12 @@ def handle(issue: dict[str, Any], services: HandlerServices) -> HandlerResult | 
                     reason="route-to-study",
                     art_swap=parsed.art_label,
                 )
+            if parsed.verb is Verbs.SELECT:
+                return Transition(
+                    target=SMState.SELECTED,
+                    reason="select",
+                    art_swap=parsed.art_label,
+                )
             if parsed.verb is Verbs.REJECT:
                 return Transition(
                     target=SMState.REJECTED,
@@ -157,7 +169,8 @@ def _render_triage_surface_body(issue: dict[str, Any]) -> str:
     return (
         f"[SM] triage-surface number={number} title={title!r}\n\n"
         f"Issue is at sm:draft awaiting triage. Decide:\n"
-        f"  1. [SM] route-to-study art=<label>?\n"
-        f"  2. [SM] reject reason=<one-liner>\n"
-        f"  3. [SM] continue reason=<triage progress>  (self-loop with new info)\n"
+        f"  1. [SM] select art=<label>?            (skip study — code/config/experiment)\n"
+        f"  2. [SM] route-to-study art=<label>?    (study first — research)\n"
+        f"  3. [SM] reject reason=<one-liner>\n"
+        f"  4. [SM] continue reason=<triage progress>  (self-loop with new info)\n"
     )
