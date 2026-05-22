@@ -70,6 +70,9 @@
       </details>
       <a href="/graph"      class="{% if active == 'graph' %}on{% endif %}">flow graph</a>
       <a href="/memory"     class="{% if active == 'memory' %}on{% endif %}">memory graph</a>
+      {% if likec4_enabled %}
+      <a href="/likec4/"    class="{% if active == 'likec4' %}on{% endif %}" target="_blank" rel="noopener">architecture ↗</a>
+      {% endif %}
       <a href="/activity"   class="{% if active == 'activity' %}on{% endif %}">activity</a>
       <a href="/running"    class="{% if active == 'running' %}on{% endif %}">running</a>
       <a href="/context"    class="{% if active == 'context' %}on{% endif %}">context</a>

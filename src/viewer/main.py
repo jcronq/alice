@@ -137,6 +137,18 @@ def create_app(paths: Paths | None = None) -> FastAPI:
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+    likec4_build = resolved_paths.mind_dir / "architecture" / "likec4" / "build"
+    if likec4_build.is_dir():
+        app.mount(
+            "/likec4",
+            StaticFiles(directory=str(likec4_build), html=True),
+            name="likec4",
+        )
+        app.state.likec4_enabled = True
+    else:
+        app.state.likec4_enabled = False
+    templates.env.globals["likec4_enabled"] = app.state.likec4_enabled
+
     def _configured_models(p: Paths) -> list[dict[str, Any]]:
         """Build per-hemisphere model routing rows for the sidebar.
 
