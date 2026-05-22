@@ -533,6 +533,31 @@ def proactive_reap_dead_spawns(
     return reaped, stuck
 
 
+def _resolve_agent_spec(spawn_config: dict[str, str]) -> Any:
+    """Return the :class:`AgentSpec` for the row's ``agent_spec`` name.
+
+    Phase 3 of #194: every SPAWN_MAP row that targets a worker-pool
+    lane now carries an ``agent_spec`` field naming a registered
+    :class:`core.agent_library.AgentSpec`. The lookup goes through
+    :data:`core.agent_library.default_registry` so the registry stays
+    the canonical source of truth for tool policy + behavioral
+    constraints. Rows without an ``agent_spec`` field (e.g., pre-#194
+    test fixtures) return ``None`` so the caller can fall back to the
+    inline ``system_prompt_role`` / ``instruction_trailer`` fields.
+    """
+    name = spawn_config.get("agent_spec")
+    if not name:
+        return None
+    # Lazy import so this module stays importable in test paths that
+    # stub out the registry.
+    from core.agent_library import default_registry
+
+    try:
+        return default_registry.get(name)
+    except KeyError:
+        return None
+
+
 def compose_spawn_prompt(
     issue: dict[str, Any],
     spawn_config: dict[str, str],
@@ -542,6 +567,19 @@ def compose_spawn_prompt(
     The prompt embeds the issue body verbatim, the artifact label, the
     issue source (author identity), and the role-specific instruction
     trailer with ``{issue_number}`` substituted.
+
+    Phase 3 of #194: the ``agent_spec`` field on ``spawn_config``
+    references a registered :class:`AgentSpec`. The registry entry is
+    the canonical source for tool policy + behavioral constraints
+    (consumed when this lane evolves to construct a kernel rather
+    than shelling out to claude-cli). For the v1 worker-pool prompt
+    text we still read ``system_prompt_role`` and
+    ``instruction_trailer`` from the row — the trailers don't have a
+    byte-identical equivalent inside the registered spec's
+    behavioral_constraints (the constraint text is semantically
+    equivalent but rendered as ``## Constraint: <id>`` blocks).
+    Phase 4 (#321) folds the duplicated fields away once the worker
+    prompt is composed from the spec's assembled system prompt.
     """
     number = issue.get("number")
     title = issue.get("title") or "(no title)"
@@ -553,6 +591,12 @@ def compose_spawn_prompt(
             break
     login = _author_login(issue) or "(unknown)"
     source_label = f"source:{login}"
+
+    # Resolve the registered AgentSpec by name for side-effect
+    # validation; the worker-prompt text still flows through the
+    # inline fields until Phase 4 collapses them. Missing or unknown
+    # ``agent_spec`` falls through with ``spec=None``.
+    _resolve_agent_spec(spawn_config)
 
     role = spawn_config["system_prompt_role"]
     trailer = spawn_config["instruction_trailer"].format(issue_number=number)
