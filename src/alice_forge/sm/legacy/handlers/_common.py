@@ -6,7 +6,7 @@ helpers, and so on. To keep handler files focused on the state-machine
 logic rather than the import bookkeeping, the common surface is
 consolidated here and each handler does::
 
-    from alice_forge.dispatcher.handlers._common import *
+    from alice_forge.sm.legacy.handlers._common import *
 
 The ``__all__`` list explicitly enumerates the names — including the
 underscore-prefixed helpers (e.g. :func:`_label_names`,
@@ -156,7 +156,7 @@ from alice_forge.dispatcher.spawn import (
     spawn_speaking_agent,
     spawn_thinking_agent,
 )
-from alice_forge.dispatcher.state import DispatcherState, load_state, save_state
+from alice_forge.sm.legacy.state import DispatcherState, load_state, save_state
 from alice_forge.dispatcher.trust import (
     TrustDecision,
     _author_login,

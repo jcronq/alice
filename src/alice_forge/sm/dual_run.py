@@ -1,14 +1,17 @@
 """Dual-run logger for the v1 → v3 per-state cutover.
 
-During Phase 2's per-state handler ports, v3 handlers run in
-dry-run mode for the state being ported. v3 logs its predicted
-action to ``/state/worker/sm-v3-predicted.jsonl``; v1 logs the
-corresponding actual action to ``/state/worker/sm-v1-actual.jsonl``.
-A nightly diff job (Phase 2 deliverable) compares the two and
-reports divergences.
+During Phase 2's per-state handler ports, v3 handlers ran in dry-
+run mode and logged predicted actions to ``sm-v3-predicted.jsonl``;
+v1 logged the corresponding actual action to ``sm-v1-actual.jsonl``.
+A nightly diff job compared the two and reported divergences. A
+state's flag flipped from ``v1-only`` to ``v3`` only after seven
+consecutive days with zero divergences.
 
-A state's feature flag flips from ``v1-only`` to ``v3`` only after
-seven consecutive days with zero divergences for that state.
+**Phase 4 (#301) rename:** v3 is now authoritative for transitions
+in production. The dispatcher writes v3's applied results to
+``sm-v3-actual.jsonl`` (lane ``"v3-actual"``) for one month so the
+previous diff job's output still parses while operators verify
+parity. The ``"v1-actual"`` lane is unchanged.
 
 This module just provides the JSONL writer. The diff job lives
 outside the dispatcher's hot path.
@@ -38,9 +41,10 @@ from alice_forge.sm.states import SMState
 class DualRunLogEntry:
     """One line in the predicted / actual JSONL file.
 
-    Cycle ID groups a v1-actual + v3-predicted pair so the diff job
-    can match them. Time + repo + issue_number identify which issue
-    the entry is about. Lane = ``"v1-actual"`` or ``"v3-predicted"``.
+    Cycle ID groups a v1-actual + v3-actual (formerly v3-predicted;
+    Phase 4 #301 rename) pair so the diff job can match them. Time
+    + repo + issue_number identify which issue the entry is about.
+    Lane = ``"v1-actual"`` or ``"v3-actual"``.
 
     ``action_kind`` is the variant name (``"Transition"`` /
     ``"Continue"`` / ``"SideEffect"`` / etc.). ``payload`` is the

@@ -5,25 +5,28 @@
 
 from __future__ import annotations
 
-from alice_forge.dispatcher.handlers._common import *  # noqa: F401, F403
+from alice_forge.sm.legacy.handlers._common import *  # noqa: F401, F403
 from alice_forge.sm.ledger import EmittedLedger, load_or_migrate
 
-# State-handler functions live in sibling modules under
-# ``alice_forge.dispatcher.handlers``. They can't be re-exported via
-# ``_common`` because the handler modules themselves import from
-# ``_common`` — that would loop. Importing them explicitly here keeps
-# the directed graph acyclic.
-from alice_forge.dispatcher.handlers.building import _process_building
-from alice_forge.dispatcher.handlers.compacting import _process_compacting
-from alice_forge.dispatcher.handlers.design_review import _process_design_review
-from alice_forge.dispatcher.handlers.designed import _process_designed
-from alice_forge.dispatcher.handlers.designing import _process_designing
-from alice_forge.dispatcher.handlers.draft import _process_draft
-from alice_forge.dispatcher.handlers.needs_study import _process_needs_study
-from alice_forge.dispatcher.handlers.open_done import _process_open_done
-from alice_forge.dispatcher.handlers.reviewing import _process_reviewing
-from alice_forge.dispatcher.handlers.selected import _process_selected
-from alice_forge.dispatcher.handlers.stale_closed import _process_stale_closed
+# v1 ``_process_*`` handlers — Phase 4 (#301) moved to
+# :mod:`alice_forge.sm.legacy.handlers`. The dispatcher still drives
+# them as the fallback for side-effects v3 hasn't ported (spawn
+# dispatch, hello, rebase machinery, verify, post-merge cleanup).
+# v3 (:mod:`alice_forge.sm.handlers`) now owns transition decisions;
+# when v3 returns a :class:`alice_forge.sm.result.Transition`, the
+# matching legacy handler is skipped for that issue this cadence to
+# avoid double-emitting label edits and audit comments.
+from alice_forge.sm.legacy.handlers.building import _process_building
+from alice_forge.sm.legacy.handlers.compacting import _process_compacting
+from alice_forge.sm.legacy.handlers.design_review import _process_design_review
+from alice_forge.sm.legacy.handlers.designed import _process_designed
+from alice_forge.sm.legacy.handlers.designing import _process_designing
+from alice_forge.sm.legacy.handlers.draft import _process_draft
+from alice_forge.sm.legacy.handlers.needs_study import _process_needs_study
+from alice_forge.sm.legacy.handlers.open_done import _process_open_done
+from alice_forge.sm.legacy.handlers.reviewing import _process_reviewing
+from alice_forge.sm.legacy.handlers.selected import _process_selected
+from alice_forge.sm.legacy.handlers.stale_closed import _process_stale_closed
 
 
 def _save_ledger_best_effort(
@@ -63,7 +66,7 @@ def _generate_cycle_id(now_iso_str: str) -> str:
     return f"{now_iso_str}-{secrets.token_hex(4)}"
 
 
-def _v3_dry_run(
+def _v3_run(
     *,
     handler: Callable[..., Any],
     state_for_log: "SMState",
@@ -71,6 +74,9 @@ def _v3_dry_run(
     repo: str,
     cycle_id: str,
     ledger: EmittedLedger,
+    post_comment: Callable[..., None],
+    edit_labels: Callable[..., None],
+    close_issue: Callable[..., None],
     list_comments: Callable[..., list[dict[str, Any]]],
     find_linked_pr: Callable[..., dict[str, Any] | None] | None = None,
     pr_merge_status: Callable[..., Any] | None = None,
@@ -78,32 +84,41 @@ def _v3_dry_run(
     research_resolver: Callable[[int], str | None] | None = None,
     trusted_authors: frozenset[str] = frozenset(),
     log_dir: pathlib.Path | None = None,
+    dry_run: bool = False,
     now_iso: Callable[[], str] = lambda: "",
     log: Callable[[str], None] = lambda s: None,
-) -> None:
-    """Dual-run shim: invoke a v3 handler in dry-run mode.
+) -> bool:
+    """Run a v3 handler with real services and apply its result.
 
-    Generic across states. Caller supplies the handler function
-    (``alice_forge.sm.handlers.<state>.handle``) and the
-    :class:`SMState` value to record in the log. The shim renders
-    the handler's :class:`HandlerResult` to
-    ``v3-predicted.jsonl`` so the diff job can compare against v1's
-    actual action on the same cycle.
+    Phase 4 (#301) flipped this from dry-run / dual-run shadow to
+    authoritative. Where the handler returns a
+    :class:`alice_forge.sm.result.HandlerResult`, the matching
+    side-effect (label edit, audit comment, ledger write, parse-
+    error reply) is applied immediately via
+    :func:`alice_forge.sm.apply.apply_result`. The dual-run logger
+    keeps writing entries — now on the ``v3-actual`` lane — for one
+    month so the previous shadow-comparison output still parses.
 
-    Failures inside the v3 handler are logged but never re-raised:
-    Phase 2 dual-run must not destabilize v1's hot path.
+    Returns ``True`` if a transition was applied (label changed) so
+    the caller can skip the legacy v1 handler for this cadence;
+    ``False`` otherwise. Returning ``False`` means v1 still gets a
+    chance to do its non-transitioning work (spawn dispatch, hello,
+    rebase machinery, verify gate, post-merge cleanup) — those
+    side-effects are not yet ported to v3.
+
+    Failures inside the v3 handler are logged and swallowed: a v3
+    bug must not destabilise the v1 fallback path during the grace
+    period.
     """
-    if log_dir is None:
-        return  # no log target configured; skip the dry-run entirely
-
     import datetime as _dt
 
+    from alice_forge.sm.apply import apply_result
     from alice_forge.sm.dual_run import log_entry as _log_entry
     from alice_forge.sm.services import HandlerServices
 
     number = issue.get("number")
     if not isinstance(number, int):
-        return
+        return False
 
     def _now_dt() -> _dt.datetime:
         try:
@@ -111,18 +126,29 @@ def _v3_dry_run(
         except ValueError:
             return _dt.datetime.now(_dt.timezone.utc)
 
+    # ``dry_run`` (CLI flag / test mode) stubs every write IO so the
+    # handler can be exercised without touching GitHub. Production
+    # runs pass the real callables.
+    def _noop(*_a: Any, **_kw: Any) -> None:
+        return None
+
+    if dry_run:
+        services_post_comment: Callable[..., None] = _noop
+        services_edit_labels: Callable[..., None] = _noop
+        services_close_issue: Callable[..., None] = _noop
+    else:
+        services_post_comment = post_comment
+        services_edit_labels = edit_labels
+        services_close_issue = close_issue
+
     try:
-        # Read-only IO (list_comments, find_linked_pr, ...) gets the
-        # real callables so the handler sees true world state. Write
-        # IO (post_comment, edit_labels, close_issue) is stubbed —
-        # the dry-run must never modify GitHub.
         services = HandlerServices(
             ledger=ledger,
             repo=repo,
-            post_comment=lambda *a, **kw: None,  # write — stubbed
+            post_comment=services_post_comment,
             list_comments=list_comments,
-            edit_labels=lambda *a, **kw: None,  # write — stubbed
-            close_issue=lambda *a, **kw: None,  # write — stubbed
+            edit_labels=services_edit_labels,
+            close_issue=services_close_issue,
             find_linked_pr=find_linked_pr if find_linked_pr else lambda *a, **kw: None,
             pr_merge_status=pr_merge_status if pr_merge_status else lambda *a, **kw: None,
             master_ci_status=master_ci_status if master_ci_status else lambda *a, **kw: None,
@@ -134,27 +160,46 @@ def _v3_dry_run(
         result = handler(issue, services)
     except Exception as exc:  # noqa: BLE001 — defense for v3 bugs
         log(
-            f"[sm-v3] dry-run {handler.__module__}.{handler.__name__} "
+            f"[sm-v3] {handler.__module__}.{handler.__name__} "
             f"#{number} raised: {type(exc).__name__}: {exc}"
         )
-        return
+        return False
 
-    try:
-        _log_entry(
-            log_dir / "sm-v3-predicted.jsonl",
-            cycle_id=cycle_id,
-            lane="v3-predicted",
-            repo=repo,
-            issue_number=number,
-            state=state_for_log,
-            result=result,
-            now=_now_dt(),
-        )
-    except OSError as exc:
-        log(
-            f"[sm-v3] failed to write v3-predicted log entry for "
-            f"#{number}: {exc} (Phase 2: best-effort)"
-        )
+    transitioned = False
+    if result is not None:
+        try:
+            transitioned = apply_result(
+                issue=issue,
+                current_state=state_for_log,
+                result=result,
+                services=services,
+            )
+        except Exception as exc:  # noqa: BLE001 — defense for apply bugs
+            log(
+                f"[sm-v3] apply_result #{number} at {state_for_log.value} "
+                f"raised: {type(exc).__name__}: {exc}"
+            )
+            transitioned = False
+
+    if log_dir is not None:
+        try:
+            _log_entry(
+                log_dir / "sm-v3-actual.jsonl",
+                cycle_id=cycle_id,
+                lane="v3-actual",
+                repo=repo,
+                issue_number=number,
+                state=state_for_log,
+                result=result,
+                now=_now_dt(),
+            )
+        except OSError as exc:
+            log(
+                f"[sm-v3] failed to write v3-actual log entry for "
+                f"#{number}: {exc} (Phase 4: best-effort)"
+            )
+
+    return transitioned
 
 
 def run(
@@ -162,7 +207,14 @@ def run(
     repo: str = DEFAULT_REPO,
     state_path: pathlib.Path,
     ledger_path: pathlib.Path | None = None,
-    v3_dry_run_states: frozenset[str] = frozenset(),
+    v3_authoritative_states: frozenset[str] = frozenset(),
+    v3_log_dir: pathlib.Path | None = None,
+    # Pre-Phase-4 names — kept as aliases for callers that haven't
+    # updated to the new flag names yet. ``v3_dry_run_states`` ->
+    # ``v3_authoritative_states``; ``v3_dry_run_log_dir`` ->
+    # ``v3_log_dir``. Deprecated; remove when the legacy/ package is
+    # deleted (one-month grace per Phase 4 design).
+    v3_dry_run_states: frozenset[str] | None = None,
     v3_dry_run_log_dir: pathlib.Path | None = None,
     list_issues: ListIssuesFn | None = None,
     list_stale_closed: ListIssuesFn | None = None,
@@ -218,6 +270,15 @@ def run(
          auth, rate limit, transport error. State NOT written;
          s6 supervisor will retry on the next cadence.
     """
+    # Phase 4 (#301): merge legacy v3-dry-run kwargs into the new
+    # authoritative kwargs. Callers that haven't migrated yet still
+    # work; once the legacy/ package is deleted these aliases go
+    # with it.
+    if v3_dry_run_states is not None and not v3_authoritative_states:
+        v3_authoritative_states = v3_dry_run_states
+    if v3_dry_run_log_dir is not None and v3_log_dir is None:
+        v3_log_dir = v3_dry_run_log_dir
+
     if list_issues is None:
         list_issues = gh_list_sm_issues
     if list_stale_closed is None:
@@ -420,10 +481,13 @@ def run(
 
     report.polled = len(issues)
 
-    # SM v3 Phase 2: stable per-cadence id used to pair v1-actual and
-    # v3-predicted log entries in the dual-run diff job. Generated
-    # once per run() call; every issue processed in this cadence
-    # shares the same cycle_id.
+    # SM v3 Phase 2/4: stable per-cadence id originally used to pair
+    # v1-actual and v3-predicted log entries during the dual-run
+    # comparison. Phase 4 renamed the v3 lane to ``v3-actual`` (the
+    # handler now applies its own result); the cycle_id is still
+    # written so downstream readers of the v1-actual + v3-actual
+    # streams can correlate entries during the one-month grace
+    # period. Generated once per run() call.
     _cycle_id = _generate_cycle_id(now_iso())
 
     fatal_exit = False
@@ -461,23 +525,33 @@ def run(
 
         try:
             if sm_label == ACTIVE_SM_LABEL:
-                if ACTIVE_SM_LABEL in v3_dry_run_states:
+                v3_transitioned = False
+                if ACTIVE_SM_LABEL in v3_authoritative_states:
                     from alice_forge.sm.handlers.selected import handle as _h_selected
                     from alice_forge.sm.states import SMState as _SMState
-                    _v3_dry_run(
+                    v3_transitioned = _v3_run(
                         handler=_h_selected,
                         state_for_log=_SMState.SELECTED,
                         issue=issue,
                         repo=repo,
                         cycle_id=_cycle_id,
                         ledger=ledger,
+                        post_comment=post_comment,
+                        edit_labels=edit_labels,
+                        close_issue=close_issue,
                         list_comments=list_comments,
                         find_linked_pr=find_linked_pr,
                         trusted_authors=trusted_authors,
-                        log_dir=v3_dry_run_log_dir,
+                        log_dir=v3_log_dir,
+                        dry_run=dry_run,
                         now_iso=now_iso,
                         log=log,
                     )
+                if v3_transitioned:
+                    # v3 owns the transition; legacy v1 handler is
+                    # skipped this cadence to avoid double-emitting
+                    # the label edit and audit comment.
+                    continue
                 _process_selected(
                     issue=issue,
                     repo=repo,
@@ -502,25 +576,32 @@ def run(
                     get_issue=get_issue,
                 )
             elif sm_label == REVIEWING_SM_LABEL:
-                if REVIEWING_SM_LABEL in v3_dry_run_states:
+                v3_transitioned = False
+                if REVIEWING_SM_LABEL in v3_authoritative_states:
                     from alice_forge.sm.handlers.reviewing import handle as _h_reviewing
                     from alice_forge.sm.states import SMState as _SMState
-                    _v3_dry_run(
+                    v3_transitioned = _v3_run(
                         handler=_h_reviewing,
                         state_for_log=_SMState.REVIEWING,
                         issue=issue,
                         repo=repo,
                         cycle_id=_cycle_id,
                         ledger=ledger,
+                        post_comment=post_comment,
+                        edit_labels=edit_labels,
+                        close_issue=close_issue,
                         list_comments=list_comments,
                         find_linked_pr=find_linked_pr,
                         pr_merge_status=pr_merge_status,
                         master_ci_status=master_ci_status,
                         trusted_authors=trusted_authors,
-                        log_dir=v3_dry_run_log_dir,
+                        log_dir=v3_log_dir,
+                        dry_run=dry_run,
                         now_iso=now_iso,
                         log=log,
                     )
+                if v3_transitioned:
+                    continue
                 _process_reviewing(
                     issue=issue,
                     repo=repo,
@@ -544,8 +625,11 @@ def run(
                     now_iso=now_iso,
                 )
             elif sm_label == NEEDS_STUDY_SM_LABEL:
-                # SM v3 Phase 2.4: dual-run the v3 needs_study handler.
-                if NEEDS_STUDY_SM_LABEL in v3_dry_run_states:
+                # SM v3 Phase 4: v3 owns the needs_study transitions when
+                # the state is in ``v3_authoritative_states``. Otherwise
+                # v1's ``_process_needs_study`` keeps running unchanged.
+                v3_transitioned = False
+                if NEEDS_STUDY_SM_LABEL in v3_authoritative_states:
                     from alice_forge.sm.handlers.needs_study import handle as _h_ns
                     from alice_forge.sm.states import SMState as _SMState
 
@@ -556,20 +640,26 @@ def run(
                             return None
                         return note.stem if note is not None else None
 
-                    _v3_dry_run(
+                    v3_transitioned = _v3_run(
                         handler=_h_ns,
                         state_for_log=_SMState.NEEDS_STUDY,
                         issue=issue,
                         repo=repo,
                         cycle_id=_cycle_id,
                         ledger=ledger,
+                        post_comment=post_comment,
+                        edit_labels=edit_labels,
+                        close_issue=close_issue,
                         list_comments=list_comments,
                         research_resolver=_v3_resolve,
                         trusted_authors=trusted_authors,
-                        log_dir=v3_dry_run_log_dir,
+                        log_dir=v3_log_dir,
+                        dry_run=dry_run,
                         now_iso=now_iso,
                         log=log,
                     )
+                if v3_transitioned:
+                    continue
                 _process_needs_study(
                     issue=issue,
                     repo=repo,
@@ -587,27 +677,35 @@ def run(
                     now_iso=now_iso,
                 )
             elif sm_label == DRAFT_SM_LABEL:
-                # SM v3 Phase 2.1: dual-run the v3 draft handler in
-                # dry-run mode when this state is in the flag set.
-                # v3 just logs its predicted action; v1 still applies
-                # the actual side-effects. The diff job (separate
-                # tool) compares the two streams.
-                if DRAFT_SM_LABEL in v3_dry_run_states:
+                # SM v3 Phase 4: v3 owns sm:draft transitions when the
+                # state is in ``v3_authoritative_states``. The legacy
+                # ``_process_draft`` still handles the triage-surface
+                # write path when v3 returns a non-transition (or no
+                # action), so the watcher/surface contract is unchanged
+                # until those side-effects are ported.
+                v3_transitioned = False
+                if DRAFT_SM_LABEL in v3_authoritative_states:
                     from alice_forge.sm.handlers.draft import handle as _h_draft
                     from alice_forge.sm.states import SMState as _SMState
-                    _v3_dry_run(
+                    v3_transitioned = _v3_run(
                         handler=_h_draft,
                         state_for_log=_SMState.DRAFT,
                         issue=issue,
                         repo=repo,
                         cycle_id=_cycle_id,
                         ledger=ledger,
+                        post_comment=post_comment,
+                        edit_labels=edit_labels,
+                        close_issue=close_issue,
                         list_comments=list_comments,
                         trusted_authors=trusted_authors,
-                        log_dir=v3_dry_run_log_dir,
+                        log_dir=v3_log_dir,
+                        dry_run=dry_run,
                         now_iso=now_iso,
                         log=log,
                     )
+                if v3_transitioned:
+                    continue
                 _process_draft(
                     issue=issue,
                     repo=repo,
@@ -625,22 +723,29 @@ def run(
                     now_iso=now_iso,
                 )
             elif sm_label == DESIGNING_SM_LABEL:
-                if DESIGNING_SM_LABEL in v3_dry_run_states:
+                v3_transitioned = False
+                if DESIGNING_SM_LABEL in v3_authoritative_states:
                     from alice_forge.sm.handlers.designing import handle as _h_designing
                     from alice_forge.sm.states import SMState as _SMState
-                    _v3_dry_run(
+                    v3_transitioned = _v3_run(
                         handler=_h_designing,
                         state_for_log=_SMState.DESIGNING,
                         issue=issue,
                         repo=repo,
                         cycle_id=_cycle_id,
                         ledger=ledger,
+                        post_comment=post_comment,
+                        edit_labels=edit_labels,
+                        close_issue=close_issue,
                         list_comments=list_comments,
                         trusted_authors=trusted_authors,
-                        log_dir=v3_dry_run_log_dir,
+                        log_dir=v3_log_dir,
+                        dry_run=dry_run,
                         now_iso=now_iso,
                         log=log,
                     )
+                if v3_transitioned:
+                    continue
                 _process_designing(
                     issue=issue,
                     repo=repo,
@@ -654,22 +759,29 @@ def run(
                     now_iso=now_iso,
                 )
             elif sm_label == DESIGN_REVIEW_SM_LABEL:
-                if DESIGN_REVIEW_SM_LABEL in v3_dry_run_states:
+                v3_transitioned = False
+                if DESIGN_REVIEW_SM_LABEL in v3_authoritative_states:
                     from alice_forge.sm.handlers.design_review import handle as _h_dr
                     from alice_forge.sm.states import SMState as _SMState
-                    _v3_dry_run(
+                    v3_transitioned = _v3_run(
                         handler=_h_dr,
                         state_for_log=_SMState.DESIGN_REVIEW,
                         issue=issue,
                         repo=repo,
                         cycle_id=_cycle_id,
                         ledger=ledger,
+                        post_comment=post_comment,
+                        edit_labels=edit_labels,
+                        close_issue=close_issue,
                         list_comments=list_comments,
                         trusted_authors=trusted_authors,
-                        log_dir=v3_dry_run_log_dir,
+                        log_dir=v3_log_dir,
+                        dry_run=dry_run,
                         now_iso=now_iso,
                         log=log,
                     )
+                if v3_transitioned:
+                    continue
                 _process_design_review(
                     issue=issue,
                     repo=repo,
@@ -684,22 +796,29 @@ def run(
                     now_iso=now_iso,
                 )
             elif sm_label == DESIGNED_SM_LABEL:
-                if DESIGNED_SM_LABEL in v3_dry_run_states:
+                v3_transitioned = False
+                if DESIGNED_SM_LABEL in v3_authoritative_states:
                     from alice_forge.sm.handlers.designed import handle as _h_designed
                     from alice_forge.sm.states import SMState as _SMState
-                    _v3_dry_run(
+                    v3_transitioned = _v3_run(
                         handler=_h_designed,
                         state_for_log=_SMState.DESIGNED,
                         issue=issue,
                         repo=repo,
                         cycle_id=_cycle_id,
                         ledger=ledger,
+                        post_comment=post_comment,
+                        edit_labels=edit_labels,
+                        close_issue=close_issue,
                         list_comments=list_comments,
                         trusted_authors=trusted_authors,
-                        log_dir=v3_dry_run_log_dir,
+                        log_dir=v3_log_dir,
+                        dry_run=dry_run,
                         now_iso=now_iso,
                         log=log,
                     )
+                if v3_transitioned:
+                    continue
                 _process_designed(
                     issue=issue,
                     repo=repo,
@@ -715,23 +834,30 @@ def run(
                     log=log,
                 )
             elif sm_label == COMPACTING_SM_LABEL:
-                # SM v3 Phase 2.2: dual-run the v3 compacting handler.
-                if COMPACTING_SM_LABEL in v3_dry_run_states:
+                # SM v3 Phase 4: v3 owns sm:compacting transitions.
+                v3_transitioned = False
+                if COMPACTING_SM_LABEL in v3_authoritative_states:
                     from alice_forge.sm.handlers.compacting import handle as _h_compacting
                     from alice_forge.sm.states import SMState as _SMState
-                    _v3_dry_run(
+                    v3_transitioned = _v3_run(
                         handler=_h_compacting,
                         state_for_log=_SMState.COMPACTING,
                         issue=issue,
                         repo=repo,
                         cycle_id=_cycle_id,
                         ledger=ledger,
+                        post_comment=post_comment,
+                        edit_labels=edit_labels,
+                        close_issue=close_issue,
                         list_comments=list_comments,
                         trusted_authors=trusted_authors,
-                        log_dir=v3_dry_run_log_dir,
+                        log_dir=v3_log_dir,
+                        dry_run=dry_run,
                         now_iso=now_iso,
                         log=log,
                     )
+                if v3_transitioned:
+                    continue
                 _process_compacting(
                     issue=issue,
                     repo=repo,
@@ -745,24 +871,31 @@ def run(
                     log=log,
                 )
             elif sm_label == BUILDING_SM_LABEL:
-                # SM v3 Phase 2.3: dual-run the v3 building handler.
-                if BUILDING_SM_LABEL in v3_dry_run_states:
+                # SM v3 Phase 4: v3 owns sm:building transitions.
+                v3_transitioned = False
+                if BUILDING_SM_LABEL in v3_authoritative_states:
                     from alice_forge.sm.handlers.building import handle as _h_building
                     from alice_forge.sm.states import SMState as _SMState
-                    _v3_dry_run(
+                    v3_transitioned = _v3_run(
                         handler=_h_building,
                         state_for_log=_SMState.BUILDING,
                         issue=issue,
                         repo=repo,
                         cycle_id=_cycle_id,
                         ledger=ledger,
+                        post_comment=post_comment,
+                        edit_labels=edit_labels,
+                        close_issue=close_issue,
                         list_comments=list_comments,
                         find_linked_pr=find_linked_pr,
                         trusted_authors=trusted_authors,
-                        log_dir=v3_dry_run_log_dir,
+                        log_dir=v3_log_dir,
+                        dry_run=dry_run,
                         now_iso=now_iso,
                         log=log,
                     )
+                if v3_transitioned:
+                    continue
                 _process_building(
                     issue=issue,
                     repo=repo,

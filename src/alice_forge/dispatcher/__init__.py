@@ -51,8 +51,11 @@ that existed pre-split:
   caps, the SPAWN_MAP table, the ``_now_iso`` helper.
 * :mod:`alice_forge.dispatcher.errors`     — :class:`GHCommandError`.
 * :mod:`alice_forge.dispatcher.types`      — ``Callable`` type aliases.
-* :mod:`alice_forge.dispatcher.state`      — :class:`DispatcherState`,
-  load/save round-trip for the dedup ledger.
+* :mod:`alice_forge.sm.legacy.state`       — :class:`DispatcherState`,
+  load/save round-trip for the v1 dedup ledger. Phase 4 moved this
+  out of ``dispatcher.state`` for the one-month grace period; the
+  symbol is re-exported here for backward compatibility. New code
+  should depend on :mod:`alice_forge.sm.ledger` instead.
 * :mod:`alice_forge.dispatcher.report`     — :class:`RunReport`,
   :class:`DependencyResolution`, :func:`resolve_dependencies`.
 * :mod:`alice_forge.dispatcher.trust`      — :class:`TrustDecision`,
@@ -69,12 +72,13 @@ that existed pre-split:
   smoke-test gate.
 * :mod:`alice_forge.dispatcher.helpers`    — shared internal helpers
   (``_comment_author_login``, ``_find_parsed_comment_of_type`` …).
-* :mod:`alice_forge.dispatcher.handlers`   — one file per state-handler
-  (``selected``, ``reviewing``, ``draft``, ``needs_study``,
+* :mod:`alice_forge.sm.legacy.handlers`    — one file per v1 state
+  handler (``selected``, ``reviewing``, ``draft``, ``needs_study``,
   ``designing``, ``design_review``, ``designed``, ``compacting``,
-  ``building``, ``stale_closed``, ``open_done``). Each handler
-  imports the shared surface via
-  :mod:`alice_forge.dispatcher.handlers._common`.
+  ``building``, ``stale_closed``, ``open_done``). Phase 4 moved
+  these from ``dispatcher.handlers``; v3 owns transitions, v1 still
+  covers the side-effects v3 hasn't ported (spawn dispatch, hello,
+  rebase machinery). Re-exported here for backward compatibility.
 * :mod:`alice_forge.dispatcher.main`       — :func:`run` (one pass) and
   :func:`main` (argparse + bin entrypoint).
 """
@@ -133,8 +137,13 @@ from alice_forge.dispatcher.types import (  # noqa: E402, F401
     VerifyFn,
 )
 
-# State persistence
-from alice_forge.dispatcher.state import (  # noqa: E402, F401
+# State persistence — Phase 4 (#301): v1 ``DispatcherState`` moved to
+# :mod:`alice_forge.sm.legacy.state` for the one-month grace period
+# before final deletion. Re-exported here so the public surface
+# (``from alice_forge.dispatcher import DispatcherState``) stays
+# backward-compatible during the grace period. New code should use
+# :class:`alice_forge.sm.ledger.EmittedLedger` directly.
+from alice_forge.sm.legacy.state import (  # noqa: E402, F401
     DispatcherState,
     load_state,
     save_state,
@@ -262,25 +271,29 @@ from alice_forge.dispatcher.helpers import (  # noqa: E402, F401
     _research_close_signal,
 )
 
-# State handlers — one file per state-transition handler so workers
-# don't have to read a 7K-line monolith to make a 30-line change.
-from alice_forge.dispatcher.handlers.building import _process_building  # noqa: E402, F401
-from alice_forge.dispatcher.handlers.compacting import _process_compacting  # noqa: E402, F401
-from alice_forge.dispatcher.handlers.design_review import _process_design_review  # noqa: E402, F401
-from alice_forge.dispatcher.handlers.designed import (  # noqa: E402, F401
+# State handlers — Phase 4 (#301): the v1 ``_process_*`` handlers
+# moved to :mod:`alice_forge.sm.legacy.handlers` for the one-month
+# grace period. v3 (:mod:`alice_forge.sm.handlers`) owns transition
+# decisions in production; legacy handlers cover the side-effects v3
+# hasn't ported (spawn dispatch, hello, rebase machinery). Re-
+# exported here so the public surface stays backward-compatible.
+from alice_forge.sm.legacy.handlers.building import _process_building  # noqa: E402, F401
+from alice_forge.sm.legacy.handlers.compacting import _process_compacting  # noqa: E402, F401
+from alice_forge.sm.legacy.handlers.design_review import _process_design_review  # noqa: E402, F401
+from alice_forge.sm.legacy.handlers.designed import (  # noqa: E402, F401
     _designed_spawn_speaking,
     _process_designed,
 )
-from alice_forge.dispatcher.handlers.designing import _process_designing  # noqa: E402, F401
-from alice_forge.dispatcher.handlers.draft import _process_draft  # noqa: E402, F401
-from alice_forge.dispatcher.handlers.needs_study import _process_needs_study  # noqa: E402, F401
-from alice_forge.dispatcher.handlers.open_done import _process_open_done  # noqa: E402, F401
-from alice_forge.dispatcher.handlers.reviewing import (  # noqa: E402, F401
+from alice_forge.sm.legacy.handlers.designing import _process_designing  # noqa: E402, F401
+from alice_forge.sm.legacy.handlers.draft import _process_draft  # noqa: E402, F401
+from alice_forge.sm.legacy.handlers.needs_study import _process_needs_study  # noqa: E402, F401
+from alice_forge.sm.legacy.handlers.open_done import _process_open_done  # noqa: E402, F401
+from alice_forge.sm.legacy.handlers.reviewing import (  # noqa: E402, F401
     _handle_conflicting_pr,
     _process_reviewing,
 )
-from alice_forge.dispatcher.handlers.selected import _process_selected  # noqa: E402, F401
-from alice_forge.dispatcher.handlers.stale_closed import _process_stale_closed  # noqa: E402, F401
+from alice_forge.sm.legacy.handlers.selected import _process_selected  # noqa: E402, F401
+from alice_forge.sm.legacy.handlers.stale_closed import _process_stale_closed  # noqa: E402, F401
 
 # Dispatcher main pass + CLI. Re-exporting ``main`` here is what makes
 # the ``alice-sm = "alice_forge.dispatcher:main"`` console-script entry in

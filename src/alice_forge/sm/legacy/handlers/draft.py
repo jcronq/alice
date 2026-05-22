@@ -8,7 +8,7 @@ from __future__ import annotations
 import datetime as _dt
 import re as _re
 
-from alice_forge.dispatcher.handlers._common import *  # noqa: F401, F403
+from alice_forge.sm.legacy.handlers._common import *  # noqa: F401, F403
 
 
 _SLUG_RE = _re.compile(r"[^a-z0-9]+")

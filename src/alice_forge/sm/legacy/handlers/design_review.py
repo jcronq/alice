@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from alice_forge.dispatcher.handlers._common import *  # noqa: F401, F403
+from alice_forge.sm.legacy.handlers._common import *  # noqa: F401, F403
 
 
 def _process_design_review(

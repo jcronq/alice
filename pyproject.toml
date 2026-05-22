@@ -141,3 +141,9 @@ ignore_missing_imports = true
 # transition handlers. F403/F405 fire as false positives on this
 # idiom; exempt the whole sub-package rather than per-file.
 "src/alice_forge/dispatcher/**/*.py" = ["F403", "F405"]
+# Phase 4 (#301) moved the v1 ``_process_*`` handlers and the
+# ``DispatcherState`` ledger out of ``dispatcher/`` into
+# ``sm/legacy/`` for the one-month grace period. Same star-import
+# idiom — exempt the legacy sub-package on the same rules so the
+# move is a pure relocation (no lint regressions).
+"src/alice_forge/sm/legacy/**/*.py" = ["F403", "F405"]
