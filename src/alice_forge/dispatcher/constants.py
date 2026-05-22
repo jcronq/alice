@@ -453,11 +453,13 @@ SPEAKING_PHASE_PER_ISSUE_BUILD = "per_issue_build"
 # wire format.
 SPEAKING_BUILD_COMPLETE_PREFIX = "[SM] build-complete"
 
-# Dotted module path of the speaking-mode entrypoint shim. Placeholder
-# implementation lives at :mod:`alice_forge.speaking_shim`; the real
+# Dotted module path of the speaking-mode entrypoint. The real
 # PhaseRunner.PER_ISSUE_BUILD dispatch (with Task-tool sub-agent
-# invocation) lands in the speaking sub-issue that replaces the shim.
-SPEAKING_SHIM_MODULE = "alice_forge.speaking_shim"
+# invocation) lives at :mod:`alice_speaking.cli.perissue` (sibling of
+# the thinking entrypoint, sub-issue 5 of #149). The legacy placeholder
+# at :mod:`alice_forge.speaking_shim` is retained for tests but no
+# longer the live entrypoint.
+SPEAKING_SHIM_MODULE = "alice_speaking.cli.perissue"
 
 # Issue #137 — worker session capture. We pre-mint a UUID per spawn and
 # pass it via ``--session-id`` so the worker writes its session JSONL to

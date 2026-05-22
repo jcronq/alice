@@ -6240,7 +6240,7 @@ def test_speaking_spawn_writes_correctly_formed_spawn_dir(tmp_path) -> None:
 
 
 def test_speaking_spawn_invokes_python_shim_with_args(tmp_path) -> None:
-    """Popen is called with the venv python + ``-m alice_forge.speaking_shim``
+    """Popen is called with the venv python + ``-m alice_speaking.cli.perissue``
     + spawn-dir + session-id + mode=build, detached via
     ``start_new_session=True``."""
     spawn_dir = tmp_path / "speaking-spawns"
@@ -6271,7 +6271,7 @@ def test_speaking_spawn_invokes_python_shim_with_args(tmp_path) -> None:
     assert len(popens) == 1
     cmd = popens[0].args
     assert cmd[0] == "/opt/alice-venv/bin/python"
-    assert cmd[1:3] == ["-m", "alice_forge.speaking_shim"]
+    assert cmd[1:3] == ["-m", "alice_speaking.cli.perissue"]
     # --spawn-dir / --session-id / --mode passed through.
     assert "--spawn-dir" in cmd
     assert "--session-id" in cmd
