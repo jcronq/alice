@@ -249,7 +249,181 @@ def test_register_builtins_is_idempotent_on_default_registry():
 def test_register_builtins_populates_a_fresh_registry():
     fresh = Registry()
     builtin_agents.register_builtins(fresh)
-    assert fresh.names() == ["speaking", "thinking"]
+    # Phase 1 + Phase 2 — eight built-in flavors. Sorted by Registry.names().
+    assert fresh.names() == [
+        "code-worker",
+        "config-worker",
+        "designer",
+        "research-writer",
+        "reviewer",
+        "speaking",
+        "thinking",
+        "watcher",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — built-in flavor specifics
+# ---------------------------------------------------------------------------
+
+
+def test_code_worker_carries_pr_and_no_verify_rules():
+    spec = default_registry.get("code-worker")
+    rule_ids = {rule.id for rule in spec.behavioral_constraints}
+    assert "open-pr-closes-issue" in rule_ids
+    assert "self-merge-on-green" in rule_ids
+    assert "no-verify-forbidden" in rule_ids
+
+
+def test_code_worker_build_spec_full_access_keeps_edit_and_bash():
+    spec = default_registry.get("code-worker")
+    built = spec.build_spec()
+    assert built.model == "claude-opus-4-7"
+    assert "Bash" in built.allowed_tools
+    assert "Edit" in built.allowed_tools
+    assert "Write" in built.allowed_tools
+
+
+def test_code_worker_prompt_merges_no_verify_block():
+    spec = default_registry.get("code-worker")
+    built = spec.build_spec()
+    prompt = built.append_system_prompt or ""
+    assert "## Constraint: open-pr-closes-issue" in prompt
+    assert "Closes #" in prompt
+    assert "## Constraint: no-verify-forbidden" in prompt
+    assert "--no-verify" in prompt
+
+
+def test_research_writer_carries_vault_and_transition_rules():
+    spec = default_registry.get("research-writer")
+    rule_ids = {rule.id for rule in spec.behavioral_constraints}
+    assert "write-research-note-under-vault" in rule_ids
+    assert "transition-to-done-on-completion" in rule_ids
+
+
+def test_research_writer_build_spec_includes_websearch_for_grounding():
+    spec = default_registry.get("research-writer")
+    built = spec.build_spec()
+    # Grounding claims outside the vault requires WebSearch.
+    assert "WebSearch" in built.allowed_tools
+    assert "Write" in built.allowed_tools
+
+
+def test_research_writer_prompt_names_vault_path():
+    spec = default_registry.get("research-writer")
+    built = spec.build_spec()
+    prompt = built.append_system_prompt or ""
+    assert "~/alice-mind/cortex-memory/research/" in prompt
+
+
+def test_reviewer_uses_sonnet_model():
+    spec = default_registry.get("reviewer")
+    assert spec.kernel_spec.model == "claude-sonnet-4-6"
+
+
+def test_reviewer_build_spec_strips_edit_and_write():
+    spec = default_registry.get("reviewer")
+    built = spec.build_spec()
+    # read_only policy: Edit / Write / Bash all gone, Read / Glob /
+    # Grep remain.
+    assert "Edit" not in built.allowed_tools
+    assert "Write" not in built.allowed_tools
+    assert "Bash" not in built.allowed_tools
+    assert "Read" in built.allowed_tools
+    assert "Glob" in built.allowed_tools
+    assert "Grep" in built.allowed_tools
+
+
+def test_reviewer_carries_strict_json_constraint():
+    spec = default_registry.get("reviewer")
+    rule_ids = {rule.id for rule in spec.behavioral_constraints}
+    assert "strict-json-verdict" in rule_ids
+    assert "verdict-gate" in rule_ids
+
+
+def test_reviewer_output_schema_references_canonical_prompt():
+    spec = default_registry.get("reviewer")
+    assert spec.output_schema is not None
+    # The OutputSchema name records the dotted reference to the
+    # canonical prompt constant so a Phase 2+ validator can resolve
+    # it at registration time. Core must not import alice_speaking.
+    assert "alice_speaking.review.code_reviewer" in spec.output_schema.name
+    assert "CODE_REVIEWER_SYSTEM_PROMPT" in spec.output_schema.name
+
+
+def test_designer_inherits_thinking_rules_and_adds_design_ready():
+    spec = default_registry.get("designer")
+    rule_ids = {rule.id for rule in spec.behavioral_constraints}
+    # Inherits the thinking sandbox + design-not-build rules.
+    assert "no-real-world-writes" in rule_ids
+    assert "design-not-build" in rule_ids
+    # And adds the SM v2 exit-comment rule.
+    assert "design-ready-exit-comment" in rule_ids
+
+
+def test_designer_runs_per_issue_not_background():
+    spec = default_registry.get("designer")
+    assert spec.scope == "per-issue"
+    assert spec.lifecycle == "per-issue"
+    # Persona collapses onto the thinking persona — same behavioral
+    # core, narrower scope. Documented in agents.py module docstring.
+    assert spec.persona == "thinking"
+
+
+def test_designer_build_spec_keeps_full_thinking_tool_surface():
+    spec = default_registry.get("designer")
+    built = spec.build_spec()
+    assert "mcp__alice__run_experiment" in built.allowed_tools
+    assert "mcp__alice__send_message" in built.allowed_tools
+
+
+def test_watcher_uses_read_only_with_signal_policy():
+    spec = default_registry.get("watcher")
+    built = spec.build_spec()
+    # Read tools present; send_message present; write tools stripped.
+    assert "Read" in built.allowed_tools
+    assert "mcp__alice__send_message" in built.allowed_tools
+    assert "Edit" not in built.allowed_tools
+    assert "Write" not in built.allowed_tools
+    assert "Bash" not in built.allowed_tools
+
+
+def test_watcher_carries_notes_not_action_constraint():
+    spec = default_registry.get("watcher")
+    rule_ids = {rule.id for rule in spec.behavioral_constraints}
+    assert "notes-not-direct-action" in rule_ids
+    assert "signal-only-when-warranted" in rule_ids
+
+
+def test_config_worker_carries_threshold_and_scope_rules():
+    spec = default_registry.get("config-worker")
+    rule_ids = {rule.id for rule in spec.behavioral_constraints}
+    assert "config-files-only" in rule_ids
+    assert "smaller-diff-threshold" in rule_ids
+    assert "open-pr-closes-issue" in rule_ids
+
+
+def test_config_worker_threshold_prompt_names_loc_cap():
+    spec = default_registry.get("config-worker")
+    built = spec.build_spec()
+    prompt = built.append_system_prompt or ""
+    # Threshold lives in the rule injection so it's visible to the
+    # model at dispatch time. The user's tactical-threshold feedback
+    # pins this at 15 LOC.
+    assert "15" in prompt
+    assert "schema" in prompt.lower()
+
+
+def test_config_worker_build_spec_keeps_edit_and_strips_mcp():
+    spec = default_registry.get("config-worker")
+    built = spec.build_spec()
+    assert "Edit" in built.allowed_tools
+    assert "Write" in built.allowed_tools
+    assert "Bash" in built.allowed_tools
+    # MCP excluded — config-worker doesn't reach for Signal or
+    # experiments.
+    assert "mcp__alice__send_message" not in built.allowed_tools
+    assert "mcp__alice__run_experiment" not in built.allowed_tools
 
 
 # ---------------------------------------------------------------------------
@@ -371,3 +545,27 @@ def test_exec_only_policy_excludes_writes_but_allows_bash():
 
 def test_full_access_policy_includes_signal_send_message():
     assert "mcp__alice__send_message" in policies.full_access.allowlist
+
+
+def test_read_only_with_signal_policy_keeps_send_message_only():
+    pol = policies.read_only_with_signal
+    assert "Read" in pol.allowlist
+    assert "mcp__alice__send_message" in pol.allowlist
+    # Mutating tools excluded.
+    assert "Edit" not in pol.allowlist
+    assert "Write" not in pol.allowlist
+    assert "Bash" not in pol.allowlist
+    # The other MCP surface (experiments) is also out — watchers
+    # don't run experiments, they observe.
+    assert "mcp__alice__run_experiment" not in pol.allowlist
+
+
+def test_config_writer_policy_keeps_edit_but_excludes_mcp():
+    pol = policies.config_writer
+    assert "Edit" in pol.allowlist
+    assert "Write" in pol.allowlist
+    assert "Bash" in pol.allowlist
+    assert "Read" in pol.allowlist
+    # MCP excluded — config-worker isn't a Signal/experiment endpoint.
+    assert "mcp__alice__send_message" not in pol.allowlist
+    assert "mcp__alice__run_experiment" not in pol.allowlist
