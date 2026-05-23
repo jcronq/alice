@@ -48,6 +48,15 @@ logger = logging.getLogger(__name__)
 # See issue #249 / cortex-memory/research/2026-05-19-vault-health-shadow-dark-swap.md.
 _TRULY_DARK_SUSPECT_THRESHOLD = 10
 
+# Low-wake-count detector (issue #323 fix 3). Total of Stage B + C + D
+# wakes in the morning window. The May-22 sleep cycle produced 3 wakes
+# in 8 hours; a healthy 8h sleep should produce 15–19. Anything under 8
+# is a strong signal that the backoff ladder ran away or the supervisor
+# stalled. When this fires the morning vault-health event tags
+# ``low_wake_count: true`` and an insight-tier surface is written to
+# ``<vault>/inner/surface/<YYYY-MM-DD-HHMMSS>-low-wake-count.md``.
+WAKE_COUNT_THRESHOLD = 8
+
 # ---------------------------------------------------------------------------
 # Constants
 
@@ -1771,7 +1780,94 @@ def build_vault_health_event(
         )
         event["parse_quality"] = "suspect"
 
+    # Low-wake-count detector (issue #323 fix 3). Sum Stage B+C+D wakes
+    # from the morning window; if under WAKE_COUNT_THRESHOLD, tag the
+    # event AND write an insight-tier surface so Speaking notices on
+    # the next morning surface scan. Background: May-22 sleep cycle
+    # had 3 wakes in 8 hours; healthy is 15–19.
+    dist = event["wake_type_distribution"]
+    total_sleep_wakes = (
+        int(dist.get("stage_b", 0))
+        + int(dist.get("stage_c", 0))
+        + int(dist.get("stage_d", 0))
+    )
+    event["total_sleep_wakes"] = total_sleep_wakes
+    if total_sleep_wakes < WAKE_COUNT_THRESHOLD:
+        event["low_wake_count"] = True
+        try:
+            _write_low_wake_count_surface(
+                surface_dir=surface_dir,
+                now=now,
+                total_sleep_wakes=total_sleep_wakes,
+                distribution=dist,
+            )
+        except OSError as exc:
+            logger.warning(
+                "vault_health: failed to write low-wake-count surface to %s: %s",
+                surface_dir,
+                exc,
+            )
+
     return event
+
+
+def _write_low_wake_count_surface(
+    *,
+    surface_dir: Path,
+    now: datetime,
+    total_sleep_wakes: int,
+    distribution: dict[str, int],
+) -> Path:
+    """Drop an insight-tier surface flagging low overnight wake count.
+
+    Insight-tier (not flash) — the symptom is structural, not urgent;
+    Speaking's morning surface sweep will pick it up alongside the rest
+    of the vault_health-driven nudges.
+
+    Filename: ``<YYYY-MM-DD-HHMMSS>-low-wake-count.md`` (matches the
+    surface naming convention used by ``design_pipeline.write_surface``
+    and the rest of the inner/surface ecosystem).
+    """
+    surface_dir.mkdir(parents=True, exist_ok=True)
+    stamp = now.strftime("%Y-%m-%d-%H%M%S")
+    path = surface_dir / f"{stamp}-low-wake-count.md"
+
+    body = (
+        f"Stage B + C + D wakes during the morning window summed to "
+        f"`{total_sleep_wakes}`, below the threshold of "
+        f"`{WAKE_COUNT_THRESHOLD}`. A healthy 8h sleep cycle produces "
+        f"15–19 wakes; persistently low counts indicate the wake-cadence "
+        f"backoff ladder ran away or the s6 supervisor stalled.\n\n"
+        f"Per-stage distribution: "
+        f"B={int(distribution.get('stage_b', 0))}, "
+        f"C={int(distribution.get('stage_c', 0))}, "
+        f"D={int(distribution.get('stage_d', 0))}.\n\n"
+        f"**Suggested next step**: check the backoff history in "
+        f"`memory/events.jsonl` (filter for `type: wake_start` / "
+        f"`type: vault_health`) and the supervisor logs under "
+        f"`/state/worker/`. If the ladder spent the night pegged at "
+        f"`MAX_INTERVAL_SECONDS` despite Stage B/D writes, the "
+        f"`did_work` signal probably isn't being emitted — see "
+        f"issue #323 fix 0.\n"
+    )
+
+    lines = [
+        "---",
+        "priority: insight",
+        (
+            "context: Wake count fell below threshold, indicating "
+            "possible backoff runaway or scheduler issue"
+        ),
+        "reply_expected: false",
+        "type: low-wake-count",
+        f"total_sleep_wakes: {total_sleep_wakes}",
+        f"threshold: {WAKE_COUNT_THRESHOLD}",
+        "---",
+        "",
+        body,
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
 
 
 # ---------------------------------------------------------------------------

@@ -2028,3 +2028,117 @@ def test_continuous_flag_does_not_change_baseline_output(
     assert {k: with_flag[k] for k in baseline} == baseline
     assert with_flag["continuous_checks"]["zero_edge_notes"]["count"] == 1
     assert with_flag["continuous_checks"]["zero_edge_notes"]["slugs"] == ["ghost"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #323 — low-wake-count surface
+# ---------------------------------------------------------------------------
+
+
+def _seed_wakes_for_morning_window(thoughts: Path, *, b: int, c: int, d: int) -> None:
+    """Drop ``b + c + d`` wake files inside the morning window.
+
+    The morning window is yesterday-23:00 → today-07:00 in local time;
+    this helper writes wakes at 00:00:NN through the previous-day dir
+    so the count is independent of when the test runs.
+    """
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    yday = thoughts / yesterday
+    yday.mkdir(parents=True, exist_ok=True)
+    seq = 0
+    for stage, n in (("B", b), ("C", c), ("D", d)):
+        for _ in range(n):
+            seq += 1
+            _write_wake(yday, f"23{seq:02d}00-wake.md", stage)
+
+
+def test_low_wake_count_tagged_when_under_threshold(tmp_path: Path) -> None:
+    """Issue #323 fix 3: when stage_b + stage_c + stage_d < threshold,
+    the event MUST tag ``low_wake_count: True`` and write an
+    insight-tier surface file under ``surface_dir``."""
+    from metrics.vault_health import WAKE_COUNT_THRESHOLD
+
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    # 3 total wakes — well under the threshold of 8 (matches the
+    # May-22 sleep cycle that motivated the fix).
+    _seed_wakes_for_morning_window(thoughts, b=1, c=1, d=1)
+
+    event = build_vault_health_event(
+        vault_dir=vault,
+        thoughts_dir=thoughts,
+        events_path=events,
+        surface_dir=surface,
+    )
+
+    assert event["wake_type_distribution"]["stage_b"] + \
+        event["wake_type_distribution"]["stage_c"] + \
+        event["wake_type_distribution"]["stage_d"] < WAKE_COUNT_THRESHOLD
+    assert event.get("low_wake_count") is True
+    assert event.get("total_sleep_wakes") == 3
+
+    # Surface file dropped with the expected naming + frontmatter.
+    written = list(surface.glob("*-low-wake-count.md"))
+    assert len(written) == 1, written
+    body = written[0].read_text(encoding="utf-8")
+    assert body.startswith("---\n")
+    assert "priority: insight" in body
+    assert "reply_expected: false" in body
+    assert "Wake count fell below threshold" in body
+    assert "total_sleep_wakes: 3" in body
+    assert f"threshold: {WAKE_COUNT_THRESHOLD}" in body
+    assert "check the backoff history" in body
+
+
+def test_low_wake_count_not_tagged_when_at_or_above_threshold(
+    tmp_path: Path,
+) -> None:
+    """Healthy 8h sleep produces 15–19 wakes. Anything ≥ threshold
+    must NOT tag the event and must NOT write a surface file."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    # 16 total wakes — the floor MIN_WAKE_PERIOD guarantees.
+    _seed_wakes_for_morning_window(thoughts, b=8, c=4, d=4)
+
+    event = build_vault_health_event(
+        vault_dir=vault,
+        thoughts_dir=thoughts,
+        events_path=events,
+        surface_dir=surface,
+    )
+
+    assert event.get("low_wake_count") is None or event["low_wake_count"] is False
+    assert event["total_sleep_wakes"] == 16
+    assert list(surface.glob("*-low-wake-count.md")) == []
+
+
+def test_low_wake_count_handles_zero_wakes(tmp_path: Path) -> None:
+    """Edge case: no thoughts at all (e.g. supervisor never ran).
+    Must still tag and surface — zero is below threshold."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    event = build_vault_health_event(
+        vault_dir=vault,
+        thoughts_dir=thoughts,
+        events_path=events,
+        surface_dir=surface,
+    )
+
+    assert event["total_sleep_wakes"] == 0
+    assert event.get("low_wake_count") is True
+    assert len(list(surface.glob("*-low-wake-count.md"))) == 1
