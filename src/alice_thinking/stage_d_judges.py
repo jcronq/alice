@@ -312,8 +312,13 @@ def _call_qwen(prompt: str) -> str:
     from google.adk.models.llm_request import LlmRequest
     from google.genai import types as gtypes
 
-    model = "openai/Qwen3-Coder-Next"
-    api_base = "http://10.20.30.177:8033/v1"
+    # Route through the LiteLLM proxy when available so the actual
+    # backend host is owned by sandbox/litellm/config.yaml. The model
+    # name becomes a virtual alias. Direct LAN endpoint stays as the
+    # fallback for host-side dev and the historical eval scripts that
+    # don't run the proxy.
+    model = os.environ.get("LITELLM_QWEN_MODEL", "openai/qwen-local")
+    api_base = os.environ.get("LITELLM_BASE_URL", "http://10.20.30.177:8033/v1")
 
     async def _run() -> str:
         adapter = LiteLlm(

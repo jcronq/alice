@@ -1,0 +1,42 @@
+# LiteLLM proxy config — virtual model map for Alice's local-model
+# traffic. Call sites (viewer.lobe_labeler, alice_thinking.stage_d_judges,
+# alice_thinking.workflows.stage_b.subroutines, cue_runner reranker)
+# talk OpenAI-compatible to http://alice-litellm:4000 using these
+# `model_name`s; the proxy forwards to the actual backend.
+#
+# Adding a new model: append to model_list with a fresh `model_name`
+# and matching `litellm_params`. Add the corresponding `LITELLM_BASE_URL`
+# usage on the call site — never let the call site know the real
+# backend URL.
+#
+# Scope today: local Qwen only. Cloud Anthropic traffic still goes
+# direct via claude-agent-sdk + ANTHROPIC_BASE_URL; cloud passthrough
+# through this proxy is a deliberate next step (see docs/refactor or
+# the PR that added this file).
+
+model_list:
+  # Stage B/D consolidation + viewer lobe labels. Backend is the LAN
+  # Qwen runtime served by pi-mono at 10.20.30.177:8033.
+  - model_name: qwen-local
+    litellm_params:
+      model: openai/qwen3-32b
+      api_base: http://10.20.30.177:8033/v1
+      api_key: dummy
+
+  # Reranker for the speaking-side retrieval cue runner. Same backend
+  # host today; separate virtual name so the model can be swapped
+  # without touching call sites.
+  - model_name: qwen-rerank
+    litellm_params:
+      model: openai/qwen3-reranker
+      api_base: http://10.20.30.177:8033/v1
+      api_key: dummy
+
+litellm_settings:
+  # Silently strip params the backend doesn't accept (e.g. response_format
+  # on older Qwen builds). Call sites can stay backend-agnostic.
+  drop_params: true
+  set_verbose: false
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

@@ -100,6 +100,15 @@ services:
       # above.
       ALICE_VIEWER_CHAT_DAEMON_HOST: "127.0.0.1"
       ALICE_VIEWER_CHAT_DAEMON_PORT: "8182"
+      # LiteLLM proxy — unified endpoint for local models (Qwen LAN
+      # endpoint today; future cloud passthrough TBD). Call sites
+      # (viewer.lobe_labeler, alice_thinking.stage_d_judges,
+      # alice_thinking.workflows.stage_b.subroutines) read this and
+      # talk OpenAI-compatible to the sidecar; the proxy maps virtual
+      # model names (qwen-local, qwen-rerank) to actual backends in
+      # sandbox/litellm/config.yaml. Hostname resolves on compose's
+      # default network bridge.
+      LITELLM_BASE_URL: "http://alice-litellm:4000/v1"
     volumes:
       # Mind + tools default to <repo>/data/{alice-mind,alice-tools}; alice-up
       # exports ALICE_MIND / ALICE_TOOLS pointing there. Fall back to the
@@ -137,3 +146,40 @@ services:
     #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml ...
     # alice-up and alice-deploy auto-include it when the nvidia runtime
     # is registered on the host (see bin/_alice-env.sh).
+    depends_on:
+      litellm:
+        condition: service_healthy
+
+  # LiteLLM proxy — single OpenAI-compatible endpoint for all local
+  # model traffic. Call sites use LITELLM_BASE_URL (set on the alice
+  # service above) plus a virtual model name (qwen-local, qwen-rerank)
+  # which the proxy maps to the actual backend in
+  # sandbox/litellm/config.yaml. Sidecar (not s6 inside alice) so the
+  # proxy restarts and logs independently; if it crashes, speaking and
+  # thinking see 502s on local-model calls and recover when it comes
+  # back rather than the whole worker tipping over.
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: alice-litellm
+    hostname: alice-litellm
+    restart: unless-stopped
+    command: ["--config", "/etc/litellm/config.yaml", "--port", "4000"]
+    environment:
+      # Master key for all proxy auth. Sourced from alice.env via
+      # bin/_alice-env.sh; falls back to a stable local default so
+      # fresh checkouts work without env setup. Rotate by setting
+      # LITELLM_MASTER_KEY in alice.env.
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-alice-local}"
+    volumes:
+      - ./litellm/config.yaml:/etc/litellm/config.yaml:ro
+    ports:
+      # Localhost-only publish — debugging from the host without
+      # docker-exec. Inter-container traffic uses the compose network
+      # at alice-litellm:4000 (see LITELLM_BASE_URL on alice).
+      - "127.0.0.1:4000:4000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:4000/health/liveliness"]
+      interval: 15s
+      timeout: 3s
+      retries: 4
+      start_period: 20s

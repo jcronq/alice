@@ -13,6 +13,7 @@ concrete LLM client; tests pass a fake :class:`ModelCall` directly.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
 from importlib import resources
@@ -85,8 +86,8 @@ def load_prompt_fragment(name: str) -> str:
 
 def make_default_model_call(
     *,
-    model: str = "openai/Qwen3-Coder-Next",
-    api_base: str = "http://10.20.30.177:8033/v1",
+    model: str | None = None,
+    api_base: str | None = None,
     api_key: str = "not-required",
 ) -> ModelCall:
     """Construct the production :class:`ModelCall`.
@@ -95,7 +96,18 @@ def make_default_model_call(
     with the JSON-only Qwen endpoint as the OpenAI-compatible provider.
     Lazy import so module-load doesn't pull in google-adk for tests
     that inject a fake.
+
+    ``model`` and ``api_base`` default to the LiteLLM proxy
+    (``LITELLM_BASE_URL`` / ``LITELLM_QWEN_MODEL``) when set; otherwise
+    fall back to the direct LAN endpoint so host-side dev still works.
     """
+
+    if model is None:
+        model = os.environ.get("LITELLM_QWEN_MODEL", "openai/qwen-local")
+    if api_base is None:
+        api_base = os.environ.get(
+            "LITELLM_BASE_URL", "http://10.20.30.177:8033/v1"
+        )
 
     async def _call(system_prompt: str, user_prompt: str) -> str:
         # Lazy imports — keeps test paths light + avoids a hard

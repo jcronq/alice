@@ -19,6 +19,7 @@ never hit the wire.
 from __future__ import annotations
 
 import asyncio
+import os
 import pathlib
 import re
 from typing import Awaitable, Callable, Optional
@@ -161,8 +162,14 @@ def sanitise_label(raw: str) -> str:
 # ``enable_thinking: False`` chat-template kwarg below; with it on a
 # label call would either burn 200 completion tokens or finish with
 # ``content=""`` if max_tokens is too tight.
-QWEN_MODEL = "Qwen3.6-35B-A3B-Q8_K_XL"
-QWEN_API_BASE = "http://10.20.30.177:8033/v1"
+QWEN_MODEL = "qwen-local"
+# LiteLLM proxy fronts the LAN Qwen runtime (and future local models).
+# Falls back to the direct LAN endpoint so dev outside the container
+# (where LITELLM_BASE_URL isn't set) still works. The model name is a
+# virtual alias resolved by sandbox/litellm/config.yaml.
+QWEN_API_BASE = os.environ.get(
+    "LITELLM_BASE_URL", "http://10.20.30.177:8033/v1"
+)
 
 # Hard cap: with thinking disabled, the model only needs a few tokens
 # for the phrase. Keep it small so latency is bounded if the model

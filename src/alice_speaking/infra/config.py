@@ -94,7 +94,11 @@ SPEAKING_DEFAULTS: dict[str, Any] = {
         "reranker": {
             "enabled": False,
             "model": "claude-haiku-4-5-20251001",
-            "litellm_endpoint": "",
+            # Default to the in-container LiteLLM proxy when present so
+            # flipping `enabled: True` works without an explicit endpoint
+            # override. Empty string preserves the legacy default for
+            # dev/test where the proxy isn't running.
+            "litellm_endpoint": os.environ.get("LITELLM_BASE_URL", ""),
             "timeout_ms": 1500,
         },
         # Hebbian edge-weight boost (#219, #254). Notes wikilinked
