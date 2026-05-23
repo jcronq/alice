@@ -26,6 +26,63 @@ class TestNonSMComments:
         )
 
 
+class TestAuditPrefixFilter:
+    """Dispatcher self-audit prefixes return None — not a parse error.
+
+    These comments are protocol-internal announcements (spawn started,
+    transition recorded, etc.) posted by the dispatcher itself. Treating
+    them as transition verbs would post a fresh ``[SM] parse-error``
+    reply every poll cycle. Issue #295 demonstrated the noise: 228
+    ``thinking-spawn-started`` audit comments would have triggered
+    228 parse-error replies without this filter.
+    """
+
+    def test_thinking_spawn_started_returns_none(self):
+        body = (
+            "[SM] thinking-spawn-started task=#295 artifact=art:code "
+            "phase=per_issue_design runtime=claude-agent-sdk:opus "
+            "spawn_id=spawn-295-1779459000 ts=2026-05-22T14:10:00+00:00"
+        )
+        assert parse_comment(body, "jcronq") is None
+
+    def test_transition_audit_returns_none(self):
+        body = '[SM] transition from=selected to=designing reason="..."'
+        assert parse_comment(body, "jcronq") is None
+
+    def test_design_ready_audit_returns_none(self):
+        # NOTE: this is the dispatcher's *echo* of a design-ready, not
+        # the agent's design-ready verb itself. The verb form (without
+        # ``-audit``) still parses as Verbs.DESIGN_READY.
+        body = "[SM] design-ready-audit task=#42 note=[[design-note]] author=alice"
+        assert parse_comment(body, "jcronq") is None
+
+    def test_design_ready_verb_still_parses(self):
+        # Ensure the audit-prefix filter doesn't accidentally swallow
+        # the actual ``[SM] design-ready`` verb (which is a real
+        # transition trigger from sm:designing).
+        body = "[SM] design-ready note=[[2026-05-22-design]]"
+        result = parse_comment(body, "alice")
+        assert isinstance(result, ParsedVerb)
+        assert result.verb is Verbs.DESIGN_READY
+
+    def test_other_audit_prefixes_return_none(self):
+        for body in (
+            "[SM] spawn-started task=#1",
+            "[SM] speaking-spawn-started task=#1",
+            "[SM] dispatcher-hello task=#1 state=sm:selected",
+            "[SM] study-hint-written task=#1 path=...",
+            '[SM] parse-error reason="..."',
+            "[SM] rebase-needed pr=#1",
+            "[SM] rebase-pushed pr=#1",
+            "[SM] rebase-escalated pr=#1",
+            "[SM] verify status=pass pr=#1",
+            "[SM] exit-transition-required",
+            "[SM] design-revisions-capped",
+            "[SM] auto-study-complete",
+        ):
+            assert parse_comment(body, "jcronq") is None, body
+
+
 class TestSuccessfulParse:
     def test_bare_route_to_study(self):
         result = parse_comment("[SM] route-to-study", "jcronq")

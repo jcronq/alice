@@ -236,6 +236,47 @@ class TestLegacyKwargAliases:
         assert (v3_log_dir / "sm-v3-actual.jsonl").exists()
 
 
+class TestV3EnablementHelper:
+    """``_v3_authoritative_states_from_env`` is the production wiring
+    for Phase 4 enablement: it populates the kwarg ``main()`` passes
+    into ``run()``. Default returns every SMState; ``SM_V3_DISABLE``
+    flips back to pure-v1 for an emergency rollback.
+    """
+
+    def test_default_returns_every_smstate(self, monkeypatch):
+        from alice_forge.dispatcher.main import (
+            _v3_authoritative_states_from_env,
+        )
+        from alice_forge.sm.states import SMState
+
+        monkeypatch.delenv("SM_V3_DISABLE", raising=False)
+        result = _v3_authoritative_states_from_env()
+        assert result == frozenset(s.value for s in SMState)
+        # Sanity: every label in the result is a known sm:* label.
+        for label in result:
+            assert label.startswith("sm:")
+            assert SMState.from_label(label) is not None
+
+    def test_disable_kill_switch_returns_empty(self, monkeypatch):
+        from alice_forge.dispatcher.main import (
+            _v3_authoritative_states_from_env,
+        )
+
+        for val in ("1", "true", "True", "yes", "on"):
+            monkeypatch.setenv("SM_V3_DISABLE", val)
+            assert _v3_authoritative_states_from_env() == frozenset(), val
+
+    def test_falsy_values_do_not_disable(self, monkeypatch):
+        from alice_forge.dispatcher.main import (
+            _v3_authoritative_states_from_env,
+        )
+
+        for val in ("", "0", "false", "no", "off"):
+            monkeypatch.setenv("SM_V3_DISABLE", val)
+            result = _v3_authoritative_states_from_env()
+            assert len(result) > 0, val
+
+
 class TestLegacyImportShims:
     def test_dispatcher_state_re_exported(self):
         """The ``DispatcherState`` / ``load_state`` / ``save_state``

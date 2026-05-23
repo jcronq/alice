@@ -79,17 +79,14 @@ def handle(issue: dict[str, Any], services: HandlerServices) -> HandlerResult | 
         body = c.get("body")
         if not isinstance(body, str):
             continue
-        # Dispatcher self-audit comments (``thinking-spawn-started``,
-        # ``dispatcher-hello``, ``design-ready-audit``, etc.) carry the
-        # ``[SM] `` prefix but are not transition verbs — they're
-        # protocol-internal announcements. Skip them so the verb
-        # parser doesn't surface them as parse errors (which would
-        # short-circuit the whole comment scan on every poll, as
-        # observed on issue #295 where every cycle's most-recent
-        # comment is a fresh ``thinking-spawn-started``).
-        if _is_audit_prefix(body):
-            continue
         author = _comment_author(c)
+        # ``parse_comment`` filters dispatcher self-audit prefixes
+        # (``thinking-spawn-started``, ``transition``, etc.) — they
+        # return ``None`` from the parser, same as ordinary prose, so
+        # they don't surface as parse errors. The step-3 orphan-
+        # recovery below does its own raw-prefix matching against the
+        # specific ``thinking-spawn-started`` / ``design-ready``
+        # markers because it needs them regardless of verb grammar.
         parsed = parse_comment(
             body, author, trusted_authors=services.trusted_authors
         )
@@ -162,27 +159,6 @@ def handle(issue: dict[str, Any], services: HandlerServices) -> HandlerResult | 
     # Step 4: nothing actionable from v3's perspective. v1's spawn /
     # hello / dep-check still own this state until Phase 3.
     return None
-
-
-# Dispatcher self-audit prefixes — comments emitted by the
-# dispatcher itself rather than transition verbs from a human or
-# agent. Defined locally (not imported from ``dispatcher.constants``)
-# to keep v3 free of the legacy v1 package; the canonical list lives
-# in ``alice_forge.dispatcher.constants`` and these two stay in sync.
-_AUDIT_PREFIXES: tuple[str, ...] = (
-    "[SM] spawn-started",
-    "[SM] thinking-spawn-started",
-    "[SM] speaking-spawn-started",
-    "[SM] dispatcher-hello",
-    "[SM] study-hint-written",
-    "[SM] design-ready-audit",
-    "[SM] transition",
-    "[SM] parse-error",
-)
-
-
-def _is_audit_prefix(body: str) -> bool:
-    return any(body.startswith(p) for p in _AUDIT_PREFIXES)
 
 
 def _comment_author(c: dict[str, Any]) -> str | None:

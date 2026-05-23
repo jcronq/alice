@@ -1183,6 +1183,34 @@ def run(
     return 0, report
 
 
+def _v3_authoritative_states_from_env() -> frozenset[str]:
+    """The full set of v3-authoritative states, with an env-var kill switch.
+
+    Phase 4 completion (#313 wired the code; this wires the
+    enablement): every non-terminal SMState is authoritative under v3
+    by default. v3 handlers own transition decisions and v1 legacy
+    only runs as a fallback for side-effects v3 hasn't ported (spawn
+    dispatch, hello, dep-check, rebase, post-merge cleanup, verify).
+
+    Emergency kill switch: set ``SM_V3_DISABLE`` (any truthy value:
+    ``1``, ``true``, ``yes``, ``on``) to return an empty set, which
+    makes every ``if X_SM_LABEL in v3_authoritative_states:`` check
+    False and falls back to pure-v1 behavior. Useful if a v3 handler
+    bug surfaces in production and a fix needs more than one cadence
+    to land. Setting + reloading the s6 service env restores pre-#313
+    behavior without redeploying code.
+    """
+    import os as _os
+
+    from alice_forge.sm.states import SMState
+
+    if _os.environ.get("SM_V3_DISABLE", "").strip().lower() in (
+        "1", "true", "yes", "on"
+    ):
+        return frozenset()
+    return frozenset(s.value for s in SMState)
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="One pass of the State Machine v0/v1.5/v2 dispatcher."
@@ -1247,6 +1275,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 state_path=state_path,
                 worker_repo_path=repo_cfg.checkout_path,
                 labels_configured=repo_cfg.labels_configured,
+                v3_authoritative_states=_v3_authoritative_states_from_env(),
                 dry_run=args.dry_run,
                 log=log,
             )

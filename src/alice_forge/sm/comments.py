@@ -30,6 +30,49 @@ TRUSTED_AUTHORS_DEFAULT: frozenset[str] = frozenset({"jcronq", "alice"})
 
 PREFIX = "[SM]"
 
+# Dispatcher self-audit prefixes — comments emitted by the dispatcher
+# itself as protocol-internal announcements, not transition verbs.
+# Mirrors the prefixes defined in ``alice_forge.dispatcher.constants``
+# but kept here as a v3-side copy to avoid a cyclic import. Any new
+# audit prefix that v1's spawn / hello / rebase machinery emits needs
+# to be added in both places.
+#
+# Comments whose body starts with one of these prefixes return
+# ``None`` from :func:`parse_comment` (treated like ordinary prose)
+# rather than ``ParseError`` (unknown verb). Without this, every
+# poll cycle on an issue with recent audit comments would post a
+# fresh ``[SM] parse-error`` reply — the same noise that masked the
+# orphan-design-ready spawn loop on #295.
+AUDIT_PREFIXES: tuple[str, ...] = (
+    "[SM] spawn-started",
+    "[SM] thinking-spawn-started",
+    "[SM] speaking-spawn-started",
+    "[SM] dispatcher-hello",
+    "[SM] study-hint-written",
+    "[SM] design-ready-audit",
+    "[SM] transition",
+    "[SM] parse-error",
+    "[SM] rebase-needed",
+    "[SM] rebase-pushed",
+    "[SM] rebase-escalated",
+    "[SM] verify",
+    "[SM] exit-transition-required",
+    "[SM] design-revisions-capped",
+    "[SM] auto-study-complete",
+)
+
+
+def is_audit_prefix(body: str) -> bool:
+    """True if ``body`` is a dispatcher-self audit comment, not a verb.
+
+    Audit comments carry the ``[SM] `` prefix but are protocol-internal
+    announcements (spawn started, label transitioned, etc.) — they
+    must not be parsed as transition verbs or every poll would post a
+    parse-error reply.
+    """
+    return any(body.startswith(p) for p in AUDIT_PREFIXES)
+
+
 # art:* label whitelist — mirrors v1's ART_LABEL_WHITELIST. Kept
 # here as a module-level default; tests can override.
 ART_LABEL_WHITELIST_DEFAULT: frozenset[str] = frozenset(
@@ -150,6 +193,14 @@ def parse_comment(
     issue rather than silent.
     """
     if not body.startswith(f"{PREFIX} "):
+        return None
+
+    # Skip dispatcher self-audit comments — they carry the ``[SM] ``
+    # prefix but are not transition verbs, so don't surface them as
+    # parse errors. Handlers that need to detect specific audit
+    # prefixes (e.g. v1 selected's orphan-design-ready recovery) do
+    # so by raw ``body.startswith(...)`` checks separately.
+    if is_audit_prefix(body):
         return None
 
     after_prefix = body[len(PREFIX) + 1 :].lstrip()
