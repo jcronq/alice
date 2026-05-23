@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""alice-sm-backfill-art-labels — one-shot ``art:*`` backfill.
+
+Issue #294 (EC-2). Scans open ``sm:draft`` issues in a target repo and,
+for any that lack an ``art:*`` label, applies the keyword classifier's
+suggestion (or ``art:pending`` as the conservative fallback) via
+``gh issue edit``. Designed to be run on deploy after the dispatcher's
+draft-entry classifier ships — handles the historical inventory the
+in-loop classifier won't see again.
+
+Examples
+--------
+
+::
+
+    alice-sm-backfill-art-labels                          # default repo, write
+    alice-sm-backfill-art-labels --dry-run                # preview only
+    alice-sm-backfill-art-labels --repo jcronq/cozyhem-engine
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+
+# Make ``alice_forge`` importable when this script runs out of the live
+# checkout without the venv site-packages being on PYTHONPATH (matches
+# the convention in ``bin/alice-sm-dispatcher``).
+_ALICE_SRC = os.environ.get("ALICE_SRC", "/home/alice/alice/src")
+if _ALICE_SRC and _ALICE_SRC not in sys.path:
+    sys.path.insert(0, _ALICE_SRC)
+
+from alice_forge.dispatcher.art_classifier import auto_label  # noqa: E402
+from alice_forge.dispatcher.gh import (  # noqa: E402
+    gh_edit_labels,
+    gh_list_sm_issues,
+)
+from alice_forge.dispatcher.trust import _label_names  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Backfill art:* labels on open sm:draft issues."
+    )
+    parser.add_argument(
+        "--repo",
+        default="jcronq/alice",
+        help="GitHub repo slug (default: jcronq/alice)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print planned label changes without writing.",
+    )
+    args = parser.parse_args(argv)
+
+    issues = gh_list_sm_issues(args.repo)
+    drafts = [
+        i for i in issues if "sm:draft" in _label_names(i)
+    ]
+
+    applied = 0
+    skipped = 0
+    failed: list[tuple[int, str]] = []
+
+    for issue in drafts:
+        number = issue["number"]
+        labels = _label_names(issue)
+        if any(l.startswith("art:") for l in labels):
+            skipped += 1
+            continue
+        suggested = auto_label(
+            title=issue.get("title") or "",
+            body=issue.get("body") or "",
+            existing_labels=labels,
+        )
+        if not suggested:
+            skipped += 1
+            continue
+        if args.dry_run:
+            print(f"  DRY-RUN #{number}: would apply {suggested!r}")
+            applied += 1
+            continue
+        try:
+            gh_edit_labels(args.repo, number, add=[suggested])
+        except Exception as exc:  # noqa: BLE001
+            failed.append((number, f"{type(exc).__name__}: {exc}"))
+            continue
+        print(f"  #{number}: applied {suggested!r}")
+        applied += 1
+
+    print(
+        f"summary: repo={args.repo} drafts={len(drafts)} "
+        f"applied={applied} skipped={skipped} failed={len(failed)}"
+    )
+    for number, reason in failed:
+        print(f"  FAILED #{number}: {reason}", file=sys.stderr)
+    return 0 if not failed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

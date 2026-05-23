@@ -634,6 +634,63 @@ def run(
             log(f"[sm-dispatcher] skipping issue with non-integer number: {number!r}")
             continue
 
+        # EC-7 (issue #297): skip issues the operator has explicitly
+        # deferred. Deferred state is written by Speaking/Thinking via
+        # ``gh_state_mirror.write_deferred``; the mirror's cleanup loop
+        # preserves these notes unconditionally (see
+        # [[2026-05-19-stale-cycle-dispatcher-gap]]). Without this
+        # guard the dispatcher re-surfaces deferred issues every poll
+        # cycle because no handler reads the deferred flag.
+        #
+        # The audit comment is throttled to once per 24h via the v3
+        # ``EmittedLedger`` so we don't spam an issue that's parked
+        # for days. The lazy import matches the pattern used by other
+        # handler-adjacent imports in this loop (avoids module-load
+        # circular-import risk).
+        from alice_forge.gh_state_mirror import (
+            read_state as _read_gh_state,
+        )
+        _gh = _read_gh_state(repo, number)
+        if _gh and _gh.get("type") == "deferred":
+            _reason = _gh.get("reason", "no reason given")
+            _deferred_by = _gh.get("deferred_by", "unknown")
+            _deferred_at = _gh.get("deferred_at", "unknown")
+            import datetime as _dt_def
+            try:
+                _now_dt = _dt_def.datetime.fromisoformat(now_iso())
+            except ValueError:
+                _now_dt = _dt_def.datetime.now(_dt_def.timezone.utc)
+            if not ledger.is_emitted_active(
+                number, "deferred-skip", _now_dt
+            ):
+                _body = (
+                    f'[SM] deferred-skip reason="{_reason}" '
+                    f"deferred_by={_deferred_by} "
+                    f"deferred_at={_deferred_at}"
+                )
+                if not dry_run:
+                    try:
+                        post_comment(repo, number, _body)
+                    except Exception as exc:  # noqa: BLE001
+                        log(
+                            f"[sm-dispatcher] #{number}: "
+                            f"deferred-skip comment failed: {exc}"
+                        )
+                ledger.mark_emitted(
+                    issue_number=number,
+                    side_effect="deferred-skip",
+                    emitted_at=_now_dt,
+                    ttl_seconds=86400,
+                    metadata={
+                        "reason": _reason,
+                        "deferred_by": _deferred_by,
+                        "deferred_at": _deferred_at,
+                    },
+                )
+                log(f"[sm-dispatcher] #{number}: deferred — {_reason}")
+            report.skipped_dedup += 1
+            continue
+
         sm_label = _current_sm_label(issue)
         if sm_label is None:
             # Either zero or >1 whitelisted ``sm:*`` labels (or only
@@ -814,6 +871,60 @@ def run(
                     now_iso=now_iso,
                 )
             elif sm_label == DRAFT_SM_LABEL:
+                # EC-2 (issue #294) — auto-classify ``art:*`` on draft
+                # entry. If the issue lacks any ``art:*`` label, the
+                # in-process keyword classifier proposes one (or falls
+                # back to ``art:pending``); we apply it via the
+                # ``edit_labels`` transport and patch the in-memory
+                # issue dict so v3 / legacy / trust filter all see the
+                # new label without a round-trip GH fetch. Wrapping in
+                # try/except so a transient GH error never aborts the
+                # whole cadence — the next pass will retry.
+                from alice_forge.dispatcher.art_classifier import (
+                    auto_label as _auto_label_art,
+                )
+
+                _labels_now = _label_names(issue)
+                if not any(l.startswith("art:") for l in _labels_now):
+                    _suggested = _auto_label_art(
+                        title=issue.get("title") or "",
+                        body=issue.get("body") or "",
+                        existing_labels=_labels_now,
+                    )
+                    if _suggested:
+                        if dry_run:
+                            log(
+                                f"[sm-dispatcher] DRY-RUN would apply "
+                                f"{_suggested!r} to draft #{number} "
+                                f"(art-classifier)"
+                            )
+                        else:
+                            try:
+                                edit_labels(
+                                    repo,
+                                    number,
+                                    add=[_suggested],
+                                    remove=[],
+                                )
+                            except Exception as _exc:  # noqa: BLE001
+                                log(
+                                    f"[sm-dispatcher] draft #{number}: "
+                                    f"art-classifier failed to apply "
+                                    f"{_suggested!r}: "
+                                    f"{type(_exc).__name__}: {_exc}"
+                                )
+                            else:
+                                log(
+                                    f"[art-classifier] #{number}: "
+                                    f"applied {_suggested!r}"
+                                )
+                                # Patch in-memory issue dict so
+                                # downstream v3 + legacy + trust filter
+                                # see the new label this pass.
+                                issue.setdefault("labels", []).append(
+                                    {"name": _suggested}
+                                )
+
                 # SM v3 Phase 4: v3 owns sm:draft transitions when the
                 # state is in ``v3_authoritative_states``. The legacy
                 # ``_process_draft`` still handles the triage-surface

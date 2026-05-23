@@ -4738,6 +4738,154 @@ def test_draft_route_to_study_clears_triage_surfaced_ledger(
     assert state_data["triage_surfaced"] == []
 
 
+# ---------------------------------------------------------------------------
+# Issue #294 (EC-2) — sm:draft art:* auto-classifier hook
+# ---------------------------------------------------------------------------
+
+
+def test_draft_without_art_label_auto_classifies_via_keyword(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """A draft with no ``art:*`` triggers the classifier hook; a
+    keyword in the title (here ``bug``) drives the suggestion to
+    ``art:bug`` via the ``edit_labels`` transport."""
+    issue = _draft_issue(
+        2940,
+        art_labels=(),
+        title="bug: spawn-loop stalls",
+    )
+    issue["body"] = "Dispatcher fails to transition on design-ready."
+    issues = [issue]
+    surface_dir = tmp_path / "surface"
+
+    label_rec = LabelRecorder()
+    exit_code, _report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        triage_surface_dir=surface_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # The classifier fires on the unlabelled draft → bug wins.
+    classifier_edits = [
+        c for c in label_rec.calls
+        if c["number"] == 2940 and c["add"] == ["art:bug"]
+    ]
+    assert len(classifier_edits) == 1
+
+
+def test_draft_without_art_label_falls_back_to_pending(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """A draft with zero keyword matches in title/body gets
+    ``art:pending`` so the triage surface still fires."""
+    issue = _draft_issue(2941, art_labels=(), title="Untitled")
+    issue["body"] = ""
+    issues = [issue]
+    surface_dir = tmp_path / "surface"
+
+    label_rec = LabelRecorder()
+    sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        triage_surface_dir=surface_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    pending_edits = [
+        c for c in label_rec.calls
+        if c["number"] == 2941 and c["add"] == ["art:pending"]
+    ]
+    assert len(pending_edits) == 1
+
+
+def test_draft_with_existing_art_label_skips_classifier(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """A draft that already carries ``art:code`` must NOT be
+    re-classified — the classifier only fills the gap."""
+    issue = _draft_issue(
+        2942, art_labels=("art:code",), title="bug everywhere fails"
+    )
+    issues = [issue]
+    surface_dir = tmp_path / "surface"
+
+    label_rec = LabelRecorder()
+    sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        triage_surface_dir=surface_dir,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    # No add= containing art:* for this issue.
+    classifier_edits = [
+        c for c in label_rec.calls
+        if c["number"] == 2942
+        and any(l.startswith("art:") for l in c["add"])
+    ]
+    assert classifier_edits == []
+
+
+def test_draft_classifier_dry_run_does_not_write(
+    state_path: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """``--dry-run`` records intent in the log but never calls
+    ``edit_labels`` with an ``art:*`` add."""
+    issue = _draft_issue(2943, art_labels=(), title="crash everywhere")
+    issues = [issue]
+    surface_dir = tmp_path / "surface"
+
+    label_rec = LabelRecorder()
+    sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        triage_surface_dir=surface_dir,
+        dry_run=True,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    classifier_edits = [
+        c for c in label_rec.calls
+        if c["number"] == 2943
+        and any(l.startswith("art:") for l in c["add"])
+    ]
+    assert classifier_edits == []
+
+
 def test_selected_return_to_study_transitions_back_to_needs_study(
     state_path: pathlib.Path,
 ) -> None:

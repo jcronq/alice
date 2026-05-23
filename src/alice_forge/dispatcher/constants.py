@@ -75,12 +75,22 @@ SM_LABEL_WHITELIST: frozenset[str] = frozenset(
 # Strict ``art:*`` allow-list. Every task must declare what kind of
 # artifact it produces; the dispatcher refuses to engage with tasks that
 # don't.
+#
+# Issue #294 (EC-2) — ``art:pending`` is the sentinel label applied by
+# the dispatcher's draft-entry classifier
+# (:mod:`alice_forge.dispatcher.art_classifier`) when no keyword in the
+# issue title/body matches a concrete ``art:*`` category. Including it in
+# the whitelist lets the triage surface fire (so Speaking/Thinking can
+# re-label) instead of the issue sitting silently at ``sm:draft``.
+# ``art:pending`` is intentionally absent from :data:`SPAWN_MAP` — see
+# the comment there.
 ART_LABEL_WHITELIST: frozenset[str] = frozenset(
     {
         "art:code",
         "art:research_note",
         "art:experiment",
         "art:config_change",
+        "art:pending",
     }
 )
 
@@ -249,6 +259,14 @@ def _now_iso() -> str:
 # designer (was v1 claude-cli code-worker pre-cutover). The new
 # ``(sm:designed, art:code)`` row routes to the speaking-agent builder.
 # Other ``(sm:selected, art:*)`` rows still spawn the v1 worker pool.
+#
+# Issue #294 (EC-2) — ``art:pending`` is intentionally NOT a key in this
+# map. An issue at ``art:pending`` is awaiting classification by the
+# draft-entry keyword classifier's Speaking/Thinking fallback path and
+# must not progress past ``sm:draft`` until the label is replaced with a
+# concrete ``art:*`` value. The dispatcher's SPAWN_MAP lookup already
+# returns nothing for unrecognized ``(sm:*, art:*)`` pairs, so the
+# natural absence is sufficient — no defensive guard required.
 SPAWN_MAP: dict[tuple[str, str], dict[str, str]] = {
     # SM v2 design lane. The per-issue thinking-agent reads the issue,
     # produces a design note at
