@@ -885,7 +885,7 @@ def run(
                 )
 
                 _labels_now = _label_names(issue)
-                if not any(l.startswith("art:") for l in _labels_now):
+                if not any(lab.startswith("art:") for lab in _labels_now):
                     _suggested = _auto_label_art(
                         title=issue.get("title") or "",
                         body=issue.get("body") or "",

@@ -106,7 +106,7 @@ def auto_label(
         forces the issue onto the triage surface for Speaking/Thinking
         to classify, instead of silently picking a wrong label.
     """
-    if any(l.startswith("art:") for l in existing_labels):
+    if any(lab.startswith("art:") for lab in existing_labels):
         return None
 
     text = f"{title} {body}".lower()
