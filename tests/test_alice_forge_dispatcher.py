@@ -5796,6 +5796,178 @@ def test_building_with_closed_linked_pr_does_not_transition(
     assert label_rec.calls == []
 
 
+# ---------------------------------------------------------------------------
+# Issue #342 — silent build-spawn guard at sm:building
+# ---------------------------------------------------------------------------
+#
+# Mirror of the sm:selected silent-spawn guard from #202. When a speaking-
+# spawn-started audit was posted from a trusted author but no linked PR has
+# appeared AND no live speaking spawn dir remains, the build worker exited
+# without opening a PR. Transition to sm:blocked rather than letting the
+# issue sit at sm:building forever (observed on #294/#296/#297/#323 on
+# 2026-05-23).
+
+
+def test_building_silent_speaking_spawn_failure_transitions_to_blocked(
+    state_path: pathlib.Path,
+) -> None:
+    """speaking-spawn-started from a trusted author + no live spawn + no
+    PR → transition sm:building → sm:blocked."""
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+
+    issues = [_design_issue(810, sm_label="sm:building")]
+    comments = [
+        _audit_comment(
+            "[SM] speaking-spawn-started task=#810 artifact=art:code "
+            "phase=per_issue_build runtime=claude-agent-sdk:opus "
+            "spawn_id=spawn-810-stub ts=2026-05-23T01:00:00+00:00"
+        ),
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=True,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        list_comments=lambda _r, _n: comments,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        find_linked_pr=_no_pr,
+        has_live_speaking_spawn=lambda _n: False,
+        count_running_speaking=lambda: 0,
+        spawn_speaking=_no_call,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 1
+    assert (810, "sm:building", "sm:blocked") in report.transitions
+    edit = label_rec.calls[-1]
+    assert edit["add"] == ["sm:blocked"]
+    assert edit["remove"] == ["sm:building"]
+    bodies = [b for _r, _n, b in recorder.posted]
+    assert any(
+        "from=building to=blocked" in b
+        and "speaking-agent exited without opening a PR" in b
+        for b in bodies
+    ), bodies
+
+
+def test_building_live_speaking_spawn_keeps_issue_at_building(
+    state_path: pathlib.Path,
+) -> None:
+    """A speaking spawn dir is still alive → the worker is still in
+    flight; don't transition to blocked even if no PR has shown up."""
+    label_rec = LabelRecorder()
+    issues = [_design_issue(811, sm_label="sm:building")]
+    comments = [
+        _audit_comment(
+            "[SM] speaking-spawn-started task=#811 artifact=art:code "
+            "phase=per_issue_build runtime=claude-agent-sdk:opus "
+            "spawn_id=spawn-811-stub ts=2026-05-23T01:00:00+00:00"
+        ),
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=True,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        list_comments=lambda _r, _n: comments,
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        find_linked_pr=_no_pr,
+        has_live_speaking_spawn=lambda _n: True,
+        count_running_speaking=lambda: 1,
+        spawn_speaking=_no_call,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert label_rec.calls == []
+
+
+def test_building_no_speaking_spawn_started_stays_idle(
+    state_path: pathlib.Path,
+) -> None:
+    """No prior speaking-spawn-started audit → the build never fired
+    in the first place; don't transition to blocked. (This case can
+    happen if an issue was manually labeled sm:building.)"""
+    label_rec = LabelRecorder()
+    issues = [_design_issue(812, sm_label="sm:building")]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=True,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        list_comments=lambda _r, _n: [],
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        find_linked_pr=_no_pr,
+        has_live_speaking_spawn=lambda _n: False,
+        count_running_speaking=lambda: 0,
+        spawn_speaking=_no_call,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert label_rec.calls == []
+
+
+def test_building_untrusted_speaking_spawn_started_does_not_block(
+    state_path: pathlib.Path,
+) -> None:
+    """A forged speaking-spawn-started from an untrusted author must
+    NOT trip the silent-spawn guard — otherwise any drive-by could
+    force a building issue into sm:blocked by pasting the audit
+    prefix."""
+    label_rec = LabelRecorder()
+    issues = [_design_issue(813, sm_label="sm:building")]
+    comments = [
+        _audit_comment(
+            "[SM] speaking-spawn-started task=#813 artifact=art:code "
+            "phase=per_issue_build runtime=claude-agent-sdk:opus "
+            "spawn_id=spawn-813-forged ts=2026-05-23T01:00:00+00:00",
+            author="random-drive-by",
+        ),
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=True,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        list_comments=lambda _r, _n: comments,
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        find_linked_pr=_no_pr,
+        has_live_speaking_spawn=lambda _n: False,
+        count_running_speaking=lambda: 0,
+        spawn_speaking=_no_call,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert label_rec.calls == []
+
+
 # ----- DispatcherState forward-compat for design_revisions -----
 
 

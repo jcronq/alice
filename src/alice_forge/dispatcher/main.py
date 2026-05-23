@@ -1153,6 +1153,9 @@ def run(
                     post_comment=post_comment,
                     edit_labels=edit_labels,
                     find_linked_pr=find_linked_pr,
+                    list_comments=list_comments,
+                    trusted_authors=trusted_authors,
+                    has_live_speaking_spawn=has_live_speaking_spawn,
                     dry_run=dry_run,
                     log=log,
                 )
