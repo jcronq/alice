@@ -125,6 +125,47 @@ def test_read_state_parses_deferred_frontmatter(gh_state_dir: Path) -> None:
     assert gh_state_mirror.is_deferred("jcronq/alice", 247) is True
 
 
+def test_is_deferred_true(gh_state_dir: Path) -> None:
+    """``is_deferred`` returns True for a freshly-written deferred note.
+
+    Direct coverage of the predicate the dispatcher's EC-7 guard
+    (issue #297) consults at the top of its per-issue loop.
+    """
+    gh_state_mirror.write_deferred(
+        "jcronq/alice", 247, reason="blocked", deferred_by="speaking"
+    )
+    assert gh_state_mirror.is_deferred("jcronq/alice", 247) is True
+
+
+def test_is_deferred_false_for_pr(gh_state_dir: Path) -> None:
+    """``is_deferred`` returns False for a mirror-written ``type: pr`` note.
+
+    Only the operator's explicit deferral counts. An open PR is the
+    mirror's normal in-flight signal and must not be treated as a
+    dispatcher skip — otherwise the verify / sweep paths never fire.
+    """
+    gh_state_mirror.write_note_atomic(
+        "jcronq/alice",
+        500,
+        {
+            "_type": "pr",
+            "state": "open",
+            "merged": False,
+            "isDraft": False,
+            "baseRefName": "master",
+            "title": "open PR",
+            "createdAt": "2026-05-19T00:00:00Z",
+            "updatedAt": "2026-05-19T00:00:00Z",
+        },
+    )
+    assert gh_state_mirror.is_deferred("jcronq/alice", 500) is False
+
+
+def test_is_deferred_false_for_missing(gh_state_dir: Path) -> None:
+    """``is_deferred`` returns False when no gh-state note exists for the issue."""
+    assert gh_state_mirror.is_deferred("jcronq/alice", 9999) is False
+
+
 def test_read_state_parses_existing_issue_note(gh_state_dir: Path) -> None:
     gh_state_mirror.write_note_atomic(
         "jcronq/alice",
