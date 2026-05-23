@@ -35,10 +35,8 @@ from alice_forge.sm.result import (
     Continue,
     EmitParseError,
     HandlerResult,
-    Transition,
 )
 from alice_forge.sm.services import HandlerServices
-from alice_forge.sm.states import SMState
 
 
 def handle(issue: dict[str, Any], services: HandlerServices) -> HandlerResult | None:
@@ -83,19 +81,6 @@ def handle(issue: dict[str, Any], services: HandlerServices) -> HandlerResult | 
     # landed). Returning ``None`` for the event case keeps v3's
     # comment-driven decisions intact (parse-error / continue handled
     # above) and lets v1 do the spawn + label flip atomically.
-    return None
-
-
-def _art_label(issue: dict[str, Any]) -> str | None:
-    labels = issue.get("labels") or []
-    for lab in labels:
-        if isinstance(lab, dict):
-            name = lab.get("name")
-            if isinstance(name, str) and name.startswith("art:"):
-                return name
-        elif isinstance(lab, str):
-            if lab.startswith("art:"):
-                return lab
     return None
 
 
