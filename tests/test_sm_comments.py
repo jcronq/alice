@@ -79,6 +79,9 @@ class TestAuditPrefixFilter:
             "[SM] exit-transition-required",
             "[SM] design-revisions-capped",
             "[SM] auto-study-complete",
+            # Legacy patterns still on old issues.
+            '[SM] blocked reason="manual operator block"',
+            "[SM] speaking-build-complete pr=#1",
         ):
             assert parse_comment(body, "jcronq") is None, body
 

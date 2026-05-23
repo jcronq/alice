@@ -59,6 +59,16 @@ AUDIT_PREFIXES: tuple[str, ...] = (
     "[SM] exit-transition-required",
     "[SM] design-revisions-capped",
     "[SM] auto-study-complete",
+    # Legacy v0/v1 operator pattern — manual ``[SM] blocked
+    # reason="..."`` shortcut used before ``[SM] transition
+    # from=X to=blocked`` became the canonical audit. Still present
+    # on old issues (e.g. #197); not a valid verb in v3's grammar.
+    # Filtered here so the v3 parser doesn't emit a parse-error reply
+    # every poll cycle the comment is still visible.
+    "[SM] blocked",
+    # Legacy speaking-build completion echo. Predates the v3
+    # event-driven build-complete; some older comments still carry it.
+    "[SM] speaking-build-complete",
 )
 
 
