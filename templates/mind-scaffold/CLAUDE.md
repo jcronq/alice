@@ -86,7 +86,10 @@ confidence). Protocol:
    Worker: branch `auto-fix/issue-<N>`, implement fix, commit message
    `<area>: fix <brief description> (#<N>)`, push, then `gh pr create
    --draft --title "Auto-fix: <title>" --body "Automated fix attempt
-   for #<N>.\n\nFixes #<N>. Please review before merging."`. Worker
+   for #<N>.\n\nCloses #<N>\n\nPlease review before merging."`. The
+   `Closes #<N>` line must stand alone with blank lines above and below
+   — GitHub's auto-close parser is line-sensitive and only honors the
+   `Closes` / `Fixes` / `Resolves` keywords on their own line. Worker
    returns the PR URL or an error.
 4. **Notify-out.** On success, send the draft PR URL. On worker error or
    low-confidence partial fix, send a short reason with the URL (or "not

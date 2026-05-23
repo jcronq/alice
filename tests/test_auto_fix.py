@@ -102,3 +102,41 @@ def test_record_swallows_write_errors_so_dispatch_continues() -> None:
         )
     assert result is None
     mock_write.assert_called_once()
+
+
+# EC-6 regression — see
+# ``cortex-memory/designs/2026-05-22-issue296-ec6-closes-pr-body.md``.
+# The auto-fix worker PR body must contain the canonical ``Closes #<N>``
+# magic phrase so GitHub auto-closes the referenced issue on merge. The
+# non-canonical ``Fixes #<N>`` form was the root cause of #285 staying
+# open after PR #289 merged. Pinning the phrase in CI ensures a future
+# edit can't silently regress to the broken form.
+_MIND_SCAFFOLD_CLAUDE_MD = (
+    Path(__file__).resolve().parent.parent
+    / "templates"
+    / "mind-scaffold"
+    / "CLAUDE.md"
+)
+
+
+def test_auto_fix_protocol_uses_closes_not_fixes() -> None:
+    """The GitHub Issue Auto-Fix Protocol description in the mind-scaffold
+    CLAUDE.md template must instruct the worker to write ``Closes #<N>``
+    in the PR body — not ``Fixes #<N>``. ``Closes`` is the only form
+    GitHub honors reliably in all repo configurations."""
+    text = _MIND_SCAFFOLD_CLAUDE_MD.read_text(encoding="utf-8")
+
+    # Narrow to the protocol section so we don't get tripped up by any
+    # unrelated mention of "Fixes" elsewhere in the file.
+    start = text.index("## GitHub Issue Auto-Fix Protocol")
+    end = text.index("\n## ", start + 1)
+    protocol = text[start:end]
+
+    assert "Closes #<N>" in protocol, (
+        "auto-fix protocol must reference Closes #<N> "
+        "(see EC-6 design note 2026-05-22-issue296-ec6-closes-pr-body.md)"
+    )
+    assert "Fixes #<N>" not in protocol, (
+        "auto-fix protocol must not use Fixes #<N> — GitHub does not "
+        "honor it reliably; use Closes #<N> instead (EC-6, issue #296)"
+    )
