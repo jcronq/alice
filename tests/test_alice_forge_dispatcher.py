@@ -4847,7 +4847,7 @@ def test_draft_with_existing_art_label_skips_classifier(
     classifier_edits = [
         c for c in label_rec.calls
         if c["number"] == 2942
-        and any(l.startswith("art:") for l in c["add"])
+        and any(lab.startswith("art:") for lab in c["add"])
     ]
     assert classifier_edits == []
 
@@ -4881,7 +4881,7 @@ def test_draft_classifier_dry_run_does_not_write(
     classifier_edits = [
         c for c in label_rec.calls
         if c["number"] == 2943
-        and any(l.startswith("art:") for l in c["add"])
+        and any(lab.startswith("art:") for lab in c["add"])
     ]
     assert classifier_edits == []
 
