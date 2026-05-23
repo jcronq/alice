@@ -623,7 +623,9 @@ def main() -> int:
             )
             rc = 1
         # Backoff bookkeeping mirrors the prompt-path block below.
-        interval_path = pathlib.Path(args.state_dir) / INTERVAL_FILE_NAME
+        state_dir = pathlib.Path(args.state_dir)
+        interval_path = state_dir / INTERVAL_FILE_NAME
+        timestamp_path = state_dir / backoff.TIMESTAMP_FILE_NAME
         prev_interval = backoff.read_interval(interval_path)
         did_work = backoff.detect_did_work(mind, since_ts=wake_start_ts)
         next_interval = backoff.next_interval_seconds(
@@ -631,8 +633,20 @@ def main() -> int:
             mode="sleep",
             did_work=did_work,
         )
+        # Issue #323 fix 2: clamp against MIN_WAKE_PERIOD when the
+        # previous wake fired recently. Prevents combined effect of
+        # short-elapsed-since-last + max-interval-write from
+        # accidentally extending the cycle past 30 min.
+        now_ts = time.time()
+        last_wake_ts = backoff.read_last_wake_timestamp(timestamp_path)
+        next_interval = backoff.apply_min_wake_period(
+            next_interval,
+            last_wake_ts=last_wake_ts,
+            now_ts=now_ts,
+        )
         try:
             backoff.write_interval_atomic(interval_path, next_interval)
+            backoff.write_last_wake_timestamp(timestamp_path, now_ts)
         except OSError as exc:
             print(
                 f"thinking: failed to write {interval_path}: {exc}",
@@ -770,7 +784,9 @@ def main() -> int:
     # test shouldn't reshape the live cadence). See
     # cortex-memory/research/2026-05-01-sleep-mode-exponential-backoff-design.md.
     if not args.quick:
-        interval_path = pathlib.Path(args.state_dir) / INTERVAL_FILE_NAME
+        state_dir = pathlib.Path(args.state_dir)
+        interval_path = state_dir / INTERVAL_FILE_NAME
+        timestamp_path = state_dir / backoff.TIMESTAMP_FILE_NAME
         prev_interval = backoff.read_interval(interval_path)
         did_work = backoff.detect_did_work(mind, since_ts=wake_start_ts)
         next_interval = backoff.next_interval_seconds(
@@ -778,8 +794,19 @@ def main() -> int:
             mode=mode_obj.name,
             did_work=did_work,
         )
+        # Issue #323 fix 2: clamp against MIN_WAKE_PERIOD when the
+        # last wake fired recently — see ``apply_min_wake_period``
+        # for the rationale.
+        now_ts = time.time()
+        last_wake_ts = backoff.read_last_wake_timestamp(timestamp_path)
+        next_interval = backoff.apply_min_wake_period(
+            next_interval,
+            last_wake_ts=last_wake_ts,
+            now_ts=now_ts,
+        )
         try:
             backoff.write_interval_atomic(interval_path, next_interval)
+            backoff.write_last_wake_timestamp(timestamp_path, now_ts)
         except OSError as exc:
             # State-dir issues shouldn't fail the wake; supervisor
             # falls back to its built-in default if the file is
