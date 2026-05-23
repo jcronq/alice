@@ -15,10 +15,14 @@ import time
 from alice_thinking.backoff import (
     BASE_INTERVAL_SECONDS,
     MAX_INTERVAL_SECONDS,
+    MIN_WAKE_PERIOD,
+    apply_min_wake_period,
     detect_did_work,
     next_interval_seconds,
     read_interval,
+    read_last_wake_timestamp,
     write_interval_atomic,
+    write_last_wake_timestamp,
 )
 
 
@@ -50,10 +54,14 @@ def test_sleep_did_work_resets_to_base() -> None:
         )
 
 
-def test_sleep_ladder_5_10_20_40() -> None:
-    """The four-step ladder: 5 → 10 → 20 → 40 minutes."""
+def test_sleep_ladder_5_10_20_30() -> None:
+    """The four-step ladder: 5 → 10 → 20 → 30 minutes.
+
+    Issue #323 lowered the cap from 40 → 30 minutes; the doubling
+    step that would have produced 40 is clamped to 30 instead.
+    """
     cur = BASE_INTERVAL_SECONDS
-    expected = [10 * 60, 20 * 60, 40 * 60]
+    expected = [10 * 60, 20 * 60, 30 * 60]
     for want in expected:
         cur = next_interval_seconds(
             prev_seconds=cur, mode="sleep:consolidate", did_work=False
@@ -61,14 +69,33 @@ def test_sleep_ladder_5_10_20_40() -> None:
         assert cur == want
 
 
-def test_sleep_ladder_caps_at_40() -> None:
-    """Once at 40 min, stays at 40 min on continued null passes."""
+def test_sleep_ladder_caps_at_30() -> None:
+    """Once at the cap, stays there on continued null passes."""
     cur = MAX_INTERVAL_SECONDS
     for _ in range(5):
         cur = next_interval_seconds(
             prev_seconds=cur, mode="sleep:consolidate", did_work=False
         )
         assert cur == MAX_INTERVAL_SECONDS
+
+
+def test_max_interval_is_30_minutes() -> None:
+    """Issue #323: cap must be 30 min (1800s), not 40 min (2400s).
+    At 40 min the May-22 sleep cycle produced only 3 wakes / 8h
+    because did_work signals from Stage B/D weren't being written."""
+    assert MAX_INTERVAL_SECONDS == 1800
+
+
+def test_sleep_caps_20_consecutive_idle_wakes() -> None:
+    """Issue #323 regression: 20 consecutive ``did_work: false`` wakes
+    must never push the interval above ``MAX_INTERVAL_SECONDS``."""
+    cur = BASE_INTERVAL_SECONDS
+    for _ in range(20):
+        cur = next_interval_seconds(
+            prev_seconds=cur, mode="sleep:consolidate", did_work=False
+        )
+        assert cur <= MAX_INTERVAL_SECONDS
+    assert cur == MAX_INTERVAL_SECONDS
 
 
 def test_sleep_below_base_floors_to_base_then_doubles() -> None:
@@ -190,3 +217,92 @@ def test_did_work_picks_up_truthy_among_mixed(tmp_path: pathlib.Path) -> None:
     _write_wake(tmp_path, day="2026-05-01", hhmmss="000001", did_work="false")
     _write_wake(tmp_path, day="2026-05-01", hhmmss="000002", did_work="true")
     assert detect_did_work(tmp_path, since_ts=since) is True
+
+
+# ---------- min-wake-period guard (issue #323 fix 2) ----------
+
+
+def test_min_wake_period_is_30_minutes() -> None:
+    """Issue #323 fix 2: cadence-level floor must be 30 min (1800s)."""
+    assert MIN_WAKE_PERIOD == 1800
+
+
+def test_min_period_clamps_when_recent_wake_and_high_next() -> None:
+    """Last wake fired 10 min ago and next interval would be 30 min →
+    clamp the next interval down to the 30 min floor. (Real case:
+    backoff ran to the cap; the supervisor's elapsed-since-last is
+    still inside MIN_WAKE_PERIOD; let the next wake fire on cadence.)"""
+    now = 1_000_000.0
+    last = now - 600  # 10 minutes ago
+    clamped = apply_min_wake_period(
+        2400, last_wake_ts=last, now_ts=now, min_period=1800
+    )
+    assert clamped == 1800
+
+
+def test_min_period_no_clamp_when_no_prior_timestamp() -> None:
+    """First wake after worker boot has no ``last-wake-timestamp``
+    file — return the input unchanged."""
+    assert apply_min_wake_period(2400, last_wake_ts=None, now_ts=1_000_000.0) == 2400
+
+
+def test_min_period_no_clamp_when_last_wake_was_long_ago() -> None:
+    """If elapsed >= MIN_WAKE_PERIOD the supervisor already waited at
+    least the floor — leave the next interval as-is."""
+    now = 1_000_000.0
+    last = now - 3600  # an hour ago
+    assert apply_min_wake_period(2400, last_wake_ts=last, now_ts=now) == 2400
+
+
+def test_min_period_no_clamp_when_next_already_below_floor() -> None:
+    """A reset-to-BASE after meaningful work must stay at BASE — never
+    *raise* the interval to the floor. The guard only clamps down."""
+    now = 1_000_000.0
+    last = now - 60  # very recent
+    assert (
+        apply_min_wake_period(
+            BASE_INTERVAL_SECONDS, last_wake_ts=last, now_ts=now
+        )
+        == BASE_INTERVAL_SECONDS
+    )
+
+
+def test_min_period_clamps_full_ladder_climb() -> None:
+    """Composing the policy: at the top of the ladder + a recent
+    last-wake, the effective next interval must equal MIN_WAKE_PERIOD."""
+    cur = BASE_INTERVAL_SECONDS
+    for _ in range(10):
+        cur = next_interval_seconds(
+            prev_seconds=cur, mode="sleep:consolidate", did_work=False
+        )
+    assert cur == MAX_INTERVAL_SECONDS
+    now = 1_000_000.0
+    last = now - 5  # essentially "just woke"
+    clamped = apply_min_wake_period(cur, last_wake_ts=last, now_ts=now)
+    assert clamped == MIN_WAKE_PERIOD
+
+
+def test_last_wake_timestamp_roundtrip(tmp_path: pathlib.Path) -> None:
+    p = tmp_path / "last-wake-timestamp"
+    write_last_wake_timestamp(p, 1_700_000_000.5)
+    got = read_last_wake_timestamp(p)
+    assert got is not None
+    assert abs(got - 1_700_000_000.5) < 1e-3
+
+
+def test_last_wake_timestamp_missing_returns_none(tmp_path: pathlib.Path) -> None:
+    assert read_last_wake_timestamp(tmp_path / "absent") is None
+
+
+def test_last_wake_timestamp_garbage_returns_none(tmp_path: pathlib.Path) -> None:
+    p = tmp_path / "last-wake-timestamp"
+    p.write_text("not-a-float\n")
+    assert read_last_wake_timestamp(p) is None
+
+
+def test_last_wake_timestamp_write_is_atomic(tmp_path: pathlib.Path) -> None:
+    """No ``.tmp`` leftover after a successful write."""
+    p = tmp_path / "last-wake-timestamp"
+    write_last_wake_timestamp(p, time.time())
+    leftovers = list(tmp_path.glob("*.tmp"))
+    assert leftovers == []

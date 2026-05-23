@@ -7,12 +7,19 @@ next wake-to-wake interval. Keeping cap/ladder constants here lets
 unit-tested in isolation.
 
 Behavior (from
-``cortex-memory/research/2026-05-01-sleep-mode-exponential-backoff-design.md``):
+``cortex-memory/research/2026-05-01-sleep-mode-exponential-backoff-design.md``,
+revised by issue #323 — wake cadence fixes):
 
 - Active mode: always 5 min — backoff applies to sleep only.
 - Sleep mode + did_work=True: hard reset to 5 min.
 - Sleep mode + did_work=False: double the previous interval, capped
-  at 40 min. Ladder: 5 → 10 → 20 → 40.
+  at 30 min. Ladder: 5 → 10 → 20 → 30. Cap lowered from 40 min by
+  issue #323 — at 40 min the ladder produced only 3 wakes over 8 hours
+  of sleep; 30 min guarantees ≥16 wakes per 8h period as a baseline.
+- ``MIN_WAKE_PERIOD`` (30 min) is the cadence-level floor enforced by
+  ``wake.py`` against ``last-wake-timestamp``: if the last wake fired
+  more recently than that and the computed next interval is above the
+  floor, the interval is clamped down to the floor.
 
 Notes:
 
@@ -33,7 +40,18 @@ import pathlib
 from .vault_state import _is_truthy, _parse_frontmatter
 
 BASE_INTERVAL_SECONDS = 5 * 60  # 300 — bottom of the ladder
-MAX_INTERVAL_SECONDS = 40 * 60  # 2400 — top of the ladder
+# Top of the ladder. Lowered from 40 min → 30 min by issue #323; at 40
+# min the May-22 sleep cycle managed only 3 wakes over 8 hours because
+# every Stage B/D drain was invisible to ``detect_did_work`` and the
+# ladder climbed unchallenged. 30 min × 16 = 8 hours, so this floors
+# the per-night wake count at ~16 even if every single wake is idle.
+MAX_INTERVAL_SECONDS = 30 * 60  # 1800 — top of the ladder
+# Cadence-level minimum-wake guarantee. Used by ``wake.py`` to clamp
+# the supervisor interval against ``last-wake-timestamp`` so a long
+# tail of idle wakes can never push the next wake past 30 min from
+# the previous one. Kept here so the cap + the floor share a single
+# source of truth.
+MIN_WAKE_PERIOD = 30 * 60  # 1800
 
 _SLEEP_MODE_PREFIX = "sleep"
 
@@ -56,6 +74,74 @@ def next_interval_seconds(
         return BASE_INTERVAL_SECONDS
     floor = max(prev_seconds, BASE_INTERVAL_SECONDS)
     return min(floor * 2, MAX_INTERVAL_SECONDS)
+
+
+TIMESTAMP_FILE_NAME = "last-wake-timestamp"
+
+
+def apply_min_wake_period(
+    next_seconds: int,
+    *,
+    last_wake_ts: float | None,
+    now_ts: float,
+    min_period: int = MIN_WAKE_PERIOD,
+) -> int:
+    """Cadence-level minimum-wake guarantee (issue #323 fix 2).
+
+    The supervisor measures intervals between consecutive wakes; if a
+    wake fires very recently and the next-interval write still sits
+    near the top of the ladder, the *combined* effect can stretch the
+    cycle past the supervisor's expected cadence. This clamps
+    ``next_seconds`` down to ``min_period`` whenever:
+
+    * we have a recent ``last_wake_ts`` (``now_ts - last_wake_ts <
+      min_period``), AND
+    * the computed next interval would otherwise exceed ``min_period``.
+
+    Why only "if it would otherwise exceed": the floor only kicks in
+    when backoff has climbed. A reset-to-BASE after meaningful work
+    must stay at BASE so cadence accelerates back to active levels.
+
+    Returns the (possibly clamped) interval in seconds.
+    """
+    if last_wake_ts is None:
+        return next_seconds
+    try:
+        elapsed = now_ts - float(last_wake_ts)
+    except (TypeError, ValueError):
+        return next_seconds
+    if elapsed < min_period and next_seconds > min_period:
+        return min_period
+    return next_seconds
+
+
+def read_last_wake_timestamp(path: pathlib.Path) -> float | None:
+    """Read ``last-wake-timestamp`` if present; return None on any error.
+
+    The timestamp file lives alongside ``next-thinking-interval-seconds``
+    in the worker state dir. Stamped after every backoff write so a
+    later wake can compute "how long since the prior wake fired".
+    """
+    try:
+        text = path.read_text().strip()
+    except OSError:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def write_last_wake_timestamp(path: pathlib.Path, ts: float) -> None:
+    """Atomically write the wall-clock timestamp of the current wake.
+
+    Mirrors :func:`write_interval_atomic`'s tmp + replace pattern so a
+    partial write can never be observed by a concurrent reader.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(f"{float(ts):.6f}\n")
+    os.replace(tmp, path)
 
 
 def write_interval_atomic(path: pathlib.Path, seconds: int) -> None:
