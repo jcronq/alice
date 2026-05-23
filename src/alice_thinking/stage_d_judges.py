@@ -38,6 +38,8 @@ import os
 import re
 from typing import Literal, Optional, TypedDict
 
+from core.config.auth import ensure_auth_env
+
 
 __all__ = [
     "Verdict",
@@ -385,6 +387,9 @@ def _call_haiku(prompt: str) -> str:
     """Synchronous wrapper around the Anthropic Messages call. Lazy
     imports the SDK and is the seam tests monkeypatch."""
 
+    # Populate ANTHROPIC_API_KEY (and friends) for the current auth mode
+    # before reading — without this, non-``api`` modes silently miss the key.
+    ensure_auth_env()
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise JudgeOutputError("ANTHROPIC_API_KEY not set in environment")

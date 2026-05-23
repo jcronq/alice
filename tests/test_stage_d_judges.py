@@ -317,6 +317,9 @@ def test_judge_haiku_missing_api_key_raises(monkeypatch):
     the SDK. This is a defensive contract — caller can catch and fall
     back."""
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    # Neutralize auth-env resolution so a host-side ``alice.env`` can't
+    # repopulate the key out from under the test's premise.
+    monkeypatch.setattr(stage_d_judges, "ensure_auth_env", lambda *a, **kw: None)
     # Don't monkeypatch _call_haiku — we want the real one to short-circuit
     # on the missing-key check.
     with pytest.raises(JudgeOutputError):
