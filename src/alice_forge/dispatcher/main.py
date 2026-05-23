@@ -634,6 +634,63 @@ def run(
             log(f"[sm-dispatcher] skipping issue with non-integer number: {number!r}")
             continue
 
+        # EC-7 (issue #297): skip issues the operator has explicitly
+        # deferred. Deferred state is written by Speaking/Thinking via
+        # ``gh_state_mirror.write_deferred``; the mirror's cleanup loop
+        # preserves these notes unconditionally (see
+        # [[2026-05-19-stale-cycle-dispatcher-gap]]). Without this
+        # guard the dispatcher re-surfaces deferred issues every poll
+        # cycle because no handler reads the deferred flag.
+        #
+        # The audit comment is throttled to once per 24h via the v3
+        # ``EmittedLedger`` so we don't spam an issue that's parked
+        # for days. The lazy import matches the pattern used by other
+        # handler-adjacent imports in this loop (avoids module-load
+        # circular-import risk).
+        from alice_forge.gh_state_mirror import (
+            read_state as _read_gh_state,
+        )
+        _gh = _read_gh_state(repo, number)
+        if _gh and _gh.get("type") == "deferred":
+            _reason = _gh.get("reason", "no reason given")
+            _deferred_by = _gh.get("deferred_by", "unknown")
+            _deferred_at = _gh.get("deferred_at", "unknown")
+            import datetime as _dt_def
+            try:
+                _now_dt = _dt_def.datetime.fromisoformat(now_iso())
+            except ValueError:
+                _now_dt = _dt_def.datetime.now(_dt_def.timezone.utc)
+            if not ledger.is_emitted_active(
+                number, "deferred-skip", _now_dt
+            ):
+                _body = (
+                    f'[SM] deferred-skip reason="{_reason}" '
+                    f"deferred_by={_deferred_by} "
+                    f"deferred_at={_deferred_at}"
+                )
+                if not dry_run:
+                    try:
+                        post_comment(repo, number, _body)
+                    except Exception as exc:  # noqa: BLE001
+                        log(
+                            f"[sm-dispatcher] #{number}: "
+                            f"deferred-skip comment failed: {exc}"
+                        )
+                ledger.mark_emitted(
+                    issue_number=number,
+                    side_effect="deferred-skip",
+                    emitted_at=_now_dt,
+                    ttl_seconds=86400,
+                    metadata={
+                        "reason": _reason,
+                        "deferred_by": _deferred_by,
+                        "deferred_at": _deferred_at,
+                    },
+                )
+                log(f"[sm-dispatcher] #{number}: deferred — {_reason}")
+            report.skipped_dedup += 1
+            continue
+
         sm_label = _current_sm_label(issue)
         if sm_label is None:
             # Either zero or >1 whitelisted ``sm:*`` labels (or only
