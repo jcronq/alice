@@ -8,6 +8,70 @@ from __future__ import annotations
 from alice_forge.sm.legacy.handlers._common import *  # noqa: F401, F403
 
 
+_DESIGN_READY_NOTE_RE = re.compile(r"note=\[\[([^\]\s]+)\]\]")
+
+
+def _resolve_design_note_path(slug: str) -> pathlib.Path | None:
+    """Resolve a ``[[<slug>]]`` wikilink to a real filesystem path.
+
+    Issue #327. The thinking-design lane writes its final design output
+    to ``cortex-memory/designs/<slug>.md``; the ``[SM] design-ready
+    note=[[<slug>]]`` audit comment carries only the slug. The build
+    worker needs the absolute path so it can load the approved design.
+
+    Returns the first existing path under :data:`DESIGNS_DIR` then
+    :data:`RESEARCH_NOTES_DIR` (pre-cutover designs landed in
+    research/). Returns ``None`` if neither location holds the file —
+    the caller should surface that as a ``[SM] design-ready-invalid``
+    audit rather than silently spawning a doomed build.
+
+    Reads :data:`DESIGNS_DIR` / :data:`RESEARCH_NOTES_DIR` as module
+    globals at call time (not as ``def``-time default args), so test
+    monkeypatching of the module attribute propagates here.
+    """
+    candidate = DESIGNS_DIR / f"{slug}.md"
+    if candidate.is_file():
+        return candidate
+    candidate = RESEARCH_NOTES_DIR / f"{slug}.md"
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+def _find_design_ready_slug(
+    comments: list[dict[str, Any]],
+    *,
+    trusted_authors: frozenset[str],
+) -> str | None:
+    """Scan ``comments`` newest-first for ``[SM] design-ready note=[[<slug>]]``.
+
+    Returns the slug from the first trusted-author match. Ignores the
+    ``[SM] design-ready-audit`` echo (dispatcher self-emission) so the
+    resolver always picks the agent's authoritative version. Returns
+    ``None`` if no design-ready comment is present from a trusted
+    author — the caller falls back to ``design_note_path=None``,
+    matching pre-#327 behaviour.
+    """
+    for c in reversed(comments):
+        if not isinstance(c, dict):
+            continue
+        body = c.get("body")
+        if not isinstance(body, str):
+            continue
+        if not body.startswith("[SM] design-ready"):
+            continue
+        if body.startswith("[SM] design-ready-audit"):
+            continue
+        login = _comment_author_login(c)
+        if not isinstance(login, str) or login not in trusted_authors:
+            continue
+        m = _DESIGN_READY_NOTE_RE.search(body)
+        if m is None:
+            continue
+        return m.group(1)
+    return None
+
+
 def _process_designed(
     *,
     issue: dict[str, Any],
@@ -15,12 +79,14 @@ def _process_designed(
     report: RunReport,
     post_comment: PostCommentFn,
     edit_labels: EditLabelsFn,
+    list_comments: ListCommentsFn,
+    trusted_authors: frozenset[str],
     live_spawn_dir: Callable[[int], pathlib.Path | None] | None,
     dry_run: bool,
     log: Callable[[str], None],
     has_live_speaking_spawn: Callable[[int], bool] | None = None,
     count_running_speaking: Callable[[], int] | None = None,
-    spawn_speaking: Callable[[dict[str, Any], str, str], str | None] | None = None,
+    spawn_speaking: Callable[..., str | None] | None = None,
     max_concurrent_speaking_spawns: int = MAX_CONCURRENT_SPEAKING_SPAWNS,
 ) -> None:
     """sm:designed → next-phase routing for one issue.
@@ -62,6 +128,8 @@ def _process_designed(
             report=report,
             post_comment=post_comment,
             edit_labels=edit_labels,
+            list_comments=list_comments,
+            trusted_authors=trusted_authors,
             has_live_speaking_spawn=has_live_speaking_spawn,
             count_running_speaking=count_running_speaking,
             spawn_speaking=spawn_speaking,
@@ -145,9 +213,11 @@ def _designed_spawn_speaking(
     report: RunReport,
     post_comment: PostCommentFn,
     edit_labels: EditLabelsFn,
+    list_comments: ListCommentsFn,
+    trusted_authors: frozenset[str],
     has_live_speaking_spawn: Callable[[int], bool] | None,
     count_running_speaking: Callable[[], int] | None,
-    spawn_speaking: Callable[[dict[str, Any], str, str], str | None] | None,
+    spawn_speaking: Callable[..., str | None] | None,
     max_concurrent_speaking_spawns: int,
     dry_run: bool,
     log: Callable[[str], None],
@@ -215,12 +285,50 @@ def _designed_spawn_speaking(
         )
         return
 
+    # Issue #327 — resolve the design-ready slug to a real filesystem
+    # path so the speaking-agent can load the approved design. Without
+    # this, ``spawn_speaking_agent`` is invoked with
+    # ``design_note_path=None`` and ``compose_speaking_spawn_prompt``
+    # renders ``design_note: (unset)`` in the frontmatter; the build
+    # worker then crashes with ``design_note path does not exist:
+    # (unset)`` and the SM has no dead-worker detector at sm:building
+    # (#298/EC-3), so the issue stays stuck.
+    design_note_path: pathlib.Path | None = None
+    try:
+        comments = list_comments(repo, number)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] designed #{number}: failed to list "
+            f"comments while resolving design-note path: {exc}"
+        )
+        if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+            raise
+        comments = []
+    slug = _find_design_ready_slug(comments, trusted_authors=trusted_authors)
+    if slug is not None:
+        design_note_path = _resolve_design_note_path(slug)
+        if design_note_path is None:
+            log(
+                f"[sm-dispatcher] designed #{number}: design-ready "
+                f"slug=[[{slug}]] does not resolve under "
+                f"{DESIGNS_DIR} or {RESEARCH_NOTES_DIR} — spawning "
+                f"with design_note_path=None (build will likely fail)"
+            )
+    else:
+        log(
+            f"[sm-dispatcher] designed #{number}: no [SM] design-ready "
+            f"comment from a trusted author — spawning with "
+            f"design_note_path=None"
+        )
+
     # Spawn first — the speaking-agent posts its own
     # [SM] speaking-spawn-started audit comment before launching the
     # shim, so failure to spawn leaves a recoverable audit trail and
     # doesn't move the label.
     try:
-        spawn_id = spawn_speaking(issue, art_label, repo)
+        spawn_id = spawn_speaking(
+            issue, art_label, repo, design_note_path=design_note_path
+        )
     except GHCommandError as exc:
         log(
             f"[sm-dispatcher] designed #{number}: failed to spawn "

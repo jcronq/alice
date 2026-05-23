@@ -8695,7 +8695,7 @@ def _track_spawn(records):
     """Build a (spawn_callable, list-of-calls) pair so a test can
     assert which lane the dispatcher routed an issue through."""
 
-    def call(issue, art_label, repo):
+    def call(issue, art_label, repo, *, design_note_path=None):
         sid = f"spawn-{issue['number']}-stub"
         records.append((issue["number"], art_label, sid))
         return sid
@@ -9108,6 +9108,295 @@ def test_phase2_designed_art_code_dry_run_records_intent_no_spawn(
     assert any(
         "DRY-RUN would spawn speaking on #723" in m for m in logged
     ), logged
+
+
+# ---------------------------------------------------------------------------
+# Issue #327 — design_note_path resolution from design-ready slug
+# ---------------------------------------------------------------------------
+
+
+def _track_spawn_with_path(records):
+    """Variant of ``_track_spawn`` that also captures ``design_note_path``.
+
+    Used by #327 regression tests to verify the dispatcher resolves the
+    ``[SM] design-ready note=[[<slug>]]`` slug to a real path and
+    threads it through to the speaking-agent.
+    """
+
+    def call(issue, art_label, repo, *, design_note_path=None):
+        sid = f"spawn-{issue['number']}-stub"
+        records.append(
+            (issue["number"], art_label, sid, design_note_path)
+        )
+        return sid
+
+    return call
+
+
+def test_designed_resolves_design_ready_slug_to_filesystem_path(
+    state_path, tmp_path, monkeypatch
+) -> None:
+    """sm:designed + art:code + ``[SM] design-ready note=[[<slug>]]`` →
+    dispatcher resolves the slug under ``DESIGNS_DIR`` and passes the
+    real path to ``spawn_speaking``. Without this, the build worker
+    crashes with ``design_note path does not exist: (unset)`` (issue
+    #327).
+    """
+    from alice_forge.sm.legacy.handlers import designed as designed_mod
+
+    designs_dir = tmp_path / "designs"
+    designs_dir.mkdir()
+    slug = "2026-05-22-issue730-foo"
+    design_path = designs_dir / f"{slug}.md"
+    design_path.write_text("# design body\n")
+    monkeypatch.setattr(designed_mod, "DESIGNS_DIR", designs_dir)
+
+    spawn_records: list = []
+    issues = [
+        _design_issue(
+            730, sm_label="sm:designed", art_labels=("art:code",)
+        )
+    ]
+    comments = [
+        _audit_comment(
+            f"[SM] design-ready note=[[{slug}]] author=alice",
+            author="jcronq",
+        ),
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        has_live_speaking_spawn=lambda _n: False,
+        count_running_speaking=lambda: 0,
+        spawn_speaking=_track_spawn_with_path(spawn_records),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 1
+    assert len(spawn_records) == 1
+    n, art, sid, resolved_path = spawn_records[0]
+    assert n == 730
+    assert art == "art:code"
+    assert resolved_path == design_path
+    assert resolved_path.is_file()
+
+
+def test_designed_design_ready_audit_echo_ignored_uses_agent_slug(
+    state_path, tmp_path, monkeypatch
+) -> None:
+    """The dispatcher's ``[SM] design-ready-audit`` echo must NOT be
+    treated as the source of the slug — the agent-emitted
+    ``[SM] design-ready`` is authoritative. (If we picked the audit
+    echo, a flaky audit could overwrite the agent's slug.)
+    """
+    from alice_forge.sm.legacy.handlers import designed as designed_mod
+
+    designs_dir = tmp_path / "designs"
+    designs_dir.mkdir()
+    agent_slug = "agent-slug"
+    audit_slug = "audit-slug"
+    (designs_dir / f"{agent_slug}.md").write_text("# agent design\n")
+    (designs_dir / f"{audit_slug}.md").write_text("# audit design\n")
+    monkeypatch.setattr(designed_mod, "DESIGNS_DIR", designs_dir)
+
+    spawn_records: list = []
+    issues = [
+        _design_issue(
+            731, sm_label="sm:designed", art_labels=("art:code",)
+        )
+    ]
+    # Order: agent posts first, dispatcher's audit echo follows. The
+    # reversed-iteration in the resolver should pick the audit echo
+    # FIRST by timestamp — the prefix filter must skip it.
+    comments = [
+        _audit_comment(
+            f"[SM] design-ready note=[[{agent_slug}]] author=alice",
+            author="jcronq",
+        ),
+        _audit_comment(
+            f"[SM] design-ready-audit task=#731 note=[[{audit_slug}]]",
+            author="jcronq",
+        ),
+    ]
+
+    exit_code, _report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        has_live_speaking_spawn=lambda _n: False,
+        count_running_speaking=lambda: 0,
+        spawn_speaking=_track_spawn_with_path(spawn_records),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert len(spawn_records) == 1
+    _, _, _, resolved_path = spawn_records[0]
+    assert resolved_path == designs_dir / f"{agent_slug}.md"
+
+
+def test_designed_no_design_ready_comment_spawns_with_none(
+    state_path, tmp_path, monkeypatch
+) -> None:
+    """If no trusted ``[SM] design-ready`` comment exists, the
+    dispatcher still spawns (pre-#327 fallback) but with
+    ``design_note_path=None`` — caller-controlled error mode rather
+    than blocking the issue forever.
+    """
+    from alice_forge.sm.legacy.handlers import designed as designed_mod
+
+    monkeypatch.setattr(designed_mod, "DESIGNS_DIR", tmp_path / "designs")
+
+    spawn_records: list = []
+    issues = [
+        _design_issue(
+            732, sm_label="sm:designed", art_labels=("art:code",)
+        )
+    ]
+
+    exit_code, _report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: [],
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        has_live_speaking_spawn=lambda _n: False,
+        count_running_speaking=lambda: 0,
+        spawn_speaking=_track_spawn_with_path(spawn_records),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert len(spawn_records) == 1
+    _, _, _, resolved_path = spawn_records[0]
+    assert resolved_path is None
+
+
+def test_designed_unresolvable_slug_spawns_with_none_and_logs(
+    state_path, tmp_path, monkeypatch
+) -> None:
+    """Slug present in the comment but ``<slug>.md`` doesn't exist on
+    disk → spawn proceeds with ``design_note_path=None`` and the
+    dispatcher logs the resolver miss. Operator-visible signal rather
+    than silent failure.
+    """
+    from alice_forge.sm.legacy.handlers import designed as designed_mod
+
+    monkeypatch.setattr(designed_mod, "DESIGNS_DIR", tmp_path / "designs")
+    monkeypatch.setattr(
+        designed_mod, "RESEARCH_NOTES_DIR", tmp_path / "research"
+    )
+
+    spawn_records: list = []
+    logged: list[str] = []
+    issues = [
+        _design_issue(
+            733, sm_label="sm:designed", art_labels=("art:code",)
+        )
+    ]
+    comments = [
+        _audit_comment(
+            "[SM] design-ready note=[[ghost-slug]] author=alice",
+            author="jcronq",
+        ),
+    ]
+
+    exit_code, _report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        has_live_speaking_spawn=lambda _n: False,
+        count_running_speaking=lambda: 0,
+        spawn_speaking=_track_spawn_with_path(spawn_records),
+        now_iso=_frozen_now,
+        log=logged.append,
+    )
+
+    assert exit_code == 0
+    assert len(spawn_records) == 1
+    _, _, _, resolved_path = spawn_records[0]
+    assert resolved_path is None
+    assert any(
+        "ghost-slug" in m and "does not resolve" in m for m in logged
+    ), logged
+
+
+def test_designed_untrusted_design_ready_falls_back_to_none(
+    state_path, tmp_path, monkeypatch
+) -> None:
+    """A ``[SM] design-ready`` from an untrusted author must NOT drive
+    the resolver — otherwise any drive-by could point the build at an
+    attacker-chosen design path.
+    """
+    from alice_forge.sm.legacy.handlers import designed as designed_mod
+
+    designs_dir = tmp_path / "designs"
+    designs_dir.mkdir()
+    (designs_dir / "evil.md").write_text("# attacker\n")
+    monkeypatch.setattr(designed_mod, "DESIGNS_DIR", designs_dir)
+
+    spawn_records: list = []
+    issues = [
+        _design_issue(
+            734, sm_label="sm:designed", art_labels=("art:code",)
+        )
+    ]
+    comments = [
+        _audit_comment(
+            "[SM] design-ready note=[[evil]] author=alice",
+            author="random-drive-by",
+        ),
+    ]
+
+    exit_code, _report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda repo: issues,
+        list_comments=lambda repo, n: comments,
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        has_live_speaking_spawn=lambda _n: False,
+        count_running_speaking=lambda: 0,
+        spawn_speaking=_track_spawn_with_path(spawn_records),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert len(spawn_records) == 1
+    _, _, _, resolved_path = spawn_records[0]
+    assert resolved_path is None
 
 
 # ---------------------------------------------------------------------------

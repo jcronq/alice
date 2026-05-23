@@ -149,6 +149,16 @@ TRIAGE_SURFACE_BODY_CHAR_LIMIT = 1500
 # avoid watcher → dispatcher import cycle).
 RESEARCH_NOTES_DIR = pathlib.Path("/home/alice/alice-mind/cortex-memory/research")
 
+# Issue #327 — directory the dispatcher resolves design-ready slugs
+# against when spawning a build agent. The thinking-design lane writes
+# its final design output to ``cortex-memory/designs/<slug>.md`` and
+# the ``[SM] design-ready note=[[<slug>]]`` audit comment carries the
+# bare slug; the designed handler resolves it to a real filesystem
+# path and passes it to ``spawn_speaking_agent(design_note_path=...)``
+# so the build worker can load the design. Falls back to
+# :data:`RESEARCH_NOTES_DIR` because pre-cutover designs landed there.
+DESIGNS_DIR = pathlib.Path("/home/alice/alice-mind/cortex-memory/designs")
+
 # Issue #164 — design-pipeline handlers. The dispatcher caps design
 # revision iterations to prevent an infinite design/review loop; the
 # fourth ``[SM] design-revise`` comment trips the cap and the issue

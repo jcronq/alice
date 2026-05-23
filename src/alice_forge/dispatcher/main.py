@@ -470,12 +470,20 @@ def run(
                 )
         if spawn_speaking is None:
             def spawn_speaking(
-                issue: dict[str, Any], art_label: str, repo: str
+                issue: dict[str, Any],
+                art_label: str,
+                repo: str,
+                *,
+                design_note_path: pathlib.Path | None = None,
             ) -> str | None:
+                # Issue #327 — pass the resolved design path through to
+                # the speaking-agent shim so its prompt frontmatter
+                # carries a real ``design_note:`` instead of ``(unset)``.
                 return spawn_speaking_agent(
                     issue,
                     art_label,
                     repo,
+                    design_note_path=design_note_path,
                     post_comment=post_comment,
                     log=log,
                     now_iso=now_iso,
@@ -954,6 +962,8 @@ def run(
                     report=report,
                     post_comment=post_comment,
                     edit_labels=edit_labels,
+                    list_comments=list_comments,
+                    trusted_authors=trusted_authors,
                     live_spawn_dir=live_spawn_dir,
                     has_live_speaking_spawn=has_live_speaking_spawn,
                     count_running_speaking=count_running_speaking,
