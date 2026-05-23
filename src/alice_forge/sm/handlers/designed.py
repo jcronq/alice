@@ -71,21 +71,19 @@ def handle(issue: dict[str, Any], services: HandlerServices) -> HandlerResult | 
         if isinstance(parsed, ContinueParsed):
             return Continue(reason=parsed.reason or "", findings=parsed.findings)
 
-    # Predict the expected event-driven transition based on art:* label.
-    # The dispatcher's v1 spawn logic still applies the actual move.
-    art = _art_label(issue)
-    if art == "art:code":
-        return Transition(
-            target=SMState.BUILDING,
-            reason="build-spawn-dispatch (predicted)",
-            metadata={"event_driven": True, "art_label": art},
-        )
-    # Anything else falls back to the legacy compact lane.
-    return Transition(
-        target=SMState.COMPACTING,
-        reason="compact-signal-drop (predicted)",
-        metadata={"event_driven": True, "art_label": art or "(none)"},
-    )
+    # Event-driven transitions (``build-spawn-dispatch`` for art:code,
+    # ``compact-signal-drop`` for the legacy compact lane) are owned by
+    # v1's ``_process_designed``: it does the actual ``spawn_speaking``
+    # / ``compact.signal`` write AND posts the resulting label change.
+    # v3 used to return a *predicted* ``Transition(BUILDING)`` here for
+    # the dual-run logger, but #333 made v3 authoritative — applying
+    # the predicted transition flips the label without ever spawning a
+    # build worker, leaving the issue at sm:building with no agent on
+    # it (the actual bug observed on #294/#296/#297/#323 after #333
+    # landed). Returning ``None`` for the event case keeps v3's
+    # comment-driven decisions intact (parse-error / continue handled
+    # above) and lets v1 do the spawn + label flip atomically.
+    return None
 
 
 def _art_label(issue: dict[str, Any]) -> str | None:

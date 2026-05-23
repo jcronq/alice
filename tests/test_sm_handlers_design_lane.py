@@ -155,27 +155,41 @@ class TestDesignReview:
 
 
 class TestDesigned:
-    def test_art_code_predicts_building_transition(self):
+    """v3 DESIGNED handler — event-driven transitions stay in v1.
+
+    Before #333 made v3 authoritative, v3's designed handler returned
+    a *predicted* ``Transition(BUILDING)`` / ``Transition(COMPACTING)``
+    for the dual-run logger to compare against v1-actual. Post-#333
+    the dispatcher applies whatever v3 returns, so the predicted
+    transition flipped the label without ever spawning a build worker
+    — bug observed live on #294/#296/#297/#323 (transitioned to
+    sm:building, no speaking-agent ever started, issues stuck).
+
+    Fix: return ``None`` for the event case so v1's
+    ``_process_designed`` runs and does the actual spawn + label
+    flip atomically. v3 only owns verb-driven decisions
+    (continue / parse-error) here.
+    """
+
+    def test_art_code_event_transition_returns_none(self):
+        # v1's _process_designed owns build-spawn-dispatch.
         result = handle_designed(
             _issue(labels=["art:code"]),
             _services(),
         )
-        assert isinstance(result, Transition)
-        assert result.target is SMState.BUILDING
-        assert result.metadata["event_driven"] is True
+        assert result is None
 
-    def test_other_art_predicts_compacting_transition(self):
+    def test_other_art_event_transition_returns_none(self):
+        # v1's _process_designed owns the legacy compact-signal lane.
         result = handle_designed(
             _issue(labels=["art:research_note"]),
             _services(),
         )
-        assert isinstance(result, Transition)
-        assert result.target is SMState.COMPACTING
+        assert result is None
 
-    def test_no_art_label_falls_back_to_compacting(self):
+    def test_no_art_label_returns_none(self):
         result = handle_designed(_issue(labels=[]), _services())
-        assert isinstance(result, Transition)
-        assert result.target is SMState.COMPACTING
+        assert result is None
 
     def test_continue_records_progress(self):
         result = handle_designed(
