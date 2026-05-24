@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import re as _re
+import subprocess as _subprocess
 
 from alice_forge.sm.legacy.handlers._common import *  # noqa: F401, F403
 
@@ -108,6 +109,63 @@ def _render_triage_surface(
     )
 
 
+def _validate_issue(
+    *,
+    repo: str,
+    number: int,
+    gh_bin: str = "gh",
+) -> tuple[bool, str]:
+    """Verify item ``#number`` is an open issue (not PR) with ``sm:draft``.
+
+    Defense-in-depth gate paired with the source-side ``type == "ISSUE"``
+    filter in :func:`alice_forge.dispatcher.gh.gh_list_sm_issues`. The list
+    helper already drops PR rows, but a stale in-memory issue dict from
+    earlier in the cadence — or a future change that bypasses the
+    list-time filter — could still let a PR slip through to the triage
+    surface writer. Calling ``gh issue view`` immediately before the
+    write rules out the leak directly against the live state.
+
+    Returns ``(ok, reason)``. ``ok=False`` means skip the surface; the
+    ledger is intentionally NOT marked so the next pass retries if the
+    item later genuinely enters ``sm:draft``.
+
+    Fail-soft on ``gh`` errors (network/auth/rate-limit/parse): log and
+    skip. The dispatcher's outer retry loop covers transient failures.
+
+    See research/2026-05-23-dispatcher-false-surface-bug and
+    research/2026-05-23-dispatcher-pre-surface-validation for context.
+    """
+    try:
+        result = _subprocess.run(
+            [
+                gh_bin,
+                "issue",
+                "view",
+                str(number),
+                "--repo",
+                repo,
+                "--json",
+                "state,type,labels",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return False, f"gh issue view failed: {(result.stderr or '').strip()}"
+        data = json.loads(result.stdout)
+        if data.get("state") != "OPEN":
+            return False, f"issue is {data.get('state')}"
+        if data.get("type") != "ISSUE":
+            return False, f"type is {data.get('type')} (not ISSUE)"
+        labels = [l.get("name") for l in data.get("labels", []) if isinstance(l, dict)]
+        if DRAFT_SM_LABEL not in labels:
+            return False, f"missing {DRAFT_SM_LABEL} label"
+        return True, "ok"
+    except Exception as exc:  # noqa: BLE001 — fail-soft, log+skip
+        return False, f"validation error: {type(exc).__name__}: {exc}"
+
+
 def _write_triage_surface(
     *,
     issue: dict[str, Any],
@@ -165,6 +223,7 @@ def _process_draft(
     dry_run: bool,
     log: Callable[[str], None],
     now_iso: Callable[[], str],
+    validate_issue: Callable[..., tuple[bool, str]] | None = None,
 ) -> None:
     """sm:draft → sm:needs_study on a trusted ``[SM] route-to-study`` comment.
 
@@ -209,6 +268,21 @@ def _process_draft(
         # Speaking can route it. Dedup on the ledger so re-runs of the
         # 60-second poll don't spam the surface dir.
         if state.has_triage_surfaced(number):
+            return
+        # Pre-surface validation: verify the item is actually an open
+        # ISSUE with sm:draft. Catches PRs that slipped through the
+        # list-side filter (research/2026-05-23-dispatcher-false-surface-bug)
+        # and stale issue dicts whose state changed mid-cadence.
+        # Injectable for tests; defaults to the real subprocess call.
+        validator = validate_issue if validate_issue is not None else _validate_issue
+        ok, reason = validator(repo=repo, number=number)
+        if not ok:
+            log(
+                f"[sm-dispatcher] draft #{number}: pre-surface validation "
+                f"failed — {reason} (skipping surface)"
+            )
+            # Do NOT mark the ledger — next pass retries if the item
+            # later legitimately enters sm:draft.
             return
         current_art = _current_art_label(issue, art_whitelist)
         if dry_run:

@@ -1224,6 +1224,7 @@ def test_sweep_helper_filters_terminal_labels_defensively() -> None:
             "labels": [{"name": "sm:done"}, {"name": "art:code"}],
             "author": {"login": "jcronq"},
             "createdAt": "2026-05-12T10:00:00Z",
+            "type": "ISSUE",
         },
         # Terminal — must be dropped.
         {
@@ -1232,6 +1233,7 @@ def test_sweep_helper_filters_terminal_labels_defensively() -> None:
             "labels": [{"name": "sm:rejected"}, {"name": "art:code"}],
             "author": {"login": "jcronq"},
             "createdAt": "2026-05-12T10:00:00Z",
+            "type": "ISSUE",
         },
         # Non-terminal — must be kept.
         {
@@ -1240,6 +1242,7 @@ def test_sweep_helper_filters_terminal_labels_defensively() -> None:
             "labels": [{"name": "sm:selected"}, {"name": "art:code"}],
             "author": {"login": "jcronq"},
             "createdAt": "2026-05-12T10:00:00Z",
+            "type": "ISSUE",
         },
     ]
 
@@ -1270,6 +1273,48 @@ def test_sweep_helper_filters_terminal_labels_defensively() -> None:
     # And the terminals must NOT appear.
     assert "sm:done" not in search_str
     assert "sm:rejected" not in search_str
+
+
+def test_gh_list_sm_issues_filters_pull_requests() -> None:
+    """``gh issue list`` returns BOTH ISSUE and PULL_REQUEST rows when a PR
+    carries a matching label. The client-side filter in ``gh_list_sm_issues``
+    must drop PRs so the draft handler never emits a triage surface for a
+    merged PR (regression for the jcronq/alice#43 false-surface bug — see
+    research/2026-05-23-dispatcher-false-surface-bug).
+    """
+    payload = [
+        # Legit open issue at sm:draft — must be kept.
+        {
+            "number": 200,
+            "title": "real draft issue",
+            "labels": [{"name": "sm:draft"}, {"name": "art:code"}],
+            "author": {"login": "jcronq"},
+            "createdAt": "2026-05-22T10:00:00Z",
+            "type": "ISSUE",
+        },
+        # A PR that happens to carry sm:draft (e.g. label survived a
+        # merge or was applied manually). Must be filtered out.
+        {
+            "number": 43,
+            "title": "speaking: switch Task interception from can_use_tool to PreToolUse hook",
+            "labels": [{"name": "sm:draft"}],
+            "author": {"login": "jcronq"},
+            "createdAt": "2026-05-11T10:00:00Z",
+            "type": "PULL_REQUEST",
+        },
+    ]
+
+    def fake_run_gh(args: list[str], *, timeout: int = 60) -> str:
+        return json.dumps(payload)
+
+    import unittest.mock as _mock
+
+    with _mock.patch.object(sm, "_run_gh", fake_run_gh):
+        result = sm.gh_list_sm_issues("jcronq/alice")
+
+    # Only the real issue survives — the PR is dropped.
+    assert [i["number"] for i in result] == [200]
+    assert all(i.get("type") == "ISSUE" for i in result)
 
 
 def test_sweep_done_line_includes_swept_counter(state_path: pathlib.Path) -> None:
@@ -4562,6 +4607,16 @@ def test_draft_route_to_study_dry_run_records_intent_only(
 # ---------------------------------------------------------------------------
 
 
+# Stub validator for triage-surface tests: the live ``_validate_issue``
+# helper shells out to ``gh issue view`` which can't reach GitHub from
+# pytest. Tests that exercise the triage-surface code path inject this
+# always-pass stub so the validation gate doesn't short-circuit the
+# behavior under test. The PR-filter regression test exercises the gate
+# itself separately.
+def _stub_validate_issue_ok(*, repo: str, number: int) -> tuple[bool, str]:
+    return True, "ok"
+
+
 def test_draft_no_route_to_study_emits_triage_surface(
     state_path: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
@@ -4585,6 +4640,7 @@ def test_draft_no_route_to_study_emits_triage_surface(
         triage_surface_dir=surface_dir,
         now_iso=_frozen_now,
         log=lambda _m: None,
+        validate_issue=_stub_validate_issue_ok,
     )
 
     assert exit_code == 0
@@ -4633,6 +4689,7 @@ def test_draft_triage_surface_deduped_on_second_pass(
         triage_surface_dir=surface_dir,
         now_iso=_frozen_now,
         log=lambda _m: None,
+        validate_issue=_stub_validate_issue_ok,
     )
     first_pass_files = sorted(surface_dir.glob("*.md"))
     assert len(first_pass_files) == 1
@@ -4651,6 +4708,7 @@ def test_draft_triage_surface_deduped_on_second_pass(
         triage_surface_dir=surface_dir,
         now_iso=_frozen_now,
         log=lambda _m: None,
+        validate_issue=_stub_validate_issue_ok,
     )
 
     assert exit_code == 0
@@ -4680,6 +4738,7 @@ def test_draft_triage_surface_dry_run_does_not_write(
         dry_run=True,
         now_iso=_frozen_now,
         log=lambda _m: None,
+        validate_issue=_stub_validate_issue_ok,
     )
 
     assert exit_code == 0
@@ -4710,6 +4769,7 @@ def test_draft_route_to_study_clears_triage_surfaced_ledger(
         triage_surface_dir=surface_dir,
         now_iso=_frozen_now,
         log=lambda _m: None,
+        validate_issue=_stub_validate_issue_ok,
     )
     state_data = json.loads(state_path.read_text())
     assert state_data["triage_surfaced"] == [413]
@@ -4730,6 +4790,7 @@ def test_draft_route_to_study_clears_triage_surfaced_ledger(
         triage_surface_dir=surface_dir,
         now_iso=_frozen_now,
         log=lambda _m: None,
+        validate_issue=_stub_validate_issue_ok,
     )
 
     assert exit_code == 0

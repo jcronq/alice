@@ -371,6 +371,7 @@ def run(
     labels_configured: bool = True,
     log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
     now_iso: Callable[[], str] = _now_iso,
+    validate_issue: Callable[..., tuple[bool, str]] | None = None,
 ) -> tuple[int, RunReport]:
     """Run one dispatcher pass. Returns ``(exit_code, report)``.
 
@@ -969,6 +970,7 @@ def run(
                     dry_run=dry_run,
                     log=log,
                     now_iso=now_iso,
+                    validate_issue=validate_issue,
                 )
             elif sm_label == DESIGNING_SM_LABEL:
                 v3_transitioned = False

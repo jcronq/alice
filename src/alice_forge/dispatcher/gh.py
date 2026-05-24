@@ -99,7 +99,7 @@ def gh_list_selected_issues(repo: str, *, gh_bin: str = "gh") -> list[dict[str, 
         "--label",
         ACTIVE_SM_LABEL,
         "--json",
-        "number,title,labels,author,createdAt,body",
+        "number,title,labels,author,createdAt,body,type",
         "--limit",
         str(RECENT_ISSUE_LIMIT),
     ]
@@ -109,7 +109,11 @@ def gh_list_selected_issues(repo: str, *, gh_bin: str = "gh") -> list[dict[str, 
     payload = json.loads(stdout)
     if not isinstance(payload, list):
         return []
-    return _sort_oldest_first(payload)
+    # ``gh issue list`` returns both ISSUE and PULL_REQUEST rows when a
+    # PR carries a matching label. Drop PRs so the dispatcher never
+    # treats a PR as an issue (see research/2026-05-23-dispatcher-false-surface-bug).
+    issues_only = [i for i in payload if i.get("type") == "ISSUE"]
+    return _sort_oldest_first(issues_only)
 
 
 def gh_list_sm_issues(repo: str, *, gh_bin: str = "gh") -> list[dict[str, Any]]:
@@ -132,7 +136,7 @@ def gh_list_sm_issues(repo: str, *, gh_bin: str = "gh") -> list[dict[str, Any]]:
         "--search",
         "label:sm:draft,sm:needs_study,sm:selected,sm:designing,sm:design_review,sm:designed,sm:compacting,sm:building,sm:reviewing,sm:validating",
         "--json",
-        "number,title,labels,author,createdAt,body",
+        "number,title,labels,author,createdAt,body,type",
         "--limit",
         str(RECENT_ISSUE_LIMIT),
     ]
@@ -145,10 +149,15 @@ def gh_list_sm_issues(repo: str, *, gh_bin: str = "gh") -> list[dict[str, Any]]:
     # Defensive client-side filter: the search qualifier above is OR
     # across the listed labels, but if gh ever loosens parsing we still
     # only act on issues with at least one whitelisted ``sm:*`` label.
+    # Also drop PULL_REQUEST rows — ``gh issue list`` returns both ISSUE
+    # and PR matches when a PR carries an ``sm:*`` label, and the draft
+    # handler would otherwise emit a triage surface for a PR (see
+    # research/2026-05-23-dispatcher-false-surface-bug).
     filtered = [
         issue
         for issue in payload
         if any(n in SM_LABEL_WHITELIST for n in _label_names(issue))
+        and issue.get("type") == "ISSUE"
     ]
     return _sort_oldest_first(filtered)
 
@@ -184,7 +193,7 @@ def gh_list_stale_closed_sm_issues(
         "--search",
         f"label:{search_terms}",
         "--json",
-        "number,title,labels,author,createdAt,body",
+        "number,title,labels,author,createdAt,body,type",
         "--limit",
         str(RECENT_ISSUE_LIMIT),
     ]
@@ -197,11 +206,14 @@ def gh_list_stale_closed_sm_issues(
     # Client-side defense: only keep issues whose label set contains at
     # least one *non-terminal* whitelisted ``sm:*`` label. A closed
     # issue at ``sm:done`` must never appear here even if the search
-    # qualifier loosens upstream.
+    # qualifier loosens upstream. Also drop PRs — ``gh issue list``
+    # returns both ISSUE and PULL_REQUEST rows when a PR carries a
+    # matching label (see research/2026-05-23-dispatcher-false-surface-bug).
     return [
         issue
         for issue in payload
         if any(n in NON_TERMINAL_SM_LABELS for n in _label_names(issue))
+        and issue.get("type") == "ISSUE"
     ]
 
 
@@ -234,7 +246,7 @@ def gh_list_open_done_sm_issues(
         "--search",
         f"label:{DONE_SM_LABEL}",
         "--json",
-        "number,title,labels,author,createdAt,body",
+        "number,title,labels,author,createdAt,body,type",
         "--limit",
         str(RECENT_ISSUE_LIMIT),
     ]
@@ -246,11 +258,14 @@ def gh_list_open_done_sm_issues(
         return []
     # Client-side defense: only keep issues whose label set contains
     # ``sm:done``. A loosened search qualifier upstream must not pull
-    # in unrelated issues.
+    # in unrelated issues. Also drop PRs — ``gh issue list`` returns
+    # both ISSUE and PULL_REQUEST rows when a PR carries the matching
+    # label (see research/2026-05-23-dispatcher-false-surface-bug).
     return [
         issue
         for issue in payload
         if DONE_SM_LABEL in _label_names(issue)
+        and issue.get("type") == "ISSUE"
     ]
 
 
