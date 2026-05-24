@@ -1265,11 +1265,11 @@ def test_sweep_helper_filters_terminal_labels_defensively() -> None:
     assert "--state" in args and args[args.index("--state") + 1] == "closed"
     search_idx = args.index("--search")
     search_str = args[search_idx + 1]
-    assert search_str.startswith("label:")
+    assert search_str.startswith("is:issue label:")
     # The label list must be exactly the non-terminal set, comma-joined,
     # sorted (deterministic for testability).
     expected_terms = ",".join(sorted(sm.NON_TERMINAL_SM_LABELS))
-    assert search_str == f"label:{expected_terms}"
+    assert search_str == f"is:issue label:{expected_terms}"
     # And the terminals must NOT appear.
     assert "sm:done" not in search_str
     assert "sm:rejected" not in search_str
@@ -1305,6 +1305,14 @@ def test_gh_list_sm_issues_filters_pull_requests() -> None:
     ]
 
     def fake_run_gh(args: list[str], *, timeout: int = 60) -> str:
+        # Simulate GitHub honoring the ``is:issue`` qualifier server-side:
+        # when the search string includes it, PR rows are excluded by the
+        # API. The production code now relies on this instead of a
+        # client-side ``type == "ISSUE"`` filter (which depended on the
+        # ``--json type`` field unrecognized by gh 2.92).
+        search_idx = args.index("--search")
+        if "is:issue" in args[search_idx + 1]:
+            return json.dumps([p for p in payload if p.get("type") == "ISSUE"])
         return json.dumps(payload)
 
     import unittest.mock as _mock
