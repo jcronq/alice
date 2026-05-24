@@ -1287,12 +1287,14 @@ def _make_links_db_inplace(
 
 def test_hebbian_defaults_match_decision_memo():
     """Guardrail: the in-module fallback config must match the
-    decision memo's recommended values. Drift requires re-eval."""
-    assert HEBBIAN_DEFAULTS["enabled"] is False
-    assert HEBBIAN_DEFAULTS["edge_boost"] == 0.4
+    calibration design's recommended values. Drift requires re-eval.
+    Updated 2026-05-24 to the calibrated values
+    (cortex-memory/research/2026-05-21-hebbian-calibration-design.md)."""
+    assert HEBBIAN_DEFAULTS["enabled"] is True
+    assert HEBBIAN_DEFAULTS["edge_boost"] == 0.5
     assert HEBBIAN_DEFAULTS["structural_weight"] == 1.0
-    assert HEBBIAN_DEFAULTS["casual_weight"] == 0.25
-    assert HEBBIAN_DEFAULTS["min_edge_weight_sum"] == 8
+    assert HEBBIAN_DEFAULTS["casual_weight"] == 0.5
+    assert HEBBIAN_DEFAULTS["min_edge_weight_sum"] == 2
 
 
 def test_query_edge_weights_sums_structural_and_casual(tmp_path: pathlib.Path):
