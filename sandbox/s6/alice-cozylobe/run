@@ -1,0 +1,29 @@
+#!/command/with-contenv bash
+# alice-cozylobe — CozyHem reasoning lobe daemon. Long-lived Python
+# process that opens an SSE connection to cozyhem-engine, runs a
+# wake loop against the resulting events, and emits structured
+# events to /state/worker/cozylobe.log via core.EventLogger.
+#
+# Runs as alice. Single supervised process — no worker-lease or
+# blue/green coordination (it's not part of the speaking/thinking
+# turn-handling path). Crash semantics: any task dying triggers an
+# orderly shutdown; s6's own restart backoff brings it back up.
+#
+# Service scaffold deferred from PR #359 (cozylobe walking skeleton);
+# wired here per the daemon docstring's "follow-up PR" note.
+set -e
+
+export ALICE_CONFIG=/home/alice/.config/alice/alice.env
+# Monorepo root bind-mounted at /home/alice/alice — src/ holds all Python
+# packages (core, alice_speaking, alice_thinking, alice_cozylobe).
+export PYTHONPATH=/home/alice/alice/src
+# Unbuffered stdout so s6 can see logs in real time.
+export PYTHONUNBUFFERED=1
+
+# redirfd (execline) opens fd 2 *after* s6-setuidgid drops privileges so
+# the stderr log is created/owned by alice. A shell-level `2>>` would be
+# opened by the supervising root shell and leave the inode root-owned,
+# breaking subsequent alice-uid writes. Mirrors the pattern in
+# alice-speaking/run and alice-sm-dispatcher/run.
+exec s6-setuidgid alice redirfd -a 2 /state/worker/cozylobe-stderr.log \
+    /opt/alice-venv/bin/python -m alice_cozylobe
