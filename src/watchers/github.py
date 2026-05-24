@@ -667,13 +667,27 @@ def poll_repo(
                         payload={"issue": issue},
                     )
                 )
-                # Best-effort SM v2 intake: stamp ``sm:draft`` so the
-                # dispatcher's labeled-issue query can see it. Skips if
-                # the issue already carries any ``sm:*`` label (a human
-                # may have pre-routed it). Any failure here is logged
-                # inside ``_apply_sm_draft_label`` and must not block
-                # the note emission above — issues #247/#258/#260/#261
-                # are the structural backlog that motivated this.
+            # Best-effort SM v2 intake: stamp ``sm:draft`` so the
+            # dispatcher's labeled-issue query can see the issue. This is
+            # deliberately *decoupled* from the ``new_issue`` event above:
+            # that ``elif`` only fires on an unseen→open transition seen
+            # *after* priming, so issues that were already open when the
+            # repo was first wired into the watcher (recorded as "open"
+            # during the prime pass — e.g. a repo onboarded with a
+            # pre-existing backlog like cozyhem-engine) never hit it and
+            # would stall forever at no label, invisible to the
+            # dispatcher's ``label:sm:*`` query. Gating the stamp on
+            # open + trusted + non-self-filed (rather than the
+            # unseen→open transition) back-fills that priming gap.
+            #
+            # ``_apply_sm_draft_label`` is idempotent — it no-ops if any
+            # ``sm:*`` label is already present — so re-stamping a fresh
+            # issue we just emitted a ``new_issue`` for is harmless, and
+            # we never replay a historical ``new_issue`` note just to fix
+            # a missing label. Failures are logged inside the labeler and
+            # must not tank the pass. Issues #247/#258/#260/#261 are the
+            # structural backlog that motivated this.
+            if new_state == "open":
                 try:
                     label_apply(
                         repo,

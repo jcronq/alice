@@ -757,11 +757,14 @@ def test_is_self_filed_helper() -> None:
 #
 # The SM v2 dispatcher's GitHub query filters by ``label:sm:draft,...`` —
 # unlabeled trusted-author issues are invisible to it and stall. The
-# watcher closes that gap by stamping ``sm:draft`` whenever it emits a
-# ``new_issue`` event. These tests pin the load-bearing behaviors:
-# fires on fresh issues, idempotent against pre-existing sm:* labels,
-# and gated by the same emit condition (no fire for self-filed,
-# untrusted authors, first run, or unprimed issue side).
+# watcher closes that gap by stamping ``sm:draft`` on any open, trusted,
+# non-self-filed issue (NOT just ones that trip the ``new_issue`` emit
+# branch — that branch only fires on an unseen→open transition, so a
+# pre-existing backlog primed as "open" would never be labeled). These
+# tests pin the load-bearing behaviors: fires on fresh issues, back-fills
+# pre-existing open ones, idempotent against pre-existing sm:* labels, and
+# still suppressed for self-filed, untrusted authors, first run, and
+# closed issues.
 # ---------------------------------------------------------------------------
 
 
@@ -848,21 +851,22 @@ def test_labeler_skips_when_issue_already_has_sm_label(
     )
 
 
-def test_labeler_gated_by_new_issue_emit_condition(
+def test_labeler_gates_still_suppress(
     mind_dir: pathlib.Path, state_path: pathlib.Path
 ) -> None:
-    """The labeler is wired inside the same branch that emits the
-    ``new_issue`` event: it must not fire when emission is suppressed by
-    first-run priming, the issues_primed gate, untrusted authors, or the
-    self-filed marker. Covers all four suppressors in one pass."""
+    """The labeler no longer keys off the ``new_issue`` emit branch (which
+    only fires on an unseen→open transition); it keys off open + trusted +
+    non-self-filed so a pre-existing backlog gets back-filled (see
+    :func:`test_labeler_backfills_preexisting_open_issue`). The remaining
+    suppressors must still hold: first-run priming, untrusted authors, the
+    self-filed marker, and closed issues. Each case uses a distinct issue
+    so the back-fill of any lingering trusted issue can't mask a gate."""
     api = FakeAPI()
     labeler = FakeLabeler()
 
-    # Case 1 — first run: prime pass with two issues already present
-    # must not fire the labeler (no new_issue event during priming).
-    api.issues = [
-        _make_issue(number=1, title="Pre-existing trusted", user="jcronq"),
-    ]
+    # Case 1 — first run: the prime pass must not fire the labeler (the
+    # whole intake block is gated on ``not first_run``).
+    api.issues = [_make_issue(number=1, title="Trusted", user="jcronq")]
     api.issue_thread_comments[1] = []
     gh_watcher.run(
         mind_dir=mind_dir,
@@ -872,16 +876,13 @@ def test_labeler_gated_by_new_issue_emit_condition(
         label_apply=labeler,
     )
     assert labeler.calls == [], "first-run prime must not invoke the labeler"
+    labeler.calls.clear()
 
-    # Case 2 — untrusted author: a rando-opened issue must not be labeled.
+    # Case 2 — untrusted author: a rando-opened issue is never labeled.
     api.issues = [
-        _make_issue(number=1, title="Pre-existing trusted", user="jcronq"),
         _make_issue(
-            number=2,
-            title="Rando issue",
-            user="rando",
-            author_association="NONE",
-        ),
+            number=2, title="Rando", user="rando", author_association="NONE"
+        )
     ]
     api.issue_thread_comments[2] = []
     gh_watcher.run(
@@ -891,24 +892,16 @@ def test_labeler_gated_by_new_issue_emit_condition(
         log=lambda _: None,
         label_apply=labeler,
     )
-    assert labeler.calls == [], "untrusted-author new issue must not be labeled"
+    assert labeler.calls == [], "untrusted-author issue must not be labeled"
 
-    # Case 3 — self-filed marker: Speaking-filed issues are suppressed at
-    # the emit branch, so the labeler must not run.
+    # Case 3 — self-filed marker: Speaking-filed issues are suppressed.
     api.issues = [
-        _make_issue(number=1, title="Pre-existing trusted", user="jcronq"),
-        _make_issue(
-            number=2,
-            title="Rando issue",
-            user="rando",
-            author_association="NONE",
-        ),
         _make_issue(
             number=3,
             title="Self-filed",
             user="jcronq",
             body=f"plan stuff\n\n{gh_watcher.SELF_FILED_MARKER}",
-        ),
+        )
     ]
     api.issue_thread_comments[3] = []
     gh_watcher.run(
@@ -920,23 +913,10 @@ def test_labeler_gated_by_new_issue_emit_condition(
     )
     assert labeler.calls == [], "self-filed issue must not be labeled"
 
-    # Sanity: a legitimately fresh trusted non-self-filed issue on the
-    # next poll DOES fire — proves the test isn't a no-op.
+    # Case 4 — closed issue: the ``new_state == "open"`` guard keeps closed
+    # issues out of the SM lifecycle even when trusted and unlabeled.
     api.issues = [
-        _make_issue(number=1, title="Pre-existing trusted", user="jcronq"),
-        _make_issue(
-            number=2,
-            title="Rando issue",
-            user="rando",
-            author_association="NONE",
-        ),
-        _make_issue(
-            number=3,
-            title="Self-filed",
-            user="jcronq",
-            body=f"plan stuff\n\n{gh_watcher.SELF_FILED_MARKER}",
-        ),
-        _make_issue(number=4, title="Real fresh", user="jcronq"),
+        _make_issue(number=4, title="Closed", user="jcronq", state="closed")
     ]
     api.issue_thread_comments[4] = []
     gh_watcher.run(
@@ -946,7 +926,68 @@ def test_labeler_gated_by_new_issue_emit_condition(
         log=lambda _: None,
         label_apply=labeler,
     )
-    assert labeler.calls == [("acme/widgets", 4, [])]
+    assert labeler.calls == [], "closed issue must not be labeled"
+
+    # Sanity — a fresh trusted, open, non-self-filed issue DOES fire,
+    # proving the gates above aren't a blanket no-op.
+    api.issues = [_make_issue(number=5, title="Real fresh", user="jcronq")]
+    api.issue_thread_comments[5] = []
+    gh_watcher.run(
+        mind_dir=mind_dir,
+        state_path=state_path,
+        api=api,
+        log=lambda _: None,
+        label_apply=labeler,
+    )
+    assert labeler.calls == [("acme/widgets", 5, [])]
+
+
+def test_labeler_backfills_preexisting_open_issue(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    """Regression for the priming gap (issues #247/#258/#260/#261): an issue
+    already open when the repo is first wired into the watcher is recorded
+    as ``"open"`` during the prime pass, so on later polls its ``prev_state``
+    is ``"open"`` (not ``None``) and it never trips the unseen→open
+    ``new_issue`` branch. The old new_issue-coupled labeler skipped it
+    forever, leaving it unlabeled and invisible to the SM dispatcher's
+    ``label:sm:*`` query — exactly cozyhem-engine's stuck backlog. The
+    decoupled labeler must back-fill ``sm:draft`` WITHOUT replaying a
+    historical ``new_issue`` note."""
+    api = FakeAPI()
+    labeler = FakeLabeler()
+
+    # Prime: the issue is already open (a pre-existing backlog ticket).
+    api.issues = [
+        _make_issue(number=17, title="Pre-existing backlog", user="jcronq")
+    ]
+    api.issue_thread_comments[17] = []
+    gh_watcher.run(
+        mind_dir=mind_dir,
+        state_path=state_path,
+        api=api,
+        log=lambda _: None,
+        label_apply=labeler,
+    )
+    assert labeler.calls == [], "prime pass must not label"
+    notes_before = len(list((mind_dir / "inner" / "notes").glob("*.md")))
+
+    # Next poll: same still-open issue. prev_state is now "open" (primed),
+    # so the unseen→open branch is dead — but the decoupled labeler fires.
+    gh_watcher.run(
+        mind_dir=mind_dir,
+        state_path=state_path,
+        api=api,
+        log=lambda _: None,
+        label_apply=labeler,
+    )
+    assert labeler.calls == [("acme/widgets", 17, [])], (
+        "pre-existing open issue must be back-filled with sm:draft"
+    )
+    notes_after = len(list((mind_dir / "inner" / "notes").glob("*.md")))
+    assert notes_after == notes_before, (
+        "back-fill must not replay a historical new_issue note"
+    )
 
 
 def test_extract_label_names_helper() -> None:
