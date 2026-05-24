@@ -4816,8 +4816,8 @@ def test_draft_without_art_label_auto_classifies_via_keyword(
     state_path: pathlib.Path, tmp_path: pathlib.Path
 ) -> None:
     """A draft with no ``art:*`` triggers the classifier hook; a
-    keyword in the title (here ``bug``) drives the suggestion to
-    ``art:bug`` via the ``edit_labels`` transport."""
+    bug-keyword in the title maps to the ``art:code`` whitelisted
+    label via :data:`_CATEGORY_LABEL` (bug → code)."""
     issue = _draft_issue(
         2940,
         art_labels=(),
@@ -4844,10 +4844,11 @@ def test_draft_without_art_label_auto_classifies_via_keyword(
     )
 
     assert exit_code == 0
-    # The classifier fires on the unlabelled draft → bug wins.
+    # The classifier fires on the unlabelled draft. Bug-category keywords
+    # map to art:code under the post-#352 whitelist-only emission scheme.
     classifier_edits = [
         c for c in label_rec.calls
-        if c["number"] == 2940 and c["add"] == ["art:bug"]
+        if c["number"] == 2940 and c["add"] == ["art:code"]
     ]
     assert len(classifier_edits) == 1
 
