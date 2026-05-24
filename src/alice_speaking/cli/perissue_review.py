@@ -31,7 +31,7 @@ import re
 import sys
 import time
 from importlib import resources
-from typing import Any, Callable, Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from .perissue import parse_frontmatter, post_comment_via_gh
 
