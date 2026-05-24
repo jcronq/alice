@@ -391,6 +391,22 @@ def test_wake_distribution_spans_midnight(tmp_path: Path) -> None:
 # Test 6 — wake distribution: all three filename formats parse
 
 
+def test_wake_distribution_accepts_sleep_prefix(tmp_path: Path) -> None:
+    """Production wake frontmatter uses ``sleep_b``/``sleep_c``/``sleep_d``;
+    _read_stage must accept that form, not just the bare letter."""
+    thoughts = tmp_path / "thoughts"
+    today = thoughts / "2026-05-08"
+    today.mkdir(parents=True)
+    _write_wake(today, "000500-wake.md", "sleep_b")
+    _write_wake(today, "001500-wake.md", "sleep_c")
+    _write_wake(today, "003000-wake.md", "sleep_d")
+
+    window_start = datetime(2026, 5, 7, 23, 0, 0)
+    window_end = datetime(2026, 5, 8, 7, 0, 0)
+    counts = count_wakes_by_stage(thoughts, window_start, window_end)
+    assert counts == {"stage_b": 1, "stage_c": 1, "stage_d": 1}, counts
+
+
 def test_wake_distribution_filename_formats(tmp_path: Path) -> None:
     thoughts = tmp_path / "thoughts"
     yest = thoughts / "2026-05-07"

@@ -1349,6 +1349,11 @@ def _read_stage(path: Path) -> str | None:
     stage = fm.get("stage")
     if isinstance(stage, str):
         s = stage.strip().upper()
+        # Production wake frontmatter uses ``sleep_b``/``sleep_c``/
+        # ``sleep_d``; older tests/fixtures use the bare ``B``/``C``/
+        # ``D``. Accept both so the metric reflects reality.
+        if s.startswith("SLEEP_"):
+            s = s[len("SLEEP_"):]
         if s in {"B", "C", "D"}:
             return s
     return None
