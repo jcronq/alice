@@ -158,7 +158,7 @@ def _validate_issue(
             return False, f"issue is {data.get('state')}"
         if data.get("type") != "ISSUE":
             return False, f"type is {data.get('type')} (not ISSUE)"
-        labels = [l.get("name") for l in data.get("labels", []) if isinstance(l, dict)]
+        labels = [entry.get("name") for entry in data.get("labels", []) if isinstance(entry, dict)]
         if DRAFT_SM_LABEL not in labels:
             return False, f"missing {DRAFT_SM_LABEL} label"
         return True, "ok"
