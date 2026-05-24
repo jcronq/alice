@@ -21,6 +21,12 @@ adds six more flavors that mirror the existing SM dispatcher spawn map
 * ``config-worker`` — ``(sm:selected, art:config_change)`` constrained
   diff worker. Smaller-diff + schema-aware threshold (<15 LOC, no
   schema change) per the user's SM tactical-threshold feedback.
+* ``cozylobe`` — third reasoning region for the CozyHem (home-
+  automation) domain. Background lifecycle; consumes cozyhem-engine
+  SSE events and writes observations/surfaces through inner/notes +
+  inner/surface. Vault read-only, no MCP — surfaces are the only
+  escalation path. Design lives at
+  ``cortex-memory/research/2026-05-23-cozyhem-lobe-design.md``.
 
 The :class:`KernelSpec` templates here are deliberately conservative
 defaults: model + tool list + max_seconds that match today's
@@ -266,6 +272,60 @@ _WATCHER_RULES = (
 )
 
 
+# cozylobe rules — third reasoning region dedicated to CozyHem (home
+# automation) domain. Lives inside the alice container alongside
+# speaking and thinking; consumes cozyhem-engine's SSE event stream,
+# runs short reasoning passes per event, and emits observations back
+# through the existing inner/notes + inner/surface plumbing. The
+# vault-boundary constraints mirror thinking's "no real-world writes"
+# rule but narrow the write surface to ephemeral scratch + the
+# fleeting-note channels, per the lobe design:
+# ``cortex-memory/research/2026-05-23-cozyhem-lobe-design.md``
+# (Question 2: read-only vault + inner/notes writes).
+_COZYLOBE_RULES = (
+    BehavioralRule(
+        id="vault-read-only",
+        injection=(
+            "You may read anything inside ``~/alice-mind/cortex-memory/`` "
+            "but never modify it. Durable observations go to "
+            "``~/alice-mind/inner/notes/`` as fleeting notes for thinking "
+            "to promote. Ephemeral scratch lives at "
+            "``~/alice-mind/inner/scratch/cozyhem/``. The vault's single-"
+            "writer invariant is held by thinking — do not race it."
+        ),
+    ),
+    BehavioralRule(
+        id="urgency-via-surface",
+        injection=(
+            "When an event is urgent enough that speaking should hear "
+            "about it immediately (doorbell, security, anomaly), write "
+            "a surface file at "
+            "``~/alice-mind/inner/surface/<utc>-cozylobe-<slug>.md``. "
+            "Surface writes are the lobe's only fast-path to speaking; "
+            "use them sparingly."
+        ),
+    ),
+    BehavioralRule(
+        id="no-direct-cozyhem-mutation",
+        injection=(
+            "Do not POST to CozyHem's REST API from this agent context. "
+            "Action proposals (light cycling, scene change) go in the "
+            "observation note for thinking to ratify and speaking to "
+            "execute. The lobe observes and reasons; speaking acts."
+        ),
+    ),
+    BehavioralRule(
+        id="lobe-quiet-on-link-loss",
+        injection=(
+            "If the qwen reasoning endpoint is unreachable, log once "
+            "and stop reasoning until the next SSE event arrives. Never "
+            "fabricate intent classifications when the model is down — "
+            "the supervisor falls back to rule-based handling."
+        ),
+    ),
+)
+
+
 # config-worker rules — smaller-diff + schema-aware threshold. Mirrors
 # the user's SM tactical-threshold feedback: config_change tasks must
 # stay under 15 LOC with no schema change, otherwise the work belongs
@@ -441,6 +501,30 @@ def _watcher_template() -> KernelSpec:
     )
 
 
+def _cozylobe_template() -> KernelSpec:
+    """Cozylobe — home-automation reasoning region. Read + Write + Edit +
+    Grep + Glob covers the vault-read + inner/notes-write surface the
+    lobe needs. ``Bash`` is included so the lobe can shell out to
+    diagnostics (e.g. ``curl http://aimax1:8000/...``) when an event
+    needs cross-checking against CozyHem state — but the
+    ``no-direct-cozyhem-mutation`` rule keeps it to GETs. No MCP —
+    the lobe does not message Jason directly; surface files are the
+    only escalation path."""
+    return KernelSpec(
+        model=_DEFAULT_MODEL,
+        allowed_tools=[
+            "Bash",
+            "Read",
+            "Write",
+            "Edit",
+            "Glob",
+            "Grep",
+        ],
+        max_seconds=0,
+        thinking=None,
+    )
+
+
 def _config_worker_template() -> KernelSpec:
     """Config-worker — read + bash + file edits, no MCP. Constrained
     enough to encode "config-files only" intent at the tool layer;
@@ -567,6 +651,33 @@ def _watcher_spec() -> AgentSpec:
     )
 
 
+def _cozylobe_spec() -> AgentSpec:
+    """Cozylobe — third reasoning region (home-automation domain).
+
+    Lives inside the alice container alongside speaking and thinking;
+    consumes cozyhem-engine's SSE events, runs short reasoning passes
+    with the local qwen 27b model as the fast classifier, and writes
+    observations/surfaces through the existing inner/notes +
+    inner/surface plumbing. Background lifecycle because the supervising
+    daemon (``alice_cozylobe``) keeps the SSE consumer open and only
+    spawns the agent on event arrival — no cron, no per-issue scope.
+
+    Per Jason's 2026-05-24 directive: the wake loop's reasoning step
+    routes through this AgentSpec via :func:`run_agent`. Direct
+    kernel calls are forbidden.
+    """
+    return AgentSpec(
+        name="cozylobe",
+        persona="cozylobe",
+        kernel_spec=_cozylobe_template(),
+        runtime="claude-agent-sdk",
+        scope="background",
+        lifecycle="always-on",
+        tool_policy=policies.config_writer,
+        behavioral_constraints=_COZYLOBE_RULES,
+    )
+
+
 def _config_worker_spec() -> AgentSpec:
     return AgentSpec(
         name="config-worker",
@@ -596,6 +707,7 @@ def register_builtins(registry=default_registry) -> None:
         _designer_spec(),
         _watcher_spec(),
         _config_worker_spec(),
+        _cozylobe_spec(),
     ):
         if spec.name in registry:
             continue

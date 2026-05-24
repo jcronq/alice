@@ -86,6 +86,7 @@ build-backend = "hatchling.build"
 #   alice_forge     — State Machine dispatcher for alice_forge (poll → trust-filter → comment)
 #   alice_speaking  — Signal daemon (composes kernel with producers/handlers/outbox)
 #   alice_thinking  — one-shot wake (python -m alice_thinking)
+#   alice_cozylobe  — CozyHem reasoning lobe (push-driven SSE consumer + wake loop)
 #   viewer    — FastAPI observability UI (serves /state logs)
 #   watchers  — one-shot pollers feeding inner/notes/ (github, …)
 [tool.hatch.build.targets.wheel]
@@ -100,6 +101,7 @@ packages = [
     "src/alice_forge",
     "src/alice_speaking",
     "src/alice_thinking",
+    "src/alice_cozylobe",
     "src/viewer",
     "src/watchers",
 ]
