@@ -99,7 +99,7 @@ def gh_list_selected_issues(repo: str, *, gh_bin: str = "gh") -> list[dict[str, 
         "--label",
         ACTIVE_SM_LABEL,
         "--json",
-        "number,title,labels,author,createdAt,body,type",
+        "number,title,labels,author,createdAt,body",
         "--limit",
         str(RECENT_ISSUE_LIMIT),
     ]
@@ -109,11 +109,13 @@ def gh_list_selected_issues(repo: str, *, gh_bin: str = "gh") -> list[dict[str, 
     payload = json.loads(stdout)
     if not isinstance(payload, list):
         return []
-    # ``gh issue list`` returns both ISSUE and PULL_REQUEST rows when a
-    # PR carries a matching label. Drop PRs so the dispatcher never
-    # treats a PR as an issue (see research/2026-05-23-dispatcher-false-surface-bug).
-    issues_only = [i for i in payload if i.get("type") == "ISSUE"]
-    return _sort_oldest_first(issues_only)
+    # ``--label`` (vs ``--search``) goes through gh's REST issue listing
+    # which already excludes PRs, so we don't need the client-side
+    # ``type == "ISSUE"`` filter here. The ``--json type`` field was
+    # dropped because gh 2.92 in the production container doesn't
+    # recognize it (a 2.93+ feature) — every poll cycle errored out
+    # before listing a single issue. See #349 / dispatcher gh regression.
+    return _sort_oldest_first(payload)
 
 
 def gh_list_sm_issues(repo: str, *, gh_bin: str = "gh") -> list[dict[str, Any]]:
@@ -134,9 +136,15 @@ def gh_list_sm_issues(repo: str, *, gh_bin: str = "gh") -> list[dict[str, Any]]:
         "--state",
         "open",
         "--search",
-        "label:sm:draft,sm:needs_study,sm:selected,sm:designing,sm:design_review,sm:designed,sm:compacting,sm:building,sm:reviewing,sm:validating",
+        # ``is:issue`` filters PRs out at GitHub's side — without it the
+        # search syntax returns both ISSUE and PULL_REQUEST rows when
+        # a PR carries an ``sm:*`` label. Replaces the client-side
+        # ``type == "ISSUE"`` filter that depended on the ``--json type``
+        # field (unrecognized by gh 2.92 in the production container —
+        # see dispatcher gh regression).
+        "is:issue label:sm:draft,sm:needs_study,sm:selected,sm:designing,sm:design_review,sm:designed,sm:compacting,sm:building,sm:reviewing,sm:validating",
         "--json",
-        "number,title,labels,author,createdAt,body,type",
+        "number,title,labels,author,createdAt,body",
         "--limit",
         str(RECENT_ISSUE_LIMIT),
     ]
@@ -146,18 +154,13 @@ def gh_list_sm_issues(repo: str, *, gh_bin: str = "gh") -> list[dict[str, Any]]:
     payload = json.loads(stdout)
     if not isinstance(payload, list):
         return []
-    # Defensive client-side filter: the search qualifier above is OR
-    # across the listed labels, but if gh ever loosens parsing we still
-    # only act on issues with at least one whitelisted ``sm:*`` label.
-    # Also drop PULL_REQUEST rows — ``gh issue list`` returns both ISSUE
-    # and PR matches when a PR carries an ``sm:*`` label, and the draft
-    # handler would otherwise emit a triage surface for a PR (see
-    # research/2026-05-23-dispatcher-false-surface-bug).
+    # Defensive client-side filter: only act on issues with at least one
+    # whitelisted ``sm:*`` label. PR exclusion is handled by ``is:issue``
+    # in the search qualifier above.
     filtered = [
         issue
         for issue in payload
         if any(n in SM_LABEL_WHITELIST for n in _label_names(issue))
-        and issue.get("type") == "ISSUE"
     ]
     return _sort_oldest_first(filtered)
 
@@ -191,9 +194,11 @@ def gh_list_stale_closed_sm_issues(
         "--state",
         "closed",
         "--search",
-        f"label:{search_terms}",
+        # ``is:issue`` filters PRs out at GitHub's side — see the
+        # equivalent comment in :func:`gh_list_sm_issues`.
+        f"is:issue label:{search_terms}",
         "--json",
-        "number,title,labels,author,createdAt,body,type",
+        "number,title,labels,author,createdAt,body",
         "--limit",
         str(RECENT_ISSUE_LIMIT),
     ]
@@ -206,14 +211,12 @@ def gh_list_stale_closed_sm_issues(
     # Client-side defense: only keep issues whose label set contains at
     # least one *non-terminal* whitelisted ``sm:*`` label. A closed
     # issue at ``sm:done`` must never appear here even if the search
-    # qualifier loosens upstream. Also drop PRs — ``gh issue list``
-    # returns both ISSUE and PULL_REQUEST rows when a PR carries a
-    # matching label (see research/2026-05-23-dispatcher-false-surface-bug).
+    # qualifier loosens upstream. PR exclusion is handled by ``is:issue``
+    # in the search qualifier above.
     return [
         issue
         for issue in payload
         if any(n in NON_TERMINAL_SM_LABELS for n in _label_names(issue))
-        and issue.get("type") == "ISSUE"
     ]
 
 
@@ -244,9 +247,11 @@ def gh_list_open_done_sm_issues(
         "--state",
         "open",
         "--search",
-        f"label:{DONE_SM_LABEL}",
+        # ``is:issue`` filters PRs out at GitHub's side — see
+        # :func:`gh_list_sm_issues`.
+        f"is:issue label:{DONE_SM_LABEL}",
         "--json",
-        "number,title,labels,author,createdAt,body,type",
+        "number,title,labels,author,createdAt,body",
         "--limit",
         str(RECENT_ISSUE_LIMIT),
     ]
@@ -258,14 +263,12 @@ def gh_list_open_done_sm_issues(
         return []
     # Client-side defense: only keep issues whose label set contains
     # ``sm:done``. A loosened search qualifier upstream must not pull
-    # in unrelated issues. Also drop PRs — ``gh issue list`` returns
-    # both ISSUE and PULL_REQUEST rows when a PR carries the matching
-    # label (see research/2026-05-23-dispatcher-false-surface-bug).
+    # in unrelated issues. PR exclusion is handled by ``is:issue`` in
+    # the search qualifier above.
     return [
         issue
         for issue in payload
         if DONE_SM_LABEL in _label_names(issue)
-        and issue.get("type") == "ISSUE"
     ]
 
 
