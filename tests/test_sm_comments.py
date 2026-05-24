@@ -82,6 +82,13 @@ class TestAuditPrefixFilter:
             # Legacy patterns still on old issues.
             '[SM] blocked reason="manual operator block"',
             "[SM] speaking-build-complete pr=#1",
+            # Speaking-side build outcome audits — informational, state
+            # advances via PR detection or the silent-spawn guard, not
+            # these. Missing pre-#346: tripped parse-error every poll
+            # cycle on #345.
+            "[SM] build-complete pr=https://github.com/jcronq/alice/pull/346",
+            '[SM] build-failed reason="kernel panic in sub-agent"',
+            '[SM] build-blocked reason="missing API key"',
         ):
             assert parse_comment(body, "jcronq") is None, body
 

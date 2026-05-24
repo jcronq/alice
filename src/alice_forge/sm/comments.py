@@ -69,6 +69,19 @@ AUDIT_PREFIXES: tuple[str, ...] = (
     # Legacy speaking-build completion echo. Predates the v3
     # event-driven build-complete; some older comments still carry it.
     "[SM] speaking-build-complete",
+    # Speaking-side build outcome audits emitted from
+    # alice_speaking.runtime.render_build_complete_comment /
+    # render_build_failed_comment, plus the build-blocked path
+    # documented at runtime.py:107. They're informational — state
+    # already advances via the dispatcher detecting the linked PR
+    # (build-complete) or the silent-spawn guard at sm:building
+    # (build-failed / build-blocked). Without these prefixes the
+    # parser raises `unknown verb 'build-complete'` every poll cycle
+    # on any issue whose build-complete comment is still visible
+    # (cf. noise on #345 on 2026-05-23/24).
+    "[SM] build-complete",
+    "[SM] build-failed",
+    "[SM] build-blocked",
 )
 
 
