@@ -129,6 +129,16 @@ services:
       - ${HOME}/.config/gh:/home/alice/.config/gh:ro
       - ${HOME}/.ssh:/home/alice/.ssh:ro
     working_dir: /home/alice/alice-mind
+    # Route `aimax1` to the docker bridge gateway so in-container HTTP
+    # calls reach cozyhem-engine on the host. Without this, docker's
+    # DNS forwards `aimax1` to the host's resolver and returns
+    # 127.0.1.1 (the host's own Ubuntu /etc/hosts self-entry),
+    # pointing the request at the container's loopback — where
+    # nothing listens. Cozylobe's SSE consumer was failing every 30s
+    # with "All connection attempts failed" until this was added
+    # (2026-05-24).
+    extra_hosts:
+      - "aimax1:host-gateway"
     # GPU pass-through (for the in-container Qwen3-Embedding-4B served
     # from /state/sci-env) lives in docker-compose.gpu.yml, not here.
     # The default deploy assumes the embedder is reached over HTTP via
