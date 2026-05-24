@@ -108,6 +108,7 @@ class VaultSnapshot:
     consecutive_b: int
     consecutive_null_c: int
     stage_d_cap_exhausted: bool
+    hours_since_last_d: float  # hours since last D wake; inf if none
     vault_dir_mtime: float
     state_dir: pathlib.Path
     today: str
@@ -358,6 +359,70 @@ def _stage_d_cap_exhausted(state_dir: pathlib.Path, *, today: str, cap: int) -> 
     return False
 
 
+def _hours_since_last_d(
+    state_dir: pathlib.Path,
+    *,
+    now: _dt.datetime,
+) -> float:
+    """Hours since the last Stage D wake. Returns infinity if no D wake exists.
+
+    Reads ``stage-d-pairs-{date}.jsonl`` for today + yesterday (UTC dates
+    of those files are typically aligned with local dates; we tolerate
+    both by scanning two days back). A record counts as a completed D
+    wake when it carries a non-empty ``synthesis`` field.
+
+    Timestamps in the JSONL are UTC (``"...Z"``). ``now`` may be local
+    (tz-aware EDT) or UTC; we normalize both ends to UTC before the
+    delta to avoid the off-by-4-hours pitfall the design note flagged.
+    """
+    last_d_ts: Optional[_dt.datetime] = None
+
+    for days_back in (0, 1):
+        date_str = (now.date() - _dt.timedelta(days=days_back)).isoformat()
+        pairs_file = state_dir / f"stage-d-pairs-{date_str}.jsonl"
+        if not pairs_file.is_file():
+            continue
+        try:
+            for line in pairs_file.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                # A record with a synthesis entry = a completed D wake.
+                if rec.get("synthesis") not in (None, ""):
+                    ts_str = rec.get("ts")
+                    if not ts_str:
+                        continue
+                    try:
+                        ts_dt = _dt.datetime.fromisoformat(
+                            ts_str.replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        continue
+                    # Normalize to UTC for comparison.
+                    if ts_dt.tzinfo is None:
+                        ts_dt = ts_dt.replace(tzinfo=_dt.timezone.utc)
+                    else:
+                        ts_dt = ts_dt.astimezone(_dt.timezone.utc)
+                    if last_d_ts is None or ts_dt > last_d_ts:
+                        last_d_ts = ts_dt
+        except OSError:
+            continue
+
+    if last_d_ts is None:
+        return float("inf")
+
+    if now.tzinfo is None:
+        now_utc = now.replace(tzinfo=_dt.timezone.utc)
+    else:
+        now_utc = now.astimezone(_dt.timezone.utc)
+    delta = now_utc - last_d_ts
+    return delta.total_seconds() / 3600
+
+
 def _vault_dir_mtime(mind: pathlib.Path) -> float:
     p = mind / "cortex-memory"
     try:
@@ -404,6 +469,7 @@ def build_vault_snapshot(
         stage_d_cap_exhausted=_stage_d_cap_exhausted(
             state_dir, today=today, cap=cfg.stage_d_nightly_cap
         ),
+        hours_since_last_d=_hours_since_last_d(state_dir, now=now),
         vault_dir_mtime=_vault_dir_mtime(mind),
         state_dir=state_dir,
         today=today,
@@ -450,6 +516,17 @@ def select_phase(vault: VaultSnapshot, cfg: Optional[PhaseConfig] = None) -> Pha
         if vault.has_recent_research and not vault.stage_d_cap_exhausted:
             return Phase.SLEEP_D
         return Phase.SLEEP_C
+
+    # Rule 2e: Periodic D floor — every 4 hours without D, schedule D.
+    # Catches the structural starvation when inbox is sparse but Rule 2b's
+    # 6-consecutive-B threshold hasn't yet been reached. Inbox triggers
+    # (Rule 2a) still take priority above.
+    if (
+        vault.hours_since_last_d >= 4
+        and vault.has_recent_research
+        and not vault.stage_d_cap_exhausted
+    ):
+        return Phase.SLEEP_D
 
     # Rule 2c: early phase (23:00–02:59) → C (default sleep).
     if vault.hour in (23, 0, 1, 2):

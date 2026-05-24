@@ -22,6 +22,7 @@ from alice_thinking.phase import (
     PhaseConfig,
     PromptFragmentLoader,
     VaultSnapshot,
+    _hours_since_last_d,
     build_vault_snapshot,
     detect_commission_notes,
     detect_conflict_notes,
@@ -41,6 +42,7 @@ def _snap(
     consecutive_b: int = 0,
     consecutive_null_c: int = 0,
     stage_d_cap_exhausted: bool = False,
+    hours_since_last_d: float = 0.0,
     state_dir: pathlib.Path = pathlib.Path("/tmp/state"),
     today: str = "2026-05-07",
 ) -> VaultSnapshot:
@@ -54,6 +56,7 @@ def _snap(
         consecutive_b=consecutive_b,
         consecutive_null_c=consecutive_null_c,
         stage_d_cap_exhausted=stage_d_cap_exhausted,
+        hours_since_last_d=hours_since_last_d,
         vault_dir_mtime=0.0,
         state_dir=state_dir,
         today=today,
@@ -243,6 +246,206 @@ def test_rule_2d_skipped_when_cap_exhausted() -> None:
 def test_fallback_late_phase_without_corpus_is_b() -> None:
     snap = _snap(hour=5, has_recent_research=False)
     assert select_phase(snap, _full_cfg()) is Phase.SLEEP_B
+
+
+# ---------------------------------------------------------------------------
+# Rule 2e — periodic D floor (4+ hours without D → D)
+#
+# Design: cortex-memory/research/2026-05-24-stage-d-minimum-guarantee.md
+# Impl:   cortex-memory/research/2026-05-24-stage-d-minimum-guarantee-impl-guide.md
+# ---------------------------------------------------------------------------
+
+
+def test_rule_2e_fires_when_4h_elapsed_with_corpus() -> None:
+    """4+ hours since last D + corpus exists + cap not exhausted +
+    inbox empty + consecutive_b below threshold → SLEEP_D.
+    Without this rule, hour 23 with these inputs would default to
+    SLEEP_C via Rule 2c (the structural starvation pattern)."""
+    snap = _snap(
+        hour=23,
+        has_recent_research=True,
+        hours_since_last_d=10.0,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_D
+
+
+def test_rule_2e_fires_on_exact_4h_boundary() -> None:
+    """4.0 hours is the threshold — boundary fires."""
+    snap = _snap(
+        hour=1,
+        has_recent_research=True,
+        hours_since_last_d=4.0,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_D
+
+
+def test_rule_2e_does_not_fire_below_4h() -> None:
+    """<4h since last D → Rule 2e is silent and Rule 2c takes over."""
+    snap = _snap(
+        hour=0,
+        has_recent_research=True,
+        hours_since_last_d=2.0,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+def test_rule_2e_does_not_fire_without_corpus() -> None:
+    """No research corpus → no point spinning D up."""
+    snap = _snap(
+        hour=23,
+        has_recent_research=False,
+        hours_since_last_d=10.0,
+    )
+    # Falls through to Rule 2c → SLEEP_C in the early window.
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+def test_rule_2e_does_not_fire_when_cap_exhausted() -> None:
+    """Cap respected — D never exceeds the nightly cap."""
+    snap = _snap(
+        hour=23,
+        has_recent_research=True,
+        hours_since_last_d=10.0,
+        stage_d_cap_exhausted=True,
+    )
+    # Falls through to Rule 2c → SLEEP_C in the early window.
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+def test_rule_2a_inbox_beats_rule_2e() -> None:
+    """Rule 2a (inbox → B) still wins over Rule 2e even with a huge
+    gap since last D. Real work always takes priority."""
+    snap = _snap(
+        hour=23,
+        has_inbox_items=True,
+        has_recent_research=True,
+        hours_since_last_d=10.0,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_B
+
+
+def test_rule_2b_consecutive_b_loop_still_breaks_before_2e() -> None:
+    """Rule 2b (6+ consecutive B → break loop) fires before Rule 2e —
+    the loop-breaker preserves its existing semantics."""
+    # 6 consecutive B + corpus → Rule 2b returns SLEEP_D regardless
+    # of hours_since_last_d. The behavior is the same either way, but
+    # placement matters for the no-corpus case:
+    snap = _snap(
+        hour=23,
+        consecutive_b=6,
+        has_recent_research=False,
+        hours_since_last_d=10.0,
+    )
+    # Rule 2b without corpus returns C; Rule 2e gated on corpus so
+    # it can't fire either. Confirms Rule 2b is reached first and
+    # Rule 2e doesn't override its no-corpus branch.
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+# ---------------------------------------------------------------------------
+# _hours_since_last_d — helper that drives Rule 2e
+# ---------------------------------------------------------------------------
+
+
+def _utc(year: int, month: int, day: int, hour: int = 0, minute: int = 0) -> _dt.datetime:
+    return _dt.datetime(year, month, day, hour, minute, tzinfo=_dt.timezone.utc)
+
+
+def test_hours_since_last_d_returns_inf_when_no_file(
+    tmp_path: pathlib.Path,
+) -> None:
+    """No stage-d-pairs files at all → infinity (no D wake exists)."""
+    assert _hours_since_last_d(tmp_path, now=_utc(2026, 5, 24, 12)) == float("inf")
+
+
+def test_hours_since_last_d_returns_inf_when_no_synthesis(
+    tmp_path: pathlib.Path,
+) -> None:
+    """File exists but no record carries a non-empty synthesis →
+    no completed D wake → infinity."""
+    today = "2026-05-24"
+    (tmp_path / f"stage-d-pairs-{today}.jsonl").write_text(
+        '{"ts": "2026-05-24T03:00:00Z", "synthesis": ""}\n'
+        '{"ts": "2026-05-24T05:00:00Z", "synthesis": null}\n'
+    )
+    assert _hours_since_last_d(tmp_path, now=_utc(2026, 5, 24, 12)) == float("inf")
+
+
+def test_hours_since_last_d_computes_delta_for_completed_d_wake(
+    tmp_path: pathlib.Path,
+) -> None:
+    """One completed D wake 6 hours before `now` → 6.0."""
+    today = "2026-05-24"
+    (tmp_path / f"stage-d-pairs-{today}.jsonl").write_text(
+        '{"ts": "2026-05-24T03:00:00Z", "synthesis": "synth note"}\n'
+    )
+    result = _hours_since_last_d(tmp_path, now=_utc(2026, 5, 24, 9))
+    assert result == pytest.approx(6.0)
+
+
+def test_hours_since_last_d_picks_most_recent_synthesis(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Multiple synthesis records → use the latest timestamp."""
+    today = "2026-05-24"
+    (tmp_path / f"stage-d-pairs-{today}.jsonl").write_text(
+        '{"ts": "2026-05-24T01:00:00Z", "synthesis": "first"}\n'
+        '{"ts": "2026-05-24T07:00:00Z", "synthesis": "latest"}\n'
+        '{"ts": "2026-05-24T04:00:00Z", "synthesis": "middle"}\n'
+    )
+    result = _hours_since_last_d(tmp_path, now=_utc(2026, 5, 24, 10))
+    assert result == pytest.approx(3.0)
+
+
+def test_hours_since_last_d_scans_yesterday_file(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Yesterday's pairs file is also scanned so a late-night D wake
+    is found when `now` rolls past midnight."""
+    yesterday = "2026-05-23"
+    (tmp_path / f"stage-d-pairs-{yesterday}.jsonl").write_text(
+        '{"ts": "2026-05-23T23:00:00Z", "synthesis": "late night D"}\n'
+    )
+    # now = 2026-05-24 02:00 UTC → 3h since the 23:00 UTC synthesis.
+    result = _hours_since_last_d(tmp_path, now=_utc(2026, 5, 24, 2))
+    assert result == pytest.approx(3.0)
+
+
+def test_hours_since_last_d_ignores_malformed_lines(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Malformed JSON, missing ts, and blank lines all skipped without
+    crashing. The one valid synthesis record drives the result."""
+    today = "2026-05-24"
+    (tmp_path / f"stage-d-pairs-{today}.jsonl").write_text(
+        "\n"
+        "{not valid json\n"
+        '{"synthesis": "no ts field"}\n'
+        '{"ts": "not-a-timestamp", "synthesis": "bad ts"}\n'
+        '{"ts": "2026-05-24T06:00:00Z", "synthesis": "valid"}\n'
+        "   \n"
+    )
+    result = _hours_since_last_d(tmp_path, now=_utc(2026, 5, 24, 10))
+    assert result == pytest.approx(4.0)
+
+
+def test_hours_since_last_d_handles_local_time_now(
+    tmp_path: pathlib.Path,
+) -> None:
+    """UTC/local off-by-N-hours protection: when `now` is tz-aware
+    local (e.g. EDT, UTC-4), the helper normalizes both ends to UTC
+    so the delta is correct."""
+    today = "2026-05-24"
+    (tmp_path / f"stage-d-pairs-{today}.jsonl").write_text(
+        '{"ts": "2026-05-24T03:00:00Z", "synthesis": "synth"}\n'
+    )
+    # 2026-05-24 05:00 EDT == 2026-05-24 09:00 UTC. 6h elapsed since
+    # the 03:00 UTC synthesis — NOT 2h (the bug if we forget to
+    # normalize timezones).
+    edt = _dt.timezone(_dt.timedelta(hours=-4))
+    now_local = _dt.datetime(2026, 5, 24, 5, 0, tzinfo=edt)
+    result = _hours_since_last_d(tmp_path, now=now_local)
+    assert result == pytest.approx(6.0)
 
 
 # ---------------------------------------------------------------------------
