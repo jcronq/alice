@@ -81,7 +81,9 @@ class TestAuditPrefixFilter:
             "[SM] auto-study-complete",
             # Dispatcher-emitted surface for untriaged drafts. Speaking
             # reads it and replies with `[SM] select` / `[SM] route-to-study`.
+            # Observed parse-error storm on alice#350 and cozyhem#17.
             "[SM] triage-surface number=350 title='Signal observability view'",
+            "[SM] triage-surface number=17 title='Hue Remote Support'",
             # Legacy patterns still on old issues.
             '[SM] blocked reason="manual operator block"',
             "[SM] speaking-build-complete pr=#1",

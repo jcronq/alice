@@ -59,6 +59,14 @@ AUDIT_PREFIXES: tuple[str, ...] = (
     "[SM] design-ready-audit",
     "[SM] transition",
     "[SM] parse-error",
+    # The dispatcher's own triage prompt on an un-triaged ``sm:draft``
+    # issue. Without this, the next poll re-parses it as a verb
+    # (``unknown verb 'triage-surface'``) and posts a parse-error reply
+    # to the bot's own comment — a self-inflicted loop, the same class
+    # of noise this list exists to prevent. The legacy
+    # ``alice_forge.comments`` parser already returns ``None`` for
+    # unknown verbs, so only the v3 parser needs the entry.
+    "[SM] triage-surface",
     "[SM] rebase-needed",
     "[SM] rebase-pushed",
     "[SM] rebase-escalated",
