@@ -30,6 +30,7 @@ from typing import Awaitable, Callable, Optional
 from core.agent_library import AgentSpec, default_registry, run_agent
 from core.events import EventEmitter
 
+from .activity_fetcher import ActivitySnapshot, FetchActivity
 from .events import CozyHemEvent
 from .qwen_client import QwenClassification, QwenClient, QwenUnreachable
 from .surfaces import build_slug, write_observation_note, write_urgent_surface
@@ -44,6 +45,14 @@ log = logging.getLogger(__name__)
 # Type alias for the run_agent shim so tests can swap in a stub without
 # reaching into core.agent_library internals.
 RunAgentCallable = Callable[..., Awaitable[object]]
+
+
+# Default cadence for the periodic wake mode. Five minutes is the
+# compromise: short enough that a degrading situation (e.g. anthem
+# left on overnight) surfaces in <10min, long enough that the
+# reasoning cost stays bounded. Override via the constructor arg or
+# the daemon's CLI flag.
+DEFAULT_PERIODIC_CADENCE_SECONDS = 300.0
 
 
 # Kinds we treat as CRITICAL — hardcoded so the lobe responds to
@@ -76,6 +85,9 @@ class WakeLoop:
         agent_spec: Optional[AgentSpec] = None,
         run_agent_fn: Optional[RunAgentCallable] = None,
         backend: object = None,
+        fetch_activity: Optional[FetchActivity] = None,
+        periodic_cadence_s: float = DEFAULT_PERIODIC_CADENCE_SECONDS,
+        sleep: Optional[Callable[[float], Awaitable[None]]] = None,
     ) -> None:
         self._emitter = emitter
         self._qwen = qwen_client
@@ -85,6 +97,12 @@ class WakeLoop:
         # Track whether we've already logged a qwen-unreachable warning
         # in the current outage. Reset on first successful classify.
         self._qwen_warned = False
+        # Periodic-mode wiring. The fetcher is optional so callers that
+        # only want the SSE path (e.g. legacy tests) can omit it; the
+        # periodic task then no-ops cleanly.
+        self._fetch_activity = fetch_activity
+        self._periodic_cadence_s = periodic_cadence_s
+        self._sleep = sleep or asyncio.sleep
 
     async def run(
         self,
@@ -183,6 +201,133 @@ class WakeLoop:
             entity_id=event.entity_id,
             urgency=classification.urgency if classification else "UNKNOWN",
             intent=classification.intent if classification else "skipped",
+        )
+
+    async def run_periodic(self, stop: asyncio.Event) -> None:
+        """Pull-driven audit loop. Every ``periodic_cadence_s`` seconds,
+        fetch an activity snapshot and dispatch run_agent with a
+        synthetic ``periodic_review`` event.
+
+        Skips the tick (no run_agent dispatch) when the snapshot is
+        ``None`` — cozyhem-engine unreachable. This is the periodic-
+        mode analog of the qwen ``lobe-quiet-on-link-loss`` rule: do
+        not fabricate reasoning input when the substrate is down.
+
+        Cancellation: respects :class:`asyncio.CancelledError` so
+        ``daemon.run()``'s shutdown sequence can tear the task down
+        cleanly. The interruptible-sleep pattern uses
+        :func:`asyncio.wait_for` on ``stop.wait()`` so we don't have
+        to wait the full cadence before exiting.
+        """
+        if self._fetch_activity is None:
+            log.info(
+                "cozylobe: periodic wake disabled (no activity fetcher "
+                "configured)"
+            )
+            return
+
+        while not stop.is_set():
+            try:
+                await self._periodic_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # One bad tick must not kill the loop. Log + telemetry +
+                # continue. Matches the SSE wake loop's per-event
+                # swallow semantics.
+                log.exception("cozylobe: periodic tick failed: %s", exc)
+                self._emitter.emit(
+                    "cozylobe_periodic_error",
+                    error=type(exc).__name__,
+                    message=str(exc),
+                )
+
+            # Interruptible sleep — stop.wait() returns immediately if
+            # the daemon is shutting down so we don't have to wait the
+            # full cadence on SIGTERM.
+            try:
+                await asyncio.wait_for(
+                    stop.wait(), timeout=self._periodic_cadence_s
+                )
+            except asyncio.TimeoutError:
+                # Normal path — cadence elapsed without stop being set.
+                continue
+            except asyncio.CancelledError:
+                raise
+
+    async def _periodic_tick(self) -> None:
+        """One full periodic-mode tick: fetch snapshot → maybe
+        dispatch. Pulled out of :meth:`run_periodic` so exceptions
+        land in one place and the sleep stays uninterrupted by per-
+        tick error handling.
+        """
+        snapshot = await self._fetch_activity()
+        if snapshot is None:
+            # Cozyhem unreachable. The fetcher already logged once;
+            # we emit telemetry so the skipped tick is visible without
+            # adding log noise.
+            self._emitter.emit("cozylobe_periodic_skipped_unreachable")
+            return
+
+        self._emitter.emit(
+            "cozylobe_periodic_tick",
+            fetched_at=snapshot.fetched_at,
+            partial_errors=len(snapshot.partial_errors),
+        )
+
+        prompt = self._build_periodic_prompt(snapshot)
+        correlation_id = f"cozylobe-periodic_review-{snapshot.fetched_at:.0f}"
+        try:
+            await self._run_agent(
+                self._agent_spec,
+                prompt=prompt,
+                emitter=self._emitter,
+                backend=self._backend,
+                correlation_id=correlation_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "cozylobe: run_agent failed for periodic_review: %s", exc
+            )
+            self._emitter.emit(
+                "cozylobe_agent_error",
+                kind="periodic_review",
+                entity_id="",
+                error=type(exc).__name__,
+            )
+            return
+
+        self._emitter.emit(
+            "cozylobe_periodic_handled",
+            fetched_at=snapshot.fetched_at,
+        )
+
+    def _build_periodic_prompt(self, snapshot: ActivitySnapshot) -> str:
+        """Compose the supervisor prompt for the periodic-review path.
+
+        Different framing from the SSE prompt: no specific event to
+        triage — instead the lobe is being asked to look at the home's
+        current state and decide whether anything is worth surfacing.
+        Concise on purpose; the registered AgentSpec carries the
+        behavioral rules.
+        """
+        partial = ""
+        if snapshot.partial_errors:
+            partial = (
+                "\nNOTE: snapshot is partial. The following endpoints "
+                f"failed: {'; '.join(snapshot.partial_errors)}\n"
+            )
+        return (
+            "Here's a snapshot of the home's recent activity. Anything "
+            "need attention? Drop an observation note "
+            "(inner/notes/) if you see a pattern worth remembering, or "
+            "an urgent surface (inner/surface/) if action is needed. "
+            "Stay quiet if nothing stands out.\n\n"
+            f"fetched_at: {snapshot.fetched_at}\n"
+            f"entity_states: {snapshot.entity_states}\n"
+            f"anthem_status: {snapshot.anthem_status}\n"
+            f"lights: {snapshot.lights}\n"
+            f"{partial}"
         )
 
     async def _classify(
