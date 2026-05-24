@@ -112,11 +112,11 @@ SPEAKING_DEFAULTS: dict[str, Any] = {
         # alice_speaking.retrieval.cue_runner.HEBBIAN_DEFAULTS for
         # the in-module fallback constants.
         "hebbian": {
-            "enabled": False,
-            "edge_boost": 0.4,
+            "enabled": True,
+            "edge_boost": 0.5,
             "structural_weight": 1.0,
-            "casual_weight": 0.25,
-            "min_edge_weight_sum": 8,
+            "casual_weight": 0.5,
+            "min_edge_weight_sum": 2,
         },
     },
 }

@@ -100,11 +100,11 @@ ACCESS_COUNT_CAP = 100
 # Defaults below are the conservative opt-in shape. Live cfg overrides
 # come from SPEAKING_DEFAULTS["cue_runner"]["hebbian"] (alice_speaking.infra.config).
 HEBBIAN_DEFAULTS: dict[str, Any] = {
-    "enabled": False,
-    "edge_boost": 0.4,
+    "enabled": True,
+    "edge_boost": 0.5,
     "structural_weight": 1.0,
-    "casual_weight": 0.25,
-    "min_edge_weight_sum": 8,
+    "casual_weight": 0.5,
+    "min_edge_weight_sum": 2,
 }
 
 # Fitness-domain recency boost (#246). The static type-aware constants
