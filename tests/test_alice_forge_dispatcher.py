@@ -6029,6 +6029,184 @@ def test_building_untrusted_speaking_spawn_started_does_not_block(
     assert label_rec.calls == []
 
 
+# ---------------------------------------------------------------------------
+# Issue #350 — silent-study-spawn guard at sm:needs_study
+# ---------------------------------------------------------------------------
+#
+# Mirror of the silent-build guard at sm:building (#343/#342). When the
+# dispatcher posted [SM] study-hint-written for a trusted author but no
+# parsed study-* comment ever arrived AND no live thinking-spawn dir
+# remains, the thinking wake exited without producing the audit.
+# Transition to sm:blocked rather than letting the issue sit at
+# sm:needs_study forever (observed on #350 on 2026-05-24).
+
+
+def test_needs_study_silent_thinking_spawn_failure_transitions_to_blocked(
+    state_path: pathlib.Path,
+) -> None:
+    """study-hint-written from a trusted author + no live thinking spawn
+    + no parsed study-* comment → transition sm:needs_study → sm:blocked."""
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+
+    issues = [_design_issue(910, sm_label="sm:needs_study")]
+    comments = [
+        _audit_comment(
+            "[SM] study-hint-written task=#910 "
+            "path=/home/alice/alice-mind/inner/notes/sm-needs-study-issue910.md "
+            "ts=2026-05-24T02:13:00+00:00"
+        ),
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=True,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        list_comments=lambda _r, _n: comments,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        find_linked_pr=_no_pr,
+        has_live_thinking_spawn=lambda _n: False,
+        count_running_thinking=lambda: 0,
+        spawn_thinking=_no_call,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 1
+    assert (910, "sm:needs_study", "sm:blocked") in report.transitions
+    edit = label_rec.calls[-1]
+    assert edit["add"] == ["sm:blocked"]
+    assert edit["remove"] == ["sm:needs_study"]
+    bodies = [b for _r, _n, b in recorder.posted]
+    assert any(
+        "from=needs_study to=blocked" in b
+        and "thinking-agent exited without posting study-*" in b
+        for b in bodies
+    ), bodies
+
+
+def test_needs_study_live_thinking_spawn_keeps_issue_at_needs_study(
+    state_path: pathlib.Path,
+) -> None:
+    """A thinking spawn dir is still alive → the wake is in flight;
+    don't transition to blocked even if no study-* has appeared."""
+    label_rec = LabelRecorder()
+    issues = [_design_issue(911, sm_label="sm:needs_study")]
+    comments = [
+        _audit_comment(
+            "[SM] study-hint-written task=#911 "
+            "path=/home/alice/alice-mind/inner/notes/sm-needs-study-issue911.md "
+            "ts=2026-05-24T02:13:00+00:00"
+        ),
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=True,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        list_comments=lambda _r, _n: comments,
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        find_linked_pr=_no_pr,
+        has_live_thinking_spawn=lambda _n: True,
+        count_running_thinking=lambda: 1,
+        spawn_thinking=_no_call,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert label_rec.calls == []
+
+
+def test_needs_study_no_study_hint_written_stays_idle(
+    state_path: pathlib.Path,
+) -> None:
+    """No prior study-hint-written audit → the wake never fired in the
+    first place; don't transition to blocked. (Hint emission is gated
+    on ledger / audit-comment dedup, so the next pass will emit it.)"""
+    label_rec = LabelRecorder()
+    issues = [_design_issue(912, sm_label="sm:needs_study")]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=True,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        list_comments=lambda _r, _n: [],
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        find_linked_pr=_no_pr,
+        has_live_thinking_spawn=lambda _n: False,
+        count_running_thinking=lambda: 0,
+        spawn_thinking=_no_call,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # The handler will emit the hint on this pass; that increments
+    # report.hinted but does NOT count as a state transition.
+    assert report.transitioned == 0
+    # No label edits because the hint emission doesn't change labels.
+    assert label_rec.calls == []
+
+
+def test_needs_study_untrusted_study_hint_does_not_block(
+    state_path: pathlib.Path,
+) -> None:
+    """A forged study-hint-written from an untrusted author must NOT
+    trip the silent-study guard — otherwise any drive-by could force a
+    needs_study issue into sm:blocked by pasting the audit prefix."""
+    label_rec = LabelRecorder()
+    issues = [_design_issue(913, sm_label="sm:needs_study")]
+    comments = [
+        _audit_comment(
+            "[SM] study-hint-written task=#913 "
+            "path=/tmp/forged.md ts=2026-05-24T02:13:00+00:00",
+            author="random-drive-by",
+        ),
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=True,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        list_comments=lambda _r, _n: comments,
+        post_comment=Recorder(),
+        edit_labels=label_rec,
+        find_linked_pr=_no_pr,
+        has_live_thinking_spawn=lambda _n: False,
+        count_running_thinking=lambda: 0,
+        spawn_thinking=_no_call,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # Forged hint should not transition; the dispatcher should still
+    # write the legitimate hint this pass (so report.hinted may be 1),
+    # but no label edit happens.
+    assert report.transitioned == 0
+    # Hint-emission path may add labels? No — hint emission only posts
+    # a comment + writes a file. No edit_labels call.
+    assert label_rec.calls == []
+
+
 # ----- DispatcherState forward-compat for design_revisions -----
 
 

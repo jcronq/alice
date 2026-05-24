@@ -867,6 +867,7 @@ def run(
                     research_dir=research_dir,
                     trusted_authors=trusted_authors,
                     art_whitelist=ART_LABEL_WHITELIST,
+                    has_live_thinking_spawn=has_live_thinking_spawn,
                     dry_run=dry_run,
                     log=log,
                     now_iso=now_iso,

@@ -21,6 +21,7 @@ def _process_needs_study(
     research_dir: pathlib.Path,
     trusted_authors: frozenset[str],
     art_whitelist: frozenset[str],
+    has_live_thinking_spawn: Callable[[int], bool] | None,
     dry_run: bool,
     log: Callable[[str], None],
     now_iso: Callable[[], str],
@@ -215,6 +216,68 @@ def _process_needs_study(
             # one-action-per-pass invariant the rest of the handler
             # follows.
             return
+
+        # Silent-study-spawn guard — mirrors the silent-build guard at
+        # sm:building (PR #343, issue #342). When the dispatcher posted
+        # ``[SM] study-hint-written`` but thinking never wrote a study-*
+        # comment AND no live thinking-spawn dir remains, the wake
+        # exited without producing the audit. Don't leave the issue
+        # parked at sm:needs_study forever — transition to sm:blocked
+        # so the operator sees the dead spawn. Observed on #350 on
+        # 2026-05-24: hint posted 02:13, no study-complete by 11:30+,
+        # no spawn dirs on disk.
+        if has_live_thinking_spawn is not None and not has_live_thinking_spawn(
+            number
+        ):
+            if _has_prior_study_hint_audit(
+                comments, trusted_authors=trusted_authors
+            ):
+                reason = (
+                    "thinking-agent exited without posting study-* "
+                    "(see #350)"
+                )
+                transition_body = render_transition_comment(
+                    NEEDS_STUDY_SM_LABEL, BLOCKED_SM_LABEL, reason
+                )
+                if dry_run:
+                    log(
+                        f"[sm-dispatcher] DRY-RUN would transition "
+                        f"#{number}: needs_study → blocked ({reason})"
+                    )
+                    report.transitioned += 1
+                    report.transitions.append(
+                        (number, NEEDS_STUDY_SM_LABEL, BLOCKED_SM_LABEL)
+                    )
+                    return
+                try:
+                    edit_labels(
+                        repo,
+                        number,
+                        add=[BLOCKED_SM_LABEL],
+                        remove=[NEEDS_STUDY_SM_LABEL],
+                    )
+                    post_comment(repo, number, transition_body)
+                except GHCommandError as exc:
+                    log(
+                        f"[sm-dispatcher] needs_study #{number}: "
+                        f"failed silent-study-failure transition: {exc}"
+                    )
+                    if (
+                        exc.looks_like_auth_failure
+                        or exc.looks_like_rate_limit
+                    ):
+                        raise
+                    return
+                report.transitioned += 1
+                report.transitions.append(
+                    (number, NEEDS_STUDY_SM_LABEL, BLOCKED_SM_LABEL)
+                )
+                log(
+                    f"[sm-dispatcher] transitioned #{number}: "
+                    f"needs_study → blocked ({reason})"
+                )
+                return
+
         log(
             f"[sm-dispatcher] needs_study #{number}: "
             f"no parsed study-* comment yet"
