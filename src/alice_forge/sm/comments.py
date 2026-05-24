@@ -49,6 +49,13 @@ AUDIT_PREFIXES: tuple[str, ...] = (
     "[SM] speaking-spawn-started",
     "[SM] dispatcher-hello",
     "[SM] study-hint-written",
+    # Dispatcher emits this when first encountering an untriaged
+    # sm:draft issue (alice_forge.sm.handlers.draft.render_triage_surface).
+    # It's a surface, not a verb — speaking is supposed to read it and
+    # respond with `[SM] select art=...` or `[SM] route-to-study`. Without
+    # this filter the parser raises `unknown verb 'triage-surface'` every
+    # poll cycle. Same drift hazard as the build-* prefixes below.
+    "[SM] triage-surface",
     "[SM] design-ready-audit",
     "[SM] transition",
     "[SM] parse-error",

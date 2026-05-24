@@ -79,6 +79,9 @@ class TestAuditPrefixFilter:
             "[SM] exit-transition-required",
             "[SM] design-revisions-capped",
             "[SM] auto-study-complete",
+            # Dispatcher-emitted surface for untriaged drafts. Speaking
+            # reads it and replies with `[SM] select` / `[SM] route-to-study`.
+            "[SM] triage-surface number=350 title='Signal observability view'",
             # Legacy patterns still on old issues.
             '[SM] blocked reason="manual operator block"',
             "[SM] speaking-build-complete pr=#1",
