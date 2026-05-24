@@ -2158,3 +2158,106 @@ def test_low_wake_count_handles_zero_wakes(tmp_path: Path) -> None:
     assert event["total_sleep_wakes"] == 0
     assert event.get("low_wake_count") is True
     assert len(list(surface.glob("*-low-wake-count.md"))) == 1
+
+
+# ---------------------------------------------------------------------------
+# gh-state exclusion
+# cortex-memory/gh-state/ holds GitHub issue/PR state-mirror notes —
+# operational records with 0 trigger_keywords and 0 wikilinks by design.
+# They are excluded from the orphan, dark, and zero-edge buckets so they
+# don't dominate the vault-health signal (production: 42 of 43 dark notes
+# were gh-state mirrors, masking the real knowledge-vault count of 1).
+# The exclusion is selective — bare research/ notes still count as dark.
+# ---------------------------------------------------------------------------
+
+
+def _write_gh_state_note(vault: Path, name: str = "alice-123.md") -> Path:
+    """Drop a representative gh-state mirror note: type: pr, no triggers,
+    no wikilinks. Same shape as production cortex-memory/gh-state/*.md."""
+    return _write(
+        vault / "gh-state" / name,
+        """
+        ---
+        slug: alice-123
+        type: pr
+        state: open
+        repo: jcronq/alice
+        ---
+
+        State-mirror body — no wikilinks, no trigger_keywords.
+        """,
+    )
+
+
+def test_gh_state_note_not_counted_as_dark(tmp_path: Path) -> None:
+    """gh-state mirrors (0 inbound, 0 triggers) MUST NOT bump
+    truly_dark_count or shadow_orphan_count."""
+    vault = _make_vault(tmp_path)
+    _write_gh_state_note(vault)
+    counts = count_shadow_and_dark(vault)
+    assert counts == {
+        "shadow_orphan_count": 0,
+        "truly_dark_count": 0,
+        "frontmatter_parse_failures": 0,
+    }
+
+
+def test_gh_state_note_not_counted_as_orphan(tmp_path: Path) -> None:
+    """gh-state mirrors have 0 inbound wikilinks by design and MUST NOT
+    appear in count_orphans's result."""
+    vault = _make_vault(tmp_path)
+    _write_gh_state_note(vault)
+    n, orphans = count_orphans(vault)
+    assert n == 0
+    assert orphans == []
+
+
+def test_gh_state_note_not_in_continuous_checks(tmp_path: Path) -> None:
+    """gh-state mirrors with 0 inbound + 0 outbound + 0 triggers (the
+    common production shape) MUST NOT appear in either bucket of
+    compute_continuous_checks."""
+    vault = _make_vault(tmp_path)
+    _write_gh_state_note(vault)
+    # Add a gh-state note that — hypothetically — has wikilinks and old
+    # date: even if its shape *would* match trigger_gap on a research/
+    # note, the folder exclusion must take precedence.
+    _write(
+        vault / "gh-state" / "alice-456.md",
+        """
+        ---
+        slug: alice-456
+        type: issue
+        state: closed
+        created: 2026-04-01
+        ---
+
+        Hypothetical mirror with outbound [[anchor-a]] and [[anchor-b]].
+        """,
+    )
+    _write(vault / "reference" / "anchor-a.md", "anchor a\n")
+    _write(vault / "reference" / "anchor-b.md", "anchor b\n")
+    result = compute_continuous_checks(vault, today=datetime(2026, 5, 20))
+    assert result["zero_edge_notes"]["count"] == 0
+    assert result["zero_edge_notes"]["slugs"] == []
+    assert result["trigger_gap_notes"]["count"] == 0
+    assert result["trigger_gap_notes"]["slugs"] == []
+
+
+def test_bare_research_note_still_counted_as_dark(tmp_path: Path) -> None:
+    """Sanity: the gh-state exclusion is selective, not a global loosening.
+    A bare research/ note (0 inbound, 0 triggers) is STILL truly_dark."""
+    vault = _make_vault(tmp_path)
+    _write_gh_state_note(vault)
+    _write(
+        vault / "research" / "real-dark.md",
+        """
+        ---
+        slug: real-dark
+        ---
+
+        Knowledge note with no triggers and no inbound — actually dark.
+        """,
+    )
+    counts = count_shadow_and_dark(vault)
+    assert counts["truly_dark_count"] == 1
+    assert counts["shadow_orphan_count"] == 0

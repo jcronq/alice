@@ -352,9 +352,11 @@ def count_orphans(vault_dir: Path) -> tuple[int, list[str]]:
     orphans: list[str] = []
     for md in _iter_notes(vault_dir):
         rel_parts = md.relative_to(vault_dir).parts
-        # Dailies and archive are always excluded — they're
-        # date-stamped activity logs that wouldn't normally be linked to.
-        if rel_parts and (rel_parts[0] == "dailies" or rel_parts[0] == "archive"):
+        # Dailies, archive, and gh-state are always excluded — dailies and
+        # archive are date-stamped activity logs that wouldn't normally be
+        # linked to; gh-state holds GitHub issue/PR state-mirror notes,
+        # which by design carry 0 wikilinks (see issue tracker context).
+        if rel_parts and rel_parts[0] in {"dailies", "archive", "gh-state"}:
             continue
         text = _read_text(md)
         fm, _body = split_frontmatter(text)
@@ -406,7 +408,11 @@ def count_shadow_and_dark(vault_dir: Path) -> dict[str, int]:
     parse_failures = 0
     for md in _iter_notes(vault_dir):
         rel_parts = md.relative_to(vault_dir).parts
-        if rel_parts and (rel_parts[0] == "dailies" or rel_parts[0] == "archive"):
+        # gh-state holds GitHub issue/PR state-mirror notes — operational
+        # records with 0 trigger_keywords and 0 wikilinks by design. They
+        # are not knowledge notes and would otherwise dominate the
+        # truly_dark_count signal.
+        if rel_parts and rel_parts[0] in {"dailies", "archive", "gh-state"}:
             continue
         if md.name in EXCLUDED_NAMES:
             continue
@@ -495,7 +501,9 @@ def compute_continuous_checks(
 
     for md in _iter_notes(vault_dir):
         rel_parts = md.relative_to(vault_dir).parts
-        if rel_parts and (rel_parts[0] == "dailies" or rel_parts[0] == "archive"):
+        # gh-state mirrors are excluded for the same reason as in
+        # count_shadow_and_dark — operational records, not knowledge.
+        if rel_parts and rel_parts[0] in {"dailies", "archive", "gh-state"}:
             continue
         rel = str(md.relative_to(vault_dir))
         text = _read_text(md)
@@ -652,8 +660,12 @@ DECAY_COVERAGE_ACTIVATION_DATE = "2026-05-06"
 
 # Folders excluded from the decayed-pool candidate set. Dailies are
 # activity logs (not retrievable knowledge); index/README/unresolved are
-# vault scaffolding; archive/ is intentionally cold storage.
-_DECAY_EXCLUDED_FOLDERS = frozenset({"dailies", "archive"})
+# vault scaffolding; archive/ is intentionally cold storage. gh-state
+# holds GitHub issue/PR state-mirror notes — operational records with
+# 0 trigger_keywords by design, so the cue runner is never expected to
+# surface them. Counting them in the decayed pool would depress the
+# coverage signal with notes that nobody is supposed to be reading.
+_DECAY_EXCLUDED_FOLDERS = frozenset({"dailies", "archive", "gh-state"})
 
 
 def _parse_access_count(raw: Any) -> int | None:
