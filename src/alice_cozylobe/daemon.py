@@ -21,13 +21,17 @@ from typing import Optional
 
 from core.events import EventLogger
 
+from .activity_fetcher import (
+    DEFAULT_COZYHEM_BASE_URL,
+    ActivityFetcher,
+)
 from .qwen_client import DEFAULT_QWEN_ENDPOINT, QwenClient
 from .sse_consumer import (
     DEFAULT_EVENTS_URL,
     DEFAULT_QUEUE_SIZE,
     SSEConsumer,
 )
-from .wake_loop import WakeLoop
+from .wake_loop import DEFAULT_PERIODIC_CADENCE_SECONDS, WakeLoop
 
 
 __all__ = ["CozylobeDaemon", "main"]
@@ -56,21 +60,46 @@ class CozylobeDaemon:
         qwen_endpoint: Optional[str] = DEFAULT_QWEN_ENDPOINT,
         queue_size: int = DEFAULT_QUEUE_SIZE,
         log_path: pathlib.Path = DEFAULT_LOG,
+        cozyhem_base_url: str = DEFAULT_COZYHEM_BASE_URL,
+        periodic_cadence_s: float = DEFAULT_PERIODIC_CADENCE_SECONDS,
     ) -> None:
         self._events_url = events_url
         self._qwen_endpoint = qwen_endpoint
         self._queue_size = queue_size
+        self._cozyhem_base_url = cozyhem_base_url
+        self._periodic_cadence_s = periodic_cadence_s
         self._emitter = EventLogger(log_path)
         self._stop = asyncio.Event()
 
     async def run(self) -> int:
         """Long-running event loop. Returns the would-be process exit
-        code so callers can exit on it directly."""
+        code so callers can exit on it directly.
+
+        Supervises three tasks independently:
+
+        * ``cozylobe-sse`` — long-lived SSE consumer feeding the queue.
+        * ``cozylobe-wake`` — push-driven event handler (drains queue).
+        * ``cozylobe-periodic`` — pull-driven periodic audit. Fetches
+          a state snapshot every ``periodic_cadence_s`` seconds and
+          dispatches a synthetic ``periodic_review`` event so the
+          lobe reasons about the home even when SSE is quiet.
+
+        Crash semantics: any task exiting causes the daemon to shut
+        down (s6 then restarts the process). The two-tier supervision
+        from the walking skeleton holds — one task dying triggers
+        ``self._stop`` and cancels the others.
+        """
         queue: asyncio.Queue = asyncio.Queue(maxsize=self._queue_size)
 
         qwen = QwenClient(self._qwen_endpoint) if self._qwen_endpoint else None
         consumer = SSEConsumer(self._events_url)
-        wake_loop = WakeLoop(emitter=self._emitter, qwen_client=qwen)
+        activity_fetcher = ActivityFetcher(self._cozyhem_base_url)
+        wake_loop = WakeLoop(
+            emitter=self._emitter,
+            qwen_client=qwen,
+            fetch_activity=activity_fetcher.fetch,
+            periodic_cadence_s=self._periodic_cadence_s,
+        )
 
         sse_task = asyncio.create_task(
             consumer.run(queue, self._stop), name="cozylobe-sse"
@@ -78,17 +107,23 @@ class CozylobeDaemon:
         loop_task = asyncio.create_task(
             wake_loop.run(queue, self._stop), name="cozylobe-wake"
         )
+        periodic_task = asyncio.create_task(
+            wake_loop.run_periodic(self._stop), name="cozylobe-periodic"
+        )
 
         self._emitter.emit(
             "cozylobe_daemon_started",
             events_url=self._events_url,
             qwen_endpoint=self._qwen_endpoint or "",
             queue_size=self._queue_size,
+            cozyhem_base_url=self._cozyhem_base_url,
+            periodic_cadence_s=self._periodic_cadence_s,
         )
 
+        supervised = {sse_task, loop_task, periodic_task}
         try:
             done, pending = await asyncio.wait(
-                {sse_task, loop_task},
+                supervised,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for task in done:
@@ -155,6 +190,24 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="JSONL event log path (default: %(default)s)",
     )
     parser.add_argument(
+        "--cozyhem-base-url",
+        default=DEFAULT_COZYHEM_BASE_URL,
+        help=(
+            "CozyHem REST base URL for the periodic activity fetcher "
+            "(default: %(default)s). Derived from --events-url's host "
+            "by default; pass explicitly to point at a different host."
+        ),
+    )
+    parser.add_argument(
+        "--periodic-cadence-s",
+        type=float,
+        default=DEFAULT_PERIODIC_CADENCE_SECONDS,
+        help=(
+            "Seconds between periodic-review wakes "
+            "(default: %(default)s)."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable INFO-level Python logging to stderr.",
@@ -172,6 +225,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         qwen_endpoint=args.qwen_endpoint or None,
         queue_size=args.queue_size,
         log_path=pathlib.Path(args.log),
+        cozyhem_base_url=args.cozyhem_base_url,
+        periodic_cadence_s=args.periodic_cadence_s,
     )
 
     loop = asyncio.new_event_loop()
