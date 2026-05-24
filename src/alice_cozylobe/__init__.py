@@ -31,6 +31,7 @@ on the registered ``cozylobe`` :class:`~core.agent_library.AgentSpec`
 
 from __future__ import annotations
 
+from .activity_fetcher import ActivityFetcher, ActivitySnapshot
 from .events import CozyHemEvent
 from .qwen_client import QwenClassification, QwenClient, QwenUnreachable
 from .sse_consumer import SSEConsumer
@@ -39,6 +40,8 @@ from .wake_loop import WakeLoop
 
 
 __all__ = [
+    "ActivityFetcher",
+    "ActivitySnapshot",
     "CozyHemEvent",
     "QwenClassification",
     "QwenClient",
