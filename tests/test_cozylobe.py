@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import pathlib
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -27,6 +28,8 @@ import httpx
 import pytest
 
 from alice_cozylobe import (
+    ActivityFetcher,
+    ActivitySnapshot,
     CozyHemEvent,
     QwenClassification,
     QwenClient,
@@ -36,6 +39,8 @@ from alice_cozylobe import (
     write_observation_note,
     write_urgent_surface,
 )
+from alice_cozylobe.activity_fetcher import base_url_from_events_url
+from alice_cozylobe.daemon import CozylobeDaemon
 from alice_cozylobe.surfaces import build_slug
 from core.agent_library import default_registry
 from core.events import CapturingEmitter
@@ -662,3 +667,421 @@ async def test_qwen_client_raises_on_missing_actions() -> None:
     )
     with pytest.raises(QwenUnreachable):
         await client.classify(_make_event())
+
+
+# ---------------------------------------------------------------------------
+# Activity fetcher — periodic-mode HTTP client.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _CannedGetResponse:
+    """httpx.Response stand-in for ActivityFetcher GET calls."""
+
+    body: Any
+    status: int = 200
+
+    def raise_for_status(self) -> None:
+        if self.status >= 400:
+            raise httpx.HTTPStatusError(
+                "boom",
+                request=httpx.Request("GET", "http://x"),
+                response=httpx.Response(self.status),
+            )
+
+    def json(self) -> Any:
+        return self.body
+
+
+class _CannedGetClient:
+    """httpx.AsyncClient stand-in for ActivityFetcher.
+
+    ``responses`` maps URL path suffix → either a body to return or an
+    Exception to raise. Captures every URL called for assertion.
+    """
+
+    def __init__(self, responses: dict[str, Any]) -> None:
+        self._responses = responses
+        self.urls_called: list[str] = []
+
+    async def __aenter__(self) -> "_CannedGetClient":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+    async def get(self, url: str, **kwargs: Any) -> _CannedGetResponse:
+        self.urls_called.append(url)
+        for suffix, value in self._responses.items():
+            if url.endswith(suffix):
+                if isinstance(value, Exception):
+                    raise value
+                return _CannedGetResponse(body=value)
+        raise httpx.ConnectError(f"no canned response for {url}")
+
+
+def test_base_url_from_events_url_strips_path() -> None:
+    assert (
+        base_url_from_events_url("http://aimax1:8000/api/v1/events")
+        == "http://aimax1:8000"
+    )
+    assert (
+        base_url_from_events_url("https://example.com/api/v1/events")
+        == "https://example.com"
+    )
+
+
+@pytest.mark.asyncio
+async def test_activity_fetcher_returns_snapshot_on_happy_path() -> None:
+    """All three endpoints succeed → ActivitySnapshot with populated
+    fields and no partial errors."""
+    client = _CannedGetClient(
+        {
+            "/api/v1/entities/states": {"light.kitchen": "on"},
+            "/api/v1/anthem/status": {"connected": True, "power": "off"},
+            "/api/v1/lights/": [{"name": "kitchen", "on": True}],
+        }
+    )
+    fetcher = ActivityFetcher(
+        "http://example:8000",
+        http_client_factory=lambda: client,
+        clock=lambda: 42.0,
+    )
+    snap = await fetcher.fetch()
+    assert snap is not None
+    assert snap.entity_states == {"light.kitchen": "on"}
+    assert snap.anthem_status == {"connected": True, "power": "off"}
+    assert snap.lights == [{"name": "kitchen", "on": True}]
+    assert snap.fetched_at == 42.0
+    assert snap.partial_errors == []
+    # The fetcher exercised exactly the documented endpoints.
+    assert any("/api/v1/entities/states" in u for u in client.urls_called)
+    assert any("/api/v1/anthem/status" in u for u in client.urls_called)
+    assert any("/api/v1/lights/" in u for u in client.urls_called)
+
+
+@pytest.mark.asyncio
+async def test_activity_fetcher_returns_none_and_logs_once_on_connect_error(
+    caplog,
+) -> None:
+    """Every endpoint raising ConnectError → fetch() returns None and
+    a single WARNING fires on the first outage, not on subsequent
+    fetches inside the same outage."""
+
+    def factory():
+        return _CannedGetClient(
+            {
+                "/api/v1/entities/states": httpx.ConnectError("nope"),
+                "/api/v1/anthem/status": httpx.ConnectError("nope"),
+                "/api/v1/lights/": httpx.ConnectError("nope"),
+            }
+        )
+
+    fetcher = ActivityFetcher(
+        "http://nowhere:1",
+        http_client_factory=factory,
+    )
+
+    with caplog.at_level("WARNING"):
+        first = await fetcher.fetch()
+        second = await fetcher.fetch()
+
+    assert first is None
+    assert second is None
+    warnings = [
+        rec
+        for rec in caplog.records
+        if rec.levelname == "WARNING"
+        and "cozyhem-engine unreachable" in rec.message
+    ]
+    assert len(warnings) == 1, (
+        f"expected one warning per outage, got {len(warnings)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_activity_fetcher_returns_partial_snapshot_on_mixed_failure() -> None:
+    """One endpoint fails, two succeed → partial snapshot with the
+    error recorded but the snapshot itself non-None so periodic
+    reasoning can still proceed."""
+    client = _CannedGetClient(
+        {
+            "/api/v1/entities/states": {"light.kitchen": "on"},
+            "/api/v1/anthem/status": httpx.ConnectError("anthem down"),
+            "/api/v1/lights/": [{"name": "kitchen", "on": True}],
+        }
+    )
+    fetcher = ActivityFetcher(
+        "http://example:8000",
+        http_client_factory=lambda: client,
+    )
+    snap = await fetcher.fetch()
+    assert snap is not None
+    assert snap.entity_states == {"light.kitchen": "on"}
+    assert snap.anthem_status is None
+    assert snap.lights == [{"name": "kitchen", "on": True}]
+    assert any("anthem_status" in err for err in snap.partial_errors)
+
+
+# ---------------------------------------------------------------------------
+# Periodic wake mode
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_periodic_wake_ticks_at_configured_cadence() -> None:
+    """Set a small cadence + capture how many ticks fire in a short
+    window. The first tick fires immediately (cadence after work), then
+    each subsequent tick after one cadence period. Asserts at least
+    two ticks landed inside the window."""
+    snapshot = ActivitySnapshot(
+        entity_states={"light.kitchen": "on"},
+        anthem_status={"connected": True},
+        lights=[],
+        fetched_at=time.time(),
+    )
+    fetch_calls: list[float] = []
+
+    async def fake_fetch() -> Optional[ActivitySnapshot]:
+        fetch_calls.append(time.time())
+        return snapshot
+
+    emitter = CapturingEmitter()
+    stub_run = _StubRunAgent()
+    loop = WakeLoop(
+        emitter=emitter,
+        qwen_client=None,
+        run_agent_fn=stub_run,
+        fetch_activity=fake_fetch,
+        periodic_cadence_s=0.05,
+    )
+
+    stop = asyncio.Event()
+    task = asyncio.create_task(loop.run_periodic(stop))
+    try:
+        # Window large enough for at least two ticks at a 0.05s cadence.
+        for _ in range(200):
+            if len(stub_run.calls) >= 2:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        stop.set()
+        try:
+            await asyncio.wait_for(task, timeout=1.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    assert len(stub_run.calls) >= 2
+    # Each call goes through the cozylobe AgentSpec with a
+    # periodic_review correlation prefix.
+    for call in stub_run.calls:
+        assert call["agent_name"] == "cozylobe"
+        assert call["correlation_id"].startswith("cozylobe-periodic_review-")
+        assert "snapshot of the home's recent activity" in call["prompt"]
+        assert "light.kitchen" in call["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_periodic_wake_skips_tick_when_snapshot_is_none() -> None:
+    """fetch_activity returning None (cozyhem unreachable) must NOT
+    trigger run_agent. The tick is silently skipped + telemetry
+    records the skipped reason."""
+
+    async def unreachable_fetch() -> Optional[ActivitySnapshot]:
+        return None
+
+    emitter = CapturingEmitter()
+    stub_run = _StubRunAgent()
+    loop = WakeLoop(
+        emitter=emitter,
+        qwen_client=None,
+        run_agent_fn=stub_run,
+        fetch_activity=unreachable_fetch,
+        periodic_cadence_s=0.02,
+    )
+
+    stop = asyncio.Event()
+    task = asyncio.create_task(loop.run_periodic(stop))
+    try:
+        for _ in range(100):
+            if emitter.of_kind("cozylobe_periodic_skipped_unreachable"):
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        stop.set()
+        try:
+            await asyncio.wait_for(task, timeout=1.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    assert stub_run.calls == []
+    assert emitter.of_kind("cozylobe_periodic_skipped_unreachable")
+
+
+@pytest.mark.asyncio
+async def test_periodic_wake_dispatches_periodic_review_event() -> None:
+    """One tick → run_agent gets a periodic_review-flavored prompt and
+    correlation_id. Distinct from the SSE-event prompt shape so
+    downstream tracing can tell them apart."""
+    snap = ActivitySnapshot(
+        entity_states={"sensor.front_door": "closed"},
+        anthem_status={"connected": False},
+        lights=[{"name": "living_room", "on": False}],
+        fetched_at=1716552000.0,
+    )
+
+    async def fake_fetch() -> Optional[ActivitySnapshot]:
+        return snap
+
+    emitter = CapturingEmitter()
+    stub_run = _StubRunAgent()
+    loop = WakeLoop(
+        emitter=emitter,
+        qwen_client=None,
+        run_agent_fn=stub_run,
+        fetch_activity=fake_fetch,
+        periodic_cadence_s=10.0,  # plenty of time for exactly one tick
+    )
+
+    stop = asyncio.Event()
+    task = asyncio.create_task(loop.run_periodic(stop))
+    try:
+        for _ in range(100):
+            if stub_run.calls:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        stop.set()
+        try:
+            await asyncio.wait_for(task, timeout=1.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    assert len(stub_run.calls) == 1
+    call = stub_run.calls[0]
+    assert call["agent_name"] == "cozylobe"
+    assert call["correlation_id"] == "cozylobe-periodic_review-1716552000"
+    # Periodic prompt frames the task as a snapshot review, NOT an
+    # event triage.
+    assert "snapshot of the home's recent activity" in call["prompt"]
+    # The snapshot fields are inlined so the agent can reason about
+    # actual state.
+    assert "sensor.front_door" in call["prompt"]
+    # Telemetry: periodic tick + handled both fire.
+    assert emitter.of_kind("cozylobe_periodic_tick")
+    assert emitter.of_kind("cozylobe_periodic_handled")
+
+
+@pytest.mark.asyncio
+async def test_periodic_task_cancels_cleanly_on_stop() -> None:
+    """Setting the stop event mid-cadence cancels the periodic task
+    cleanly. No exceptions leak out; the task exits quickly without
+    waiting the full cadence."""
+
+    async def fake_fetch() -> Optional[ActivitySnapshot]:
+        return ActivitySnapshot(fetched_at=time.time())
+
+    emitter = CapturingEmitter()
+    stub_run = _StubRunAgent()
+    loop = WakeLoop(
+        emitter=emitter,
+        qwen_client=None,
+        run_agent_fn=stub_run,
+        fetch_activity=fake_fetch,
+        periodic_cadence_s=60.0,  # long cadence; stop must short-circuit it
+    )
+
+    stop = asyncio.Event()
+    task = asyncio.create_task(loop.run_periodic(stop))
+    # Let the first tick run so we're in the cadence-sleep window.
+    for _ in range(100):
+        if stub_run.calls:
+            break
+        await asyncio.sleep(0.01)
+    assert stub_run.calls, "first tick should have fired before stop"
+
+    # Now trip stop and verify the task exits in well under the
+    # 60s cadence.
+    start = time.time()
+    stop.set()
+    await asyncio.wait_for(task, timeout=2.0)
+    elapsed = time.time() - start
+    assert elapsed < 1.0, (
+        f"periodic task took {elapsed:.2f}s to exit after stop; "
+        "interruptible sleep is broken"
+    )
+    # Task ended cleanly — neither cancelled nor errored.
+    assert task.done()
+    assert not task.cancelled()
+    assert task.exception() is None
+
+
+@pytest.mark.asyncio
+async def test_periodic_task_disabled_when_no_fetcher() -> None:
+    """WakeLoop without a fetch_activity callable should no-op the
+    periodic path — run_periodic returns immediately so the daemon
+    can supervise it without crashing."""
+    emitter = CapturingEmitter()
+    loop = WakeLoop(emitter=emitter, qwen_client=None)
+    stop = asyncio.Event()
+    # Must return promptly even though stop is never set.
+    await asyncio.wait_for(loop.run_periodic(stop), timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Daemon — periodic task supervision.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_daemon_supervises_periodic_task_alongside_sse(monkeypatch) -> None:
+    """The daemon's run() loop should create three tasks (sse, wake,
+    periodic). Smoke-test by patching the constructors so each task
+    immediately exits and asserting all three names appeared."""
+    task_names: list[str] = []
+    real_create = asyncio.create_task
+
+    def tracking_create(coro, *, name=None):
+        if name:
+            task_names.append(name)
+        return real_create(coro, name=name)
+
+    monkeypatch.setattr(asyncio, "create_task", tracking_create)
+
+    # Stub out the three runner methods so daemon.run exits quickly.
+    async def fast_sse_run(self, queue, stop):
+        return
+
+    async def fast_wake_run(self, queue, stop):
+        return
+
+    async def fast_periodic_run(self, stop):
+        return
+
+    monkeypatch.setattr(
+        "alice_cozylobe.daemon.SSEConsumer.run", fast_sse_run
+    )
+    monkeypatch.setattr(WakeLoop, "run", fast_wake_run)
+    monkeypatch.setattr(WakeLoop, "run_periodic", fast_periodic_run)
+
+    daemon = CozylobeDaemon(
+        log_path=pathlib.Path("/dev/null"),
+        qwen_endpoint=None,
+    )
+    rc = await daemon.run()
+    assert rc == 0
+    assert "cozylobe-sse" in task_names
+    assert "cozylobe-wake" in task_names
+    assert "cozylobe-periodic" in task_names
