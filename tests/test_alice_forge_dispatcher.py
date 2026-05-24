@@ -5522,6 +5522,228 @@ def test_design_review_no_recognized_comment_is_no_op(
     ), logged
 
 
+# ---------------------------------------------------------------------------
+# Issue #344 — design-reviewer spawn at sm:design_review
+# ---------------------------------------------------------------------------
+#
+# When the reviewer callables are wired, sm:design_review issues with no
+# parsed verdict should spawn an automated reviewer instead of sitting
+# indefinitely. The reviewer's verdict comment is parsed by the existing
+# DesignApproved / DesignRevise paths on the next pass.
+
+
+def test_design_review_no_verdict_spawns_reviewer(
+    state_path: pathlib.Path, tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    """No parsed verdict + reviewer wired + design-ready slug resolves →
+    spawn fires, no transition this pass."""
+    # The handler resolves the design note path from the slug. Point
+    # DESIGNS_DIR at a tmp_path that contains the slug file.
+    designs_dir = tmp_path / "designs"
+    designs_dir.mkdir()
+    (designs_dir / "test-design-slug.md").write_text("# design")
+    import alice_forge.sm.legacy.handlers.designed as _designed_mod
+
+    monkeypatch.setattr(_designed_mod, "DESIGNS_DIR", designs_dir)
+
+    issues = [_design_issue(950, sm_label="sm:design_review")]
+    comments = [
+        _audit_comment(
+            "[SM] design-ready note=[[test-design-slug]] author=jcronq"
+        ),
+    ]
+    spawn_calls: list[tuple[int, str, str]] = []
+
+    def _spawn_design_reviewer(
+        issue, art_label, repo, *, design_note_path
+    ):
+        spawn_calls.append((issue["number"], art_label, str(design_note_path)))
+        return f"spawn-{issue['number']}-stub"
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=True,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        list_comments=lambda _r, _n: comments,
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        has_live_design_reviewer_spawn=lambda _n: False,
+        count_running_design_reviewer=lambda: 0,
+        spawn_design_reviewer=_spawn_design_reviewer,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert report.spawned == 1
+    assert spawn_calls == [
+        (950, "art:code", str(designs_dir / "test-design-slug.md")),
+    ]
+    assert (950, "art:code", "spawn-950-stub") in report.spawn_records
+
+
+def test_design_review_live_reviewer_spawn_blocks_new_spawn(
+    state_path: pathlib.Path, tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    """A live design-reviewer spawn for the same issue prevents a
+    duplicate spawn — the existing one will produce the verdict."""
+    designs_dir = tmp_path / "designs"
+    designs_dir.mkdir()
+    (designs_dir / "live-spawn-slug.md").write_text("# design")
+    import alice_forge.sm.legacy.handlers.designed as _designed_mod
+
+    monkeypatch.setattr(_designed_mod, "DESIGNS_DIR", designs_dir)
+
+    issues = [_design_issue(951, sm_label="sm:design_review")]
+    comments = [
+        _audit_comment(
+            "[SM] design-ready note=[[live-spawn-slug]] author=jcronq"
+        ),
+    ]
+
+    def _spawn_design_reviewer(*a, **kw):
+        raise AssertionError("must not spawn when a live reviewer exists")
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=True,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        list_comments=lambda _r, _n: comments,
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        has_live_design_reviewer_spawn=lambda _n: True,
+        count_running_design_reviewer=lambda: 1,
+        spawn_design_reviewer=_spawn_design_reviewer,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.transitioned == 0
+    assert report.spawned == 0
+
+
+def test_design_review_pool_full_defers_spawn(
+    state_path: pathlib.Path, tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    """When the reviewer pool is at cap, no new spawn fires."""
+    designs_dir = tmp_path / "designs"
+    designs_dir.mkdir()
+    (designs_dir / "pool-full-slug.md").write_text("# design")
+    import alice_forge.sm.legacy.handlers.designed as _designed_mod
+
+    monkeypatch.setattr(_designed_mod, "DESIGNS_DIR", designs_dir)
+
+    issues = [_design_issue(952, sm_label="sm:design_review")]
+    comments = [
+        _audit_comment(
+            "[SM] design-ready note=[[pool-full-slug]] author=jcronq"
+        ),
+    ]
+
+    def _spawn_design_reviewer(*a, **kw):
+        raise AssertionError("must not spawn when pool is full")
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=True,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        list_comments=lambda _r, _n: comments,
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        has_live_design_reviewer_spawn=lambda _n: False,
+        # Pool exactly at the cap.
+        count_running_design_reviewer=lambda: sm.MAX_CONCURRENT_DESIGN_REVIEWER_SPAWNS,
+        spawn_design_reviewer=_spawn_design_reviewer,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 0
+
+
+def test_design_review_no_design_ready_slug_skips_spawn(
+    state_path: pathlib.Path,
+) -> None:
+    """No design-ready comment ever posted → reviewer can't run.
+    Handler should log and stay rather than spawn a doomed reviewer."""
+    issues = [_design_issue(953, sm_label="sm:design_review")]
+
+    def _spawn_design_reviewer(*a, **kw):
+        raise AssertionError("must not spawn without a design-ready slug")
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=True,
+        enable_cleanup=False,
+        enable_verify=False,
+        list_issues=lambda _r: issues,
+        list_comments=lambda _r, _n: [],
+        post_comment=Recorder(),
+        edit_labels=LabelRecorder(),
+        has_live_design_reviewer_spawn=lambda _n: False,
+        count_running_design_reviewer=lambda: 0,
+        spawn_design_reviewer=_spawn_design_reviewer,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 0
+
+
+# ----- CLI verdict parsing -----
+
+
+def test_design_review_cli_parses_approved_verdict() -> None:
+    """The CLI parses the final response line for the verdict prefix."""
+    from alice_speaking.cli.perissue_review import parse_verdict_line
+
+    response = (
+        "Reading the design note...\n\nThe alternatives are clearly stated.\n"
+        "The tests cover the new path.\n\n"
+        "[SM] design-approved by speaking — design is sound; the chosen "
+        "alternative correctly handles the silent-failure case."
+    )
+    verdict = parse_verdict_line(response)
+    assert verdict is not None
+    assert verdict.startswith("[SM] design-approved")
+
+
+def test_design_review_cli_parses_revise_verdict() -> None:
+    from alice_speaking.cli.perissue_review import parse_verdict_line
+
+    response = (
+        'I notice the design omits prior art on similar refactors.\n\n'
+        '[SM] design-revise reason="missing prior art section" — the design '
+        "should cite the wake-cadence refactor."
+    )
+    verdict = parse_verdict_line(response)
+    assert verdict is not None
+    assert verdict.startswith("[SM] design-revise reason=")
+
+
+def test_design_review_cli_returns_none_for_missing_verdict() -> None:
+    """When the final line isn't a verdict prefix, parsing returns None
+    so the CLI's failsafe revise path fires."""
+    from alice_speaking.cli.perissue_review import parse_verdict_line
+
+    response = "I'm thinking about this... maybe approve, maybe not."
+    assert parse_verdict_line(response) is None
+
+
 # ----- _process_designed -----
 
 

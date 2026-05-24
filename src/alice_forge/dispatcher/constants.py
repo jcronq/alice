@@ -472,6 +472,52 @@ SPEAKING_BUILD_COMPLETE_PREFIX = "[SM] build-complete"
 # longer the live entrypoint.
 SPEAKING_SHIM_MODULE = "alice_speaking.cli.perissue"
 
+# ---------------------------------------------------------------------------
+# Issue #344 — per-issue design-reviewer spawn (SM v2 design-review phase)
+# ---------------------------------------------------------------------------
+#
+# Closes the design-reviewer gap flagged in last session's exit note. Before
+# this, sm:design_review issues sat indefinitely waiting for alice to
+# notice them during her own wakes and manually post a design-approved /
+# design-revise verdict. The new spawn lane gives the dispatcher a way to
+# kick off a deterministic reviewer the same way it kicks off design
+# (thinking) and build (speaking).
+#
+# Architecture mirrors the speaking-build lane: separate spawn dir,
+# separate concurrency cap, separate audit prefix, separate CLI
+# entrypoint. The reviewer is short-lived (one Opus call) so its cap is
+# higher than the build/design caps.
+
+# Separate spawn dir for the design-reviewer lane. Same on-disk shape as
+# the other lanes (per-spawn subdir with prompt.txt / pidfile / stdout /
+# stderr / session_id).
+SM_DESIGN_REVIEWER_SPAWN_DIR = pathlib.Path(
+    "/state/worker/sm-design-reviewer-spawns"
+)
+
+# Concurrency cap for the design-reviewer lane. Higher than the build
+# cap because reviews are short (~30-60s of Opus) and we don't want a
+# burst of approvals queued. Configurable via env.
+MAX_CONCURRENT_DESIGN_REVIEWER_SPAWNS = int(
+    os.environ.get("ALICE_MAX_CONCURRENT_DESIGN_REVIEWER_SPAWNS", "4")
+)
+
+# Audit-comment prefix for the design-reviewer lane. Distinct from the
+# thinking/speaking spawn prefixes so the comments module can
+# disambiguate without a body-shape cascade. Neither is a prefix of the
+# other.
+DESIGN_REVIEWER_SPAWN_STARTED_PREFIX = "[SM] design-reviewer-spawn-started"
+
+# Runtime label rendered into the audit comment.
+DESIGN_REVIEWER_RUNTIME_LABEL = "claude-agent-sdk:opus"
+
+# Per-issue phase the design-reviewer enters at spawn time.
+DESIGN_REVIEWER_PHASE = "per_issue_design_review"
+
+# Dotted module path of the design-reviewer CLI. Sibling of the build
+# entrypoint at :mod:`alice_speaking.cli.perissue`.
+DESIGN_REVIEWER_SHIM_MODULE = "alice_speaking.cli.perissue_review"
+
 # Issue #137 — worker session capture. We pre-mint a UUID per spawn and
 # pass it via ``--session-id`` so the worker writes its session JSONL to
 # a known file. The id is persisted in ``<spawn_dir>/session_id`` at

@@ -38,10 +38,15 @@ from alice_forge.dispatcher.constants import (
     CLAUDE_BIN_FALLBACK,
     CLAUDE_BIN_PREFERRED,
     CLAUDE_PROJECTS_DIR,
+    DESIGN_REVIEWER_PHASE,
+    DESIGN_REVIEWER_RUNTIME_LABEL,
+    DESIGN_REVIEWER_SHIM_MODULE,
+    DESIGN_REVIEWER_SPAWN_STARTED_PREFIX,
     PYTHON_BIN_FALLBACK,
     PYTHON_BIN_PREFERRED,
     SESSION_ID_FILENAME,
     SESSION_JSONL_FILENAME,
+    SM_DESIGN_REVIEWER_SPAWN_DIR,
     SM_SPEAKING_SPAWN_DIR,
     SM_THINKING_SPAWN_DIR,
     SPAWN_DIR,
@@ -396,6 +401,35 @@ def has_live_speaking_spawn_for_issue(
     and thinking lanes. Consults only :data:`SM_SPEAKING_SPAWN_DIR` —
     a live thinking-agent spawn in :data:`SM_THINKING_SPAWN_DIR` on
     the same issue must NOT satisfy this check.
+    """
+    return has_live_spawn_for_issue(issue_number, spawn_dir, log=log)
+
+
+def count_running_design_reviewer_spawns(
+    spawn_dir: pathlib.Path = SM_DESIGN_REVIEWER_SPAWN_DIR,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> int:
+    """Mirror of :func:`count_running_spawns` scoped to the design-reviewer lane.
+
+    Issue #344. The design-reviewer lane has its own concurrency cap
+    (:data:`MAX_CONCURRENT_DESIGN_REVIEWER_SPAWNS`) — short-lived Opus
+    review calls run in parallel without draining build/design capacity.
+    """
+    return count_running_spawns(spawn_dir, log=log)
+
+
+def has_live_design_reviewer_spawn_for_issue(
+    issue_number: int,
+    spawn_dir: pathlib.Path = SM_DESIGN_REVIEWER_SPAWN_DIR,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> bool:
+    """Returns True when a live design-reviewer spawn exists for this issue.
+
+    Mirrors :func:`has_live_speaking_spawn_for_issue`. Consults only
+    :data:`SM_DESIGN_REVIEWER_SPAWN_DIR` so a live thinking-design or
+    speaking-build spawn on the same issue does not satisfy this check.
     """
     return has_live_spawn_for_issue(issue_number, spawn_dir, log=log)
 
@@ -1401,6 +1435,193 @@ def spawn_speaking_agent(
         pidfile_path.write_text(str(pid))
     log(
         f"[sm-dispatcher] spawned speaking-agent {spawn_id} (pid={pid}) "
+        f"on #{number} art={art_label} phase={phase} "
+        f"session_id={session_id}"
+    )
+    return spawn_id
+
+
+# ---------------------------------------------------------------------------
+# Issue #344 — design-reviewer spawn (sm:design_review phase)
+# ---------------------------------------------------------------------------
+
+
+def compose_design_reviewer_spawn_prompt(
+    issue: dict[str, Any],
+    *,
+    design_note_path: str | pathlib.Path,
+) -> str:
+    """Compose the prompt the design-reviewer CLI loads from its
+    spawn dir.
+
+    Frontmatter mirrors the speaking-build prompt (``issue:`` / ``phase:`` /
+    ``art:`` / ``design_note:``) so the CLI can reuse the same
+    :func:`alice_speaking.cli.perissue.parse_frontmatter` helper. The
+    body is intentionally short — the per-issue-design-review.md prompt
+    that the CLI assembles for the kernel carries the real instructions.
+    """
+    number = issue.get("number")
+    title = issue.get("title") or "(no title)"
+    body = issue.get("body") or "(no body)"
+    art_label = "art:unknown"
+    for name in _label_names(issue):
+        if name.startswith("art:") and name in ART_LABEL_WHITELIST:
+            art_label = name
+            break
+    login = _author_login(issue) or "(unknown)"
+    source_label = f"source:{login}"
+    return (
+        f"---\n"
+        f"issue: #{number}\n"
+        f"phase: {DESIGN_REVIEWER_PHASE}\n"
+        f"art: {art_label}\n"
+        f"design_note: {design_note_path}\n"
+        f"---\n"
+        f"You are a design-reviewer agent on SM task #{number}.\n"
+        f"\n"
+        f"Issue: #{number}\n"
+        f"Title: {title}\n"
+        f"Source: {source_label}\n"
+        f"Artifact type: {art_label}\n"
+        f"Design note: {design_note_path}\n"
+        f"\n"
+        f"Issue body:\n"
+        f"{body}\n"
+        f"\n"
+        f"Read the design note path above. The CLI loads it for you and "
+        f"composes the full per-issue-design-review.md prompt. End your "
+        f"response with one line: `[SM] design-approved ...` or "
+        f"`[SM] design-revise reason=\"...\" ...`.\n"
+    )
+
+
+def render_design_reviewer_spawn_started_comment(
+    number: int,
+    art_label: str,
+    spawn_id: str,
+    *,
+    phase: str = DESIGN_REVIEWER_PHASE,
+    runtime: str = DESIGN_REVIEWER_RUNTIME_LABEL,
+    timestamp: str | None = None,
+) -> str:
+    """Produce the literal ``[SM] design-reviewer-spawn-started ...`` audit comment."""
+    ts = timestamp or _now_iso()
+    return (
+        f"{DESIGN_REVIEWER_SPAWN_STARTED_PREFIX} task=#{number} "
+        f"artifact={art_label} phase={phase} runtime={runtime} "
+        f"spawn_id={spawn_id} ts={ts}"
+    )
+
+
+def spawn_design_reviewer_agent(
+    issue: dict[str, Any],
+    art_label: str,
+    repo: str,
+    *,
+    design_note_path: str | pathlib.Path,
+    spawn_dir: pathlib.Path = SM_DESIGN_REVIEWER_SPAWN_DIR,
+    python_bin: str | None = None,
+    shim_module: str = DESIGN_REVIEWER_SHIM_MODULE,
+    phase: str = DESIGN_REVIEWER_PHASE,
+    runtime: str = DESIGN_REVIEWER_RUNTIME_LABEL,
+    post_comment: PostCommentFn = gh_post_comment,
+    popen: Callable[..., Any] = subprocess.Popen,
+    now_iso: Callable[[], str] = _now_iso,
+    log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
+    clock: Callable[[], float] | None = None,
+    new_session_id: Callable[[], str] = lambda: str(uuid.uuid4()),
+) -> str | None:
+    """Spawn a per-issue design-reviewer for an sm:design_review issue.
+
+    Issue #344. Sibling of :func:`spawn_speaking_agent` and
+    :func:`spawn_thinking_agent`. The on-disk shape is identical
+    (``<spawn_dir>/<spawn_id>/`` with ``prompt.txt`` / ``pidfile`` /
+    ``stdout.log`` / ``stderr.log`` / ``session_id``) but the lane is
+    separate: distinct concurrency cap, distinct audit prefix, distinct
+    spawn dir, distinct CLI entrypoint.
+
+    Caller must pass ``design_note_path`` — the design-ready audit
+    comment carries the slug, and the dispatcher resolves it to a real
+    filesystem path before spawning (same plumbing as
+    :func:`spawn_speaking_agent`).
+
+    Returns the ``spawn_id`` on success, or ``None`` if the issue number
+    isn't an integer. Does NOT wait for the spawned subprocess.
+    """
+    if clock is None:
+        clock = time.time
+
+    number = issue.get("number")
+    if not isinstance(number, int):
+        log(
+            f"[sm-dispatcher] cannot spawn design-reviewer on "
+            f"non-integer issue number: {number!r}"
+        )
+        return None
+
+    if python_bin is None:
+        python_bin = resolve_python_bin()
+
+    spawn_id = f"spawn-{number}-{int(clock())}"
+    work_dir = spawn_dir / spawn_id
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    prompt_text = compose_design_reviewer_spawn_prompt(
+        issue, design_note_path=design_note_path
+    )
+    prompt_path = work_dir / "prompt.txt"
+    prompt_path.write_text(prompt_text)
+
+    session_id = new_session_id()
+    (work_dir / SESSION_ID_FILENAME).write_text(session_id)
+
+    body = render_design_reviewer_spawn_started_comment(
+        number,
+        art_label,
+        spawn_id,
+        phase=phase,
+        runtime=runtime,
+        timestamp=now_iso(),
+    )
+    try:
+        post_comment(repo, number, body)
+    except GHCommandError as exc:
+        log(
+            f"[sm-dispatcher] failed to post design-reviewer-spawn-started "
+            f"on #{number}: {exc} — aborting spawn"
+        )
+        raise
+
+    stdout_path = work_dir / "stdout.log"
+    stderr_path = work_dir / "stderr.log"
+    pidfile_path = work_dir / "pidfile"
+
+    stdout_fh = open(stdout_path, "wb")
+    stderr_fh = open(stderr_path, "wb")
+    try:
+        proc = popen(
+            [
+                python_bin,
+                "-m",
+                shim_module,
+                "--spawn-dir",
+                str(work_dir),
+                "--session-id",
+                session_id,
+            ],
+            stdout=stdout_fh,
+            stderr=stderr_fh,
+            start_new_session=True,
+        )
+    finally:
+        stdout_fh.close()
+        stderr_fh.close()
+
+    pid = getattr(proc, "pid", None)
+    if pid is not None:
+        pidfile_path.write_text(str(pid))
+    log(
+        f"[sm-dispatcher] spawned design-reviewer {spawn_id} (pid={pid}) "
         f"on #{number} art={art_label} phase={phase} "
         f"session_id={session_id}"
     )

@@ -346,6 +346,9 @@ def run(
     has_live_speaking_spawn: Callable[[int], bool] | None = None,
     count_running_speaking: Callable[[], int] | None = None,
     spawn_speaking: Callable[[dict[str, Any], str, str], str | None] | None = None,
+    has_live_design_reviewer_spawn: Callable[[int], bool] | None = None,
+    count_running_design_reviewer: Callable[[], int] | None = None,
+    spawn_design_reviewer: Callable[..., str | None] | None = None,
     spawn_rebase: Callable[[dict[str, Any], str, str, str], str | None] | None = None,
     attempt_rebase: Callable[[str], dict[str, Any]] | None = None,
     enable_rebase: bool = True,
@@ -355,6 +358,7 @@ def run(
     max_concurrent_spawns: int = MAX_CONCURRENT_SPAWNS,
     max_concurrent_thinking_spawns: int = MAX_CONCURRENT_THINKING_SPAWNS,
     max_concurrent_speaking_spawns: int = MAX_CONCURRENT_SPEAKING_SPAWNS,
+    max_concurrent_design_reviewer_spawns: int = MAX_CONCURRENT_DESIGN_REVIEWER_SPAWNS,
     post_merge_cleanup: PostMergeCleanupFn | None = None,
     enable_cleanup: bool = True,
     worker_repo_path: pathlib.Path = WORKER_REPO_PATH,
@@ -481,6 +485,35 @@ def run(
                 # the speaking-agent shim so its prompt frontmatter
                 # carries a real ``design_note:`` instead of ``(unset)``.
                 return spawn_speaking_agent(
+                    issue,
+                    art_label,
+                    repo,
+                    design_note_path=design_note_path,
+                    post_comment=post_comment,
+                    log=log,
+                    now_iso=now_iso,
+                )
+        # Issue #344 — design-reviewer lane. Bind production callables
+        # when not explicitly injected (tests opt out by passing fakes).
+        if has_live_design_reviewer_spawn is None:
+            def has_live_design_reviewer_spawn(number: int) -> bool:
+                return has_live_design_reviewer_spawn_for_issue(
+                    number, SM_DESIGN_REVIEWER_SPAWN_DIR, log=log
+                )
+        if count_running_design_reviewer is None:
+            def count_running_design_reviewer() -> int:
+                return count_running_design_reviewer_spawns(
+                    SM_DESIGN_REVIEWER_SPAWN_DIR, log=log
+                )
+        if spawn_design_reviewer is None:
+            def spawn_design_reviewer(
+                issue: dict[str, Any],
+                art_label: str,
+                repo: str,
+                *,
+                design_note_path: pathlib.Path,
+            ) -> str | None:
+                return spawn_design_reviewer_agent(
                     issue,
                     art_label,
                     repo,
@@ -1041,6 +1074,11 @@ def run(
                     edit_labels=edit_labels,
                     list_comments=list_comments,
                     trusted_authors=trusted_authors,
+                    art_whitelist=ART_LABEL_WHITELIST,
+                    has_live_design_reviewer_spawn=has_live_design_reviewer_spawn,
+                    count_running_design_reviewer=count_running_design_reviewer,
+                    spawn_design_reviewer=spawn_design_reviewer,
+                    max_concurrent_design_reviewer_spawns=MAX_CONCURRENT_DESIGN_REVIEWER_SPAWNS,
                     dry_run=dry_run,
                     log=log,
                     now_iso=now_iso,

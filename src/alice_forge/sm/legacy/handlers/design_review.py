@@ -4,6 +4,10 @@
 from __future__ import annotations
 
 from alice_forge.sm.legacy.handlers._common import *  # noqa: F401, F403
+from alice_forge.sm.legacy.handlers.designed import (
+    _find_design_ready_slug,
+    _resolve_design_note_path,
+)
 
 
 def _process_design_review(
@@ -16,6 +20,11 @@ def _process_design_review(
     edit_labels: EditLabelsFn,
     list_comments: ListCommentsFn,
     trusted_authors: frozenset[str],
+    art_whitelist: frozenset[str],
+    has_live_design_reviewer_spawn: Callable[[int], bool] | None,
+    count_running_design_reviewer: Callable[[], int] | None,
+    spawn_design_reviewer: Callable[..., str | None] | None,
+    max_concurrent_design_reviewer_spawns: int,
     dry_run: bool,
     log: Callable[[str], None],
     now_iso: Callable[[], str],
@@ -58,9 +67,93 @@ def _process_design_review(
         log=log,
     )
     if parsed is None:
+        # Issue #344 — design-reviewer spawn dispatch. When no verdict
+        # has been posted yet, kick off an automated reviewer instead of
+        # waiting for a human (or alice's own active wake) to notice the
+        # issue. The reviewer is a one-shot Opus call that emits one of
+        # the two verdict prefixes; the dispatcher's next pass picks
+        # that up via the parser above and runs the existing transition
+        # logic.
+        if (
+            spawn_design_reviewer is None
+            or has_live_design_reviewer_spawn is None
+            or count_running_design_reviewer is None
+        ):
+            log(
+                f"[sm-dispatcher] design_review #{number}: "
+                f"awaiting design-approved / design-revise"
+            )
+            return
+        if has_live_design_reviewer_spawn(number):
+            log(
+                f"[sm-dispatcher] design_review #{number}: "
+                f"reviewer spawn in flight — waiting"
+            )
+            return
+        if count_running_design_reviewer() >= max_concurrent_design_reviewer_spawns:
+            log(
+                f"[sm-dispatcher] design_review #{number}: "
+                f"reviewer pool full — deferring"
+            )
+            return
+        # Resolve the design note from the design-ready comment slug.
+        # Without a resolvable note the reviewer has nothing to evaluate;
+        # fall back to the existing log-and-wait path so a human can
+        # diagnose rather than spawning a doomed reviewer.
+        slug = _find_design_ready_slug(comments, trusted_authors=trusted_authors)
+        if slug is None:
+            log(
+                f"[sm-dispatcher] design_review #{number}: "
+                f"no design-ready slug found — cannot spawn reviewer"
+            )
+            return
+        design_note_path = _resolve_design_note_path(slug)
+        if design_note_path is None:
+            log(
+                f"[sm-dispatcher] design_review #{number}: "
+                f"design-ready slug {slug!r} did not resolve to a file"
+            )
+            return
+        art_label = _current_art_label(issue, art_whitelist)
+        if art_label is None:
+            log(
+                f"[sm-dispatcher] design_review #{number}: "
+                f"no whitelisted art:* label — cannot spawn reviewer"
+            )
+            return
+        if dry_run:
+            log(
+                f"[sm-dispatcher] DRY-RUN would spawn design-reviewer on "
+                f"#{number} art={art_label} design_note={design_note_path}"
+            )
+            report.spawned += 1
+            return
+        try:
+            spawn_id = spawn_design_reviewer(
+                issue,
+                art_label,
+                repo,
+                design_note_path=design_note_path,
+            )
+        except GHCommandError as exc:
+            log(
+                f"[sm-dispatcher] design_review #{number}: "
+                f"failed to spawn design-reviewer: {exc}"
+            )
+            if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+                raise
+            return
+        if spawn_id is None:
+            log(
+                f"[sm-dispatcher] design_review #{number}: "
+                f"design-reviewer spawn returned None"
+            )
+            return
+        report.spawned += 1
+        report.spawn_records.append((number, art_label, spawn_id))
         log(
             f"[sm-dispatcher] design_review #{number}: "
-            f"awaiting design-approved / design-revise"
+            f"spawned design-reviewer {spawn_id}"
         )
         return
 
