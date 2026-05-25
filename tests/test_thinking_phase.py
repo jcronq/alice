@@ -114,7 +114,8 @@ def test_kill_switch_collapses_sleep_to_b() -> None:
 # ---------------------------------------------------------------------------
 # select_phase — full B/C/D cascade (six rules + fallback)
 #
-# Rules under ``enable_full_sleep_dispatch=True``:
+# Rules under ``enable_full_sleep_dispatch=True`` (evaluated in this order):
+#   - Rule 2e: 4h+ since last D + corpus + cap free  → SLEEP_D (promoted 2026-05-25)
 #   - Rule 2a: inbox / broken-links / orphan-stubs   → SLEEP_B
 #   - Rule 2b: 6+ consecutive Stage B wakes          → SLEEP_C / D
 #   - Rule 2c: 23:00–02:59 default                   → SLEEP_C (with null-C escape to D)
@@ -312,13 +313,30 @@ def test_rule_2e_does_not_fire_when_cap_exhausted() -> None:
     assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
 
 
-def test_rule_2a_inbox_beats_rule_2e() -> None:
-    """Rule 2a (inbox → B) still wins over Rule 2e even with a huge
-    gap since last D. Real work always takes priority."""
+def test_rule_2e_beats_rule_2a_when_guardrails_met() -> None:
+    """Rule 2e (4h+ D floor) is evaluated BEFORE Rule 2a (inbox → B)
+    as of 2026-05-25. Rationale: cozylobe sensor notes keep the inbox
+    perpetually non-empty, which caused a 4-day Stage D drought
+    (2026-05-22 → 2026-05-25) when Rule 2a always won. Rule 2e's own
+    guardrails (>=4h since last D, has_recent_research, cap not
+    exhausted) bound the promotion to at most one D wake per 4-hour
+    window, only when fresh material exists, capped per night."""
     snap = _snap(
         hour=23,
         has_inbox_items=True,
         has_recent_research=True,
+        hours_since_last_d=10.0,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_D
+
+
+def test_rule_2a_still_wins_when_rule_2e_guardrails_unmet() -> None:
+    """When Rule 2e's guardrails are NOT satisfied (no recent research),
+    Rule 2a's inbox-drain semantics are preserved — inbox → SLEEP_B."""
+    snap = _snap(
+        hour=23,
+        has_inbox_items=True,
+        has_recent_research=False,
         hours_since_last_d=10.0,
     )
     assert select_phase(snap, _full_cfg()) is Phase.SLEEP_B

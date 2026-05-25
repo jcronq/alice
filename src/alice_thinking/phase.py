@@ -507,7 +507,22 @@ def select_phase(vault: VaultSnapshot, cfg: Optional[PhaseConfig] = None) -> Pha
     if not cfg.enable_full_sleep_dispatch:
         return Phase.SLEEP_B
 
-    # Rule 2a: inbox items / vault issues → Stage B (real work always wins).
+    # Rule 2e (promoted): Periodic D floor — every 4 hours without D, schedule D
+    # even if the inbox has items. Previously Rule 2a (inbox drain) took priority
+    # above this rule, but in practice cozylobe sensor notes keep the inbox
+    # perpetually non-empty, which caused a 4-day Stage D drought (2026-05-22
+    # → 2026-05-25). The 4-hour floor + has_recent_research + cap-not-exhausted
+    # guardrails make promotion safe: at most one Stage D wake every 4 hours,
+    # only when there is fresh material to recombine, and capped per night.
+    if (
+        vault.hours_since_last_d >= 4
+        and vault.has_recent_research
+        and not vault.stage_d_cap_exhausted
+    ):
+        return Phase.SLEEP_D
+
+    # Rule 2a: inbox items / vault issues → Stage B (real work always wins
+    # within the bounds of Rule 2e above).
     if vault.has_inbox_items or vault.has_broken_links or vault.has_orphan_stubs:
         return Phase.SLEEP_B
 
@@ -516,17 +531,6 @@ def select_phase(vault: VaultSnapshot, cfg: Optional[PhaseConfig] = None) -> Pha
         if vault.has_recent_research and not vault.stage_d_cap_exhausted:
             return Phase.SLEEP_D
         return Phase.SLEEP_C
-
-    # Rule 2e: Periodic D floor — every 4 hours without D, schedule D.
-    # Catches the structural starvation when inbox is sparse but Rule 2b's
-    # 6-consecutive-B threshold hasn't yet been reached. Inbox triggers
-    # (Rule 2a) still take priority above.
-    if (
-        vault.hours_since_last_d >= 4
-        and vault.has_recent_research
-        and not vault.stage_d_cap_exhausted
-    ):
-        return Phase.SLEEP_D
 
     # Rule 2c: early phase (23:00–02:59) → C (default sleep).
     if vault.hour in (23, 0, 1, 2):
