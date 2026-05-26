@@ -72,3 +72,17 @@ input_kinds:
   - scene_changed
   - mode_changed
   - lock_state_changed
+
+# Phase 4 (#381) — adjacency inference window.
+#
+# Two motion events in non-adjacent rooms (per the cozylobe-cortex
+# vault's room.adjacent lists) within this many seconds count as
+# evidence of an unknown adjacency. The AdjacencyInferrer increments
+# an in-memory counter per (room_a, room_b) pair; once the count
+# crosses the 5/10/20/50 thresholds, an inline IS-ADJACENT-TO edge
+# is written to both rooms' notes (weight 0.3 / 0.5 / 0.7 / 0.9).
+#
+# 30s is the design's default — long enough to catch a brisk walk
+# between adjacent rooms, short enough to filter out coincidental
+# fires from different people in different parts of the house.
+adjacency_inference_window_s: 30.0

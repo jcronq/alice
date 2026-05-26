@@ -293,6 +293,18 @@ def _parse_simple_yaml(fm_text: str) -> dict:
             inner = value[1:-1].strip()
             if not inner:
                 out[key] = []
+            elif "[[" in value:
+                # The value contains wikilink targets in the
+                # ``[[category/Title]], [[category/Title]]`` shape the
+                # onboarding CLI writes. Splitting on commas inside the
+                # outer brackets carves the wikilinks in half (Phase 4
+                # bug repro: ``adjacent: [[rooms/A]], [[rooms/B]]`` got
+                # mangled to ``['[rooms/A]]', '[[rooms/B]']``). Keep
+                # the whole value as a single string — the wikilink
+                # regex in ``_frontmatter_targets`` reliably re-extracts
+                # each ``[[target]]`` from the joined form regardless
+                # of how the outer brackets land.
+                out[key] = value
             else:
                 out[key] = [item.strip() for item in inner.split(",")]
             continue
@@ -438,27 +450,54 @@ def _frontmatter_targets(value: object) -> tuple[str, ...]:
         adjacent: [[rooms/Living Room]], [[rooms/Dining Room]]
         sensors: [[sensors/hue_kitchen_motion]]
 
-    The simple-YAML parser passes these through as strings (or list of
-    strings); strip the brackets and return the targets in order.
+    The simple-YAML parser AND PyYAML both produce inconsistent shapes
+    on this format:
+
+    * PyYAML reads ``[[rooms/Hallway]]`` as ``[['rooms/Hallway']]`` (a
+      list-of-list) and chokes outright on the comma-separated form.
+    * The simple-YAML fallback splits on commas inside the outer
+      brackets, which gives partial items like ``'[rooms/Living Room]]'``
+      that the wikilink regex doesn't match.
+
+    Rather than depend on either parser getting it right, we flatten
+    whatever shape we receive into a single string and re-run the
+    wikilink regex on the whole thing. That recovers every well-formed
+    ``[[target]]`` reference regardless of how the parser carved it up.
+    Phase 4 (#381) needs reliable adjacency lookups for the inferrer,
+    so this is the fixup point.
     """
     if value is None:
         return ()
-    if isinstance(value, list):
-        items = [str(v) for v in value]
-    else:
-        items = [str(value)]
-    out: list[str] = []
-    for item in items:
-        # Strip leading/trailing whitespace + any standalone brackets.
+
+    def _flatten(v: object) -> list[str]:
+        if isinstance(v, list):
+            out: list[str] = []
+            for item in v:
+                out.extend(_flatten(item))
+            return out
+        return [str(v)]
+
+    flat = _flatten(value)
+    joined = " , ".join(flat)
+    matches = _WIKILINK_TARGET_RE.findall(joined)
+    if matches:
+        # Dedupe while preserving order.
+        seen: set[str] = set()
+        out_list: list[str] = []
+        for m in matches:
+            m = m.strip()
+            if m and m not in seen:
+                seen.add(m)
+                out_list.append(m)
+        return tuple(out_list)
+    # No wikilinks recovered; fall back to bare scalars (operator
+    # hand-edits, no brackets).
+    fallback: list[str] = []
+    for item in flat:
         s = item.strip()
-        matches = _WIKILINK_TARGET_RE.findall(s)
-        if matches:
-            out.extend(m.strip() for m in matches)
-        elif s and not s.startswith("[["):
-            # A bare value (no brackets) — keep verbatim. Onboarding
-            # writes wikilink lists but operators may hand-edit.
-            out.append(s)
-    return tuple(out)
+        if s and not s.startswith("[") and not s.endswith("]"):
+            fallback.append(s)
+    return tuple(fallback)
 
 
 def _build_note(

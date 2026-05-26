@@ -48,6 +48,7 @@ from .surfaces import build_slug, write_observation_note, write_urgent_surface
 
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard
+    from .adjacency import AdjacencyInferrer
     from .guesses import Guess, GuessLifecycle
 
 
@@ -57,6 +58,7 @@ __all__ = [
     "DEFAULT_SECURITY_NIGHT_START_HOUR",
     "DEFAULT_SECURITY_NIGHT_END_HOUR",
     "DEFAULT_TRAIL_SIZE",
+    "DEFAULT_SUBGRAPH_HOPS",
     "MOTION_EVENT_KINDS",
     "MotionEvent",
     "MotionInference",
@@ -64,6 +66,7 @@ __all__ = [
     "MotionQueue",
     "MotionTrail",
     "build_motion_prompt",
+    "build_subgraph_snapshot",
     "classify_motion_batch",
     "is_security_class",
 ]
@@ -100,6 +103,21 @@ DEFAULT_MAX_BATCH_SIZE = 50
 # 23:00–06:59 inclusive.
 DEFAULT_SECURITY_NIGHT_START_HOUR = 23
 DEFAULT_SECURITY_NIGHT_END_HOUR = 7
+
+# Phase 4 (#381): subgraph pruning radius. The cortex snapshot in the
+# classify prompt is restricted to rooms within this many adjacency
+# hops of any room mentioned in the current motion trail. 2 hops keeps
+# qwen grounded in the locally-relevant home topology without dumping
+# the whole vault into every prompt. Configurable on
+# :class:`MotionPipeline` but defaulted here so :func:`build_motion_prompt`
+# stays a pure function with no global state.
+DEFAULT_SUBGRAPH_HOPS = 2
+
+# Soft ceiling on the cortex snapshot size. The design's Phase 4 brief
+# calls for "under 4000 tokens for the cortex section." We approximate
+# tokens as len(json) / 4 and trim rooms/sensors lists if the snapshot
+# blows past the ceiling. Conservative cap; nothing crashes if exceeded.
+SUBGRAPH_TOKEN_CEILING = 4000
 
 # Event kinds we treat as "motion" for the special-class flow. The SSE
 # producer emits ``motion_detected`` for the canonical Hue/CozyHem
@@ -350,6 +368,9 @@ def build_motion_prompt(
     batch: Iterable[MotionEvent],
     trail: Iterable[MotionEvent],
     vault: Optional[cortex_mod.Vault],
+    *,
+    subgraph_hops: int = DEFAULT_SUBGRAPH_HOPS,
+    now_hour: Optional[int] = None,
 ) -> str:
     """Assemble the qwen prompt for one motion-batch classify call.
 
@@ -378,7 +399,13 @@ def build_motion_prompt(
     trail_list = list(trail)
     batch_summary = [_serialize_motion(e) for e in batch_list]
     trail_summary = [_serialize_motion(e) for e in trail_list]
-    cortex_snapshot = _serialize_cortex(vault)
+    cortex_snapshot = build_subgraph_snapshot(
+        vault,
+        batch_list,
+        trail_list,
+        hops=subgraph_hops,
+        now_hour=now_hour,
+    )
 
     return (
         "You are a positional-inference engine for a smart home. Given "
@@ -424,43 +451,281 @@ def _serialize_motion(event: MotionEvent) -> dict:
     }
 
 
-def _serialize_cortex(vault: Optional[cortex_mod.Vault]) -> dict:
-    """Render a compact cortex snapshot — rooms, sensors, adjacency.
+def build_subgraph_snapshot(
+    vault: Optional[cortex_mod.Vault],
+    batch: Iterable[MotionEvent],
+    trail: Iterable[MotionEvent],
+    *,
+    hops: int = DEFAULT_SUBGRAPH_HOPS,
+    now_hour: Optional[int] = None,
+) -> dict:
+    """Return a JSON-safe cortex snapshot pruned to the 2-hop neighborhood
+    of every room in the recent motion trail (Phase 4 of #381).
 
-    Skips note bodies and frontmatter we don't need; qwen only needs
-    enough to ground room names + sensor → room mappings + the
-    adjacency graph for next-room reasoning. Returns an empty snapshot
-    when the vault is missing or unloaded.
+    Replaces the Phase 2 full-vault dump. Sharpening the cortex section
+    to the locally-relevant subgraph keeps the qwen prompt under the
+    design's 4000-token budget AND removes irrelevant rooms that were
+    noise from the classifier's point of view.
+
+    Pruning rules:
+
+    * **Seed rooms** — every room mentioned in ``batch`` or ``trail``
+      (deduped). If the trail is empty AND no vault, returns an empty
+      snapshot.
+    * **N-hop expansion** — for ``hops=2`` (default) the seed set is
+      unioned with rooms adjacent to seeds, then unioned with rooms
+      adjacent to THAT set. Operates over the vault's
+      ``Room.adjacent`` frontmatter list.
+    * **Sensors** — only sensors whose ``room`` lands in the pruned
+      room set survive into the snapshot. Sensors with no room
+      (un-onboarded) are dropped.
+    * **People priors** — when ``now_hour`` is provided, every
+      :class:`~alice_cozylobe.cortex.Person` whose ``time_patterns``
+      reference a destination matching the hour is included with a
+      short summary. ``now_hour=None`` skips the people priors
+      altogether (Phase 2 callers).
+
+    Output shape (matches the design's CORTEX_STATE section):
+
+    .. code-block:: python
+
+        {
+            "rooms": ["Hallway", "Kitchen", "Living Room", ...],
+            "sensors": [{"entity_id": "hue_kitchen_motion", "room": "Kitchen"}],
+            "adjacency": {"Kitchen": ["Hallway", "Dining Room"], ...},
+            "people_priors": [
+                {"person": "Jason", "destination": "Kitchen-at-07:00"}
+            ],
+        }
+
+    Returns ``{"rooms": [], "sensors": [], "adjacency": {}, "people_priors": []}``
+    when the vault is missing OR the trail provides no usable seed
+    rooms — graceful degrade matches the Phase 2 fail-open posture.
     """
     if vault is None:
-        return {"rooms": [], "sensors": [], "adjacency": {}}
+        return {
+            "rooms": [],
+            "sensors": [],
+            "adjacency": {},
+            "people_priors": [],
+        }
 
-    rooms = sorted(r.title for r in vault.rooms.values())
-    sensors = []
-    for s in vault.sensors.values():
-        sensors.append(
-            {
-                "entity_id": s.title,
-                "room": (s.room.split("/", 1)[-1] if s.room else None),
-            }
-        )
-    # Adjacency from each room's frontmatter `adjacent:` field. The
-    # adjacency.graph JSON file is the machine-readable mirror, but
-    # for the prompt we render the in-memory view so a half-onboarded
-    # vault still produces usable context.
+    seed_rooms = _collect_seed_rooms(batch, trail)
+    if not seed_rooms:
+        # Empty trail (e.g. cold start). Surface a minimal grounding
+        # snapshot — every room + every adjacency, but no sensors or
+        # priors. Keeps the classifier informed of the home layout on
+        # the very first event without dragging in the whole vault.
+        return _minimal_snapshot(vault)
+
+    selected_titles = _expand_subgraph(vault, seed_rooms, hops=max(1, hops))
+
+    rooms_sorted = sorted(selected_titles)
+
+    # Sensor pruning: only sensors whose room landed in the selected
+    # set survive. Drops empty/uncovered sensors so the prompt stays
+    # focused on the local neighborhood.
+    sensors: list[dict] = []
+    for sensor in vault.sensors.values():
+        if sensor.room is None:
+            continue
+        room_title = sensor.room.split("/", 1)[-1] if "/" in sensor.room else sensor.room
+        if room_title in selected_titles:
+            sensors.append({"entity_id": sensor.title, "room": room_title})
+    sensors.sort(key=lambda s: s["entity_id"])
+
     adjacency: dict[str, list[str]] = {}
     for room in vault.rooms.values():
-        targets = []
-        for adj in room.adjacent:
-            # adjacent values can be "rooms/Kitchen" or "Kitchen".
-            targets.append(adj.split("/", 1)[-1])
+        if room.title not in selected_titles:
+            continue
+        targets = sorted(
+            {
+                adj.split("/", 1)[-1] if "/" in adj else adj
+                for adj in room.adjacent
+            }
+        )
         if targets:
-            adjacency[room.title] = sorted(set(targets))
-    return {
-        "rooms": rooms,
-        "sensors": sorted(sensors, key=lambda s: s["entity_id"]),
+            adjacency[room.title] = targets
+
+    people_priors = _select_people_priors(vault, now_hour) if now_hour is not None else []
+
+    snapshot = {
+        "rooms": rooms_sorted,
+        "sensors": sensors,
         "adjacency": adjacency,
+        "people_priors": people_priors,
     }
+    return _trim_to_budget(snapshot)
+
+
+def _collect_seed_rooms(
+    batch: Iterable[MotionEvent], trail: Iterable[MotionEvent]
+) -> set[str]:
+    """Pull the unique set of room ids mentioned in ``batch`` + ``trail``.
+
+    Drops events with no resolved room (sensor not in vault). Order
+    doesn't matter for the seed set, so a plain set is enough.
+    """
+    seeds: set[str] = set()
+    for event in batch:
+        if event.room_id:
+            seeds.add(event.room_id)
+    for event in trail:
+        if event.room_id:
+            seeds.add(event.room_id)
+    return seeds
+
+
+def _expand_subgraph(
+    vault: cortex_mod.Vault, seeds: set[str], *, hops: int
+) -> set[str]:
+    """BFS expansion from ``seeds`` through the room adjacency graph.
+
+    Stops after ``hops`` rounds. Returns the union of all rooms
+    encountered (including the seeds). Rooms not present in the vault
+    are kept in the seed set so the snapshot still reports them — qwen
+    can decide whether they're real or a sensor misconfiguration.
+    """
+    selected: set[str] = set(seeds)
+    frontier: set[str] = set(seeds)
+    for _ in range(hops):
+        next_frontier: set[str] = set()
+        for title in frontier:
+            room = vault.rooms.get(f"rooms/{title}")
+            if room is None:
+                continue
+            for adj in room.adjacent:
+                adj_title = adj.split("/", 1)[-1] if "/" in adj else adj
+                if adj_title not in selected:
+                    next_frontier.add(adj_title)
+        if not next_frontier:
+            break
+        selected.update(next_frontier)
+        frontier = next_frontier
+    return selected
+
+
+def _minimal_snapshot(vault: cortex_mod.Vault) -> dict:
+    """Whole-vault snapshot — used as a cold-start fallback when the
+    trail is empty so qwen still gets layout grounding on the very
+    first event.
+
+    Includes every room + sensor + adjacency edge the vault carries.
+    The token-budget trimmer in :func:`_trim_to_budget` will drop
+    sensors first if the snapshot blows past the ceiling for a big
+    vault, so the cold-start path stays bounded.
+    """
+    rooms = sorted(r.title for r in vault.rooms.values())
+    sensors: list[dict] = []
+    for sensor in vault.sensors.values():
+        if sensor.room is None:
+            continue
+        room_title = (
+            sensor.room.split("/", 1)[-1] if "/" in sensor.room else sensor.room
+        )
+        sensors.append({"entity_id": sensor.title, "room": room_title})
+    sensors.sort(key=lambda s: s["entity_id"])
+    adjacency: dict[str, list[str]] = {}
+    for room in vault.rooms.values():
+        targets = sorted(
+            {
+                adj.split("/", 1)[-1] if "/" in adj else adj
+                for adj in room.adjacent
+            }
+        )
+        if targets:
+            adjacency[room.title] = targets
+    return _trim_to_budget(
+        {
+            "rooms": rooms,
+            "sensors": sensors,
+            "adjacency": adjacency,
+            "people_priors": [],
+        }
+    )
+
+
+def _select_people_priors(vault: cortex_mod.Vault, hour: int) -> list[dict]:
+    """Return a short list of (person, destination) pairs whose
+    time-of-day window covers ``hour``.
+
+    The destination note's ``time_window`` frontmatter is the source of
+    truth (shape ``HH:MM–HH:MM``). When that's missing or unparseable,
+    we fall back to the destination's filename slug (``Kitchen-at-07:00``).
+    """
+    out: list[dict] = []
+    for person in vault.people.values():
+        for dest_target in person.time_patterns:
+            dest_title = dest_target.split("/", 1)[-1] if "/" in dest_target else dest_target
+            dest = vault.destinations.get(f"destinations/{dest_title}")
+            if dest is None:
+                continue
+            if _destination_covers_hour(dest, dest_title, hour):
+                out.append({"person": person.title, "destination": dest_title})
+    out.sort(key=lambda d: (d["person"], d["destination"]))
+    return out
+
+
+def _destination_covers_hour(
+    dest: cortex_mod.Destination, dest_title: str, hour: int
+) -> bool:
+    """Best-effort: does ``dest`` cover ``hour``?
+
+    Reads ``dest.time_window`` if present (shape ``HH:MM–HH:MM`` or
+    ``HH:MM-HH:MM``). Falls back to scanning ``-at-HH:MM`` in the
+    destination title. Window crossing midnight is supported.
+    """
+    if dest.time_window:
+        window = dest.time_window.replace("–", "-")  # accept en-dash + hyphen
+        if "-" in window:
+            start_s, end_s = window.split("-", 1)
+            try:
+                start_h = int(start_s.split(":")[0])
+                end_h = int(end_s.split(":")[0])
+            except ValueError:
+                start_h = end_h = -1
+            if 0 <= start_h <= 23 and 0 <= end_h <= 23:
+                if start_h <= end_h:
+                    return start_h <= hour <= end_h
+                return hour >= start_h or hour <= end_h
+    # Fallback: parse "Kitchen-at-07:00" → 7.
+    if "-at-" in dest_title:
+        try:
+            tail = dest_title.split("-at-", 1)[1]
+            anchor_h = int(tail.split(":")[0])
+        except (IndexError, ValueError):
+            return False
+        # Treat the anchor as a 2-hour window around the hour for the
+        # fallback case (07:00 → covers 06-08).
+        return abs(anchor_h - hour) <= 1
+    return False
+
+
+def _trim_to_budget(snapshot: dict) -> dict:
+    """Trim sensors then adjacency entries when the snapshot exceeds the
+    soft token ceiling. Rooms list stays — that's the load-bearing
+    grounding information for the classifier.
+    """
+    estimated = sum(
+        len(json.dumps(v, ensure_ascii=False, separators=(",", ":")))
+        for v in snapshot.values()
+    )
+    if estimated <= SUBGRAPH_TOKEN_CEILING * 4:
+        return snapshot
+    # Drop sensors first — entity_ids tend to dominate the byte count
+    # and the adjacency graph carries more reasoning value.
+    snapshot = dict(snapshot)
+    if snapshot.get("sensors"):
+        snapshot["sensors"] = []
+        estimated = sum(
+            len(json.dumps(v, ensure_ascii=False, separators=(",", ":")))
+            for v in snapshot.values()
+        )
+    if estimated <= SUBGRAPH_TOKEN_CEILING * 4:
+        return snapshot
+    # If still too big, drop people priors next.
+    snapshot["people_priors"] = []
+    return snapshot
 
 
 async def classify_motion_batch(
@@ -469,6 +734,8 @@ async def classify_motion_batch(
     *,
     qwen_client: QwenClient,
     vault: Optional[cortex_mod.Vault] = None,
+    subgraph_hops: int = DEFAULT_SUBGRAPH_HOPS,
+    now_hour: Optional[int] = None,
 ) -> MotionInference:
     """Classify one motion batch via local qwen.
 
@@ -477,7 +744,9 @@ async def classify_motion_batch(
     :class:`QwenUnreachable` on network or parse failure — the caller
     (the pipeline) catches and degrades gracefully.
     """
-    prompt = build_motion_prompt(batch, trail, vault)
+    prompt = build_motion_prompt(
+        batch, trail, vault, subgraph_hops=subgraph_hops, now_hour=now_hour
+    )
     parsed = await qwen_client.complete(prompt)
     return MotionInference(
         current_room=_opt_str(parsed.get("current_room")),
@@ -544,6 +813,11 @@ class MotionPipeline:
         vault_root: Optional[Path] = None,
         lifecycle: Optional["GuessLifecycle"] = None,
         write_surface: Optional[Callable[..., object]] = None,
+        adjacency_inferrer: Optional["AdjacencyInferrer"] = None,
+        record_trajectory_fn: Optional[
+            Callable[[Path, Optional[str], str, str, datetime], object]
+        ] = None,
+        subgraph_hops: int = DEFAULT_SUBGRAPH_HOPS,
     ) -> None:
         self._qwen = qwen_client
         self._vault = vault
@@ -564,6 +838,16 @@ class MotionPipeline:
         self._vault_root = Path(vault_root) if vault_root is not None else None
         self._lifecycle = lifecycle
         self._write_surface = write_surface or write_urgent_surface
+        # Phase 4 (#381): adjacency inferrer + trajectory recorder.
+        # Both are optional so existing Phase 2/3 callers and tests can
+        # keep their constructor calls unchanged. When ``adjacency_inferrer``
+        # is None, observe() is skipped; when ``record_trajectory_fn`` is
+        # None, we lazy-import the default implementation from
+        # :mod:`alice_cozylobe.trajectories`. The latter is wrapped so
+        # tests can inject a recorder spy without importing the module.
+        self._adjacency_inferrer = adjacency_inferrer
+        self._record_trajectory_fn = record_trajectory_fn
+        self._subgraph_hops = subgraph_hops
         # Lock-free single-consumer use: the wake loop drains one
         # event at a time on one asyncio task.
 
@@ -608,6 +892,20 @@ class MotionPipeline:
         motion = MotionEvent.from_cozyhem(event, vault=self._vault)
         self._trail.append(motion)
 
+        # Phase 4 (#381): adjacency inferrer.observe runs every event
+        # against the latest trail. Walks consecutive pairs and counts
+        # any non-adjacent pair within the 30s window — promotes
+        # crossings of the 5/10/20/50 thresholds to inline edges on the
+        # room notes. Fail-open: an adjacency write failure must never
+        # take the motion pipeline down, so observe() never raises.
+        if self._adjacency_inferrer is not None:
+            try:
+                self._adjacency_inferrer.observe(self._trail.snapshot())
+            except Exception as exc:  # noqa: BLE001 - fail-open
+                log.warning(
+                    "cozylobe motion: adjacency.observe raised: %s", exc
+                )
+
         # Phase 3: lifecycle gets first crack at the event — confirm /
         # refute pending guesses whose 60s window is still open. We
         # swallow exceptions because a broken lifecycle should never
@@ -647,6 +945,72 @@ class MotionPipeline:
             return self._security_predicate(motion)
         return is_security_class(motion, localtime=self._localtime)
 
+    def _current_hour(self) -> Optional[int]:
+        """Return the local hour-of-day (0..23) for the people-prior
+        selection in the cortex snapshot. Falls back to None when the
+        localtime hook isn't injected — keeps Phase 2 tests stable.
+        """
+        try:
+            return self._localtime(self._clock()).tm_hour
+        except Exception:  # noqa: BLE001 - defensive
+            return None
+
+    def _record_trajectory_safely(
+        self, guess: Optional["Guess"]
+    ) -> None:
+        """Phase 4: persist a typed-edge trajectory observation if the
+        classify produced a next-room hypothesis AND we know which
+        room the person came from.
+
+        ``from_room`` is the second-to-last room in the trail (the room
+        before the guess's current room); ``to_room`` is the predicted
+        next-room hypothesis. Person defaults to "unknown" when the
+        classifier didn't propose one. Fail-open on any error —
+        trajectory IO must never block the motion pipeline.
+        """
+        if self._vault_root is None:
+            return
+        if guess is None or not guess.next_room_hypothesis:
+            return
+        if not guess.room:
+            return
+        from_room = self._previous_trail_room(guess.room)
+        if not from_room:
+            # No prior room in the trail — we can't anchor a
+            # from→to edge yet. Trajectory needs both endpoints.
+            return
+        try:
+            recorder = self._record_trajectory_fn
+            if recorder is None:
+                from .trajectories import record_trajectory
+
+                recorder = record_trajectory
+            recorder(
+                self._vault_root,
+                guess.person,
+                from_room,
+                guess.next_room_hypothesis,
+                guess.updated or guess.created or datetime.now(timezone.utc),
+            )
+        except OSError as exc:
+            log.warning(
+                "cozylobe motion: trajectory write failed: %s", exc
+            )
+        except Exception as exc:  # noqa: BLE001 - fail-open
+            log.warning(
+                "cozylobe motion: trajectory record raised: %s", exc
+            )
+
+    def _previous_trail_room(self, current_room: str) -> Optional[str]:
+        """Walk the trail backwards from the latest event, return the
+        first room that isn't ``current_room``. Used as the ``from_room``
+        anchor for trajectory recording.
+        """
+        for event in reversed(self._trail.snapshot()):
+            if event.room_id and event.room_id != current_room:
+                return event.room_id
+        return None
+
     async def _classify_and_write(
         self, batch: list[MotionEvent], *, security: bool
     ) -> None:
@@ -670,6 +1034,8 @@ class MotionPipeline:
                 self._trail.snapshot(),
                 qwen_client=self._qwen,
                 vault=self._vault,
+                subgraph_hops=self._subgraph_hops,
+                now_hour=self._current_hour(),
             )
         except QwenUnreachable as exc:
             log.warning(
@@ -725,6 +1091,12 @@ class MotionPipeline:
         # ship the cross-link in a follow-up. Today the guess and the
         # note are written independently.
         guess = self._emit_guess(batch, inference)
+        # Phase 4 (#381): persist a trajectory edge if the classify
+        # proposed a next-room hypothesis. The guess-lifecycle's
+        # self-evident confirmation will validate/refute on the next
+        # event — this write is the durable record so confirmed
+        # trajectories accumulate weight over time.
+        self._record_trajectory_safely(guess)
         tier = self._classify_surface_tier(guess, security=security)
 
         tags = ["lobe-observation", "motion-pipeline", f"surface-tier:{tier}"]

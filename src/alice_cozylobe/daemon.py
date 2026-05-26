@@ -28,7 +28,9 @@ from .activity_fetcher import (
     DEFAULT_COZYHEM_BASE_URL,
     ActivityFetcher,
 )
+from .adjacency import AdjacencyInferrer
 from .cortex import DEFAULT_VAULT_ROOT, load_vault
+from .guesses import GuessLifecycle
 from .motion import MotionPipeline
 from .qwen_client import DEFAULT_QWEN_ENDPOINT, QwenClient
 from .sse_consumer import (
@@ -170,9 +172,22 @@ class CozylobeDaemon:
         # directory is missing — the daemon stays up on a half-onboarded
         # vault, the prompt just carries an empty cortex snapshot.
         cortex_vault = load_vault(self._cozylobe_cortex_root)
+        # Phase 3 (#380) + Phase 4 (#381) wiring: guess lifecycle for
+        # self-evident confirmation/refutation, adjacency inferrer for
+        # unknown-edge discovery. Both read the same throttle config
+        # for their tunable knobs (adjacency window) so operators have
+        # a single editable file.
+        guess_lifecycle = GuessLifecycle(vault_root=self._cozylobe_cortex_root)
+        adjacency_inferrer = AdjacencyInferrer(
+            vault=cortex_vault,
+            window_s=throttle.config.adjacency_inference_window_s,
+        )
         motion_pipeline = MotionPipeline(
             qwen_client=qwen,
             vault=cortex_vault,
+            vault_root=self._cozylobe_cortex_root,
+            lifecycle=guess_lifecycle,
+            adjacency_inferrer=adjacency_inferrer,
         )
 
         wake_loop = WakeLoop(

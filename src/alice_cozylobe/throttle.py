@@ -181,6 +181,14 @@ class ThrottleConfig:
     input_kinds: frozenset[str] = field(
         default_factory=lambda: DEFAULT_INPUT_KINDS
     )
+    # Phase 4 (#381): adjacency inference window (seconds). Two motion
+    # events in non-adjacent rooms within this window count as evidence
+    # of an unknown adjacency. 30s default — long enough to catch a
+    # brisk walk between adjacent rooms, short enough to filter out
+    # coincidental fires from different people in different parts of
+    # the house. Configurable so operators can dial up/down without a
+    # code change.
+    adjacency_inference_window_s: float = 30.0
 
     @classmethod
     def default(cls) -> "ThrottleConfig":
@@ -255,6 +263,20 @@ class ThrottleConfig:
             cfg.input_kinds = frozenset(
                 str(x) for x in ik if isinstance(x, str)
             )
+
+        # Phase 4 (#381): adjacency inference window. Bad value → keep
+        # default rather than crash.
+        aiw = raw.get("adjacency_inference_window_s")
+        if aiw is not None:
+            try:
+                cfg.adjacency_inference_window_s = float(aiw)
+            except (TypeError, ValueError):
+                log.warning(
+                    "cozylobe throttle: adjacency_inference_window_s is not "
+                    "a number (%r); keeping default %.1f",
+                    aiw,
+                    cfg.adjacency_inference_window_s,
+                )
 
         return cfg
 

@@ -57,6 +57,19 @@ STRUCTURAL_ROOT_FILES = {"index"}  # /index.md at vault root
 DEFAULT_VAULT = Path.home() / "alice-mind" / "cortex-memory"
 DEFAULT_DB = Path.home() / "alice-mind" / "inner" / "state" / "cortex-index.db"
 
+# Phase 4 (#381): cozylobe-cortex is a SEPARATE vault indexed into a
+# SEPARATE DB. The structure of notes is identical (frontmatter +
+# wikilinks + markdown body), so the same parsing logic + FTS5 schema
+# work — but the two indices must never share rows. Privacy isolation:
+# the cue runner queries cortex-index.db by default and never touches
+# cozylobe-cortex-index.db unless explicitly pointed at it. See design
+# §4.6 of cortex-memory/research/2026-05-26-cozylobe-motion-cortex.md.
+COZYLOBE_VAULT_ENV = "COZYLOBE_CORTEX_ROOT"
+DEFAULT_COZYLOBE_VAULT = Path.home() / "alice-mind" / "cozylobe-cortex"
+DEFAULT_COZYLOBE_DB = (
+    Path.home() / "alice-mind" / "inner" / "state" / "cozylobe-cortex-index.db"
+)
+
 
 SCHEMA_SQL = """
 CREATE TABLE meta (
@@ -395,6 +408,30 @@ def build(vault: Path, db_path: Path) -> dict:
     }
 
 
+def _resolve_cozylobe_paths(
+    vault: Path | None, db: Path | None
+) -> tuple[Path, Path]:
+    """Pick the cozylobe-cortex vault + db paths for ``--cozylobe`` runs.
+
+    Precedence:
+    1. CLI ``--vault`` / ``--db`` overrides win when explicitly set
+       (i.e. not equal to :data:`DEFAULT_VAULT` / :data:`DEFAULT_DB`).
+    2. The ``COZYLOBE_CORTEX_ROOT`` env var picks the vault root.
+    3. :data:`DEFAULT_COZYLOBE_VAULT` / :data:`DEFAULT_COZYLOBE_DB`.
+    """
+    import os as _os
+
+    if vault is None or vault == DEFAULT_VAULT:
+        env_root = _os.environ.get(COZYLOBE_VAULT_ENV)
+        if env_root:
+            vault = Path(env_root).expanduser()
+        else:
+            vault = DEFAULT_COZYLOBE_VAULT
+    if db is None or db == DEFAULT_DB:
+        db = DEFAULT_COZYLOBE_DB
+    return vault, db
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("--vault", type=Path, default=DEFAULT_VAULT)
@@ -409,12 +446,30 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Suppress stats output on success",
     )
+    parser.add_argument(
+        "--cozylobe",
+        action="store_true",
+        help=(
+            "Build the cozylobe-cortex index instead of the main "
+            "cortex-memory index. Defaults vault to "
+            f"{DEFAULT_COZYLOBE_VAULT} (override via --vault or "
+            f"${COZYLOBE_VAULT_ENV}) and db to {DEFAULT_COZYLOBE_DB}."
+        ),
+    )
     args = parser.parse_args(argv)
 
-    if args.check:
-        return 0 if needs_rebuild(args.vault, args.db) else 1
+    if args.cozylobe:
+        # Re-use the same build pipeline against the cozylobe vault.
+        # Same frontmatter schema, same FTS5 schema, separate DB file.
+        # Privacy isolation is enforced by the cue runner — see design §4.6.
+        vault, db = _resolve_cozylobe_paths(args.vault, args.db)
+    else:
+        vault, db = args.vault, args.db
 
-    stats = build(args.vault, args.db)
+    if args.check:
+        return 0 if needs_rebuild(vault, db) else 1
+
+    stats = build(vault, db)
     if not args.quiet:
         print(json.dumps(stats, indent=2))
     return 0

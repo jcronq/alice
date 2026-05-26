@@ -1263,6 +1263,57 @@ def _resolve_vault_root(explicit: pathlib.Path | None) -> pathlib.Path:
     return pathlib.Path.home() / "alice-mind" / "cortex-memory"
 
 
+# ---------------------------------------------------------------------------
+# Privacy isolation — cozylobe-cortex opt-in (Phase 4 of #381)
+#
+# The default cue-runner code path above queries the main cortex-index.db
+# only. cozylobe-cortex notes — rooms, sensors, motion guesses,
+# trajectories — must NOT surface in unrelated Speaking turns (design
+# §4.6 of 2026-05-26-cozylobe-motion-cortex.md).
+#
+# The two indices are physically separate files: cortex-index.db lives
+# at the path :func:`_resolve_db_path` returns; cozylobe-cortex-index.db
+# is at :data:`COZYLOBE_DB_PATH` below. Since :func:`build_cue_context`
+# only opens whatever ``db_path`` resolves to, the cue runner CANNOT
+# accidentally surface cozylobe-cortex notes — the structural separation
+# is the privacy boundary, not a runtime filter.
+#
+# When a caller explicitly wants cozylobe-cortex retrieval (cozylobe
+# itself doing a deep-dive query, or thinking reasoning about motion
+# patterns), they pass ``vault="cozylobe"`` to :func:`build_cue_context`
+# or wire the COZYLOBE_DB_PATH + COZYLOBE_VAULT_ROOT through directly.
+
+COZYLOBE_DB_PATH = (
+    pathlib.Path.home() / "alice-mind" / "inner" / "state" / "cozylobe-cortex-index.db"
+)
+COZYLOBE_VAULT_ROOT = pathlib.Path.home() / "alice-mind" / "cozylobe-cortex"
+VAULT_COZYLOBE = "cozylobe"
+VAULT_DEFAULT = "default"
+
+
+def resolve_vault_paths(
+    vault: str = VAULT_DEFAULT,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """Return ``(db_path, vault_root)`` for a named vault.
+
+    Public seam for callers that want to opt into the cozylobe-cortex
+    index without hardcoding the paths. ``vault="default"`` returns the
+    main cortex-memory paths; ``vault="cozylobe"`` returns the
+    cozylobe-cortex paths. Anything else raises ``ValueError`` — better
+    a loud error than silently mixing the two.
+    """
+    if vault == VAULT_COZYLOBE:
+        return COZYLOBE_DB_PATH, COZYLOBE_VAULT_ROOT
+    if vault == VAULT_DEFAULT:
+        return (
+            pathlib.Path.home() / "alice-mind" / "inner" / "state" / "cortex-index.db",
+            pathlib.Path.home() / "alice-mind" / "cortex-memory",
+        )
+    raise ValueError(
+        f"unknown vault {vault!r}; expected {VAULT_DEFAULT!r} or {VAULT_COZYLOBE!r}"
+    )
+
+
 def _spawn_bump(
     vault_root: pathlib.Path,
     rel_path: str,
@@ -1301,6 +1352,7 @@ __all__ = [
     "build_cue_packet",
     "classify_note",
     "extract_matched_lines",
+    "resolve_vault_paths",
     # Constants exposed for tests.
     "STATE_BOOST",
     "BEHAVIOR_BOOST",
@@ -1314,4 +1366,8 @@ __all__ = [
     "FITNESS_RECENCY_COEFFICIENT",
     "FITNESS_RECENCY_CAP",
     "HEBBIAN_DEFAULTS",
+    "COZYLOBE_DB_PATH",
+    "COZYLOBE_VAULT_ROOT",
+    "VAULT_COZYLOBE",
+    "VAULT_DEFAULT",
 ]
