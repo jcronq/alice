@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# task — SM v2 task tracker CLI. Operates on ~/alice-mind/inner/tasks/.
+#
+# Usage:
+#   task create --title TITLE [--tags T,T,...] [--actor ACTOR]
+#               [--artifact-type TYPE] [--source SRC] [--reason R]
+#   task update <id> --status STATE [--reason R] [--merge-ref REF]
+#                    [--validation-evidence E] [--unblocked-by U]
+#                    [--actor ACTOR]
+#   task list [--status STATE|open] [--tag TAG] [--actor ACTOR]
+#   task view <id>
+#   task close <id> [--reason R] [--merge-ref REF] [--actor ACTOR]
+#
+# Add --json to any subcommand for machine-readable output.
+#
+# Roots (in priority order): $TASKS_DIR, $ALICE_MIND_DIR/inner/tasks,
+# ~/alice-mind/inner/tasks. Override per-call with --root <path>.
+#
+# The CLI is kernel-agnostic — Speaking (Claude SDK), Thinking
+# (pi-coding-agent), and ad-hoc shells all share this entry point so
+# the task store is reached through one contract regardless of who's
+# calling. The Python implementation lives in
+# src/alice_forge/task_cli.py.
+
+set -u
+
+VENV_PY="${VENV_PY:-/opt/alice-venv/bin/python}"
+ALICE_SRC="${ALICE_SRC:-/home/alice/alice/src}"
+
+# Fall back to a system python if the venv path isn't present —
+# matters for local invocations outside the container.
+if [ ! -x "$VENV_PY" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+        VENV_PY="$(command -v python3)"
+    else
+        echo "[task] no python3 available" >&2
+        exit 2
+    fi
+fi
+
+# Honour an existing PYTHONPATH so dependent venvs don't lose theirs.
+if [ -n "${PYTHONPATH-}" ]; then
+    export PYTHONPATH="$ALICE_SRC:$PYTHONPATH"
+else
+    export PYTHONPATH="$ALICE_SRC"
+fi
+export PYTHONUNBUFFERED=1
+
+exec "$VENV_PY" -m alice_forge.task_cli "$@"

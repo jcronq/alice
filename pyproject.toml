@@ -54,6 +54,13 @@ alice-experiment = "alice_thinking.cli.experiment:main"
 # issues, trust-filters them, and posts a dispatcher-hello comment. Invoke
 # on a cadence (later: s6 supervisor); for now it's manual.
 alice-sm = "alice_forge.dispatcher:main"
+# SM v2 task tracker CLI — operates on ~/alice-mind/inner/tasks/
+# (per-task task.yaml + transitions.jsonl + index.jsonl). Kernel-agnostic
+# so Speaking, Thinking, and ad-hoc shells share one entry point.
+# Issue #375. The bin/task shell wrapper invokes ``python -m
+# alice_forge.task_cli`` directly; this entry-point exists so the
+# CLI is also reachable as ``task`` once the wheel is installed.
+task = "alice_forge.task_cli:main"
 # One-shot reconciliation: copy access_count from vault frontmatter into
 # the cortex-index note_metrics table. Used to bootstrap historical
 # counts after wiring the cue runner's DB write path.

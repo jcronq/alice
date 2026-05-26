@@ -793,6 +793,15 @@ async def handle_background_task_complete(
         channel_transport=(event.channel.transport if event.channel else None),
     )
 
+    # Issue #375: transition the SM v2 task to its terminal state.
+    # Local import to dodge circulars at module load — auto_fix
+    # imports from alice_forge which imports back here in tests.
+    from . import auto_fix as _auto_fix
+
+    _auto_fix.record_auto_fix_task_complete(
+        event.handle, event.result_text or "", is_error=event.is_error
+    )
+
     framing = "failed" if event.is_error else "completed"
     body = (event.result_text or "").strip() or "(sub-agent returned no text)"
     prompt = (

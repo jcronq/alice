@@ -1379,6 +1379,14 @@ class SpeakingDaemon:
         # cortex-memory/research/2026-05-19-dispatched-inflight-speaking-wiring.md
         # and PR #262 (write path).
         auto_fix_module.record_auto_fix_inflight(instructions, handle)
+        # Issue #375: also record an SM v2 task entry so the
+        # ``inner/tasks/`` state machine has producers wired to real
+        # workflows. The intake call cascades draft → selected →
+        # building; the completion handler in _dispatch transitions
+        # building → done (PR URL) or building → blocked (error).
+        auto_fix_module.record_auto_fix_task_intake(
+            instructions, handle, title=description
+        )
 
         async def _run_subagent() -> None:
             result_text = ""
