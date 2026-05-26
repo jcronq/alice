@@ -40,6 +40,10 @@ _SENTINEL_PATH = Path("/state/worker/reload-requested")
 _EXPECTED_HEAD_PATH = (
     Path.home() / "alice-mind" / "inner" / "state" / "reload-expected-head"
 )
+_COZYLOBE_SENTINEL_PATH = Path("/state/worker/cozylobe-reload-requested")
+_COZYLOBE_EXPECTED_HEAD_PATH = (
+    Path.home() / "alice-mind" / "inner" / "state" / "cozylobe-reload-expected-head"
+)
 _REPO_PATH = "/home/alice/alice"
 
 
@@ -121,7 +125,61 @@ def build(cfg: Config, *, personae: Personae | None = None) -> list[SdkMcpTool[A
             msg += f"Reason: {reason}"
         return _ok(msg.rstrip())
 
-    return [request_worker_reload]
+    @tool(
+        name="request_cozylobe_reload",
+        description=(
+            "Request a hot restart of the alice-cozylobe daemon to pick up "
+            "code changes from the bind-mounted alice repo. Writes a sentinel "
+            "to /state/worker/cozylobe-reload-requested; the "
+            "alice-cozylobe-reload-watcher s6 service waits 3s then triggers "
+            "the cozylobe restart loop. The Python interpreter recycles and "
+            "modules reload; cozylobe re-establishes its cozyhem-engine SSE "
+            "connection on startup. Total downtime ~5-10s. Use after committing "
+            "a cozylobe code change to master that needs to take effect in the "
+            "running process. Unlike request_worker_reload this does NOT kill "
+            "the current Signal turn — cozylobe is a separate daemon. Watcher "
+            "rate-limits to one reload per 60s to prevent restart loops on bad "
+            "code."
+        ),
+        input_schema={"reason": str},
+    )
+    async def request_cozylobe_reload(args: dict) -> dict:
+        reason = (args.get("reason") or "").strip()
+        head = _git_head()
+        ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        payload: dict[str, Any] = {
+            "type": "hot",
+            "reason": reason,
+            "ts": ts,
+            "git_head": head,
+        }
+
+        # Write the expected-head file first so the post-restart cozylobe
+        # daemon can verify it picked up the right commit. Best-effort; do
+        # not block on failure. Distinct path from speaking's reload sentinel
+        # so concurrent reloads don't stomp each other's verification state.
+        try:
+            _COZYLOBE_EXPECTED_HEAD_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _COZYLOBE_EXPECTED_HEAD_PATH.write_text(head)
+        except OSError:
+            pass
+
+        # Write the sentinel — this is what triggers the watcher.
+        try:
+            _COZYLOBE_SENTINEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _COZYLOBE_SENTINEL_PATH.write_text(json.dumps(payload))
+        except OSError as exc:
+            return _err(f"cozylobe sentinel write failed: {exc}")
+
+        msg = (
+            f"Cozylobe reload requested at git HEAD {head}. "
+            "Watcher will restart alice-cozylobe in ~3s. "
+        )
+        if reason:
+            msg += f"Reason: {reason}"
+        return _ok(msg.rstrip())
+
+    return [request_worker_reload, request_cozylobe_reload]
 
 
 __all__ = ["build", "_git_head"]

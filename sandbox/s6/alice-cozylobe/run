@@ -11,6 +11,17 @@
 #
 # Service scaffold deferred from PR #359 (cozylobe walking skeleton);
 # wired here per the daemon docstring's "follow-up PR" note.
+#
+# Hot-restart loop (#390): the inner `while true` re-execs the Python
+# interpreter when /state/worker/cozylobe-reload-requested-internal exists.
+# The alice-cozylobe-reload-watcher s6 service touches that flag and
+# then runs `s6-svc -r` against this service; SIGTERM forwards to the
+# Python process, the loop sees the flag, clears it, and starts a fresh
+# interpreter — picking up bind-mounted code changes without recycling
+# the s6 service. If the flag isn't set after the Python process exits,
+# this is a normal shutdown (or a crash) and we break out so s6's own
+# restart-backoff handles it. Mirrors the speaking pattern documented in
+# cortex-memory/research/2026-05-05-speaking-self-deploy-design.md.
 set -e
 
 export ALICE_CONFIG=/home/alice/.config/alice/alice.env
@@ -26,4 +37,40 @@ export PYTHONUNBUFFERED=1
 # breaking subsequent alice-uid writes. Mirrors the pattern in
 # alice-speaking/run and alice-sm-dispatcher/run.
 exec s6-setuidgid alice redirfd -a 2 /state/worker/cozylobe-stderr.log \
-    /opt/alice-venv/bin/python -m alice_cozylobe
+    bash -c '
+        shutdown=
+        child=
+        on_signal() {
+            shutdown=1
+            if [[ -n "$child" ]]; then
+                kill -TERM "$child" 2>/dev/null || true
+            fi
+        }
+        trap on_signal TERM INT
+
+        while true; do
+            /opt/alice-venv/bin/python -m alice_cozylobe &
+            child=$!
+
+            # Signals interrupt wait (return 128+signum); the trap then
+            # forwards SIGTERM to Python. We re-wait until Python is
+            # actually reaped — drain may take a moment. ``|| rc=$?``
+            # keeps the non-zero from killing the script under set -e.
+            while :; do
+                rc=0
+                wait "$child" 2>/dev/null || rc=$?
+                kill -0 "$child" 2>/dev/null || break
+            done
+
+            if [[ -n "$shutdown" ]]; then
+                # Real shutdown: do not honour a stale reload flag.
+                break
+            fi
+            if [[ -f /state/worker/cozylobe-reload-requested-internal ]]; then
+                rm -f /state/worker/cozylobe-reload-requested-internal
+            else
+                break
+            fi
+        done
+        exit "${rc:-0}"
+    '
