@@ -205,10 +205,14 @@ services:
     volumes:
       - ./litellm/config.yaml:/etc/litellm/config.yaml:ro
     ports:
-      # Localhost-only publish — debugging from the host without
-      # docker-exec. Inter-container traffic uses the compose network
-      # at alice-litellm:4000 (see LITELLM_BASE_URL on alice).
-      - "127.0.0.1:4000:4000"
+      # Published on ALL interfaces so the dashboard is reachable across
+      # the LAN at http://<aimax1-ip>:4000/ui without an SSH tunnel.
+      # Acceptable now that auth is on (master key on /v1, login on /ui) —
+      # but the defaults are weak (sk-alice-local / admin:alice-admin);
+      # set real LITELLM_MASTER_KEY / LITELLM_UI_PASSWORD in alice.env if
+      # the LAN isn't trusted. Inter-container traffic still uses
+      # alice-litellm:4000 on the compose bridge.
+      - "4000:4000"
     healthcheck:
       # The litellm image ships no curl/wget — only python. Probe
       # liveliness with the stdlib so the healthcheck can actually pass
