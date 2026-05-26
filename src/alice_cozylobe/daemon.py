@@ -51,9 +51,12 @@ DEFAULT_LOG = pathlib.Path("/state/worker/cozylobe.log")
 # run_agent fell through to its BackendSpec(backend="subscription")
 # default and dispatched claude-opus-4-7 on every single SSE event.
 # This pins the lobe to pi+qwen instead. The model string is
-# "<pi-provider>/<model-id>"; the provider's endpoint is declared in
-# the vault's pi-models.json (openai-desktop -> 10.20.30.147:8033).
-DEFAULT_REASONING_MODEL = "openai-desktop/qwen3.6-27b"
+# "<pi-provider>/<model-id>"; the "litellm" provider in the vault's
+# pi-models.json points pi at the LiteLLM proxy (alice-litellm:4000),
+# and "qwen-desktop" maps to the 3090 desktop (10.20.30.147:8033) in
+# sandbox/litellm/config.yaml — so PiKernel reasoning goes through the
+# proxy like every other local-model call site, not direct to the box.
+DEFAULT_REASONING_MODEL = "litellm/qwen-desktop"
 
 # Bound each reasoning pass. The registered cozylobe template uses
 # max_seconds=0 (unbounded); a slow/hung qwen on every event would

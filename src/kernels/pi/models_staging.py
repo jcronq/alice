@@ -4,8 +4,8 @@ pi-coding-agent reads its provider/model registry from
 ``~/.pi/agent/models.json`` (or ``$PI_AGENT_DIR/models.json``).
 Alice's source-of-truth registry lives in the vault at
 ``~/alice-mind/config/pi-models.json`` — that's where the
-``openai-local/Qwen3.6-35B-A3B-Q8_K_XL`` endpoint thinking talks
-to is declared.
+``litellm`` provider (pointing pi at the LiteLLM proxy that fronts
+the local Qwen runtimes) is declared.
 
 This module is the alice-pi-managed staging step that copies
 vault → pi runtime location at the start of every PiKernel run.
