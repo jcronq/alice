@@ -31,6 +31,7 @@ from core.agent_library import AgentSpec, default_registry, run_agent
 from core.events import EventEmitter
 
 from .activity_fetcher import ActivitySnapshot, FetchActivity
+from .event_log import SseEventLogger
 from .events import CozyHemEvent
 from .motion import MotionPipeline
 from .qwen_client import QwenClassification, QwenClient, QwenUnreachable
@@ -92,6 +93,7 @@ class WakeLoop:
         sleep: Optional[Callable[[float], Awaitable[None]]] = None,
         throttle: Optional[Throttle] = None,
         motion_pipeline: Optional[MotionPipeline] = None,
+        event_logger: Optional[SseEventLogger] = None,
     ) -> None:
         self._emitter = emitter
         self._qwen = qwen_client
@@ -115,6 +117,13 @@ class WakeLoop:
         # continue to exercise the generic event path; when None,
         # motion events fall through to the existing classify path.
         self._motion_pipeline = motion_pipeline
+        # Issue #401: raw-event JSONL logger for NN training corpus.
+        # Optional — None disables logging entirely. The logger sits
+        # post-INPUT_KINDS, pre-throttle, pre-motion so OUTPUT events
+        # never enter the corpus and duplicate "sensor still on" fires
+        # are preserved verbatim (timing information matters for the
+        # sequence model).
+        self._event_logger = event_logger
 
     async def run(
         self,
@@ -177,6 +186,16 @@ class WakeLoop:
             kind=event.kind,
             entity_id=event.entity_id,
         )
+
+        # Issue #401: append the raw event to the JSONL corpus BEFORE
+        # throttle suppression and BEFORE motion routing. Rationale:
+        # INPUT_KINDS has already filtered out OUTPUT events (circadian
+        # ticks, propagated light states); throttle would collapse
+        # duplicate "sensor still on" fires that carry useful inter-
+        # event timing information for the future sequence model.
+        # Fail-safe inside the logger — never crashes the wake loop.
+        if self._event_logger is not None:
+            self._event_logger.log(event)
 
         # Phase 2 (#379): motion is a special class. Motion events
         # BYPASS the throttle entirely and route through the motion

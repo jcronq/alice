@@ -32,6 +32,7 @@ on the registered ``cozylobe`` :class:`~core.agent_library.AgentSpec`
 from __future__ import annotations
 
 from .activity_fetcher import ActivityFetcher, ActivitySnapshot
+from .event_log import DEFAULT_EVENT_LOG_ROOT, SseEventLogger
 from .events import CozyHemEvent
 from .qwen_client import QwenClassification, QwenClient, QwenUnreachable
 from .sse_consumer import SSEConsumer
@@ -44,10 +45,12 @@ __all__ = [
     "ActivityFetcher",
     "ActivitySnapshot",
     "CozyHemEvent",
+    "DEFAULT_EVENT_LOG_ROOT",
     "QwenClassification",
     "QwenClient",
     "QwenUnreachable",
     "SSEConsumer",
+    "SseEventLogger",
     "Throttle",
     "ThrottleConfig",
     "ThrottleDecision",

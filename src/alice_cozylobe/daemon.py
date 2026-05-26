@@ -30,6 +30,7 @@ from .activity_fetcher import (
 )
 from .adjacency import AdjacencyInferrer
 from .cortex import DEFAULT_VAULT_ROOT, load_vault
+from .event_log import DEFAULT_EVENT_LOG_ROOT, SseEventLogger
 from .guesses import GuessLifecycle
 from .motion import MotionPipeline
 from .qwen_client import DEFAULT_QWEN_ENDPOINT, QwenClient
@@ -97,6 +98,8 @@ class CozylobeDaemon:
         reasoning_max_seconds: int = DEFAULT_REASONING_MAX_SECONDS,
         throttle_config_path: pathlib.Path = DEFAULT_THROTTLE_CONFIG_PATH,
         cozylobe_cortex_root: pathlib.Path = DEFAULT_VAULT_ROOT,
+        event_log_root: pathlib.Path = DEFAULT_EVENT_LOG_ROOT,
+        event_log_enabled: bool = True,
     ) -> None:
         self._events_url = events_url
         self._qwen_endpoint = qwen_endpoint
@@ -107,6 +110,8 @@ class CozylobeDaemon:
         self._reasoning_max_seconds = reasoning_max_seconds
         self._throttle_config_path = pathlib.Path(throttle_config_path)
         self._cozylobe_cortex_root = pathlib.Path(cozylobe_cortex_root)
+        self._event_log_root = pathlib.Path(event_log_root)
+        self._event_log_enabled = bool(event_log_enabled)
         self._emitter = EventLogger(log_path)
         self._stop = asyncio.Event()
 
@@ -190,6 +195,15 @@ class CozylobeDaemon:
             adjacency_inferrer=adjacency_inferrer,
         )
 
+        # Issue #401: raw-event JSONL logger for the NN training corpus.
+        # Disabled by passing ``--no-event-log`` (CLI) — the writer
+        # short-circuits to a no-op when ``enabled=False`` so a flipped
+        # flag doesn't require additional plumbing.
+        event_logger = SseEventLogger(
+            root=self._event_log_root,
+            enabled=self._event_log_enabled,
+        )
+
         wake_loop = WakeLoop(
             emitter=self._emitter,
             qwen_client=qwen,
@@ -199,6 +213,7 @@ class CozylobeDaemon:
             periodic_cadence_s=self._periodic_cadence_s,
             throttle=throttle,
             motion_pipeline=motion_pipeline,
+            event_logger=event_logger,
         )
 
         sse_task = asyncio.create_task(
@@ -224,6 +239,8 @@ class CozylobeDaemon:
             cozylobe_cortex_root=str(self._cozylobe_cortex_root),
             cozylobe_cortex_rooms=len(cortex_vault.rooms),
             cozylobe_cortex_sensors=len(cortex_vault.sensors),
+            event_log_root=str(self._event_log_root),
+            event_log_enabled=self._event_log_enabled,
         )
 
         supervised = {sse_task, loop_task, periodic_task}
@@ -253,6 +270,10 @@ class CozylobeDaemon:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
         finally:
+            # Release the JSONL corpus file descriptor on shutdown.
+            # Idempotent + best-effort: a write-failed logger that
+            # never opened a file is fine to close.
+            event_logger.close()
             self._emitter.emit("cozylobe_daemon_stopped")
 
         return 0
@@ -349,6 +370,27 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--event-log-root",
+        default=str(DEFAULT_EVENT_LOG_ROOT),
+        help=(
+            "Directory for the raw SSE event JSONL corpus (issue #401, "
+            "default: %(default)s). Used by a future small sequence "
+            "model that replaces qwen's next-room prediction."
+        ),
+    )
+    parser.add_argument(
+        "--no-event-log",
+        dest="event_log_enabled",
+        action="store_false",
+        help=(
+            "Disable the raw SSE event JSONL logger. Default behavior "
+            "is to write one line per INPUT_KINDS event to the per-day "
+            "file under --event-log-root. Flip this off if the logger "
+            "ever interferes with the motion pipeline."
+        ),
+    )
+    parser.set_defaults(event_log_enabled=True)
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable INFO-level Python logging to stderr.",
@@ -372,6 +414,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         reasoning_max_seconds=args.reasoning_max_seconds,
         throttle_config_path=pathlib.Path(args.throttle_config),
         cozylobe_cortex_root=pathlib.Path(args.cozylobe_cortex_root),
+        event_log_root=pathlib.Path(args.event_log_root),
+        event_log_enabled=args.event_log_enabled,
     )
 
     loop = asyncio.new_event_loop()
