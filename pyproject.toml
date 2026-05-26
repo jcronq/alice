@@ -108,6 +108,7 @@ build-backend = "hatchling.build"
 #   alice_speaking  — Signal daemon (composes kernel with producers/handlers/outbox)
 #   alice_thinking  — one-shot wake (python -m alice_thinking)
 #   alice_cozylobe  — CozyHem reasoning lobe (push-driven SSE consumer + wake loop)
+#   cozylobe_cortex — Statistical person-identification classifier (#399, Phase 5)
 #   viewer    — FastAPI observability UI (serves /state logs)
 #   watchers  — one-shot pollers feeding inner/notes/ (github, …)
 [tool.hatch.build.targets.wheel]
@@ -123,6 +124,7 @@ packages = [
     "src/alice_speaking",
     "src/alice_thinking",
     "src/alice_cozylobe",
+    "src/cozylobe_cortex",
     "src/viewer",
     "src/watchers",
 ]

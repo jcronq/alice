@@ -51,6 +51,7 @@ from .surfaces import build_slug, write_observation_note, write_urgent_surface
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard
     from .adjacency import AdjacencyInferrer
     from .guesses import Guess, GuessLifecycle
+    from cozylobe_cortex.classify import ClassificationResult
 
 
 __all__ = [
@@ -151,6 +152,16 @@ MOTION_ENTITY_PATTERNS: frozenset[str] = frozenset(
 
 # CozyHem's wire-level kind for the generic state-update bus.
 _ENTITY_UPDATE_KIND = "entity:update"
+
+
+# Phase 5 (#399): statistical classifier override threshold. When the
+# Dirichlet-Multinomial classifier in :mod:`cozylobe_cortex.classify`
+# returns a person_id with confidence above this floor, we override the
+# qwen-derived person hypothesis on the emitted :class:`Guess` and bump
+# the guess confidence to the max of the two signals. Matches the design
+# doc's Step 3 threshold (``cortex-memory/research/
+# 2026-05-26-classify-integration-design.md``).
+STATISTICAL_CLASSIFIER_OVERRIDE_THRESHOLD = 0.65
 
 
 # ---------------------------------------------------------------------------
@@ -1106,7 +1117,14 @@ class MotionPipeline:
                 reason=f"classify_error: {type(exc).__name__}",
             )
             return
-        self._write_inference_note(batch, inference, security=security)
+        # Phase 5 (#399): run the statistical person-identification
+        # classifier alongside qwen. Fail-open — a classifier exception
+        # must not take the pipeline down. The result enriches the
+        # emitted Guess in :meth:`_emit_guess`.
+        classification = self._run_statistical_classifier()
+        self._write_inference_note(
+            batch, inference, security=security, classification=classification
+        )
 
     def _write_inference_note(
         self,
@@ -1114,6 +1132,7 @@ class MotionPipeline:
         inference: MotionInference,
         *,
         security: bool,
+        classification: Optional["ClassificationResult"] = None,
     ) -> None:
         """Render the inference as a fleeting note in inner/notes/.
 
@@ -1123,6 +1142,11 @@ class MotionPipeline:
         security fast-path fired). Phase 3 also writes a guess record
         to ``cozylobe-cortex/guesses/`` and routes the surface tier
         per design §4.5.
+
+        Phase 5 (#399): ``classification`` carries the statistical
+        person-id result (or None on failure). It's threaded into
+        :meth:`_emit_guess` so the persisted Guess can carry the
+        enriched person + confidence.
         """
         slug_parts = ["motion", "batch", str(len(batch))]
         if inference.current_room:
@@ -1133,7 +1157,7 @@ class MotionPipeline:
         # note, so the note's body can reference the guess id once we
         # ship the cross-link in a follow-up. Today the guess and the
         # note are written independently.
-        guess = self._emit_guess(batch, inference)
+        guess = self._emit_guess(batch, inference, classification=classification)
         # Phase 4 (#381): persist a trajectory edge if the classify
         # proposed a next-room hypothesis. The guess-lifecycle's
         # self-evident confirmation will validate/refute on the next
@@ -1161,6 +1185,8 @@ class MotionPipeline:
         self,
         batch: list[MotionEvent],
         inference: MotionInference,
+        *,
+        classification: Optional["ClassificationResult"] = None,
     ) -> Optional["Guess"]:
         """Construct a guess record and persist it to the vault.
 
@@ -1168,6 +1194,15 @@ class MotionPipeline:
         can carry the id onto the observation note's tags. Returns
         None when no vault_root is configured (Phase 2 callers that
         haven't migrated yet) or when the write fails — fail-open.
+
+        Phase 5 (#399): when ``classification`` carries a confident
+        person id from the statistical Dirichlet-Multinomial classifier
+        (confidence above
+        :data:`STATISTICAL_CLASSIFIER_OVERRIDE_THRESHOLD`), we override
+        the qwen-derived person hypothesis on the guess and raise the
+        guess confidence to the max of the two signals. Qwen's
+        contextual reasoning still drives ``room`` + ``next_room`` —
+        the statistical model only contributes person identity.
         """
         if self._vault_root is None:
             return None
@@ -1183,6 +1218,17 @@ class MotionPipeline:
                 trail_window=len(self._trail),
                 now=now,
             )
+            # Phase 5: stats-classifier override. Only fires when the
+            # classifier produced a confident person_id; otherwise the
+            # qwen-derived person field carries through unchanged.
+            if (
+                classification is not None
+                and classification.person_id
+                and classification.confidence
+                > STATISTICAL_CLASSIFIER_OVERRIDE_THRESHOLD
+            ):
+                guess.person = classification.person_id
+                guess.confidence = max(guess.confidence, classification.confidence)
             write_guess(self._vault_root, guess)
             return guess
         except OSError as exc:
@@ -1190,6 +1236,51 @@ class MotionPipeline:
             return None
         except Exception as exc:  # noqa: BLE001 - fail-open
             log.warning("cozylobe motion: guess emit raised: %s", exc)
+            return None
+
+    def _run_statistical_classifier(self) -> Optional["ClassificationResult"]:
+        """Run :func:`cozylobe_cortex.classify.classify_from_trail` on
+        the current motion trail.
+
+        Phase 5 (#399). Translates this module's :class:`MotionEvent`
+        records into the classifier's own dataclass shape (different
+        field names: ``timestamp`` vs ``ts``, ``room_id`` vs ``room``)
+        and swallows every exception path so a classifier import error,
+        empty profile dir, or arithmetic edge case never propagates to
+        the motion pipeline. Returns ``None`` on failure or empty trail.
+        """
+        try:
+            from cozylobe_cortex.classify import (
+                MotionEvent as ClassifyMotionEvent,
+                classify_from_trail,
+            )
+        except Exception as exc:  # noqa: BLE001 - fail-open
+            log.warning("cozylobe motion: classify.py import failed: %s", exc)
+            return None
+
+        try:
+            trail_snapshot = self._trail.snapshot()
+            classify_events: list[ClassifyMotionEvent] = []
+            for ev in trail_snapshot:
+                if not ev.room_id:
+                    # Skip events with no resolved room — the
+                    # classifier's room-preference scoring needs a room
+                    # label and a None would be silently treated as the
+                    # string "None".
+                    continue
+                classify_events.append(
+                    ClassifyMotionEvent(
+                        entity_id=ev.entity_id,
+                        room=ev.room_id,
+                        ts=datetime.fromtimestamp(ev.timestamp, tz=timezone.utc),
+                        state=ev.state,
+                    )
+                )
+            if not classify_events:
+                return None
+            return classify_from_trail(classify_events)
+        except Exception as exc:  # noqa: BLE001 - fail-open
+            log.warning("cozylobe motion: classify_from_trail failed: %s", exc)
             return None
 
     def _classify_surface_tier(
