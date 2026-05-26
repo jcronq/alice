@@ -88,7 +88,7 @@ def make_default_model_call(
     *,
     model: str | None = None,
     api_base: str | None = None,
-    api_key: str = "not-required",
+    api_key: str | None = None,
 ) -> ModelCall:
     """Construct the production :class:`ModelCall`.
 
@@ -108,6 +108,10 @@ def make_default_model_call(
         api_base = os.environ.get(
             "LITELLM_BASE_URL", "http://10.20.30.177:8033/v1"
         )
+    if api_key is None:
+        # Bearer token for the LiteLLM proxy (its master key); "not-required"
+        # against the direct LAN fallback (unauthenticated).
+        api_key = os.environ.get("LITELLM_MASTER_KEY", "not-required")
 
     async def _call(system_prompt: str, user_prompt: str) -> str:
         # Lazy imports — keeps test paths light + avoids a hard

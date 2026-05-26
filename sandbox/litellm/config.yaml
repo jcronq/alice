@@ -49,12 +49,10 @@ litellm_settings:
   set_verbose: false
 
 general_settings:
-  # Auth intentionally disabled. Every call site (viewer.lobe_labeler,
-  # thinking stage_b/d, the cozylobe classifier) talks to the proxy
-  # WITHOUT an Authorization header — they were written against the
-  # unauthenticated LAN Qwen endpoint. The proxy is published only on
-  # 127.0.0.1:4000 + the compose bridge network, so its exposure
-  # matches that of the LAN backends it fronts. Re-enabling auth means
-  # adding `Authorization: Bearer <key>` to ALL call sites in lockstep
-  # (set master_key: os.environ/LITELLM_MASTER_KEY here to do so).
-  {}
+  # Master key — required for the /ui dashboard (it signs the login
+  # session) and enforced on /v1. Every call site sends this same value
+  # as a Bearer token: pi (pi-models.json apiKey), the cozylobe
+  # classifier, viewer.lobe_labeler, and thinking stage_b/d all read it
+  # from the LITELLM_MASTER_KEY env. Sourced from the container env
+  # (compose default sk-alice-local; rotate via alice.env).
+  master_key: os.environ/LITELLM_MASTER_KEY

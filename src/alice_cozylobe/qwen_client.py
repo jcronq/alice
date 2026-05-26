@@ -68,6 +68,11 @@ DEFAULT_QWEN_ENDPOINT = os.environ.get(
 # so this also works against the direct fallback.
 DEFAULT_QWEN_MODEL = os.environ.get("LITELLM_QWEN_MODEL", "qwen-desktop")
 
+# Bearer token for the LiteLLM proxy (its master key). Empty in dev/tests
+# and against the direct LAN fallback (unauthenticated) — the
+# Authorization header is only sent when this is non-empty.
+DEFAULT_QWEN_API_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
+
 # Per the qwen-prompt design: low temperature for structured output,
 # high enough for some flexibility in pattern recognition.
 DEFAULT_TEMPERATURE = 0.4
@@ -128,12 +133,14 @@ class QwenClient:
         endpoint: str = DEFAULT_QWEN_ENDPOINT,
         *,
         model: str = DEFAULT_QWEN_MODEL,
+        api_key: str = DEFAULT_QWEN_API_KEY,
         temperature: float = DEFAULT_TEMPERATURE,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         http_client_factory=None,
     ) -> None:
         self._endpoint = endpoint.rstrip("/")
         self._model = model
+        self._api_key = api_key
         self._temperature = temperature
         self._timeout_seconds = timeout_seconds
         self._http_client_factory = http_client_factory or (
@@ -165,12 +172,16 @@ class QwenClient:
             # ``drop_params: true`` strips this safely if a backend ignores it.
             "chat_template_kwargs": {"enable_thinking": False},
         }
+        headers = (
+            {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
+        )
         try:
             client_cm = self._http_client_factory()
             async with client_cm as client:
                 response = await client.post(
                     f"{self._endpoint}/chat/completions",
                     json=body,
+                    headers=headers,
                 )
                 response.raise_for_status()
                 blob = response.json()

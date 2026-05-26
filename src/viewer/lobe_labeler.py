@@ -170,6 +170,9 @@ QWEN_MODEL = "qwen-local"
 QWEN_API_BASE = os.environ.get(
     "LITELLM_BASE_URL", "http://10.20.30.177:8033/v1"
 )
+# Bearer token for the LiteLLM proxy (its master key). Empty against the
+# direct LAN fallback (unauthenticated) — only sent when set.
+QWEN_API_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 
 # Hard cap: with thinking disabled, the model only needs a few tokens
 # for the phrase. Keep it small so latency is bounded if the model
@@ -208,9 +211,12 @@ async def call_qwen_async(prompt: str) -> str:
         # from ~190 completion tokens to ~5.
         "chat_template_kwargs": {"enable_thinking": False},
     }
+    headers = (
+        {"Authorization": f"Bearer {QWEN_API_KEY}"} if QWEN_API_KEY else None
+    )
     async with httpx.AsyncClient(timeout=QWEN_TIMEOUT_S) as client:
         resp = await client.post(
-            f"{QWEN_API_BASE}/chat/completions", json=payload
+            f"{QWEN_API_BASE}/chat/completions", json=payload, headers=headers
         )
         resp.raise_for_status()
         data = resp.json()

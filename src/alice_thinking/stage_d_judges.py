@@ -321,10 +321,13 @@ def _call_qwen(prompt: str) -> str:
     # don't run the proxy.
     model = os.environ.get("LITELLM_QWEN_MODEL", "openai/qwen-local")
     api_base = os.environ.get("LITELLM_BASE_URL", "http://10.20.30.177:8033/v1")
+    # Bearer token for the LiteLLM proxy (its master key); "not-required"
+    # against the direct LAN fallback (unauthenticated).
+    api_key = os.environ.get("LITELLM_MASTER_KEY", "not-required")
 
     async def _run() -> str:
         adapter = LiteLlm(
-            model=model, api_base=api_base, api_key="not-required", drop_params=True
+            model=model, api_base=api_base, api_key=api_key, drop_params=True
         )
         req = LlmRequest(
             model=model,

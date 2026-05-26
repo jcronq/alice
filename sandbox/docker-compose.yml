@@ -109,6 +109,11 @@ services:
       # sandbox/litellm/config.yaml. Hostname resolves on compose's
       # default network bridge.
       LITELLM_BASE_URL: "http://alice-litellm:4000/v1"
+      # Shared key the call sites send as a Bearer token to the proxy
+      # (same value as the litellm service's LITELLM_MASTER_KEY). Read by
+      # qwen_client, lobe_labeler, thinking stage_b/d; pi gets it via the
+      # apiKey field in pi-models.json. Must match the proxy's master key.
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-alice-local}"
     volumes:
       # Mind + tools default to <repo>/data/{alice-mind,alice-tools}; alice-up
       # exports ALICE_MIND / ALICE_TOOLS pointing there. Fall back to the
@@ -174,14 +179,29 @@ services:
     hostname: alice-litellm
     restart: unless-stopped
     command: ["--config", "/etc/litellm/config.yaml", "--port", "4000"]
-    # Auth intentionally disabled: NO LITELLM_MASTER_KEY. litellm
-    # auto-reads that env var and enforces it on /v1/* — but every call
-    # site (viewer.lobe_labeler, thinking stage_b/d, cozylobe classifier)
-    # sends no Authorization header, matching the unauthenticated LAN
-    # Qwen backends this proxy fronts. The proxy is published only on
-    # 127.0.0.1:4000 + the compose bridge. Re-enabling auth means
-    # restoring this env AND adding `Bearer` to every call site in
-    # lockstep (see sandbox/litellm/config.yaml general_settings note).
+    environment:
+      # Master key: signs the /ui dashboard session AND authenticates the
+      # /v1 API. Required for the web UI to work (the login flow 500s
+      # without it). Every call site sends this same value as a Bearer
+      # token — see LITELLM_MASTER_KEY on the alice service + the call
+      # sites (pi-models.json apiKey, qwen_client, lobe_labeler,
+      # thinking stage_b/d). The :-default keeps fresh checkouts working;
+      # rotate via LITELLM_MASTER_KEY in alice.env.
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-alice-local}"
+      # Persistence for the dashboard: litellm writes request/spend logs
+      # to Postgres (litellm-db). Without DATABASE_URL the UI loads but
+      # every analytics view errors ("Database not connected"). litellm
+      # runs its own schema migrations against this DB at startup.
+      DATABASE_URL: "postgresql://litellm:${LITELLM_DB_PASSWORD:-litellm-local}@litellm-db:5432/litellm"
+      # Dashboard login credentials (the /ui form). Distinct from the
+      # master key so the login isn't the raw API secret.
+      UI_USERNAME: "${LITELLM_UI_USERNAME:-admin}"
+      UI_PASSWORD: "${LITELLM_UI_PASSWORD:-alice-admin}"
+      # Keep model config in the YAML (source of truth), not the DB.
+      STORE_MODEL_IN_DB: "False"
+    depends_on:
+      litellm-db:
+        condition: service_healthy
     volumes:
       - ./litellm/config.yaml:/etc/litellm/config.yaml:ro
     ports:
@@ -202,3 +222,30 @@ services:
       timeout: 5s
       retries: 4
       start_period: 20s
+
+  # Postgres backing store for the LiteLLM dashboard — request/spend
+  # logs, so the /ui analytics views have data. Internal to the compose
+  # network only (no published port). litellm runs its own migrations
+  # against this DB at startup.
+  litellm-db:
+    image: postgres:16-alpine
+    container_name: alice-litellm-db
+    hostname: litellm-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: "${LITELLM_DB_PASSWORD:-litellm-local}"
+    volumes:
+      - litellm-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  # Persistent store for litellm-db; survives container recreation so
+  # the dashboard's request history isn't wiped on every deploy.
+  litellm-pgdata:
