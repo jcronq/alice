@@ -84,7 +84,6 @@ from typing import Any, Callable, Optional
 from alice_forge.task_store import (
     InvalidTransition,
     TERMINAL_STATES,
-    TaskRecord,
     TaskStore,
     VALID_TRANSITIONS,
     default_root,

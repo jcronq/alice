@@ -57,7 +57,7 @@ def _issue(
         "number": number,
         "title": title or f"Issue {number}",
         "state": state,
-        "labels": [{"name": l} for l in (labels or [])],
+        "labels": [{"name": label} for label in (labels or [])],
         "html_url": html_url or f"https://github.com/jcronq/alice/issues/{number}",
         "pull_request": pull_request,
     }

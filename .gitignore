@@ -39,3 +39,6 @@ htmlcov/
 
 # Local Claude Code runtime state (wakeup locks, plan files)
 .claude/
+
+# accidentally-nested alice-mind data dir (alice-mind is a separate repo)
+/alice-mind/
