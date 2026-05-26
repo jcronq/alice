@@ -76,6 +76,13 @@ alice-host-claude-request = "alice_speaking.tools.host_claude:main"
 # scripts/sm-thinking-perissue.py shim is a thin file-path wrapper around
 # the same module for repo-root invocations.
 alice-sm-thinking-perissue = "alice_thinking.cli.perissue:main"
+# cozylobe-cortex Phase 1 (#378). Onboarding seeds the home knowledge
+# graph at ~/alice-mind/cozylobe-cortex/; lint validates it. The scripts
+# also run directly as standalone modules:
+#   python scripts/cozylobe_cortex_onboard.py --help
+#   python scripts/cozylobe_cortex_lint.py --help
+cozylobe-cortex-onboard = "alice_cozylobe.cortex_cli:onboard_main"
+cozylobe-cortex-lint = "alice_cozylobe.cortex_cli:lint_main"
 
 [build-system]
 requires = ["hatchling"]
