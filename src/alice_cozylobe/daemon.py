@@ -17,8 +17,11 @@ import logging
 import pathlib
 import signal
 import sys
+from dataclasses import replace
 from typing import Optional
 
+from core.agent_library import default_registry
+from core.config.model import BackendSpec
 from core.events import EventLogger
 
 from .activity_fetcher import (
@@ -42,6 +45,22 @@ log = logging.getLogger(__name__)
 
 DEFAULT_LOG = pathlib.Path("/state/worker/cozylobe.log")
 
+# Cozylobe's reasoning step runs on the LOCAL qwen model on the 3090
+# desktop, driven through pi-coding-agent (PiKernel) — never Anthropic.
+# The walking skeleton constructed the WakeLoop without a backend, so
+# run_agent fell through to its BackendSpec(backend="subscription")
+# default and dispatched claude-opus-4-7 on every single SSE event.
+# This pins the lobe to pi+qwen instead. The model string is
+# "<pi-provider>/<model-id>"; the provider's endpoint is declared in
+# the vault's pi-models.json (openai-desktop -> 10.20.30.147:8033).
+DEFAULT_REASONING_MODEL = "openai-desktop/qwen3.6-27b"
+
+# Bound each reasoning pass. The registered cozylobe template uses
+# max_seconds=0 (unbounded); a slow/hung qwen on every event would
+# otherwise wedge the wake loop. 180s is generous for a 27B local
+# triage pass.
+DEFAULT_REASONING_MAX_SECONDS = 180
+
 
 class CozylobeDaemon:
     """Owns the SSE consumer + wake loop tasks for one process lifetime.
@@ -62,12 +81,16 @@ class CozylobeDaemon:
         log_path: pathlib.Path = DEFAULT_LOG,
         cozyhem_base_url: str = DEFAULT_COZYHEM_BASE_URL,
         periodic_cadence_s: float = DEFAULT_PERIODIC_CADENCE_SECONDS,
+        reasoning_model: str = DEFAULT_REASONING_MODEL,
+        reasoning_max_seconds: int = DEFAULT_REASONING_MAX_SECONDS,
     ) -> None:
         self._events_url = events_url
         self._qwen_endpoint = qwen_endpoint
         self._queue_size = queue_size
         self._cozyhem_base_url = cozyhem_base_url
         self._periodic_cadence_s = periodic_cadence_s
+        self._reasoning_model = reasoning_model
+        self._reasoning_max_seconds = reasoning_max_seconds
         self._emitter = EventLogger(log_path)
         self._stop = asyncio.Event()
 
@@ -94,9 +117,36 @@ class CozylobeDaemon:
         qwen = QwenClient(self._qwen_endpoint) if self._qwen_endpoint else None
         consumer = SSEConsumer(self._events_url)
         activity_fetcher = ActivityFetcher(self._cozyhem_base_url)
+
+        # Route the reasoning step through pi-coding-agent + local qwen,
+        # NOT the Anthropic subscription default. We override two things
+        # on the registered cozylobe spec: the backend (pi-mono -> PiKernel)
+        # and the model (a pi "provider/model" string). build_spec() carries
+        # the model into the KernelSpec PiKernel dispatches; the backend is
+        # what make_kernel() switches on. Both must change together — a pi
+        # backend with a claude-* model, or a qwen model with the default
+        # backend, would each be wrong.
+        reasoning_backend = BackendSpec(
+            backend="pi",
+            harness="pi-mono",
+            model=self._reasoning_model,
+        )
+        base_spec = default_registry.get("cozylobe")
+        cozylobe_spec = replace(
+            base_spec,
+            runtime="pi",
+            kernel_spec=replace(
+                base_spec.kernel_spec,
+                model=self._reasoning_model,
+                max_seconds=self._reasoning_max_seconds,
+            ),
+        )
+
         wake_loop = WakeLoop(
             emitter=self._emitter,
             qwen_client=qwen,
+            agent_spec=cozylobe_spec,
+            backend=reasoning_backend,
             fetch_activity=activity_fetcher.fetch,
             periodic_cadence_s=self._periodic_cadence_s,
         )
@@ -118,6 +168,8 @@ class CozylobeDaemon:
             queue_size=self._queue_size,
             cozyhem_base_url=self._cozyhem_base_url,
             periodic_cadence_s=self._periodic_cadence_s,
+            reasoning_backend="pi",
+            reasoning_model=self._reasoning_model,
         )
 
         supervised = {sse_task, loop_task, periodic_task}
@@ -208,6 +260,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--reasoning-model",
+        default=DEFAULT_REASONING_MODEL,
+        help=(
+            "pi 'provider/model' string for the reasoning step "
+            "(default: %(default)s). Provider endpoint is declared in "
+            "the vault's pi-models.json. Cozylobe reasons on local qwen "
+            "via pi-coding-agent — it must never call Anthropic."
+        ),
+    )
+    parser.add_argument(
+        "--reasoning-max-seconds",
+        type=int,
+        default=DEFAULT_REASONING_MAX_SECONDS,
+        help="Per-event reasoning timeout in seconds (default: %(default)s).",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable INFO-level Python logging to stderr.",
@@ -227,6 +295,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         log_path=pathlib.Path(args.log),
         cozyhem_base_url=args.cozyhem_base_url,
         periodic_cadence_s=args.periodic_cadence_s,
+        reasoning_model=args.reasoning_model,
+        reasoning_max_seconds=args.reasoning_max_seconds,
     )
 
     loop = asyncio.new_event_loop()
