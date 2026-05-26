@@ -22,6 +22,11 @@ model_list:
       model: openai/qwen3-32b
       api_base: http://10.20.30.177:8033/v1
       api_key: dummy
+      # Imputed "what this would cost behind a hosted API" — the backend
+      # is local/$0, but pricing it lets the dashboard track equivalent
+      # spend. Qwen 35B-A3B reference: $0.15 in / $1.00 out per 1M tokens.
+      input_cost_per_token: 0.00000015
+      output_cost_per_token: 0.000001
 
   # Cozylobe's CozyHem-event classifier. Backend is the LAN Qwen
   # runtime on the 3090 desktop at 10.20.30.147:8033 (distinct host
@@ -32,6 +37,9 @@ model_list:
       model: openai/qwen3.6-27b
       api_base: http://10.20.30.147:8033/v1
       api_key: dummy
+      # Qwen 27B reference: $0.30 in / $3.20 out per 1M tokens.
+      input_cost_per_token: 0.0000003
+      output_cost_per_token: 0.0000032
 
   # Reranker for the speaking-side retrieval cue runner. Same backend
   # host today; separate virtual name so the model can be swapped
@@ -41,6 +49,9 @@ model_list:
       model: openai/qwen3-reranker
       api_base: http://10.20.30.177:8033/v1
       api_key: dummy
+      # Nominal — Jason didn't quote a rerank rate; adjust if it gets used.
+      input_cost_per_token: 0.0000001
+      output_cost_per_token: 0.0000001
 
 litellm_settings:
   # Silently strip params the backend doesn't accept (e.g. response_format
@@ -56,3 +67,8 @@ general_settings:
   # from the LITELLM_MASTER_KEY env. Sourced from the container env
   # (compose default sk-alice-local; rotate via alice.env).
   master_key: os.environ/LITELLM_MASTER_KEY
+  # Capture the actual request prompts + responses in the spend logs so
+  # the dashboard's request view shows the messages, not just token
+  # counts. NOTE: this persists full prompt/response content (incl. home
+  # + personal data in Alice's prompts) to the Postgres store.
+  store_prompts_in_spend_logs: true
