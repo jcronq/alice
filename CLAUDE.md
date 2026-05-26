@@ -80,6 +80,11 @@ that you may notice in logs:
   procedural code; closes the "agent forgot to call the skill" gap
   from #375. See `~/alice-mind/inner/tasks/SCHEMA.md` for the label →
   status mapping.
+- `alice-repo-autopull` — pulls the bind-mounted `/home/alice/alice`
+  clone forward to `origin/master` every 60s (issue #395) so self-deploy
+  restarts (`request_cozylobe_reload`, `request_worker_reload`) actually
+  re-exec against the latest pushed code. Skips when the worktree is
+  dirty or off-master. Fast-forward only — never resolves conflicts.
 
 ## Stage B (Consolidation) — google-adk workflow
 

@@ -1,0 +1,139 @@
+#!/command/with-contenv bash
+# alice-repo-autopull — timer loop that keeps the bind-mounted alice clone
+# in sync with origin/master so self-deploy (cozylobe/worker restart) actually
+# re-execs against the latest pushed code (issue #395).
+#
+# The cozylobe / worker self-deploy mechanism (#391) restarts the daemon
+# in-place, which re-imports modules from /home/alice/alice/. Nothing in
+# that flow pulls the local clone forward, so a restart silently re-execs
+# whatever commit happens to be checked out on the host. Discovered live
+# 2026-05-26 on aimax1: clone pinned at 1416f8d while origin/master was at
+# 60c5174 — restarts dropped motion events because the #394 fix wasn't on
+# disk. Manual `git pull` was the only path forward. This service closes
+# that gap.
+#
+# Behavior:
+#   - Every N seconds (default 60s, floor 30s; configurable via
+#     alice.config.json `repo_autopull.poll_interval_seconds`) run
+#     `git fetch origin master` then `git merge --ff-only origin/master`.
+#   - Skip when working tree is dirty (refuse to overwrite WIP).
+#   - Skip when not on master (someone might be on a feature branch).
+#   - Emit `alice_repo_autopull_advanced` (from_sha + to_sha) on FF.
+#   - Emit `alice_repo_autopull_noop` otherwise, throttled to once per
+#     ~10 min so the event log doesn't flood.
+#
+# Singleton via `flock -n` so a slow pull can't double-fire. Cadence is
+# re-read each cycle so live reconfig works without an s6 restart.
+set -e
+
+LOCK=/state/worker/repo-autopull.lock
+NOOP_STAMP=/state/worker/repo-autopull-last-noop
+CONFIG_JSON=/home/alice/alice-mind/config/alice.config.json
+REPO=/home/alice/alice
+DEFAULT_INTERVAL=60
+INTERVAL_FLOOR=30
+NOOP_THROTTLE_SECONDS=600
+
+mkdir -p "$(dirname "$LOCK")"
+touch "$LOCK"
+chown alice:alice "$LOCK" || true
+
+# Stagger startup so we don't compete with the other periodic services
+# (gh-watcher, gh-reconciler, sm-dispatcher) at boot.
+sleep 45
+
+while true; do
+    interval="$DEFAULT_INTERVAL"
+    if [ -f "$CONFIG_JSON" ] && command -v jq >/dev/null 2>&1; then
+        v=$(jq -r '.repo_autopull.poll_interval_seconds // empty' "$CONFIG_JSON" 2>/dev/null || true)
+        case "$v" in
+            ''|*[!0-9]*) ;;
+            *) interval="$v" ;;
+        esac
+    fi
+    if [ "$interval" -lt "$INTERVAL_FLOOR" ]; then
+        # Hammering git fetch sub-minute is wasteful and would noise the
+        # event log. Anyone needing faster propagation should restart by
+        # hand — that's already the explicit-control path.
+        interval="$INTERVAL_FLOOR"
+    fi
+
+    start_ts=$(date +%s)
+    # redirfd (execline) opens fd 2 after the privilege drop so the log
+    # file is owned by alice; shell `2>>` would open it as root.
+    flock -n "$LOCK" s6-setuidgid alice redirfd -a 2 /state/worker/repo-autopull-stderr.log \
+        bash -c '
+set -u
+REPO=/home/alice/alice
+NOOP_STAMP=/state/worker/repo-autopull-last-noop
+NOOP_THROTTLE_SECONDS='"$NOOP_THROTTLE_SECONDS"'
+
+cd "$REPO" || { echo "alice-repo-autopull: cannot cd $REPO" >&2; exit 0; }
+
+# Skip if working tree has uncommitted changes (tracked-file diffs OR
+# staged changes). Untracked files are fine — git pull does not touch
+# them.
+if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "alice-repo-autopull: uncommitted changes in $REPO; skipping pull" >&2
+    /usr/local/bin/event-log alice_repo_autopull_skipped system \
+        reason=dirty_worktree repo="$REPO" --source cron >/dev/null 2>&1 || true
+    exit 0
+fi
+
+# Skip if not on master.
+current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "DETACHED")
+if [ "$current_branch" != "master" ]; then
+    echo "alice-repo-autopull: on branch $current_branch (not master); skipping pull" >&2
+    /usr/local/bin/event-log alice_repo_autopull_skipped system \
+        reason=not_on_master branch="$current_branch" repo="$REPO" --source cron \
+        >/dev/null 2>&1 || true
+    exit 0
+fi
+
+before=$(git rev-parse HEAD)
+if ! git fetch origin master 2>&1; then
+    echo "alice-repo-autopull: git fetch failed" >&2
+    /usr/local/bin/event-log alice_repo_autopull_skipped system \
+        reason=fetch_failed repo="$REPO" --source cron >/dev/null 2>&1 || true
+    exit 0
+fi
+
+if ! git merge --ff-only origin/master 2>&1; then
+    echo "alice-repo-autopull: ff merge refused (local has diverged?)" >&2
+    /usr/local/bin/event-log alice_repo_autopull_skipped system \
+        reason=ff_refused repo="$REPO" --source cron >/dev/null 2>&1 || true
+    exit 0
+fi
+
+after=$(git rev-parse HEAD)
+
+if [ "$before" != "$after" ]; then
+    echo "alice-repo-autopull: advanced $before -> $after" >&2
+    /usr/local/bin/event-log alice_repo_autopull_advanced system \
+        from_sha="$before" to_sha="$after" repo="$REPO" --source cron \
+        >/dev/null 2>&1 || true
+    # Reset noop throttle so the next noop after a real advance is logged
+    # immediately (useful for "did the catch-up actually quiesce?").
+    rm -f "$NOOP_STAMP" 2>/dev/null || true
+else
+    # Throttle the noop event to once per NOOP_THROTTLE_SECONDS so the
+    # event log does not get flooded by the 60s polling cadence.
+    now=$(date +%s)
+    last=0
+    if [ -f "$NOOP_STAMP" ]; then
+        last=$(cat "$NOOP_STAMP" 2>/dev/null || echo 0)
+    fi
+    if [ $(( now - last )) -ge "$NOOP_THROTTLE_SECONDS" ]; then
+        /usr/local/bin/event-log alice_repo_autopull_noop system \
+            sha="$after" repo="$REPO" --source cron >/dev/null 2>&1 || true
+        echo "$now" > "$NOOP_STAMP"
+    fi
+fi
+' || true
+    end_ts=$(date +%s)
+    elapsed=$(( end_ts - start_ts ))
+    remainder=$(( interval - elapsed ))
+    if [ "$remainder" -gt 0 ]; then
+        sleep "$remainder"
+    fi
+done
