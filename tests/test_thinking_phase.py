@@ -17,6 +17,7 @@ import pytest
 
 from alice_thinking.phase import (
     CONFLICT_DEFER_THRESHOLD,
+    STAGE_C_DEBT_ESCALATION_THRESHOLD,
     STAGE_D_NIGHTLY_CAP,
     Phase,
     PhaseConfig,
@@ -45,6 +46,7 @@ def _snap(
     hours_since_last_d: float = 0.0,
     state_dir: pathlib.Path = pathlib.Path("/tmp/state"),
     today: str = "2026-05-07",
+    stage_c_candidates_total: int = 0,
 ) -> VaultSnapshot:
     return VaultSnapshot(
         hour=hour,
@@ -60,6 +62,7 @@ def _snap(
         vault_dir_mtime=0.0,
         state_dir=state_dir,
         today=today,
+        stage_c_candidates_total=stage_c_candidates_total,
     )
 
 
@@ -183,6 +186,101 @@ def test_rule_2b_threshold_is_configurable() -> None:
     cfg = PhaseConfig(enable_full_sleep_dispatch=True, consecutive_b_threshold=3)
     snap = _snap(hour=1, consecutive_b=3, has_recent_research=False)
     assert select_phase(snap, cfg) is Phase.SLEEP_C
+
+
+# ---------------------------------------------------------------------------
+# Rule 2b — debt-weighted escalation (issue #388)
+#
+# When ``stage_c_candidates.total`` is at or above
+# :data:`STAGE_C_DEBT_ESCALATION_THRESHOLD`, the consecutive-B loop break
+# routes to Stage C even when a research corpus exists. Self-correcting:
+# once C drains the debt below the threshold, the legacy corpus-driven
+# D-preference resumes.
+#
+# Symptom that motivated the fix: Stage C ran zero times across 40
+# sleep-phase wakes between Phase 3 deployment (2026-05-08) and the
+# surface (2026-05-26) because the research corpus is non-empty every
+# night, so Rule 2b always preferred D over C.
+# ---------------------------------------------------------------------------
+
+
+def test_rule_2b_debt_above_threshold_with_corpus_routes_to_c() -> None:
+    """The fix: corpus is no longer enough to win over Stage C debt."""
+    snap = _snap(
+        hour=1,
+        consecutive_b=6,
+        has_recent_research=True,
+        stage_c_candidates_total=10,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+def test_rule_2b_debt_below_threshold_with_corpus_routes_to_d() -> None:
+    """Below the threshold, the prior corpus-driven D-preference is
+    preserved — the fix is gated, not blanket."""
+    snap = _snap(
+        hour=1,
+        consecutive_b=6,
+        has_recent_research=True,
+        stage_c_candidates_total=2,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_D
+
+
+def test_rule_2b_debt_above_threshold_no_corpus_still_routes_to_c() -> None:
+    """No-corpus path was already C; the new gate must not regress it."""
+    snap = _snap(
+        hour=1,
+        consecutive_b=6,
+        has_recent_research=False,
+        stage_c_candidates_total=10,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+def test_rule_2b_debt_above_threshold_below_consecutive_b_falls_through() -> None:
+    """The debt gate sits inside Rule 2b; if ``consecutive_b`` is below
+    the loop-break threshold, the gate must not fire. Hour 1 with
+    ``consecutive_b=0`` should land on Rule 2c (SLEEP_C) — same default
+    as without the debt. Pin so a future refactor can't promote the
+    debt gate above Rule 2a / 2e or out of the consecutive-B branch."""
+    snap = _snap(
+        hour=1,
+        consecutive_b=0,
+        has_recent_research=True,
+        stage_c_candidates_total=20,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+def test_rule_2b_debt_at_exact_threshold_routes_to_c() -> None:
+    """Boundary: ``total == STAGE_C_DEBT_ESCALATION_THRESHOLD`` triggers
+    the gate (``>=`` comparison)."""
+    snap = _snap(
+        hour=1,
+        consecutive_b=6,
+        has_recent_research=True,
+        stage_c_candidates_total=STAGE_C_DEBT_ESCALATION_THRESHOLD,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+def test_rule_2b_debt_just_below_threshold_routes_to_d() -> None:
+    """Boundary: ``total == STAGE_C_DEBT_ESCALATION_THRESHOLD - 1`` is
+    not enough; corpus still wins."""
+    snap = _snap(
+        hour=1,
+        consecutive_b=6,
+        has_recent_research=True,
+        stage_c_candidates_total=STAGE_C_DEBT_ESCALATION_THRESHOLD - 1,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_D
+
+
+def test_rule_2b_debt_threshold_constant_matches_design() -> None:
+    """The design (issue #388) chose 5 to align with the Stage D nightly
+    cap. Pin the constant so a future tune surfaces in code review."""
+    assert STAGE_C_DEBT_ESCALATION_THRESHOLD == 5
 
 
 # Rule 2c — early phase (23:00–02:59) defaults to C

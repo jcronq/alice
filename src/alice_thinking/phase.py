@@ -51,12 +51,32 @@ __all__ = [
     "detect_commission_notes",
     "detect_conflict_notes",
     "STAGE_D_NIGHTLY_CAP",
+    "STAGE_C_DEBT_ESCALATION_THRESHOLD",
 ]
 
 
 # Mirrors :data:`alice_thinking.vault_state.STAGE_D_NIGHTLY_CAP`. Re-declared
 # here so ``select_phase()`` doesn't import the legacy snapshot module.
 STAGE_D_NIGHTLY_CAP = 5
+
+
+# Issue #388 — debt-weighted Stage C escalation threshold.
+#
+# When ``stage_c_candidates.total`` (bloated notes + stale dailies that
+# Stage C atomizes / archives) is at or above this value, Rule 2b
+# (``consecutive_b >= 6`` loop-break) prefers Stage C over Stage D even
+# when a research corpus exists. Without this gate, the corpus-driven
+# D-preference always won — Stage C ran zero times across 40 sleep-phase
+# wakes between Phase 3 deployment (2026-05-08) and the surface
+# (2026-05-26) while vault debt climbed to 10 bloated notes.
+#
+# Threshold rationale: 5 is the Stage D nightly cap, so the two stages
+# are scheduled on comparable workload signals. Lower would over-fire C;
+# higher would let debt accumulate indefinitely (which is the bug).
+# Self-correcting: once C drains debt below 5, D-preference resumes.
+#
+# Design: cortex-memory/research/2026-04-26-adaptive-stage-selection-design.md
+STAGE_C_DEBT_ESCALATION_THRESHOLD = 5
 
 
 class Phase(enum.Enum):
@@ -112,6 +132,13 @@ class VaultSnapshot:
     vault_dir_mtime: float
     state_dir: pathlib.Path
     today: str
+    # Issue #388 — count of Stage C atomization/archive candidates
+    # (bloated notes + stale dailies). Drives Rule 2b debt-weighted
+    # escalation: when this is at or above
+    # :data:`STAGE_C_DEBT_ESCALATION_THRESHOLD`, the loop-breaker
+    # prefers C over D even when a research corpus exists.
+    # Default 0 keeps the field optional for existing call sites.
+    stage_c_candidates_total: int = 0
 
 
 @dataclass(frozen=True)
@@ -431,6 +458,33 @@ def _vault_dir_mtime(mind: pathlib.Path) -> float:
         return 0.0
 
 
+def _stage_c_candidates_total(mind: pathlib.Path) -> int:
+    """Return ``stage_c_candidates.total`` for Rule 2b's debt gate.
+
+    Issue #388: the loop-breaker needs to know how much Stage C work
+    is queued (bloated notes + stale dailies). Delegates to
+    :func:`metrics.vault_health.count_stage_c_candidates` so the
+    selector and the morning vault-health snapshot agree on the
+    same number. Lazy import keeps ``phase.py`` from taking a hard
+    dependency on the metrics package at module load.
+
+    Returns 0 when the vault is missing or the import / call fails —
+    fails safe to the prior corpus-driven Rule 2b behavior.
+    """
+    vault_dir = mind / "cortex-memory"
+    if not vault_dir.is_dir():
+        return 0
+    try:
+        from metrics.vault_health import count_stage_c_candidates
+    except ImportError:
+        return 0
+    try:
+        result = count_stage_c_candidates(vault_dir)
+    except OSError:
+        return 0
+    return int(result.get("total", 0))
+
+
 def build_vault_snapshot(
     mind: pathlib.Path,
     *,
@@ -473,6 +527,7 @@ def build_vault_snapshot(
         vault_dir_mtime=_vault_dir_mtime(mind),
         state_dir=state_dir,
         today=today,
+        stage_c_candidates_total=_stage_c_candidates_total(mind),
     )
 
 
@@ -527,7 +582,19 @@ def select_phase(vault: VaultSnapshot, cfg: Optional[PhaseConfig] = None) -> Pha
         return Phase.SLEEP_B
 
     # Rule 2b: 6+ consecutive Stage B wakes → break the loop.
+    #
+    # Issue #388: debt-weighted escalation. When
+    # ``stage_c_candidates.total`` is at or above
+    # :data:`STAGE_C_DEBT_ESCALATION_THRESHOLD`, prefer Stage C over
+    # Stage D even with a research corpus. Without this gate, the
+    # corpus-driven D-preference always won (corpus is non-empty every
+    # night) and Stage C ran zero times across 40 sleep-phase wakes
+    # post-Phase-3 deployment. Below the threshold, the original
+    # corpus-driven Stage D preference is preserved. Self-correcting:
+    # once C drains the candidates below 5, escalation reverts to D.
     if vault.consecutive_b >= cfg.consecutive_b_threshold:
+        if vault.stage_c_candidates_total >= STAGE_C_DEBT_ESCALATION_THRESHOLD:
+            return Phase.SLEEP_C
         if vault.has_recent_research and not vault.stage_d_cap_exhausted:
             return Phase.SLEEP_D
         return Phase.SLEEP_C
