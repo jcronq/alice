@@ -39,7 +39,7 @@ if [[ -f "$SENTINEL" ]]; then
     rm -f "$SENTINEL"
     sleep "$GRACE_SEC"
     touch "$INTERNAL_FLAG"
-    s6-svc -r /run/service/alice-speaking
+    s6-svc -t /run/service/alice-speaking
 fi
 
 # Ensure /state/worker exists; init-state-perms is a oneshot we depend on,
@@ -80,9 +80,14 @@ exec s6-setuidgid alice \
 
         # Touch the internal flag so the alice-speaking restart loop knows
         # to re-exec rather than break out. Then SIGTERM the Python process
-        # via s6-svc -r; the run script's bash-c while-true catches the
+        # via s6-svc -t; the run script's bash-c while-true catches the
         # internal flag and starts a new interpreter.
+        #
+        # (Originally used `s6-svc -r`; verified empirically 2026-05-26 on
+        # s6 2.14 that -r returned rc=0 but did NOT terminate the child.
+        # -t sends SIGTERM as the run-script's trap expects. Same fix as
+        # #392 for the cozylobe-reload-watcher.)
         touch "$INTERNAL_FLAG"
-        s6-svc -r /run/service/alice-speaking
+        s6-svc -t /run/service/alice-speaking
         echo "alice-reload-watcher: SIGTERM sent to alice-speaking." >&2
     done
