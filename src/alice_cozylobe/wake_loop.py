@@ -32,6 +32,7 @@ from core.events import EventEmitter
 
 from .activity_fetcher import ActivitySnapshot, FetchActivity
 from .events import CozyHemEvent
+from .motion import MotionPipeline
 from .qwen_client import QwenClassification, QwenClient, QwenUnreachable
 from .surfaces import build_slug, write_observation_note, write_urgent_surface
 from .throttle import Throttle
@@ -90,6 +91,7 @@ class WakeLoop:
         periodic_cadence_s: float = DEFAULT_PERIODIC_CADENCE_SECONDS,
         sleep: Optional[Callable[[float], Awaitable[None]]] = None,
         throttle: Optional[Throttle] = None,
+        motion_pipeline: Optional[MotionPipeline] = None,
     ) -> None:
         self._emitter = emitter
         self._qwen = qwen_client
@@ -109,6 +111,10 @@ class WakeLoop:
         # that don't care about throttling can omit it — when None,
         # every event passes through unchanged.
         self._throttle = throttle
+        # Phase 2 (#379) motion pipeline. Optional so legacy tests can
+        # continue to exercise the generic event path; when None,
+        # motion events fall through to the existing classify path.
+        self._motion_pipeline = motion_pipeline
 
     async def run(
         self,
@@ -148,11 +154,47 @@ class WakeLoop:
 
     async def _handle_event(self, event: CozyHemEvent) -> None:
         """One full wake tick for one event."""
+        # Phase 2 (#379): INPUT_KINDS allowlist is the PRIMARY filter,
+        # applied BEFORE telemetry, throttle, classify, or any note
+        # write. OUTPUT events (circadian brightness updates, propagated
+        # light states after a scene change, automation setpoint writes)
+        # never enter the pipeline. The throttle config carries the
+        # allowlist so agents can edit it at runtime via the same yaml
+        # they already edit for the throttle rules.
+        if self._throttle is not None and not self._throttle.is_input_kind(event):
+            # Single low-cost telemetry event so the drop is visible in
+            # the JSONL log; intentionally NO observation note write
+            # (the design's "drop silently — output event" branch).
+            self._emitter.emit(
+                "cozylobe_event_dropped_non_input",
+                kind=event.kind,
+                entity_id=event.entity_id,
+            )
+            return
+
         self._emitter.emit(
             "cozylobe_event_received",
             kind=event.kind,
             entity_id=event.entity_id,
         )
+
+        # Phase 2 (#379): motion is a special class. Motion events
+        # BYPASS the throttle entirely and route through the motion
+        # pipeline (trail + 30s coalesce queue + qwen classify with
+        # cortex snapshot). The throttle's secondary-gate behavior
+        # only applies to OTHER input kinds (doorbell, button, door,
+        # security, camera, scene, lock).
+        if (
+            self._motion_pipeline is not None
+            and self._motion_pipeline.is_motion_event(event)
+        ):
+            self._emitter.emit(
+                "cozylobe_motion_routed",
+                kind=event.kind,
+                entity_id=event.entity_id,
+            )
+            await self._motion_pipeline.handle(event)
+            return
 
         # Diff-aware throttle (#371): suppress / coalesce routine
         # entity:update micro-deltas BEFORE the classify+agent path.

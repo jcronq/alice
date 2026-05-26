@@ -28,6 +28,8 @@ from .activity_fetcher import (
     DEFAULT_COZYHEM_BASE_URL,
     ActivityFetcher,
 )
+from .cortex import DEFAULT_VAULT_ROOT, load_vault
+from .motion import MotionPipeline
 from .qwen_client import DEFAULT_QWEN_ENDPOINT, QwenClient
 from .sse_consumer import (
     DEFAULT_EVENTS_URL,
@@ -92,6 +94,7 @@ class CozylobeDaemon:
         reasoning_model: str = DEFAULT_REASONING_MODEL,
         reasoning_max_seconds: int = DEFAULT_REASONING_MAX_SECONDS,
         throttle_config_path: pathlib.Path = DEFAULT_THROTTLE_CONFIG_PATH,
+        cozylobe_cortex_root: pathlib.Path = DEFAULT_VAULT_ROOT,
     ) -> None:
         self._events_url = events_url
         self._qwen_endpoint = qwen_endpoint
@@ -101,6 +104,7 @@ class CozylobeDaemon:
         self._reasoning_model = reasoning_model
         self._reasoning_max_seconds = reasoning_max_seconds
         self._throttle_config_path = pathlib.Path(throttle_config_path)
+        self._cozylobe_cortex_root = pathlib.Path(cozylobe_cortex_root)
         self._emitter = EventLogger(log_path)
         self._stop = asyncio.Event()
 
@@ -160,6 +164,17 @@ class CozylobeDaemon:
             ),
         )
 
+        # Phase 2 (#379): load the cozylobe-cortex vault once at boot so
+        # the motion pipeline can include the home layout in every
+        # classify prompt. load_vault returns an empty Vault if the
+        # directory is missing — the daemon stays up on a half-onboarded
+        # vault, the prompt just carries an empty cortex snapshot.
+        cortex_vault = load_vault(self._cozylobe_cortex_root)
+        motion_pipeline = MotionPipeline(
+            qwen_client=qwen,
+            vault=cortex_vault,
+        )
+
         wake_loop = WakeLoop(
             emitter=self._emitter,
             qwen_client=qwen,
@@ -168,6 +183,7 @@ class CozylobeDaemon:
             fetch_activity=activity_fetcher.fetch,
             periodic_cadence_s=self._periodic_cadence_s,
             throttle=throttle,
+            motion_pipeline=motion_pipeline,
         )
 
         sse_task = asyncio.create_task(
@@ -190,6 +206,9 @@ class CozylobeDaemon:
             reasoning_backend="pi",
             reasoning_model=self._reasoning_model,
             throttle_config_path=str(self._throttle_config_path),
+            cozylobe_cortex_root=str(self._cozylobe_cortex_root),
+            cozylobe_cortex_rooms=len(cortex_vault.rooms),
+            cozylobe_cortex_sensors=len(cortex_vault.sensors),
         )
 
         supervised = {sse_task, loop_task, periodic_task}
@@ -305,6 +324,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--cozylobe-cortex-root",
+        default=str(DEFAULT_VAULT_ROOT),
+        help=(
+            "Path to the cozylobe-cortex vault (default: %(default)s). "
+            "The motion pipeline (#379 Phase 2) reads this at boot to "
+            "ground qwen classify calls in the home's room/sensor "
+            "layout."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable INFO-level Python logging to stderr.",
@@ -327,6 +356,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         reasoning_model=args.reasoning_model,
         reasoning_max_seconds=args.reasoning_max_seconds,
         throttle_config_path=pathlib.Path(args.throttle_config),
+        cozylobe_cortex_root=pathlib.Path(args.cozylobe_cortex_root),
     )
 
     loop = asyncio.new_event_loop()

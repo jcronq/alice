@@ -159,6 +159,45 @@ class QwenClient:
         failure. The wake loop catches it; this method does NOT retry.
         """
         prompt = self._build_prompt(event, context or {})
+        blob = await self._post_chat(prompt)
+        return self._parse_response(blob)
+
+    async def complete(self, prompt: str) -> dict:
+        """Send a raw user prompt; return the assistant's parsed JSON
+        object verbatim. Used by call sites whose output schema differs
+        from the urgency/intent template (Phase 2 motion-cortex pipeline,
+        future custom prompts).
+
+        Raises :class:`QwenUnreachable` on network / HTTP failure OR
+        when the assistant's content is not valid JSON. Does NOT enforce
+        a top-level key shape — that's the caller's job.
+        """
+        blob = await self._post_chat(prompt)
+        try:
+            content = blob["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise QwenUnreachable(
+                f"qwen response missing choices[0].message.content: {exc}"
+            ) from exc
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise QwenUnreachable(
+                f"qwen returned non-JSON content: {exc}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise QwenUnreachable(
+                f"qwen content is not a JSON object: {type(parsed).__name__}"
+            )
+        return parsed
+
+    async def _post_chat(self, prompt: str) -> dict:
+        """Low-level POST against the OpenAI-compatible chat endpoint.
+
+        Shared between :meth:`classify` and :meth:`complete` so the
+        network wiring (auth header, thinking-off flag, exception
+        funnel) only lives in one place. Returns the raw response JSON.
+        """
         body = {
             "model": self._model,
             "messages": [{"role": "user", "content": prompt}],
@@ -184,13 +223,11 @@ class QwenClient:
                     headers=headers,
                 )
                 response.raise_for_status()
-                blob = response.json()
+                return response.json()
         except (httpx.HTTPError, json.JSONDecodeError, OSError) as exc:
             raise QwenUnreachable(
                 f"qwen endpoint {self._endpoint} unreachable or errored: {exc}"
             ) from exc
-
-        return self._parse_response(blob)
 
     def _build_prompt(self, event: CozyHemEvent, context: dict) -> str:
         """Render the qwen-prompt template from the design note.

@@ -61,6 +61,7 @@ from .events import CozyHemEvent
 
 __all__ = [
     "DEFAULT_CONFIG_PATH",
+    "DEFAULT_INPUT_KINDS",
     "DEFAULT_SHIPPED_CONFIG_PATH",
     "ThrottleConfig",
     "ThrottleDecision",
@@ -89,6 +90,47 @@ DEFAULT_SHIPPED_CONFIG_PATH = (
 
 # Event kind we treat as the "tunable" path. Other kinds always pass.
 _ENTITY_UPDATE_KIND = "entity:update"
+
+
+# INPUT_KINDS allowlist — the primary filter applied at the SSE entry
+# point in :class:`alice_cozylobe.wake_loop.WakeLoop` (Phase 2 of #379).
+# Any event whose kind is NOT on this list is dropped silently before
+# the throttle, before any classify, before any log. OUTPUT events
+# (circadian brightness updates, propagated light states after a scene
+# change, automation setpoint writes) never enter the pipeline.
+#
+# The list is configurable in the same yaml as the throttle so agents
+# can extend it at runtime without a daemon restart (mtime reload).
+# Defaults match the motion-cortex design's "INPUT_KINDS allowlist"
+# section (cortex-memory/research/2026-05-26-cozylobe-motion-cortex.md
+# §1.1). See also the issue #379 acceptance criteria.
+DEFAULT_INPUT_KINDS: frozenset[str] = frozenset(
+    {
+        # Motion sensors (the special-class flow lives in motion.py).
+        "motion_detected",
+        # Discrete user inputs.
+        "doorbell_pressed",
+        "button_pressed",
+        # Door / window contact sensors.
+        "door_opened",
+        "door_closed",
+        "window_opened",
+        "window_closed",
+        # Environment sensors (only readings — setpoint writes are OUTPUT).
+        "temperature_changed",
+        # Security sensors.
+        "smoke_detected",
+        "glass_break",
+        "water_leak",
+        # Camera events (person identified, motion in frame).
+        "camera_event",
+        # User-initiated mode/scene changes (auto-changes are OUTPUT).
+        "scene_changed",
+        "mode_changed",
+        # Lock state changes (user-initiated).
+        "lock_state_changed",
+    }
+)
 
 
 @dataclass
@@ -131,6 +173,13 @@ class ThrottleConfig:
                 "mode_changed",
             }
         )
+    )
+    # Phase 2 (#379): INPUT_KINDS allowlist applied BEFORE the throttle.
+    # Empty set means "accept all" — fail-open for legacy callers that
+    # don't set this field. The shipped yaml carries the canonical
+    # default list (see :data:`DEFAULT_INPUT_KINDS`).
+    input_kinds: frozenset[str] = field(
+        default_factory=lambda: DEFAULT_INPUT_KINDS
     )
 
     @classmethod
@@ -195,6 +244,16 @@ class ThrottleConfig:
         if isinstance(apk, (list, tuple, set, frozenset)):
             cfg.always_pass_kinds = frozenset(
                 str(x) for x in apk if isinstance(x, str)
+            )
+
+        # Phase 2 (#379): input_kinds allowlist. Missing key → keep the
+        # default set baked into the dataclass. Explicit empty list →
+        # empty set, which the WakeLoop interprets as "accept all"
+        # (fail-open) so a botched edit can't take cozylobe offline.
+        ik = raw.get("input_kinds")
+        if isinstance(ik, (list, tuple, set, frozenset)):
+            cfg.input_kinds = frozenset(
+                str(x) for x in ik if isinstance(x, str)
             )
 
         return cfg
@@ -324,6 +383,26 @@ class Throttle:
             sorted(new_cfg.tracked_numeric_fields),
             len(new_cfg.always_pass_entities),
         )
+
+    def is_input_kind(self, event: CozyHemEvent) -> bool:
+        """Return True iff ``event.kind`` is on the INPUT_KINDS allowlist.
+
+        Triggers a config-mtime reload first so a runtime edit to the
+        yaml takes effect on the next event without a daemon restart.
+        An empty allowlist is treated as "accept all" (fail-open) so a
+        botched config can't take cozylobe offline silently.
+
+        This is the primary filter applied at the SSE entry point by
+        :class:`alice_cozylobe.wake_loop.WakeLoop`. OUTPUT events
+        (circadian brightness deltas, propagated light states, automation
+        setpoint writes) fall on the wrong side of this gate and are
+        dropped before any throttle, classify, or note write. See
+        Phase 2 of #379 and the motion-cortex design §1.1.
+        """
+        self._maybe_reload()
+        if not self._config.input_kinds:
+            return True
+        return event.kind in self._config.input_kinds
 
     def handle(self, event: CozyHemEvent) -> ThrottleDecision:
         """Apply the throttle rules to one event.

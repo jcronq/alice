@@ -39,3 +39,36 @@ always_pass_kinds:
   - motion_detected
   - scene_changed
   - mode_changed
+
+# Phase 2 (#379) — INPUT_KINDS allowlist.
+#
+# The PRIMARY filter, applied at the SSE consumer level BEFORE the
+# throttle. Any event whose kind is NOT on this list is dropped
+# silently — no throttle, no classify, no note. OUTPUT events
+# (circadian brightness updates, propagated light states after a
+# scene change, automation setpoint writes, micro-deltas) never enter
+# the pipeline at all.
+#
+# Motion events (motion_detected) on this list bypass the throttle
+# entirely and route through the motion pipeline in
+# src/alice_cozylobe/motion.py. Other INPUT_KINDS events still pass
+# through the throttle as a secondary quality gate.
+#
+# Empty list → "accept all" (fail-open). A botched edit can't take
+# cozylobe offline silently — at worst it lets through noise.
+input_kinds:
+  - motion_detected
+  - doorbell_pressed
+  - button_pressed
+  - door_opened
+  - door_closed
+  - window_opened
+  - window_closed
+  - temperature_changed
+  - smoke_detected
+  - glass_break
+  - water_leak
+  - camera_event
+  - scene_changed
+  - mode_changed
+  - lock_state_changed
