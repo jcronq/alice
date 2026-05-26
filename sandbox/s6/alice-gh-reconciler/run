@@ -1,0 +1,59 @@
+#!/command/with-contenv bash
+# alice-gh-reconciler — timer loop that runs the deterministic
+# GitHub → ~/alice-mind/inner/tasks/ reconciler (issue #376).
+#
+# Reads sm:* labels from each watched repo and reconciles them into the
+# SM v2 task store. GitHub labels are the source of truth; inner/tasks/
+# is a deterministic mirror plus transition history. Closes the
+# "agent forgot" gap by replacing the stochastic skill-call path with
+# a periodic procedural sweep.
+#
+# Singleton via `flock -n` so a slow poll can't double-fire.
+#
+# Cadence is read from alice.config.json `gh_reconciler.poll_interval_seconds`
+# on each cycle (live reconfig, no restart needed). Default: 300s, floor 60s.
+# Reconciler is a no-op when nothing has changed since the last cycle,
+# so it's safe to leave running.
+set -e
+
+LOCK=/state/worker/gh-reconciler.lock
+CONFIG_JSON=/home/alice/alice-mind/config/alice.config.json
+DEFAULT_INTERVAL=300
+
+mkdir -p "$(dirname "$LOCK")"
+touch "$LOCK"
+chown alice:alice "$LOCK" || true
+
+# Stagger startup so the reconciler, dispatcher, and gh-watcher don't
+# all wake up in lockstep when the worker boots.
+sleep 60
+
+while true; do
+    interval="$DEFAULT_INTERVAL"
+    if [ -f "$CONFIG_JSON" ] && command -v jq >/dev/null 2>&1; then
+        v=$(jq -r '.gh_reconciler.poll_interval_seconds // empty' "$CONFIG_JSON" 2>/dev/null || true)
+        case "$v" in
+            ''|*[!0-9]*) ;;
+            *) interval="$v" ;;
+        esac
+    fi
+    if [ "$interval" -lt 60 ]; then
+        # Polling faster than once a minute would burn rate limit and
+        # GitHub's secondary-rate-limit thresholds — same reasoning as
+        # alice-gh-watcher.
+        interval=60
+    fi
+
+    start_ts=$(date +%s)
+    # redirfd (execline) opens fd 2 after the privilege drop so the log
+    # file is owned by alice; shell `2>>` would open it as the
+    # supervising root shell.
+    flock -n "$LOCK" s6-setuidgid alice redirfd -a 2 /state/worker/gh-reconciler-stderr.log \
+        /usr/local/bin/alice-gh-reconciler || true
+    end_ts=$(date +%s)
+    elapsed=$(( end_ts - start_ts ))
+    remainder=$(( interval - elapsed ))
+    if [ "$remainder" -gt 0 ]; then
+        sleep "$remainder"
+    fi
+done

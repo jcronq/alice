@@ -15,7 +15,8 @@ mkdir -p "$HOME/alice-mind" "$HOME/alice-tools" "$HOME/.config"
 # any stale baked-in copy left over from a pre-fix image.
 for wrapper in alice-mind-autopush event-log alice-think \
                alice-thinker-watchdog alice-client \
-               alice-gh-watcher alice-sm-dispatcher; do
+               alice-gh-watcher alice-sm-dispatcher \
+               alice-gh-reconciler; do
     if [ -x "/home/alice/alice/bin/$wrapper" ]; then
         ln -sf "/home/alice/alice/bin/$wrapper" "/usr/local/bin/$wrapper"
     else

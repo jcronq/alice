@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# alice-gh-reconciler — one pass of the GitHub → inner/tasks/ reconciler.
+#
+# Polls watched repos for issues touched within the lookback window,
+# derives target SM v2 status from sm:* labels (plus PR-merge state),
+# and reconciles ~/alice-mind/inner/tasks/ to match. GitHub labels are
+# the source of truth; inner/tasks/ is a deterministic mirror plus
+# transition history.
+#
+# Singleton enforcement is external — the s6 supervisor wraps each
+# invocation in `flock -n /state/worker/gh-reconciler.lock` so a slow
+# poll can't double-fire.
+#
+# Exit codes (from alice_forge.github_reconciler):
+#   0  poll OK (zero or more transitions emitted)
+#   1  one or more repos failed to fetch; supervisor sleeps one
+#      cadence and tries again, same as alice-gh-watcher.
+set -u
+
+VENV_PY="/opt/alice-venv/bin/python"
+ALICE_SRC="${ALICE_SRC:-/home/alice/alice/src}"
+
+if [ ! -x "$VENV_PY" ]; then
+    echo "[alice-gh-reconciler] venv python missing at $VENV_PY" >&2
+    exit 2
+fi
+
+export PYTHONPATH="$ALICE_SRC"
+export PYTHONUNBUFFERED=1
+exec "$VENV_PY" -m alice_forge.github_reconciler "$@"

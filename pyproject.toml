@@ -54,6 +54,13 @@ alice-experiment = "alice_thinking.cli.experiment:main"
 # issues, trust-filters them, and posts a dispatcher-hello comment. Invoke
 # on a cadence (later: s6 supervisor); for now it's manual.
 alice-sm = "alice_forge.dispatcher:main"
+# GitHub → ~/alice-mind/inner/tasks/ reconciler (issue #376). Runs as
+# the alice-gh-reconciler s6 service inside the alice container on a
+# 5-min cadence; the bin/alice-gh-reconciler wrapper invokes
+# `python -m alice_forge.github_reconciler` so renames propagate
+# without a docker rebuild. This entry point lets the same module
+# be reached as `alice-gh-reconciler` once the wheel is installed.
+alice-gh-reconciler = "alice_forge.github_reconciler:main"
 # SM v2 task tracker CLI — operates on ~/alice-mind/inner/tasks/
 # (per-task task.yaml + transitions.jsonl + index.jsonl). Kernel-agnostic
 # so Speaking, Thinking, and ad-hoc shells share one entry point.

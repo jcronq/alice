@@ -64,6 +64,23 @@ Notes:
 `bin/alice-think` (trigger a thinking-hemisphere wake), `bin/alice-init`
 (first-run scaffold), `bin/event-log` (tail/query `memory/events.jsonl`).
 
+## Background s6 services to know about
+
+The `alice` container supervises a handful of timer-driven services
+that you may notice in logs:
+
+- `alice-gh-watcher` — polls watched repos every 5 min and drops PR /
+  comment / review activity as `inner/notes/` entries for thinking.
+- `alice-sm-dispatcher` — SM v2 dispatcher; polls `sm:*` labels on
+  watched repos every minute and posts the dispatcher-hello /
+  transition-comment lifecycle.
+- `alice-gh-reconciler` — deterministic GitHub → `~/alice-mind/inner/tasks/`
+  reconciler (issue #376). Reads `sm:*` labels from watched repos
+  every 5 min and mirrors them into the SM v2 task store. Pure
+  procedural code; closes the "agent forgot to call the skill" gap
+  from #375. See `~/alice-mind/inner/tasks/SCHEMA.md` for the label →
+  status mapping.
+
 ## Stage B (Consolidation) — google-adk workflow
 
 Stage B sleep wakes can route through a typed-step workflow built on
