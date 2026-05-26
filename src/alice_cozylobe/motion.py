@@ -37,12 +37,18 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Iterable, Optional
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Awaitable, Callable, Iterable, Optional, TYPE_CHECKING
 
 from . import cortex as cortex_mod
 from .events import CozyHemEvent
 from .qwen_client import QwenClient, QwenUnreachable
-from .surfaces import build_slug, write_observation_note
+from .surfaces import build_slug, write_observation_note, write_urgent_surface
+
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle guard
+    from .guesses import Guess, GuessLifecycle
 
 
 __all__ = [
@@ -359,6 +365,14 @@ def build_motion_prompt(
     Returns a JSON-output-only prompt that asks qwen for the
     positional inference shape. The classify call parses the response
     with :func:`classify_motion_batch`.
+
+    NOTE: Human-only identification (no pet-or-person fallback). Per
+    Jason 2026-05-26 (see feedback memory ``project_household_no_pets``)
+    the household has no pets and the robot vacuum has been dormant
+    for 1+ years, so every motion event is treated as human occupancy.
+    The disambiguation is WHICH person, not what species. If the
+    robot vacuum is ever reactivated, revisit this comment + the
+    classification rules in §4.3 of the motion-cortex design.
     """
     batch_list = list(batch)
     trail_list = list(trail)
@@ -527,6 +541,9 @@ class MotionPipeline:
         security_predicate: Optional[
             Callable[[MotionEvent], bool]
         ] = None,
+        vault_root: Optional[Path] = None,
+        lifecycle: Optional["GuessLifecycle"] = None,
+        write_surface: Optional[Callable[..., object]] = None,
     ) -> None:
         self._qwen = qwen_client
         self._vault = vault
@@ -536,6 +553,17 @@ class MotionPipeline:
         self._clock = clock or time.time
         self._localtime = localtime or time.localtime
         self._security_predicate = security_predicate
+        # Phase 3 (#380): guess emission + lifecycle wiring. The pipeline
+        # writes a guess note to ``vault_root/guesses/`` after every
+        # successful classify and runs the lifecycle's
+        # ``process_new_event`` on every motion event so self-evident
+        # confirmation/refutation fires within the 60-second window.
+        # ``vault_root`` defaults to None — guess writes are skipped and
+        # only the legacy observation-note path runs, which is what
+        # Phase 2's tests rely on.
+        self._vault_root = Path(vault_root) if vault_root is not None else None
+        self._lifecycle = lifecycle
+        self._write_surface = write_surface or write_urgent_surface
         # Lock-free single-consumer use: the wake loop drains one
         # event at a time on one asyncio task.
 
@@ -563,9 +591,13 @@ class MotionPipeline:
         1. Build a :class:`MotionEvent` (sensor → room lookup via the
            cortex vault).
         2. Append to the trail (always, even on security-class).
-        3. If security-class, classify + write the note IMMEDIATELY,
+        3. Run the lifecycle's :meth:`process_new_event` so any
+           recent pending guess gets self-evident confirmation/refutation
+           applied against this fresh observation BEFORE the classify
+           runs and overwrites the prediction.
+        4. If security-class, classify + write the note IMMEDIATELY,
            bypassing the queue.
-        4. Otherwise, add to the queue and flush if the window has
+        5. Otherwise, add to the queue and flush if the window has
            elapsed or the batch is full.
 
         Exceptions in the classify or note write are logged but do
@@ -575,6 +607,20 @@ class MotionPipeline:
         """
         motion = MotionEvent.from_cozyhem(event, vault=self._vault)
         self._trail.append(motion)
+
+        # Phase 3: lifecycle gets first crack at the event — confirm /
+        # refute pending guesses whose 60s window is still open. We
+        # swallow exceptions because a broken lifecycle should never
+        # take the motion pipeline down (same fail-open posture as the
+        # classify path).
+        if self._lifecycle is not None:
+            try:
+                self._lifecycle.process_new_event(motion)
+            except Exception as exc:  # noqa: BLE001 - fail-open
+                log.warning(
+                    "cozylobe motion: lifecycle.process_new_event raised: %s",
+                    exc,
+                )
 
         if self._is_security_class(motion):
             await self._classify_and_write([motion], security=True)
@@ -665,22 +711,152 @@ class MotionPipeline:
         Tagged ``motion-pipeline`` so thinking can spot the new Phase 2
         flow during drain (plus ``lobe-observation`` for compatibility
         with the existing drain rules, and ``motion-security`` when the
-        security fast-path fired).
+        security fast-path fired). Phase 3 also writes a guess record
+        to ``cozylobe-cortex/guesses/`` and routes the surface tier
+        per design §4.5.
         """
         slug_parts = ["motion", "batch", str(len(batch))]
         if inference.current_room:
             slug_parts.append(inference.current_room)
         slug = build_slug(*slug_parts)
 
-        tags = ["lobe-observation", "motion-pipeline"]
+        # Phase 3: emit the durable guess record before the observation
+        # note, so the note's body can reference the guess id once we
+        # ship the cross-link in a follow-up. Today the guess and the
+        # note are written independently.
+        guess = self._emit_guess(batch, inference)
+        tier = self._classify_surface_tier(guess, security=security)
+
+        tags = ["lobe-observation", "motion-pipeline", f"surface-tier:{tier}"]
         if security:
             tags.append("motion-security")
+        if guess is not None and guess.guess_id is not None:
+            tags.append(f"guess-id:{guess.guess_id}")
 
         body = self._render_body(batch, inference, security=security)
         try:
             self._write_note(body, slug=slug, tags=tuple(tags))
         except OSError as exc:
             log.warning("cozylobe motion: note write failed: %s", exc)
+
+        if tier == "actionable" and guess is not None:
+            self._emit_actionable_surface(guess, batch, security=security)
+
+    def _emit_guess(
+        self,
+        batch: list[MotionEvent],
+        inference: MotionInference,
+    ) -> Optional["Guess"]:
+        """Construct a guess record and persist it to the vault.
+
+        Returns the in-memory guess so :meth:`_write_inference_note`
+        can carry the id onto the observation note's tags. Returns
+        None when no vault_root is configured (Phase 2 callers that
+        haven't migrated yet) or when the write fails — fail-open.
+        """
+        if self._vault_root is None:
+            return None
+        # Lazy import to keep the motion.py↔guesses.py edge from
+        # forming an import cycle at module load.
+        from .guesses import guess_from_inference, write_guess
+
+        try:
+            now = datetime.now(timezone.utc)
+            guess = guess_from_inference(
+                inference,
+                batch,
+                trail_window=len(self._trail),
+                now=now,
+            )
+            write_guess(self._vault_root, guess)
+            return guess
+        except OSError as exc:
+            log.warning("cozylobe motion: guess write failed: %s", exc)
+            return None
+        except Exception as exc:  # noqa: BLE001 - fail-open
+            log.warning("cozylobe motion: guess emit raised: %s", exc)
+            return None
+
+    def _classify_surface_tier(
+        self,
+        guess: Optional["Guess"],
+        *,
+        security: bool,
+    ) -> str:
+        """Pick the surface tier for this inference.
+
+        Uses :func:`surface_threshold` with ``unexpected=security`` —
+        Phase 2's security heuristic (motion in the nighttime window)
+        is the closest stand-in for the design's "unexpected event"
+        flag until Phase 4 ships the novel-pattern detector. Falls
+        back to the legacy "log" tier when no guess was emitted so
+        existing Phase 2 tests (no vault_root) keep their tag shape.
+        """
+        if guess is None:
+            return "log"
+        from .guesses import surface_threshold
+
+        return surface_threshold(guess, unexpected=security)
+
+    def _emit_actionable_surface(
+        self,
+        guess: "Guess",
+        batch: list[MotionEvent],
+        *,
+        security: bool,
+    ) -> None:
+        """Drop a surface file into ``inner/surface/`` for the speaking
+        daemon to pick up. Reserved for actionable-tier guesses.
+
+        Frontmatter mirrors the shape :func:`write_urgent_surface`
+        emits for other lobes; the speaking watcher already routes on
+        ``surface_type`` so cozylobe doesn't need a custom code path.
+        """
+        slug = build_slug(
+            "guess",
+            guess.person or "unknown",
+            guess.room or "unknown",
+        )
+        body_lines = [
+            f"**Actionable motion inference** — {guess.title}",
+            "",
+            f"- person: {guess.person or 'unknown'}",
+            f"- room: {guess.room or 'unknown'}",
+            f"- confidence: {guess.confidence:.2f}",
+            f"- security-class: {'yes' if security else 'no'}",
+        ]
+        if guess.next_room_hypothesis:
+            body_lines.append(
+                f"- next-room hypothesis: {guess.next_room_hypothesis}"
+            )
+        if guess.body:
+            body_lines.append("")
+            body_lines.append(guess.body.strip())
+        body = "\n".join(body_lines)
+        extra = {
+            "guess_id": guess.guess_id or "",
+            "confidence": f"{guess.confidence:.3f}",
+            "person": guess.person or "unknown",
+            "room": guess.room or "unknown",
+            "security": "true" if security else "false",
+        }
+        try:
+            self._write_surface(
+                body,
+                slug=slug,
+                surface_type="cozylobe-actionable",
+                extra_frontmatter=extra,
+            )
+        except OSError as exc:
+            log.warning("cozylobe motion: actionable surface write failed: %s", exc)
+        except TypeError:
+            # Fallback for test injects that don't accept the full kwargs.
+            try:
+                self._write_surface(body, slug=slug)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "cozylobe motion: actionable surface fallback failed: %s", exc
+                )
 
     def _write_degraded_note(
         self,
