@@ -36,6 +36,7 @@ from .events import CozyHemEvent
 from .qwen_client import QwenClassification, QwenClient, QwenUnreachable
 from .sse_consumer import SSEConsumer
 from .surfaces import write_observation_note, write_urgent_surface
+from .throttle import Throttle, ThrottleConfig, ThrottleDecision
 from .wake_loop import WakeLoop
 
 
@@ -47,6 +48,9 @@ __all__ = [
     "QwenClient",
     "QwenUnreachable",
     "SSEConsumer",
+    "Throttle",
+    "ThrottleConfig",
+    "ThrottleDecision",
     "WakeLoop",
     "write_observation_note",
     "write_urgent_surface",

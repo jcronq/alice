@@ -34,6 +34,7 @@ from .activity_fetcher import ActivitySnapshot, FetchActivity
 from .events import CozyHemEvent
 from .qwen_client import QwenClassification, QwenClient, QwenUnreachable
 from .surfaces import build_slug, write_observation_note, write_urgent_surface
+from .throttle import Throttle
 
 
 __all__ = ["WakeLoop"]
@@ -88,6 +89,7 @@ class WakeLoop:
         fetch_activity: Optional[FetchActivity] = None,
         periodic_cadence_s: float = DEFAULT_PERIODIC_CADENCE_SECONDS,
         sleep: Optional[Callable[[float], Awaitable[None]]] = None,
+        throttle: Optional[Throttle] = None,
     ) -> None:
         self._emitter = emitter
         self._qwen = qwen_client
@@ -103,6 +105,10 @@ class WakeLoop:
         self._fetch_activity = fetch_activity
         self._periodic_cadence_s = periodic_cadence_s
         self._sleep = sleep or asyncio.sleep
+        # Diff-aware throttle (issue #371). Optional so legacy tests
+        # that don't care about throttling can omit it — when None,
+        # every event passes through unchanged.
+        self._throttle = throttle
 
     async def run(
         self,
@@ -147,6 +153,36 @@ class WakeLoop:
             kind=event.kind,
             entity_id=event.entity_id,
         )
+
+        # Diff-aware throttle (#371): suppress / coalesce routine
+        # entity:update micro-deltas BEFORE the classify+agent path.
+        # CRITICAL kinds are listed in the throttle's always_pass_kinds
+        # so doorbell / smoke / glass_break still bypass via the
+        # default config; the explicit check below stays as a backstop
+        # if the user-edited config drops the override.
+        if self._throttle is not None:
+            decision = self._throttle.handle(event)
+            if decision.action == "drop":
+                self._emitter.emit(
+                    "cozylobe_event_throttled",
+                    kind=event.kind,
+                    entity_id=event.entity_id,
+                    action="drop",
+                    reason=decision.reason,
+                )
+                return
+            if decision.action == "summary":
+                self._emitter.emit(
+                    "cozylobe_event_throttled",
+                    kind=event.kind,
+                    entity_id=event.entity_id,
+                    action="summary",
+                    reason=decision.reason,
+                    suppressed_count=decision.event.payload.get(
+                        "_suppressed_count", 0
+                    ),
+                )
+                event = decision.event
 
         # CRITICAL fast-path: hardcoded rules, skip qwen entirely.
         # Surface immediately so speaking sees doorbell/smoke/glass-break

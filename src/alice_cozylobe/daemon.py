@@ -34,6 +34,11 @@ from .sse_consumer import (
     DEFAULT_QUEUE_SIZE,
     SSEConsumer,
 )
+from .throttle import (
+    DEFAULT_CONFIG_PATH as DEFAULT_THROTTLE_CONFIG_PATH,
+    Throttle,
+    ensure_user_config,
+)
 from .wake_loop import DEFAULT_PERIODIC_CADENCE_SECONDS, WakeLoop
 
 
@@ -86,6 +91,7 @@ class CozylobeDaemon:
         periodic_cadence_s: float = DEFAULT_PERIODIC_CADENCE_SECONDS,
         reasoning_model: str = DEFAULT_REASONING_MODEL,
         reasoning_max_seconds: int = DEFAULT_REASONING_MAX_SECONDS,
+        throttle_config_path: pathlib.Path = DEFAULT_THROTTLE_CONFIG_PATH,
     ) -> None:
         self._events_url = events_url
         self._qwen_endpoint = qwen_endpoint
@@ -94,6 +100,7 @@ class CozylobeDaemon:
         self._periodic_cadence_s = periodic_cadence_s
         self._reasoning_model = reasoning_model
         self._reasoning_max_seconds = reasoning_max_seconds
+        self._throttle_config_path = pathlib.Path(throttle_config_path)
         self._emitter = EventLogger(log_path)
         self._stop = asyncio.Event()
 
@@ -120,6 +127,14 @@ class CozylobeDaemon:
         qwen = QwenClient(self._qwen_endpoint) if self._qwen_endpoint else None
         consumer = SSEConsumer(self._events_url)
         activity_fetcher = ActivityFetcher(self._cozyhem_base_url)
+
+        # Seed the user-editable throttle config from the shipped
+        # default on first start; subsequent starts find the file
+        # already in place and skip. Construct the Throttle pointed at
+        # the user-side path so agent edits (#371) are picked up via
+        # the per-event mtime check.
+        ensure_user_config(user_path=self._throttle_config_path)
+        throttle = Throttle(config_path=self._throttle_config_path)
 
         # Route the reasoning step through pi-coding-agent + local qwen,
         # NOT the Anthropic subscription default. We override two things
@@ -152,6 +167,7 @@ class CozylobeDaemon:
             backend=reasoning_backend,
             fetch_activity=activity_fetcher.fetch,
             periodic_cadence_s=self._periodic_cadence_s,
+            throttle=throttle,
         )
 
         sse_task = asyncio.create_task(
@@ -173,6 +189,7 @@ class CozylobeDaemon:
             periodic_cadence_s=self._periodic_cadence_s,
             reasoning_backend="pi",
             reasoning_model=self._reasoning_model,
+            throttle_config_path=str(self._throttle_config_path),
         )
 
         supervised = {sse_task, loop_task, periodic_task}
@@ -279,6 +296,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Per-event reasoning timeout in seconds (default: %(default)s).",
     )
     parser.add_argument(
+        "--throttle-config",
+        default=str(DEFAULT_THROTTLE_CONFIG_PATH),
+        help=(
+            "Path to the diff-aware-throttle YAML (default: %(default)s). "
+            "Agents edit this file at runtime; cozylobe reloads via "
+            "mtime check on the next event."
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable INFO-level Python logging to stderr.",
@@ -300,6 +326,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         periodic_cadence_s=args.periodic_cadence_s,
         reasoning_model=args.reasoning_model,
         reasoning_max_seconds=args.reasoning_max_seconds,
+        throttle_config_path=pathlib.Path(args.throttle_config),
     )
 
     loop = asyncio.new_event_loop()

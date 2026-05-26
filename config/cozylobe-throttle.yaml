@@ -1,0 +1,41 @@
+# cozylobe throttle — diff-aware filter for SSE entity:update events.
+#
+# This file is the SHIPPED DEFAULT. On first start, alice_cozylobe.daemon
+# copies it to ~/alice-mind/config/cozylobe-throttle.yaml if that path
+# doesn't already exist. After that, agents (thinking, speaking, other
+# lobes) edit the user-side copy; cozylobe reloads on the next event
+# via an mtime check — no restart needed.
+#
+# Module docs: src/alice_cozylobe/throttle.py
+# Issue: #371
+
+# Numeric fields the throttle tracks for micro-delta suppression. Each
+# value is the threshold below which a change is considered routine.
+# Both fields are assumed to be normalized to [0.0, 1.0] (matches the
+# brightness/color_temp scale CozyHem emits).
+tracked_numeric_fields:
+  brightness: 0.05
+  color_temp: 0.05
+
+# After suppressing one or more events on a given entity, emit ONE
+# summary event every coalesce_window_s seconds carrying the entity's
+# current state + the count of suppressed events since the last emit.
+# 300s (5 min) matches issue #371's acceptance criteria.
+coalesce_window_s: 300.0
+
+# Per-entity escape hatch. Any entity_id in this list is NEVER
+# suppressed — useful when thinking decides one sensor is always
+# interesting (e.g. a specific motion zone she's debugging).
+always_pass_entities: []
+
+# Per-kind escape hatch. These kinds bypass the throttle entirely.
+# Defaults cover the CRITICAL fast-path kinds plus the obvious "always
+# interesting" non-routine events. Add more here if a producer rename
+# leaks routine traffic into a new kind.
+always_pass_kinds:
+  - doorbell_pressed
+  - smoke_detected
+  - glass_break
+  - motion_detected
+  - scene_changed
+  - mode_changed
