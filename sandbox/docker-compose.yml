@@ -174,12 +174,14 @@ services:
     hostname: alice-litellm
     restart: unless-stopped
     command: ["--config", "/etc/litellm/config.yaml", "--port", "4000"]
-    environment:
-      # Master key for all proxy auth. Sourced from alice.env via
-      # bin/_alice-env.sh; falls back to a stable local default so
-      # fresh checkouts work without env setup. Rotate by setting
-      # LITELLM_MASTER_KEY in alice.env.
-      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-alice-local}"
+    # Auth intentionally disabled: NO LITELLM_MASTER_KEY. litellm
+    # auto-reads that env var and enforces it on /v1/* — but every call
+    # site (viewer.lobe_labeler, thinking stage_b/d, cozylobe classifier)
+    # sends no Authorization header, matching the unauthenticated LAN
+    # Qwen backends this proxy fronts. The proxy is published only on
+    # 127.0.0.1:4000 + the compose bridge. Re-enabling auth means
+    # restoring this env AND adding `Bearer` to every call site in
+    # lockstep (see sandbox/litellm/config.yaml general_settings note).
     volumes:
       - ./litellm/config.yaml:/etc/litellm/config.yaml:ro
     ports:
@@ -188,8 +190,15 @@ services:
       # at alice-litellm:4000 (see LITELLM_BASE_URL on alice).
       - "127.0.0.1:4000:4000"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:4000/health/liveliness"]
+      # The litellm image ships no curl/wget — only python. Probe
+      # liveliness with the stdlib so the healthcheck can actually pass
+      # (a never-healthy litellm would block alice via depends_on).
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=3).status==200 else 1)"
       interval: 15s
-      timeout: 3s
+      timeout: 5s
       retries: 4
       start_period: 20s

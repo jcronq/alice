@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -49,15 +50,23 @@ __all__ = [
 log = logging.getLogger(__name__)
 
 
-# TODO(cozyhem-engine#31): swap for the AI-fleet-managed binding once
-# the service registry ships. The design names "desktop-3090" as the
-# target; for the walking skeleton we hardcode the literal so the lobe
-# is testable end-to-end without fleet infrastructure.
-DEFAULT_QWEN_ENDPOINT = "http://desktop-3090:8080"
+# Classifier endpoint. In-container this is the LiteLLM proxy
+# (LITELLM_BASE_URL=http://alice-litellm:4000/v1), the single seam for
+# all local-model traffic — matches viewer.lobe_labeler + thinking's
+# stage_b/d call sites so backend moves never touch this code again.
+# Fallback is the direct LAN desktop Qwen (3090, 10.20.30.147:8033) for
+# dev outside the container. NOTE: the base now includes ``/v1`` (the
+# OpenAI convention these sites share); :meth:`classify` appends only
+# ``/chat/completions``. The old hardcoded ``desktop-3090:8080`` was
+# stale on both host and port.
+DEFAULT_QWEN_ENDPOINT = os.environ.get(
+    "LITELLM_BASE_URL", "http://10.20.30.147:8033/v1"
+)
 
-# Model identifier passed in the OpenAI-style ``model`` field. Matches
-# the PoC script at /tmp/cozyhem-lobe-poc/cozyhem-lobe-poc.py.
-DEFAULT_QWEN_MODEL = "qwen2.5:27b"
+# Virtual model name resolved by sandbox/litellm/config.yaml -> the
+# 3090 desktop Qwen. The LAN llama.cpp server ignores the model field,
+# so this also works against the direct fallback.
+DEFAULT_QWEN_MODEL = os.environ.get("LITELLM_QWEN_MODEL", "qwen-desktop")
 
 # Per the qwen-prompt design: low temperature for structured output,
 # high enough for some flexibility in pattern recognition.
@@ -148,12 +157,19 @@ class QwenClient:
             "messages": [{"role": "user", "content": prompt}],
             "temperature": self._temperature,
             "stream": False,
+            # The Qwen3.6 builds are reasoning models: with thinking on
+            # they spend the token budget on ``reasoning_content`` and
+            # return ``content=""`` — which would make :meth:`_parse_response`
+            # see no JSON. Classification is a closed-form task, so turn
+            # thinking off (same fix viewer.lobe_labeler uses). LiteLLM's
+            # ``drop_params: true`` strips this safely if a backend ignores it.
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         try:
             client_cm = self._http_client_factory()
             async with client_cm as client:
                 response = await client.post(
-                    f"{self._endpoint}/v1/chat/completions",
+                    f"{self._endpoint}/chat/completions",
                     json=body,
                 )
                 response.raise_for_status()

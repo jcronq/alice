@@ -23,6 +23,16 @@ model_list:
       api_base: http://10.20.30.177:8033/v1
       api_key: dummy
 
+  # Cozylobe's CozyHem-event classifier. Backend is the LAN Qwen
+  # runtime on the 3090 desktop at 10.20.30.147:8033 (distinct host
+  # from qwen-local's aimax1 box). The served model id is ignored by
+  # the llama.cpp server, but we name it for clarity.
+  - model_name: qwen-desktop
+    litellm_params:
+      model: openai/qwen3.6-27b
+      api_base: http://10.20.30.147:8033/v1
+      api_key: dummy
+
   # Reranker for the speaking-side retrieval cue runner. Same backend
   # host today; separate virtual name so the model can be swapped
   # without touching call sites.
@@ -39,4 +49,12 @@ litellm_settings:
   set_verbose: false
 
 general_settings:
-  master_key: os.environ/LITELLM_MASTER_KEY
+  # Auth intentionally disabled. Every call site (viewer.lobe_labeler,
+  # thinking stage_b/d, the cozylobe classifier) talks to the proxy
+  # WITHOUT an Authorization header — they were written against the
+  # unauthenticated LAN Qwen endpoint. The proxy is published only on
+  # 127.0.0.1:4000 + the compose bridge network, so its exposure
+  # matches that of the LAN backends it fronts. Re-enabling auth means
+  # adding `Authorization: Bearer <key>` to ALL call sites in lockstep
+  # (set master_key: os.environ/LITELLM_MASTER_KEY here to do so).
+  {}
