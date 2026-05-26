@@ -28,6 +28,7 @@ from .background_task import (
 from .base import InternalSource
 from .cozyhem import CozyHemEvent, CozyHemEventSubscriber
 from .emergency import EmergencyEvent, EmergencyWatcher
+from .idle import IDLE_POLL_SECONDS, IdleEvent, IdleFlushSource
 from .surfaces import SurfaceEvent, SurfaceWatcher
 
 __all__ = [
@@ -37,6 +38,9 @@ __all__ = [
     "CozyHemEventSubscriber",
     "EmergencyEvent",
     "EmergencyWatcher",
+    "IDLE_POLL_SECONDS",
+    "IdleEvent",
+    "IdleFlushSource",
     "InternalSource",
     "SurfaceEvent",
     "SurfaceWatcher",

@@ -59,6 +59,14 @@ SPEAKING_DEFAULTS: dict[str, Any] = {
     # appears to extend via prompt caching, so we leave generous headroom
     # rather than fire on phantom pressure.
     "context_compaction_threshold": 750_000,
+    # Session-close flush protocol (issue #373; design:
+    # cortex-memory/research/2026-04-29-session-close-flush-design.md).
+    # When a conversational (transport, address) pair has been quiet
+    # for this many minutes the idle watcher fires one silent
+    # session-close flush turn that writes any open observations to
+    # inner/notes/ for Thinking to drain. Hot-reloadable: read on
+    # every poll cycle. Default 10 minutes matches the design.
+    "session_close_timeout_minutes": 10,
     # Mid-turn stitch acknowledgement emoji. When a Signal follow-up
     # arrives while Alice is mid-turn for that same channel, the producer
     # diverts it into the active turn's context inbox instead of starting

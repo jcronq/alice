@@ -36,6 +36,7 @@ from .internal import (
     BackgroundTaskCompletionSource,
     CozyHemEventSubscriber,
     EmergencyWatcher,
+    IdleFlushSource,
     SurfaceWatcher,
 )
 from .startup import (
@@ -141,6 +142,7 @@ def build_registry(
     emergency_watcher: EmergencyWatcher,
     background_task_source: Optional[BackgroundTaskCompletionSource] = None,
     cozyhem_subscriber: Optional[CozyHemEventSubscriber] = None,
+    idle_flush_source: Optional[IdleFlushSource] = None,
 ) -> SourceRegistry:
     """Assemble a :class:`SourceRegistry` for one daemon session.
 
@@ -169,6 +171,8 @@ def build_registry(
         registry.register_internal(background_task_source)
     if cozyhem_subscriber is not None:
         registry.register_internal(cozyhem_subscriber)
+    if idle_flush_source is not None:
+        registry.register_internal(idle_flush_source)
     # Startup sources are individually fail-soft — register them
     # all. The dispatcher's startup phase iterates ``all_startup_sources``
     # and runs each, swallowing exceptions per-source.

@@ -70,6 +70,8 @@ from .internal import (
     CozyHemEventSubscriber,
     EmergencyEvent,
     EmergencyWatcher,
+    IdleEvent,
+    IdleFlushSource,
     SurfaceEvent,
     SurfaceWatcher,
 )
@@ -117,6 +119,7 @@ __all__ = [
     "CLIEvent",
     "DiscordEvent",
     "EmergencyEvent",
+    "IdleEvent",
     "SignalEvent",
     "SpeakingDaemon",
     "SurfaceEvent",
@@ -288,6 +291,17 @@ class SpeakingDaemon:
         # Reset to False on turn entry.
         self._current_turn_replied: bool = False
 
+        # Session-close idle tracking (issue #373, design:
+        # cortex-memory/research/2026-04-29-session-close-flush-design.md).
+        # _last_inbound maps each conversational (transport, address)
+        # to the timestamp of its most recent inbound; _idle_flushed
+        # records which channels already fired an IdleEvent in the
+        # current quiet window. Both touched by the per-transport
+        # handlers in _dispatch.py and read by IdleFlushSource's
+        # producer.
+        self._last_inbound: dict[tuple[str, str], Any] = {}
+        self._idle_flushed: set[tuple[str, str]] = set()
+
         # CLI transport — optional, falls back to no-op if disabled.
         # Constructed here so it shares the daemon's lifecycle and can
         # see _current_reply_channel via _send_message. ACL + display
@@ -356,6 +370,10 @@ class SpeakingDaemon:
         # registers them by reference.
         self._surface_watcher = SurfaceWatcher(cfg.mind_dir)
         self._emergency_watcher = EmergencyWatcher(cfg.mind_dir)
+        # Session-close idle-flush watcher (issue #373). Owns its poll
+        # loop; reads ``_last_inbound`` / ``_idle_flushed`` off the
+        # daemon via ctx.
+        self._idle_flush_source = IdleFlushSource()
         # CozyHem SSE subscriber — optional. Empty URL disables the
         # subscriber entirely (operator opted out, or there's no
         # CozyHem deployed on this network). Non-empty URL means
@@ -415,6 +433,7 @@ class SpeakingDaemon:
             emergency_watcher=self._emergency_watcher,
             background_task_source=self._background_task_source,
             cozyhem_subscriber=self._cozyhem_subscriber,
+            idle_flush_source=self._idle_flush_source,
         )
         # Phase 6a of plan 01: outbound dispatch + quiet-queue
         # routing + canonical send-event emission live in

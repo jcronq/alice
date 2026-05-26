@@ -57,9 +57,26 @@ if TYPE_CHECKING:
     )
     from .internal.background_task import BackgroundTaskCompleteEvent
     from .internal.cozyhem import CozyHemEvent
+    from .internal.idle import IdleEvent
 
 
 log = logging.getLogger("alice_speaking._dispatch")
+
+
+def _touch_inbound(ctx: DaemonContext, transport: str, address: str) -> None:
+    """Refresh the per-channel idle tracker on every inbound message.
+
+    Stamps ``_last_inbound[(transport, address)]`` with the current
+    timestamp and discards any prior ``_idle_flushed`` flag so the
+    :class:`IdleFlushSource` re-arms for the next quiet window. Called
+    by every conversational inbound handler before the turn runs.
+
+    Issue #373 / design:
+    ``cortex-memory/research/2026-04-29-session-close-flush-design.md``.
+    """
+    key = (transport, address)
+    ctx._last_inbound[key] = datetime.datetime.now().astimezone()
+    ctx._idle_flushed.discard(key)
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +100,10 @@ async def handle_signal(ctx: DaemonContext, batch: list["SignalEvent"]) -> None:
     head = batch[0]
     sender_name = head.sender_name
     source = head.envelope.source
+    # Idle tracking (issue #373): every inbound refreshes the per-channel
+    # ``last seen`` timestamp and clears any prior flush flag so the
+    # session-close watcher will re-arm on the next quiet window.
+    _touch_inbound(ctx, "signal", source)
     quiet = is_quiet_hours(ctx.cfg.speaking)
     turn_id = uuid.uuid4().hex[:12]
     started = time.time()
@@ -248,6 +269,8 @@ async def handle_cli(ctx: DaemonContext, event: "CLIEvent") -> None:
     """
     assert ctx.cli_transport is not None
     msg = event.message
+    # Idle tracking (issue #373) — see handle_signal note.
+    _touch_inbound(ctx, "cli", msg.principal.native_id)
     turn_id = uuid.uuid4().hex[:12]
     started = time.time()
 
@@ -337,6 +360,8 @@ async def handle_discord(ctx: DaemonContext, event: "DiscordEvent") -> None:
     don't have a pending prompt to clear)."""
     assert ctx.discord_transport is not None
     msg = event.message
+    # Idle tracking (issue #373) — see handle_signal note.
+    _touch_inbound(ctx, "discord", msg.principal.native_id)
     turn_id = uuid.uuid4().hex[:12]
     started = time.time()
 
@@ -928,3 +953,62 @@ async def _handle_doorbell_pressed(
         entity_id=event.entity_id,
         recipient=recipient.address,
     )
+
+
+# ---------------------------------------------------------------------------
+# Idle-flush turn — silent session-close flush.
+#
+# Fires when a conversational channel has been quiet for
+# ``session_close_timeout_minutes`` (default 10, hot-reloadable from
+# ``alice.config.json``). Issue #373 / design:
+# ``cortex-memory/research/2026-04-29-session-close-flush-design.md``.
+#
+# Runs ``_run_turn(..., silent=True)``: no outbound channel, no
+# ``send_message`` budget, no missed_reply event, no compaction
+# arming. The kernel's only job is to drop any open observations as
+# ``append_note`` calls into ``inner/notes/`` so Thinking can drain
+# them on her next wake. Valid outcome is a no-op turn.
+
+
+async def handle_idle(ctx: DaemonContext, event: "IdleEvent") -> None:
+    """Run one silent session-close flush turn for an idle channel."""
+    now = datetime.datetime.now().astimezone()
+    idle_min = int((now - event.idle_since).total_seconds() / 60)
+    turn_id = uuid.uuid4().hex[:12]
+    started = time.time()
+    ctx.events.emit(
+        "session_close_flush_start",
+        turn_id=turn_id,
+        sender_name=event.sender_name,
+        idle_minutes=idle_min,
+    )
+    prompt = (
+        f"[{event.sender_name}'s conversation idle {idle_min}m. "
+        "Session-close flush.] "
+        "Run lightweight flush — ≤3 tool calls: write open observations "
+        "via append_note to inner/notes/ or drop surface-threshold "
+        "insights in inner/surface/. No send_message. Valid outcome: no-op."
+    )
+    error: Optional[str] = None
+    prev_kind = ctx._current_turn_kind
+    ctx._current_turn_kind = "idle_flush"
+    try:
+        await ctx._run_turn(
+            prompt,
+            turn_id=turn_id,
+            outbound_recipient=None,
+            silent=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("idle flush failed for %s", event.sender_name)
+        error = f"{type(exc).__name__}: {exc}"
+    finally:
+        ctx._current_turn_kind = prev_kind
+        ctx.events.emit(
+            "session_close_flush_end",
+            turn_id=turn_id,
+            sender_name=event.sender_name,
+            idle_minutes=idle_min,
+            error=error,
+            duration_ms=int((time.time() - started) * 1000),
+        )

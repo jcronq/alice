@@ -63,6 +63,32 @@ Catch-all. `{"topic": "...", "summary": "..."}` works.
 ### `correction`
 Overrides a prior event. Include `refers_to_ts` pointing at the original.
 
+### `session_close_flush_start`
+Emitted by Speaking when a conversational `(transport, address)` pair has
+been silent for `session_close_timeout_minutes` (default 10) and the
+idle watcher fires a silent session-close flush turn. Issue #373; design:
+`cortex-memory/research/2026-04-29-session-close-flush-design.md`.
+
+```json
+{"ts": "...", "type": "session_close_flush_start", "turn_id": "...", "sender_name": "...", "idle_minutes": 12}
+```
+
+- `turn_id` (string) — opaque per-turn correlation id.
+- `sender_name` (string) — display name of the principal whose channel went quiet.
+- `idle_minutes` (number) — elapsed minutes between the last inbound and the flush turn start.
+
+### `session_close_flush_end`
+Companion to `session_close_flush_start`. Emitted after the silent flush
+turn closes (success, no-op, or error).
+
+```json
+{"ts": "...", "type": "session_close_flush_end", "turn_id": "...", "sender_name": "...", "idle_minutes": 12, "error": null, "duration_ms": 4200}
+```
+
+- `turn_id`, `sender_name`, `idle_minutes` — same as `_start`.
+- `error` (string or null) — `null` on success / no-op; `"<ExcType>: <message>"` when the turn raised.
+- `duration_ms` (number) — wall-clock duration from `_start` to `_end`.
+
 ## Appending
 
 Never edit events.jsonl in place. Append via the `event-log` CLI:
