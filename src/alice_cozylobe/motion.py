@@ -32,6 +32,7 @@ cortex writes, no MCP calls, no shell outs.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import logging
 import time
@@ -59,6 +60,7 @@ __all__ = [
     "DEFAULT_SECURITY_NIGHT_END_HOUR",
     "DEFAULT_TRAIL_SIZE",
     "DEFAULT_SUBGRAPH_HOPS",
+    "MOTION_ENTITY_PATTERNS",
     "MOTION_EVENT_KINDS",
     "MotionEvent",
     "MotionInference",
@@ -124,6 +126,31 @@ SUBGRAPH_TOKEN_CEILING = 4000
 # event; we keep the set extensible for future producers without
 # rewriting the wake_loop routing.
 MOTION_EVENT_KINDS: frozenset[str] = frozenset({"motion_detected"})
+
+
+# Issue #393: in practice CozyHem emits motion-sensor state changes as
+# ``entity:update`` with the sensor's entity_id, not as a synthetic
+# ``motion_detected`` kind (the cozylobe.log evidence prior to the fix:
+# 427 entity:update / 0 motion_detected over one hour, all motion
+# events dropped). These fnmatch globs let
+# :meth:`MotionPipeline.is_motion_event` recognize motion sensors by
+# entity_id when the kind is ``entity:update``. The doubled
+# ``_motion_*`` pattern catches Hue's compound naming convention where
+# multi-sensor devices expose the motion channel as
+# ``binary_sensor.hue_master_closet_motion_sensor_motion``. Kept
+# narrower than the throttle's ``tracked_input_entity_patterns`` —
+# this set is "what counts as motion specifically," not "what counts
+# as input."
+MOTION_ENTITY_PATTERNS: frozenset[str] = frozenset(
+    {
+        "binary_sensor.*_motion",
+        "binary_sensor.*_motion_*",
+    }
+)
+
+
+# CozyHem's wire-level kind for the generic state-update bus.
+_ENTITY_UPDATE_KIND = "entity:update"
 
 
 # ---------------------------------------------------------------------------
@@ -861,11 +888,27 @@ class MotionPipeline:
 
     @staticmethod
     def is_motion_event(event: CozyHemEvent) -> bool:
-        """Return True iff ``event.kind`` is one of the motion kinds.
+        """Return True iff ``event`` is a motion-sensor firing.
 
-        Centralized here so wake_loop doesn't duplicate the set.
+        Two arms:
+
+        * ``event.kind`` is in :data:`MOTION_EVENT_KINDS` (the original
+          ``motion_detected`` kind, kept for future producers).
+        * ``event.kind == "entity:update"`` AND ``event.entity_id``
+          matches one of :data:`MOTION_ENTITY_PATTERNS`. Issue #393:
+          CozyHem doesn't emit ``motion_detected`` — it emits
+          ``entity:update`` with a motion-sensor entity_id, so the
+          motion pipeline must recognize the entity_id-shape too.
+
+        Centralized here so wake_loop doesn't duplicate the rules.
         """
-        return event.kind in MOTION_EVENT_KINDS
+        if event.kind in MOTION_EVENT_KINDS:
+            return True
+        if event.kind == _ENTITY_UPDATE_KIND and event.entity_id:
+            for pattern in MOTION_ENTITY_PATTERNS:
+                if fnmatch.fnmatchcase(event.entity_id, pattern):
+                    return True
+        return False
 
     async def handle(self, event: CozyHemEvent) -> None:
         """Process one motion event through the full pipeline.

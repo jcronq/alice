@@ -779,3 +779,174 @@ def test_throttle_empty_input_kinds_means_accept_all(tmp_path: Path):
     throttle = Throttle(config_path=cfg)
     assert throttle.is_input_kind(_cozyhem(kind="entity:update")) is True
     assert throttle.is_input_kind(_cozyhem(kind="anything_at_all")) is True
+
+
+# ---------------------------------------------------------------------------
+# Issue #393 — entity:update routing to motion pipeline
+#
+# In production CozyHem emits motion events as kind=entity:update with
+# a binary_sensor entity_id, NOT as a synthetic motion_detected kind.
+# The pre-fix INPUT_KINDS filter silently dropped all of them. These
+# tests pin both arms: (a) MotionPipeline.is_motion_event recognizes
+# the entity_id shape, (b) the wake_loop's end-to-end flow routes the
+# real-shape event to the motion pipeline (not the generic classify
+# path).
+
+
+def test_is_motion_event_recognizes_entity_update_motion_entity():
+    """A kind=entity:update with a binary_sensor.*_motion entity_id is
+    motion — even though the kind isn't motion_detected."""
+    event = CozyHemEvent(
+        kind="entity:update",
+        entity_id="binary_sensor.hue_hallway_1_motion",
+        payload={"state": "on"},
+        received_at=1_000.0,
+    )
+    assert MotionPipeline.is_motion_event(event) is True
+
+
+def test_is_motion_event_recognizes_doubled_suffix_motion_entity():
+    """Hue compound naming: binary_sensor.*_motion_sensor_motion is
+    real and must match the *_motion_* pattern."""
+    event = CozyHemEvent(
+        kind="entity:update",
+        entity_id="binary_sensor.hue_master_closet_motion_sensor_motion",
+        payload={"state": "on"},
+        received_at=1_000.0,
+    )
+    assert MotionPipeline.is_motion_event(event) is True
+
+
+def test_is_motion_event_rejects_entity_update_light():
+    """entity:update on a light is not motion — the original classify
+    path applies (or the throttle drops it as a micro-delta)."""
+    event = CozyHemEvent(
+        kind="entity:update",
+        entity_id="light.hue_kitchen_2.3",
+        payload={"brightness": 0.4},
+        received_at=1_000.0,
+    )
+    assert MotionPipeline.is_motion_event(event) is False
+
+
+def test_is_motion_event_rejects_other_binary_sensor():
+    """Not every binary_sensor entity_id is motion — e.g. a light-level
+    sensor on the same Hue device is binary_sensor.*_light_level."""
+    event = CozyHemEvent(
+        kind="entity:update",
+        entity_id="binary_sensor.hue_pantry_light_level",
+        payload={"state": "on"},
+        received_at=1_000.0,
+    )
+    assert MotionPipeline.is_motion_event(event) is False
+
+
+def test_is_motion_event_still_matches_kind_arm():
+    """motion_detected (kept around for future producers) still
+    matches via the kind arm, regardless of entity_id."""
+    event = CozyHemEvent(
+        kind="motion_detected",
+        entity_id="anything",
+        payload={},
+        received_at=1_000.0,
+    )
+    assert MotionPipeline.is_motion_event(event) is True
+
+
+@pytest.mark.asyncio
+async def test_wake_loop_routes_entity_update_motion_event_to_pipeline(
+    tmp_path: Path,
+):
+    """End-to-end #393 acceptance: a kind=entity:update event from a
+    motion-sensor entity_id passes the INPUT filter AND routes to the
+    motion pipeline (not the generic classify path)."""
+    throttle = _make_throttle(tmp_path)  # default config — includes patterns
+    emitter = CapturingEmitter()
+    run_calls: list = []
+
+    async def _stub_run_agent(*args, **kwargs):
+        run_calls.append((args, kwargs))
+
+    qwen = _StubQwen()
+    pipeline = MotionPipeline(
+        qwen_client=qwen,
+        vault=None,
+        write_note=lambda *a, **kw: Path("/tmp/x.md"),
+        security_predicate=lambda _e: False,
+    )
+    wake = WakeLoop(
+        emitter=emitter,
+        throttle=throttle,
+        motion_pipeline=pipeline,
+        run_agent_fn=_stub_run_agent,
+    )
+    event = CozyHemEvent(
+        kind="entity:update",
+        entity_id="binary_sensor.hue_hallway_1_motion",
+        payload={"state": "on"},
+        received_at=1_000.0,
+    )
+    await wake._handle_event(event)
+
+    # The input filter did NOT drop it.
+    assert emitter.of_kind("cozylobe_event_dropped_non_input") == []
+    # And the motion pipeline took it (not the generic classify).
+    assert len(emitter.of_kind("cozylobe_motion_routed")) == 1
+    assert len(pipeline.queue) == 1
+    assert run_calls == []
+
+
+@pytest.mark.asyncio
+async def test_wake_loop_drops_entity_update_for_light(tmp_path: Path):
+    """The behavior the issue's prior code already had — entity:update
+    on a light entity drops as an OUTPUT event. Pinning the no-regression
+    boundary."""
+    throttle = _make_throttle(tmp_path)
+    emitter = CapturingEmitter()
+
+    async def _stub_run_agent(*args, **kwargs):  # pragma: no cover
+        raise AssertionError("agent dispatch must not fire")
+
+    wake = WakeLoop(
+        emitter=emitter,
+        throttle=throttle,
+        run_agent_fn=_stub_run_agent,
+    )
+    event = CozyHemEvent(
+        kind="entity:update",
+        entity_id="light.hue_kitchen_2.3",
+        payload={"brightness": 0.4},
+        received_at=1_000.0,
+    )
+    await wake._handle_event(event)
+    assert len(emitter.of_kind("cozylobe_event_dropped_non_input")) == 1
+    assert emitter.of_kind("cozylobe_event_received") == []
+
+
+@pytest.mark.asyncio
+async def test_wake_loop_drops_entity_update_for_non_motion_binary_sensor(
+    tmp_path: Path,
+):
+    """A binary_sensor that isn't on the pattern allowlist (e.g.
+    light_level) must still drop. Verifies the allowlist is honored
+    rather than waved through for any binary_sensor.* shape."""
+    throttle = _make_throttle(tmp_path)
+    emitter = CapturingEmitter()
+
+    async def _stub_run_agent(*args, **kwargs):  # pragma: no cover
+        raise AssertionError("agent dispatch must not fire")
+
+    wake = WakeLoop(
+        emitter=emitter,
+        throttle=throttle,
+        run_agent_fn=_stub_run_agent,
+    )
+    event = CozyHemEvent(
+        kind="entity:update",
+        entity_id="binary_sensor.hue_pantry_light_level",
+        payload={"state": "on"},
+        received_at=1_000.0,
+    )
+    await wake._handle_event(event)
+    assert len(emitter.of_kind("cozylobe_event_dropped_non_input")) == 1
+    assert emitter.of_kind("cozylobe_event_received") == []

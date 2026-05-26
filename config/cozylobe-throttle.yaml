@@ -73,6 +73,31 @@ input_kinds:
   - mode_changed
   - lock_state_changed
 
+# Issue #393 — entity_id allowlist for entity:update events.
+#
+# CozyHem doesn't emit motion/door/sensor events with a distinct kind;
+# they arrive as kind=entity:update with the sensor's entity_id. The
+# kind-only INPUT_KINDS filter above silently dropped 100% of those
+# (cozylobe.log 2026-05-26 16:05 EDT: 427 entity:update / 0
+# motion_detected over the prior hour). This second arm of the input
+# filter matches entity:update events whose entity_id passes one of
+# these fnmatch globs (case-sensitive). The motion pipeline still
+# does its own narrower entity-id check for routing motion → the
+# motion-special-class flow.
+#
+# Empty list → no entity:update events qualify via this path (i.e.
+# the regression-free fallback to the kind-only #379 behavior).
+tracked_input_entity_patterns:
+  - "binary_sensor.*_motion"
+  - "binary_sensor.*_motion_*"        # Hue compound naming: *_motion_sensor_motion
+  - "binary_sensor.*_doorbell*"
+  - "binary_sensor.*_door"
+  - "binary_sensor.*_window"
+  - "binary_sensor.*_smoke"
+  - "binary_sensor.*_glass_break"
+  - "binary_sensor.*_water_leak"
+  - "binary_sensor.*_lock"
+
 # Phase 4 (#381) — adjacency inference window.
 #
 # Two motion events in non-adjacent rooms (per the cozylobe-cortex

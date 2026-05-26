@@ -21,6 +21,7 @@ import pytest
 
 from alice_cozylobe.events import CozyHemEvent
 from alice_cozylobe.throttle import (
+    DEFAULT_TRACKED_INPUT_ENTITY_PATTERNS,
     SUMMARY_EVENT_KIND,
     Throttle,
     ThrottleConfig,
@@ -439,3 +440,163 @@ def test_throttle_decision_is_immutable():
     d = ThrottleDecision("pass", _make_event(), reason="first_seen")
     with pytest.raises(dataclasses.FrozenInstanceError):
         d.action = "drop"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# 9. Issue #393 — tracked_input_entity_patterns
+#
+# CozyHem emits motion-sensor events as kind=entity:update with the
+# sensor's entity_id, not as a synthetic motion_detected kind. The
+# kind-only INPUT_KINDS filter shipped in PR #385 dropped all of them
+# (cozylobe.log evidence: 427 entity:update / 0 motion_detected). The
+# fix adds an entity_id-pattern arm to is_input_kind so those events
+# survive the filter.
+
+
+def test_is_input_kind_passes_entity_update_for_motion_sensor(tmp_path):
+    """entity:update on a binary_sensor.*_motion entity_id should pass
+    the input filter via the pattern allowlist."""
+    throttle = _new_throttle(tmp_path, _FakeClock())
+    event = _make_event(
+        kind="entity:update",
+        entity_id="binary_sensor.hue_hallway_1_motion",
+        payload={"state": "on"},
+    )
+    assert throttle.is_input_kind(event) is True
+
+
+def test_is_input_kind_passes_doubled_suffix_motion_sensor(tmp_path):
+    """Hue compound naming: binary_sensor.hue_master_closet_motion_sensor_motion
+    must match the binary_sensor.*_motion_* pattern."""
+    throttle = _new_throttle(tmp_path, _FakeClock())
+    event = _make_event(
+        kind="entity:update",
+        entity_id="binary_sensor.hue_master_closet_motion_sensor_motion",
+        payload={"state": "on"},
+    )
+    assert throttle.is_input_kind(event) is True
+
+
+def test_is_input_kind_drops_entity_update_for_light(tmp_path):
+    """entity:update on a light entity must still drop — no regression
+    on the kind-only behavior for non-sensor entity_ids."""
+    throttle = _new_throttle(tmp_path, _FakeClock())
+    event = _make_event(
+        kind="entity:update",
+        entity_id="light.hue_kitchen_2.3",
+        payload={"brightness": 0.4},
+    )
+    assert throttle.is_input_kind(event) is False
+
+
+def test_is_input_kind_drops_non_matching_binary_sensor(tmp_path):
+    """Not every binary_sensor entity_id qualifies — e.g. a light-level
+    sensor isn't in the allowlist."""
+    throttle = _new_throttle(tmp_path, _FakeClock())
+    event = _make_event(
+        kind="entity:update",
+        entity_id="binary_sensor.hue_pantry_light_level",
+        payload={"state": "on"},
+    )
+    assert throttle.is_input_kind(event) is False
+
+
+def test_is_input_kind_with_empty_patterns_drops_entity_update(tmp_path):
+    """Empty tracked_input_entity_patterns → no entity:update events
+    qualify via the pattern arm. The kind-only #379 behavior is the
+    regression-free fallback."""
+    cfg_path = tmp_path / "cozylobe-throttle.yaml"
+    cfg_path.write_text(
+        "input_kinds:\n"
+        "  - motion_detected\n"
+        "tracked_input_entity_patterns: []\n"
+    )
+    throttle = Throttle(config_path=cfg_path, clock=_FakeClock())
+    event = _make_event(
+        kind="entity:update",
+        entity_id="binary_sensor.hue_hallway_1_motion",
+    )
+    assert throttle.is_input_kind(event) is False
+
+
+def test_is_input_kind_pattern_hot_reload(tmp_path):
+    """Editing the yaml mid-stream picks up new entity patterns on the
+    next event via the mtime check."""
+    cfg_path = tmp_path / "cozylobe-throttle.yaml"
+    # Start with NO entity patterns — entity:update drops.
+    cfg_path.write_text(
+        "input_kinds:\n"
+        "  - motion_detected\n"
+        "tracked_input_entity_patterns: []\n"
+    )
+    throttle = Throttle(config_path=cfg_path, clock=_FakeClock())
+    event = _make_event(
+        kind="entity:update",
+        entity_id="binary_sensor.hue_hallway_1_motion",
+    )
+    assert throttle.is_input_kind(event) is False
+
+    # Rewrite with the motion pattern — entity:update for a motion
+    # sensor must now pass on the very next call.
+    cfg_path.write_text(
+        "input_kinds:\n"
+        "  - motion_detected\n"
+        "tracked_input_entity_patterns:\n"
+        '  - "binary_sensor.*_motion"\n'
+    )
+    new_mtime = time.time() + 10
+    import os
+
+    os.utime(cfg_path, (new_mtime, new_mtime))
+
+    assert throttle.is_input_kind(event) is True
+
+
+def test_throttle_config_default_patterns_cover_all_classes():
+    """Sanity: the shipped default covers motion / door / window /
+    smoke / glass-break / water-leak / lock — the classes the issue
+    lists. We don't enumerate exact patterns (those evolve), just
+    verify representative entity_ids match."""
+    import fnmatch as fn
+
+    patterns = DEFAULT_TRACKED_INPUT_ENTITY_PATTERNS
+    samples = [
+        "binary_sensor.hue_hallway_1_motion",
+        "binary_sensor.hue_master_closet_motion_sensor_motion",
+        "binary_sensor.front_doorbell",
+        "binary_sensor.kitchen_door",
+        "binary_sensor.bedroom_window",
+        "binary_sensor.kitchen_smoke",
+        "binary_sensor.living_room_glass_break",
+        "binary_sensor.basement_water_leak",
+        "binary_sensor.front_lock",
+    ]
+    for entity_id in samples:
+        assert any(
+            fn.fnmatchcase(entity_id, p) for p in patterns
+        ), f"no default pattern matched {entity_id}"
+
+
+def test_throttle_config_parses_tracked_input_entity_patterns(tmp_path):
+    """yaml → ThrottleConfig.tracked_input_entity_patterns round-trips."""
+    cfg_path = tmp_path / "cozylobe-throttle.yaml"
+    cfg_path.write_text(
+        "tracked_input_entity_patterns:\n"
+        '  - "binary_sensor.custom_*"\n'
+        '  - "binary_sensor.another"\n'
+    )
+    cfg = ThrottleConfig.load(cfg_path)
+    assert cfg.tracked_input_entity_patterns == frozenset(
+        {"binary_sensor.custom_*", "binary_sensor.another"}
+    )
+
+
+def test_is_input_kind_kind_arm_still_works_with_patterns(tmp_path):
+    """An event whose kind is on the input_kinds list still passes
+    regardless of entity_id (the original #379 arm)."""
+    throttle = _new_throttle(tmp_path, _FakeClock())
+    event = _make_event(
+        kind="doorbell_pressed",
+        entity_id="doorbell.front",
+    )
+    assert throttle.is_input_kind(event) is True

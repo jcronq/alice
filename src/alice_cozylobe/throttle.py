@@ -50,6 +50,7 @@ Default rule set (matches issue #371's acceptance criteria):
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 import pathlib
 import time
@@ -63,6 +64,7 @@ __all__ = [
     "DEFAULT_CONFIG_PATH",
     "DEFAULT_INPUT_KINDS",
     "DEFAULT_SHIPPED_CONFIG_PATH",
+    "DEFAULT_TRACKED_INPUT_ENTITY_PATTERNS",
     "ThrottleConfig",
     "ThrottleDecision",
     "Throttle",
@@ -133,6 +135,39 @@ DEFAULT_INPUT_KINDS: frozenset[str] = frozenset(
 )
 
 
+# Issue #393: CozyHem doesn't emit `motion_detected` (or door/smoke/etc)
+# as distinct kinds — it emits ``entity:update`` and lets the consumer
+# read the entity_id. The Phase 2 INPUT_KINDS filter (#379 / PR #385)
+# assumed the richer taxonomy and dropped every motion-sensor firing on
+# the floor (cozylobe.log 2026-05-26: 427 entity:update / 0
+# motion_detected, all motion events dropped). This pattern allowlist
+# is the second arm of :meth:`Throttle.is_input_kind`: an
+# ``entity:update`` whose entity_id matches one of these fnmatch
+# patterns is treated as an INPUT event regardless of kind. Patterns
+# use :func:`fnmatch.fnmatchcase` (shell-glob, case-sensitive) so the
+# operator-facing config feels familiar.
+#
+# Default set covers motion / doorbell / door / window / smoke /
+# glass-break / water-leak / lock sensors — the kinds the original
+# motion-cortex design lists as "user input" classes. The doubled
+# ``_motion_*`` pattern catches Hue's compound naming convention where
+# a multi-sensor device exposes its motion channel as
+# ``binary_sensor.hue_master_closet_motion_sensor_motion``.
+DEFAULT_TRACKED_INPUT_ENTITY_PATTERNS: frozenset[str] = frozenset(
+    {
+        "binary_sensor.*_motion",
+        "binary_sensor.*_motion_*",
+        "binary_sensor.*_doorbell*",
+        "binary_sensor.*_door",
+        "binary_sensor.*_window",
+        "binary_sensor.*_smoke",
+        "binary_sensor.*_glass_break",
+        "binary_sensor.*_water_leak",
+        "binary_sensor.*_lock",
+    }
+)
+
+
 @dataclass
 class ThrottleConfig:
     """Runtime-tunable filter config.
@@ -180,6 +215,16 @@ class ThrottleConfig:
     # default list (see :data:`DEFAULT_INPUT_KINDS`).
     input_kinds: frozenset[str] = field(
         default_factory=lambda: DEFAULT_INPUT_KINDS
+    )
+    # Issue #393: entity_id glob patterns matched against
+    # ``entity:update`` events so motion / door / sensor state changes
+    # (which CozyHem emits with kind=entity:update, not a synthetic
+    # kind) survive the INPUT_KINDS filter. Empty set means "no
+    # entity:update events qualify via this path" — the kind-only
+    # behavior #379 shipped with. See
+    # :data:`DEFAULT_TRACKED_INPUT_ENTITY_PATTERNS`.
+    tracked_input_entity_patterns: frozenset[str] = field(
+        default_factory=lambda: DEFAULT_TRACKED_INPUT_ENTITY_PATTERNS
     )
     # Phase 4 (#381): adjacency inference window (seconds). Two motion
     # events in non-adjacent rooms within this window count as evidence
@@ -262,6 +307,18 @@ class ThrottleConfig:
         if isinstance(ik, (list, tuple, set, frozenset)):
             cfg.input_kinds = frozenset(
                 str(x) for x in ik if isinstance(x, str)
+            )
+
+        # Issue #393: tracked_input_entity_patterns — entity_id globs
+        # for entity:update events. Missing key → keep the shipped
+        # default set. Explicit empty list → empty set, which means
+        # "no entity:update events pass via this path" (regression-free
+        # fallback to the kind-only behavior). Non-string entries are
+        # skipped so a botched yaml comment can't poison the list.
+        tep = raw.get("tracked_input_entity_patterns")
+        if isinstance(tep, (list, tuple, set, frozenset)):
+            cfg.tracked_input_entity_patterns = frozenset(
+                str(x) for x in tep if isinstance(x, str)
             )
 
         # Phase 4 (#381): adjacency inference window. Bad value → keep
@@ -407,12 +464,29 @@ class Throttle:
         )
 
     def is_input_kind(self, event: CozyHemEvent) -> bool:
-        """Return True iff ``event.kind`` is on the INPUT_KINDS allowlist.
+        """Return True iff the event passes the INPUT allowlist.
+
+        Two arms:
+
+        * ``event.kind`` is on the configured ``input_kinds`` set. The
+          original #379 / PR #385 behavior.
+        * ``event.kind == "entity:update"`` AND ``event.entity_id``
+          matches one of ``tracked_input_entity_patterns`` (fnmatch
+          globs, case-sensitive). This arm exists because CozyHem
+          emits motion / door / sensor state changes as
+          ``entity:update`` with a distinguishing entity_id, NOT as
+          the synthetic ``motion_detected`` / ``door_opened`` kinds
+          the design assumed. See issue #393 and the cozylobe.log
+          evidence (427 entity:update / 0 motion_detected in the hour
+          before the fix shipped).
 
         Triggers a config-mtime reload first so a runtime edit to the
         yaml takes effect on the next event without a daemon restart.
-        An empty allowlist is treated as "accept all" (fail-open) so a
-        botched config can't take cozylobe offline silently.
+        An empty ``input_kinds`` allowlist is treated as "accept all"
+        (fail-open) so a botched config can't take cozylobe offline
+        silently. An empty ``tracked_input_entity_patterns`` simply
+        means no entity:update events qualify via the second arm —
+        the kind-only #379 behavior, no regression.
 
         This is the primary filter applied at the SSE entry point by
         :class:`alice_cozylobe.wake_loop.WakeLoop`. OUTPUT events
@@ -424,7 +498,17 @@ class Throttle:
         self._maybe_reload()
         if not self._config.input_kinds:
             return True
-        return event.kind in self._config.input_kinds
+        if event.kind in self._config.input_kinds:
+            return True
+        if (
+            event.kind == _ENTITY_UPDATE_KIND
+            and event.entity_id
+            and self._config.tracked_input_entity_patterns
+        ):
+            for pattern in self._config.tracked_input_entity_patterns:
+                if fnmatch.fnmatchcase(event.entity_id, pattern):
+                    return True
+        return False
 
     def handle(self, event: CozyHemEvent) -> ThrottleDecision:
         """Apply the throttle rules to one event.
