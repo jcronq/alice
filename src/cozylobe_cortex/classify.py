@@ -17,6 +17,7 @@ container picks up the live vault.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import re
@@ -24,6 +25,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+import yaml
+
+log = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -257,41 +263,45 @@ def build_trail(n: int = TRAIL_EVENT_COUNT) -> MotionTrail:
 # ---------------------------------------------------------------------------
 
 def _parse_yaml_frontmatter(text: str) -> dict[str, Any]:
-    """Minimal YAML frontmatter parser (no external deps)."""
-    fm: dict[str, Any] = {}
+    """Parse the YAML frontmatter block of a markdown note.
+
+    Callers in this module pass the full note text, so the leading
+    ``---`` fenced block is located here. The body between the fences
+    is delegated to :func:`yaml.safe_load` so nested mappings (e.g.
+    ``cozylobe_behavioral: room_preferences: kitchen: 0.25``) are
+    preserved. The previous regex-based parser only matched flat
+    ``key: value`` lines and silently dropped every nested key, which
+    left every behavioral profile empty and broke person attribution.
+
+    Returns ``{}`` for empty input, missing/unclosed fences, invalid
+    YAML, or a non-mapping document.
+    """
+    if not text or not text.strip():
+        return {}
+
+    # Extract the body between the leading ``---`` fences if present;
+    # otherwise treat the whole string as a YAML document (back-compat
+    # with any caller that pre-strips the fences).
+    body = text
     lines = text.splitlines()
-    in_fm = False
-    current_key = None
-    for line in lines:
-        if line.strip() == "---":
-            if not in_fm:
-                in_fm = True
-                continue
-            else:
-                break
-        if in_fm:
-            # Parse simple key: value
-            m = re.match(r"^\s*(\w[\w_-]*)\s*:\s*(.*)$", line)
-            if m:
-                key = m.group(1)
-                val = m.group(2).strip()
-                # Skip wikilink values for now
-                if val.startswith("[["):
-                    current_key = key
-                    fm[key] = []
-                elif val.startswith("- "):
-                    if current_key and isinstance(fm.get(current_key), list):
-                        fm[current_key].append(val[2:].strip())
-                else:
-                    current_key = key
-                    # Try numeric
-                    try:
-                        fm[key] = float(val)
-                        if fm[key] == int(fm[key]):
-                            fm[key] = int(fm[key])
-                    except ValueError:
-                        fm[key] = val
-    return fm
+    if lines and lines[0].strip() == "---":
+        try:
+            end = lines.index("---", 1)
+        except ValueError:
+            # opening fence with no closing fence -> no frontmatter
+            return {}
+        body = "\n".join(lines[1:end])
+
+    if not body.strip():
+        return {}
+
+    try:
+        result = yaml.safe_load(body)
+    except yaml.YAMLError as exc:
+        log.warning("Failed to parse YAML frontmatter: %s", exc)
+        return {}
+
+    return result if isinstance(result, dict) else {}
 
 
 def _load_people_dir(directory: Path) -> dict[str, BehavioralProfile]:
