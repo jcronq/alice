@@ -14,7 +14,6 @@ behavioral data.
 
 from __future__ import annotations
 
-from pathlib import Path
 from textwrap import dedent
 
 from cozylobe_cortex.classify import _parse_yaml_frontmatter
