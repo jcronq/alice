@@ -8,10 +8,33 @@ source of truth for *envelopes*; this file is the record of *Alice's turns*.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Optional
+
+
+# How many days of turn history to retain. Older entries are pruned on
+# append. Bootstrap/summary readers (``turn_runner.py``) only ever pull
+# ``tail(5)``/``tail(20)``, so a 30-day floor is plenty.
+RETENTION_DAYS = 30
+RETENTION_SECONDS = RETENTION_DAYS * 86400
+
+# Per-field truncation ceiling. Compaction turns inject the full
+# context summary into ``inbound``/``outbound``, which inflates entries
+# past 10 KB. The full summary already persists at
+# ``inner/state/context-summary.md``, so the log only needs a marker.
+MAX_FIELD_BYTES = 4096
+TRUNCATION_MARKER = "...[truncated]"
+
+# Prune-rate gate. Re-reading + rewriting the whole file on every
+# append would be wasteful — but skipping prune indefinitely is what
+# got us to 4.4 MB in the first place. We prune opportunistically when
+# the file is already heavier than this threshold. At ~55 turns/day and
+# ~2.4 KB/turn the file hits 1 MB in ~7 days, which keeps the prune
+# cadence weekly-ish without per-write scans on a fresh file.
+PRUNE_SIZE_THRESHOLD_BYTES = 1_000_000
 
 
 @dataclass
@@ -41,8 +64,18 @@ class TurnLog:
 
     def append(self, turn: Turn) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = _truncate_fields(asdict(turn))
         with self.path.open("a") as f:
-            f.write(json.dumps(asdict(turn), ensure_ascii=False) + "\n")
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        # Opportunistic prune — only when the file is heavy enough that
+        # a full rewrite is worth doing. Cheap stat() on every write,
+        # full scan + rewrite roughly weekly under normal traffic.
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            return
+        if size >= PRUNE_SIZE_THRESHOLD_BYTES:
+            self._prune_old_entries()
 
     def tail(self, n: int) -> list[Turn]:
         """Return the last n turns (oldest-first). Cheap on small files; fine
@@ -68,6 +101,58 @@ class TurnLog:
             except TypeError:
                 continue
         return out
+
+    def _prune_old_entries(self) -> None:
+        """Rewrite the log keeping only entries with ``ts >= now - 30d``.
+
+        Atomic ``.tmp`` sibling + ``os.replace`` so a crash mid-prune
+        never leaves a partial file. Lines that fail to parse are kept
+        as-is (better to retain noise than to silently discard data).
+        Lines with no ``ts`` field are also kept — we can't judge
+        their age.
+        """
+        if not self.path.is_file():
+            return
+        cutoff = time.time() - RETENTION_SECONDS
+        kept: list[str] = []
+        dropped = 0
+        with self.path.open("r") as f:
+            for raw in f:
+                stripped = raw.strip()
+                if not stripped:
+                    continue
+                try:
+                    obj = json.loads(stripped)
+                except json.JSONDecodeError:
+                    kept.append(stripped)
+                    continue
+                ts = obj.get("ts")
+                if isinstance(ts, (int, float)) and ts < cutoff:
+                    dropped += 1
+                    continue
+                kept.append(stripped)
+        if dropped == 0:
+            return
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text("\n".join(kept) + ("\n" if kept else ""))
+        os.replace(tmp, self.path)
+
+
+def _truncate_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    """Cap any string field at ``MAX_FIELD_BYTES``.
+
+    The 4 KB ceiling targets compaction turns whose ``inbound`` /
+    ``outbound`` embed the full vault summary. The summary is the
+    authoritative copy at ``inner/state/context-summary.md`` — the
+    turn log only needs enough text to show what happened.
+    """
+    out: dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, str) and len(value) > MAX_FIELD_BYTES:
+            out[key] = value[: MAX_FIELD_BYTES - len(TRUNCATION_MARKER)] + TRUNCATION_MARKER
+        else:
+            out[key] = value
+    return out
 
 
 def new_turn(
