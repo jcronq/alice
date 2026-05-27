@@ -116,7 +116,9 @@ def test_prunes_old_entries(tmp_path: pathlib.Path) -> None:
     _write_fixture(path, fixture)
     log = TurnLog(path)
     log._prune_old_entries()
-    remaining = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    remaining = [
+        json.loads(line) for line in path.read_text().splitlines() if line.strip()
+    ]
     assert len(remaining) == 1
     assert remaining[0]["inbound"] == "recent"
 
@@ -138,7 +140,9 @@ def test_prune_keeps_entries_without_ts(tmp_path: pathlib.Path) -> None:
         ],
     )
     TurnLog(path)._prune_old_entries()
-    remaining = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    remaining = [
+        json.loads(line) for line in path.read_text().splitlines() if line.strip()
+    ]
     assert len(remaining) == 1
     assert remaining[0]["sender_name"] == "no-ts-field"
 
@@ -219,7 +223,9 @@ def test_append_triggers_prune_when_file_exceeds_threshold(
     log = TurnLog(path)
     log.append(_turn(inbound="brand new", outbound="now"))
 
-    remaining = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+    remaining = [
+        json.loads(line) for line in path.read_text().splitlines() if line.strip()
+    ]
     # All old fixture entries should be gone; the brand-new one stays.
     assert len(remaining) == 1
     assert remaining[0]["inbound"] == "brand new"
