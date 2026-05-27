@@ -34,8 +34,22 @@ from .activity_fetcher import ActivitySnapshot, FetchActivity
 from .event_log import SseEventLogger
 from .events import CozyHemEvent
 from .motion import MotionPipeline
+from .noise_router import (
+    BurstCoalescer,
+    CoalesceFlush,
+    NoiseEvent,
+    classify_entity_type,
+    coalesce_slug,
+    render_coalesced_body,
+    should_route_to_noise,
+)
 from .qwen_client import QwenClassification, QwenClient, QwenUnreachable
-from .surfaces import build_slug, write_observation_note, write_urgent_surface
+from .surfaces import (
+    build_slug,
+    write_noise_note,
+    write_observation_note,
+    write_urgent_surface,
+)
 from .throttle import Throttle
 
 
@@ -94,6 +108,9 @@ class WakeLoop:
         throttle: Optional[Throttle] = None,
         motion_pipeline: Optional[MotionPipeline] = None,
         event_logger: Optional[SseEventLogger] = None,
+        noise_coalescer: Optional[BurstCoalescer] = None,
+        write_note_fn: Optional[Callable[..., object]] = None,
+        write_noise_fn: Optional[Callable[..., object]] = None,
     ) -> None:
         self._emitter = emitter
         self._qwen = qwen_client
@@ -124,6 +141,18 @@ class WakeLoop:
         # are preserved verbatim (timing information matters for the
         # sequence model).
         self._event_logger = event_logger
+        # Issue #411: noise-routing infrastructure. The motion pipeline
+        # already coalesces motion events on its 30s window
+        # (:class:`MotionQueue`) and routes the resulting batch note
+        # through its own writer. For OTHER noise-class entity types
+        # (light_level / ambient / humidity) that survive the
+        # INPUT_KINDS gate, the backstop note path consults the noise
+        # router and either buffers in a 60s coalescer or writes
+        # directly to inner/notes/noise/. Both are injection points so
+        # tests can spy on the routing without filesystem.
+        self._noise_coalescer = noise_coalescer or BurstCoalescer()
+        self._write_note_fn = write_note_fn or write_observation_note
+        self._write_noise_fn = write_noise_fn or write_noise_note
 
     async def run(
         self,
@@ -357,7 +386,23 @@ class WakeLoop:
         dispatch. Pulled out of :meth:`run_periodic` so exceptions
         land in one place and the sleep stays uninterrupted by per-
         tick error handling.
+
+        Issue #411: also drains stale noise-coalescer buffers so a
+        light_level burst that stalled below the threshold doesn't
+        sit in memory indefinitely. Cheap — at most one note per
+        entity type per drained tick.
         """
+        # Issue #411: opportunistic stale-flush of the noise coalescer.
+        # Runs BEFORE the activity fetch so a fetch-failure short-circuit
+        # doesn't skip the drain.
+        try:
+            self.flush_stale_noise()
+        except Exception as exc:  # noqa: BLE001 - fail-open
+            log.warning(
+                "cozylobe: noise stale-flush failed during periodic tick: %s",
+                exc,
+            )
+
         snapshot = await self._fetch_activity()
         if snapshot is None:
             # Cozyhem unreachable. The fetcher already logged once;
@@ -504,6 +549,17 @@ class WakeLoop:
         trail even if the agent didn't write one. Tagged
         ``cozylobe-backstop`` so thinking can prefer agent-written
         notes during drain.
+
+        Issue #411 routing: when the event is a low-value sensor type
+        (light_level / ambient / humidity per
+        :func:`should_route_to_noise`), the backstop note feeds the
+        burst coalescer and writes to inner/notes/noise/ — see module
+        docstring for the rationale. Motion events have their own
+        pipeline and never reach this path (the wake loop branches to
+        ``motion_pipeline.handle`` before backstop). Anything not
+        classified as noise — light/switch transitions, scenes,
+        buttons, locks, doors, windows — continues to land in
+        inner/notes/ as before.
         """
         slug = build_slug(event.kind, event.entity_id)
         body = (
@@ -514,14 +570,105 @@ class WakeLoop:
             f"{classification.summary}\n\n"
             f"_reasoning: {classification.reasoning}_\n"
         )
+
+        if should_route_to_noise(event.entity_id):
+            self._route_to_noise(event, body, classification.summary)
+            return
+
         try:
-            write_observation_note(
+            self._write_note_fn(
                 body,
                 slug=slug,
                 tags=("lobe-observation", "cozylobe-backstop"),
             )
         except OSError as exc:
             log.warning("cozylobe: backstop note write failed: %s", exc)
+
+    def _route_to_noise(
+        self,
+        event: CozyHemEvent,
+        body: str,
+        summary: str,
+    ) -> None:
+        """Push a noise-class event through the burst coalescer.
+
+        Below the threshold → buffered, no immediate write. At the
+        threshold → flush a coalesced note covering the window.
+        Stale-flush is driven by :meth:`flush_stale_noise` on the
+        periodic tick.
+
+        Fails open: if classify_entity_type returns None despite the
+        upstream should_route_to_noise check (shouldn't happen), we
+        fall back to a direct noise-note write so nothing is silently
+        dropped.
+        """
+        entity_type = classify_entity_type(event.entity_id) or ""
+        if not entity_type:
+            slug = build_slug(event.kind, event.entity_id, "noise")
+            try:
+                self._write_noise_fn(
+                    body,
+                    slug=slug,
+                    tags=("lobe-observation", "cozylobe-backstop", "noise"),
+                )
+            except OSError as exc:
+                log.warning(
+                    "cozylobe: noise note write failed: %s", exc
+                )
+            return
+
+        noise_event = NoiseEvent(
+            timestamp=event.received_at,
+            entity_id=event.entity_id,
+            entity_type=entity_type,
+            summary=summary or f"kind={event.kind}",
+        )
+        flush = self._noise_coalescer.add(noise_event)
+        self._emitter.emit(
+            "cozylobe_noise_buffered",
+            entity_id=event.entity_id,
+            entity_type=entity_type,
+            pending=self._noise_coalescer.pending_count(entity_type),
+        )
+        if flush is not None:
+            self._write_noise_flush(flush)
+
+    def _write_noise_flush(self, flush: CoalesceFlush) -> None:
+        """Render a coalesced flush as a single noise note."""
+        body = render_coalesced_body(flush)
+        slug = coalesce_slug(flush)
+        tags = [
+            "lobe-observation",
+            "noise",
+            f"noise-type:{flush.entity_type}",
+        ]
+        if flush.coalesced:
+            tags.append("burst-coalesce")
+        else:
+            tags.append("noise-stale-flush")
+        try:
+            self._write_noise_fn(body, slug=slug, tags=tuple(tags))
+        except OSError as exc:
+            log.warning(
+                "cozylobe: noise coalesce write failed: %s", exc
+            )
+        self._emitter.emit(
+            "cozylobe_noise_flushed",
+            entity_type=flush.entity_type,
+            count=len(flush.events),
+            coalesced=flush.coalesced,
+        )
+
+    def flush_stale_noise(self) -> None:
+        """Drain stale buffers from the noise coalescer.
+
+        Public hook the periodic task calls so events that arrived but
+        never crossed the threshold get written before the buffer
+        leaks them on a daemon restart. Returns nothing; emits one
+        flush event per drained bucket.
+        """
+        for flush in self._noise_coalescer.flush_stale():
+            self._write_noise_flush(flush)
 
     def _surface_critical(self, event: CozyHemEvent) -> None:
         """Drop an urgent surface for hardcoded CRITICAL kinds.

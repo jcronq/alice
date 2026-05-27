@@ -45,7 +45,12 @@ from typing import Awaitable, Callable, Iterable, Optional, TYPE_CHECKING
 from . import cortex as cortex_mod
 from .events import CozyHemEvent
 from .qwen_client import QwenClient, QwenUnreachable
-from .surfaces import build_slug, write_observation_note, write_urgent_surface
+from .surfaces import (
+    build_slug,
+    write_noise_note,
+    write_observation_note,
+    write_urgent_surface,
+)
 
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard
@@ -843,6 +848,9 @@ class MotionPipeline:
         write_note: Optional[
             Callable[..., object]
         ] = None,
+        write_noise: Optional[
+            Callable[..., object]
+        ] = None,
         clock: Optional[Callable[[], float]] = None,
         localtime: Optional[Callable[[float], time.struct_time]] = None,
         security_predicate: Optional[
@@ -862,6 +870,19 @@ class MotionPipeline:
         self._trail = trail or MotionTrail()
         self._queue = queue or MotionQueue(clock=clock)
         self._write_note = write_note or write_observation_note
+        # Issue #411: a parallel writer for noise-routed motion batches.
+        # Defaults to ``write_noise_note`` (writes to inner/notes/noise/);
+        # tests inject a spy to assert the route choice without filesystem.
+        # When ``write_note`` is overridden but ``write_noise`` isn't, we
+        # fall back to the overridden write_note so legacy tests that
+        # only capture the single writer don't lose visibility into the
+        # noise-routed writes.
+        if write_noise is not None:
+            self._write_noise = write_noise
+        elif write_note is not None:
+            self._write_noise = write_note
+        else:
+            self._write_noise = write_noise_note
         self._clock = clock or time.time
         self._localtime = localtime or time.localtime
         self._security_predicate = security_predicate
@@ -1173,8 +1194,25 @@ class MotionPipeline:
             tags.append(f"guess-id:{guess.guess_id}")
 
         body = self._render_body(batch, inference, security=security)
+        # Issue #411: route motion-pipeline notes to inner/notes/noise/
+        # by default — motion is the highest-volume noise source and
+        # was the primary cause of thinking's inbox exhaustion. Two
+        # exceptions stay on the inner/notes/ path so thinking sees
+        # them in her drain:
+        #
+        # * ``security=True`` — motion in the nighttime window is
+        #   high-signal; thinking should see it on the next wake.
+        # * ``tier == "actionable"`` — the guess crossed the
+        #   surface-tier threshold; the surface file is emitted
+        #   separately by :meth:`_emit_actionable_surface`, but the
+        #   companion note also belongs in the inbox so thinking can
+        #   correlate them.
+        if security or tier == "actionable":
+            writer = self._write_note
+        else:
+            writer = self._write_noise
         try:
-            self._write_note(body, slug=slug, tags=tuple(tags))
+            writer(body, slug=slug, tags=tuple(tags))
         except OSError as exc:
             log.warning("cozylobe motion: note write failed: %s", exc)
 

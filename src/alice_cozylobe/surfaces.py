@@ -1,11 +1,21 @@
 """Surface + note emitters — the lobe's only writes into ~/alice-mind/.
 
-Two channels, per the wake-loop design:
+Three channels, per the wake-loop design + issue #411 noise routing:
 
 * **observation note** — :func:`write_observation_note` drops a
   fleeting note into ``~/alice-mind/inner/notes/`` with
   ``tag: lobe-observation``. Thinking's drain promotes them to the
-  vault. This is the default channel for HIGH / MEDIUM / LOW events.
+  vault. This is the default channel for HIGH / MEDIUM / LOW events
+  AND anything not classified as low-value sensor telemetry.
+* **noise note** — :func:`write_noise_note` drops a fleeting note
+  into ``~/alice-mind/inner/notes/noise/``. Same shape as observation
+  notes but the subdirectory is invisible to thinking's inbox-drain
+  trigger (non-recursive iterdir / glob in
+  ``alice_thinking.vault_state._has_pending_inbox`` /
+  ``alice_thinking.phase``). Used for low-value sensor telemetry —
+  motion-pipeline batches, light_level, ambient temp/humidity —
+  per the design in
+  ``cortex-memory/research/2026-05-25-cozylobe-noise-inbox-routing-design.md``.
 * **urgent surface** — :func:`write_urgent_surface` drops a file into
   ``~/alice-mind/inner/surface/`` with the
   ``cozylobe-urgent-<slug>`` naming convention. Speaking's surface
@@ -13,8 +23,8 @@ Two channels, per the wake-loop design:
   the address book. Reserved for CRITICAL events (or HIGH events the
   agent explicitly marks urgent).
 
-Both helpers are pure-Python file emitters — no MCP, no shell. The
-``inner/notes/`` write path is identical to what
+All three helpers are pure-Python file emitters — no MCP, no shell.
+The ``inner/notes/`` write path is identical to what
 :mod:`alice_speaking.tools.append_note` produces for thinking; we
 duplicate the shape here so the lobe doesn't take an alice_speaking
 import.
@@ -32,6 +42,7 @@ from typing import Iterable, Optional
 __all__ = [
     "DEFAULT_MIND",
     "build_slug",
+    "write_noise_note",
     "write_observation_note",
     "write_urgent_surface",
 ]
@@ -114,6 +125,62 @@ def write_observation_note(
     )
     path.write_text(content)
     log.info("cozylobe note: %s", path)
+    return path
+
+
+def write_noise_note(
+    body: str,
+    *,
+    slug: str,
+    tags: Iterable[str] = ("lobe-observation", "noise"),
+    mind: Optional[pathlib.Path] = None,
+    now: Optional[float] = None,
+) -> pathlib.Path:
+    """Drop a noise-class fleeting note into ``inner/notes/noise/``.
+
+    Issue #411: motion-pipeline batches, light_level / ambient / humidity
+    telemetry, and other low-value sensor events are written here instead
+    of ``inner/notes/`` so they don't keep thinking's inbox perpetually
+    non-empty. The subdirectory is invisible to thinking's drain
+    triggers (non-recursive iterdir + glob), so noise notes accumulate
+    without gating Stage D fires.
+
+    The body / frontmatter shape is identical to
+    :func:`write_observation_note` so the data shape is unchanged —
+    only the path differs. Thinking can still walk noise/ manually
+    when auditing home-behavior patterns (the cortex-memory skill
+    treats it as a regular folder; nothing's hidden from a vault read).
+
+    Tags default to ``lobe-observation`` + ``noise`` so a misrouted
+    note remains tagged as a lobe observation; the ``noise`` tag lets
+    thinking-side queries identify it as a noise-class write if it
+    ever does walk the directory.
+
+    ``mind`` defaults to :data:`DEFAULT_MIND` resolved at call time so
+    tests can monkeypatch the module-level constant.
+    """
+    if mind is None:
+        mind = DEFAULT_MIND
+    noise_dir = mind / "inner" / "notes" / "noise"
+    noise_dir.mkdir(parents=True, exist_ok=True)
+    prefix = _utc_prefix(now)
+    filename = f"{prefix}-cozylobe-{slug}.md"
+    path = noise_dir / filename
+    tag_list = ", ".join(sorted(set(tags)))
+    created = time.strftime(
+        "%Y-%m-%d %H:%M:%S UTC", time.gmtime(now if now is not None else time.time())
+    )
+    content = (
+        "---\n"
+        f"created: {created}\n"
+        "source: cozylobe\n"
+        "route: noise\n"
+        f"tags: [{tag_list}]\n"
+        "---\n\n"
+        f"{body.rstrip()}\n"
+    )
+    path.write_text(content)
+    log.info("cozylobe noise note: %s", path)
     return path
 
 
