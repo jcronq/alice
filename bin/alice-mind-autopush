@@ -62,11 +62,19 @@ mkdir -p "$(dirname "$FAILURE_LOG")"
 # Stage list might not exist post-reset; capture staged-before-reset by
 # re-running diff against HEAD (working tree still has the changes).
 staged_files=$(git diff --name-only HEAD | tr '\n' ',' | sed 's/,$//')
-# JSON-escape the commit output for safe embedding.
-escaped=$(printf '%s' "$commit_output" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
 timestamp=$(date -Iseconds)
-printf '{"timestamp":"%s","exit_code":%d,"files":"%s","output":%s}\n' \
-    "$timestamp" "$commit_rc" "$staged_files" "$escaped" >> "$FAILURE_LOG"
+
+# Delegate the actual append/dedup/truncate logic to the Python helper.
+# It bounds growth by capping `output` at 2 KB and collapsing consecutive
+# identical failures into a single line with `count` + `last_seen_at`.
+# See bin/_log_auto_commit_failure.py and jcronq/alice#403.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+printf '%s' "$commit_output" | python3 "$SCRIPT_DIR/_log_auto_commit_failure.py" \
+    --log-path "$FAILURE_LOG" \
+    --timestamp "$timestamp" \
+    --exit-code "$commit_rc" \
+    --files "$staged_files" \
+    --output-stdin
 
 echo "auto-push: commit failed (rc=$commit_rc) — see $FAILURE_LOG" >&2
 echo "auto-push: working tree left intact; next manual commit will hit the same error." >&2
