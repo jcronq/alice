@@ -23,6 +23,7 @@ from alice_thinking.phase import (
     PhaseConfig,
     PromptFragmentLoader,
     VaultSnapshot,
+    _hours_since_last_c,
     _hours_since_last_d,
     build_vault_snapshot,
     detect_commission_notes,
@@ -47,6 +48,7 @@ def _snap(
     state_dir: pathlib.Path = pathlib.Path("/tmp/state"),
     today: str = "2026-05-07",
     stage_c_candidates_total: int = 0,
+    hours_since_last_c: float = 0.0,
 ) -> VaultSnapshot:
     return VaultSnapshot(
         hour=hour,
@@ -63,6 +65,7 @@ def _snap(
         state_dir=state_dir,
         today=today,
         stage_c_candidates_total=stage_c_candidates_total,
+        hours_since_last_c=hours_since_last_c,
     )
 
 
@@ -456,6 +459,215 @@ def test_rule_2b_consecutive_b_loop_still_breaks_before_2e() -> None:
     # it can't fire either. Confirms Rule 2b is reached first and
     # Rule 2e doesn't override its no-corpus branch.
     assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+# ---------------------------------------------------------------------------
+# Rule 2f — periodic C floor (8+ hours without C + debt above threshold → C)
+#
+# Design: cortex-memory/research/2026-05-27-stage-c-drought-analysis.md
+#
+# Rule 2f composes with Rule 2e (D floor). Mirrors the D-floor structure
+# but at an 8h cadence (vs 4h for D) and gated on stage_c_candidates_total
+# so the floor only fires when there's actual debt to drain. Self-
+# correcting: once Stage C drains debt below the threshold, Rule 2f
+# stops firing and Rule 2a / Rule 2e resume.
+#
+# Motivating symptom: Stage C ran zero times across 40+ sleep-phase wakes
+# 2026-05-08 → 2026-05-27 because Rule 2a (inbox drain, perpetually triggered
+# by cozylobe sensor notes) and Rule 2e (4h D floor, perpetually triggered
+# by the nightly research corpus) cascaded above Rule 2c, leaving the
+# Stage C window structurally unreachable.
+# ---------------------------------------------------------------------------
+
+
+def test_rule_2f_fires_when_8h_elapsed_and_debt_above_threshold() -> None:
+    """Both conditions met (debt + hours) → SLEEP_C, regardless of inbox."""
+    snap = _snap(
+        hour=2,
+        has_inbox_items=True,  # would normally route Rule 2a → SLEEP_B
+        hours_since_last_c=10.0,
+        stage_c_candidates_total=10,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+def test_rule_2f_fires_on_exact_8h_boundary() -> None:
+    """8.0 hours is the threshold — boundary fires (``>=`` comparison)."""
+    snap = _snap(
+        hour=1,
+        hours_since_last_c=8.0,
+        stage_c_candidates_total=STAGE_C_DEBT_ESCALATION_THRESHOLD,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+def test_rule_2f_does_not_fire_below_8h() -> None:
+    """<8h since last C → Rule 2f silent; falls through to later rules.
+    With clean vault + hour 0 + debt present, default Rule 2c → SLEEP_C
+    still fires (debt is irrelevant outside Rule 2b / 2f). Confirms 2f's
+    hours guard is honored — the rule does not fire prematurely."""
+    snap = _snap(
+        hour=23,
+        has_inbox_items=True,
+        hours_since_last_c=4.0,
+        stage_c_candidates_total=10,
+    )
+    # Rule 2f silent (4h < 8h) → Rule 2a wins on inbox → SLEEP_B
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_B
+
+
+def test_rule_2f_does_not_fire_when_debt_below_threshold() -> None:
+    """High hours_since_last_c with low debt → Rule 2f silent. Avoids
+    spurious C wakes when the vault is clean (the C floor is a debt-drain
+    mechanism, not a calendar floor)."""
+    snap = _snap(
+        hour=23,
+        has_inbox_items=True,
+        hours_since_last_c=24.0,
+        stage_c_candidates_total=STAGE_C_DEBT_ESCALATION_THRESHOLD - 1,
+    )
+    # Rule 2f silent (debt below threshold) → Rule 2a wins on inbox → SLEEP_B
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_B
+
+
+def test_rule_2f_does_not_fire_with_zero_debt() -> None:
+    """Even with very stale C (inf-equivalent hours), zero debt → silent."""
+    snap = _snap(
+        hour=2,
+        has_inbox_items=True,
+        hours_since_last_c=float("inf"),
+        stage_c_candidates_total=0,
+    )
+    # Rule 2f silent → Rule 2a wins → SLEEP_B
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_B
+
+
+def test_rule_2f_beats_rule_2a_when_both_conditions_met() -> None:
+    """The whole point of the rule: inbox-drain (Rule 2a) loses to the
+    C floor when there's both stale C and accumulated debt. Without 2f,
+    cozylobe-era wakes always route to SLEEP_B and Stage C starves."""
+    snap = _snap(
+        hour=1,
+        has_inbox_items=True,
+        has_broken_links=True,
+        has_orphan_stubs=True,
+        hours_since_last_c=12.0,
+        stage_c_candidates_total=STAGE_C_DEBT_ESCALATION_THRESHOLD,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+def test_rule_2e_d_floor_still_fires_before_rule_2f() -> None:
+    """Rule 2e (D floor) is evaluated before Rule 2f. When both floors
+    are ready to fire, D wins — D is the more generative stage and
+    Stage C floor is a hygiene rule that can wait one wake."""
+    snap = _snap(
+        hour=2,
+        has_inbox_items=True,
+        has_recent_research=True,
+        hours_since_last_d=10.0,  # Rule 2e ready
+        hours_since_last_c=12.0,  # Rule 2f also ready
+        stage_c_candidates_total=10,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_D
+
+
+def test_rule_2f_pathology_scenario_high_inbox_high_debt() -> None:
+    """End-to-end: the exact pathology the drought analysis describes —
+    high cozylobe inbox + high stage_c_candidates + 12h since last C +
+    no recent research (so Rule 2e cannot fire). Pre-fix outcome: SLEEP_B
+    every wake. Post-fix outcome: SLEEP_C, draining the debt."""
+    snap = _snap(
+        hour=1,
+        has_inbox_items=True,
+        has_broken_links=True,
+        has_recent_research=False,  # Rule 2e silent (no corpus)
+        hours_since_last_c=12.0,
+        stage_c_candidates_total=17,  # matches 2026-05-27 observed debt
+    )
+    result = select_phase(snap, _full_cfg())
+    assert result is Phase.SLEEP_C
+    assert result is not Phase.SLEEP_B
+    assert result is not Phase.SLEEP_D
+
+
+def test_existing_rule_2a_still_fires_when_2f_preconditions_unmet() -> None:
+    """Smoke: Rule 2a unchanged for the common cozylobe wake (recent
+    C wake, low debt). Pin against accidental regressions to the
+    inbox-drain default."""
+    snap = _snap(
+        hour=1,
+        has_inbox_items=True,
+        hours_since_last_c=2.0,  # recent C
+        stage_c_candidates_total=2,  # low debt
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_B
+
+
+def test_existing_rule_2c_still_fires_when_2f_preconditions_unmet() -> None:
+    """Smoke: Rule 2c (default early-window C) unchanged when 2f is silent
+    (clean vault, no debt). Pin against accidental regressions to the
+    default early-night C route."""
+    snap = _snap(
+        hour=0,
+        hours_since_last_c=2.0,
+        stage_c_candidates_total=0,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+# ---------------------------------------------------------------------------
+# _hours_since_last_c — helper that drives Rule 2f
+# ---------------------------------------------------------------------------
+
+
+def test_hours_since_last_c_returns_inf_when_no_thoughts_dir(
+    tmp_path: pathlib.Path,
+) -> None:
+    """No ``inner/thoughts/`` → no C history → inf."""
+    assert _hours_since_last_c(tmp_path, now=_utc(2026, 5, 27, 12)) == float("inf")
+
+
+def test_hours_since_last_c_returns_inf_when_no_c_wake(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``inner/thoughts/`` exists but no wake with ``stage: C`` → inf."""
+    thoughts = tmp_path / "inner" / "thoughts" / "2026-05-27"
+    thoughts.mkdir(parents=True)
+    wake = thoughts / "wake-001.md"
+    wake.write_text("---\nstage: B\ndid_work: true\n---\n# wake\n")
+    assert _hours_since_last_c(tmp_path, now=_utc(2026, 5, 27, 12)) == float("inf")
+
+
+def test_hours_since_last_c_finds_most_recent_c_wake(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Walks newest → oldest and returns the most recent C wake's age."""
+    import os
+
+    thoughts = tmp_path / "inner" / "thoughts" / "2026-05-27"
+    thoughts.mkdir(parents=True)
+    # Older C wake
+    older = thoughts / "wake-001.md"
+    older.write_text("---\nstage: C\ndid_work: true\n---\n# old C\n")
+    older_ts = _utc(2026, 5, 27, 4).timestamp()
+    os.utime(older, (older_ts, older_ts))
+    # Newer non-C wake (shouldn't shadow the older C — _consecutive scans
+    # stage frontmatter, but _hours_since_last_c returns the first C found
+    # walking backward from newest, irrespective of intervening stages).
+    middle = thoughts / "wake-002.md"
+    middle.write_text("---\nstage: B\ndid_work: true\n---\n# B\n")
+    middle_ts = _utc(2026, 5, 27, 6).timestamp()
+    os.utime(middle, (middle_ts, middle_ts))
+    # Newer C wake (this is the one that should be returned)
+    newer = thoughts / "wake-003.md"
+    newer.write_text("---\nstage: C\ndid_work: true\n---\n# new C\n")
+    newer_ts = _utc(2026, 5, 27, 8).timestamp()
+    os.utime(newer, (newer_ts, newer_ts))
+
+    result = _hours_since_last_c(tmp_path, now=_utc(2026, 5, 27, 12))
+    # now=12:00 UTC, newer=08:00 UTC → 4 hours
+    assert result == pytest.approx(4.0, abs=0.01)
 
 
 # ---------------------------------------------------------------------------

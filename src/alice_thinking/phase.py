@@ -139,6 +139,14 @@ class VaultSnapshot:
     # prefers C over D even when a research corpus exists.
     # Default 0 keeps the field optional for existing call sites.
     stage_c_candidates_total: int = 0
+    # Stage C drought fix — hours since last Stage C wake. Drives
+    # Rule 2f (C floor): when this is at or above 8h AND
+    # ``stage_c_candidates_total`` is at or above
+    # :data:`STAGE_C_DEBT_ESCALATION_THRESHOLD`, schedule Stage C
+    # even if the inbox has items. Mirrors the D-floor design (Rule
+    # 2e). ``inf`` when no Stage C wake has been recorded; default
+    # keeps the field optional for existing call sites.
+    hours_since_last_c: float = float("inf")
 
 
 @dataclass(frozen=True)
@@ -450,6 +458,64 @@ def _hours_since_last_d(
     return delta.total_seconds() / 3600
 
 
+def _hours_since_last_c(
+    mind: pathlib.Path,
+    *,
+    now: _dt.datetime,
+    window_hours: int = 48,
+) -> float:
+    """Hours since the last Stage C wake. Returns infinity if none in window.
+
+    Stage C, unlike Stage D, does not maintain its own pairs JSONL —
+    its wake-file frontmatter is the source of truth. Walks
+    ``inner/thoughts/<date>/`` newest-first looking for the most
+    recent wake with ``stage: C``; returns the delta in hours.
+
+    Used by Rule 2f (C floor) to break out of the Rule 2a (inbox
+    drain) / Rule 2e (D floor) cascade lock that caused the Stage C
+    drought (zero C wakes across 40 sleep-phase wakes 2026-05-08 →
+    2026-05-27).
+
+    ``window_hours`` bounds the scan — 48h is generous enough to
+    cover a full sleep cycle (Rule 2f's threshold is 8h) plus
+    headroom for clock drift, but cheap to walk.
+    """
+    from . import vault_state as _vs
+
+    thoughts_dir = mind / "inner" / "thoughts"
+    if not thoughts_dir.is_dir():
+        return float("inf")
+
+    since = now - _dt.timedelta(hours=window_hours)
+    files = _vs._wake_files_within(thoughts_dir, since=since)
+    if not files:
+        return float("inf")
+
+    if now.tzinfo is None:
+        now_utc = now.replace(tzinfo=_dt.timezone.utc)
+    else:
+        now_utc = now.astimezone(_dt.timezone.utc)
+
+    # Walk newest → oldest, return first Stage C wake's age in hours.
+    for f in reversed(files):
+        try:
+            text = f.read_text()
+        except OSError:
+            continue
+        fm = _vs._parse_frontmatter(text)
+        if fm.get("stage", "").upper() != "C":
+            continue
+        try:
+            mtime = f.stat().st_mtime
+        except OSError:
+            continue
+        wake_dt = _dt.datetime.fromtimestamp(mtime, tz=_dt.timezone.utc)
+        delta = now_utc - wake_dt
+        return delta.total_seconds() / 3600
+
+    return float("inf")
+
+
 def _vault_dir_mtime(mind: pathlib.Path) -> float:
     p = mind / "cortex-memory"
     try:
@@ -528,6 +594,7 @@ def build_vault_snapshot(
         state_dir=state_dir,
         today=today,
         stage_c_candidates_total=_stage_c_candidates_total(mind),
+        hours_since_last_c=_hours_since_last_c(mind, now=now),
     )
 
 
@@ -576,8 +643,31 @@ def select_phase(vault: VaultSnapshot, cfg: Optional[PhaseConfig] = None) -> Pha
     ):
         return Phase.SLEEP_D
 
+    # Rule 2f: Periodic C floor — every 8 hours without C, schedule C
+    # even if the inbox has items. Mirrors Rule 2e's D floor. Without
+    # this guardrail Rule 2a (inbox drain) wins on every cozylobe-era
+    # wake (sensor notes keep the inbox perpetually non-empty), and
+    # Rule 2b (consecutive-B loop break) never fires either because
+    # Rule 2e periodically resets the streak. Net effect: Stage C ran
+    # zero times across 40 sleep-phase wakes 2026-05-08 → 2026-05-27
+    # while vault debt climbed to 17 candidates.
+    #
+    # Gated on ``stage_c_candidates_total`` so the floor only fires
+    # when there is actual debt to drain — same threshold as Rule 2b
+    # debt-weighted escalation (Issue #388). 8h cadence composes with
+    # the 4h D floor: D at T=0, C at T=8, D at T=12, etc. Self-
+    # correcting — once C drains debt below the threshold, Rule 2f
+    # stops firing and Rule 2a / Rule 2e resume.
+    #
+    # Design: cortex-memory/research/2026-05-27-stage-c-drought-analysis.md
+    if (
+        vault.hours_since_last_c >= 8
+        and vault.stage_c_candidates_total >= STAGE_C_DEBT_ESCALATION_THRESHOLD
+    ):
+        return Phase.SLEEP_C
+
     # Rule 2a: inbox items / vault issues → Stage B (real work always wins
-    # within the bounds of Rule 2e above).
+    # within the bounds of Rule 2e / 2f above).
     if vault.has_inbox_items or vault.has_broken_links or vault.has_orphan_stubs:
         return Phase.SLEEP_B
 
