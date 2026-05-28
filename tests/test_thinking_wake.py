@@ -168,6 +168,7 @@ def _stub_main_dependencies(monkeypatch, tmp_path, *, phase_value):
     monkeypatch.setattr(wake_module, "select_phase", lambda *a, **kw: phase_value)
     monkeypatch.setattr(wake_module, "detect_commission_notes", lambda *a, **kw: [])
     monkeypatch.setattr(wake_module, "detect_conflict_notes", lambda *a, **kw: [])
+    monkeypatch.setattr(wake_module, "ensure_auth_env", lambda *a, **kw: None)
     monkeypatch.setattr(
         wake_module,
         "load_phase_config",
@@ -250,18 +251,8 @@ def _write_model_yml(tmp_path: pathlib.Path, body: str) -> None:
 def test_stage_override_applies_when_configured(monkeypatch, tmp_path) -> None:
     """Phase.SLEEP_D + thinking.stages.sleep_d in model.yml → run_wake
     receives the override BackendSpec and a stage_backend_override
-    event is emitted.
-
-    The base thinking spec uses ``backend: pi``, whose auth-setup path
-    clears ``ANTHROPIC_*`` from os.environ (so a stale API key can't
-    leak into a later pi call). The sleep_d override then asks for
-    ``subscription``, which raises ``AuthConfigError`` unless a
-    ``CLAUDE_CODE_OAUTH_TOKEN`` is in env. Seed a fake one — this test
-    is about the stage-override wiring, not auth resolution.
-    """
+    event is emitted."""
     from alice_thinking.phase import Phase
-
-    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-test-fake")
 
     _write_model_yml(
         tmp_path,
