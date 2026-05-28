@@ -20,9 +20,6 @@ import re
 from importlib import resources
 from typing import Any, Awaitable, Callable, Optional
 
-
-log = logging.getLogger(__name__)
-
 from .types import (
     Action,
     AppendToDaily,
@@ -36,6 +33,9 @@ from .types import (
     SurfacePayload,
     WikilinkFix,
 )
+
+
+log = logging.getLogger(__name__)
 
 
 __all__ = [
