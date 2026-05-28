@@ -22,7 +22,31 @@
 # this is a normal shutdown (or a crash) and we break out so s6's own
 # restart-backoff handles it. Mirrors the speaking pattern documented in
 # cortex-memory/research/2026-05-05-speaking-self-deploy-design.md.
+#
+# Opt-out: setting ALICE_COZYLOBE_ENABLED=false in alice.env makes this
+# service idle (sleep infinity) instead of running. For deploys without
+# LAN reachability to the cozyhem backbone or a Qwen endpoint — the
+# Python process would otherwise crashloop trying to open its SSE
+# connection. Mirrors the signal-daemon "SIGNAL_ACCOUNT unset -> idle"
+# pattern. Default is enabled, so existing deploys are unaffected (#422).
 set -e
+
+# Source alice.env so the opt-out flag is visible to this shell before we
+# spawn the Python interpreter. signal-daemon does the same thing.
+set -a
+# shellcheck disable=SC1091
+[ -f /home/alice/.config/alice/alice.env ] && source /home/alice/.config/alice/alice.env
+set +a
+
+if [ "${ALICE_COZYLOBE_ENABLED:-true}" = "false" ]; then
+    echo "alice-cozylobe: ALICE_COZYLOBE_ENABLED=false — service idle." \
+         "Unset (or set to 'true') in alice.env and " \
+         "'s6-svc -r /run/service/alice-cozylobe' to start." >&2
+    # Sleep forever instead of exiting — exiting trips s6's restart
+    # backoff and floods logs for what's a clean opt-out state, not an
+    # error. Mirrors alice-embedder's missing-venv idle pattern.
+    exec sleep infinity
+fi
 
 export ALICE_CONFIG=/home/alice/.config/alice/alice.env
 # Monorepo root bind-mounted at /home/alice/alice — src/ holds all Python

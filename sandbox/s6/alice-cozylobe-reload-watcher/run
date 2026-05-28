@@ -22,8 +22,26 @@
 #
 # Runs as alice — the state volume is alice-owned and inotifywait does not
 # need root.
+#
+# Opt-out: setting ALICE_COZYLOBE_ENABLED=false in alice.env makes this
+# service idle. Has to gate alongside alice-cozylobe so the watcher
+# doesn't pointlessly inotify on a never-spawned worker. The compose
+# `down`-file override pattern documented in the README does NOT
+# suppress this service (s6-rc autostarts the run script regardless),
+# so the env flag is the only reliable way to silence both halves of
+# the cozylobe pair on a no-LAN-backend deploy (#422).
 
 set -e
+
+set -a
+# shellcheck disable=SC1091
+[ -f /home/alice/.config/alice/alice.env ] && source /home/alice/.config/alice/alice.env
+set +a
+
+if [ "${ALICE_COZYLOBE_ENABLED:-true}" = "false" ]; then
+    echo "alice-cozylobe-reload-watcher: ALICE_COZYLOBE_ENABLED=false — service idle." >&2
+    exec sleep infinity
+fi
 
 SENTINEL=/state/worker/cozylobe-reload-requested
 INTERNAL_FLAG=/state/worker/cozylobe-reload-requested-internal
