@@ -59,14 +59,24 @@ class SkillRegistry:
     def from_search_paths(cls, search_paths: list[pathlib.Path]) -> "SkillRegistry":
         """Walk each path, parse every SKILL.md, return a registry.
 
-        Parse errors propagate (don't silently drop skills) — the
-        inventory CLI catches and reports them; the speaking +
-        thinking factories let them surface so a malformed skill
-        is visible at deploy.
+        Per-file parse errors are logged at ``WARNING`` and the bad
+        file is skipped — a single malformed ``SKILL.md`` must not
+        take down the daemons that depend on the registry (#423).
+        The invariant callers can rely on is "malformed on disk =
+        absent from the registry", same as missing-on-disk. Operators
+        and the inventory CLI surface the warning to find the bad
+        file; the rest of the registry comes up.
+
+        Only :class:`SkillError` is caught — broader exceptions still
+        propagate so genuine bugs in the parser stay visible.
         """
         loaded: list[Skill] = []
         for _, skill_md in iter_skill_paths(search_paths):
-            loaded.append(Skill.parse(skill_md))
+            try:
+                loaded.append(Skill.parse(skill_md))
+            except SkillError as exc:
+                log.warning("skill parse failed, skipping %s: %s", skill_md, exc)
+                continue
         return cls(loaded, search_paths=search_paths)
 
     @classmethod

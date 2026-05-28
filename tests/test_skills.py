@@ -238,6 +238,34 @@ def test_registry_loads_every_skill_md(tmp_path: pathlib.Path) -> None:
     assert reg.find("nope") is None
 
 
+def test_registry_skips_malformed_skill_and_warns(
+    tmp_path: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A single malformed ``SKILL.md`` must not abort registry
+    construction — the speaking + thinking daemons depend on this
+    not raising (#423). The valid skill loads; the broken one is
+    skipped with a WARNING that names the path.
+    """
+    _write_skill(tmp_path, "good")
+    bad_dir = tmp_path / "_cp_test_dir"
+    bad_dir.mkdir()
+    bad_path = bad_dir / "SKILL.md"
+    bad_path.write_text("v2")  # the exact 3-byte artifact from #423
+
+    with caplog.at_level("WARNING", logger="skills.registry"):
+        reg = SkillRegistry.from_search_paths([tmp_path])
+
+    names = {s.name for s in reg.all()}
+    assert "good" in names
+    assert "_cp_test_dir" not in names
+    assert reg.find("_cp_test_dir") is None
+    assert any(
+        str(bad_path) in rec.getMessage() and rec.levelname == "WARNING"
+        for rec in caplog.records
+    ), f"expected WARNING naming {bad_path}, got: {[r.getMessage() for r in caplog.records]}"
+
+
 def test_registry_resolves_override_from_mind_over_default(
     tmp_path: pathlib.Path,
 ) -> None:
