@@ -11,7 +11,12 @@ import time
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sse_starlette.sse import EventSourceResponse
@@ -233,6 +238,21 @@ def create_app(paths: Paths | None = None) -> FastAPI:
             "thinking_avg": aggregators.thinking_usage_average(events),
             "configured_models": _configured_models(p),
         }
+
+    # ------------------------------------------------------------------
+    # Liveness probe
+
+    @app.get("/healthz", response_class=PlainTextResponse)
+    async def healthz() -> str:
+        """Cheap liveness probe for the container HEALTHCHECK.
+
+        Does NO disk I/O, NO mind-state reads, NO template rendering —
+        just confirms the uvicorn worker is accepting requests and the
+        FastAPI app is dispatched. Heavy routes like ``/`` perform vault
+        reads that on a macOS/virtiofs bind mount can take ~5s on a cold
+        hit (#424); the HEALTHCHECK must not penalise that.
+        """
+        return "ok"
 
     # ------------------------------------------------------------------
     # Views

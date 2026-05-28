@@ -169,8 +169,15 @@ WORKDIR /home/alice/alice-mind
 # orphaned claude/ssh processes had been stuck since 08:43 EDT — speaking +
 # viewer both hung but the viewer-only HEALTHCHECK reported healthy); 9 such
 # incidents from 2026-04-26 through 2026-05-28. See EKS Phase 2 design §2.
-HEALTHCHECK --interval=15s --timeout=3s --retries=5 --start-period=60s \
-    CMD (curl -sf http://127.0.0.1:7777/ >/dev/null 2>&1 && \
+# /healthz (added 2026-05-28, #424) is a no-I/O liveness route: returns
+# "ok" without touching the vault, so the probe is bounded by uvicorn
+# scheduling rather than virtiofs cold-cache latency. The previous probe
+# hit "/", which on macOS/Rancher-Desktop's virtiofs mount measured ~5s
+# on first paint and tripped the old 3s wall every retry. Timeout bumped
+# to 10s and start_period to 120s for belt-and-suspenders headroom on
+# slow mounts and cold uvicorn imports.
+HEALTHCHECK --interval=15s --timeout=10s --retries=5 --start-period=120s \
+    CMD (curl -sf http://127.0.0.1:7777/healthz >/dev/null 2>&1 && \
          test $(($(date +%s) - $(stat -c %Y /state/worker/speaking-alive 2>/dev/null || echo 0))) -lt 300 && \
          test $(($(date +%s) - $(stat -c %Y /state/worker/thinking-alive 2>/dev/null || echo 0))) -lt 600) \
         || exit 1
