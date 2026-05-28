@@ -629,6 +629,29 @@ def select_phase(vault: VaultSnapshot, cfg: Optional[PhaseConfig] = None) -> Pha
     if not cfg.enable_full_sleep_dispatch:
         return Phase.SLEEP_B
 
+    # Rule 2f: Periodic C floor — every 8 hours without C, schedule C
+    # even if the inbox has items. Checked BEFORE Rule 2e (D floor) so
+    # that when both are ready (e.g. T=8h since last C, ≥4h since last D)
+    # C gets the wake. Pre-swap ordering put 2e first, which meant D
+    # always won at every T=8,12,16... boundary and C never fired — 92
+    # sleep-phase wakes overnight 2026-05-27→28 produced zero C even
+    # with 15 bloated notes signalling debt.
+    #
+    # Gated on ``stage_c_candidates_total`` so the floor only fires
+    # when there is actual debt to drain — same threshold as Rule 2b
+    # debt-weighted escalation (Issue #388). 8h cadence composes with
+    # the 4h D floor below: C at T=8, D at next available 4h slot, etc.
+    # Self-correcting — once C drains debt below the threshold, Rule 2f
+    # stops firing and Rule 2a / Rule 2e resume.
+    #
+    # Design: cortex-memory/research/2026-05-27-stage-c-drought-analysis.md
+    # Ordering fix: cortex-memory/research/2026-05-28-stage-c-floor-ordering-bug.md
+    if (
+        vault.hours_since_last_c >= 8
+        and vault.stage_c_candidates_total >= STAGE_C_DEBT_ESCALATION_THRESHOLD
+    ):
+        return Phase.SLEEP_C
+
     # Rule 2e (promoted): Periodic D floor — every 4 hours without D, schedule D
     # even if the inbox has items. Previously Rule 2a (inbox drain) took priority
     # above this rule, but in practice cozylobe sensor notes keep the inbox
@@ -642,29 +665,6 @@ def select_phase(vault: VaultSnapshot, cfg: Optional[PhaseConfig] = None) -> Pha
         and not vault.stage_d_cap_exhausted
     ):
         return Phase.SLEEP_D
-
-    # Rule 2f: Periodic C floor — every 8 hours without C, schedule C
-    # even if the inbox has items. Mirrors Rule 2e's D floor. Without
-    # this guardrail Rule 2a (inbox drain) wins on every cozylobe-era
-    # wake (sensor notes keep the inbox perpetually non-empty), and
-    # Rule 2b (consecutive-B loop break) never fires either because
-    # Rule 2e periodically resets the streak. Net effect: Stage C ran
-    # zero times across 40 sleep-phase wakes 2026-05-08 → 2026-05-27
-    # while vault debt climbed to 17 candidates.
-    #
-    # Gated on ``stage_c_candidates_total`` so the floor only fires
-    # when there is actual debt to drain — same threshold as Rule 2b
-    # debt-weighted escalation (Issue #388). 8h cadence composes with
-    # the 4h D floor: D at T=0, C at T=8, D at T=12, etc. Self-
-    # correcting — once C drains debt below the threshold, Rule 2f
-    # stops firing and Rule 2a / Rule 2e resume.
-    #
-    # Design: cortex-memory/research/2026-05-27-stage-c-drought-analysis.md
-    if (
-        vault.hours_since_last_c >= 8
-        and vault.stage_c_candidates_total >= STAGE_C_DEBT_ESCALATION_THRESHOLD
-    ):
-        return Phase.SLEEP_C
 
     # Rule 2a: inbox items / vault issues → Stage B (real work always wins
     # within the bounds of Rule 2e / 2f above).

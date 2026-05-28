@@ -28,16 +28,40 @@ model_list:
       input_cost_per_token: 0.00000015
       output_cost_per_token: 0.000001
 
-  # Cozylobe's CozyHem-event classifier. Backend is the LAN Qwen
-  # runtime on the 3090 desktop at 10.20.30.147:8033 (distinct host
-  # from qwen-local's aimax1 box). The served model id is ignored by
-  # the llama.cpp server, but we name it for clarity.
+  # Cozylobe's CozyHem-event narrator/classifier. Backend is the LAN
+  # Qwen runtime on the 3090 desktop at 10.20.30.147 — switched
+  # 2026-05-27 from Qwen3.6-27B on :8033 to Qwen3.6-35B-A3B (MoE) on
+  # :8034 for ~3.8x speedup (39.75 -> 151.9 tok/s gen on motion-event
+  # narration). The 27B container (llama-27b) is stopped; use the
+  # qwen-desktop-27b virtual model below to roll back.
   - model_name: qwen-desktop
+    litellm_params:
+      model: openai/qwen3.6-a3b
+      api_base: http://10.20.30.147:8034/v1
+      api_key: dummy
+      # Qwen3 30B-A3B reference: $0.15 in / $1.00 out per 1M tokens.
+      input_cost_per_token: 0.00000015
+      output_cost_per_token: 0.000001
+
+  # Explicit alias for the A3B endpoint — same backend as qwen-desktop.
+  # Use when a call site wants to assert it's on the A3B model.
+  - model_name: qwen-desktop-a3b
+    litellm_params:
+      model: openai/qwen3.6-a3b
+      api_base: http://10.20.30.147:8034/v1
+      api_key: dummy
+      input_cost_per_token: 0.00000015
+      output_cost_per_token: 0.000001
+
+  # Rollback target — points at the dormant 27B container on :8033.
+  # To use: 'sudo docker start llama-27b' on .147, then swap
+  # qwen-desktop's api_base back to :8033 (or change call sites to
+  # use this name explicitly).
+  - model_name: qwen-desktop-27b
     litellm_params:
       model: openai/qwen3.6-27b
       api_base: http://10.20.30.147:8033/v1
       api_key: dummy
-      # Qwen 27B reference: $0.30 in / $3.20 out per 1M tokens.
       input_cost_per_token: 0.0000003
       output_cost_per_token: 0.0000032
 

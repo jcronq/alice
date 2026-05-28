@@ -557,10 +557,13 @@ def test_rule_2f_beats_rule_2a_when_both_conditions_met() -> None:
     assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
 
 
-def test_rule_2e_d_floor_still_fires_before_rule_2f() -> None:
-    """Rule 2e (D floor) is evaluated before Rule 2f. When both floors
-    are ready to fire, D wins — D is the more generative stage and
-    Stage C floor is a hygiene rule that can wait one wake."""
+def test_rule_2f_c_floor_fires_before_rule_2e_when_both_ready() -> None:
+    """Rule 2f (C floor) is evaluated before Rule 2e (D floor). When both
+    floors are ready to fire, C wins. Pre-swap ordering (D-first) caused
+    Stage C to never fire — 92 sleep-phase wakes overnight 2026-05-27→28
+    produced zero C even with 15 bloated notes signalling debt — because
+    D's 4h cadence pre-empted C at every T=8,12,16... boundary.
+    Post-swap: C drains debt first, D picks up the next 4h slot."""
     snap = _snap(
         hour=2,
         has_inbox_items=True,
@@ -569,7 +572,7 @@ def test_rule_2e_d_floor_still_fires_before_rule_2f() -> None:
         hours_since_last_c=12.0,  # Rule 2f also ready
         stage_c_candidates_total=10,
     )
-    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_D
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
 
 
 def test_rule_2f_pathology_scenario_high_inbox_high_debt() -> None:
