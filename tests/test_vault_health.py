@@ -1667,6 +1667,8 @@ def test_decay_coverage_all_decayed_returns_zero(tmp_path: Path) -> None:
         "decayed": 3,
         "accessed": 0,
         "coverage_pct": 0.0,
+        "struct_recovered": 0,
+        "structural_coverage_pct": 0.0,
     }
 
 
@@ -1917,6 +1919,274 @@ def test_decay_coverage_missing_access_count_skipped(tmp_path: Path) -> None:
     )
     result = compute_decay_coverage(vault, today=_TODAY, activation_date=_ACTIVATION)
     assert result["total_decayed_notes"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Structural reachability extension to decay coverage.
+# Design: [[2026-05-21-decay-structural-implementation-design]]
+# A decayed note is "structurally covered" if it was directly accessed in
+# the window OR has ≥1 inbound link from a note accessed in the window.
+# ---------------------------------------------------------------------------
+
+
+def test_decay_coverage_structural_empty_vault_defaults_to_one_hundred(
+    tmp_path: Path,
+) -> None:
+    """When the decayed pool is empty, ``decay_coverage_structural_pct``
+    is vacuously 100.0 — same convention as ``decay_coverage_pct``."""
+    vault = _make_vault(tmp_path)
+    result = compute_decay_coverage(vault, today=_TODAY, activation_date=_ACTIVATION)
+    assert result["total_decayed_notes"] == 0
+    assert result["decay_coverage_structural_pct"] == 100.0
+
+
+def test_decay_coverage_structural_recovers_via_inbound_link(
+    tmp_path: Path,
+) -> None:
+    """A decayed note that is not directly accessed but is linked-to by a
+    recently-accessed note must be counted as structurally covered.
+
+    Setup: three decayed notes. One is directly accessed in the window
+    (counts toward `decay_coverage_pct`). Another is only linked from
+    the accessed note (counts only toward structural). The third has
+    no inbound link from any recently-accessed note (covered by neither).
+
+    Expectation: structural > direct, and the linked note shows up in
+    the structural count.
+    """
+    vault = _make_vault(tmp_path)
+    # Directly-accessed decayed note (counts in both metrics).
+    _write(
+        vault / "research" / "accessed.md",
+        """
+        ---
+        slug: accessed
+        created: 2026-04-01
+        access_count: 1
+        last_accessed: 2026-05-09
+        domain: fitness
+        ---
+        Links to [[linked-only]].
+        """,
+    )
+    # Decayed but only structurally reachable.
+    _write(
+        vault / "research" / "linked-only.md",
+        """
+        ---
+        slug: linked-only
+        created: 2026-04-01
+        access_count: 0
+        domain: fitness
+        ---
+        Body.
+        """,
+    )
+    # Decayed and has no inbound link from anything recently accessed.
+    _write(
+        vault / "research" / "isolated.md",
+        """
+        ---
+        slug: isolated
+        created: 2026-04-01
+        access_count: 0
+        domain: fitness
+        ---
+        Body.
+        """,
+    )
+
+    result = compute_decay_coverage(vault, today=_TODAY, activation_date=_ACTIVATION)
+
+    assert result["total_decayed_notes"] == 3
+    # Direct: only `accessed` (1/3 ≈ 33.33%).
+    assert result["decayed_accessed_in_window"] == 1
+    assert result["decay_coverage_pct"] == round(100.0 / 3, 2)
+    # Structural union: `accessed` + `linked-only` (2/3 ≈ 66.67%).
+    assert result["decay_coverage_structural_pct"] == round(200.0 / 3, 2)
+    assert (
+        result["decay_coverage_structural_pct"] > result["decay_coverage_pct"]
+    )
+
+
+def test_decay_coverage_structural_resolves_via_alias(tmp_path: Path) -> None:
+    """A decayed note linked to via one of its frontmatter aliases must
+    still count as structurally covered. The resolver checks slug first,
+    then falls through to alias_lower_to_slug."""
+    vault = _make_vault(tmp_path)
+    # Recently-accessed source links via the alias spelling, not the slug.
+    _write(
+        vault / "research" / "source.md",
+        """
+        ---
+        slug: source
+        created: 2026-04-01
+        access_count: 1
+        last_accessed: 2026-05-09
+        domain: fitness
+        ---
+        Refers to [[Migraine Trigger]] as an alias.
+        """,
+    )
+    # Decayed target has the matching alias.
+    _write(
+        vault / "research" / "neck-tension.md",
+        """
+        ---
+        slug: neck-tension
+        aliases:
+          - Migraine Trigger
+        created: 2026-04-01
+        access_count: 0
+        domain: fitness
+        ---
+        Body.
+        """,
+    )
+
+    result = compute_decay_coverage(vault, today=_TODAY, activation_date=_ACTIVATION)
+    # Pool is: source (accessed) + neck-tension (decayed, untouched).
+    assert result["total_decayed_notes"] == 2
+    # Direct: only `source` itself.
+    assert result["decayed_accessed_in_window"] == 1
+    # Structural: both — source (direct) and neck-tension (alias-resolved link).
+    assert result["decay_coverage_structural_pct"] == 100.0
+
+
+def test_decay_coverage_structural_per_domain_fields(tmp_path: Path) -> None:
+    """``by_domain`` carries per-domain ``struct_recovered`` and
+    ``structural_coverage_pct`` fields alongside the direct counts."""
+    vault = _make_vault(tmp_path)
+    # Fitness: 2 decayed, 1 accessed directly, the other reachable via link.
+    _write(
+        vault / "research" / "f-accessed.md",
+        """
+        ---
+        slug: f-accessed
+        created: 2026-04-01
+        access_count: 1
+        last_accessed: 2026-05-09
+        domain: fitness
+        ---
+        See [[f-linked]].
+        """,
+    )
+    _write(
+        vault / "research" / "f-linked.md",
+        """
+        ---
+        slug: f-linked
+        created: 2026-04-01
+        access_count: 0
+        domain: fitness
+        ---
+        Body.
+        """,
+    )
+    # Architecture: 1 decayed, isolated — covered by neither.
+    _write(
+        vault / "research" / "a-isolated.md",
+        """
+        ---
+        slug: a-isolated
+        created: 2026-04-01
+        access_count: 0
+        domain: alice-architecture
+        ---
+        Body.
+        """,
+    )
+
+    result = compute_decay_coverage(vault, today=_TODAY, activation_date=_ACTIVATION)
+
+    fitness = result["by_domain"]["fitness"]
+    assert fitness["decayed"] == 2
+    assert fitness["accessed"] == 1
+    assert fitness["coverage_pct"] == 50.0
+    assert fitness["struct_recovered"] == 2
+    assert fitness["structural_coverage_pct"] == 100.0
+
+    arch = result["by_domain"]["alice-architecture"]
+    assert arch["decayed"] == 1
+    assert arch["accessed"] == 0
+    assert arch["struct_recovered"] == 0
+    assert arch["structural_coverage_pct"] == 0.0
+
+
+def test_decay_coverage_structural_ignores_links_from_stale_sources(
+    tmp_path: Path,
+) -> None:
+    """An inbound link from a note that was NOT accessed in the window
+    does not count toward structural coverage — the structural pass only
+    follows wikilinks out of notes whose ``last_accessed >= window_floor``.
+    """
+    vault = _make_vault(tmp_path)
+    # Source that is itself stale (last_accessed predates window floor).
+    _write(
+        vault / "research" / "stale-source.md",
+        """
+        ---
+        slug: stale-source
+        created: 2026-04-01
+        access_count: 1
+        last_accessed: 2026-05-06
+        domain: fitness
+        ---
+        Links to [[decayed-target]].
+        """,
+    )
+    # Wait — last_accessed: 2026-05-06 IS the activation date which IS the
+    # window floor in this fixture (today=2026-05-10, 7-day window → 2026-05-03,
+    # capped at activation 2026-05-06). So this would actually be inside.
+    # We need a source strictly BEFORE the window floor. The window_floor is
+    # max(today - window_days, activation) = max(2026-05-03, 2026-05-06) =
+    # 2026-05-06. So any last_accessed < 2026-05-06 is stale.
+    # But such a source also can't be in the decayed pool, because pool
+    # membership requires last_accessed >= activation. So it would be
+    # excluded from the pool entirely — meaning a source can be "stale for
+    # structural purposes" only if it is NOT a pool member (i.e., a
+    # recently-created note or one that predates the pool age cutoff with
+    # last_accessed before window floor).
+    # Practically: use a young note (created post-activation) that has
+    # last_accessed in the past. It's not in the decayed pool, AND its
+    # last_accessed is before the window floor → its outbound links
+    # should not confer structural coverage.
+    (vault / "research" / "stale-source.md").unlink()
+    _write(
+        vault / "research" / "young-stale.md",
+        """
+        ---
+        slug: young-stale
+        created: 2026-05-07
+        access_count: 1
+        last_accessed: 2026-05-05
+        domain: fitness
+        ---
+        Links to [[decayed-target]].
+        """,
+    )
+    # The target is decayed and only linked-from by `young-stale` (which
+    # is stale w.r.t. the window).
+    _write(
+        vault / "research" / "decayed-target.md",
+        """
+        ---
+        slug: decayed-target
+        created: 2026-04-01
+        access_count: 0
+        domain: fitness
+        ---
+        Body.
+        """,
+    )
+
+    result = compute_decay_coverage(vault, today=_TODAY, activation_date=_ACTIVATION)
+    # Pool: just `decayed-target` (young-stale is too young for the pool).
+    assert result["total_decayed_notes"] == 1
+    # Neither direct access nor a recently-accessed inbound link covers it.
+    assert result["decayed_accessed_in_window"] == 0
+    assert result["decay_coverage_pct"] == 0.0
+    assert result["decay_coverage_structural_pct"] == 0.0
 
 
 # ---------------------------------------------------------------------------

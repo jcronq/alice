@@ -241,6 +241,32 @@ def _build_resolution_index(
     return by_slug, slugs_to_aliases, alias_lower_to_slug
 
 
+def _resolve_rel(
+    target: str,
+    vault_dir: Path,
+    by_slug: dict[str, Path],
+    alias_lower_to_slug: dict[str, str],
+) -> str | None:
+    """Resolve a wikilink target to its vault-relative path.
+
+    Checks slug match first, then alias lookup. Returns the path
+    relative to ``vault_dir``, or ``None`` if no match.
+
+    Top-level analogue of the local ``_resolve`` inside
+    ``count_inbound_links``, parameterized for reuse by the structural
+    reachability extension in :func:`compute_decay_coverage`.
+    """
+    lower = target.lower()
+    resolved = by_slug.get(lower)
+    if resolved is None:
+        resolved_slug = alias_lower_to_slug.get(lower)
+        if resolved_slug:
+            resolved = by_slug.get(resolved_slug)
+    if resolved is None:
+        return None
+    return str(resolved.relative_to(vault_dir))
+
+
 def _extract_targets(body: str, *, rescue_inline: bool = True) -> list[str]:
     """Extract ``[[target]]`` / ``[[target|alias]]`` wikilink targets,
     excluding code spans / fences / HTML comments. Returns normalized
@@ -758,6 +784,16 @@ def compute_decay_coverage(
     total_decayed = 0
     total_accessed = 0
 
+    # Structural reachability: pre-build resolution index + tracking sets.
+    # Indexed once so the post-loop pass can resolve wikilink targets from
+    # recently-accessed notes back to decayed-pool slugs.
+    by_slug, _slugs_to_aliases, alias_lower_to_slug = _build_resolution_index(
+        vault_dir
+    )
+    decayed_by_slug: dict[str, str] = {}       # slug_lower → domain
+    decayed_rel_to_slug: dict[str, str] = {}   # rel_lower → slug_lower
+    accessed_decay_slugs: set[str] = set()     # directly-accessed decayed slugs
+
     for md in _iter_notes(vault_dir):
         rel_parts = md.relative_to(vault_dir).parts
         if rel_parts and rel_parts[0] in _DECAY_EXCLUDED_FOLDERS:
@@ -794,9 +830,64 @@ def compute_decay_coverage(
         total_decayed += 1
         by_domain[domain]["decayed"] += 1
 
+        slug = _slug_from_fm(fm, md.stem) or md.stem
+        slug_lower = slug.lower()
+        decayed_by_slug[slug_lower] = domain
+        decayed_rel_to_slug[rel.lower()] = slug_lower
+
         if last_accessed is not None and last_accessed >= window_floor:
             total_accessed += 1
             by_domain[domain]["accessed"] += 1
+            accessed_decay_slugs.add(slug_lower)
+
+    # ── Structural reachability ──────────────────────────────────
+    # A decayed note is "structurally covered" if it was directly
+    # accessed in the window OR has ≥ 1 inbound link from a
+    # recently-accessed note. Union of direct + structural support.
+    #
+    # Pass: for each recently-accessed note, follow its wikilink
+    # targets to find decayed notes it links to.
+    struct_links_slugs: set[str] = set()
+    for md in _iter_notes(vault_dir):
+        text = _read_text(md)
+        fm, body = split_frontmatter(text)
+        last_accessed = _parse_last_accessed(fm.get("last_accessed"))
+        if last_accessed is None or last_accessed < window_floor:
+            continue
+        targets: list[str] = list(_extract_targets(body))
+        for val in fm.values():
+            if isinstance(val, str):
+                targets.extend(_extract_targets(val))
+            elif isinstance(val, list):
+                for item in val:
+                    if isinstance(item, str):
+                        targets.extend(_extract_targets(item))
+        for target in targets:
+            target_lower = target.lower()
+            if target_lower in decayed_by_slug:
+                struct_links_slugs.add(target_lower)
+                continue
+            resolved = _resolve_rel(
+                target, vault_dir, by_slug, alias_lower_to_slug,
+            )
+            if resolved is not None:
+                if resolved.lower() in decayed_rel_to_slug:
+                    struct_links_slugs.add(
+                        decayed_rel_to_slug[resolved.lower()],
+                    )
+
+    # Union of direct access + structural support
+    struct_recovered_set = accessed_decay_slugs | struct_links_slugs
+    struct_coverage = (
+        round(100.0 * len(struct_recovered_set) / total_decayed, 2)
+        if total_decayed > 0
+        else 100.0
+    )
+
+    # Per-domain structural counts
+    struct_by_domain: dict[str, int] = defaultdict(int)
+    for slug_lower in struct_recovered_set:
+        struct_by_domain[decayed_by_slug[slug_lower]] += 1
 
     coverage_pct = (
         round(100.0 * total_accessed / total_decayed, 2)
@@ -808,16 +899,23 @@ def compute_decay_coverage(
         d_total = counts["decayed"]
         d_acc = counts["accessed"]
         d_pct = round(100.0 * d_acc / d_total, 2) if d_total > 0 else 0.0
+        d_struct = struct_by_domain.get(domain, 0)
+        d_struct_pct = (
+            round(100.0 * d_struct / d_total, 2) if d_total > 0 else 0.0
+        )
         domain_payload[domain] = {
             "decayed": d_total,
             "accessed": d_acc,
             "coverage_pct": d_pct,
+            "struct_recovered": d_struct,
+            "structural_coverage_pct": d_struct_pct,
         }
 
     return {
         "total_decayed_notes": total_decayed,
         "decayed_accessed_in_window": total_accessed,
         "decay_coverage_pct": coverage_pct,
+        "decay_coverage_structural_pct": struct_coverage,
         "window_days": window_days,
         "activation_date": activation_date,
         "by_domain": domain_payload,
