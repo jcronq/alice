@@ -14,6 +14,7 @@ plan 08 phase 3 retires it once callers migrate to the new path.
 """
 
 from .auth import (
+    AuthConfigError,
     AuthEnv,
     AuthMode,
     DEFAULT_ALICE_ENV,
@@ -39,6 +40,7 @@ from .personae import (
 
 __all__ = [
     "AgentPersona",
+    "AuthConfigError",
     "AuthEnv",
     "AuthMode",
     "BackendDefaults",

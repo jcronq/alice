@@ -16,6 +16,7 @@ import pathlib
 import pytest
 
 from core.config.auth import (
+    AuthConfigError,
     ensure_auth_env,
     find_auth_env,
 )
@@ -218,3 +219,94 @@ def test_ensure_auth_env_base_url_kwarg_writes_override_into_env(
     import os
 
     assert os.environ.get("ANTHROPIC_BASE_URL") == "https://override.example.com/v1"
+
+
+# Issue #427: subscription mode_hint with empty oauth_token.
+
+
+def test_subscription_hint_with_api_creds_escalates_to_api(
+    clean_env, monkeypatch: pytest.MonkeyPatch, empty_env_file, caplog
+) -> None:
+    """The exact bug from #427: a fresh mind's env_aware default picks
+    subscription, the daemon hands mode_hint='subscription' to
+    ensure_auth_env, but the operator has wired api creds. Escalate
+    to api rather than wiping ANTHROPIC_* + writing empty OAuth."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://litellm.example.com/v1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "key-abc")
+    with caplog.at_level("ERROR", logger="core.config.auth"):
+        auth = find_auth_env(empty_env_file, mode_hint="subscription")
+    assert auth.mode == "api"
+    assert auth.api_key == "key-abc"
+    assert auth.base_url == "https://litellm.example.com/v1"
+    # Log breadcrumb so the operator can find the mismatch.
+    assert any(
+        "escalating to api mode" in rec.message for rec in caplog.records
+    ), caplog.records
+
+
+def test_subscription_hint_with_only_auth_token_escalates_to_api(
+    clean_env, monkeypatch: pytest.MonkeyPatch, empty_env_file
+) -> None:
+    """ANTHROPIC_AUTH_TOKEN alone (bearer-style proxy auth) is enough
+    to escalate — same as ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY."""
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "bearer-xyz")
+    auth = find_auth_env(empty_env_file, mode_hint="subscription")
+    assert auth.mode == "api"
+    assert auth.auth_token == "bearer-xyz"
+
+
+def test_subscription_hint_with_no_creds_anywhere_raises(
+    clean_env, empty_env_file
+) -> None:
+    """No oauth_token, no api creds, explicit subscription hint: this
+    is a real config error — raise so the operator sees it rather than
+    silently writing an empty token."""
+    with pytest.raises(AuthConfigError, match="subscription mode requested"):
+        find_auth_env(empty_env_file, mode_hint="subscription")
+
+
+def test_subscription_hint_with_valid_oauth_token_does_not_escalate(
+    clean_env, monkeypatch: pytest.MonkeyPatch, empty_env_file
+) -> None:
+    """Sanity: an honest subscription user keeps the existing behaviour
+    even when stale ANTHROPIC_* vars are also set in env."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok-real")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "stale-key")
+    auth = find_auth_env(empty_env_file, mode_hint="subscription")
+    assert auth.mode == "subscription"
+    assert auth.oauth_token == "tok-real"
+
+
+def test_ensure_subscription_with_api_creds_does_not_clear_anthropic_vars(
+    clean_env, monkeypatch: pytest.MonkeyPatch, empty_env_file
+) -> None:
+    """End-to-end: the daemon path that triggered #427. With api creds
+    in env and an explicit subscription hint, ensure_auth_env should
+    escalate to api and leave ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL
+    populated in os.environ — not pop them silently."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://litellm.example.com/v1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "key-abc")
+    auth = ensure_auth_env(empty_env_file, mode_hint="subscription")
+    assert auth.mode == "api"
+    import os
+
+    assert os.environ.get("ANTHROPIC_API_KEY") == "key-abc"
+    assert os.environ.get("ANTHROPIC_BASE_URL") == "https://litellm.example.com/v1"
+    # Subscription-mode empty token must not be written.
+    assert os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") is None
+
+
+def test_ensure_subscription_with_valid_token_clears_anthropic_vars(
+    clean_env, monkeypatch: pytest.MonkeyPatch, empty_env_file
+) -> None:
+    """Regression-guard for the existing subscription-clears-api
+    behaviour: when the operator genuinely wants subscription and has
+    a real OAuth token, the defensive escalation path must not fire."""
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok-real")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "stale-key")
+    auth = ensure_auth_env(empty_env_file, mode_hint="subscription")
+    assert auth.mode == "subscription"
+    import os
+
+    assert os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") == "tok-real"
+    assert os.environ.get("ANTHROPIC_API_KEY") is None

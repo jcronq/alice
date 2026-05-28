@@ -43,6 +43,7 @@ top).
 
 from __future__ import annotations
 
+import os
 import pathlib
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping
@@ -120,15 +121,66 @@ class ModelConfig:
 
     @classmethod
     def subscription_default(cls) -> "ModelConfig":
-        """The fallback when ``model.yml`` is absent: every hemisphere
-        on subscription with no model override (caller layers its own
-        default). Matches today's behaviour."""
+        """Every hemisphere on subscription with no model override
+        (caller layers its own default). Used by explicit callers and
+        as the env-aware default's no-creds branch — :meth:`load`
+        prefers :meth:`env_aware_default` so a mind without
+        ``model.yml`` doesn't pin to subscription regardless of which
+        creds the operator actually wired (see issue #427)."""
         return cls(
             speaking=BackendSpec(backend="subscription", harness="claude-code"),
             thinking=BackendSpec(backend="subscription", harness="claude-code"),
             viewer=BackendSpec(backend="subscription", harness="claude-code"),
             backends={},
         )
+
+    @classmethod
+    def api_default(cls) -> "ModelConfig":
+        """Every hemisphere on api backend, claude-code harness. Used
+        by :meth:`env_aware_default` when ``ANTHROPIC_*`` creds are
+        present in the process env. See issue #427."""
+        return cls(
+            speaking=BackendSpec(backend="api", harness="claude-code"),
+            thinking=BackendSpec(backend="api", harness="claude-code"),
+            viewer=BackendSpec(backend="api", harness="claude-code"),
+            backends={},
+        )
+
+    @classmethod
+    def env_aware_default(cls) -> "ModelConfig":
+        """Pick a sensible default backend from process-env credentials.
+
+        Used by :meth:`load` when ``mind/config/model.yml`` is absent
+        or empty. The previous behaviour (always
+        :meth:`subscription_default`) silently broke api-mode auth on
+        any fresh mind whose operator had wired ``ANTHROPIC_BASE_URL``
+        + ``ANTHROPIC_API_KEY`` for a LiteLLM proxy or corporate
+        gateway: the daemon then asked
+        :func:`core.config.auth.ensure_auth_env` for subscription
+        mode, which cleared the operator's ANTHROPIC_* vars out of
+        ``os.environ`` and wrote an empty ``CLAUDE_CODE_OAUTH_TOKEN``.
+
+        Resolution order:
+
+        1. Any of ``ANTHROPIC_BASE_URL`` / ``ANTHROPIC_API_KEY`` /
+           ``ANTHROPIC_AUTH_TOKEN`` non-empty in ``os.environ`` →
+           :meth:`api_default`.
+        2. ``CLAUDE_CODE_OAUTH_TOKEN`` non-empty →
+           :meth:`subscription_default`.
+        3. Nothing set → :meth:`subscription_default` (preserves the
+           SDK's ``~/.claude/.credentials.json`` fallback path; the
+           daemon still surfaces a clearer error downstream).
+
+        Bedrock isn't auto-detected here — bedrock minds should declare
+        ``backend: bedrock`` explicitly in ``model.yml``. See #427.
+        """
+        if (
+            os.environ.get("ANTHROPIC_BASE_URL")
+            or os.environ.get("ANTHROPIC_API_KEY")
+            or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+        ):
+            return cls.api_default()
+        return cls.subscription_default()
 
     def hemisphere(self, name: str) -> BackendSpec:
         """Return the resolved spec for ``name`` (``"speaking"`` /
@@ -356,22 +408,25 @@ def from_mapping(data: Mapping[str, Any]) -> ModelConfig:
 def load(mind_path: pathlib.Path) -> ModelConfig:
     """Load ``mind_path/config/model.yml``.
 
-    File missing → :meth:`ModelConfig.subscription_default` (today's
-    behaviour preserved). Parse error or schema mismatch →
-    :class:`ModelConfigError` with a message that names the offending
-    field.
+    File missing or empty → :meth:`ModelConfig.env_aware_default`,
+    which picks api vs subscription based on which credentials are
+    actually populated in ``os.environ`` (issue #427 — the previous
+    unconditional subscription default silently broke fresh minds
+    wired against an Anthropic-compatible api endpoint). Parse error
+    or schema mismatch → :class:`ModelConfigError` with a message
+    that names the offending field.
     """
     import yaml  # imported lazily so cold-import stays light
 
     path = mind_path / "config" / MODEL_FILENAME
     if not path.is_file():
-        return ModelConfig.subscription_default()
+        return ModelConfig.env_aware_default()
     try:
         raw = yaml.safe_load(path.read_text())
     except yaml.YAMLError as exc:
         raise ModelConfigError(f"failed to parse {path}: {exc}") from exc
     if raw is None:
-        return ModelConfig.subscription_default()
+        return ModelConfig.env_aware_default()
     if not isinstance(raw, Mapping):
         raise ModelConfigError(
             f"{path} must contain a YAML mapping (got {type(raw).__name__})"

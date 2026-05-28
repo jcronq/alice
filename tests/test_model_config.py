@@ -124,7 +124,19 @@ def test_load_full_config(tmp_path: pathlib.Path) -> None:
     assert cfg.viewer.model == "claude-haiku-4-5-20251001"
 
 
-def test_load_missing_file_returns_subscription_default(tmp_path: pathlib.Path) -> None:
+def test_load_missing_file_returns_subscription_default(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Issue #427: load() now uses env_aware_default(), which returns
+    # api when ANTHROPIC_* is set. Strip those vars so the
+    # "no creds, no model.yml" path is what we exercise.
+    for key in (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ):
+        monkeypatch.delenv(key, raising=False)
     cfg = load(tmp_path)
     assert cfg == ModelConfig.subscription_default()
     assert cfg.speaking.backend == "subscription"
@@ -132,10 +144,117 @@ def test_load_missing_file_returns_subscription_default(tmp_path: pathlib.Path) 
     assert cfg.viewer.backend == "subscription"
 
 
-def test_load_empty_file_returns_subscription_default(tmp_path: pathlib.Path) -> None:
+def test_load_empty_file_returns_subscription_default(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for key in (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ):
+        monkeypatch.delenv(key, raising=False)
     _write(tmp_path, "")
     cfg = load(tmp_path)
     assert cfg == ModelConfig.subscription_default()
+
+
+# Issue #427: env-aware default — load() picks api when the operator
+# has wired ANTHROPIC_* creds without ever writing a model.yml.
+
+
+_ANTHROPIC_ENV_VARS = (
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+
+
+@pytest.fixture
+def clean_anthropic_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in _ANTHROPIC_ENV_VARS:
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_env_aware_default_returns_api_when_base_url_set(
+    clean_anthropic_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://litellm.example.com/v1")
+    cfg = ModelConfig.env_aware_default()
+    assert cfg.speaking.backend == "api"
+    assert cfg.thinking.backend == "api"
+    assert cfg.viewer.backend == "api"
+    assert cfg.speaking.harness == "claude-code"
+
+
+def test_env_aware_default_returns_api_when_api_key_set(
+    clean_anthropic_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "key-abc")
+    cfg = ModelConfig.env_aware_default()
+    assert cfg.speaking.backend == "api"
+    assert cfg.thinking.backend == "api"
+    assert cfg.viewer.backend == "api"
+
+
+def test_env_aware_default_returns_api_when_auth_token_set(
+    clean_anthropic_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "bearer-token")
+    cfg = ModelConfig.env_aware_default()
+    assert cfg.speaking.backend == "api"
+
+
+def test_env_aware_default_returns_subscription_when_only_oauth_set(
+    clean_anthropic_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok-xyz")
+    cfg = ModelConfig.env_aware_default()
+    assert cfg == ModelConfig.subscription_default()
+
+
+def test_env_aware_default_falls_back_to_subscription_when_nothing_set(
+    clean_anthropic_env,
+) -> None:
+    cfg = ModelConfig.env_aware_default()
+    assert cfg == ModelConfig.subscription_default()
+
+
+def test_env_aware_default_prefers_api_over_subscription_when_both_set(
+    clean_anthropic_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the operator has both kinds of creds set, api wins — that's
+    the configuration that makes them actually a corporate-gateway /
+    LiteLLM user, not someone running on personal Claude."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "key")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
+    cfg = ModelConfig.env_aware_default()
+    assert cfg.speaking.backend == "api"
+
+
+def test_load_missing_file_with_api_env_returns_api_default(
+    tmp_path: pathlib.Path,
+    clean_anthropic_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://litellm.example.com/v1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "key")
+    cfg = load(tmp_path)
+    assert cfg.speaking.backend == "api"
+    assert cfg.thinking.backend == "api"
+    assert cfg.viewer.backend == "api"
+
+
+def test_load_empty_file_with_api_env_returns_api_default(
+    tmp_path: pathlib.Path,
+    clean_anthropic_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "key")
+    _write(tmp_path, "")
+    cfg = load(tmp_path)
+    assert cfg.speaking.backend == "api"
 
 
 def test_invalid_backend_raises(tmp_path: pathlib.Path) -> None:

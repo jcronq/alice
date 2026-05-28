@@ -31,11 +31,14 @@ and the SDK call inherits the result.
 
 from __future__ import annotations
 
+import logging
 import os
 import pathlib
 from dataclasses import dataclass
 from typing import Literal, Optional
 
+
+_LOG = logging.getLogger(__name__)
 
 DEFAULT_ALICE_ENV = pathlib.Path.home() / ".config" / "alice" / "alice.env"
 
@@ -43,6 +46,15 @@ AuthMode = Literal["subscription", "api", "bedrock", "none", "pi"]
 
 _API_VARS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 _BEDROCK_VARS = ("CLAUDE_CODE_USE_BEDROCK", "AWS_REGION", "AWS_PROFILE")
+
+
+class AuthConfigError(ValueError):
+    """Raised when an explicit ``mode_hint`` is incompatible with the
+    resolved credentials — e.g. ``mode_hint='subscription'`` but no
+    ``CLAUDE_CODE_OAUTH_TOKEN`` is set anywhere and no api creds are
+    present to escalate to. Naming the mismatch beats silently writing
+    an empty token and letting the SDK return ``authentication_failed``
+    later with no breadcrumb (issue #427)."""
 
 
 @dataclass(frozen=True)
@@ -126,7 +138,42 @@ def find_auth_env(
     profile = aws_profile or pick("AWS_PROFILE")
 
     mode: AuthMode
-    if mode_hint is not None:
+    if mode_hint == "subscription" and not oauth_token:
+        # Subscription requested explicitly (typically because
+        # mind/config/model.yml — or its env-aware default — said so)
+        # but no OAuth token resolved. Two sub-cases:
+        #   1. api creds are present in env/alice.env → escalate to
+        #      api mode. Writing an empty CLAUDE_CODE_OAUTH_TOKEN and
+        #      clearing the operator's ANTHROPIC_* vars produces an
+        #      opaque "authentication_failed" downstream with no log
+        #      breadcrumb (issue #427).
+        #   2. nothing is set → raise AuthConfigError. The SDK's
+        #      ~/.claude/.credentials.json fallback is the "no
+        #      mode_hint" path; an explicit mode_hint=subscription
+        #      with nothing to back it is a config mismatch, not a
+        #      fallback opportunity.
+        if resolved_base_url or api_key or auth_token:
+            _LOG.error(
+                "subscription mode requested but no "
+                "CLAUDE_CODE_OAUTH_TOKEN is set; ANTHROPIC_* api creds "
+                "are present, so escalating to api mode. Set "
+                "`backend: api` in mind/config/model.yml to silence "
+                "this warning, or set CLAUDE_CODE_OAUTH_TOKEN if you "
+                "meant subscription."
+            )
+            mode = "api"
+        else:
+            raise AuthConfigError(
+                "subscription mode requested but no "
+                "CLAUDE_CODE_OAUTH_TOKEN is set in env or alice.env, "
+                "and no ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY / "
+                "ANTHROPIC_AUTH_TOKEN are present to escalate to. "
+                "Either set CLAUDE_CODE_OAUTH_TOKEN to a Claude "
+                "subscription token, or switch the hemisphere to "
+                "`backend: api` / `backend: bedrock` in "
+                "mind/config/model.yml."
+            )
+    elif mode_hint is not None:
         mode = mode_hint
     elif resolved_base_url or api_key or auth_token:
         mode = "api"
@@ -191,6 +238,23 @@ def ensure_auth_env(
             else:
                 os.environ.pop(key, None)
     elif auth.mode == "subscription":
+        if not auth.oauth_token:
+            # Defensive: find_auth_env now escalates / raises when
+            # subscription is requested without a token, so this
+            # branch should be unreachable. Guard anyway — a future
+            # caller that hands us a hand-constructed AuthEnv with
+            # mode="subscription" and an empty oauth_token would
+            # otherwise re-introduce the issue #427 silent breakage
+            # (empty CLAUDE_CODE_OAUTH_TOKEN written, ANTHROPIC_*
+            # cleared).
+            _LOG.error(
+                "ensure_auth_env reached the subscription branch with "
+                "an empty oauth_token; refusing to clear ANTHROPIC_* "
+                "env vars or write an empty CLAUDE_CODE_OAUTH_TOKEN. "
+                "This is a bug — find_auth_env should have escalated "
+                "or raised."
+            )
+            return auth
         os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = auth.oauth_token
         for key in _API_VARS:
             os.environ.pop(key, None)
@@ -246,6 +310,7 @@ def ensure_token(env_file: pathlib.Path | None = None) -> str | None:
 
 
 __all__ = [
+    "AuthConfigError",
     "AuthEnv",
     "AuthMode",
     "DEFAULT_ALICE_ENV",
