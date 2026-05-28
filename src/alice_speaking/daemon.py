@@ -313,6 +313,9 @@ class SpeakingDaemon:
                 principal_name_for=lambda uid: self.address_book.display_name_for(
                     "cli", uid
                 ),
+                acts_on_behalf_of_for=lambda uid: self.address_book.acts_on_behalf_of_for(
+                    "cli", uid
+                ),
             )
             if cfg.cli_enabled
             else None

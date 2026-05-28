@@ -273,6 +273,23 @@ def test_turn_cli_renders_with_context():
     assert "[CLI from Owner | now]" in rendered
     assert "hi" in rendered
     assert "(caps)" in rendered
+    # When no delegation is recorded the header stays bare — no
+    # stray "(agent acting for ...)" parenthetical leaks in.
+    assert "agent acting for" not in rendered
+
+
+def test_turn_cli_renders_proxy_header_when_acts_on_behalf_of_set():
+    """CLI inbound from a host-side agent surfaces the delegation in
+    the header so Alice doesn't mistake the agent for the operator."""
+    rendered = load(
+        "speaking.turn.cli",
+        principal_name="host-agent",
+        stamp="now",
+        text="hi",
+        acts_on_behalf_of="Jason",
+        capability="(caps)",
+    )
+    assert "[CLI from host-agent (agent acting for Jason) | now]" in rendered
 
 
 def test_turn_signal_single_message_renders():

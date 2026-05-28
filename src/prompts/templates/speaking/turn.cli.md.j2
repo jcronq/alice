@@ -1,4 +1,4 @@
-[CLI from {{ principal_name }} | {{ stamp }}]
+[CLI from {{ principal_name }}{% if acts_on_behalf_of %} (agent acting for {{ acts_on_behalf_of }}){% endif %} | {{ stamp }}]
 
 {{ text }}
 

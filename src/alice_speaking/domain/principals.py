@@ -55,12 +55,22 @@ class PrincipalChannel:
 @dataclass
 class PrincipalRecord:
     """A single human / agent identity. Mutable so :meth:`AddressBook.learn`
-    can refresh display names without rebuilding the index."""
+    can refresh display names without rebuilding the index.
+
+    ``acts_on_behalf_of`` records a delegation relationship: this
+    principal is an agent acting for another principal (referenced by
+    id). Used so the speaking daemon's CLI transport can render a
+    proxy-aware header (``[CLI from host-agent (agent acting for
+    jcronq) | ...]``) when an agent — not the operator directly —
+    drives the socket. ``None`` means the principal speaks for
+    themselves.
+    """
 
     id: str
     display_name: str
     channels: list[PrincipalChannel] = field(default_factory=list)
     allowed: bool = True
+    acts_on_behalf_of: Optional[str] = None
 
     def channel_for(self, transport: str) -> Optional[PrincipalChannel]:
         """Return the preferred channel on ``transport``, falling back to
@@ -137,6 +147,27 @@ class AddressBook:
         when no principal claims this address)."""
         record = self.lookup_by_native(transport, native_id)
         return record.display_name if record is not None else native_id
+
+    def acts_on_behalf_of_for(
+        self, transport: str, native_id: str
+    ) -> Optional[str]:
+        """Return the display name of the principal that the inbound's
+        sender is delegating for, or ``None`` if no delegation is
+        recorded (or the referenced principal is unknown). Resolved via
+        display name rather than id so callers don't need to know the
+        principal-id taxonomy."""
+        record = self.lookup_by_native(transport, native_id)
+        if record is None or not record.acts_on_behalf_of:
+            return None
+        target = self.lookup_by_id(record.acts_on_behalf_of)
+        if target is None:
+            log.warning(
+                "principal %r delegates to unknown principal %r",
+                record.id,
+                record.acts_on_behalf_of,
+            )
+            return None
+        return target.display_name
 
     def preferred_channel(
         self, principal_id: str, transport: Optional[str] = None
@@ -304,15 +335,33 @@ def _from_dict(data: dict, *, source: str) -> AddressBook:
                     preferred=bool(ch.get("preferred", False)),
                 )
             )
+        acts_on_behalf_of = body.get("acts_on_behalf_of")
+        if acts_on_behalf_of is not None:
+            acts_on_behalf_of = str(acts_on_behalf_of)
         records.append(
             PrincipalRecord(
                 id=str(pid),
                 display_name=str(display),
                 channels=channels,
                 allowed=allowed,
+                acts_on_behalf_of=acts_on_behalf_of,
             )
         )
-    return AddressBook(records)
+    book = AddressBook(records)
+    # Validate delegation targets resolve. Soft-fail with a warning
+    # rather than ValueError so a typo in one entry doesn't take the
+    # whole daemon down at boot.
+    for record in records:
+        if record.acts_on_behalf_of and book.lookup_by_id(
+            record.acts_on_behalf_of
+        ) is None:
+            log.warning(
+                "%s: principal %r delegates to unknown principal %r",
+                source,
+                record.id,
+                record.acts_on_behalf_of,
+            )
+    return book
 
 
 def _normalize_address(transport: str, address: str) -> str:

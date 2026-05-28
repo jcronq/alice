@@ -211,6 +211,78 @@ def test_load_from_yaml(tmp_path: pathlib.Path):
     )
 
 
+def test_load_parses_acts_on_behalf_of_and_renders_proxy_header(
+    tmp_path: pathlib.Path,
+):
+    """Integration: a host_agent principal with ``acts_on_behalf_of:
+    jcronq`` and a CLI channel for uid 1000 loads cleanly, exposes
+    the delegation via :meth:`acts_on_behalf_of_for`, and the CLI
+    turn template surfaces "agent acting for Jason" in the rendered
+    header. Locks the end-to-end shape Jason flagged 2026-05-28."""
+    from prompts import load as load_prompt
+
+    p = tmp_path / "principals.yaml"
+    p.write_text(
+        textwrap.dedent("""\
+        principals:
+          jcronq:
+            display_name: Jason
+            channels:
+              - {transport: signal, address: "+14357091512", preferred: true}
+          host_agent:
+            display_name: host-agent
+            acts_on_behalf_of: jcronq
+            channels:
+              - {transport: cli, address: "1000", durable: false}
+    """)
+    )
+    book = load(yaml_path=p)
+    host = book.lookup_by_id("host_agent")
+    assert host is not None
+    assert host.acts_on_behalf_of == "jcronq"
+    assert book.acts_on_behalf_of_for("cli", "1000") == "Jason"
+    # Operator's own principal speaks for themselves — no delegation.
+    assert book.acts_on_behalf_of_for("signal", "+14357091512") is None
+
+    rendered = load_prompt(
+        "speaking.turn.cli",
+        principal_name=book.display_name_for("cli", "1000"),
+        stamp="now",
+        text="hi",
+        acts_on_behalf_of=book.acts_on_behalf_of_for("cli", "1000"),
+        capability="(caps)",
+    )
+    assert "agent acting for Jason" in rendered
+    assert "[CLI from host-agent (agent acting for Jason) | now]" in rendered
+
+
+def test_load_warns_on_unresolved_acts_on_behalf_of(
+    tmp_path: pathlib.Path, caplog
+):
+    """A typo in ``acts_on_behalf_of`` logs a warning but does not
+    take the daemon down at boot — soft-fail by design."""
+    p = tmp_path / "principals.yaml"
+    p.write_text(
+        textwrap.dedent("""\
+        principals:
+          host_agent:
+            display_name: host-agent
+            acts_on_behalf_of: nobody-here
+            channels:
+              - {transport: cli, address: "1000", durable: false}
+    """)
+    )
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        book = load(yaml_path=p)
+    assert any(
+        "delegates to unknown principal" in record.message for record in caplog.records
+    )
+    # Lookup returns None when the target is unresolved.
+    assert book.acts_on_behalf_of_for("cli", "1000") is None
+
+
 def test_load_synth_fallback_when_yaml_missing(tmp_path: pathlib.Path, caplog):
     book = load(
         yaml_path=tmp_path / "absent.yaml",

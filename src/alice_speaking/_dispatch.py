@@ -306,6 +306,7 @@ async def handle_cli(ctx: DaemonContext, event: "CLIEvent") -> None:
             principal_name=msg.principal.display_name,
             stamp=stamp,
             text=msg.text,
+            acts_on_behalf_of=msg.metadata.get("acts_on_behalf_of"),
         )
         await ctx._run_turn(
             prompt,

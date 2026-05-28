@@ -114,6 +114,7 @@ class CLITransport:
         socket_path: pathlib.Path,
         is_allowed: Optional[ACLCallable] = None,
         principal_name_for: Optional[Callable[[str], str]] = None,
+        acts_on_behalf_of_for: Optional[Callable[[str], Optional[str]]] = None,
         context_probe: Optional[object] = None,
     ) -> None:
         self._socket_path = socket_path
@@ -127,6 +128,13 @@ class CLITransport:
         # Optional display-name lookup (address-book backed). Falls back to
         # the legacy ``"local (uid=N)"`` rendering when not supplied.
         self._principal_name_for = principal_name_for
+        # Optional delegation lookup (address-book backed). Returns the
+        # display name of the principal the sender is acting for, or
+        # ``None`` when the sender speaks for themselves. Used to render
+        # a proxy-aware turn header — CLI inbound is rarely the operator
+        # directly; usually a host-side agent driving the socket on
+        # their behalf.
+        self._acts_on_behalf_of_for = acts_on_behalf_of_for
         # Optional read-only context probe — when set, the socket
         # accepts ``{"type": "context"}`` requests and replies with a
         # ``context_snapshot`` event. The daemon constructs the
@@ -253,12 +261,20 @@ class CLITransport:
         principal_name: str,
         stamp: str,
         text: str,
+        acts_on_behalf_of: Optional[str] = None,
     ) -> str:
         """Compose the prompt for a single CLI message.
 
         Body lives in
         ``prompts/templates/speaking/turn.cli.md.j2``
         (Plan 04 Phase 5).
+
+        ``acts_on_behalf_of`` — when set, the rendered header notes
+        that the sender is an agent acting for the named principal.
+        CLI inbound is never the operator directly; the host runs a
+        proxy agent that drives the socket on their behalf, and the
+        prompt should make that relationship explicit so Alice
+        doesn't mistake the agent for the operator.
         """
         from prompts import load as load_prompt
         from ..domain.render import capability_prompt_fragment
@@ -268,6 +284,7 @@ class CLITransport:
             principal_name=principal_name,
             stamp=stamp,
             text=text,
+            acts_on_behalf_of=acts_on_behalf_of,
             capability=capability_prompt_fragment("cli", self.caps),
         )
 
@@ -372,6 +389,15 @@ class CLITransport:
             native_id=peer_uid_str,
             display_name=display_name,
         )
+        # Resolve delegation up front so per-message dispatch can read
+        # it from inbound.metadata without re-querying the address book.
+        # ``None`` when no delegation is recorded (or the resolver is
+        # not wired by tests / standalone harnesses).
+        acts_on_behalf_of: Optional[str] = (
+            self._acts_on_behalf_of_for(peer_uid_str)
+            if self._acts_on_behalf_of_for is not None
+            else None
+        )
         channel = ChannelRef(transport="cli", address=conn_id, durable=False)
         self._writers[conn_id] = writer
         self._conns_by_uid.setdefault(peer_uid_str, set()).add(conn_id)
@@ -433,11 +459,15 @@ class CLITransport:
                     )
                     continue
 
+                metadata: dict = {}
+                if acts_on_behalf_of:
+                    metadata["acts_on_behalf_of"] = acts_on_behalf_of
                 inbound = InboundMessage(
                     principal=principal,
                     origin=channel,
                     text=text,
                     timestamp=time.time(),
+                    metadata=metadata,
                 )
                 await self._write_event(writer, {"type": "ack"})
                 try:
