@@ -34,11 +34,15 @@ site without pulling in google-adk / anthropic.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from typing import Literal, Optional, TypedDict
 
 from core.config.auth import ensure_auth_env
+
+
+log = logging.getLogger(__name__)
 
 
 __all__ = [
@@ -49,6 +53,34 @@ __all__ = [
     "QWEN_JUDGE_PROMPT_TEMPLATE",
     "HAIKU_JUDGE_PROMPT_TEMPLATE",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Resolved local-model config (issue #420)
+# ---------------------------------------------------------------------------
+#
+# ``LITELLM_QWEN_MODEL`` is the qwen-local virtual model name as seen by
+# google-adk's LiteLlm wrapper — value carries an ``openai/`` provider
+# prefix so the wrapper knows to dispatch via the OpenAI-compatible
+# transport. This var is shared with ``alice_thinking.workflows.stage_b``;
+# the cozylobe narrator/classifier uses a DIFFERENT env var
+# (``LITELLM_NARRATOR_MODEL``) so the two call sites can be repointed
+# independently. Direct-httpx call sites (viewer.lobe_labeler) read yet
+# another var (``LITELLM_LABEL_MODEL``) because they need the bare model
+# name without the ``openai/`` prefix.
+QWEN_MODEL = os.environ.get("LITELLM_QWEN_MODEL", "openai/qwen-local")
+QWEN_API_BASE = os.environ.get("LITELLM_BASE_URL", "http://10.20.30.177:8033/v1")
+# Bearer token for the LiteLLM proxy (its master key); "not-required"
+# against the direct LAN fallback (unauthenticated).
+QWEN_API_KEY = os.environ.get("LITELLM_MASTER_KEY", "not-required")
+
+# Log the resolved config once at import so a 404 storm against an
+# alternate LiteLLM proxy is diagnosable without grepping each module.
+log.info(
+    "stage_d_judges qwen config: model=%s api_base=%s",
+    QWEN_MODEL,
+    QWEN_API_BASE,
+)
 
 
 Tier = Literal["T1", "T2", "T3", "T4"]
@@ -318,12 +350,11 @@ def _call_qwen(prompt: str) -> str:
     # backend host is owned by sandbox/litellm/config.yaml. The model
     # name becomes a virtual alias. Direct LAN endpoint stays as the
     # fallback for host-side dev and the historical eval scripts that
-    # don't run the proxy.
-    model = os.environ.get("LITELLM_QWEN_MODEL", "openai/qwen-local")
-    api_base = os.environ.get("LITELLM_BASE_URL", "http://10.20.30.177:8033/v1")
-    # Bearer token for the LiteLLM proxy (its master key); "not-required"
-    # against the direct LAN fallback (unauthenticated).
-    api_key = os.environ.get("LITELLM_MASTER_KEY", "not-required")
+    # don't run the proxy. Resolution moved to module scope (issue #420)
+    # so the values are logged once at import.
+    model = QWEN_MODEL
+    api_base = QWEN_API_BASE
+    api_key = QWEN_API_KEY
 
     async def _run() -> str:
         adapter = LiteLlm(

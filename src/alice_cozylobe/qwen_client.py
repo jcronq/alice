@@ -66,12 +66,30 @@ DEFAULT_QWEN_ENDPOINT = os.environ.get(
 # Virtual model name resolved by sandbox/litellm/config.yaml -> the
 # 3090 desktop Qwen. The LAN llama.cpp server ignores the model field,
 # so this also works against the direct fallback.
-DEFAULT_QWEN_MODEL = os.environ.get("LITELLM_QWEN_MODEL", "qwen-desktop")
+#
+# Uses ``LITELLM_NARRATOR_MODEL`` rather than the shared
+# ``LITELLM_QWEN_MODEL`` so the cozylobe narrator/classifier can be
+# repointed independently of the alice_thinking stage_b/d call sites
+# (which still read ``LITELLM_QWEN_MODEL``). Prior to issue #420 both
+# call sites shared a single knob, which meant repointing
+# ``LITELLM_BASE_URL`` at an alternate LiteLLM proxy forced both onto
+# the same backend or 404'd one of them.
+DEFAULT_QWEN_MODEL = os.environ.get("LITELLM_NARRATOR_MODEL", "qwen-desktop")
 
 # Bearer token for the LiteLLM proxy (its master key). Empty in dev/tests
 # and against the direct LAN fallback (unauthenticated) — the
 # Authorization header is only sent when this is non-empty.
 DEFAULT_QWEN_API_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
+
+# Log the resolved local-model config once at import so a 404 storm
+# against an alternate LiteLLM proxy (e.g. a shared corporate proxy
+# repointed via LITELLM_BASE_URL) is diagnosable without grepping each
+# module. See issue #420.
+log.info(
+    "cozylobe qwen_client config: model=%s endpoint=%s",
+    DEFAULT_QWEN_MODEL,
+    DEFAULT_QWEN_ENDPOINT,
+)
 
 # Per the qwen-prompt design: low temperature for structured output,
 # high enough for some flexibility in pattern recognition.

@@ -19,10 +19,14 @@ never hit the wire.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import pathlib
 import re
 from typing import Awaitable, Callable, Optional
+
+
+log = logging.getLogger(__name__)
 
 
 # Hard cap on what we hand the UI. Long labels would force bubble-text
@@ -162,7 +166,14 @@ def sanitise_label(raw: str) -> str:
 # ``enable_thinking: False`` chat-template kwarg below; with it on a
 # label call would either burn 200 completion tokens or finish with
 # ``content=""`` if max_tokens is too tight.
-QWEN_MODEL = "qwen-local"
+#
+# ``LITELLM_LABEL_MODEL`` is the dedicated override for this call site —
+# kept separate from ``LITELLM_QWEN_MODEL`` (used by stage_b/d via the
+# google-adk LiteLlm wrapper, where the value carries an ``openai/``
+# provider prefix) because here we POST the bare model name straight at
+# the OpenAI-compatible chat endpoint. Mixing the two shapes 404s the
+# proxy. See issue #420 for the failure mode.
+QWEN_MODEL = os.environ.get("LITELLM_LABEL_MODEL", "qwen-local")
 # LiteLLM proxy fronts the LAN Qwen runtime (and future local models).
 # Falls back to the direct LAN endpoint so dev outside the container
 # (where LITELLM_BASE_URL isn't set) still works. The model name is a
@@ -173,6 +184,16 @@ QWEN_API_BASE = os.environ.get(
 # Bearer token for the LiteLLM proxy (its master key). Empty against the
 # direct LAN fallback (unauthenticated) — only sent when set.
 QWEN_API_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
+
+# Log the resolved local-model config once at import so a 404 storm
+# against an alternate LiteLLM proxy (e.g. a shared corporate proxy
+# repointed via LITELLM_BASE_URL) is diagnosable without grepping each
+# module. See issue #420.
+log.info(
+    "lobe_labeler local-model config: model=%s api_base=%s",
+    QWEN_MODEL,
+    QWEN_API_BASE,
+)
 
 # Hard cap: with thinking disabled, the model only needs a few tokens
 # for the phrase. Keep it small so latency is bounded if the model

@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import pathlib
 import signal
 import sys
@@ -67,7 +68,13 @@ DEFAULT_LOG = pathlib.Path("/state/worker/cozylobe.log")
 # and "qwen-desktop" maps to the 3090 desktop (10.20.30.147:8033) in
 # sandbox/litellm/config.yaml — so PiKernel reasoning goes through the
 # proxy like every other local-model call site, not direct to the box.
-DEFAULT_REASONING_MODEL = "litellm/qwen-desktop"
+#
+# The virtual model name is taken from ``LITELLM_NARRATOR_MODEL`` (same
+# var qwen_client.py reads) so the two cozylobe call sites move
+# together when LITELLM_BASE_URL is repointed at an alternate proxy.
+# See issue #420.
+DEFAULT_NARRATOR_MODEL = os.environ.get("LITELLM_NARRATOR_MODEL", "qwen-desktop")
+DEFAULT_REASONING_MODEL = f"litellm/{DEFAULT_NARRATOR_MODEL}"
 
 # Bound each reasoning pass. The registered cozylobe template uses
 # max_seconds=0 (unbounded); a slow/hung qwen on every event would

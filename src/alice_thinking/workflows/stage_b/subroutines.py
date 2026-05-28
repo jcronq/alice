@@ -13,11 +13,15 @@ concrete LLM client; tests pass a fake :class:`ModelCall` directly.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import pathlib
 import re
 from importlib import resources
 from typing import Any, Awaitable, Callable, Optional
+
+
+log = logging.getLogger(__name__)
 
 from .types import (
     Action,
@@ -45,6 +49,34 @@ __all__ = [
     "conflict_scan",
     "coerce_surface_payload",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Resolved local-model config (issue #420)
+# ---------------------------------------------------------------------------
+#
+# ``LITELLM_QWEN_MODEL`` is the qwen-local virtual model name as seen by
+# google-adk's LiteLlm wrapper — value carries an ``openai/`` provider
+# prefix so the wrapper knows to dispatch via the OpenAI-compatible
+# transport. Shared with ``alice_thinking.stage_d_judges``; the cozylobe
+# narrator/classifier uses ``LITELLM_NARRATOR_MODEL`` and the viewer
+# lobe labeller uses ``LITELLM_LABEL_MODEL`` so the three call sites can
+# be repointed independently at an alternate LiteLLM proxy.
+DEFAULT_QWEN_MODEL = os.environ.get("LITELLM_QWEN_MODEL", "openai/qwen-local")
+DEFAULT_QWEN_API_BASE = os.environ.get(
+    "LITELLM_BASE_URL", "http://10.20.30.177:8033/v1"
+)
+# Bearer token for the LiteLLM proxy (its master key); "not-required"
+# against the direct LAN fallback (unauthenticated).
+DEFAULT_QWEN_API_KEY = os.environ.get("LITELLM_MASTER_KEY", "not-required")
+
+# Log the resolved config once at import so a 404 storm against an
+# alternate LiteLLM proxy is diagnosable without grepping each module.
+log.info(
+    "stage_b qwen config: model=%s api_base=%s",
+    DEFAULT_QWEN_MODEL,
+    DEFAULT_QWEN_API_BASE,
+)
 
 
 # Async (system, user) -> raw assistant text. Tests inject a fake.
@@ -103,15 +135,11 @@ def make_default_model_call(
     """
 
     if model is None:
-        model = os.environ.get("LITELLM_QWEN_MODEL", "openai/qwen-local")
+        model = DEFAULT_QWEN_MODEL
     if api_base is None:
-        api_base = os.environ.get(
-            "LITELLM_BASE_URL", "http://10.20.30.177:8033/v1"
-        )
+        api_base = DEFAULT_QWEN_API_BASE
     if api_key is None:
-        # Bearer token for the LiteLLM proxy (its master key); "not-required"
-        # against the direct LAN fallback (unauthenticated).
-        api_key = os.environ.get("LITELLM_MASTER_KEY", "not-required")
+        api_key = DEFAULT_QWEN_API_KEY
 
     async def _call(system_prompt: str, user_prompt: str) -> str:
         # Lazy imports — keeps test paths light + avoids a hard
