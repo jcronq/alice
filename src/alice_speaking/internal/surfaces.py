@@ -40,6 +40,23 @@ log = logging.getLogger(__name__)
 POLL_SECONDS = 5.0
 
 
+# Liveness file the container HEALTHCHECK probes for speaking-side wedges.
+# Refreshed every SurfaceWatcher._run tick — that's the fixed-cadence
+# event-loop wake that fires regardless of inbound traffic, so a hung turn
+# (or a hung kernel) shows up as a stuck mtime within ~6 min (5-min staleness
+# window + interval slack). Bare path constant — NO try/except around the
+# touch site: a read-only FS or missing dir SHOULD trip the probe rather
+# than silently mask a wedge. See sandbox/Dockerfile HEALTHCHECK comment.
+SPEAKING_LIVENESS_PATH = pathlib.Path("/state/worker/speaking-alive")
+
+
+def _touch_liveness(path: pathlib.Path) -> None:
+    """Touch the speaking-side liveness file so the container HEALTHCHECK
+    sees a fresh mtime. Extracted as a function so the unit test can pass
+    a tmp_path override; behavior is just ``Path.touch()``."""
+    path.touch()
+
+
 # Surface types that are produced by automated, cron-driven scans
 # (not LLM judgment) and tend to re-fire identical signal multiple
 # times per day. The first occurrence of each type per day dispatches
@@ -145,6 +162,13 @@ class SurfaceWatcher:
                         entry.name,
                     )
         while not ctx._stop.is_set():
+            # Liveness heartbeat — this loop is the speaking event-loop
+            # tick that wakes regardless of inbound traffic, which is
+            # exactly the signal we want the container HEALTHCHECK to
+            # observe. Touch first so a downstream OSError on the glob
+            # doesn't skip the heartbeat. NOT wrapped in try/except: if
+            # /state/worker isn't writable, the probe SHOULD fire.
+            _touch_liveness(SPEAKING_LIVENESS_PATH)
             try:
                 for path in sorted(self._surface_dir.glob("*.md")):
                     if path.name.startswith(".") or path.name in self._dispatched:

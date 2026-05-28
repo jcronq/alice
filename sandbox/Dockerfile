@@ -147,11 +147,33 @@ EXPOSE 7777
 
 WORKDIR /home/alice/alice-mind
 
-# Readiness = viewer is responding. In the single-container shape there's no
-# blue/green lease to probe; the viewer's `/` is the cheapest visible signal
-# that the pod is up. See EKS Phase 2 design §2 ("What goes away").
+# Readiness = viewer responding AND speaking + thinking heartbeats fresh.
+# Docker honors only one HEALTHCHECK per image, so the three probes combine
+# in a single shell test:
+#
+#   - viewer `/` returns 2xx (cheapest visible signal that the pod is up).
+#   - /state/worker/speaking-alive mtime within the last 300s. Speaking's
+#     event-loop tick (SurfaceWatcher._run, 5s cadence) refreshes this
+#     regardless of inbound traffic, so a wedged turn shows up as a stuck
+#     mtime within ~6 min even when no Signal / surface activity is in flight.
+#   - /state/worker/thinking-alive mtime within the last 600s. Thinking
+#     touches this at the start of each wake (5-min cadence) before any
+#     model call, so a wedged wake or stuck claude CLI subprocess is caught
+#     within ~10 min.
+#
+# `2>/dev/null || echo 0` makes the staleness test FAIL (not error) when the
+# liveness file doesn't exist yet — we want a stuck mtime to trip the probe,
+# not a missing file to mask it. No try/except wrappers around the producer-
+# side touches either: if the FS is read-only or the dir is missing, the
+# probe SHOULD fire. Triggered by the 2026-05-28 hang (force-killed after
+# orphaned claude/ssh processes had been stuck since 08:43 EDT — speaking +
+# viewer both hung but the viewer-only HEALTHCHECK reported healthy); 9 such
+# incidents from 2026-04-26 through 2026-05-28. See EKS Phase 2 design §2.
 HEALTHCHECK --interval=15s --timeout=3s --retries=5 --start-period=60s \
-    CMD curl -sf http://127.0.0.1:7777/ >/dev/null || exit 1
+    CMD (curl -sf http://127.0.0.1:7777/ >/dev/null 2>&1 && \
+         test $(($(date +%s) - $(stat -c %Y /state/worker/speaking-alive 2>/dev/null || echo 0))) -lt 300 && \
+         test $(($(date +%s) - $(stat -c %Y /state/worker/thinking-alive 2>/dev/null || echo 0))) -lt 600) \
+        || exit 1
 
 ENTRYPOINT ["/init"]
 CMD ["/usr/local/bin/entrypoint.sh", "sleep", "infinity"]
