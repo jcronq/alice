@@ -42,6 +42,7 @@ caller's responsibility (Stage D wake prompt). The pipeline only:
 
 from __future__ import annotations
 
+import asyncio
 import datetime as _dt
 import json
 import pathlib
@@ -230,18 +231,34 @@ def run_dual_judge(
             retry_history.append(last_synthesis)
 
         last_synthesis = synthesis
-        last_qwen = judge_qwen_fn(
-            synthesis=synthesis,
-            source_a_text=source_a_text,
-            source_b_text=source_b_text,
-            prior_pair_synthesis=prior_pair_synthesis,
-        )
-        last_haiku = judge_haiku_fn(
-            synthesis=synthesis,
-            source_a_text=source_a_text,
-            source_b_text=source_b_text,
-            prior_pair_synthesis=prior_pair_synthesis,
-        )
+        # Run judges concurrently — independent backends (LAN llama-server,
+        # Anthropic cloud), no shared state. Preserves the
+        # independent-judgment invariant from
+        # [[2026-05-13-stage-d-dual-judge-investigation]]. Both
+        # ``judge_qwen_fn`` / ``judge_haiku_fn`` are sync callables, so we
+        # dispatch each through ``asyncio.to_thread`` and gather. Plain
+        # gather (no ``return_exceptions``) keeps the original semantics:
+        # a failure in either judge cancels the other and bubbles up to
+        # the outer fallback in ``commit_stage_d_synthesis``.
+        async def _run_judges() -> tuple[dict, dict]:
+            return await asyncio.gather(
+                asyncio.to_thread(
+                    judge_qwen_fn,
+                    synthesis=synthesis,
+                    source_a_text=source_a_text,
+                    source_b_text=source_b_text,
+                    prior_pair_synthesis=prior_pair_synthesis,
+                ),
+                asyncio.to_thread(
+                    judge_haiku_fn,
+                    synthesis=synthesis,
+                    source_a_text=source_a_text,
+                    source_b_text=source_b_text,
+                    prior_pair_synthesis=prior_pair_synthesis,
+                ),
+            )
+
+        last_qwen, last_haiku = asyncio.run(_run_judges())
 
         qwen_decision = last_qwen.get("decision")
         haiku_decision = last_haiku.get("decision")
