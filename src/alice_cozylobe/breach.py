@@ -307,7 +307,6 @@ def classify_trail(
     if not lookback or lookback[-1].timestamp != current.timestamp or lookback[-1].entity_id != current.entity_id:
         lookback = lookback + [current]
 
-    distinct_sensors = {e.entity_id for e in lookback if e.entity_id}
     distinct_rooms = {e.room_id for e in lookback if e.room_id}
 
     # --- Case 1: trail traces back to ingress -------------------------

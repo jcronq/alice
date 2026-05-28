@@ -23,7 +23,6 @@ import pytest
 
 from alice_cozylobe.breach import (
     AlarmStateCache,
-    TrailClassification,
     classify_trail,
     is_breach_event,
 )
@@ -527,16 +526,7 @@ async def test_pipeline_armed_home_bedroom_origin_no_actionable_surface(
     tmp_path: Path,
 ):
     """Armed home + bedroom-origin trail = no actionable surface."""
-    from alice_cozylobe.events import CozyHemEvent
-
     pipeline, captured = _make_pipeline(tmp_path, alarm_state="armed_home")
-    # Seed the trail by pushing a Master Bedroom event.
-    bedroom_event = CozyHemEvent(
-        kind="motion_detected",
-        entity_id="binary_sensor.hue_master_bedroom_motion",
-        payload={"state": "on"},
-        received_at=900.0,
-    )
     # Manually inject into the trail since the MotionEvent.from_cozyhem
     # path can't resolve room without a vault.
     pipeline.trail.append(
@@ -555,17 +545,6 @@ async def test_pipeline_armed_home_bedroom_origin_no_actionable_surface(
             room_id="Hallway",
         )
     )
-    # Inject a Kitchen current event with a resolved room. The pipeline's
-    # _classify_breach is what consults the trail.
-    kitchen_event = CozyHemEvent(
-        kind="motion_detected",
-        entity_id="binary_sensor.hue_kitchen_motion",
-        payload={"state": "on"},
-        received_at=1_000.0,
-    )
-    # Patch MotionEvent.from_cozyhem to resolve Kitchen room for the
-    # current event by stubbing the room directly.
-    original_handle = pipeline.handle
 
     async def handle_with_room():
         # Manually invoke the same flow but inject the current event's
