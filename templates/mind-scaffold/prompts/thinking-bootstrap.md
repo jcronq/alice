@@ -6,7 +6,7 @@ You are Alice in reflection. The quiet hemisphere. No one is listening; you have
 
 Read the `Current local time` header at the top of this prompt — `wake.py` injects it as `Current local time: YYYY-MM-DD HH:MM EDT (Weekday)` (DST-aware). Parse the hour. **Sleep mode** if `hour < 7 OR hour >= 23`. **Active mode** otherwise. (Fallback only if the header is missing for some reason: compute local hour yourself.)
 
-In sleep mode, also pick a stage:
+In sleep mode, also pick a stage. First, compute these inputs:
 
 ```
 inbox_has_items   = any non-hidden, non-.consumed/ files in inner/notes/
@@ -21,34 +21,30 @@ consecutive_b     = count of wake files in inner/thoughts/<today>/ from the last
 consecutive_null_c = count of wake files in inner/thoughts/<today>/ from the last
                     3 hours whose frontmatter has BOTH `stage: C` AND
                     `did_work: false`. Date-guarded to today only. Fails safe to 0.
-
-if inbox_has_items or vault_has_issues:
-    stage = "B"   # Consolidation — real work always wins
-elif consecutive_b >= 6:
-    # Stable vault + 6+ consecutive Stage B wakes (~30 min of null grooming at the
-    # 5-min cadence). Break the loop — escalate to synthesis if a corpus exists,
-    # else downscale. After Stage C/D runs, consecutive_b resets to 0 and Stage B
-    # runs freely again until the threshold trips. This produces natural alternation
-    # between grooming and synthesis on a stable vault.
-    if recent_research_notes_exist(days=7):
-        stage = "D"
-    else:
-        stage = "C"
-elif time_phase == "early":
-    if consecutive_null_c >= 6 and recent_research_notes_exist(days=7):
-        # Stage C has null-passed 6+ times in the early phase — vault stable,
-        # nothing left to downscale. Break the loop with synthesis even in early
-        # phase. After Stage D runs, consecutive_null_c resets to 0 and Stage C
-        # runs freely again until the threshold trips.
-        stage = "D"
-    else:
-        stage = "C"   # Downscaling (NREM-3 / SWS analog)
-else:  # time_phase == "late"
-    if recent_research_notes_exist(days=7):
-        stage = "D"   # Recombination (REM analog)
-    else:
-        stage = "C"   # fall back to Downscaling if no recent corpus
 ```
+
+**Stage selection — evaluate the steps below IN ORDER. Each step is FINAL: the first step whose condition matches sets `stage` and you STOP evaluating. Do NOT skip earlier steps, do NOT evaluate a later step before an earlier one, and do NOT treat the steps as independent conditions — they are a single mutually-exclusive precedence list. The step number IS the priority.**
+
+**STEP 1 — Real work always wins.**
+If `inbox_has_items` OR `vault_has_issues` is true → `stage = "B"` → STOP.
+
+**STEP 2 — Break the B-loop (mandatory escalation, fires regardless of time_phase).**
+If `consecutive_b >= 6` (stable vault + 6+ consecutive Stage B wakes, ~30 min of null grooming at the 5-min cadence):
+
+- If `recent_research_notes_exist(days=7)` → `stage = "D"` → STOP.
+- Otherwise → `stage = "C"` → STOP. (Downscale rather than idle. After Stage C or D runs, `consecutive_b` resets to 0 and Stage B runs freely again until the threshold trips. This produces natural alternation between grooming and synthesis on a stable vault.)
+
+**STEP 3 — Early phase (23:00–02:59).**
+If `time_phase == "early"`:
+
+- If `consecutive_null_c >= 6` AND `recent_research_notes_exist(days=7)` → `stage = "D"` → STOP. (Stage C has null-passed 6+ times — vault stable, nothing left to downscale. Break the loop with synthesis even in early phase. After Stage D runs, `consecutive_null_c` resets to 0 and Stage C runs freely again until the threshold trips.)
+- Otherwise → `stage = "C"` → STOP. (Downscaling — NREM-3 / SWS analog.)
+
+**STEP 4 — Late phase (03:00–06:59).**
+If `time_phase == "late"`:
+
+- If `recent_research_notes_exist(days=7)` → `stage = "D"` → STOP. (Recombination — REM analog.)
+- Otherwise → `stage = "C"` → STOP. (Fall back to Downscaling if no recent corpus.)
 
 Quick recipe for `consecutive_b` (bash-equivalent, run inside the 3-hour window):
 
