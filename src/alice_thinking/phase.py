@@ -371,8 +371,27 @@ def _consecutive_stage_count(
     )
 
 
-def _stage_d_cap_exhausted(state_dir: pathlib.Path, *, today: str, cap: int) -> bool:
-    p = state_dir / f"stage-d-pairs-{today}.jsonl"
+def _pairs_log_path(mind: pathlib.Path, today: str) -> pathlib.Path:
+    """Path to the Stage D pairs log for ``today`` under ``mind``.
+
+    Single source of truth for the reader side. Must agree with the
+    writer (:func:`alice_thinking.stage_d_pipeline._today_pairs_log_path`)
+    and with the cap-gate citations in the LLM prompts
+    (``sleep-d.md``, ``wake.active.md.j2``, ``thinking-bootstrap.md``)
+    which all target ``~/alice-mind/inner/state/stage-d-pairs-{today}.jsonl``.
+
+    Issue #433: before this helper, the readers resolved against
+    ``state_dir`` (default ``/state/worker``) — a directory the writer
+    has never used — so :func:`_stage_d_cap_exhausted` silently
+    returned ``False`` on every wake and :func:`_hours_since_last_d`
+    silently returned ``inf``. Empirical check (2026-05-28): 0 files
+    under ``/state/worker/``, 28 under ``~/alice-mind/inner/state/``.
+    """
+    return mind / "inner" / "state" / f"stage-d-pairs-{today}.jsonl"
+
+
+def _stage_d_cap_exhausted(mind: pathlib.Path, *, today: str, cap: int) -> bool:
+    p = _pairs_log_path(mind, today)
     if not p.is_file():
         return False
     syntheses = 0
@@ -395,7 +414,7 @@ def _stage_d_cap_exhausted(state_dir: pathlib.Path, *, today: str, cap: int) -> 
 
 
 def _hours_since_last_d(
-    state_dir: pathlib.Path,
+    mind: pathlib.Path,
     *,
     now: _dt.datetime,
 ) -> float:
@@ -414,7 +433,7 @@ def _hours_since_last_d(
 
     for days_back in (0, 1):
         date_str = (now.date() - _dt.timedelta(days=days_back)).isoformat()
-        pairs_file = state_dir / f"stage-d-pairs-{date_str}.jsonl"
+        pairs_file = _pairs_log_path(mind, date_str)
         if not pairs_file.is_file():
             continue
         try:
@@ -587,9 +606,9 @@ def build_vault_snapshot(
             mind, stage="C", require_did_work_false=True, now=now
         ),
         stage_d_cap_exhausted=_stage_d_cap_exhausted(
-            state_dir, today=today, cap=cfg.stage_d_nightly_cap
+            mind, today=today, cap=cfg.stage_d_nightly_cap
         ),
-        hours_since_last_d=_hours_since_last_d(state_dir, now=now),
+        hours_since_last_d=_hours_since_last_d(mind, now=now),
         vault_dir_mtime=_vault_dir_mtime(mind),
         state_dir=state_dir,
         today=today,

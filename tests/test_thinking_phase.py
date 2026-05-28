@@ -25,6 +25,8 @@ from alice_thinking.phase import (
     VaultSnapshot,
     _hours_since_last_c,
     _hours_since_last_d,
+    _pairs_log_path,
+    _stage_d_cap_exhausted,
     build_vault_snapshot,
     detect_commission_notes,
     detect_conflict_notes,
@@ -689,15 +691,28 @@ def test_hours_since_last_d_returns_inf_when_no_file(
     assert _hours_since_last_d(tmp_path, now=_utc(2026, 5, 24, 12)) == float("inf")
 
 
+def _seed_pairs(mind: pathlib.Path, date_str: str, body: str) -> None:
+    """Seed ``<mind>/inner/state/stage-d-pairs-{date_str}.jsonl``.
+
+    Issue #433: readers now resolve the pairs log from ``mind`` (not
+    ``state_dir``) — tests have to drop the file under
+    ``<mind>/inner/state/`` to match the writer.
+    """
+    state = mind / "inner" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / f"stage-d-pairs-{date_str}.jsonl").write_text(body)
+
+
 def test_hours_since_last_d_returns_inf_when_no_synthesis(
     tmp_path: pathlib.Path,
 ) -> None:
     """File exists but no record carries a non-empty synthesis →
     no completed D wake → infinity."""
-    today = "2026-05-24"
-    (tmp_path / f"stage-d-pairs-{today}.jsonl").write_text(
+    _seed_pairs(
+        tmp_path,
+        "2026-05-24",
         '{"ts": "2026-05-24T03:00:00Z", "synthesis": ""}\n'
-        '{"ts": "2026-05-24T05:00:00Z", "synthesis": null}\n'
+        '{"ts": "2026-05-24T05:00:00Z", "synthesis": null}\n',
     )
     assert _hours_since_last_d(tmp_path, now=_utc(2026, 5, 24, 12)) == float("inf")
 
@@ -706,9 +721,10 @@ def test_hours_since_last_d_computes_delta_for_completed_d_wake(
     tmp_path: pathlib.Path,
 ) -> None:
     """One completed D wake 6 hours before `now` → 6.0."""
-    today = "2026-05-24"
-    (tmp_path / f"stage-d-pairs-{today}.jsonl").write_text(
-        '{"ts": "2026-05-24T03:00:00Z", "synthesis": "synth note"}\n'
+    _seed_pairs(
+        tmp_path,
+        "2026-05-24",
+        '{"ts": "2026-05-24T03:00:00Z", "synthesis": "synth note"}\n',
     )
     result = _hours_since_last_d(tmp_path, now=_utc(2026, 5, 24, 9))
     assert result == pytest.approx(6.0)
@@ -718,11 +734,12 @@ def test_hours_since_last_d_picks_most_recent_synthesis(
     tmp_path: pathlib.Path,
 ) -> None:
     """Multiple synthesis records → use the latest timestamp."""
-    today = "2026-05-24"
-    (tmp_path / f"stage-d-pairs-{today}.jsonl").write_text(
+    _seed_pairs(
+        tmp_path,
+        "2026-05-24",
         '{"ts": "2026-05-24T01:00:00Z", "synthesis": "first"}\n'
         '{"ts": "2026-05-24T07:00:00Z", "synthesis": "latest"}\n'
-        '{"ts": "2026-05-24T04:00:00Z", "synthesis": "middle"}\n'
+        '{"ts": "2026-05-24T04:00:00Z", "synthesis": "middle"}\n',
     )
     result = _hours_since_last_d(tmp_path, now=_utc(2026, 5, 24, 10))
     assert result == pytest.approx(3.0)
@@ -733,9 +750,10 @@ def test_hours_since_last_d_scans_yesterday_file(
 ) -> None:
     """Yesterday's pairs file is also scanned so a late-night D wake
     is found when `now` rolls past midnight."""
-    yesterday = "2026-05-23"
-    (tmp_path / f"stage-d-pairs-{yesterday}.jsonl").write_text(
-        '{"ts": "2026-05-23T23:00:00Z", "synthesis": "late night D"}\n'
+    _seed_pairs(
+        tmp_path,
+        "2026-05-23",
+        '{"ts": "2026-05-23T23:00:00Z", "synthesis": "late night D"}\n',
     )
     # now = 2026-05-24 02:00 UTC → 3h since the 23:00 UTC synthesis.
     result = _hours_since_last_d(tmp_path, now=_utc(2026, 5, 24, 2))
@@ -747,14 +765,15 @@ def test_hours_since_last_d_ignores_malformed_lines(
 ) -> None:
     """Malformed JSON, missing ts, and blank lines all skipped without
     crashing. The one valid synthesis record drives the result."""
-    today = "2026-05-24"
-    (tmp_path / f"stage-d-pairs-{today}.jsonl").write_text(
+    _seed_pairs(
+        tmp_path,
+        "2026-05-24",
         "\n"
         "{not valid json\n"
         '{"synthesis": "no ts field"}\n'
         '{"ts": "not-a-timestamp", "synthesis": "bad ts"}\n'
         '{"ts": "2026-05-24T06:00:00Z", "synthesis": "valid"}\n'
-        "   \n"
+        "   \n",
     )
     result = _hours_since_last_d(tmp_path, now=_utc(2026, 5, 24, 10))
     assert result == pytest.approx(4.0)
@@ -766,9 +785,10 @@ def test_hours_since_last_d_handles_local_time_now(
     """UTC/local off-by-N-hours protection: when `now` is tz-aware
     local (e.g. EDT, UTC-4), the helper normalizes both ends to UTC
     so the delta is correct."""
-    today = "2026-05-24"
-    (tmp_path / f"stage-d-pairs-{today}.jsonl").write_text(
-        '{"ts": "2026-05-24T03:00:00Z", "synthesis": "synth"}\n'
+    _seed_pairs(
+        tmp_path,
+        "2026-05-24",
+        '{"ts": "2026-05-24T03:00:00Z", "synthesis": "synth"}\n',
     )
     # 2026-05-24 05:00 EDT == 2026-05-24 09:00 UTC. 6h elapsed since
     # the 03:00 UTC synthesis — NOT 2h (the bug if we forget to
@@ -776,6 +796,88 @@ def test_hours_since_last_d_handles_local_time_now(
     edt = _dt.timezone(_dt.timedelta(hours=-4))
     now_local = _dt.datetime(2026, 5, 24, 5, 0, tzinfo=edt)
     result = _hours_since_last_d(tmp_path, now=now_local)
+    assert result == pytest.approx(6.0)
+
+
+# ---------------------------------------------------------------------------
+# Issue #433 regression — pairs log path resolves under mind, not state_dir
+# ---------------------------------------------------------------------------
+
+
+def test_pairs_log_path_resolves_under_mind(tmp_path: pathlib.Path) -> None:
+    """``_pairs_log_path`` agrees with the writer + LLM prompts:
+    ``<mind>/inner/state/stage-d-pairs-{today}.jsonl``."""
+    today = "2026-05-28"
+    path = _pairs_log_path(tmp_path, today)
+    assert path == tmp_path / "inner" / "state" / f"stage-d-pairs-{today}.jsonl"
+
+
+def test_stage_d_cap_exhausted_reads_from_mind_inner_state(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Reader resolves the pairs log under ``<mind>/inner/state/`` —
+    the same dir the writer (stage_d_pipeline._today_pairs_log_path)
+    actually writes to. cap=3, three synthesis lines → exhausted."""
+    today = "2026-05-28"
+    _seed_pairs(
+        tmp_path,
+        today,
+        '{"ts": "2026-05-28T01:00:00Z", "synthesis": "a"}\n'
+        '{"ts": "2026-05-28T02:00:00Z", "synthesis": "b"}\n'
+        '{"ts": "2026-05-28T03:00:00Z", "synthesis": "c"}\n',
+    )
+    assert _stage_d_cap_exhausted(tmp_path, today=today, cap=3) is True
+
+
+def test_stage_d_cap_exhausted_under_cap_returns_false(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Two synthesis lines below cap=3 → not exhausted."""
+    today = "2026-05-28"
+    _seed_pairs(
+        tmp_path,
+        today,
+        '{"ts": "2026-05-28T01:00:00Z", "synthesis": "a"}\n'
+        '{"ts": "2026-05-28T02:00:00Z", "synthesis": "b"}\n',
+    )
+    assert _stage_d_cap_exhausted(tmp_path, today=today, cap=3) is False
+
+
+def test_stage_d_cap_exhausted_ignores_state_dir_dropped_file(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Regression for #433: a pairs file dropped under the OLD location
+    (a separate ``state_dir`` sibling) is invisible to the reader.
+
+    Confirms the path resolution is anchored on ``mind``, not on any
+    leftover ``state_dir``. If the reader regresses to ``state_dir``,
+    this test will start returning ``True`` instead of ``False``.
+    """
+    today = "2026-05-28"
+    mind = tmp_path / "mind"
+    mind.mkdir()
+    legacy_state = tmp_path / "state"
+    legacy_state.mkdir()
+    (legacy_state / f"stage-d-pairs-{today}.jsonl").write_text(
+        '{"ts": "2026-05-28T01:00:00Z", "synthesis": "a"}\n'
+        '{"ts": "2026-05-28T02:00:00Z", "synthesis": "b"}\n'
+        '{"ts": "2026-05-28T03:00:00Z", "synthesis": "c"}\n'
+    )
+    assert _stage_d_cap_exhausted(mind, today=today, cap=3) is False
+
+
+def test_hours_since_last_d_reads_from_mind_inner_state(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Companion to the cap-exhausted test: the hours-since helper
+    also resolves under ``<mind>/inner/state/``."""
+    today = "2026-05-28"
+    _seed_pairs(
+        tmp_path,
+        today,
+        '{"ts": "2026-05-28T03:00:00Z", "synthesis": "synth"}\n',
+    )
+    result = _hours_since_last_d(tmp_path, now=_utc(2026, 5, 28, 9))
     assert result == pytest.approx(6.0)
 
 
@@ -912,8 +1014,12 @@ def test_build_vault_snapshot_detects_stage_d_cap_exhaustion(
 ) -> None:
     state_dir = tmp_path / "state"
     state_dir.mkdir(parents=True)
+    # Pairs log resolves under mind/inner/state/ now (#433), not the
+    # legacy /state/worker dir that ``state_dir`` defaults to.
+    pairs_dir = tmp_path / "inner" / "state"
+    pairs_dir.mkdir(parents=True)
     today = _now().date().isoformat()
-    pairs = state_dir / f"stage-d-pairs-{today}.jsonl"
+    pairs = pairs_dir / f"stage-d-pairs-{today}.jsonl"
     pairs.write_text(
         "\n".join(f'{{"ts": "x", "synthesis": "s{i}"}}' for i in range(STAGE_D_NIGHTLY_CAP)) + "\n"
     )
