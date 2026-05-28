@@ -570,12 +570,73 @@ def test_kernel_spec_model_from_model_yml(cfg, monkeypatch, tmp_path) -> None:
 
 def test_falls_back_to_alice_config_when_model_yml_absent(cfg, monkeypatch) -> None:
     """No ``model.yml`` → daemon falls back to ``alice.config.json``'s
-    ``speaking.model`` (today's behaviour)."""
+    ``speaking.model`` (today's behaviour).
+
+    The env-aware default added for issue #427 picks api when any
+    ``ANTHROPIC_*`` or ``CLAUDE_CODE_OAUTH_TOKEN`` is set in the
+    process env (CI runners typically have one). This test pins the
+    no-creds fallback path, so wipe those vars first.
+    """
+    for var in (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ):
+        monkeypatch.delenv(var, raising=False)
     d = _make_daemon(cfg, monkeypatch)
     assert d._model_config.speaking.backend == "subscription"
     assert d._model_config.speaking.model == ""
     # build_kernel_model picks up the legacy field.
     assert d.turn_runner._model == cfg.speaking.get("model")
+
+
+def test_env_aware_default_picks_api_when_api_key_set(cfg, monkeypatch) -> None:
+    """Issue #427: with ``ANTHROPIC_API_KEY`` in env and no
+    ``model.yml`` on disk, the env-aware default lands on api so a
+    fresh mind wired against a LiteLLM proxy doesn't get its
+    ``ANTHROPIC_*`` vars wiped by subscription-mode auth setup."""
+    for var in (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "key-abc")
+    d = _make_daemon(cfg, monkeypatch)
+    assert d._model_config.speaking.backend == "api"
+
+
+def test_env_aware_default_picks_subscription_when_only_oauth_set(
+    cfg, monkeypatch
+) -> None:
+    """Issue #427: ``CLAUDE_CODE_OAUTH_TOKEN`` alone in env (no
+    ``ANTHROPIC_*``) → subscription default."""
+    for var in (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-test-fake")
+    d = _make_daemon(cfg, monkeypatch)
+    assert d._model_config.speaking.backend == "subscription"
+
+
+def test_env_aware_default_picks_subscription_when_nothing_set(
+    cfg, monkeypatch
+) -> None:
+    """Issue #427: no creds anywhere → subscription default (the SDK's
+    ``~/.claude/.credentials.json`` fallback path is preserved)."""
+    for var in (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    d = _make_daemon(cfg, monkeypatch)
+    assert d._model_config.speaking.backend == "subscription"
 
 
 def test_kernel_spec_includes_personae_system_prompt(cfg, monkeypatch) -> None:

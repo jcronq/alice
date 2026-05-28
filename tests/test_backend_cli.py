@@ -9,7 +9,20 @@ from contextlib import redirect_stdout
 from core.config.cli import main as backend_cli
 
 
-def test_show_handles_missing_model_yml(tmp_path: pathlib.Path) -> None:
+def test_show_handles_missing_model_yml(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    """No ``model.yml`` and no ANTHROPIC_* in env → subscription
+    default. The env-aware default added for issue #427 picks api
+    when ANTHROPIC_* is present, so wipe those vars first to pin
+    the no-creds fallback path."""
+    for var in (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ):
+        monkeypatch.delenv(var, raising=False)
     buf = io.StringIO()
     with redirect_stdout(buf):
         rc = backend_cli(["--mind", str(tmp_path), "show"])
