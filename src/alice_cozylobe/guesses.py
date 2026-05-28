@@ -593,19 +593,33 @@ def expire_overdue_guesses(vault_root: Path, now: datetime) -> int:
 
 
 def surface_threshold(
-    guess: Guess, *, unexpected: bool = False
+    guess: Guess,
+    *,
+    unexpected: bool = False,
+    breach_actionable: Optional[bool] = None,
 ) -> Literal["silent", "log", "actionable"]:
-    """Map a guess + unexpected-event flag to a surface tier.
+    """Map a guess + breach-classification to a surface tier.
 
-    Design §4.5:
+    Two modes:
 
-    * ``silent`` — confidence < 0.3 OR no actionable inference (no
-      room → no actionable handle). Just write the observation note.
-    * ``log`` — 0.3 ≤ confidence < 0.7, or anything routine. Note
-      goes out; thinking promotes to the daily on drain.
-    * ``actionable`` — confidence ≥ 0.7 AND ``unexpected`` (security-
-      class, novel pattern). Cozylobe additionally drops a surface
-      file into ``inner/surface/`` for the speaking daemon.
+    * **New (trail-based breach classifier).** When ``breach_actionable``
+      is non-None, it is the source of truth for the actionable
+      decision — caller is the motion pipeline with the
+      trail-shape + alarm-state classifier wired. ``True`` →
+      actionable (subject to the no-actionable-handle filter below);
+      ``False`` → log or silent based on confidence only. The
+      ``unexpected`` flag is ignored in this mode.
+    * **Legacy (Phase 2/3 fallback).** When ``breach_actionable`` is
+      ``None``, the old "high confidence AND ``unexpected``" gate
+      decides. Preserves Phase 2/3 test fixtures.
+
+    Filters that apply in both modes:
+
+    * ``silent`` when neither ``guess.room`` nor
+      ``guess.next_room_hypothesis`` is set — there is nothing for the
+      speaking daemon to act on.
+    * ``silent`` when confidence is below
+      :data:`SURFACE_SILENT_MAX` (0.3) — too uncertain to surface.
 
     Pure function so callers can dry-run the decision in tests.
     """
@@ -615,6 +629,12 @@ def surface_threshold(
         return "silent"
     if conf < SURFACE_SILENT_MAX:
         return "silent"
+    if breach_actionable is not None:
+        # New trail-based path. The breach classifier is the source
+        # of truth — confidence still has to clear the silent floor
+        # (handled above), but the actionable gate is the breach
+        # decision, not the legacy unexpected/confidence pair.
+        return "actionable" if breach_actionable else "log"
     if conf >= SURFACE_ACTIONABLE_MIN and unexpected:
         return "actionable"
     return "log"

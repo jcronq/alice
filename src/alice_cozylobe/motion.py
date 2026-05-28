@@ -55,6 +55,7 @@ from .surfaces import (
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard
     from .adjacency import AdjacencyInferrer
+    from .breach import AlarmStateCache, TrailClassification
     from .guesses import Guess, GuessLifecycle
     from cozylobe_cortex.classify import ClassificationResult
 
@@ -864,6 +865,10 @@ class MotionPipeline:
             Callable[[Path, Optional[str], str, str, datetime], object]
         ] = None,
         subgraph_hops: int = DEFAULT_SUBGRAPH_HOPS,
+        breach_cache: Optional["AlarmStateCache"] = None,
+        breach_classify_fn: Optional[
+            Callable[..., "TrailClassification"]
+        ] = None,
     ) -> None:
         self._qwen = qwen_client
         self._vault = vault
@@ -907,6 +912,19 @@ class MotionPipeline:
         self._adjacency_inferrer = adjacency_inferrer
         self._record_trajectory_fn = record_trajectory_fn
         self._subgraph_hops = subgraph_hops
+        # Breach-classifier wiring. ``breach_cache`` polls the HA alarm
+        # state; ``breach_classify_fn`` runs the trail-shape rules.
+        # Both default to None — when either is missing, the pipeline
+        # falls back to the legacy "security == unexpected" tier
+        # decision and the surfaced-on-every-night-event bug stays
+        # latent (which is what the Phase 2 tests still exercise).
+        # Production wiring in ``daemon.py`` sets both.
+        self._breach_cache = breach_cache
+        self._breach_classify_fn = breach_classify_fn
+        # Tracks the most recent trail classification so
+        # ``_classify_surface_tier`` and ``_emit_actionable_surface``
+        # can read a consistent decision without re-running the rules.
+        self._latest_breach: Optional["TrailClassification"] = None
         # Lock-free single-consumer use: the wake loop drains one
         # event at a time on one asyncio task.
 
@@ -995,8 +1013,29 @@ class MotionPipeline:
                     exc,
                 )
 
-        if self._is_security_class(motion):
-            await self._classify_and_write([motion], security=True)
+        # New (issue: trail-based breach classifier): the actionable
+        # decision is no longer driven by UTC night-hours OR the
+        # ``unknown person`` fallback. We compute the trail-shape
+        # classification here, gate it on the HA alarm state, and stash
+        # the result so ``_classify_surface_tier`` can read it without
+        # re-running the rules. ``classification.actionable`` is the
+        # one bit downstream code consults.
+        self._latest_breach = self._classify_breach(motion)
+        breach_actionable = (
+            self._latest_breach is not None
+            and self._latest_breach.actionable
+        )
+
+        # Legacy security predicate (UTC night-hours) is kept as the
+        # bypass-queue trigger for backward compatibility with the
+        # existing test fixtures — bypassing the 30s coalesce window
+        # for nighttime motion still has value even when the
+        # actionable decision now lives elsewhere. A real breach
+        # (actionable=True from the trail classifier) ALSO bypasses
+        # the queue so the surface lands within seconds.
+        legacy_security = self._is_security_class(motion)
+        if breach_actionable or legacy_security:
+            await self._classify_and_write([motion], security=legacy_security)
             return
 
         self._queue.add(motion)
@@ -1019,6 +1058,69 @@ class MotionPipeline:
         if self._security_predicate is not None:
             return self._security_predicate(motion)
         return is_security_class(motion, localtime=self._localtime)
+
+    def _classify_breach(
+        self, motion: MotionEvent
+    ) -> Optional["TrailClassification"]:
+        """Run the trail-based breach classifier for ``motion``.
+
+        Returns the :class:`TrailClassification` so callers see the
+        case + reason for logging, or ``None`` when no breach
+        classifier is wired (legacy Phase 2/3 callers — preserves
+        their behaviour).
+
+        Fail-open: any exception during alarm-state polling or trail
+        evaluation logs a warning and returns ``None``. The motion
+        pipeline must not go down because the breach detector hit a
+        rough patch.
+        """
+        if self._breach_cache is None and self._breach_classify_fn is None:
+            return None
+        try:
+            from .breach import is_breach_event
+
+            alarm_state = (
+                self._breach_cache.maybe_poll()
+                if self._breach_cache is not None
+                else "unknown"
+            )
+            adjacency = self._build_adjacency_map()
+            classifier = self._breach_classify_fn or is_breach_event
+            return classifier(
+                motion,
+                self._trail.snapshot(),
+                alarm_state=alarm_state,
+                adjacency=adjacency,
+            )
+        except Exception as exc:  # noqa: BLE001 - fail-open
+            log.warning(
+                "cozylobe motion: breach classifier raised: %s", exc
+            )
+            return None
+
+    def _build_adjacency_map(self) -> Optional[dict[str, set[str]]]:
+        """Build a ``room → {adjacent rooms}`` map from the loaded vault.
+
+        Returns ``None`` when no vault is configured — the breach
+        classifier degrades to a timing-only chain walk in that case.
+        The map is recomputed on every call because the vault's
+        ``adjacent`` field can be mutated by the adjacency inferrer
+        (Phase 4); caching this would mean missing newly-promoted
+        inferred edges.
+        """
+        if self._vault is None:
+            return None
+        adjacency: dict[str, set[str]] = {}
+        for room in self._vault.rooms.values():
+            neighbors: set[str] = set()
+            for adj in room.adjacent:
+                # Strip the ``rooms/`` category prefix the vault
+                # carries on wikilink targets.
+                title = adj.split("/", 1)[-1] if "/" in adj else adj
+                neighbors.add(title)
+            if neighbors:
+                adjacency[room.title] = neighbors
+        return adjacency
 
     def _current_hour(self) -> Optional[int]:
         """Return the local hour-of-day (0..23) for the people-prior
@@ -1329,17 +1431,30 @@ class MotionPipeline:
     ) -> str:
         """Pick the surface tier for this inference.
 
-        Uses :func:`surface_threshold` with ``unexpected=security`` —
-        Phase 2's security heuristic (motion in the nighttime window)
-        is the closest stand-in for the design's "unexpected event"
-        flag until Phase 4 ships the novel-pattern detector. Falls
-        back to the legacy "log" tier when no guess was emitted so
-        existing Phase 2 tests (no vault_root) keep their tag shape.
+        Source of truth for the actionable decision:
+
+        * When the trail-based breach classifier is wired and produced
+          a result on the current event, the breach classifier's
+          ``actionable`` field decides. This is the new path that
+          replaces the buggy ``person=unknown AND security`` trigger.
+        * Otherwise (legacy callers without breach wiring), fall back
+          to :func:`surface_threshold` with ``unexpected=security`` —
+          preserves the Phase 2/3 test fixtures' behaviour.
+
+        Falls back to the legacy "log" tier when no guess was emitted
+        so existing Phase 2 tests (no vault_root) keep their tag shape.
         """
         if guess is None:
             return "log"
         from .guesses import surface_threshold
 
+        # New path: breach classifier present + ran on this event.
+        if self._latest_breach is not None:
+            return surface_threshold(
+                guess, breach_actionable=self._latest_breach.actionable
+            )
+        # Legacy path: no breach classifier wired. Use the old
+        # security-as-unexpected gate.
         return surface_threshold(guess, unexpected=security)
 
     def _emit_actionable_surface(
@@ -1369,6 +1484,13 @@ class MotionPipeline:
             f"- confidence: {guess.confidence:.2f}",
             f"- security-class: {'yes' if security else 'no'}",
         ]
+        if self._latest_breach is not None:
+            body_lines.append(
+                f"- breach-case: {self._latest_breach.case}"
+            )
+            body_lines.append(
+                f"- breach-reason: {self._latest_breach.reason}"
+            )
         if guess.next_room_hypothesis:
             body_lines.append(
                 f"- next-room hypothesis: {guess.next_room_hypothesis}"
@@ -1384,6 +1506,9 @@ class MotionPipeline:
             "room": guess.room or "unknown",
             "security": "true" if security else "false",
         }
+        if self._latest_breach is not None:
+            extra["breach_case"] = self._latest_breach.case
+            extra["breach_reason"] = self._latest_breach.reason
         try:
             self._write_surface(
                 body,

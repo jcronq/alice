@@ -29,6 +29,7 @@ from .activity_fetcher import (
     ActivityFetcher,
 )
 from .adjacency import AdjacencyInferrer
+from .breach import AlarmStateCache
 from .cortex import DEFAULT_VAULT_ROOT, load_vault
 from .event_log import DEFAULT_EVENT_LOG_ROOT, SseEventLogger
 from .guesses import GuessLifecycle
@@ -187,12 +188,20 @@ class CozylobeDaemon:
             vault=cortex_vault,
             window_s=throttle.config.adjacency_inference_window_s,
         )
+        # New trail-based breach classifier (replaces the always-on
+        # nighttime actionable trigger that fired five false positives
+        # overnight 2026-05-27→28). The cache polls HA every 60s for
+        # the alarm-control-panel state; the motion pipeline consults
+        # it on every event and runs the four-case trail-shape
+        # classifier. See ``breach.py`` for the rules.
+        breach_cache = AlarmStateCache()
         motion_pipeline = MotionPipeline(
             qwen_client=qwen,
             vault=cortex_vault,
             vault_root=self._cozylobe_cortex_root,
             lifecycle=guess_lifecycle,
             adjacency_inferrer=adjacency_inferrer,
+            breach_cache=breach_cache,
         )
 
         # Issue #401: raw-event JSONL logger for the NN training corpus.
