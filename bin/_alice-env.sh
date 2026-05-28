@@ -36,6 +36,25 @@ export ALICE_REPO="${ALICE_REPO:-$ALICE_ROOT}"
 export ALICE_MIND="${ALICE_MIND:-$ALICE_ROOT/data/alice-mind}"
 export ALICE_TOOLS="${ALICE_TOOLS:-$ALICE_ROOT/data/alice-tools}"
 
+# WebSocket gateway transport (issue #430). Token-authenticated
+# WebSocket front for the CLI session protocol so off-host clients
+# (iOS app, browser tools) can talk to Alice without docker exec.
+# Disabled unless ALICE_WS_GATEWAY_TOKEN is set in alice.env. Pick a
+# strong shared secret — anything fronting it (Cloudflare Tunnel,
+# Tailscale, reverse proxy) terminates TLS, but the bearer is what
+# Alice actually checks at the upgrade.
+#
+# Example alice.env entries (uncommented to enable):
+#   # ALICE_WS_GATEWAY_TOKEN=<paste-a-long-random-secret-here>
+#   # ALICE_WS_GATEWAY_PORT=8765
+#   # ALICE_WS_GATEWAY_HOST=0.0.0.0
+#   # ALICE_WS_GATEWAY_PATH=/cli
+#
+# Once set, `bin/alice-up` reports the gateway state in its startup
+# banner; the daemon binds at ALICE_WS_GATEWAY_PORT on the configured
+# host inside the container and docker-compose publishes the same
+# port to the host.
+
 # Name of the single sandbox container. Matches `container_name:` in
 # sandbox/docker-compose.yml. Single-container shape (EKS Phase 2,
 # #160) collapsed the legacy alice-daemon + alice-worker-{blue,green}

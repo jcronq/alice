@@ -193,6 +193,18 @@ class Config:
     viewer_chat_principal: str = "jason"
     viewer_chat_principal_display_name: str = "Jason"
 
+    # WebSocket gateway transport — optional. Token-authenticated TCP
+    # WebSocket listener that fronts a CLI-style session protocol so
+    # off-host clients (iOS app, browser tools, custom desktops) can
+    # talk to Alice without ``docker exec``. Defaults are "disabled
+    # unless an operator opts in by setting the bearer token env var" —
+    # binding without auth is refused. See alice_speaking.transports.ws.
+    ws_gateway_enabled: bool = False
+    ws_gateway_host: str = "0.0.0.0"
+    ws_gateway_port: int = 8765
+    ws_gateway_token_env: str = "ALICE_WS_GATEWAY_TOKEN"
+    ws_gateway_path: str = "/cli"
+
     # CozyHem event subscriber — optional. The speaking-side subscriber
     # opens a long-lived SSE connection to this URL and turns each frame
     # into a typed :class:`CozyHemEvent` for the dispatcher. Default
@@ -339,6 +351,39 @@ def load() -> Config:
         or "http://aimax1:8000/api/v1/events"
     ).strip()
 
+    # WebSocket gateway: opt-in via the token env var. Operator points
+    # the env var name they want via ``ALICE_WS_GATEWAY_TOKEN_ENV`` (rare
+    # — the default name is the documented one). The transport itself
+    # reads the actual secret out of ``os.environ`` at start time so
+    # rotation works without touching this config object.
+    ws_gateway_token_env = (
+        from_any("ALICE_WS_GATEWAY_TOKEN_ENV", "ALICE_WS_GATEWAY_TOKEN")
+        or "ALICE_WS_GATEWAY_TOKEN"
+    ).strip()
+    # Gateway is enabled iff the configured env var is set + non-empty.
+    # Operator turns it on by exporting ``ALICE_WS_GATEWAY_TOKEN=<secret>``
+    # — no second toggle to forget. ``ALICE_WS_GATEWAY_ENABLED`` is
+    # supported as an explicit kill-switch (set to ``0`` to force off
+    # even when the token is exported).
+    ws_token_value = (
+        os.environ.get(ws_gateway_token_env) or env.get(ws_gateway_token_env, "")
+    ).strip()
+    ws_gateway_kill_raw = (
+        from_any("ALICE_WS_GATEWAY_ENABLED", "1") or "1"
+    ).strip().lower()
+    ws_gateway_kill = ws_gateway_kill_raw in {"0", "false", "no", "off"}
+    ws_gateway_enabled = bool(ws_token_value) and not ws_gateway_kill
+    ws_gateway_host = (
+        from_any("ALICE_WS_GATEWAY_HOST", "0.0.0.0") or "0.0.0.0"
+    ).strip()
+    try:
+        ws_gateway_port = int(from_any("ALICE_WS_GATEWAY_PORT", "8765") or "8765")
+    except ValueError:
+        ws_gateway_port = 8765
+    ws_gateway_path = (from_any("ALICE_WS_GATEWAY_PATH", "/cli") or "/cli").strip()
+    if not ws_gateway_path.startswith("/"):
+        ws_gateway_path = "/" + ws_gateway_path
+
     a2a_enabled_raw = (from_any("ALICE_A2A_ENABLED", "0") or "0").strip().lower()
     a2a_enabled = a2a_enabled_raw in {"1", "true", "yes", "on"}
     try:
@@ -383,4 +428,9 @@ def load() -> Config:
         a2a_principal=a2a_principal,
         a2a_external_url=a2a_external_url,
         cozyhem_events_url=cozyhem_events_url,
+        ws_gateway_enabled=ws_gateway_enabled,
+        ws_gateway_host=ws_gateway_host,
+        ws_gateway_port=ws_gateway_port,
+        ws_gateway_token_env=ws_gateway_token_env,
+        ws_gateway_path=ws_gateway_path,
     )

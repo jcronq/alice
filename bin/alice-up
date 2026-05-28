@@ -36,12 +36,28 @@ mkdir -p \
     "$HOME/.local/state/alice" \
     "$HOME/.local/share/signal-cli"
 
+# Banner: which optional services are wired up this run. Read once so
+# we don't print a different state mid-run if alice.env is edited under
+# us. Stays under each service line so an operator can spot a misconfig
+# without grepping container logs.
+_print_banner() {
+    if [ -n "${ALICE_WS_GATEWAY_TOKEN:-}" ]; then
+        echo "alice-up: WS gateway listening on :${ALICE_WS_GATEWAY_PORT:-8765} (path ${ALICE_WS_GATEWAY_PATH:-/cli})"
+    fi
+    if [ -n "${DISCORD_BOT_TOKEN:-}" ]; then
+        echo "alice-up: discord transport enabled (bot token present)"
+    fi
+    if [ "${ALICE_A2A_ENABLED:-0}" = "1" ] || [ "${ALICE_A2A_ENABLED:-}" = "true" ]; then
+        echo "alice-up: A2A transport listening on :${ALICE_A2A_PORT:-7878}"
+    fi
+}
+
 # Is the container already up? Noop unless it's stuck unhealthy.
 state="$(docker inspect -f '{{.State.Status}}' "$ALICE_CONTAINER" 2>/dev/null || echo missing)"
 if [ "$state" = "running" ]; then
     health="$(docker inspect -f '{{.State.Health.Status}}' "$ALICE_CONTAINER" 2>/dev/null || echo none)"
     case "$health" in
-        healthy|starting|none) exit 0 ;;
+        healthy|starting|none) _print_banner; exit 0 ;;
     esac
 fi
 
@@ -63,7 +79,7 @@ for _ in $(seq 1 90); do
     if [ "$state" = "running" ]; then
         health="$(docker inspect -f '{{.State.Health.Status}}' "$ALICE_CONTAINER" 2>/dev/null || echo none)"
         case "$health" in
-            healthy) exit 0 ;;
+            healthy) _print_banner; exit 0 ;;
             unhealthy)
                 echo "alice-up: container $ALICE_CONTAINER reported unhealthy" >&2
                 exit 1

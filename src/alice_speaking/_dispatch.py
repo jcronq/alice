@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from .internal.background_task import BackgroundTaskCompleteEvent
     from .internal.cozyhem import CozyHemEvent
     from .internal.idle import IdleEvent
+    from .transports.ws import WSEvent
 
 
 log = logging.getLogger("alice_speaking._dispatch")
@@ -345,6 +346,97 @@ async def handle_cli(ctx: DaemonContext, event: "CLIEvent") -> None:
             "cli_turn_end",
             turn_id=turn_id,
             principal_id=msg.principal.native_id,
+            error=error,
+            duration_ms=int((time.time() - started) * 1000),
+        )
+
+
+# ---------------------------------------------------------------------------
+# WebSocket gateway turn — same wire vocabulary as CLI, off-host clients.
+
+
+async def handle_ws(ctx: DaemonContext, event: "WSEvent") -> None:
+    """Run one turn for a message arriving over the WebSocket gateway.
+
+    Mirrors :func:`handle_cli`: ephemeral channel (the WS connection
+    may have already closed by the time the turn finishes — the
+    transport's :meth:`signal_done` / :meth:`signal_error` handles
+    missing-connection cases by logging and dropping). The dispatch
+    path is identical except for the ``ws`` turn-kind label and the
+    ``ws_turn_*`` event names; everything downstream (kernel turn,
+    outbox routing, vault snapshot, turn log) treats it the same way.
+    """
+    assert ctx.ws_transport is not None
+    msg = event.message
+    # Idle tracking (issue #373) — see handle_signal note.
+    _touch_inbound(ctx, "ws", msg.principal.native_id)
+    turn_id = uuid.uuid4().hex[:12]
+    started = time.time()
+
+    ctx.events.emit(
+        "ws_turn_start",
+        turn_id=turn_id,
+        principal_id=msg.principal.native_id,
+        display_name=msg.principal.display_name,
+        channel=msg.origin.address,
+        inbound_chars=len(msg.text),
+        inbound=_short(msg.text, 600),
+    )
+
+    prev_kind = ctx._current_turn_kind
+    prev_channel = ctx._current_reply_channel
+    prev_display_name = ctx._current_principal_display_name
+    ctx._current_turn_kind = "ws"
+    ctx._current_reply_channel = msg.origin
+    ctx._current_principal_display_name = msg.principal.display_name
+    error: Optional[str] = None
+    try:
+        if ctx.ws_transport.caps.lifecycle_events:
+            with contextlib.suppress(Exception):
+                await ctx.ws_transport.push_lifecycle_event(
+                    msg.origin, {"type": "turn_start", "turn_id": turn_id}
+                )
+        now = datetime.datetime.now().astimezone()
+        stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
+        prompt = ctx.ws_transport.build_prompt(
+            principal_name=msg.principal.display_name,
+            stamp=stamp,
+            text=msg.text,
+        )
+        await ctx._run_turn(
+            prompt,
+            turn_id=turn_id,
+            outbound_recipient=f"ws:{msg.origin.address}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("ws turn failed for %s", msg.principal.display_name)
+        error = f"{type(exc).__name__}: {exc}"
+        with contextlib.suppress(Exception):
+            await ctx.ws_transport.signal_error(msg.origin, error)
+    finally:
+        if error is None:
+            with contextlib.suppress(Exception):
+                await ctx.ws_transport.signal_done(msg.origin)
+        ctx._current_turn_kind = prev_kind
+        ctx._current_reply_channel = prev_channel
+        ctx._current_principal_display_name = prev_display_name
+        vault_context, vault_candidates = _vault_snapshot(ctx)
+        ctx.turns.append(
+            new_turn(
+                sender_number=msg.principal.native_id,
+                sender_name=msg.principal.display_name,
+                inbound=msg.text,
+                outbound=ctx._turn_last_outbound,
+                error=error,
+                vault_context=vault_context,
+                vault_candidates=vault_candidates,
+            )
+        )
+        ctx.events.emit(
+            "ws_turn_end",
+            turn_id=turn_id,
+            principal_id=msg.principal.native_id,
+            channel=msg.origin.address,
             error=error,
             duration_ms=int((time.time() - started) * 1000),
         )

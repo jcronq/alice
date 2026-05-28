@@ -39,6 +39,12 @@ services:
       # it to the host. Signal client work on the host (manual signal-cli
       # commands) can talk to the same daemon without nsenter/docker exec.
       - "8080:8080"
+      # WebSocket gateway — token-authenticated CLI-session bridge for
+      # off-host clients (iOS app, browser tooling). The speaking daemon
+      # only binds the listener when ALICE_WS_GATEWAY_TOKEN is set, so
+      # exposing the port unconditionally is safe — without a token
+      # nothing is listening behind it. Issue #430.
+      - "${ALICE_WS_GATEWAY_PORT:-8765}:${ALICE_WS_GATEWAY_PORT:-8765}"
     environment:
       # signal-cli is in the same container; no inter-service hop.
       SIGNAL_API: "http://localhost:8080"
@@ -73,6 +79,14 @@ services:
       ALICE_A2A_HOST: "${ALICE_A2A_HOST:-}"
       ALICE_A2A_PRINCIPAL: "${ALICE_A2A_PRINCIPAL:-}"
       ALICE_A2A_EXTERNAL_URL: "${ALICE_A2A_EXTERNAL_URL:-}"
+      # WS gateway (issue #430). Opt-in via the bearer token; when
+      # ALICE_WS_GATEWAY_TOKEN is empty the speaking daemon skips the
+      # listener and the published host port has nothing behind it.
+      # Default host/port match the documented :8765 entry point.
+      ALICE_WS_GATEWAY_TOKEN: "${ALICE_WS_GATEWAY_TOKEN:-}"
+      ALICE_WS_GATEWAY_HOST: "${ALICE_WS_GATEWAY_HOST:-0.0.0.0}"
+      ALICE_WS_GATEWAY_PORT: "${ALICE_WS_GATEWAY_PORT:-8765}"
+      ALICE_WS_GATEWAY_PATH: "${ALICE_WS_GATEWAY_PATH:-/cli}"
       # viewer-chat transport (PR #46). Speaking daemon listens on
       # localhost (no longer 0.0.0.0 — the viewer is in the same
       # container now, no Docker bridge to traverse).

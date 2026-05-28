@@ -40,6 +40,10 @@ dependencies = [
     # the kernel layer.
     "google-adk>=1.32",
     "litellm>=1.83",
+    # WebSocket gateway transport (alice_speaking.transports.ws). Pulls
+    # the asyncio-native ``websockets`` library — same wire vocabulary
+    # as the CLI socket, accessible to off-host clients (iOS, browser).
+    "websockets>=15.0",
 ]
 
 [project.scripts]

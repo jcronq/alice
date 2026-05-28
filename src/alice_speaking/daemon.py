@@ -86,6 +86,7 @@ from .transports import (
     ChannelRef,
     SignalTransport,
     ViewerChatTransport,
+    WSTransport,
 )
 
 # DiscordTransport is imported lazily below, only when the daemon is actually
@@ -104,6 +105,11 @@ from .transports.cli import CLIEvent
 from .transports.discord import DiscordEvent
 from .transports.signal import SignalEvent
 from .transports.viewer_chat import ViewerChatEvent
+from .transports.ws import resolve_token as resolve_ws_token
+
+# Re-export for back-compat with callers that import the event dataclass
+# from the daemon module (mirrors A2AEvent / CLIEvent / ViewerChatEvent).
+from .transports.ws import WSEvent  # noqa: E402,F401
 from .turn_runner import BUILTIN_TOOLS, TurnRunner
 
 
@@ -359,6 +365,29 @@ class SpeakingDaemon:
                 principal_display_name=cfg.viewer_chat_principal_display_name,
             )
 
+        # WS gateway transport — token-authenticated WebSocket front
+        # for the CLI session protocol, so off-host clients (the iOS
+        # app, browser tools) can hold a session without going through
+        # docker exec. Opt-in: built only when the operator exported
+        # the bearer-token env var. Resolves the token at construction
+        # time so a stale env on reload doesn't accidentally start the
+        # gateway with the wrong (or no) secret.
+        self.ws_transport: Optional[WSTransport] = None
+        if cfg.ws_gateway_enabled:
+            ws_token = resolve_ws_token(cfg.ws_gateway_token_env)
+            if ws_token:
+                self.ws_transport = WSTransport(
+                    host=cfg.ws_gateway_host,
+                    port=cfg.ws_gateway_port,
+                    token=ws_token,
+                    path=cfg.ws_gateway_path,
+                )
+            else:
+                log.warning(
+                    "ws gateway enabled but %s is empty; skipping construction",
+                    cfg.ws_gateway_token_env,
+                )
+
         # Heterogeneous event queue: each producer pushes its own
         # event type, the registry routes by ``type(event)`` (Phase 3
         # of plan 01). No Union annotation — the closed set lives in
@@ -431,6 +460,7 @@ class SpeakingDaemon:
                 self.discord_transport,
                 self.a2a_transport,
                 self.viewer_chat_transport,
+                self.ws_transport,
             ),
             surface_watcher=self._surface_watcher,
             emergency_watcher=self._emergency_watcher,
@@ -450,6 +480,7 @@ class SpeakingDaemon:
                 "discord": self.discord_transport,
                 "a2a": self.a2a_transport,
                 "viewer-chat": self.viewer_chat_transport,
+                "ws": self.ws_transport,
             }.get(name),
             address_book=self.address_book,
             events=self.events,
@@ -512,6 +543,7 @@ class SpeakingDaemon:
                 "discord": self.discord_transport,
                 "a2a": self.a2a_transport,
                 "viewer-chat": self.viewer_chat_transport,
+                "ws": self.ws_transport,
             }.get(name),
             system_prompt=self._system_prompt,
             # Plan 06 Phase 3: model.yml's speaking.model wins over
@@ -593,6 +625,10 @@ class SpeakingDaemon:
         # bind.
         if self.cli_transport is not None:
             self.cli_transport.context_probe = self.context_probe
+        # Same post-hoc bind for the WS gateway — it ships the same
+        # ``{"type": "context"}`` RPC and expects a probe to answer.
+        if self.ws_transport is not None:
+            self.ws_transport.context_probe = self.context_probe
         self._config_path = cfg.mind_dir / "config" / "alice.config.json"
         self._config_mtime: float = (
             self._config_path.stat().st_mtime if self._config_path.is_file() else 0.0
