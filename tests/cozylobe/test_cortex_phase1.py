@@ -72,9 +72,11 @@ def test_load_populated_vault(tmp_path, onboard):
 
     vault = load_vault(tmp_path)
     assert {n.title for n in vault.rooms.values()} == {"Kitchen", "Living Room"}
+    # Sensor titles are the prefix-stripped form (live vault convention).
+    # The full HA entity_id is preserved in frontmatter `entity_id:`.
     assert {n.title for n in vault.sensors.values()} == {
-        "binary_sensor.hue_kitchen_motion",
-        "binary_sensor.hue_living_room_motion",
+        "hue_kitchen_motion",
+        "hue_living_room_motion",
     }
     # Jason, Katie, Mike, unknown — the canonical four.
     assert {n.title for n in vault.people.values()} == {
@@ -129,16 +131,29 @@ def test_sensor_room_lookup(tmp_path, onboard):
     from alice_cozylobe.cortex import load_vault, sensor_room
 
     vault = load_vault(tmp_path)
+    # Raw HA entity_id (with domain prefix) — prefix gets stripped before lookup.
     room = sensor_room(vault, "binary_sensor.hue_kitchen_motion")
     assert room is not None
     assert room.title == "Kitchen"
 
-    # Slug form works too.
-    room2 = sensor_room(vault, "sensors/binary_sensor.hue_kitchen_motion")
+    # Bare title (already stripped) works too.
+    room2 = sensor_room(vault, "hue_kitchen_motion")
     assert room2 is not None and room2.title == "Kitchen"
+
+    # Full slug form (matches the live vault convention — no HA prefix).
+    room3 = sensor_room(vault, "sensors/hue_kitchen_motion")
+    assert room3 is not None and room3.title == "Kitchen"
+
+    # Other HA domain prefixes should also strip cleanly.
+    # (Not a sensor lookup we'd actually make, but verifies the prefix table.)
+    for prefix in ("light.", "switch.", "fan.", "sensor."):
+        # These would resolve to the same room if a sensor existed at that title.
+        # Just ensure they don't crash.
+        sensor_room(vault, f"{prefix}some_imaginary_thing")
 
     # Unknown sensor returns None.
     assert sensor_room(vault, "does-not-exist") is None
+    assert sensor_room(vault, "binary_sensor.does_not_exist") is None
 
 
 def test_vault_get_resolves_slug_and_title(tmp_path, onboard):
@@ -265,10 +280,10 @@ def test_onboarding_writes_expected_files(tmp_path, onboard):
     room_names = {p.stem for p in written["rooms"]}
     assert room_names == {"Kitchen", "Living Room", "Master Bedroom"}
 
-    # Sensors.
+    # Sensors — filename uses prefix-stripped form (live vault convention).
     sensor_names = {p.stem for p in written["sensors"]}
-    assert "binary_sensor.hue_kitchen_motion" in sensor_names
-    assert "binary_sensor.hue_master_motion" in sensor_names
+    assert "hue_kitchen_motion" in sensor_names
+    assert "hue_master_motion" in sensor_names
 
     # People: canonical 4 + Sarah.
     people_names = {p.stem for p in written["people"]}

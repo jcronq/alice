@@ -640,13 +640,38 @@ def load_vault(root: Path) -> Vault:
 # ---------------------------------------------------------------------------
 # Convenience helpers
 
+_HA_ENTITY_PREFIXES = (
+    "binary_sensor.",
+    "light.",
+    "switch.",
+    "input_number.",
+    "input_boolean.",
+    "fan.",
+    "cover.",
+    "sensor.",
+    "media_player.",
+    "climate.",
+)
+
+
 def sensor_room(vault: Vault, sensor_slug_or_title: str) -> Optional[Room]:
     """Resolve a sensor → the room it covers.
 
-    Accepts either a full slug (``sensors/hue_kitchen_motion``) or a
-    bare title (``hue_kitchen_motion``). Returns ``None`` if the sensor
-    is unknown or its ``room:`` frontmatter is missing / dangling.
+    Accepts either a full slug (``sensors/hue_kitchen_motion``), a bare
+    title (``hue_kitchen_motion``), or a raw HA entity_id with a domain
+    prefix (``binary_sensor.hue_kitchen_motion``). Returns ``None`` if
+    the sensor is unknown or its ``room:`` frontmatter is missing /
+    dangling.
+
+    HA domain prefixes are stripped before lookup because vault sensor
+    slugs don't carry them — without the strip ~90% of motion events
+    were resolving to None, leaving guesses and the breach classifier
+    blind to which room fired.
     """
+    for prefix in _HA_ENTITY_PREFIXES:
+        if sensor_slug_or_title.startswith(prefix):
+            sensor_slug_or_title = sensor_slug_or_title[len(prefix):]
+            break
     sensor: Optional[Sensor]
     if "/" in sensor_slug_or_title:
         sensor = vault.sensors.get(sensor_slug_or_title)

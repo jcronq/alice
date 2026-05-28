@@ -341,6 +341,32 @@ def write_room_note(
     return path
 
 
+def _strip_ha_prefix(entity_id: str) -> str:
+    """Drop the HA domain prefix from an entity_id.
+
+    ``binary_sensor.hue_kitchen_motion`` → ``hue_kitchen_motion``.
+    The live cozylobe-cortex vault stores sensor slugs without the
+    HA prefix; this helper aligns onboarding-written notes with that
+    convention. Mirrors the prefix list in
+    :func:`alice_cozylobe.cortex.sensor_room`.
+    """
+    for prefix in (
+        "binary_sensor.",
+        "light.",
+        "switch.",
+        "input_number.",
+        "input_boolean.",
+        "fan.",
+        "cover.",
+        "sensor.",
+        "media_player.",
+        "climate.",
+    ):
+        if entity_id.startswith(prefix):
+            return entity_id[len(prefix):]
+    return entity_id
+
+
 def write_sensor_note(
     root: Path,
     entity_id: str,
@@ -349,11 +375,16 @@ def write_sensor_note(
     kind: str = "PIR",
     install_date: Optional[str] = None,
 ) -> Path:
-    path = root / "sensors" / f"{_slugify(entity_id)}.md"
+    # Live vault convention: filename, title, and body heading use the
+    # prefix-stripped form; the ``entity_id:`` frontmatter field
+    # preserves the full HA entity_id so downstream consumers can map
+    # back to the source. See _strip_ha_prefix docstring.
+    stripped = _strip_ha_prefix(entity_id)
+    path = root / "sensors" / f"{_slugify(stripped)}.md"
     install = install_date or _today_iso()
     lines = [
         "---",
-        f"title: {entity_id}",
+        f"title: {stripped}",
         "tags: [sensor, motion, cozylobe-cortex]",
         f"created: {_today_iso()}",
         f"updated: {_today_iso()}",
@@ -363,7 +394,7 @@ def write_sensor_note(
         f"install_date: {install}",
         "---",
         "",
-        f"# {entity_id}",
+        f"# {stripped}",
         "",
         f"Motion sensor (COVERS:1.0){_wikilink('rooms', room)}. "
         f"Installed {install}.",
