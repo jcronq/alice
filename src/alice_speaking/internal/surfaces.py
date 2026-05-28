@@ -44,17 +44,25 @@ POLL_SECONDS = 5.0
 # Refreshed every SurfaceWatcher._run tick — that's the fixed-cadence
 # event-loop wake that fires regardless of inbound traffic, so a hung turn
 # (or a hung kernel) shows up as a stuck mtime within ~6 min (5-min staleness
-# window + interval slack). Bare path constant — NO try/except around the
-# touch site: a read-only FS or missing dir SHOULD trip the probe rather
-# than silently mask a wedge. See sandbox/Dockerfile HEALTHCHECK comment.
+# window + interval slack). The touch site swallows ONLY FileNotFoundError
+# so dev/test environments (where /state/worker/ doesn't exist) can import
+# and exercise the watcher as a no-op; in prod the directory is guaranteed
+# by sandbox/s6/init-state-perms, and a genuinely missing file is caught by
+# the HEALTHCHECK's mtime-staleness test. Other OSErrors (PermissionError,
+# read-only FS, etc.) are NOT swallowed — those are real failures we want
+# surfaced. See sandbox/Dockerfile HEALTHCHECK comment.
 SPEAKING_LIVENESS_PATH = pathlib.Path("/state/worker/speaking-alive")
 
 
 def _touch_liveness(path: pathlib.Path) -> None:
     """Touch the speaking-side liveness file so the container HEALTHCHECK
     sees a fresh mtime. Extracted as a function so the unit test can pass
-    a tmp_path override; behavior is just ``Path.touch()``."""
-    path.touch()
+    a tmp_path override. Swallows FileNotFoundError only (parent dir
+    missing) for dev/test environments; other OSErrors propagate."""
+    try:
+        path.touch()
+    except FileNotFoundError:
+        pass
 
 
 # Surface types that are produced by automated, cron-driven scans
