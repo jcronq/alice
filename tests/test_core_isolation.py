@@ -35,6 +35,11 @@ ALLOWED_TOPLEVEL = _STDLIB | {
     # (auth, personae, model) use it to parse YAML files in the mind.
     # Sibling packages still aren't allowed.
     "yaml",
+    # ``httpx`` is the async HTTP transport already pulled in by
+    # claude_agent_sdk; core.llm_client uses it to speak OpenAI-schema
+    # endpoints (Qwen via llama.cpp, OpenAI, Together, …). No stdlib
+    # equivalent for async HTTP.
+    "httpx",
 }
 
 
