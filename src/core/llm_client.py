@@ -1,28 +1,39 @@
-"""Qwen 27b HTTP client — fast classifier for CozyHem events.
+"""Generic OpenAI-compatible HTTP completion client.
 
-The lobe's reasoning step has two layers:
+A thin async HTTP wrapper around any OpenAI-schema chat-completions
+endpoint. The wire format is OpenAI's ``/chat/completions``; the
+backend behind it can be anything that speaks that schema — Qwen
+served by vllm / llama.cpp, the OpenAI API itself, Groq, Together,
+Anyscale, a self-hosted LiteLLM proxy, etc. Model is configured
+per-instance via the ``model`` constructor argument, not baked into
+the client.
 
-1. **qwen 27b pattern matcher** (this module). Lives on
-   ``desktop-3090`` behind an OpenAI-compatible HTTP endpoint. Fast
-   (~2-5s per call), cheap, bounded-domain. Produces a structured
-   :class:`QwenClassification` per event: urgency tier + intent +
-   summary.
-2. **agent_library run_agent supervisor**. Lives in the alice
-   container; consumes qwen's classification + the raw event and
-   decides whether to write an observation note, a surface, or
-   nothing. Runs through :func:`core.agent_library.run_agent` on the
-   registered ``cozylobe`` AgentSpec (Jason's directive).
+Two public entry points:
+
+* :meth:`LLMClient.complete` — send a single prompt, return the
+  parsed JSON object the assistant emits. Used by call sites whose
+  expected output schema is "the assistant returns a JSON object";
+  the caller validates the inner shape.
+* :meth:`LLMClient.classify` — cozylobe-specific helper that builds
+  the urgency/intent classification prompt and parses the structured
+  response into a :class:`QwenClassification`. Currently tightly
+  coupled to :class:`alice_cozylobe.events.CozyHemEvent`; see the
+  BLOCKED ON note in the promotion PR (#436) for the next step.
 
 **Graceful degrade contract** (design's "lobe-goes-quiet-on-link-loss"
-requirement): when qwen is unreachable, :meth:`QwenClient.classify`
-raises :class:`QwenUnreachable`. The wake loop catches it, logs once,
-and either skips reasoning entirely for the event or falls back to
-hardcoded rules for CRITICAL events. The lobe must never fabricate a
-classification when the model is down.
+requirement): when the endpoint is unreachable, :meth:`classify` and
+:meth:`complete` raise :class:`LLMUnreachable`. Callers catch it,
+log once, and either skip reasoning entirely or fall back to
+hardcoded rules. The client must never fabricate output when the
+model is down. Do NOT retry inside this client — backoff happens in
+the supervisor.
 
-Hardcoded endpoint: ``http://desktop-3090:8080`` per the design's
-named target. TODO(cozyhem-engine#31): replace with AI-fleet-managed
-service binding once the registry ships.
+In-container the default endpoint is the LiteLLM proxy
+(``LITELLM_BASE_URL=http://alice-litellm:4000/v1``), the single seam
+for all local-model traffic — matches viewer.lobe_labeler + thinking's
+stage_b/d call sites so backend moves never touch this code again.
+Fallback is the direct LAN desktop Qwen (3090, 10.20.30.147:8033) for
+dev outside the container.
 """
 
 from __future__ import annotations
@@ -31,41 +42,54 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import httpx
 
-from .events import CozyHemEvent
+# Backward type-checking-only import into alice_cozylobe. This is the
+# layering violation called out in the BLOCKED ON section of the
+# promotion PR (#436): cozylobe's event type leaks back into core via
+# :meth:`LLMClient.classify`'s type signature. Held under TYPE_CHECKING
+# to avoid a hard runtime cycle (cozylobe.__init__ also imports
+# LLMClient from this module). The classify() method only touches the
+# duck-typed attributes ``kind``, ``entity_id``, ``payload``,
+# ``received_at``, so the runtime is happy without the concrete type.
+# The clean fix is to split the cozylobe-specific classification
+# helper into its own cozylobe module (CozyHemClassifier wrapping an
+# LLMClient) and remove this import entirely. Out of scope for the
+# file move.
+if TYPE_CHECKING:
+    from alice_cozylobe.events import CozyHemEvent
 
 
 __all__ = [
-    "DEFAULT_QWEN_ENDPOINT",
-    "DEFAULT_QWEN_MODEL",
+    "DEFAULT_ENDPOINT",
+    "DEFAULT_MODEL",
+    "LLMClient",
+    "LLMUnreachable",
     "QwenClassification",
-    "QwenClient",
-    "QwenUnreachable",
 ]
 
 
 log = logging.getLogger(__name__)
 
 
-# Classifier endpoint. In-container this is the LiteLLM proxy
+# Default endpoint. In-container this is the LiteLLM proxy
 # (LITELLM_BASE_URL=http://alice-litellm:4000/v1), the single seam for
-# all local-model traffic — matches viewer.lobe_labeler + thinking's
-# stage_b/d call sites so backend moves never touch this code again.
-# Fallback is the direct LAN desktop Qwen (3090, 10.20.30.147:8033) for
-# dev outside the container. NOTE: the base now includes ``/v1`` (the
-# OpenAI convention these sites share); :meth:`classify` appends only
-# ``/chat/completions``. The old hardcoded ``desktop-3090:8080`` was
-# stale on both host and port.
-DEFAULT_QWEN_ENDPOINT = os.environ.get(
+# all local-model traffic. Fallback is the direct LAN desktop Qwen
+# (3090, 10.20.30.147:8033) for dev outside the container. NOTE: the
+# base includes ``/v1`` (the OpenAI convention these sites share);
+# :meth:`_post_chat` appends only ``/chat/completions``.
+DEFAULT_ENDPOINT = os.environ.get(
     "LITELLM_BASE_URL", "http://10.20.30.147:8033/v1"
 )
 
 # Virtual model name resolved by sandbox/litellm/config.yaml -> the
 # 3090 desktop Qwen. The LAN llama.cpp server ignores the model field,
-# so this also works against the direct fallback.
+# so this also works against the direct fallback. The default value is
+# qwen-specific because it names the actual local backend; the
+# constant name itself is backend-neutral so non-cozylobe callers can
+# inject their own model string.
 #
 # Uses ``LITELLM_NARRATOR_MODEL`` rather than the shared
 # ``LITELLM_QWEN_MODEL`` so the cozylobe narrator/classifier can be
@@ -74,21 +98,21 @@ DEFAULT_QWEN_ENDPOINT = os.environ.get(
 # call sites shared a single knob, which meant repointing
 # ``LITELLM_BASE_URL`` at an alternate LiteLLM proxy forced both onto
 # the same backend or 404'd one of them.
-DEFAULT_QWEN_MODEL = os.environ.get("LITELLM_NARRATOR_MODEL", "qwen-desktop")
+DEFAULT_MODEL = os.environ.get("LITELLM_NARRATOR_MODEL", "qwen-desktop")
 
 # Bearer token for the LiteLLM proxy (its master key). Empty in dev/tests
 # and against the direct LAN fallback (unauthenticated) — the
 # Authorization header is only sent when this is non-empty.
-DEFAULT_QWEN_API_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
+DEFAULT_API_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 
 # Log the resolved local-model config once at import so a 404 storm
 # against an alternate LiteLLM proxy (e.g. a shared corporate proxy
 # repointed via LITELLM_BASE_URL) is diagnosable without grepping each
 # module. See issue #420.
 log.info(
-    "cozylobe qwen_client config: model=%s endpoint=%s",
-    DEFAULT_QWEN_MODEL,
-    DEFAULT_QWEN_ENDPOINT,
+    "core.llm_client config: model=%s endpoint=%s",
+    DEFAULT_MODEL,
+    DEFAULT_ENDPOINT,
 )
 
 # Per the qwen-prompt design: low temperature for structured output,
@@ -96,13 +120,13 @@ log.info(
 DEFAULT_TEMPERATURE = 0.4
 
 # Per the wake-loop design: qwen 27b inference is ~2-5s; cap a single
-# call at 30s so a hung endpoint surfaces as :class:`QwenUnreachable`
+# call at 30s so a hung endpoint surfaces as :class:`LLMUnreachable`
 # rather than wedging the wake loop indefinitely.
 DEFAULT_TIMEOUT_SECONDS = 30.0
 
 
-class QwenUnreachable(RuntimeError):
-    """Raised when the qwen endpoint is unreachable or errored.
+class LLMUnreachable(RuntimeError):
+    """Raised when the LLM endpoint is unreachable or errored.
 
     The wake loop catches this and skips the reasoning step for the
     event (or falls back to hardcoded rules for CRITICAL events). Do
@@ -112,23 +136,28 @@ class QwenUnreachable(RuntimeError):
 
 @dataclass(frozen=True)
 class QwenClassification:
-    """One qwen classification of one CozyHem event.
+    """One classification of one CozyHem event.
 
     Shape mirrors the qwen-prompt design's output JSON object
     (urgency + intent + summary + reasoning). Multiple-action outputs
     from a batched call are flattened to one classification per event
     by the wake loop; richer batching ships in a follow-up.
 
+    Name is a holdover from the qwen-only era of this client; the
+    shape is generic over any OpenAI-compatible backend that follows
+    the cozylobe prompt template. Rename to ``LLMClassification``
+    when the classify-helper split lands (see PR #436 BLOCKED ON).
+
     Attributes:
         urgency: One of ``"CRITICAL" | "HIGH" | "MEDIUM" | "LOW"``.
             CRITICAL is reserved for the hardcoded fast-path and is
-            never produced by qwen itself.
+            never produced by the model itself.
         intent: One of ``"notify" | "act" | "log" | "investigate"``.
         summary: One-line human-readable summary.
         reasoning: Brief explanation (max 20 words per the prompt).
-        raw: The unparsed JSON object qwen returned. Escape hatch for
-            inspection; structured handlers should rely on the typed
-            fields above.
+        raw: The unparsed JSON object the model returned. Escape hatch
+            for inspection; structured handlers should rely on the
+            typed fields above.
     """
 
     urgency: str
@@ -138,8 +167,13 @@ class QwenClassification:
     raw: dict
 
 
-class QwenClient:
-    """Thin HTTP wrapper around the qwen 27b OpenAI-compatible API.
+class LLMClient:
+    """Thin async HTTP wrapper around any OpenAI-compatible chat API.
+
+    Endpoint, model, API key, temperature, and timeout are all
+    configured per-instance. The wire format is OpenAI's
+    ``/chat/completions``; the backend can be anything that speaks
+    that schema.
 
     Inject ``http_client_factory`` in tests so we don't open real
     sockets. The factory returns an :class:`httpx.AsyncClient`-shaped
@@ -148,10 +182,10 @@ class QwenClient:
 
     def __init__(
         self,
-        endpoint: str = DEFAULT_QWEN_ENDPOINT,
+        endpoint: str = DEFAULT_ENDPOINT,
         *,
-        model: str = DEFAULT_QWEN_MODEL,
-        api_key: str = DEFAULT_QWEN_API_KEY,
+        model: str = DEFAULT_MODEL,
+        api_key: str = DEFAULT_API_KEY,
         temperature: float = DEFAULT_TEMPERATURE,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         http_client_factory=None,
@@ -167,13 +201,13 @@ class QwenClient:
 
     async def classify(
         self,
-        event: CozyHemEvent,
+        event: "CozyHemEvent",
         *,
         context: Optional[dict] = None,
     ) -> QwenClassification:
-        """Send one event to qwen and parse the structured response.
+        """Send one event to the model and parse the structured response.
 
-        Raises :class:`QwenUnreachable` on any network / HTTP / parse
+        Raises :class:`LLMUnreachable` on any network / HTTP / parse
         failure. The wake loop catches it; this method does NOT retry.
         """
         prompt = self._build_prompt(event, context or {})
@@ -186,7 +220,7 @@ class QwenClient:
         from the urgency/intent template (Phase 2 motion-cortex pipeline,
         future custom prompts).
 
-        Raises :class:`QwenUnreachable` on network / HTTP failure OR
+        Raises :class:`LLMUnreachable` on network / HTTP failure OR
         when the assistant's content is not valid JSON. Does NOT enforce
         a top-level key shape — that's the caller's job.
         """
@@ -194,18 +228,18 @@ class QwenClient:
         try:
             content = blob["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise QwenUnreachable(
-                f"qwen response missing choices[0].message.content: {exc}"
+            raise LLMUnreachable(
+                f"llm response missing choices[0].message.content: {exc}"
             ) from exc
         try:
             parsed = json.loads(content)
         except json.JSONDecodeError as exc:
-            raise QwenUnreachable(
-                f"qwen returned non-JSON content: {exc}"
+            raise LLMUnreachable(
+                f"llm returned non-JSON content: {exc}"
             ) from exc
         if not isinstance(parsed, dict):
-            raise QwenUnreachable(
-                f"qwen content is not a JSON object: {type(parsed).__name__}"
+            raise LLMUnreachable(
+                f"llm content is not a JSON object: {type(parsed).__name__}"
             )
         return parsed
 
@@ -243,11 +277,11 @@ class QwenClient:
                 response.raise_for_status()
                 return response.json()
         except (httpx.HTTPError, json.JSONDecodeError, OSError) as exc:
-            raise QwenUnreachable(
-                f"qwen endpoint {self._endpoint} unreachable or errored: {exc}"
+            raise LLMUnreachable(
+                f"llm endpoint {self._endpoint} unreachable or errored: {exc}"
             ) from exc
 
-    def _build_prompt(self, event: CozyHemEvent, context: dict) -> str:
+    def _build_prompt(self, event: "CozyHemEvent", context: dict) -> str:
         """Render the qwen-prompt template from the design note.
 
         Walking-skeleton scope: single-event prompt rather than the
@@ -299,32 +333,32 @@ class QwenClient:
     def _parse_response(self, blob: dict) -> QwenClassification:
         """Pull the assistant content out of the OpenAI-style response
         envelope and parse the inner JSON object. Strict on shape —
-        anything we don't recognize becomes ``QwenUnreachable`` so the
+        anything we don't recognize becomes ``LLMUnreachable`` so the
         supervisor degrades gracefully.
         """
         try:
             content = blob["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise QwenUnreachable(
-                f"qwen response missing choices[0].message.content: {exc}"
+            raise LLMUnreachable(
+                f"llm response missing choices[0].message.content: {exc}"
             ) from exc
 
         try:
             parsed = json.loads(content)
         except json.JSONDecodeError as exc:
-            raise QwenUnreachable(
-                f"qwen returned non-JSON content: {exc}"
+            raise LLMUnreachable(
+                f"llm returned non-JSON content: {exc}"
             ) from exc
 
         actions = parsed.get("actions") if isinstance(parsed, dict) else None
         if not actions or not isinstance(actions, list):
-            raise QwenUnreachable(
-                "qwen response missing or empty 'actions' list"
+            raise LLMUnreachable(
+                "llm response missing or empty 'actions' list"
             )
 
         first = actions[0]
         if not isinstance(first, dict):
-            raise QwenUnreachable("qwen action is not a dict")
+            raise LLMUnreachable("llm action is not a dict")
 
         return QwenClassification(
             urgency=str(first.get("urgency", "LOW")),

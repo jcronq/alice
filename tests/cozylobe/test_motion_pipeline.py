@@ -61,7 +61,7 @@ class _FakeClock:
 
 
 class _StubQwen:
-    """Stub QwenClient.complete that returns a canned positional inference."""
+    """Stub LLMClient.complete that returns a canned positional inference."""
 
     def __init__(self, payload: Optional[dict] = None) -> None:
         self.payload = payload or {
@@ -351,7 +351,7 @@ async def test_classify_motion_batch_parses_inference():
     result = await classify_motion_batch(
         batch=[_motion(entity_id="hue_kitchen_motion", room="Kitchen")],
         trail=[],
-        qwen_client=qwen,
+        llm_client=qwen,
         vault=None,
     )
     assert isinstance(result, MotionInference)
@@ -374,7 +374,7 @@ async def test_classify_tolerates_missing_fields():
     result = await classify_motion_batch(
         batch=[_motion()],
         trail=[],
-        qwen_client=qwen,
+        llm_client=qwen,
         vault=None,
     )
     assert result.current_room is None
@@ -398,7 +398,7 @@ async def test_security_class_bypasses_queue_and_writes_note():
         return Path("/tmp/fake-note.md")
 
     pipeline = MotionPipeline(
-        qwen_client=qwen,
+        llm_client=qwen,
         vault=None,
         write_note=_capture,
         # Force every event into security-class so the bypass fires.
@@ -427,7 +427,7 @@ async def test_normal_motion_event_is_queued_not_classified():
 
     clock = _FakeClock()
     pipeline = MotionPipeline(
-        qwen_client=qwen,
+        llm_client=qwen,
         vault=None,
         queue=MotionQueue(batch_window_s=30.0, clock=clock),
         write_note=_capture,
@@ -454,7 +454,7 @@ async def test_queue_flushes_classifies_and_writes_note_after_window():
 
     clock = _FakeClock()
     pipeline = MotionPipeline(
-        qwen_client=qwen,
+        llm_client=qwen,
         vault=None,
         queue=MotionQueue(batch_window_s=30.0, clock=clock),
         write_note=_capture,
@@ -480,14 +480,14 @@ async def test_queue_flushes_classifies_and_writes_note_after_window():
 
 @pytest.mark.asyncio
 async def test_pipeline_writes_degraded_note_when_qwen_unreachable():
-    """When QwenClient.complete raises QwenUnreachable, the pipeline
+    """When LLMClient.complete raises LLMUnreachable, the pipeline
     should write a 'motion-degraded' note so the event still leaves a
     trail."""
-    from alice_cozylobe.qwen_client import QwenUnreachable
+    from core.llm_client import LLMUnreachable
 
     class _BrokenQwen:
         async def complete(self, prompt: str) -> dict:
-            raise QwenUnreachable("desk unreachable")
+            raise LLMUnreachable("desk unreachable")
 
     notes: list[dict] = []
 
@@ -496,7 +496,7 @@ async def test_pipeline_writes_degraded_note_when_qwen_unreachable():
         return Path("/tmp/fake-note.md")
 
     pipeline = MotionPipeline(
-        qwen_client=_BrokenQwen(),
+        llm_client=_BrokenQwen(),
         write_note=_capture,
         security_predicate=lambda _e: True,
     )
@@ -518,7 +518,7 @@ async def test_pipeline_writes_degraded_note_when_no_qwen_wired():
         return Path("/tmp/fake-note.md")
 
     pipeline = MotionPipeline(
-        qwen_client=None,
+        llm_client=None,
         write_note=_capture,
         security_predicate=lambda _e: True,
     )
@@ -550,7 +550,7 @@ async def test_pipeline_resolves_room_from_vault(tmp_path: Path):
 
     qwen = _StubQwen()
     pipeline = MotionPipeline(
-        qwen_client=qwen,
+        llm_client=qwen,
         vault=vault,
         write_note=lambda *a, **kw: Path("/tmp/x.md"),
         security_predicate=lambda _e: True,
@@ -636,7 +636,7 @@ async def test_wake_loop_routes_motion_to_pipeline_bypassing_throttle(
 
     qwen = _StubQwen()
     pipeline = MotionPipeline(
-        qwen_client=qwen,
+        llm_client=qwen,
         vault=None,
         write_note=lambda *a, **kw: Path("/tmp/x.md"),
         security_predicate=lambda _e: False,  # normal path → queue it
@@ -680,7 +680,7 @@ async def test_wake_loop_motion_with_security_bypass_writes_note(
 
     qwen = _StubQwen()
     pipeline = MotionPipeline(
-        qwen_client=qwen,
+        llm_client=qwen,
         vault=None,
         write_note=_capture,
         security_predicate=lambda _e: True,
@@ -720,7 +720,7 @@ async def test_burst_ten_events_in_five_seconds_no_drops():
         return Path("/tmp/x.md")
 
     pipeline = MotionPipeline(
-        qwen_client=qwen,
+        llm_client=qwen,
         vault=None,
         queue=MotionQueue(batch_window_s=30.0, max_batch_size=100, clock=clock),
         write_note=_capture,
@@ -869,7 +869,7 @@ async def test_wake_loop_routes_entity_update_motion_event_to_pipeline(
 
     qwen = _StubQwen()
     pipeline = MotionPipeline(
-        qwen_client=qwen,
+        llm_client=qwen,
         vault=None,
         write_note=lambda *a, **kw: Path("/tmp/x.md"),
         security_predicate=lambda _e: False,

@@ -43,7 +43,7 @@ from .noise_router import (
     render_coalesced_body,
     should_route_to_noise,
 )
-from .qwen_client import QwenClassification, QwenClient, QwenUnreachable
+from core.llm_client import LLMClient, LLMUnreachable, QwenClassification
 from .surfaces import (
     build_slug,
     write_noise_note,
@@ -98,7 +98,7 @@ class WakeLoop:
         self,
         *,
         emitter: EventEmitter,
-        qwen_client: Optional[QwenClient] = None,
+        llm_client: Optional[LLMClient] = None,
         agent_spec: Optional[AgentSpec] = None,
         run_agent_fn: Optional[RunAgentCallable] = None,
         backend: object = None,
@@ -113,7 +113,7 @@ class WakeLoop:
         write_noise_fn: Optional[Callable[..., object]] = None,
     ) -> None:
         self._emitter = emitter
-        self._qwen = qwen_client
+        self._llm = llm_client
         self._agent_spec = agent_spec or default_registry.get("cozylobe")
         self._run_agent = run_agent_fn or run_agent
         self._backend = backend
@@ -482,11 +482,11 @@ class WakeLoop:
         successful classify so a flapping endpoint surfaces every time
         it recovers.
         """
-        if self._qwen is None:
+        if self._llm is None:
             return None
         try:
-            classification = await self._qwen.classify(event)
-        except QwenUnreachable as exc:
+            classification = await self._llm.classify(event)
+        except LLMUnreachable as exc:
             if not self._qwen_warned:
                 log.warning(
                     "cozylobe: qwen unreachable, lobe going quiet on "

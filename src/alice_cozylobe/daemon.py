@@ -35,7 +35,7 @@ from .cortex import DEFAULT_VAULT_ROOT, load_vault
 from .event_log import DEFAULT_EVENT_LOG_ROOT, SseEventLogger
 from .guesses import GuessLifecycle
 from .motion import MotionPipeline
-from .qwen_client import DEFAULT_QWEN_ENDPOINT, QwenClient
+from core.llm_client import DEFAULT_ENDPOINT as DEFAULT_LLM_ENDPOINT, LLMClient
 from .sse_consumer import (
     DEFAULT_EVENTS_URL,
     DEFAULT_QUEUE_SIZE,
@@ -70,7 +70,7 @@ DEFAULT_LOG = pathlib.Path("/state/worker/cozylobe.log")
 # proxy like every other local-model call site, not direct to the box.
 #
 # The virtual model name is taken from ``LITELLM_NARRATOR_MODEL`` (same
-# var qwen_client.py reads) so the two cozylobe call sites move
+# var core.llm_client reads) so the two cozylobe call sites move
 # together when LITELLM_BASE_URL is repointed at an alternate proxy.
 # See issue #420.
 DEFAULT_NARRATOR_MODEL = os.environ.get("LITELLM_NARRATOR_MODEL", "qwen-desktop")
@@ -97,7 +97,7 @@ class CozylobeDaemon:
         self,
         *,
         events_url: str = DEFAULT_EVENTS_URL,
-        qwen_endpoint: Optional[str] = DEFAULT_QWEN_ENDPOINT,
+        qwen_endpoint: Optional[str] = DEFAULT_LLM_ENDPOINT,
         queue_size: int = DEFAULT_QUEUE_SIZE,
         log_path: pathlib.Path = DEFAULT_LOG,
         cozyhem_base_url: str = DEFAULT_COZYHEM_BASE_URL,
@@ -143,7 +143,7 @@ class CozylobeDaemon:
         """
         queue: asyncio.Queue = asyncio.Queue(maxsize=self._queue_size)
 
-        qwen = QwenClient(self._qwen_endpoint) if self._qwen_endpoint else None
+        llm_client = LLMClient(self._qwen_endpoint) if self._qwen_endpoint else None
         consumer = SSEConsumer(self._events_url)
         activity_fetcher = ActivityFetcher(self._cozyhem_base_url)
 
@@ -203,7 +203,7 @@ class CozylobeDaemon:
         # classifier. See ``breach.py`` for the rules.
         breach_cache = AlarmStateCache()
         motion_pipeline = MotionPipeline(
-            qwen_client=qwen,
+            llm_client=llm_client,
             vault=cortex_vault,
             vault_root=self._cozylobe_cortex_root,
             lifecycle=guess_lifecycle,
@@ -222,7 +222,7 @@ class CozylobeDaemon:
 
         wake_loop = WakeLoop(
             emitter=self._emitter,
-            qwen_client=qwen,
+            llm_client=llm_client,
             agent_spec=cozylobe_spec,
             backend=reasoning_backend,
             fetch_activity=activity_fetcher.fetch,
@@ -314,7 +314,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument(
         "--qwen-endpoint",
-        default=DEFAULT_QWEN_ENDPOINT,
+        default=DEFAULT_LLM_ENDPOINT,
         help=(
             "Qwen 27b OpenAI-compatible endpoint. Pass empty string to "
             "disable qwen (lobe stays quiet on reasoning, agent still "

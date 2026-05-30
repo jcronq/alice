@@ -652,7 +652,7 @@ async def test_motion_pipeline_writes_guess_to_vault_root(tmp_path: Path):
         return Path("/tmp/fake-note.md")
 
     pipeline = MotionPipeline(
-        qwen_client=qwen,
+        llm_client=qwen,
         vault=None,
         vault_root=tmp_path,
         write_note=_capture,
@@ -699,7 +699,7 @@ async def test_motion_pipeline_emits_actionable_surface_for_security_high_conf(
         return Path("/tmp/fake-surface.md")
 
     pipeline = MotionPipeline(
-        qwen_client=qwen,
+        llm_client=qwen,
         vault=None,
         vault_root=tmp_path,
         write_note=_capture,
@@ -744,7 +744,7 @@ async def test_motion_pipeline_silent_low_confidence_no_surface(tmp_path: Path):
         return Path("/tmp/fake-surface.md")
 
     pipeline = MotionPipeline(
-        qwen_client=qwen,
+        llm_client=qwen,
         vault=None,
         vault_root=tmp_path,
         write_note=_capture,
@@ -776,7 +776,7 @@ async def test_motion_pipeline_runs_lifecycle_on_new_event(tmp_path: Path):
     qwen = _StubQwen()
     lifecycle = _RecordingLifecycle()
     pipeline = MotionPipeline(
-        qwen_client=qwen,
+        llm_client=qwen,
         vault=None,
         vault_root=tmp_path,
         lifecycle=lifecycle,
@@ -801,7 +801,7 @@ async def test_motion_pipeline_without_vault_root_still_writes_note(tmp_path: Pa
         return Path("/tmp/fake-note.md")
 
     pipeline = MotionPipeline(
-        qwen_client=qwen,
+        llm_client=qwen,
         vault=None,
         # vault_root=None (default) → guess emission skipped
         write_note=_capture,

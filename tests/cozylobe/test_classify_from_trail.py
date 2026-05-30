@@ -169,7 +169,7 @@ def _motion(
 def test_run_statistical_classifier_returns_none_on_empty_trail():
     """An empty trail (or trail with no resolved rooms) → None,
     not an exception. The pipeline degrades gracefully."""
-    pipeline = MotionPipeline(qwen_client=_StubQwen())
+    pipeline = MotionPipeline(llm_client=_StubQwen())
     # Trail is empty by default — classifier should bail without error.
     assert pipeline._run_statistical_classifier() is None
 
@@ -177,7 +177,7 @@ def test_run_statistical_classifier_returns_none_on_empty_trail():
 def test_run_statistical_classifier_skips_events_without_room():
     """Events whose ``room_id`` is None get dropped before the call; if
     all events in the trail have no room, returns None."""
-    pipeline = MotionPipeline(qwen_client=_StubQwen())
+    pipeline = MotionPipeline(llm_client=_StubQwen())
     pipeline.trail.append(
         MotionEvent(
             timestamp=1_000.0,
@@ -203,7 +203,7 @@ def test_run_statistical_classifier_swallows_import_failure(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", _explode)
 
-    pipeline = MotionPipeline(qwen_client=_StubQwen())
+    pipeline = MotionPipeline(llm_client=_StubQwen())
     pipeline.trail.append(_motion(room="Kitchen", timestamp=1_000.0))
     pipeline.trail.append(_motion(room="Hallway", timestamp=1_030.0))
     # Must not raise; must not crash the pipeline.
@@ -225,7 +225,7 @@ def test_run_statistical_classifier_swallows_runtime_exception(monkeypatch):
 
     monkeypatch.setattr(classify_mod, "classify_from_trail", _boom)
 
-    pipeline = MotionPipeline(qwen_client=_StubQwen())
+    pipeline = MotionPipeline(llm_client=_StubQwen())
     pipeline.trail.append(_motion(room="Kitchen", timestamp=1_000.0))
     pipeline.trail.append(_motion(room="Hallway", timestamp=1_030.0))
     assert pipeline._run_statistical_classifier() is None
@@ -256,7 +256,7 @@ def _make_pipeline_with_vault(tmp_path: Path) -> MotionPipeline:
     """Build a pipeline that writes guesses to ``tmp_path`` so
     ``_emit_guess`` actually fires."""
     return MotionPipeline(
-        qwen_client=_StubQwen(),
+        llm_client=_StubQwen(),
         vault_root=tmp_path,
         lifecycle=GuessLifecycle(vault_root=tmp_path),
     )

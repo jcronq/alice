@@ -34,7 +34,7 @@ from __future__ import annotations
 from .activity_fetcher import ActivityFetcher, ActivitySnapshot
 from .event_log import DEFAULT_EVENT_LOG_ROOT, SseEventLogger
 from .events import CozyHemEvent
-from .qwen_client import QwenClassification, QwenClient, QwenUnreachable
+from core.llm_client import LLMClient, LLMUnreachable, QwenClassification
 from .sse_consumer import SSEConsumer
 from .surfaces import write_observation_note, write_urgent_surface
 from .throttle import Throttle, ThrottleConfig, ThrottleDecision
@@ -46,9 +46,9 @@ __all__ = [
     "ActivitySnapshot",
     "CozyHemEvent",
     "DEFAULT_EVENT_LOG_ROOT",
+    "LLMClient",
+    "LLMUnreachable",
     "QwenClassification",
-    "QwenClient",
-    "QwenUnreachable",
     "SSEConsumer",
     "SseEventLogger",
     "Throttle",

@@ -423,7 +423,7 @@ def test_alarm_state_cache_retains_previous_state_on_subsequent_failure(
 
 
 class _CannedQwen:
-    """Stand-in for QwenClient.complete that returns a fixed
+    """Stand-in for LLMClient.complete that returns a fixed
     positional inference. Confidence is high enough (0.85) to clear
     the surface threshold's silent floor."""
 
@@ -480,7 +480,7 @@ def _make_pipeline(
 
     qwen = _CannedQwen(room=qwen_room)
     pipeline = MotionPipeline(
-        qwen_client=qwen,
+        llm_client=qwen,
         vault=None,  # adjacency comes from the classify_fn override
         vault_root=tmp_path,
         write_note=_capture_note,

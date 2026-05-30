@@ -125,7 +125,7 @@ services:
       LITELLM_BASE_URL: "http://alice-litellm:4000/v1"
       # Shared key the call sites send as a Bearer token to the proxy
       # (same value as the litellm service's LITELLM_MASTER_KEY). Read by
-      # qwen_client, lobe_labeler, thinking stage_b/d; pi gets it via the
+      # core.llm_client, lobe_labeler, thinking stage_b/d; pi gets it via the
       # apiKey field in pi-models.json. Must match the proxy's master key.
       LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-alice-local}"
     volumes:
@@ -198,7 +198,7 @@ services:
       # /v1 API. Required for the web UI to work (the login flow 500s
       # without it). Every call site sends this same value as a Bearer
       # token — see LITELLM_MASTER_KEY on the alice service + the call
-      # sites (pi-models.json apiKey, qwen_client, lobe_labeler,
+      # sites (pi-models.json apiKey, core.llm_client, lobe_labeler,
       # thinking stage_b/d). The :-default keeps fresh checkouts working;
       # rotate via LITELLM_MASTER_KEY in alice.env.
       LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-sk-alice-local}"

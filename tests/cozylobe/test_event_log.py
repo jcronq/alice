@@ -268,7 +268,7 @@ async def test_event_logger_hook_only_logs_input_kinds_and_preserves_duplicates(
 
     loop = WakeLoop(
         emitter=emitter,
-        qwen_client=None,
+        llm_client=None,
         run_agent_fn=stub_run,
         throttle=throttle,
         event_logger=event_logger,
@@ -376,7 +376,7 @@ async def test_event_logger_disabled_hook_writes_nothing(
 
     loop = WakeLoop(
         emitter=emitter,
-        qwen_client=None,
+        llm_client=None,
         run_agent_fn=stub_run,
         throttle=throttle,
         event_logger=event_logger,

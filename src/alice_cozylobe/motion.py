@@ -13,7 +13,7 @@ triggers the motion pipeline:
 3. On flush, assemble a qwen prompt with (a) the current batch,
    (b) the trail snapshot, (c) a cozylobe-cortex snapshot
    (rooms + sensors + adjacency.graph) and call qwen via
-   :class:`alice_cozylobe.qwen_client.QwenClient`.
+   :class:`core.llm_client.LLMClient`.
 4. Write the positional inference to ``inner/notes/`` tagged
    ``motion-pipeline``. No cortex writes yet — that's Phase 3.
 
@@ -44,7 +44,7 @@ from typing import Awaitable, Callable, Iterable, Optional, TYPE_CHECKING
 
 from . import cortex as cortex_mod
 from .events import CozyHemEvent
-from .qwen_client import QwenClient, QwenUnreachable
+from core.llm_client import LLMClient, LLMUnreachable
 from .surfaces import (
     build_slug,
     write_noise_note,
@@ -776,7 +776,7 @@ async def classify_motion_batch(
     batch: list[MotionEvent],
     trail: Iterable[MotionEvent],
     *,
-    qwen_client: QwenClient,
+    llm_client: LLMClient,
     vault: Optional[cortex_mod.Vault] = None,
     subgraph_hops: int = DEFAULT_SUBGRAPH_HOPS,
     now_hour: Optional[int] = None,
@@ -785,13 +785,13 @@ async def classify_motion_batch(
 
     Returns a :class:`MotionInference` with the positional-inference
     fields parsed out of qwen's JSON response. Raises
-    :class:`QwenUnreachable` on network or parse failure — the caller
+    :class:`LLMUnreachable` on network or parse failure — the caller
     (the pipeline) catches and degrades gracefully.
     """
     prompt = build_motion_prompt(
         batch, trail, vault, subgraph_hops=subgraph_hops, now_hour=now_hour
     )
-    parsed = await qwen_client.complete(prompt)
+    parsed = await llm_client.complete(prompt)
     return MotionInference(
         current_room=_opt_str(parsed.get("current_room")),
         confidence=_opt_float(parsed.get("confidence")),
@@ -842,7 +842,7 @@ class MotionPipeline:
     def __init__(
         self,
         *,
-        qwen_client: Optional[QwenClient],
+        llm_client: Optional[LLMClient],
         vault: Optional[cortex_mod.Vault] = None,
         trail: Optional[MotionTrail] = None,
         queue: Optional[MotionQueue] = None,
@@ -870,7 +870,7 @@ class MotionPipeline:
             Callable[..., "TrailClassification"]
         ] = None,
     ) -> None:
-        self._qwen = qwen_client
+        self._llm = llm_client
         self._vault = vault
         self._trail = trail or MotionTrail()
         self._queue = queue or MotionQueue(clock=clock)
@@ -1193,13 +1193,13 @@ class MotionPipeline:
     ) -> None:
         """Internal: run the qwen classify call and write the note.
 
-        Logs + swallows :class:`QwenUnreachable` so an offline classifier
+        Logs + swallows :class:`LLMUnreachable` so an offline classifier
         doesn't take the motion pipeline down. Logs + swallows
         :class:`OSError` on the note write for the same reason.
         """
         if not batch:
             return
-        if self._qwen is None:
+        if self._llm is None:
             # No classifier wired — drop a degraded note so the event
             # still leaves a trail. Matches the design's "log-only on
             # link loss" rule.
@@ -1209,12 +1209,12 @@ class MotionPipeline:
             inference = await classify_motion_batch(
                 batch,
                 self._trail.snapshot(),
-                qwen_client=self._qwen,
+                llm_client=self._llm,
                 vault=self._vault,
                 subgraph_hops=self._subgraph_hops,
                 now_hour=self._current_hour(),
             )
-        except QwenUnreachable as exc:
+        except LLMUnreachable as exc:
             log.warning(
                 "cozylobe motion: qwen unreachable (batch=%d security=%s): %s",
                 len(batch),

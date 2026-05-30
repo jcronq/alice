@@ -41,7 +41,7 @@ from alice_cozylobe.noise_router import (
     render_coalesced_body,
     should_route_to_noise,
 )
-from alice_cozylobe.qwen_client import QwenUnreachable
+from core.llm_client import LLMUnreachable
 from alice_cozylobe.surfaces import write_noise_note
 from alice_cozylobe.wake_loop import WakeLoop
 from core.events import CapturingEmitter
@@ -63,7 +63,7 @@ class _FakeClock:
 
 
 class _StubQwen:
-    """Stub QwenClient that returns a canned classification."""
+    """Stub LLMClient that returns a canned classification."""
 
     def __init__(self, payload: Optional[dict] = None) -> None:
         self.payload = payload or {
@@ -407,7 +407,7 @@ async def test_motion_pipeline_writes_to_noise_route():
         return Path("/tmp/noise.md")
 
     pipeline = MotionPipeline(
-        qwen_client=_StubQwen(),
+        llm_client=_StubQwen(),
         vault=None,
         write_note=_notes,
         write_noise=_noise,
@@ -451,7 +451,7 @@ async def test_security_motion_stays_on_notes_route():
         return Path("/tmp/noise.md")
 
     pipeline = MotionPipeline(
-        qwen_client=_StubQwen(),
+        llm_client=_StubQwen(),
         vault=None,
         write_note=_notes,
         write_noise=_noise,
@@ -481,7 +481,7 @@ async def test_degraded_motion_note_routes_to_notes_during_outage():
 
     class _BrokenQwen:
         async def complete(self, prompt: str) -> dict:
-            raise QwenUnreachable("desktop offline")
+            raise LLMUnreachable("desktop offline")
 
     notes_writes: list[dict] = []
     noise_writes: list[dict] = []
@@ -495,7 +495,7 @@ async def test_degraded_motion_note_routes_to_notes_during_outage():
         return Path("/tmp/noise.md")
 
     pipeline = MotionPipeline(
-        qwen_client=_BrokenQwen(),
+        llm_client=_BrokenQwen(),
         write_note=_notes,
         write_noise=_noise,
         security_predicate=lambda _e: False,
@@ -544,7 +544,7 @@ async def test_wake_loop_backstop_routes_light_level_to_noise():
         write_noise_fn=_noise,
         noise_coalescer=coalescer,
     )
-    from alice_cozylobe.qwen_client import QwenClassification
+    from core.llm_client import QwenClassification
 
     event = CozyHemEvent(
         kind="entity:update",
@@ -593,7 +593,7 @@ async def test_wake_loop_backstop_flushes_light_level_at_threshold():
         write_noise_fn=_noise,
         noise_coalescer=coalescer,
     )
-    from alice_cozylobe.qwen_client import QwenClassification
+    from core.llm_client import QwenClassification
 
     classification = QwenClassification(
         urgency="LOW",
@@ -645,7 +645,7 @@ async def test_wake_loop_backstop_routes_signal_event_to_notes():
         write_note_fn=_notes,
         write_noise_fn=_noise,
     )
-    from alice_cozylobe.qwen_client import QwenClassification
+    from core.llm_client import QwenClassification
 
     event = CozyHemEvent(
         kind="entity:update",
@@ -690,7 +690,7 @@ async def test_wake_loop_flush_stale_noise_drains_buffer():
         write_noise_fn=_noise,
         noise_coalescer=coalescer,
     )
-    from alice_cozylobe.qwen_client import QwenClassification
+    from core.llm_client import QwenClassification
 
     event = CozyHemEvent(
         kind="entity:update",

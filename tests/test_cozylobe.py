@@ -31,9 +31,9 @@ from alice_cozylobe import (
     ActivityFetcher,
     ActivitySnapshot,
     CozyHemEvent,
+    LLMClient,
+    LLMUnreachable,
     QwenClassification,
-    QwenClient,
-    QwenUnreachable,
     SSEConsumer,
     WakeLoop,
     write_observation_note,
@@ -249,7 +249,7 @@ class _StubQwen:
     """In-process qwen client double.
 
     Returns the supplied :class:`QwenClassification` on every call, or
-    raises :class:`QwenUnreachable` when configured to. Lets tests
+    raises :class:`LLMUnreachable` when configured to. Lets tests
     cover both the happy-path and the lobe-quiet-on-link-loss path
     without standing up the real desktop-3090 endpoint.
     """
@@ -267,7 +267,7 @@ class _StubQwen:
     async def classify(self, event, *, context=None) -> QwenClassification:
         self.call_count += 1
         if self._unreachable:
-            raise QwenUnreachable("simulated outage")
+            raise LLMUnreachable("simulated outage")
         assert self._classification is not None
         return self._classification
 
@@ -307,7 +307,7 @@ async def test_wake_loop_dispatches_cozylobe_agent_spec(
     stub_run = _StubRunAgent()
     loop = WakeLoop(
         emitter=emitter,
-        qwen_client=qwen,
+        llm_client=qwen,
         run_agent_fn=stub_run,
     )
 
@@ -348,7 +348,7 @@ async def test_wake_loop_dispatches_cozylobe_agent_spec(
 async def test_wake_loop_qwen_unreachable_does_not_crash(
     tmp_path, monkeypatch, caplog
 ) -> None:
-    """When qwen raises QwenUnreachable, the wake loop logs once,
+    """When qwen raises LLMUnreachable, the wake loop logs once,
     skips the backstop note, dispatches the agent anyway with a
     "qwen unreachable" prompt block, and stays alive for the next
     event."""
@@ -361,7 +361,7 @@ async def test_wake_loop_qwen_unreachable_does_not_crash(
     stub_run = _StubRunAgent()
     loop = WakeLoop(
         emitter=emitter,
-        qwen_client=qwen,
+        llm_client=qwen,
         run_agent_fn=stub_run,
     )
 
@@ -387,7 +387,7 @@ async def test_wake_loop_qwen_unreachable_does_not_crash(
             except (asyncio.CancelledError, Exception):
                 pass
 
-    # Both events dispatched (the loop did NOT crash on QwenUnreachable).
+    # Both events dispatched (the loop did NOT crash on LLMUnreachable).
     assert len(stub_run.calls) == 2
     for call in stub_run.calls:
         assert "UNREACHABLE" in call["prompt"]
@@ -419,7 +419,7 @@ async def test_wake_loop_critical_kind_fast_path_surfaces_without_agent(
     stub_run = _StubRunAgent()
     loop = WakeLoop(
         emitter=emitter,
-        qwen_client=qwen,
+        llm_client=qwen,
         run_agent_fn=stub_run,
     )
 
@@ -580,15 +580,15 @@ class _UnreachableClient:
 
 
 @pytest.mark.asyncio
-async def test_qwen_client_raises_qwen_unreachable_on_connect_error() -> None:
+async def test_llm_client_raises_llm_unreachable_on_connect_error() -> None:
     """When the endpoint can't be reached, ``classify`` surfaces a
-    :class:`QwenUnreachable` so the wake loop catches it cleanly."""
-    client = QwenClient(
+    :class:`LLMUnreachable` so the wake loop catches it cleanly."""
+    client = LLMClient(
         "http://nowhere:1",
         http_client_factory=_UnreachableClient,
     )
     event = _make_event()
-    with pytest.raises(QwenUnreachable):
+    with pytest.raises(LLMUnreachable):
         await client.classify(event)
 
 
@@ -620,7 +620,7 @@ class _CannedClient:
 
 
 @pytest.mark.asyncio
-async def test_qwen_client_parses_actions_list() -> None:
+async def test_llm_client_parses_actions_list() -> None:
     canned_body = {
         "choices": [
             {
@@ -642,7 +642,7 @@ async def test_qwen_client_parses_actions_list() -> None:
             }
         ]
     }
-    client = QwenClient(
+    client = LLMClient(
         "http://nowhere:1",
         http_client_factory=lambda: _CannedClient(body=canned_body),
     )
@@ -653,19 +653,19 @@ async def test_qwen_client_parses_actions_list() -> None:
 
 
 @pytest.mark.asyncio
-async def test_qwen_client_raises_on_missing_actions() -> None:
+async def test_llm_client_raises_on_missing_actions() -> None:
     """A response missing the 'actions' list is treated as upstream
-    breakage — QwenUnreachable so the wake loop degrades gracefully."""
+    breakage — LLMUnreachable so the wake loop degrades gracefully."""
     canned_body = {
         "choices": [
             {"message": {"content": json.dumps({"not_actions": []})}}
         ]
     }
-    client = QwenClient(
+    client = LLMClient(
         "http://nowhere:1",
         http_client_factory=lambda: _CannedClient(body=canned_body),
     )
-    with pytest.raises(QwenUnreachable):
+    with pytest.raises(LLMUnreachable):
         await client.classify(_make_event())
 
 
@@ -850,7 +850,7 @@ async def test_periodic_wake_ticks_at_configured_cadence() -> None:
     stub_run = _StubRunAgent()
     loop = WakeLoop(
         emitter=emitter,
-        qwen_client=None,
+        llm_client=None,
         run_agent_fn=stub_run,
         fetch_activity=fake_fetch,
         periodic_cadence_s=0.05,
@@ -898,7 +898,7 @@ async def test_periodic_wake_skips_tick_when_snapshot_is_none() -> None:
     stub_run = _StubRunAgent()
     loop = WakeLoop(
         emitter=emitter,
-        qwen_client=None,
+        llm_client=None,
         run_agent_fn=stub_run,
         fetch_activity=unreachable_fetch,
         periodic_cadence_s=0.02,
@@ -945,7 +945,7 @@ async def test_periodic_wake_dispatches_periodic_review_event() -> None:
     stub_run = _StubRunAgent()
     loop = WakeLoop(
         emitter=emitter,
-        qwen_client=None,
+        llm_client=None,
         run_agent_fn=stub_run,
         fetch_activity=fake_fetch,
         periodic_cadence_s=10.0,  # plenty of time for exactly one tick
@@ -997,7 +997,7 @@ async def test_periodic_task_cancels_cleanly_on_stop() -> None:
     stub_run = _StubRunAgent()
     loop = WakeLoop(
         emitter=emitter,
-        qwen_client=None,
+        llm_client=None,
         run_agent_fn=stub_run,
         fetch_activity=fake_fetch,
         periodic_cadence_s=60.0,  # long cadence; stop must short-circuit it
@@ -1034,7 +1034,7 @@ async def test_periodic_task_disabled_when_no_fetcher() -> None:
     periodic path — run_periodic returns immediately so the daemon
     can supervise it without crashing."""
     emitter = CapturingEmitter()
-    loop = WakeLoop(emitter=emitter, qwen_client=None)
+    loop = WakeLoop(emitter=emitter, llm_client=None)
     stop = asyncio.Event()
     # Must return promptly even though stop is never set.
     await asyncio.wait_for(loop.run_periodic(stop), timeout=1.0)
