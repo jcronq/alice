@@ -16,9 +16,12 @@ Two public entry points:
   the caller validates the inner shape.
 * :meth:`LLMClient.classify` — cozylobe-specific helper that builds
   the urgency/intent classification prompt and parses the structured
-  response into a :class:`QwenClassification`. Currently tightly
-  coupled to :class:`alice_cozylobe.events.CozyHemEvent`; see the
-  BLOCKED ON note in the promotion PR (#436) for the next step.
+  response into a :class:`QwenClassification`. The ``event`` arg is
+  duck-typed (kind / entity_id / payload / received_at), not bound
+  to any concrete class — the original ``CozyHemEvent`` annotation
+  was dropped to keep ``core`` free of sibling-package imports. The
+  proper fix is to lift ``classify`` out of the generic client into
+  a cozylobe wrapper; tracked as follow-up to PR #437.
 
 **Graceful degrade contract** (design's "lobe-goes-quiet-on-link-loss"
 requirement): when the endpoint is unreachable, :meth:`classify` and
@@ -42,25 +45,9 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import Any, Optional
 
 import httpx
-
-# Backward type-checking-only import into alice_cozylobe. This is the
-# layering violation called out in the BLOCKED ON section of the
-# promotion PR (#436): cozylobe's event type leaks back into core via
-# :meth:`LLMClient.classify`'s type signature. Held under TYPE_CHECKING
-# to avoid a hard runtime cycle (cozylobe.__init__ also imports
-# LLMClient from this module). The classify() method only touches the
-# duck-typed attributes ``kind``, ``entity_id``, ``payload``,
-# ``received_at``, so the runtime is happy without the concrete type.
-# The clean fix is to split the cozylobe-specific classification
-# helper into its own cozylobe module (CozyHemClassifier wrapping an
-# LLMClient) and remove this import entirely. Out of scope for the
-# file move.
-if TYPE_CHECKING:
-    from alice_cozylobe.events import CozyHemEvent
-
 
 __all__ = [
     "DEFAULT_ENDPOINT",
@@ -201,7 +188,7 @@ class LLMClient:
 
     async def classify(
         self,
-        event: "CozyHemEvent",
+        event: Any,
         *,
         context: Optional[dict] = None,
     ) -> QwenClassification:
@@ -281,7 +268,7 @@ class LLMClient:
                 f"llm endpoint {self._endpoint} unreachable or errored: {exc}"
             ) from exc
 
-    def _build_prompt(self, event: "CozyHemEvent", context: dict) -> str:
+    def _build_prompt(self, event: Any, context: dict) -> str:
         """Render the qwen-prompt template from the design note.
 
         Walking-skeleton scope: single-event prompt rather than the
