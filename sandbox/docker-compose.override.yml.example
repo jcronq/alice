@@ -1,0 +1,72 @@
+# docker-compose.override.yml.example — optional cozylobe sidecar.
+#
+# Phase 1 plugin architecture (research/2026-05-30-plugin-architecture-phase1-draft).
+# By default, `docker compose -f sandbox/docker-compose.yml up -d` builds and
+# runs only the `main` Dockerfile target — no cozylobe code is in the image
+# and no cozylobe processes run. This file is the opt-in.
+#
+# To enable the cozylobe sidecar:
+#
+#   1. Copy this file to docker-compose.override.yml (no `.example` suffix):
+#        cp sandbox/docker-compose.override.yml.example \
+#           sandbox/docker-compose.override.yml
+#      The plain name is gitignored, so per-host customizations stay local.
+#
+#   2. Build the cozylobe target and bring the profile up:
+#        docker compose -f sandbox/docker-compose.yml \
+#                       -f sandbox/docker-compose.override.yml \
+#                       --profile cozylobe up -d
+#
+# The cozylobe service shares the same alice-mind, alice-tools, alice-repo,
+# signal-cli, and host-state bind mounts as the main alice container so it
+# can write to inner/notes/ and read inner/surface/ alongside speaking and
+# thinking. It needs `aimax1:host-gateway` for its SSE connection to
+# cozyhem-engine on the host (same as the main container's extra_hosts).
+
+services:
+  cozylobe:
+    image: alice-cozylobe:latest
+    container_name: alice-cozylobe
+    hostname: alice-cozylobe
+    profiles: ["cozylobe"]
+    restart: unless-stopped
+    # 10 min mirrors the cozylobe s6 drain budget — much shorter than the
+    # main container's 30 min because cozylobe has no claude-turn or wake
+    # cycles in flight.
+    stop_grace_period: 10m
+    build:
+      context: ..
+      dockerfile: sandbox/Dockerfile
+      target: cozylobe
+      args:
+        USER_ID: ${USER_ID:-1000}
+        GROUP_ID: ${GROUP_ID:-1000}
+    environment:
+      ALICE_MIND: "/home/alice/alice-mind"
+      ALICE_STATE: "/state/worker"
+      ALICE_CLI_SOCKET: "/state/alice.sock"
+      ALICE_CONFIG: "/home/alice/.config/alice/alice.env"
+      TZ: "${ALICE_TZ:-America/New_York}"
+      PATH: "/home/alice/alice-tools/bin:/home/alice/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    volumes:
+      # Shared with main alice container so cozylobe can drop notes into
+      # inner/notes/ for thinking to drain.
+      - ${ALICE_MIND:-${HOME}/alice-mind}:/home/alice/alice-mind
+      - ${ALICE_TOOLS:-${HOME}/alice-tools}:/home/alice/alice-tools
+      # Monorepo bind: the cozylobe s6 run scripts set PYTHONPATH to
+      # /home/alice/alice/src and import cozylobe_cortex from there.
+      - ${ALICE_REPO:-${HOME}/alice}:/home/alice/alice
+      # Shared state — alice.sock for talking to the speaking daemon RPC.
+      - ${HOME}/.local/state/alice:/state
+      # signal-cli account is read-only here — cozylobe doesn't send
+      # messages directly; it surfaces via inner/notes/.
+      - ${HOME}/.local/share/signal-cli:/home/alice/.local/share/signal-cli:ro
+      - ${HOME}/.config/alice:/home/alice/.config/alice:ro
+    # Route `aimax1` to the docker bridge gateway so cozylobe's SSE
+    # consumer can reach cozyhem-engine on the host. Mirrors the main
+    # container's extra_hosts entry (added 2026-05-24 after "All
+    # connection attempts failed" loops).
+    extra_hosts:
+      - "aimax1:host-gateway"
+    depends_on:
+      - alice

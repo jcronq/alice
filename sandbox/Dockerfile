@@ -1,13 +1,23 @@
-FROM debian:trixie-slim
+FROM debian:trixie-slim AS base
 
 # Single-container fold of sandbox/worker/Dockerfile + sandbox/daemon/Dockerfile
 # + sandbox/viewer/Dockerfile (issue #152 / EKS Phase 2 §1). The three legacy
 # Dockerfiles stay in place until the docker-compose / alice-deploy cutover
 # lands; this image is additive scaffolding for now.
 #
-# Layer order is least-churning → most-churning so warm rebuilds touch only the
-# top layers: base → OS deps → signal-cli → node globals → python venv → s6
-# overlay → user/dirs → app scripts → s6 tree → env.
+# Phase 1 plugin architecture (research/2026-05-30-plugin-architecture-phase1-draft):
+# the build splits into three stages — `base` (shared deps), `main` (default
+# alice, all s6 services except cozylobe), and `cozylobe` (sidecar with the
+# two cozylobe services only). Default `docker compose up -d` builds and runs
+# the `main` target; opt into cozylobe via docker-compose.override.yml.example
+# plus `--profile cozylobe`. Per-stage s6 copy is what makes "code not on disk"
+# real for opt-out users: the main image carries no cozylobe service dirs and
+# no cozylobe entry in the s6 user bundle.
+#
+# Layer order in base is least-churning → most-churning so warm rebuilds touch
+# only the top layers: base → OS deps → signal-cli → node globals → python venv
+# → s6 overlay → user/dirs → app scripts.  Per-stage layers (s6 tree, env,
+# healthcheck, expose) come after the shared base.
 
 ARG USER_ID=1000
 ARG GROUP_ID=1000
@@ -130,22 +140,100 @@ COPY --chown=alice:alice sandbox/alice.gitconfig /home/alice/.gitconfig
 # at the old `sm.dispatcher` module path while the host source had
 # already been updated to `alice_forge.dispatcher`.
 
-# Merged s6 tree — daemon + worker + new alice-viewer unit.
-COPY sandbox/s6/ /etc/s6-overlay/s6-rc.d/
+# Make the entrypoint executable in the base layer so both derived stages
+# inherit the correct mode without re-running chmod.
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
-RUN chmod +x /usr/local/bin/entrypoint.sh \
-    && find /etc/s6-overlay/s6-rc.d \( -name 'run' -o -name 'up' -o -name 'finish' \) | xargs -r chmod +x
-
+# Shared env — both `main` and `cozylobe` derive from base, so PATH, HOME,
+# S6_KEEP_ENV, WORKDIR are set once here and inherited.
 ENV HOME=/home/alice
 # User's personal sidecars (/home/alice/alice-tools/bin) shadow built-ins.
 ENV PATH=/home/alice/alice-tools/bin:/home/alice/.local/bin:/usr/local/bin:/usr/bin:/bin
 ENV S6_KEEP_ENV=1
 
+WORKDIR /home/alice/alice-mind
+
+# ============================================================
+# Stage 2: cozylobe — optional sidecar with cozylobe services only.
+# ============================================================
+# Built only when the caller passes `--target cozylobe` (or the compose
+# override's `build.target: cozylobe`). Defined before `main` so that
+# `main` remains the Dockerfile's final stage and is what Docker picks
+# when no `target:` is set — preserving the canonical `docker compose
+# build alice` invocation in docker-compose.yml unchanged (#422 #423 #424).
+# Carries the two cozylobe s6 services plus init-state-perms (their only
+# dependency). No HEALTHCHECK and no EXPOSE — the sidecar publishes no
+# host ports, and its liveness is observed via the shared inner/notes/
+# filesystem, not HTTP.
+FROM base AS cozylobe
+
+COPY sandbox/s6/alice-cozylobe/                /etc/s6-overlay/s6-rc.d/alice-cozylobe/
+COPY sandbox/s6/alice-cozylobe-reload-watcher/ /etc/s6-overlay/s6-rc.d/alice-cozylobe-reload-watcher/
+COPY sandbox/s6/init-state-perms/              /etc/s6-overlay/s6-rc.d/init-state-perms/
+
+# Cozylobe-only user bundle.
+COPY sandbox/s6/user/type                                       /etc/s6-overlay/s6-rc.d/user/type
+COPY sandbox/s6/user/contents.d/alice-cozylobe                  /etc/s6-overlay/s6-rc.d/user/contents.d/alice-cozylobe
+COPY sandbox/s6/user/contents.d/alice-cozylobe-reload-watcher   /etc/s6-overlay/s6-rc.d/user/contents.d/alice-cozylobe-reload-watcher
+COPY sandbox/s6/user/contents.d/init-state-perms                /etc/s6-overlay/s6-rc.d/user/contents.d/init-state-perms
+
+RUN find /etc/s6-overlay/s6-rc.d \( -name 'run' -o -name 'up' -o -name 'finish' \) | xargs -r chmod +x
+
+ENTRYPOINT ["/init"]
+CMD ["/usr/local/bin/entrypoint.sh", "sleep", "infinity"]
+
+# ============================================================
+# Stage 3: main — default alice container, all s6 services except cozylobe.
+# ============================================================
+# Final stage — picked by default when no `--target` is set, so the
+# canonical docker-compose.yml that omits `target:` still produces the
+# cozylobe-free image. This stage must NOT include any cozylobe service
+# dirs or cozylobe entries in the s6 user bundle; that's what makes the
+# opt-out real (issues #422 #423 #424).
+FROM base AS main
+
+# Per-stage s6 copy: 14 non-cozylobe service dirs plus init-state-perms.
+# Compared with the pre-split blanket `COPY sandbox/s6/`, this:
+#   1. Omits alice-cozylobe/ and alice-cozylobe-reload-watcher/ entirely.
+#   2. Builds a stage-specific user bundle (contents.d/) below, so s6 does
+#      not try to bring up services whose dirs don't exist.
+COPY sandbox/s6/alice-autopush/         /etc/s6-overlay/s6-rc.d/alice-autopush/
+COPY sandbox/s6/alice-embedder/         /etc/s6-overlay/s6-rc.d/alice-embedder/
+COPY sandbox/s6/alice-gh-reconciler/    /etc/s6-overlay/s6-rc.d/alice-gh-reconciler/
+COPY sandbox/s6/alice-gh-watcher/       /etc/s6-overlay/s6-rc.d/alice-gh-watcher/
+COPY sandbox/s6/alice-reload-watcher/   /etc/s6-overlay/s6-rc.d/alice-reload-watcher/
+COPY sandbox/s6/alice-repo-autopull/    /etc/s6-overlay/s6-rc.d/alice-repo-autopull/
+COPY sandbox/s6/alice-sm-dispatcher/    /etc/s6-overlay/s6-rc.d/alice-sm-dispatcher/
+COPY sandbox/s6/alice-speaking/         /etc/s6-overlay/s6-rc.d/alice-speaking/
+COPY sandbox/s6/alice-thinker/          /etc/s6-overlay/s6-rc.d/alice-thinker/
+COPY sandbox/s6/alice-thinker-watchdog/ /etc/s6-overlay/s6-rc.d/alice-thinker-watchdog/
+COPY sandbox/s6/alice-viewer/           /etc/s6-overlay/s6-rc.d/alice-viewer/
+COPY sandbox/s6/init-state-perms/       /etc/s6-overlay/s6-rc.d/init-state-perms/
+COPY sandbox/s6/signal-daemon/          /etc/s6-overlay/s6-rc.d/signal-daemon/
+
+# User bundle — copy the dir itself for `type`, then enumerate the
+# non-cozylobe `contents.d/` entries explicitly. Listing only services whose
+# dirs we copied above keeps s6 from failing on a missing-bundle reference.
+COPY sandbox/s6/user/type                                       /etc/s6-overlay/s6-rc.d/user/type
+COPY sandbox/s6/user/contents.d/alice-autopush                  /etc/s6-overlay/s6-rc.d/user/contents.d/alice-autopush
+COPY sandbox/s6/user/contents.d/alice-embedder                  /etc/s6-overlay/s6-rc.d/user/contents.d/alice-embedder
+COPY sandbox/s6/user/contents.d/alice-gh-reconciler             /etc/s6-overlay/s6-rc.d/user/contents.d/alice-gh-reconciler
+COPY sandbox/s6/user/contents.d/alice-gh-watcher                /etc/s6-overlay/s6-rc.d/user/contents.d/alice-gh-watcher
+COPY sandbox/s6/user/contents.d/alice-reload-watcher            /etc/s6-overlay/s6-rc.d/user/contents.d/alice-reload-watcher
+COPY sandbox/s6/user/contents.d/alice-repo-autopull             /etc/s6-overlay/s6-rc.d/user/contents.d/alice-repo-autopull
+COPY sandbox/s6/user/contents.d/alice-sm-dispatcher             /etc/s6-overlay/s6-rc.d/user/contents.d/alice-sm-dispatcher
+COPY sandbox/s6/user/contents.d/alice-speaking                  /etc/s6-overlay/s6-rc.d/user/contents.d/alice-speaking
+COPY sandbox/s6/user/contents.d/alice-thinker                   /etc/s6-overlay/s6-rc.d/user/contents.d/alice-thinker
+COPY sandbox/s6/user/contents.d/alice-thinker-watchdog          /etc/s6-overlay/s6-rc.d/user/contents.d/alice-thinker-watchdog
+COPY sandbox/s6/user/contents.d/alice-viewer                    /etc/s6-overlay/s6-rc.d/user/contents.d/alice-viewer
+COPY sandbox/s6/user/contents.d/init-state-perms                /etc/s6-overlay/s6-rc.d/user/contents.d/init-state-perms
+COPY sandbox/s6/user/contents.d/signal-daemon                   /etc/s6-overlay/s6-rc.d/user/contents.d/signal-daemon
+
+RUN find /etc/s6-overlay/s6-rc.d \( -name 'run' -o -name 'up' -o -name 'finish' \) | xargs -r chmod +x
+
 # Viewer port published from the same container now; speaking + signal-cli
 # stay on localhost (no inter-container DNS hop).
 EXPOSE 7777
-
-WORKDIR /home/alice/alice-mind
 
 # Readiness = viewer responding AND speaking + thinking heartbeats fresh.
 # Docker honors only one HEALTHCHECK per image, so the three probes combine

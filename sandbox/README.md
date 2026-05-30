@@ -111,6 +111,32 @@ services:
 Compose merges automatically. Sidecars are accessible from within Alice's
 environment without modifying the base runtime.
 
+## Optional cozylobe sidecar (Phase 1 plugin architecture)
+
+The image is built in stages — `base` (shared deps), `main` (default
+alice, no cozylobe code), and `cozylobe` (sidecar with the cozylobe s6
+services only). By default `docker compose up -d` builds and runs only
+`main`, so hosts without smart-home reachability carry no cozylobe code on
+disk and run no cozylobe processes (issues #422, #423, #424; follow-up to
+#425's runtime env-flag stopgap).
+
+To enable cozylobe:
+
+```bash
+cp sandbox/docker-compose.override.yml.example \
+   sandbox/docker-compose.override.yml
+# edit if you need host-specific volumes / env, then:
+docker compose -f sandbox/docker-compose.yml \
+               -f sandbox/docker-compose.override.yml \
+               --profile cozylobe up -d
+```
+
+The plain `docker-compose.override.yml` filename is gitignored, so each
+host can customize its own override without touching the repo. For richer
+customization (extra volumes, host-specific env), edit the override copy.
+The canonical `sandbox/docker-compose.yml` is unchanged and is shared by
+all users.
+
 ## Known tradeoffs
 
 - **Network isolation is soft.** The bridge network lets Alice reach your
