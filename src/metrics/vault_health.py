@@ -1528,7 +1528,7 @@ def count_stage_c_candidates(
     if vault_dir.exists():
         for md in vault_dir.rglob("*.md"):
             rel_parts = md.relative_to(vault_dir).parts
-            if rel_parts and rel_parts[0] == "dailies":
+            if rel_parts and rel_parts[0] in {"dailies", "archive"}:
                 continue
             if md.name in EXCLUDED_NAMES:
                 continue
