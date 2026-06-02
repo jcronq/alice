@@ -1,8 +1,13 @@
-"""Plan 03 Phase 3: selector dispatches by local hour.
+"""Phase 5 (2026-06-02) cutover: selector always returns ActiveMode.
 
 Pure-function unit tests — no I/O, no time-of-day flakiness.
 ``select_mode`` takes an explicit ``now`` so tests pin behavior
 deterministically.
+
+Pre-phase-5, the selector dispatched between :class:`ActiveMode` and
+:class:`SleepMode` on local hour. Phase 5 retired ``SleepMode`` (the
+former sleep-stage work moved to the ``alice-memory-worker`` service);
+the selector now returns :class:`ActiveMode` unconditionally.
 """
 
 from __future__ import annotations
@@ -12,8 +17,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from alice_thinking.modes import ActiveMode, SleepMode
-from alice_thinking.phase import Phase
+from alice_thinking.modes import ActiveMode
 from alice_thinking.selector import is_active_hour, select_mode
 
 
@@ -30,42 +34,28 @@ def test_selector_returns_active_during_day(hour: int) -> None:
 
 
 @pytest.mark.parametrize("hour", [23, 0, 1, 3, 6])
-def test_selector_returns_sleep_during_night(hour: int) -> None:
-    assert isinstance(select_mode(now=_at(hour)), SleepMode)
+def test_selector_returns_active_at_night_post_phase5(hour: int) -> None:
+    """Phase 5: night-hour wakes route to ActiveMode (sleep retired)."""
+    assert isinstance(select_mode(now=_at(hour)), ActiveMode)
 
 
 def test_active_window_endpoints() -> None:
-    """Boundary check: 07:00 active, 23:00 sleep, 06:59 sleep."""
-    assert is_active_hour(7) is True
-    assert is_active_hour(22) is True
-    assert is_active_hour(23) is False
-    assert is_active_hour(6) is False
-    assert is_active_hour(0) is False
-
-
-def test_sleep_mode_defaults_to_phase_sleep_b() -> None:
-    """Phase routing migration Phase 0/1: SleepMode wraps PhaseRunner
-    pinned to ``Phase.SLEEP_B`` (matching the legacy Stage B
-    behavior). Phase 3 of the migration unlocks B/C/D dispatch."""
-    sm = SleepMode()
-    assert sm.phase is Phase.SLEEP_B
-    # The stage label flows through to wake_start.mode for telemetry.
-    assert sm.stage == "sleep_b"
+    """Post phase 5, every hour is active — the function exists for
+    back-compat with external callers that key off the schedule."""
+    for h in (0, 6, 7, 22, 23):
+        assert is_active_hour(h) is True
 
 
 def test_selector_dst_aware() -> None:
-    """DST: 2026-03-08 02:00 → skipped to 03:00 in America/New_York.
-    Selector reads tz-aware hour, so the wake's local-hour view is
-    consistent across the transition."""
+    """DST transitions don't change dispatch — thinking is single-mode."""
     spring_forward = datetime(2026, 3, 8, 3, 30, tzinfo=WAKE_TZ)
     fall_back = datetime(2026, 11, 1, 1, 30, tzinfo=WAKE_TZ)
-    # Both are <7am → sleep.
-    assert isinstance(select_mode(now=spring_forward), SleepMode)
-    assert isinstance(select_mode(now=fall_back), SleepMode)
+    assert isinstance(select_mode(now=spring_forward), ActiveMode)
+    assert isinstance(select_mode(now=fall_back), ActiveMode)
 
 
 def test_selector_accepts_vault_and_cfg_kwargs() -> None:
-    """Phase 3 ignores them; the kwargs exist so Phase 4 can wire
-    state-driven sleep sub-stage logic without changing callers."""
+    """Phase 5 ignores them; the kwargs exist so back-compat callers
+    that still pass ``vault`` / ``cfg`` don't break."""
     mode = select_mode(now=_at(10), vault={"anything": "ignored"}, cfg={})
     assert isinstance(mode, ActiveMode)

@@ -164,8 +164,12 @@ def _stub_main_dependencies(monkeypatch, tmp_path, *, phase_value):
 
     captured: dict[str, Any] = {"runs": [], "events": []}
 
-    monkeypatch.setattr(wake_module, "build_vault_snapshot", lambda *a, **kw: object())
-    monkeypatch.setattr(wake_module, "select_phase", lambda *a, **kw: phase_value)
+    # Phase 5 cutover (2026-06-02): wake.main() no longer calls
+    # ``build_vault_snapshot`` or ``select_phase`` — the dispatch is
+    # ACTIVE / QUICK / preempt only. ``phase_value`` is left in the
+    # signature for back-compat but is informational; the live path
+    # always returns Phase.ACTIVE unless a preempt fires.
+    del phase_value  # noqa: F841 — accepted for back-compat but unused.
     monkeypatch.setattr(wake_module, "detect_commission_notes", lambda *a, **kw: [])
     monkeypatch.setattr(wake_module, "detect_conflict_notes", lambda *a, **kw: [])
     monkeypatch.setattr(wake_module, "ensure_auth_env", lambda *a, **kw: None)
@@ -249,9 +253,15 @@ def _write_model_yml(tmp_path: pathlib.Path, body: str) -> None:
 
 
 def test_stage_override_applies_when_configured(monkeypatch, tmp_path) -> None:
-    """Phase.SLEEP_D + thinking.stages.sleep_d in model.yml → run_wake
+    """Phase.ACTIVE + thinking.stages.active in model.yml → run_wake
     receives the override BackendSpec and a stage_backend_override
-    event is emitted."""
+    event is emitted.
+
+    Phase 5 cutover: the override path now keys off ACTIVE rather than
+    SLEEP_D (sleep dispatch moved to the memory worker). Behavior is
+    identical — the override block under ``thinking.stages.<stage>``
+    overrides the base spec when the live phase matches.
+    """
     from alice_thinking.phase import Phase
 
     _write_model_yml(
@@ -262,13 +272,13 @@ def test_stage_override_applies_when_configured(monkeypatch, tmp_path) -> None:
           backend: pi
           model: openai-local/Qwen3.6-35B
           stages:
-            sleep_d:
+            active:
               backend: subscription
               harness: claude-code
               model: claude-sonnet-4-6
         """,
     )
-    captured = _stub_main_dependencies(monkeypatch, tmp_path, phase_value=Phase.SLEEP_D)
+    captured = _stub_main_dependencies(monkeypatch, tmp_path, phase_value=Phase.ACTIVE)
     monkeypatch.setattr(
         "sys.argv",
         [
@@ -295,7 +305,7 @@ def test_stage_override_applies_when_configured(monkeypatch, tmp_path) -> None:
     events = captured["events_in"]
     overrides = [f for ev, f in events if ev == "stage_backend_override"]
     assert overrides, f"no stage_backend_override event in {events!r}"
-    assert overrides[0]["phase"] == "sleep_d"
+    assert overrides[0]["phase"] == "active"
     assert overrides[0]["backend"] == "subscription"
     assert overrides[0]["model"] == "claude-sonnet-4-6"
 
@@ -316,7 +326,7 @@ def test_stage_override_absent_leaves_thinking_spec_unchanged(
           model: openai-local/Qwen3.6-35B
         """,
     )
-    captured = _stub_main_dependencies(monkeypatch, tmp_path, phase_value=Phase.SLEEP_D)
+    captured = _stub_main_dependencies(monkeypatch, tmp_path, phase_value=Phase.ACTIVE)
     monkeypatch.setattr(
         "sys.argv",
         [
@@ -355,13 +365,13 @@ def test_cli_backend_flag_wins_over_stage_override(monkeypatch, tmp_path) -> Non
           backend: pi
           model: openai-local/Qwen3.6-35B
           stages:
-            sleep_d:
+            active:
               backend: subscription
               harness: claude-code
               model: claude-sonnet-4-6
         """,
     )
-    captured = _stub_main_dependencies(monkeypatch, tmp_path, phase_value=Phase.SLEEP_D)
+    captured = _stub_main_dependencies(monkeypatch, tmp_path, phase_value=Phase.ACTIVE)
     monkeypatch.setattr(
         "sys.argv",
         [

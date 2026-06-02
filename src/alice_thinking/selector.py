@@ -4,17 +4,13 @@
 time, an optional vault-state snapshot, and the resolved thinking
 config, return the :class:`Mode` to drive this wake.
 
-Phase 3 dispatches by hour:
-
-- 07:00–22:59 local → :class:`ActiveMode`
-- 23:00–06:59 local → :class:`SleepMode` (which Phase 3 stubs to
-  always pick :class:`ConsolidationStage`).
-
-Phase 4 (deferred — behavior change) wires the SleepMode sub-stage
-selector spelled out in ``inner/directive.md`` Step 0.
-
-The hour comparison uses the tz-aware ``now.hour`` so DST
-transitions Just Work — :mod:`zoneinfo` does the conversion.
+Phase 5 of the memory-worker extraction (2026-06-02) retired
+:class:`SleepMode` — thinking is single-mode and always returns
+:class:`ActiveMode`. The hour-based dispatch the original
+implementation did is no longer needed because the former sleep-stage
+work (B/C/D) moved to the ``alice-memory-worker`` service. The
+function signature is preserved for callers that still pass ``now``
++ ``vault``; both are accepted and ignored.
 """
 
 from __future__ import annotations
@@ -22,21 +18,21 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Optional
 
-from .modes import ActiveMode, Mode, SleepMode
+from .modes import ActiveMode, Mode
 
 
-# Plan 03 design: active window is 07:00–23:00 local. Outside that
-# window we're in sleep. Constants kept here so Phase 3 tests + the
-# Phase 1 open question (config override) have one place to look.
-ACTIVE_HOUR_START = 7
-ACTIVE_HOUR_END = 23
+# Plan 03 design: active window was 07:00–23:00 local. Phase 5 (2026-06-02)
+# made it 24/7 — thinking is single-mode. Constants kept for any external
+# caller that reads ``is_active_hour`` for its own bookkeeping.
+ACTIVE_HOUR_START = 0
+ACTIVE_HOUR_END = 24
 
 
 def is_active_hour(hour: int) -> bool:
-    """Return True if ``hour`` falls in the active window.
+    """Return True for any hour — thinking is always active post phase 5.
 
-    Active window is closed on the start, open on the end:
-    ``[07:00, 23:00)``. So 22:xx is active; 23:00 onward is sleep.
+    Kept as a pure function so external callers reading the schedule
+    don't break. Use :func:`select_mode` for the live dispatch.
     """
     return ACTIVE_HOUR_START <= hour < ACTIVE_HOUR_END
 
@@ -49,10 +45,9 @@ def select_mode(
 ) -> Mode:
     """Return the :class:`Mode` to drive this wake.
 
-    Phase 3 contract: hour-based dispatch. ``vault`` + ``cfg`` are
-    accepted now to keep the signature stable across phases —
-    Phase 4 consumes ``vault`` for SleepMode sub-stage selection.
+    Phase 5 contract: always :class:`ActiveMode`. ``now``, ``vault``,
+    ``cfg`` are accepted for back-compat but unused — the dispatch is
+    unconditional.
     """
-    if is_active_hour(now.hour):
-        return ActiveMode()
-    return SleepMode()
+    del now, vault, cfg  # accepted for back-compat; unused.
+    return ActiveMode()

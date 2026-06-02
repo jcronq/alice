@@ -109,27 +109,8 @@ def test_selector_returns_active_mode(tmp_path) -> None:
     assert isinstance(mode, ActiveMode)
 
 
-def test_sleep_mode_loads_sleep_b_fragment(tmp_path) -> None:
-    """SleepMode wraps PhaseRunner pinned to Phase.SLEEP_B. The
-    composed prompt picks up sleep-b.md rather than active.md."""
-    from alice_thinking.modes import SleepMode
-
-    ctx = _ctx(tmp_path)
-    out = asyncio.run(SleepMode().build_prompt(ctx))
-    assert "Stage B (Consolidation)" in out
-    # Should NOT carry the active-mode-only Step 2b context-summary §4 drain.
-    assert "context-summary §4" not in out
-
-
-def test_active_and_sleep_render_distinct_phase_bodies(tmp_path) -> None:
-    """Phase routing intent: active and sleep wakes load different
-    phase fragments. Both share the prelude verbatim."""
-    from alice_thinking.modes import SleepMode
-
-    ctx = _ctx(tmp_path)
-    a = asyncio.run(ActiveMode().build_prompt(ctx))
-    s = asyncio.run(SleepMode().build_prompt(ctx))
-    assert a != s
-    # Both pick up the same prelude.
-    assert "Thinking Alice — wake" in a
-    assert "Thinking Alice — wake" in s
+# Phase 5 cutover (2026-06-02): ``SleepMode`` retired. The two tests
+# that previously asserted SleepMode loaded ``sleep-b.md`` are removed —
+# the memory worker owns the former sleep-stage work. ActiveMode is
+# now the only Mode in the public API; ``select_mode`` returns it
+# unconditionally regardless of clock hour.

@@ -7,10 +7,16 @@ from the s6 supervisor. Each invocation:
    thinking.backend → ``ensure_auth_env(mode_hint=...)``).
 2. Applies ``thinking.*`` overrides from ``alice.config.json``.
 3. Loads personae + installs a mind-aware prompt loader.
-4. Builds a :class:`WakeContext` and asks the selector for the
-   :class:`Mode` (today: always ``ActiveMode``; Phase 3 introduces
-   hour-based dispatch).
+4. Builds a :class:`WakeContext` and dispatches to :class:`ActiveMode`
+   (or one of the task-type preempts: design commission, conflict
+   resolution).
 5. Runs the wake via :func:`alice_thinking.kernel_adapter.run_wake`.
+
+Phase 5 of the memory-worker extraction (2026-06-02) retired the
+sleep-mode dispatch. Thinking is now single-mode (always generative)
+on a 5-min cadence; inbox drain + vault grooming (the former B/C/D
+stages) moved to the ``alice-memory-worker`` service on a 30-min
+cadence. See ``cortex-memory/research/2026-06-01-memory-worker-extraction-design.md``.
 
 No handlers are composed — thinking doesn't persist sessions across
 wakes (each is fresh) and doesn't compact (Sonnet stays small by
@@ -45,49 +51,15 @@ from . import design_pipeline as _design_pipeline
 from .kernel_adapter import run_wake
 from .modes.active import ActiveMode
 from .modes.base import WakeContext
-from .modes.sleep import SleepMode
 from .phase import (
     Phase,
-    build_vault_snapshot,
     detect_commission_notes,
     detect_conflict_notes,
     record_conflict_deferral,
-    select_phase,
 )
 from .runtime import PhaseRunner, load_phase_config
 from .selector import select_mode
 from .vault_state import snapshot as snapshot_vault
-# Stage B workflow imports are deferred until a flag actually flips
-# (see ``_import_stage_b_workflow()``). The workflow depends on
-# ``google-adk`` + ``litellm``, which aren't required for the prompt-
-# driven path that runs by default. Import-at-module-load would
-# break every wake on a worker that hasn't pip-installed the new
-# deps yet — exactly what happened when PR #24 merged before the
-# next ``alice-deploy worker`` rebuild.
-
-
-def _import_stage_b_workflow() -> tuple:
-    """Lazy-import the Stage B workflow callables.
-
-    Raises ``ModuleNotFoundError`` with a clear message if the deps
-    aren't installed; callers gate this behind the workflow / shadow
-    flags so default-config wakes never hit it.
-    """
-    try:
-        from .workflows.stage_b import (
-            load_runner_config as load_cfg,
-            run_stage_b_shadow as run_shadow,
-            run_stage_b_wake as run_wake,
-        )
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "Stage B workflow dependencies missing. The "
-            "stage_b_workflow_enabled / stage_b_shadow_enabled flags "
-            "require google-adk + litellm. Install in the worker's venv "
-            "or rebuild the container via alice-deploy. Underlying "
-            f"error: {exc}"
-        ) from exc
-    return load_cfg, run_shadow, run_wake
 
 
 DEFAULT_MIND = pathlib.Path("/home/alice/alice-mind")
@@ -107,9 +79,6 @@ INTERVAL_FILE_NAME = "next-thinking-interval-seconds"
 
 _PHASE_TO_STAGE: dict[Phase, str] = {
     Phase.ACTIVE: "active",
-    Phase.SLEEP_B: "sleep_b",
-    Phase.SLEEP_C: "sleep_c",
-    Phase.SLEEP_D: "sleep_d",
 }
 
 
@@ -262,36 +231,6 @@ def _apply_config_overrides(args: argparse.Namespace) -> None:
         args.max_seconds = int(think["max_wake_seconds"])
     if args.tools == DEFAULT_TOOLS and "allowed_tools" in think:
         args.tools = ",".join(think["allowed_tools"])
-
-
-def _stage_b_workflow_flags(mind: pathlib.Path) -> tuple[bool, bool]:
-    """Read ``thinking.stage_b_workflow_enabled`` +
-    ``thinking.stage_b_shadow_enabled`` from ``alice.config.json``.
-
-    Both default ``False``. Cutover protocol per
-    ``docs/designs/stage-b-cutover.md``:
-
-    1. Both flags false (initial commit).
-    2. Flip ``stage_b_shadow_enabled=true`` to run the workflow in
-       shadow alongside the existing prompt-driven Stage B path.
-    3. Compare actions over a few wakes — workflow output should be a
-       strict subset of prompt output.
-    4. Flip ``stage_b_workflow_enabled=true`` to cut over.
-    """
-    cfg_path = mind / "config" / "alice.config.json"
-    if not cfg_path.is_file():
-        return False, False
-    try:
-        blob = json.loads(cfg_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return False, False
-    think = (blob or {}).get("thinking") or {}
-    if not isinstance(think, dict):
-        return False, False
-    return (
-        bool(think.get("stage_b_workflow_enabled", False)),
-        bool(think.get("stage_b_shadow_enabled", False)),
-    )
 
 
 def _load_personae(mind: pathlib.Path):
@@ -519,11 +458,11 @@ def main() -> int:
     _install_prompt_loader(mind, personae)
 
     ctx = _build_context(args, personae)
-    # Phase routing — design:
-    # cortex-memory/research/2026-05-07-thinking-phase-routing-design.md.
-    # Build the vault snapshot once at wake-start, pass it to
-    # ``select_phase``. ``--quick`` short-circuits to Phase.QUICK so
-    # the selector doesn't touch the filesystem in /tmp.
+    # Phase 5 (2026-06-02): thinking is single-mode. The legacy
+    # sleep-mode B/C/D dispatch moved to the alice-memory-worker
+    # service — see ``cortex-memory/research/2026-06-01-memory-worker-extraction-design.md``.
+    # The selector reduces to: ``--quick`` → QUICK, else task-type
+    # preempts (design commission, conflict resolution) → ACTIVE.
     phase_cfg = load_phase_config(mind)
     if args.quick:
         from dataclasses import replace as _replace
@@ -531,19 +470,13 @@ def main() -> int:
         phase_cfg = _replace(phase_cfg, quick_mode=True)
         phase = Phase.QUICK
     else:
-        snap = build_vault_snapshot(
-            mind,
-            now=ctx.now,
-            state_dir=pathlib.Path(args.state_dir),
-            cfg=phase_cfg,
-        )
-        phase = select_phase(snap, phase_cfg)
+        phase = Phase.ACTIVE
 
-        # Task-type preempts — these run BEFORE the cadence-routed
-        # phase fires. Order is deterministic:
+        # Task-type preempts — these run BEFORE the generative wake
+        # body. Order is deterministic:
         #   1. Design commission (Jason-explicit work) — highest priority.
         #   2. Conflict resolution (vault-state-driven) — vault hygiene.
-        #   3. Cadence routing (Active / Sleep B/C/D) — falls through.
+        #   3. Active generative wake — falls through.
         # Only one task-type wake per cron tick; oldest note wins
         # within a category.
 
@@ -619,72 +552,6 @@ def main() -> int:
                 model=thinking_spec.model,
             )
 
-    # Stage B workflow cutover — see ``docs/designs/stage-b-cutover.md``.
-    # When ``thinking.stage_b_workflow_enabled=true`` and the selected
-    # phase is SLEEP_B, route through the google-adk SequentialAgent
-    # workflow instead of the prompt-driven SleepMode. Shadow flag is
-    # honored separately below: it runs the workflow alongside the
-    # prompt path with apply_writes=False so cutover comparison can
-    # diff the two outputs without doubling LLM-induced side effects.
-    workflow_enabled, shadow_enabled = (
-        (False, False) if args.quick else _stage_b_workflow_flags(mind)
-    )
-
-    if not args.quick and phase == Phase.SLEEP_B and workflow_enabled:
-        wake_start_ts = time.time()
-        _load_stage_b_config, _run_stage_b_shadow, _run_stage_b_wake = (
-            _import_stage_b_workflow()
-        )
-        runner_cfg = _load_stage_b_config(
-            mind_dir=mind,
-            state_dir=pathlib.Path(args.state_dir),
-            wake_file_path=None,
-            now=ctx.now,
-            event_log_path=pathlib.Path(args.log),
-        )
-        try:
-            asyncio.run(_run_stage_b_wake(runner_cfg, emitter=emitter))
-            rc = 0
-        except Exception as exc:  # noqa: BLE001
-            emitter.emit(
-                "exception",
-                phase=phase.value,
-                type=type(exc).__name__,
-                message=str(exc),
-            )
-            rc = 1
-        # Backoff bookkeeping mirrors the prompt-path block below.
-        state_dir = pathlib.Path(args.state_dir)
-        interval_path = state_dir / INTERVAL_FILE_NAME
-        timestamp_path = state_dir / backoff.TIMESTAMP_FILE_NAME
-        prev_interval = backoff.read_interval(interval_path)
-        did_work = backoff.detect_did_work(mind, since_ts=wake_start_ts)
-        next_interval = backoff.next_interval_seconds(
-            prev_seconds=prev_interval,
-            mode="sleep",
-            did_work=did_work,
-        )
-        # Issue #323 fix 2: clamp against MIN_WAKE_PERIOD when the
-        # previous wake fired recently. Prevents combined effect of
-        # short-elapsed-since-last + max-interval-write from
-        # accidentally extending the cycle past 30 min.
-        now_ts = time.time()
-        last_wake_ts = backoff.read_last_wake_timestamp(timestamp_path)
-        next_interval = backoff.apply_min_wake_period(
-            next_interval,
-            last_wake_ts=last_wake_ts,
-            now_ts=now_ts,
-        )
-        try:
-            backoff.write_interval_atomic(interval_path, next_interval)
-            backoff.write_last_wake_timestamp(timestamp_path, now_ts)
-        except OSError as exc:
-            print(
-                f"thinking: failed to write {interval_path}: {exc}",
-                file=sys.stderr,
-            )
-        return rc
-
     runner = PhaseRunner(config=phase_cfg)
 
     # Build the thinking-side MCP server (today: run_experiment only).
@@ -725,18 +592,12 @@ def main() -> int:
             api_base_url=subagent_base_url or None,
         )
 
-    if phase == Phase.ACTIVE:
-        mode_obj = ActiveMode(runner=runner, mcp_servers=mcp_servers)
-    elif phase in (Phase.SLEEP_B, Phase.SLEEP_C, Phase.SLEEP_D):
-        mode_obj = SleepMode(
-            runner=runner, phase=phase, mcp_servers=mcp_servers
-        )
-    else:
-        # QUICK / DESIGN_COMMISSION fall back to the active wrapper —
-        # the runner handles ``ctx.quick`` / inline_prompt internally.
-        # MCP servers are still threaded so a design-commission wake
-        # can dispatch experiments if needed (today: rare).
-        mode_obj = ActiveMode(runner=runner, mcp_servers=mcp_servers)
+    # Phase 5: every non-preempt wake routes through ActiveMode. QUICK /
+    # DESIGN_COMMISSION reuse the wrapper because the runner handles
+    # ``ctx.quick`` / inline_prompt internally. MCP servers are threaded
+    # so a design-commission wake can dispatch experiments if needed
+    # (today: rare).
+    mode_obj = ActiveMode(runner=runner, mcp_servers=mcp_servers)
 
     # ``vault`` is still computed for backoff (existing contract) —
     # build_vault_snapshot doesn't replace VaultState's frontmatter
@@ -748,67 +609,19 @@ def main() -> int:
 
     wake_start_ts = time.time()
 
-    # Stage B shadow hook — when shadow_enabled is true and the prompt
-    # path is still authoritative (workflow_enabled=false OR phase is
-    # not SLEEP_B), also run the workflow with apply_writes=False so we
-    # can compare outputs against the live writes. Shadow telemetry is
-    # tagged ``stage_b_shadow_*`` so the viewer can filter it from real
-    # ``stage_b_*`` events.
-    #
-    # (Stage D post-wake invariant hook is wired below in the try/finally
-    # around ``run_wake``; see :func:`alice_thinking.wake_hooks.post_stage_d_invariant_check`.)
-    if (
-        not args.quick
-        and shadow_enabled
-        and phase == Phase.SLEEP_B
-        and not workflow_enabled
-    ):
-        try:
-            _load_stage_b_config, _run_stage_b_shadow, _run_stage_b_wake = (
-                _import_stage_b_workflow()
-            )
-            shadow_cfg = _load_stage_b_config(
-                mind_dir=mind,
-                state_dir=pathlib.Path(args.state_dir),
-                wake_file_path=None,
-                now=ctx.now,
-                shadow_mode=True,
-                event_log_path=pathlib.Path(args.log),
-            )
-            asyncio.run(_run_stage_b_shadow(shadow_cfg, emitter=emitter))
-        except Exception as exc:  # noqa: BLE001
-            emitter.emit(
-                "exception",
-                phase=phase.value,
-                type=type(exc).__name__,
-                message=f"shadow stage_b: {exc}",
-            )
-            # Shadow failures must NEVER take down the live wake.
-
-    try:
-        rc = asyncio.run(
-            run_wake(
-                ctx=ctx,
-                mode=mode_obj,
-                emitter=emitter,
-                backend=thinking_spec,
-                phase=phase.value,
-            )
-        )
-    finally:
-        # Stage D post-wake invariant hook — ALWAYS fires on SLEEP_D,
-        # even if the wake body raised. Closes the "LLM forgot to call
-        # the invariant check" loophole that PR #40's prompt-only
-        # instruction left open. Audit-report mode: scan + per-note
-        # events + single surface; never mutates the vault. Errors
-        # inside the hook are absorbed (see ``wake_hooks`` module).
-        from .wake_hooks import post_stage_d_invariant_check
-
-        post_stage_d_invariant_check(
-            mind=mind,
+    # Phase 5: the Stage B shadow workflow and the post-Stage-D
+    # invariant hook moved with their stages to the memory worker.
+    # Thinking now runs only ACTIVE / QUICK / DESIGN_COMMISSION /
+    # CONFLICT_RESOLUTION wakes here.
+    rc = asyncio.run(
+        run_wake(
+            ctx=ctx,
+            mode=mode_obj,
             emitter=emitter,
-            phase=phase,
+            backend=thinking_spec,
+            phase=phase.value,
         )
+    )
 
     # Sleep-mode exponential backoff: write the next wake-to-wake
     # interval for the s6 supervisor. Skipped for --quick (a smoke
