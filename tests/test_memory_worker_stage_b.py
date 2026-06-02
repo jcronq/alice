@@ -16,7 +16,6 @@ from __future__ import annotations
 import datetime
 import json
 import pathlib
-from unittest import mock
 
 import pytest
 
