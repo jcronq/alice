@@ -65,6 +65,7 @@ from claude_agent_sdk import (
     SystemMessage,
     TextBlock,
     ThinkingBlock,
+    ToolResultBlock,
     ToolUseBlock,
     UserMessage,
     query,
@@ -227,6 +228,24 @@ class AnthropicKernel:
                         await self._dispatch_block(block, parts, handlers)
                 elif isinstance(msg, UserMessage):
                     self._emit("user_message", content=_short(msg.content, self._cap))
+                    # Tool results arrive as ToolResultBlocks inside the
+                    # follow-up user message. Surface each one as an
+                    # on_tool_result boundary signal so consumers can close
+                    # the tool span they opened on the matching on_tool_use.
+                    if isinstance(msg.content, list):
+                        for block in msg.content:
+                            if isinstance(block, ToolResultBlock):
+                                is_error = bool(block.is_error)
+                                self._emit(
+                                    "tool_result",
+                                    id=block.tool_use_id,
+                                    is_error=is_error,
+                                    content=_short(block.content, self._cap),
+                                )
+                                for h in handlers:
+                                    await h.on_tool_result(
+                                        block.tool_use_id, block.content, is_error
+                                    )
                     for h in handlers:
                         await h.on_user_message(msg.content)
                 elif isinstance(msg, ResultMessage):

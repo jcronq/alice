@@ -131,6 +131,61 @@ def test_tool_execution_start_calls_on_tool_use() -> None:
     assert fired == [("Read", {"file_path": "/x"}, "tc-1")]
 
 
+def test_tool_execution_end_calls_on_tool_result_and_emits() -> None:
+    fired: list[tuple] = []
+
+    class H(NullHandler):
+        async def on_tool_result(self, tool_use_id, content, is_error):
+            fired.append((tool_use_id, content, is_error))
+
+    emit, recorded = _emit_recorder()
+    t = PiEventTranslator(emit)
+    asyncio.run(
+        _drain(
+            t,
+            [
+                {
+                    "type": "tool_execution_end",
+                    "toolName": "Read",
+                    "toolCallId": "tc-1",
+                    "result": "file contents",
+                    "isError": False,
+                }
+            ],
+            handlers=[H()],
+        )
+    )
+    assert fired == [("tc-1", "file contents", False)]
+    tr = [f for (name, f) in recorded if name == "tool_result"]
+    assert tr and tr[0]["id"] == "tc-1" and tr[0]["is_error"] is False
+
+
+def test_tool_execution_end_marks_is_error_true() -> None:
+    fired: list[tuple] = []
+
+    class H(NullHandler):
+        async def on_tool_result(self, tool_use_id, content, is_error):
+            fired.append((tool_use_id, content, is_error))
+
+    emit, _ = _emit_recorder()
+    t = PiEventTranslator(emit)
+    asyncio.run(
+        _drain(
+            t,
+            [
+                {
+                    "type": "tool_execution_end",
+                    "toolCallId": "tc-2",
+                    "result": "boom",
+                    "isError": True,
+                }
+            ],
+            handlers=[H()],
+        )
+    )
+    assert fired == [("tc-2", "boom", True)]
+
+
 def test_message_end_assistant_fires_on_result_with_usage() -> None:
     seen: list[TurnSummary] = []
 

@@ -12,7 +12,7 @@ Event vocabulary mapping (see ``docs/refactor/09-spike-pi-coding-agent.md``):
 | ``message_update`` text_end    | (no-op; final block already accumulated)     |
 | ``message_update`` thinking    | ``on_thinking(text)``                        |
 | ``tool_execution_start``       | emit ``tool_use`` + ``on_tool_use(...)``     |
-| ``tool_execution_end``         | (no-op for now; no on_tool_result yet)       |
+| ``tool_execution_end``         | emit ``tool_result`` + ``on_tool_result(...)``|
 | ``message_end`` (assistant)    | capture usage + cost from ``message.usage``  |
 | ``turn_end``                   | last seen turn → fed to KernelResult         |
 | ``agent_end``                  | terminal; build KernelResult                 |
@@ -164,9 +164,17 @@ class PiEventTranslator:
             return
 
         if kind == "tool_execution_end":
-            # Pi reports the result; no on_tool_result hook today
-            # (Anthropic side doesn't have one either — tool results
-            # arrive as the next user message). Leave for now.
+            tcid = event.get("toolCallId") or ""
+            result = event.get("result")
+            is_error = bool(event.get("isError"))
+            self._emit(
+                "tool_result",
+                id=tcid,
+                is_error=is_error,
+                content=_short(result, self._cap),
+            )
+            for h in handlers:
+                await h.on_tool_result(tcid, result, is_error)
             return
 
         if kind == "turn_end":

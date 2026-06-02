@@ -214,6 +214,15 @@ class CLITraceHandler(NullHandler):
             {"type": "tool_use", "name": name, "input": _trim_input(name, input)},
         )
 
+    async def on_tool_result(self, tool_use_id: str, content, is_error: bool) -> None:
+        ch = self._cli_channel()
+        if ch is None:
+            return
+        await self._transport.push_trace(
+            ch,
+            {"type": "tool_result", "tool_use_id": tool_use_id, "is_error": is_error},
+        )
+
     async def on_result(self, summary: TurnSummary) -> None:
         ch = self._cli_channel()
         if ch is None:
@@ -249,13 +258,14 @@ class TurnLifecycleHandler(NullHandler):
     doesn't advertise ``caps.lifecycle_events=True`` (Signal, Discord,
     A2A), so installing unconditionally is safe.
 
-    Note on tool boundaries: ``on_tool_use`` fires when the SDK reports
-    a tool block; the corresponding ``tool_call_end`` is best-effort
-    derived from ``on_user_message`` (the tool-result block lands as a
-    user-message content item) and the next ``on_text`` or
-    ``on_result``. To keep this handler simple we emit
-    ``tool_call_start`` only — the end is implied by the next event
-    after it. A future phase can wire a richer tool-result hook.
+    Note on tool boundaries: ``on_tool_use`` opens the span with
+    ``tool_call_start``; ``on_tool_result`` closes it with
+    ``tool_call_end`` carrying the matching ``tool_use_id`` and the
+    ``is_error`` flag. Both kernels surface the result boundary now
+    (AnthropicKernel extracts the ToolResultBlock from the follow-up
+    user message; PiKernel maps ``tool_execution_end``), so the UI can
+    bracket each tool exactly instead of inferring the end from the
+    next event.
     """
 
     def __init__(
@@ -312,6 +322,15 @@ class TurnLifecycleHandler(NullHandler):
                 "tool_use_id": id,
                 "name": name,
                 "input": _trim_input(name, input),
+            }
+        )
+
+    async def on_tool_result(self, tool_use_id: str, content, is_error: bool) -> None:
+        await self._push(
+            {
+                "type": "tool_call_end",
+                "tool_use_id": tool_use_id,
+                "is_error": is_error,
             }
         )
 

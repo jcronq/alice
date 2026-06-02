@@ -54,6 +54,13 @@ class _FakeUserMessage:
 
 
 @dataclass
+class _FakeToolResultBlock:
+    tool_use_id: str
+    content: Any = None
+    is_error: Any = None
+
+
+@dataclass
 class _FakeResultMessage:
     session_id: str | None = None
     is_error: bool = False
@@ -81,6 +88,7 @@ def patched_sdk(monkeypatch):
     monkeypatch.setattr(k, "SystemMessage", _FakeSystemMessage)
     monkeypatch.setattr(k, "TextBlock", _FakeTextBlock)
     monkeypatch.setattr(k, "ToolUseBlock", _FakeToolUseBlock)
+    monkeypatch.setattr(k, "ToolResultBlock", _FakeToolResultBlock)
     monkeypatch.setattr(k, "ThinkingBlock", _FakeThinkingBlock)
     monkeypatch.setattr(k, "ClaudeAgentOptions", lambda **kw: SimpleNamespace(**kw))
 
@@ -177,6 +185,39 @@ async def test_kernel_fires_handlers_for_each_block(patched_sdk, monkeypatch):
     assert seen["tool"] == ["Read"]
     assert seen["thinking"] == ["reasoning..."]
     assert seen["result"] == ["sess-2"]
+
+
+@pytest.mark.asyncio
+async def test_kernel_fires_on_tool_result_from_user_message(patched_sdk, monkeypatch):
+    messages = [
+        _FakeAssistantMessage(
+            content=[_FakeToolUseBlock(name="Bash", input={"command": "ls"}, id="t1")]
+        ),
+        _FakeUserMessage(
+            content=[
+                _FakeToolResultBlock(
+                    tool_use_id="t1", content="out", is_error=None
+                )
+            ]
+        ),
+        _FakeResultMessage(session_id="sess-3"),
+    ]
+    _install_fake_query(monkeypatch, messages)
+
+    fired: list[tuple] = []
+
+    class SpyHandler(NullHandler):
+        async def on_tool_result(self, tool_use_id, content, is_error):
+            fired.append((tool_use_id, content, is_error))
+
+    cap = CapturingEmitter()
+    kernel = AnthropicKernel(cap, correlation_id="c-r")
+    await kernel.run("x", KernelSpec(model="m"), handlers=[SpyHandler()])
+
+    # is_error None coerces to False; the boundary signal carries the id.
+    assert fired == [("t1", "out", False)]
+    tr = cap.of_kind("tool_result")
+    assert tr and tr[0]["id"] == "t1" and tr[0]["is_error"] is False
 
 
 @pytest.mark.asyncio
