@@ -36,7 +36,7 @@ from typing import Any
 
 from core.events import EventLogger
 
-from . import journal, stage_b
+from . import journal, stage_b, stage_c
 
 
 DEFAULT_MIND = pathlib.Path("/home/alice/alice-mind")
@@ -155,6 +155,13 @@ def main() -> int:
 
     emitter = EventLogger(pathlib.Path(args.log), echo=args.echo)
 
+    # Phase 3: register Stage C verifiers BEFORE replay so any
+    # pending atomize/archive/dedupe-merge/orphan-link entries from a
+    # crashed prior wake can be validated against the live vault
+    # state. Without this, replay falls back to the Phase 1 stubs and
+    # marks every Stage C op ``skipped``.
+    stage_c.register_verifiers(mind)
+
     # Phase 1: journal replay first so any in-flight mutation from a
     # crashed prior wake is verified or skipped before new work runs.
     # Replay is best-effort — a verifier raising is caught inside
@@ -170,15 +177,17 @@ def main() -> int:
     # vault root), not on ``--state-dir``.
     drain = stage_b.run(mind, journal_path=journal_path)
 
-    # Phase 3 + 4 land here in subsequent PRs. Each stage takes
-    # the same (mind, journal_path) shape so wiring them in is a
-    # one-line addition per stage.
-    # TODO(phase-3): groom = stage_c.run(mind, journal_path=journal_path)
+    # Phase 3: Stage C vault grooming. UNION trigger over structural
+    # debt + decay + orphan + broken-link signals; incremental cap
+    # per category keeps wake budget bounded.
+    groom = stage_c.run(mind, journal_path=journal_path)
+
+    # Phase 4 lands here in a subsequent PR.
     # TODO(phase-4): synth = stage_d.run(mind, journal_path=journal_path)
 
     emitter.emit(
         "memory_worker_heartbeat",
-        phase="stage_b",
+        phase="stage_c" if groom.ran else "stage_b",
         journal_path=str(journal_path),
         cadence_minutes=int(cfg.get("cadence_minutes", DEFAULT_CADENCE_MINUTES)),
         stage_d_model=str(cfg.get("stage_d_model", DEFAULT_STAGE_D_MODEL)),
@@ -187,6 +196,8 @@ def main() -> int:
         ),
         **report.to_dict(),
         **{f"stage_b_{k}": v for k, v in drain.to_dict().items()},
+        **{f"stage_c_{k}": v for k, v in groom.to_dict().items()},
+        stage_c_ran=bool(groom.ran),
     )
 
     return 0

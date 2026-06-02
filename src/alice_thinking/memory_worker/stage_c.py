@@ -1,0 +1,1326 @@
+"""Stage C — vault grooming.
+
+Deterministic, model-free maintenance of ``cortex-memory/``. Each
+tick performs up to four operations in order:
+
+1. **atomize**     — split notes longer than :data:`BLOATED_LINE_THRESHOLD`
+   lines on top-level ``## `` heading boundaries.
+2. **archive**     — move dailies older than :data:`STALE_DAILY_DAYS`
+   into ``archive/dailies/<year>/``.
+3. **dedupe-merge** — collapse pairs of notes that share a slug or whose
+   titles are within :data:`FUZZY_TITLE_DISTANCE` Levenshtein edits.
+4. **orphan-resolve** — auto-link zero-inbound notes to a single matching
+   parent (by frontmatter ``tags:``); queue ambiguous ones to
+   ``inner/orphans-pending.md`` for human/thinking review.
+
+Design contract — see
+``cortex-memory/research/2026-06-01-memory-worker-extraction-design.md``
+§ "Phase 3: Stage C Grooming — Design Input (2026-06-02)" for the
+UNION trigger rationale and incremental-cap design.
+
+NO LLM CALLS. All four operations are mechanical and reversible from
+the journal. Per-op verifiers (registered with the journal module)
+back replay on crash recovery.
+
+Trigger
+-------
+
+Stage C runs when ANY of the following is true (UNION, not AND):
+
+  * ``bloated_notes > 0``                   — structural debt
+  * ``stale_dailies > 0``                   — structural debt
+  * ``decayed_notes_in_window > threshold`` — decay backlog (NEW)
+  * ``orphans > 0``                         — graph islands
+  * ``broken_wikilinks > 0``                — graph debt
+
+This is the fix for the 82-sleep Stage C drought: the old structural
+trigger missed the ~570-note decay backlog accumulating in the vault.
+
+Incremental cap
+---------------
+
+Each operation processes at most :data:`DEFAULT_MAX_ITEMS_PER_CATEGORY`
+items per tick. The cap keeps wake budget bounded; a 600-item backlog
+drains over the next dozen wakes instead of dominating one.
+
+Path conventions
+----------------
+
+Like :mod:`stage_b`, all paths resolve relative to the *mind root*
+(``~/alice-mind``). The vault lives at ``<mind>/cortex-memory/`` and
+the inbox at ``<mind>/inner/notes/``. Helpers from
+:mod:`metrics.vault_health` operate on the vault root directly — we
+pass ``mind / "cortex-memory"`` when calling into them.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import datetime
+import hashlib
+import json
+import logging
+import pathlib
+import re
+import time
+from collections import defaultdict
+from typing import Any, Optional
+
+from indexer.yaml_lite import split_frontmatter
+
+from . import journal as journal_mod
+
+
+logger = logging.getLogger(__name__)
+
+
+# ---------- tunables ----------
+
+#: Default decay-backlog threshold above which Stage C is allowed to
+#: run for decay reasons alone. Configurable via
+#: ``memory_worker.stage_c.decay_threshold`` in ``alice.config.json``.
+DEFAULT_DECAY_THRESHOLD = 50
+
+#: Default per-category processing cap per cycle. Configurable via
+#: ``memory_worker.stage_c.max_items_per_category``.
+DEFAULT_MAX_ITEMS_PER_CATEGORY = 20
+
+#: A note above this length (in lines) is an atomize candidate. Matches
+#: :func:`metrics.vault_health.count_stage_c_candidates`'s default.
+BLOATED_LINE_THRESHOLD = 250
+
+#: Daily older than this many days is an archive candidate.
+STALE_DAILY_DAYS = 90
+
+#: Fuzzy title-match distance for dedupe. A pair of notes whose titles
+#: are within this Levenshtein distance (case-insensitive) is treated as
+#: a duplicate group. Slug-equality is checked independently and always
+#: dedupes regardless of distance.
+FUZZY_TITLE_DISTANCE = 3
+
+#: Decay window in days. Matches the design's "7-day window" callout.
+DECAY_WINDOW_DAYS = 7
+
+#: Folders within ``cortex-memory/`` that are excluded from grooming
+#: candidate sets (dailies are archive-managed; archive/ is the
+#: destination; gh-state is auto-generated mirror data).
+_EXCLUDED_TOP_DIRS = frozenset({"dailies", "archive", "gh-state"})
+
+#: Files that aren't real notes — mirrors
+#: :data:`metrics.vault_health.EXCLUDED_NAMES`.
+_EXCLUDED_NAMES = frozenset({"index.md", "README.md", "unresolved.md"})
+
+
+# ---------- reports + state ----------
+
+
+@dataclasses.dataclass
+class StageCState:
+    """Trigger inputs computed before deciding whether to run."""
+
+    bloated_notes: int = 0
+    stale_dailies: int = 0
+    decayed_notes_in_window: int = 0
+    orphans: int = 0
+    broken_wikilinks: int = 0
+
+
+@dataclasses.dataclass
+class StageCReport:
+    """Counts of mutations performed this tick."""
+
+    atomize: int = 0
+    archive: int = 0
+    dedupe_merge: int = 0
+    orphan_resolve: int = 0
+    ran: bool = False
+
+    def to_dict(self) -> dict[str, int]:
+        # Mypy/json-friendly: only return the int fields the heartbeat
+        # cares about. ``ran`` is exposed separately via :func:`run`.
+        return {
+            "atomize": self.atomize,
+            "archive": self.archive,
+            "dedupe_merge": self.dedupe_merge,
+            "orphan_resolve": self.orphan_resolve,
+        }
+
+
+# ---------- path helpers ----------
+
+
+def _vault_dir(mind: pathlib.Path) -> pathlib.Path:
+    return mind / "cortex-memory"
+
+
+def _archive_dailies_dir(mind: pathlib.Path) -> pathlib.Path:
+    return _vault_dir(mind) / "archive" / "dailies"
+
+
+def _orphans_pending_path(mind: pathlib.Path) -> pathlib.Path:
+    return mind / "inner" / "orphans-pending.md"
+
+
+def _events_jsonl_path(mind: pathlib.Path) -> pathlib.Path:
+    return mind / "memory" / "events.jsonl"
+
+
+def _is_groomable(rel_parts: tuple[str, ...], name: str) -> bool:
+    """True if a note under ``cortex-memory/<rel_parts>`` is a
+    candidate for atomize / dedupe / orphan operations.
+
+    Mirrors the exclusion rules used by
+    :func:`metrics.vault_health.count_stage_c_candidates` — top-level
+    dailies/archive/gh-state are off-limits; scaffolding files
+    (``index.md`` etc.) are skipped. Hidden directories (``.``) are
+    skipped too so ``.obsidian/`` doesn't bleed in.
+    """
+    if not rel_parts:
+        return False
+    if rel_parts[0] in _EXCLUDED_TOP_DIRS:
+        return False
+    if any(part.startswith(".") for part in rel_parts):
+        return False
+    if name in _EXCLUDED_NAMES:
+        return False
+    return True
+
+
+def _iter_groomable_notes(vault: pathlib.Path) -> list[pathlib.Path]:
+    """All ``cortex-memory/*.md`` paths eligible for grooming.
+
+    Deterministic order (sorted) so a partial cycle is reproducible.
+    """
+    if not vault.is_dir():
+        return []
+    out: list[pathlib.Path] = []
+    for md in vault.rglob("*.md"):
+        rel_parts = md.relative_to(vault).parts
+        if not _is_groomable(rel_parts, md.name):
+            continue
+        out.append(md)
+    out.sort()
+    return out
+
+
+def _today() -> datetime.date:
+    return datetime.date.today()
+
+
+def _now() -> datetime.datetime:
+    return datetime.datetime.now()
+
+
+def _utc_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _sha256_of_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# ---------- vault state collection ----------
+
+
+def _line_count(path: pathlib.Path) -> int:
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as fh:
+            return sum(1 for _ in fh)
+    except OSError:
+        return 0
+
+
+def _count_bloated(vault: pathlib.Path) -> int:
+    n = 0
+    for md in _iter_groomable_notes(vault):
+        if _line_count(md) > BLOATED_LINE_THRESHOLD:
+            n += 1
+    return n
+
+
+def _count_stale_dailies(vault: pathlib.Path, today: datetime.date) -> int:
+    dailies = vault / "dailies"
+    if not dailies.is_dir():
+        return 0
+    cutoff = today - datetime.timedelta(days=STALE_DAILY_DAYS)
+    cutoff_str = cutoff.isoformat()
+    n = 0
+    for md in dailies.glob("*.md"):
+        stem = md.stem
+        if len(stem) >= 10 and stem[:10] < cutoff_str:
+            n += 1
+    return n
+
+
+_WIKILINK_RE = re.compile(r"\[\[([^\]|#]+?)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
+
+
+def _extract_wikilink_targets(body: str) -> list[str]:
+    """Pull every ``[[target]]`` (or aliased / anchored variant)
+    target slug out of ``body``. Best-effort — we don't try to strip
+    code fences here, the caller filters as needed."""
+    return [m.group(1).strip() for m in _WIKILINK_RE.finditer(body)]
+
+
+def _slug_of(md: pathlib.Path, vault: pathlib.Path) -> str:
+    """Slug used by wikilinks. The vault convention is filename stem;
+    explicit ``slug:`` frontmatter overrides if present."""
+    try:
+        text = md.read_text(encoding="utf-8")
+    except OSError:
+        return md.stem
+    fm, _body = split_frontmatter(text)
+    raw = fm.get("slug")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return md.stem
+
+
+def _build_inbound_index(vault: pathlib.Path) -> dict[str, set[str]]:
+    """Map ``slug -> {source-rel-paths}`` — every note that links to it.
+
+    Source paths are relative to ``vault``. The slug key is the bare
+    filename stem of the target (no folder); wikilinks address by
+    basename in this vault.
+    """
+    inbound: dict[str, set[str]] = defaultdict(set)
+    if not vault.is_dir():
+        return inbound
+    for md in vault.rglob("*.md"):
+        try:
+            text = md.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        _fm, body = split_frontmatter(text)
+        rel = str(md.relative_to(vault))
+        for target in _extract_wikilink_targets(body):
+            # Normalize: strip folder prefix and lowercase. We track
+            # both forms so callers can look up either.
+            base = target.rsplit("/", 1)[-1]
+            inbound[base].add(rel)
+            inbound[base.lower()].add(rel)
+    return inbound
+
+
+def _count_orphans(vault: pathlib.Path) -> int:
+    """Notes with zero inbound wikilinks, excluding dailies/archive/gh-state.
+
+    This is a Stage C-specific orphan count (matching what
+    :func:`orphan_resolve` will iterate over) — we don't use
+    :func:`metrics.vault_health.count_orphans` because that one also
+    considers aliases, which inflates the count above what Stage C can
+    actually resolve via tags."""
+    inbound = _build_inbound_index(vault)
+    n = 0
+    for md in _iter_groomable_notes(vault):
+        if md.stem in inbound or md.stem.lower() in inbound:
+            continue
+        n += 1
+    return n
+
+
+def _count_broken_wikilinks(vault: pathlib.Path) -> int:
+    """Wikilink target slugs that don't resolve to any vault file.
+
+    Slug = basename. We resolve case-insensitively and only count
+    targets coming from groomable source files — broken links inside
+    archived dailies aren't Stage C's problem."""
+    if not vault.is_dir():
+        return 0
+    by_slug: set[str] = set()
+    for md in vault.rglob("*.md"):
+        by_slug.add(md.stem.lower())
+    broken = 0
+    for md in _iter_groomable_notes(vault):
+        try:
+            text = md.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        _fm, body = split_frontmatter(text)
+        for target in _extract_wikilink_targets(body):
+            base = target.rsplit("/", 1)[-1].lower()
+            if base and base not in by_slug:
+                broken += 1
+    return broken
+
+
+def _count_decayed_in_window(vault: pathlib.Path, today: datetime.date) -> int:
+    """Decayed = ``last_accessed`` older than :data:`DECAY_WINDOW_DAYS`
+    AND ``access_count <= 1``. Approximates the design's tier R3-R4
+    decay-backlog signal using only fields already on every note.
+
+    Counts groomable notes (excludes dailies/archive/gh-state)."""
+    cutoff = today - datetime.timedelta(days=DECAY_WINDOW_DAYS)
+    cutoff_str = cutoff.isoformat()
+    n = 0
+    for md in _iter_groomable_notes(vault):
+        try:
+            text = md.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fm, _body = split_frontmatter(text)
+        la = fm.get("last_accessed")
+        ac = fm.get("access_count")
+        if la is None:
+            continue
+        la_str = str(la).strip()
+        if len(la_str) < 10:
+            continue
+        if la_str[:10] >= cutoff_str:
+            continue
+        # Inside the decay window — check access count.
+        try:
+            ac_int = int(ac) if ac is not None else 0
+        except (TypeError, ValueError):
+            ac_int = 0
+        if ac_int <= 1:
+            n += 1
+    return n
+
+
+def compute_state(mind: pathlib.Path) -> StageCState:
+    """Snapshot the five trigger signals."""
+    vault = _vault_dir(mind)
+    today = _today()
+    return StageCState(
+        bloated_notes=_count_bloated(vault),
+        stale_dailies=_count_stale_dailies(vault, today),
+        decayed_notes_in_window=_count_decayed_in_window(vault, today),
+        orphans=_count_orphans(vault),
+        broken_wikilinks=_count_broken_wikilinks(vault),
+    )
+
+
+@dataclasses.dataclass
+class StageCConfig:
+    decay_threshold: int = DEFAULT_DECAY_THRESHOLD
+    max_items_per_category: int = DEFAULT_MAX_ITEMS_PER_CATEGORY
+
+
+def should_run_c(state: StageCState, config: StageCConfig) -> bool:
+    """UNION trigger: any single non-zero signal is enough."""
+    return (
+        state.bloated_notes > 0
+        or state.stale_dailies > 0
+        or state.decayed_notes_in_window > config.decay_threshold
+        or state.orphans > 0
+        or state.broken_wikilinks > 0
+    )
+
+
+# ---------- atomize ----------
+
+
+def _split_on_headings(body: str) -> list[tuple[str, str]]:
+    """Split ``body`` on top-level ``## `` headings.
+
+    Returns a list of ``(heading_title, section_text)`` pairs. The
+    pre-heading prologue (if any) is dropped — it stays in the parent.
+    ``heading_title`` is the heading line with ``## `` stripped and
+    whitespace normalized; ``section_text`` includes the heading line
+    itself so the child note preserves its top-level header.
+    """
+    lines = body.splitlines(keepends=False)
+    sections: list[tuple[str, str]] = []
+    cur_title: Optional[str] = None
+    cur_lines: list[str] = []
+    for line in lines:
+        if line.startswith("## ") and not line.startswith("### "):
+            if cur_title is not None:
+                sections.append((cur_title, "\n".join(cur_lines)))
+            cur_title = line[3:].strip()
+            cur_lines = [line]
+        else:
+            if cur_title is not None:
+                cur_lines.append(line)
+    if cur_title is not None:
+        sections.append((cur_title, "\n".join(cur_lines)))
+    return sections
+
+
+def _slugify(title: str) -> str:
+    """Turn a heading title into a filesystem-safe slug suffix.
+
+    Lowercase, ASCII alphanumerics + hyphens; runs of non-alphanumerics
+    collapse to a single hyphen.
+    """
+    s = title.lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    return s.strip("-") or "section"
+
+
+def _frontmatter_render(fm: dict[str, Any]) -> str:
+    """Render a frontmatter dict back into YAML-ish lines.
+
+    Same flat key/value shape :mod:`indexer.yaml_lite` parses. Order:
+    the keys we care about most come first (title/tags/created/updated),
+    then everything else in insertion order. We intentionally don't
+    re-parse the original YAML — Stage C only writes flat keys.
+    """
+    preferred = ["title", "tags", "created", "updated", "last_accessed", "access_count"]
+    out: list[str] = ["---"]
+    seen: set[str] = set()
+    for key in preferred:
+        if key in fm:
+            out.append(_render_kv(key, fm[key]))
+            seen.add(key)
+    for key, val in fm.items():
+        if key in seen:
+            continue
+        out.append(_render_kv(key, val))
+    out.append("---")
+    return "\n".join(out) + "\n"
+
+
+def _render_kv(key: str, val: Any) -> str:
+    if isinstance(val, list):
+        # Flow-style list for tag-like fields. Stringify each item.
+        items = ", ".join(str(v) for v in val)
+        return f"{key}: [{items}]"
+    if isinstance(val, bool):
+        return f"{key}: {'true' if val else 'false'}"
+    return f"{key}: {val}"
+
+
+def atomize(
+    mind: pathlib.Path,
+    max_items: int,
+    journal_path: Optional[pathlib.Path],
+) -> int:
+    """Split bloated notes on top-level ``## `` boundaries.
+
+    Returns the count of parent notes atomized this cycle.
+    """
+    vault = _vault_dir(mind)
+    today_iso = _today().isoformat()
+    processed = 0
+
+    for md in _iter_groomable_notes(vault):
+        if processed >= max_items:
+            break
+        if _line_count(md) <= BLOATED_LINE_THRESHOLD:
+            continue
+        try:
+            text = md.read_text(encoding="utf-8")
+        except OSError as exc:
+            logger.warning("stage_c atomize: read failed for %s: %s", md, exc)
+            continue
+        fm, body = split_frontmatter(text)
+        sections = _split_on_headings(body)
+        if not sections:
+            logger.info(
+                "stage_c atomize-skipped-no-headings: %s has no ## sections",
+                md.relative_to(vault),
+            )
+            continue
+
+        parent_slug = md.stem
+        children_rel: list[str] = []
+        child_writes: list[tuple[pathlib.Path, str]] = []
+        # Build child files first so we can journal them with their
+        # final paths.
+        for title, section_text in sections:
+            child_slug = f"{parent_slug}-{_slugify(title)}"
+            child_path = md.parent / f"{child_slug}.md"
+            # Don't clobber an existing file; suffix until unique.
+            suffix = 2
+            while child_path.exists() and child_path.resolve() != md.resolve():
+                child_slug = f"{parent_slug}-{_slugify(title)}-{suffix}"
+                child_path = md.parent / f"{child_slug}.md"
+                suffix += 1
+
+            child_fm: dict[str, Any] = {
+                "title": title,
+                "tags": fm.get("tags", []),
+                "created": fm.get("created", today_iso),
+                "updated": today_iso,
+                "derived_from": parent_slug,
+            }
+            if isinstance(child_fm["tags"], str):
+                child_fm["tags"] = [child_fm["tags"]]
+            child_body = section_text.strip() + "\n"
+            child_writes.append(
+                (child_path, _frontmatter_render(child_fm) + "\n" + child_body)
+            )
+            children_rel.append(str(child_path.relative_to(vault)))
+
+        # Parent rewrite — replace the body with wikilinks. Keep the
+        # original frontmatter intact (atomize is structural, not
+        # editorial); bump ``updated``.
+        new_fm = dict(fm)
+        new_fm["updated"] = today_iso
+        parent_body_lines: list[str] = []
+        # Preserve any pre-first-heading prologue from the original
+        # body — that content has nowhere else to live.
+        prologue_lines: list[str] = []
+        for line in body.splitlines():
+            if line.startswith("## ") and not line.startswith("### "):
+                break
+            prologue_lines.append(line)
+        prologue = "\n".join(prologue_lines).strip()
+        if prologue:
+            parent_body_lines.append(prologue)
+            parent_body_lines.append("")
+        parent_body_lines.append("## Sections")
+        parent_body_lines.append("")
+        for child_rel in children_rel:
+            child_slug = pathlib.Path(child_rel).stem
+            parent_body_lines.append(f"- See [[{child_slug}]]")
+        new_parent_text = (
+            _frontmatter_render(new_fm) + "\n" + "\n".join(parent_body_lines) + "\n"
+        )
+
+        # Journal BEFORE the write.
+        original_sha = _sha256_of_text(text)
+        entry = None
+        if journal_path is not None:
+            entry = journal_mod.append(
+                journal_path,
+                op="atomize",
+                source=str(md.relative_to(vault)),
+                targets=children_rel,
+                detail={
+                    "parent": parent_slug,
+                    "children": [pathlib.Path(c).stem for c in children_rel],
+                    "original_content_sha": original_sha,
+                },
+            )
+
+        try:
+            for child_path, child_text in child_writes:
+                child_path.write_text(child_text, encoding="utf-8")
+            md.write_text(new_parent_text, encoding="utf-8")
+        except OSError as exc:
+            logger.warning("stage_c atomize: write failed for %s: %s", md, exc)
+            continue
+
+        if journal_path is not None and entry is not None:
+            journal_mod.commit(journal_path, entry.journal_id)
+        processed += 1
+    return processed
+
+
+# ---------- archive ----------
+
+
+def _rewrite_wikilinks_in_file(
+    path: pathlib.Path,
+    old_slug: str,
+    new_slug: str,
+) -> bool:
+    """Rewrite ``[[old_slug]]`` (and aliased/folder-qualified forms) to
+    ``[[new_slug]]`` inside ``path``. Returns True if the file changed.
+
+    Conservative — only rewrites the slug portion, leaving any
+    ``#anchor`` and ``|alias`` parts alone.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+    def repl(match: re.Match[str]) -> str:
+        target = match.group(1).strip()
+        base = target.rsplit("/", 1)[-1]
+        if base != old_slug:
+            return match.group(0)
+        # Reconstruct with the new slug. Anchor / alias survive in
+        # match.group(0) — we replace only the slug section.
+        full = match.group(0)
+        return full.replace(target, new_slug, 1)
+
+    new_text = _WIKILINK_RE.sub(repl, text)
+    if new_text != text:
+        path.write_text(new_text, encoding="utf-8")
+        return True
+    return False
+
+
+def archive(
+    mind: pathlib.Path,
+    max_items: int,
+    journal_path: Optional[pathlib.Path],
+    today: Optional[datetime.date] = None,
+) -> int:
+    """Move stale dailies into ``archive/dailies/<year>/`` and rewrite
+    wikilinks that pointed at them.
+
+    Returns the count of dailies archived this cycle.
+    """
+    vault = _vault_dir(mind)
+    dailies = vault / "dailies"
+    if not dailies.is_dir():
+        return 0
+
+    today = today or _today()
+    cutoff = today - datetime.timedelta(days=STALE_DAILY_DAYS)
+    cutoff_str = cutoff.isoformat()
+    processed = 0
+
+    archive_root = _archive_dailies_dir(mind)
+    for md in sorted(dailies.glob("*.md")):
+        if processed >= max_items:
+            break
+        stem = md.stem
+        if len(stem) < 10 or stem[:10] >= cutoff_str:
+            continue
+        # Filename year prefix is YYYY. We rely on the canonical
+        # naming convention; anything else is skipped.
+        year = stem[:4]
+        if not year.isdigit():
+            continue
+        dst_dir = archive_root / year
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst = dst_dir / md.name
+        if dst.exists():
+            logger.info(
+                "stage_c archive: destination already exists, skipping %s",
+                md.relative_to(vault),
+            )
+            continue
+
+        # Find inbound wikilinks across the vault that point at this slug.
+        wikilink_updates: list[dict[str, str]] = []
+        new_slug = f"archive/dailies/{year}/{md.stem}"
+        for source in vault.rglob("*.md"):
+            if source.resolve() == md.resolve():
+                continue
+            try:
+                text = source.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if f"[[{md.stem}" not in text:
+                continue
+            wikilink_updates.append(
+                {
+                    "file": str(source.relative_to(vault)),
+                    "old": md.stem,
+                    "new": new_slug,
+                }
+            )
+
+        original_text = ""
+        try:
+            original_text = md.read_text(encoding="utf-8")
+        except OSError:
+            pass
+
+        entry = None
+        if journal_path is not None:
+            entry = journal_mod.append(
+                journal_path,
+                op="archive",
+                source=str(md.relative_to(vault)),
+                targets=[str(dst.relative_to(vault))],
+                detail={
+                    "src": str(md.relative_to(vault)),
+                    "dst": str(dst.relative_to(vault)),
+                    "wikilink_updates": wikilink_updates,
+                    "src_sha": _sha256_of_text(original_text),
+                },
+            )
+
+        try:
+            md.rename(dst)
+        except OSError as exc:
+            logger.warning("stage_c archive: rename failed %s -> %s: %s", md, dst, exc)
+            continue
+
+        for upd in wikilink_updates:
+            target_path = vault / upd["file"]
+            _rewrite_wikilinks_in_file(target_path, upd["old"], upd["new"])
+
+        if journal_path is not None and entry is not None:
+            journal_mod.commit(journal_path, entry.journal_id)
+        processed += 1
+    return processed
+
+
+# ---------- dedupe-merge ----------
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Standard DP Levenshtein. Small strings only — vault titles are
+    short, this is fine for O(n*m) where n,m < ~80 chars."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            cur[j] = min(
+                cur[j - 1] + 1,        # insertion
+                prev[j] + 1,           # deletion
+                prev[j - 1] + cost,    # substitution
+            )
+        prev = cur
+    return prev[-1]
+
+
+def _parse_created_date(raw: Any) -> Optional[datetime.date]:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if len(s) < 10:
+        return None
+    try:
+        return datetime.date.fromisoformat(s[:10])
+    except ValueError:
+        return None
+
+
+def _dedupe_groups(
+    notes: list[pathlib.Path],
+) -> list[list[pathlib.Path]]:
+    """Group notes by (a) exact slug-stem match and (b) fuzzy title.
+
+    Returns a list of groups, each of length >= 2. Singletons are
+    dropped. A note belongs to at most one group; slug-stem groups
+    are formed first, then remaining singletons are pairwise compared
+    for fuzzy-title proximity.
+    """
+    by_stem: dict[str, list[pathlib.Path]] = defaultdict(list)
+    for md in notes:
+        by_stem[md.stem.lower()].append(md)
+
+    groups: list[list[pathlib.Path]] = []
+    leftover: list[pathlib.Path] = []
+    for stem_key, group in by_stem.items():
+        if len(group) >= 2:
+            groups.append(group)
+        else:
+            leftover.extend(group)
+
+    # Title-fuzzy pass: O(n^2) — fine for n in the hundreds.
+    titles: list[tuple[pathlib.Path, str]] = []
+    for md in leftover:
+        try:
+            text = md.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fm, _body = split_frontmatter(text)
+        title = str(fm.get("title") or md.stem).strip().lower()
+        if title:
+            titles.append((md, title))
+
+    used: set[pathlib.Path] = set()
+    for i, (md_i, title_i) in enumerate(titles):
+        if md_i in used:
+            continue
+        cluster: list[pathlib.Path] = [md_i]
+        for md_j, title_j in titles[i + 1 :]:
+            if md_j in used:
+                continue
+            if title_i == title_j or _levenshtein(title_i, title_j) < FUZZY_TITLE_DISTANCE:
+                cluster.append(md_j)
+        if len(cluster) >= 2:
+            for m in cluster:
+                used.add(m)
+            groups.append(cluster)
+    return groups
+
+
+def _pick_canonical(
+    group: list[pathlib.Path],
+    inbound: dict[str, set[str]],
+) -> pathlib.Path:
+    """Canonical = oldest ``created:``; tie-break on inbound link count;
+    final tie-break on alphabetical slug."""
+
+    def sort_key(md: pathlib.Path) -> tuple[str, int, str]:
+        try:
+            text = md.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        fm, _body = split_frontmatter(text)
+        created = _parse_created_date(fm.get("created"))
+        created_str = created.isoformat() if created else "9999-99-99"
+        # Negative inbound count so MORE inbound sorts earlier (canonical).
+        inbound_count = len(inbound.get(md.stem, set()) | inbound.get(md.stem.lower(), set()))
+        return (created_str, -inbound_count, md.stem)
+
+    return sorted(group, key=sort_key)[0]
+
+
+def dedupe_merge(
+    mind: pathlib.Path,
+    max_items: int,
+    journal_path: Optional[pathlib.Path],
+) -> int:
+    """Merge duplicate notes (slug-equal OR fuzzy title-equal).
+
+    Returns the count of duplicate notes consumed (not the number of
+    groups). Each group of N produces N-1 deletes.
+    """
+    vault = _vault_dir(mind)
+    today_iso = _today().isoformat()
+    notes = _iter_groomable_notes(vault)
+    if not notes:
+        return 0
+
+    inbound = _build_inbound_index(vault)
+    groups = _dedupe_groups(notes)
+    if not groups:
+        return 0
+
+    processed = 0
+    for group in groups:
+        if processed >= max_items:
+            break
+        canonical = _pick_canonical(group, inbound)
+        duplicates = [m for m in group if m != canonical]
+        if not duplicates:
+            continue
+
+        try:
+            canon_text = canonical.read_text(encoding="utf-8")
+        except OSError as exc:
+            logger.warning("stage_c dedupe: canonical read failed %s: %s", canonical, exc)
+            continue
+        canon_fm, canon_body = split_frontmatter(canon_text)
+
+        merged_slugs: list[str] = []
+        merged_sections: list[str] = []
+        wikilink_updates: list[dict[str, str]] = []
+
+        for dup in duplicates:
+            if processed >= max_items:
+                break
+            try:
+                dup_text = dup.read_text(encoding="utf-8")
+            except OSError as exc:
+                logger.warning("stage_c dedupe: dup read failed %s: %s", dup, exc)
+                continue
+            dup_fm, dup_body = split_frontmatter(dup_text)
+            dup_created = str(dup_fm.get("created", "unknown"))
+            section = (
+                f"\n## Merged from {dup.stem} ({dup_created})\n\n"
+                f"{dup_body.strip()}\n"
+            )
+            merged_sections.append(section)
+            merged_slugs.append(dup.stem)
+
+            # Wikilinks across vault pointing at duplicate → canonical.
+            for source in vault.rglob("*.md"):
+                if source.resolve() in (canonical.resolve(), dup.resolve()):
+                    continue
+                try:
+                    text = source.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                if f"[[{dup.stem}" not in text:
+                    continue
+                wikilink_updates.append(
+                    {
+                        "file": str(source.relative_to(vault)),
+                        "old": dup.stem,
+                        "new": canonical.stem,
+                    }
+                )
+
+        if not merged_slugs:
+            continue
+
+        # Bump canonical frontmatter, append merged sections.
+        new_canon_fm = dict(canon_fm)
+        new_canon_fm["updated"] = today_iso
+        new_canon_fm["last_accessed"] = today_iso
+        try:
+            ac = int(new_canon_fm.get("access_count") or 0)
+        except (TypeError, ValueError):
+            ac = 0
+        new_canon_fm["access_count"] = ac + 1
+        new_canon_body = canon_body.rstrip() + "\n" + "".join(merged_sections)
+        new_canon_text = _frontmatter_render(new_canon_fm) + "\n" + new_canon_body
+        if not new_canon_text.endswith("\n"):
+            new_canon_text += "\n"
+
+        entry = None
+        if journal_path is not None:
+            entry = journal_mod.append(
+                journal_path,
+                op="dedupe-merge",
+                source=str(canonical.relative_to(vault)),
+                targets=[str(canonical.relative_to(vault))],
+                detail={
+                    "canonical": canonical.stem,
+                    "merged": merged_slugs,
+                    "wikilink_updates": wikilink_updates,
+                },
+            )
+
+        try:
+            canonical.write_text(new_canon_text, encoding="utf-8")
+            for dup in duplicates:
+                if dup.stem in merged_slugs and dup.exists():
+                    dup.unlink()
+        except OSError as exc:
+            logger.warning("stage_c dedupe: write/unlink failed: %s", exc)
+            continue
+
+        for upd in wikilink_updates:
+            target_path = vault / upd["file"]
+            _rewrite_wikilinks_in_file(target_path, upd["old"], upd["new"])
+
+        if journal_path is not None and entry is not None:
+            journal_mod.commit(journal_path, entry.journal_id)
+
+        processed += len(merged_slugs)
+    return processed
+
+
+# ---------- orphan-resolve ----------
+
+
+def _tags_of(fm: dict[str, Any]) -> list[str]:
+    raw = fm.get("tags")
+    if isinstance(raw, list):
+        return [str(t).strip().lower() for t in raw if str(t).strip()]
+    if isinstance(raw, str) and raw.strip():
+        return [raw.strip().lower()]
+    return []
+
+
+_PARENT_FOLDERS = ("projects", "reference", "people")
+
+
+def _parent_candidates(vault: pathlib.Path, tag: str) -> list[pathlib.Path]:
+    out: list[pathlib.Path] = []
+    for folder in _PARENT_FOLDERS:
+        candidate = vault / folder / f"{tag}.md"
+        if candidate.is_file():
+            out.append(candidate)
+    return out
+
+
+def _append_linked_notes_section(parent: pathlib.Path, link_line: str) -> bool:
+    """Append ``link_line`` (no trailing newline) under a
+    ``## Linked notes`` section in ``parent``. Creates the section if
+    missing. Idempotent: returns False if the exact line already exists
+    anywhere in the file."""
+    try:
+        text = parent.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if link_line in text:
+        return False
+    if "## Linked notes" in text:
+        # Append directly after the section header (or at end).
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip() == "## Linked notes":
+                # Find end of the section: next "## " heading or EOF.
+                j = i + 1
+                while j < len(lines) and not (
+                    lines[j].startswith("## ") and not lines[j].startswith("### ")
+                ):
+                    j += 1
+                lines.insert(j, link_line)
+                new_text = "\n".join(lines)
+                if not new_text.endswith("\n"):
+                    new_text += "\n"
+                parent.write_text(new_text, encoding="utf-8")
+                return True
+    # No section — append at EOF.
+    if text and not text.endswith("\n"):
+        text += "\n"
+    parent.write_text(text + "\n## Linked notes\n\n" + link_line + "\n", encoding="utf-8")
+    return True
+
+
+def orphan_resolve(
+    mind: pathlib.Path,
+    max_items: int,
+    journal_path: Optional[pathlib.Path],
+) -> int:
+    """Auto-link tag-matched orphans to a single parent; queue
+    ambiguous ones to ``inner/orphans-pending.md``.
+
+    Returns the count of orphans resolved (linked + queued) this cycle.
+    """
+    vault = _vault_dir(mind)
+    inbound = _build_inbound_index(vault)
+    processed = 0
+    pending_lines: list[str] = []
+
+    for md in _iter_groomable_notes(vault):
+        if processed >= max_items:
+            break
+        if md.stem in inbound or md.stem.lower() in inbound:
+            continue
+        # Skip notes that *are* parent candidates themselves — they
+        # legitimately have no inbound link until first reference.
+        rel_parts = md.relative_to(vault).parts
+        if rel_parts and rel_parts[0] in _PARENT_FOLDERS:
+            continue
+
+        try:
+            text = md.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fm, _body = split_frontmatter(text)
+        tags = _tags_of(fm)
+
+        # Find parent candidates: tag → projects/<tag>.md OR reference/<tag>.md OR people/<tag>.md.
+        all_candidates: list[pathlib.Path] = []
+        for tag in tags:
+            all_candidates.extend(_parent_candidates(vault, tag))
+        # Dedupe while preserving order.
+        seen: set[pathlib.Path] = set()
+        unique = [c for c in all_candidates if not (c in seen or seen.add(c))]
+
+        if len(unique) == 1:
+            parent = unique[0]
+            link_line = f"- [[{md.stem}]]"
+            changed = _append_linked_notes_section(parent, link_line)
+            if not changed:
+                # Already linked — still counts as a "resolved" pass.
+                processed += 1
+                continue
+            if journal_path is not None:
+                entry = journal_mod.append(
+                    journal_path,
+                    op="orphan-link",
+                    source=str(md.relative_to(vault)),
+                    targets=[str(parent.relative_to(vault))],
+                    detail={
+                        "orphan": md.stem,
+                        "parent": parent.stem,
+                        "line": link_line,
+                    },
+                )
+                journal_mod.commit(journal_path, entry.journal_id)
+            processed += 1
+        else:
+            # Zero or multiple parents — queue.
+            tag_repr = ", ".join(tags) if tags else "(none)"
+            pending_lines.append(f"- [[{md.stem}]] (tags: {tag_repr})")
+            processed += 1
+
+    if pending_lines:
+        path = _orphans_pending_path(mind)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing = ""
+        if path.is_file():
+            try:
+                existing = path.read_text(encoding="utf-8")
+            except OSError:
+                existing = ""
+        if existing and not existing.endswith("\n"):
+            existing += "\n"
+        path.write_text(existing + "\n".join(pending_lines) + "\n", encoding="utf-8")
+    return processed
+
+
+# ---------- verifiers ----------
+#
+# Verifiers are bound to a concrete ``mind`` root via the closure
+# pattern in :func:`register_verifiers`. The journal module's verifier
+# signature is ``(entry) -> bool`` — it has no way to receive the
+# vault root, so the closure captures it.
+
+
+def register_verifiers(mind: pathlib.Path) -> None:
+    """Bind Stage C verifiers to a concrete ``mind`` root.
+
+    Called once at worker startup BEFORE :func:`journal.replay`. The
+    closure form captures the vault root so verifiers can resolve
+    relative paths from journal entries.
+    """
+    vault = _vault_dir(mind)
+
+    def atomize_verifier(entry: journal_mod.JournalEntry) -> bool:
+        # All child targets must exist.
+        for target_rel in entry.targets:
+            if not (vault / target_rel).is_file():
+                return False
+        # Parent must reference each child via wikilink.
+        parent_path = vault / entry.source
+        if not parent_path.is_file():
+            return False
+        try:
+            text = parent_path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        for child_slug in entry.detail.get("children", []):
+            if f"[[{child_slug}]]" not in text:
+                return False
+        return True
+
+    def archive_verifier(entry: journal_mod.JournalEntry) -> bool:
+        src = vault / entry.detail.get("src", entry.source)
+        dst = vault / entry.detail.get("dst", entry.targets[0] if entry.targets else "")
+        if src.exists():
+            return False
+        if not dst.is_file():
+            return False
+        return True
+
+    def dedupe_verifier(entry: journal_mod.JournalEntry) -> bool:
+        canonical_slug = entry.detail.get("canonical")
+        merged_slugs = entry.detail.get("merged", [])
+        if not canonical_slug:
+            return False
+        # Canonical file must exist with merge sections; each merged
+        # file must NOT exist (was deleted).
+        canon_path = vault / entry.source
+        if not canon_path.is_file():
+            return False
+        try:
+            text = canon_path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        for slug in merged_slugs:
+            if f"## Merged from {slug}" not in text:
+                return False
+        return True
+
+    def orphan_link_verifier(entry: journal_mod.JournalEntry) -> bool:
+        parent_rel = entry.targets[0] if entry.targets else ""
+        link_line = entry.detail.get("line", "")
+        if not parent_rel or not link_line:
+            return False
+        parent_path = vault / parent_rel
+        if not parent_path.is_file():
+            return False
+        try:
+            text = parent_path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        return link_line in text
+
+    journal_mod.register_verifier("atomize", atomize_verifier)
+    journal_mod.register_verifier("archive", archive_verifier)
+    journal_mod.register_verifier("dedupe-merge", dedupe_verifier)
+    journal_mod.register_verifier("orphan-link", orphan_link_verifier)
+
+
+# ---------- top-level run ----------
+
+
+def _emit_decay_recovery_event(
+    mind: pathlib.Path,
+    notes_recovered: int,
+    cycle_duration_seconds: float,
+) -> None:
+    """Append a ``decay_recovery_rate`` record to events.jsonl.
+
+    Best-effort: write failure is logged and swallowed (the loop
+    must not crash on observability).
+    """
+    rate = (notes_recovered / cycle_duration_seconds) if cycle_duration_seconds > 0 else 0.0
+    record = {
+        "ts": _utc_iso(),
+        "type": "decay_recovery_rate",
+        "notes_recovered": int(notes_recovered),
+        "cycle_duration_seconds": round(float(cycle_duration_seconds), 3),
+        "rate": round(float(rate), 6),
+    }
+    path = _events_jsonl_path(mind)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        logger.warning("stage_c: failed to append decay_recovery_rate event: %s", exc)
+
+
+def _load_stage_c_config(mind: pathlib.Path) -> StageCConfig:
+    """Read ``memory_worker.stage_c.*`` overrides from
+    ``alice.config.json``.
+
+    Missing / malformed config returns module defaults — same shape as
+    :func:`memory_worker.wake._load_config`.
+    """
+    cfg_path = mind / "config" / "alice.config.json"
+    cfg = StageCConfig()
+    if not cfg_path.is_file():
+        return cfg
+    try:
+        blob = json.loads(cfg_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return cfg
+    section = ((blob or {}).get("memory_worker") or {}).get("stage_c") or {}
+    if not isinstance(section, dict):
+        return cfg
+    if "decay_threshold" in section:
+        try:
+            cfg.decay_threshold = int(section["decay_threshold"])
+        except (TypeError, ValueError):
+            pass
+    if "max_items_per_category" in section:
+        try:
+            cfg.max_items_per_category = int(section["max_items_per_category"])
+        except (TypeError, ValueError):
+            pass
+    return cfg
+
+
+def run(
+    mind: pathlib.Path,
+    *,
+    journal_path: Optional[pathlib.Path] = None,
+    config: Optional[StageCConfig] = None,
+) -> StageCReport:
+    """One Stage C tick.
+
+    Computes the trigger state, short-circuits if no signal fires,
+    otherwise runs the four grooming operations in order with the
+    per-category cap from ``config``. Emits a
+    ``decay_recovery_rate`` event regardless of whether work happened
+    (zero-rate samples are useful for tracking drought duration).
+    """
+    cfg = config or _load_stage_c_config(mind)
+    report = StageCReport()
+    state = compute_state(mind)
+    if not should_run_c(state, cfg):
+        logger.info(
+            "stage_c: trigger inactive — bloated=%d stale=%d decayed=%d orphans=%d broken=%d (threshold=%d)",
+            state.bloated_notes,
+            state.stale_dailies,
+            state.decayed_notes_in_window,
+            state.orphans,
+            state.broken_wikilinks,
+            cfg.decay_threshold,
+        )
+        return report
+
+    report.ran = True
+    started = time.monotonic()
+    report.atomize = atomize(mind, cfg.max_items_per_category, journal_path)
+    report.archive = archive(mind, cfg.max_items_per_category, journal_path)
+    report.dedupe_merge = dedupe_merge(mind, cfg.max_items_per_category, journal_path)
+    report.orphan_resolve = orphan_resolve(mind, cfg.max_items_per_category, journal_path)
+    elapsed = time.monotonic() - started
+
+    total_recovered = (
+        report.atomize + report.archive + report.dedupe_merge + report.orphan_resolve
+    )
+    _emit_decay_recovery_event(mind, total_recovered, elapsed)
+    return report
+
+
+__all__ = [
+    "BLOATED_LINE_THRESHOLD",
+    "DECAY_WINDOW_DAYS",
+    "DEFAULT_DECAY_THRESHOLD",
+    "DEFAULT_MAX_ITEMS_PER_CATEGORY",
+    "FUZZY_TITLE_DISTANCE",
+    "STALE_DAILY_DAYS",
+    "StageCConfig",
+    "StageCReport",
+    "StageCState",
+    "archive",
+    "atomize",
+    "compute_state",
+    "dedupe_merge",
+    "orphan_resolve",
+    "register_verifiers",
+    "run",
+    "should_run_c",
+]
