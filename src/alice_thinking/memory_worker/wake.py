@@ -36,7 +36,7 @@ from typing import Any
 
 from core.events import EventLogger
 
-from . import journal
+from . import journal, stage_b
 
 
 DEFAULT_MIND = pathlib.Path("/home/alice/alice-mind")
@@ -155,15 +155,30 @@ def main() -> int:
 
     emitter = EventLogger(pathlib.Path(args.log), echo=args.echo)
 
-    # Phase 1: journal replay only. Phase 2+ inserts B/C/D dispatch
-    # between this and the heartbeat emit. The replay is best-effort
-    # — a verifier raising is caught inside :func:`journal.replay`
-    # and recorded as ``skipped`` rather than crashing the wake.
+    # Phase 1: journal replay first so any in-flight mutation from a
+    # crashed prior wake is verified or skipped before new work runs.
+    # Replay is best-effort — a verifier raising is caught inside
+    # :func:`journal.replay` and recorded as ``skipped`` rather than
+    # crashing the wake.
     report = journal.replay(journal_path)
+
+    # Phase 2: Stage B inbox drain. Deterministic routing; no LLM
+    # calls. Each note's vault write + journal commit must succeed
+    # before the note is atomic-renamed into ``.consumed/`` — a
+    # writer raising leaves the note in the inbox for the next
+    # tick's retry. Stage B operates on ``mind`` directly (the
+    # vault root), not on ``--state-dir``.
+    drain = stage_b.run(mind, journal_path=journal_path)
+
+    # Phase 3 + 4 land here in subsequent PRs. Each stage takes
+    # the same (mind, journal_path) shape so wiring them in is a
+    # one-line addition per stage.
+    # TODO(phase-3): groom = stage_c.run(mind, journal_path=journal_path)
+    # TODO(phase-4): synth = stage_d.run(mind, journal_path=journal_path)
 
     emitter.emit(
         "memory_worker_heartbeat",
-        phase="scaffold",
+        phase="stage_b",
         journal_path=str(journal_path),
         cadence_minutes=int(cfg.get("cadence_minutes", DEFAULT_CADENCE_MINUTES)),
         stage_d_model=str(cfg.get("stage_d_model", DEFAULT_STAGE_D_MODEL)),
@@ -171,6 +186,7 @@ def main() -> int:
             cfg.get("stage_d_api_tier_enabled", DEFAULT_STAGE_D_API_TIER_ENABLED)
         ),
         **report.to_dict(),
+        **{f"stage_b_{k}": v for k, v in drain.to_dict().items()},
     )
 
     return 0

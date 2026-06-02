@@ -97,7 +97,9 @@ def test_heartbeat_event_carries_replay_report(
     assert len(lines) == 1
     record = json.loads(lines[0])
     assert record["event"] == "memory_worker_heartbeat"
-    assert record["phase"] == "scaffold"
+    # Phase 2 onward: the heartbeat advertises the latest stage
+    # that landed. Phase 1's "scaffold" was a placeholder.
+    assert record["phase"] == "stage_b"
     assert record["cadence_minutes"] == 30
     assert record["stage_d_model"] == "local"
     assert record["stage_d_api_tier_enabled"] is False
