@@ -36,7 +36,7 @@ from typing import Any
 
 from core.events import EventLogger
 
-from . import journal, stage_b, stage_c
+from . import journal, stage_b, stage_c, stage_d
 
 
 DEFAULT_MIND = pathlib.Path("/home/alice/alice-mind")
@@ -161,6 +161,10 @@ def main() -> int:
     # state. Without this, replay falls back to the Phase 1 stubs and
     # marks every Stage C op ``skipped``.
     stage_c.register_verifiers(mind)
+    # Phase 4: same wiring for Stage D's ``recombination`` op — replay
+    # confirms the synthesis file landed AND the audit row exists
+    # before marking the journal entry committed.
+    stage_d.register_verifiers(mind)
 
     # Phase 1: journal replay first so any in-flight mutation from a
     # crashed prior wake is verified or skipped before new work runs.
@@ -182,12 +186,25 @@ def main() -> int:
     # per category keeps wake budget bounded.
     groom = stage_c.run(mind, journal_path=journal_path)
 
-    # Phase 4 lands here in a subsequent PR.
-    # TODO(phase-4): synth = stage_d.run(mind, journal_path=journal_path)
+    # Phase 4: Stage D recombination. Runs after Stage C so any
+    # atomize/dedupe that touched a research note this cycle is
+    # already reflected in the candidate set's frontmatter timestamps.
+    synth = stage_d.run(mind, journal_path=journal_path)
+
+    # Heartbeat phase: precedence is the heaviest stage that actually
+    # ran (D > C > B). ``stage_d.ran`` is True iff a pair was selected
+    # this cycle — null-result outcomes still count, because Stage D
+    # *did* think this cycle (it just didn't ship).
+    if synth.ran:
+        heartbeat_phase = "stage_d"
+    elif groom.ran:
+        heartbeat_phase = "stage_c"
+    else:
+        heartbeat_phase = "stage_b"
 
     emitter.emit(
         "memory_worker_heartbeat",
-        phase="stage_c" if groom.ran else "stage_b",
+        phase=heartbeat_phase,
         journal_path=str(journal_path),
         cadence_minutes=int(cfg.get("cadence_minutes", DEFAULT_CADENCE_MINUTES)),
         stage_d_model=str(cfg.get("stage_d_model", DEFAULT_STAGE_D_MODEL)),
@@ -198,6 +215,8 @@ def main() -> int:
         **{f"stage_b_{k}": v for k, v in drain.to_dict().items()},
         **{f"stage_c_{k}": v for k, v in groom.to_dict().items()},
         stage_c_ran=bool(groom.ran),
+        **{f"stage_d_{k}": v for k, v in synth.to_dict().items()},
+        stage_d_ran=bool(synth.ran),
     )
 
     return 0

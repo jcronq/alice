@@ -595,3 +595,178 @@ def test_replay_archive_verifier_checks_src_gone_and_dst_present(mind: pathlib.P
     report = journal_mod.replay(journal_path)
     after = {e.journal_id: e.status for e in journal_mod.load(journal_path)}
     assert after["arch-2"] == journal_mod.SKIPPED
+
+
+# ---------- vault_lock retrofit (phase 4) ----------
+#
+# The phase 3 worker shipped stage_c.py without using vault_lock from
+# phase 1. The phase 4 retrofit wires :func:`vault_lock.acquire` around
+# every vault mutation in stage_c.py. These tests prove the wiring by
+# (a) running the operations end-to-end (they still produce correct
+# output — same as the tests above) and (b) showing that an externally
+# held lock makes the operation skip the locked file.
+#
+# The lock is process-scoped; we use ``os.fork`` to hold the sidecar
+# from a child process so the parent's acquire actually contends.
+
+
+def _hold_lock_in_child(target_path: pathlib.Path) -> int:
+    """Fork a child that grabs ``target_path``'s sidecar and sleeps.
+    Returns the child PID. Parent must SIGKILL + waitpid in finally."""
+    import os
+    import time as _time
+
+    from alice_thinking import vault_lock as _vl
+
+    pid = os.fork()
+    if pid == 0:
+        try:
+            with _vl.acquire(target_path, mode=_vl.LockMode.EXCLUSIVE):
+                _time.sleep(10.0)
+        finally:
+            os._exit(0)
+    # Brief pause so the child has time to acquire before parent contends.
+    _time.sleep(0.1)
+    return pid
+
+
+def _kill_child(pid: int) -> None:
+    import os
+    import signal as _signal
+
+    try:
+        os.kill(pid, _signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    os.waitpid(pid, 0)
+
+
+def test_atomize_skips_when_source_lock_held(
+    mind: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+    """An externally held EXCLUSIVE lock on the bloated source makes
+    atomize log + skip rather than rewrite."""
+    monkeypatch.setattr(stage_c, "_LOCK_TIMEOUT_SECONDS", 0.2)
+    body_lines = []
+    for section in ("Foo", "Bar"):
+        body_lines.append(f"\n## {section}\n")
+        body_lines.extend(["x\n"] * 150)
+    src = _write_note(
+        mind, "research/locked-src.md", title="Locked", body="".join(body_lines)
+    )
+
+    pid = _hold_lock_in_child(src)
+    try:
+        n = stage_c.atomize(mind, max_items=10, journal_path=None)
+    finally:
+        _kill_child(pid)
+    assert n == 0
+    # Source remains intact (no children produced).
+    assert "## Foo" in src.read_text(encoding="utf-8")
+    assert not list((mind / "cortex-memory" / "research").glob("locked-src-*.md"))
+
+
+def test_archive_skips_when_destination_lock_held(
+    mind: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Atomic lock on the archive destination makes archive log + skip."""
+    monkeypatch.setattr(stage_c, "_LOCK_TIMEOUT_SECONDS", 0.2)
+    today = datetime.date(2026, 6, 10)
+    stale = mind / "cortex-memory" / "dailies" / "2025-01-01.md"
+    stale.write_text("---\ntitle: 2025-01-01\n---\n", encoding="utf-8")
+    # Pre-create dest directory and lock the destination path.
+    dst = (
+        mind
+        / "cortex-memory"
+        / "archive"
+        / "dailies"
+        / "2025"
+        / "2025-01-01.md"
+    )
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    pid = _hold_lock_in_child(dst)
+    try:
+        n = stage_c.archive(mind, max_items=10, journal_path=None, today=today)
+    finally:
+        _kill_child(pid)
+    assert n == 0
+    # Source not moved.
+    assert stale.is_file()
+
+
+def test_orphan_link_skips_when_parent_lock_held(
+    mind: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A locked parent makes the orphan-link append return False — but
+    the orphan still gets counted as "resolved" by the cycle (idempotent
+    semantics — we'll retry next tick)."""
+    monkeypatch.setattr(stage_c, "_LOCK_TIMEOUT_SECONDS", 0.2)
+    parent = _write_note(mind, "projects/alpha.md", title="Alpha", body="\n")
+    _write_note(
+        mind,
+        "research/orphan-1.md",
+        title="Orphan-1",
+        tags=["alpha"],
+        body="\n",
+    )
+
+    pid = _hold_lock_in_child(parent)
+    try:
+        stage_c.orphan_resolve(mind, max_items=10, journal_path=None)
+    finally:
+        _kill_child(pid)
+    # Parent unchanged — no Linked notes section appended.
+    assert "## Linked notes" not in parent.read_text(encoding="utf-8")
+
+
+def test_dedupe_skips_group_when_lock_held(
+    mind: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A locked duplicate file makes the whole group skip — the canonical
+    remains unchanged and the duplicate stays on disk."""
+    monkeypatch.setattr(stage_c, "_LOCK_TIMEOUT_SECONDS", 0.2)
+    canon = _write_note(
+        mind,
+        "research/widget.md",
+        title="Widget",
+        created="2026-01-01",
+        body="canonical body\n",
+    )
+    dup = _write_note(
+        mind,
+        "reference/widget.md",
+        title="Widget",
+        created="2026-05-01",
+        body="dup body\n",
+    )
+
+    pid = _hold_lock_in_child(dup)
+    try:
+        n = stage_c.dedupe_merge(mind, max_items=10, journal_path=None)
+    finally:
+        _kill_child(pid)
+    assert n == 0
+    # Duplicate not deleted, canonical not merged.
+    assert dup.is_file()
+    canon_text = canon.read_text(encoding="utf-8")
+    assert "## Merged from" not in canon_text
+
+
+def test_atomize_still_works_under_normal_lock_path(mind: pathlib.Path):
+    """Sanity check: with no external contention, atomize still produces
+    the expected children + parent rewrite under vault_lock."""
+    body_lines = []
+    for section in ("First", "Second"):
+        body_lines.append(f"\n## {section}\n")
+        body_lines.extend(["x\n"] * 150)
+    src = _write_note(
+        mind, "research/unlocked.md", title="Unlocked", body="".join(body_lines)
+    )
+    n = stage_c.atomize(mind, max_items=10, journal_path=None)
+    assert n == 1
+    research = mind / "cortex-memory" / "research"
+    children = sorted(p.name for p in research.glob("unlocked-*.md"))
+    assert children == ["unlocked-first.md", "unlocked-second.md"]
+    # Parent rewritten under the held source lock.
+    assert "[[unlocked-first]]" in src.read_text(encoding="utf-8")

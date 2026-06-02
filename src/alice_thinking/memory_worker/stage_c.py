@@ -55,6 +55,7 @@ pass ``mind / "cortex-memory"`` when calling into them.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
 import hashlib
@@ -68,10 +69,24 @@ from typing import Any, Optional
 
 from indexer.yaml_lite import split_frontmatter
 
+from alice_thinking import vault_lock
+
 from . import journal as journal_mod
 
 
 logger = logging.getLogger(__name__)
+
+
+#: Vault-lock timeout (seconds) for every Stage C mutation. Stage C
+#: writes are short — if a holder is sitting on the sidecar for more
+#: than this, the lock acquirer raises :class:`vault_lock.VaultLockTimeout`
+#: and the per-op loop logs + skips the file. The next cadence tick
+#: retries.
+#:
+#: Tuned to be a little longer than a typical Stage B inbox-drain
+#: write (~200 ms) but well under the 30-min cadence so a hung peer
+#: doesn't wedge a whole tick.
+_LOCK_TIMEOUT_SECONDS = 5.0
 
 
 # ---------- tunables ----------
@@ -500,104 +515,163 @@ def atomize(
             break
         if _line_count(md) <= BLOATED_LINE_THRESHOLD:
             continue
+
+        # Hold the source EXCLUSIVE lock from read through parent
+        # rewrite. This is the structural fix for the
+        # "thinking-appends-while-we're-splitting" race the design
+        # doc §6 calls out: while we hold the sidecar, thinking
+        # blocks; by the time it gets the lock, the source has been
+        # rewritten to the pointer-only stub. Lock ordering is
+        # source-first then children-in-path-order, both alphabetical
+        # against any sibling locker, so no deadlock with another
+        # atomize-style operation hitting the same directory.
+        #
+        # The :func:`vault_lock.acquire` call is a ``@contextmanager``,
+        # so the timeout fires on ``__enter__`` (entering ``with``),
+        # not on the call itself — the try/except wraps the ``with``.
         try:
-            text = md.read_text(encoding="utf-8")
-        except OSError as exc:
-            logger.warning("stage_c atomize: read failed for %s: %s", md, exc)
+            with vault_lock.acquire(
+                md,
+                mode=vault_lock.LockMode.EXCLUSIVE,
+                timeout=_LOCK_TIMEOUT_SECONDS,
+            ):
+                if _atomize_one(
+                    md,
+                    vault=vault,
+                    today_iso=today_iso,
+                    journal_path=journal_path,
+                ):
+                    processed += 1
+        except vault_lock.VaultLockTimeout as exc:
+            logger.warning("stage_c atomize: lock timeout for %s: %s", md, exc)
             continue
-        fm, body = split_frontmatter(text)
-        sections = _split_on_headings(body)
-        if not sections:
-            logger.info(
-                "stage_c atomize-skipped-no-headings: %s has no ## sections",
-                md.relative_to(vault),
-            )
-            continue
+    return processed
 
-        parent_slug = md.stem
-        children_rel: list[str] = []
-        child_writes: list[tuple[pathlib.Path, str]] = []
-        # Build child files first so we can journal them with their
-        # final paths.
-        for title, section_text in sections:
-            child_slug = f"{parent_slug}-{_slugify(title)}"
+
+def _atomize_one(
+    md: pathlib.Path,
+    *,
+    vault: pathlib.Path,
+    today_iso: str,
+    journal_path: Optional[pathlib.Path],
+) -> bool:
+    """Atomize a single note. Caller holds the EXCLUSIVE lock on
+    ``md``. Returns True on a successful split, False on read failure
+    / no-headings / write failure.
+
+    Extracted so the try/except VaultLockTimeout in :func:`atomize`
+    cleanly wraps the ``with vault_lock.acquire(...)`` without
+    duplicating the per-note body.
+    """
+    try:
+        text = md.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("stage_c atomize: read failed for %s: %s", md, exc)
+        return False
+    fm, body = split_frontmatter(text)
+    sections = _split_on_headings(body)
+    if not sections:
+        logger.info(
+            "stage_c atomize-skipped-no-headings: %s has no ## sections",
+            md.relative_to(vault),
+        )
+        return False
+
+    parent_slug = md.stem
+    children_rel: list[str] = []
+    child_writes: list[tuple[pathlib.Path, str]] = []
+    # Build child files first so we can journal them with their final paths.
+    for title, section_text in sections:
+        child_slug = f"{parent_slug}-{_slugify(title)}"
+        child_path = md.parent / f"{child_slug}.md"
+        # Don't clobber an existing file; suffix until unique.
+        suffix = 2
+        while child_path.exists() and child_path.resolve() != md.resolve():
+            child_slug = f"{parent_slug}-{_slugify(title)}-{suffix}"
             child_path = md.parent / f"{child_slug}.md"
-            # Don't clobber an existing file; suffix until unique.
-            suffix = 2
-            while child_path.exists() and child_path.resolve() != md.resolve():
-                child_slug = f"{parent_slug}-{_slugify(title)}-{suffix}"
-                child_path = md.parent / f"{child_slug}.md"
-                suffix += 1
+            suffix += 1
 
-            child_fm: dict[str, Any] = {
-                "title": title,
-                "tags": fm.get("tags", []),
-                "created": fm.get("created", today_iso),
-                "updated": today_iso,
-                "derived_from": parent_slug,
-            }
-            if isinstance(child_fm["tags"], str):
-                child_fm["tags"] = [child_fm["tags"]]
-            child_body = section_text.strip() + "\n"
-            child_writes.append(
-                (child_path, _frontmatter_render(child_fm) + "\n" + child_body)
-            )
-            children_rel.append(str(child_path.relative_to(vault)))
+        child_fm: dict[str, Any] = {
+            "title": title,
+            "tags": fm.get("tags", []),
+            "created": fm.get("created", today_iso),
+            "updated": today_iso,
+            "derived_from": parent_slug,
+        }
+        if isinstance(child_fm["tags"], str):
+            child_fm["tags"] = [child_fm["tags"]]
+        child_body = section_text.strip() + "\n"
+        child_writes.append(
+            (child_path, _frontmatter_render(child_fm) + "\n" + child_body)
+        )
+        children_rel.append(str(child_path.relative_to(vault)))
 
-        # Parent rewrite — replace the body with wikilinks. Keep the
-        # original frontmatter intact (atomize is structural, not
-        # editorial); bump ``updated``.
-        new_fm = dict(fm)
-        new_fm["updated"] = today_iso
-        parent_body_lines: list[str] = []
-        # Preserve any pre-first-heading prologue from the original
-        # body — that content has nowhere else to live.
-        prologue_lines: list[str] = []
-        for line in body.splitlines():
-            if line.startswith("## ") and not line.startswith("### "):
-                break
-            prologue_lines.append(line)
-        prologue = "\n".join(prologue_lines).strip()
-        if prologue:
-            parent_body_lines.append(prologue)
-            parent_body_lines.append("")
-        parent_body_lines.append("## Sections")
+    # Parent rewrite — replace the body with wikilinks. Keep the original
+    # frontmatter intact (atomize is structural, not editorial); bump ``updated``.
+    new_fm = dict(fm)
+    new_fm["updated"] = today_iso
+    parent_body_lines: list[str] = []
+    # Preserve any pre-first-heading prologue from the original body —
+    # that content has nowhere else to live.
+    prologue_lines: list[str] = []
+    for line in body.splitlines():
+        if line.startswith("## ") and not line.startswith("### "):
+            break
+        prologue_lines.append(line)
+    prologue = "\n".join(prologue_lines).strip()
+    if prologue:
+        parent_body_lines.append(prologue)
         parent_body_lines.append("")
-        for child_rel in children_rel:
-            child_slug = pathlib.Path(child_rel).stem
-            parent_body_lines.append(f"- See [[{child_slug}]]")
-        new_parent_text = (
-            _frontmatter_render(new_fm) + "\n" + "\n".join(parent_body_lines) + "\n"
+    parent_body_lines.append("## Sections")
+    parent_body_lines.append("")
+    for child_rel in children_rel:
+        child_slug = pathlib.Path(child_rel).stem
+        parent_body_lines.append(f"- See [[{child_slug}]]")
+    new_parent_text = (
+        _frontmatter_render(new_fm)
+        + "\n"
+        + "\n".join(parent_body_lines)
+        + "\n"
+    )
+
+    # Journal BEFORE the write.
+    original_sha = _sha256_of_text(text)
+    entry = None
+    if journal_path is not None:
+        entry = journal_mod.append(
+            journal_path,
+            op="atomize",
+            source=str(md.relative_to(vault)),
+            targets=children_rel,
+            detail={
+                "parent": parent_slug,
+                "children": [pathlib.Path(c).stem for c in children_rel],
+                "original_content_sha": original_sha,
+            },
         )
 
-        # Journal BEFORE the write.
-        original_sha = _sha256_of_text(text)
-        entry = None
-        if journal_path is not None:
-            entry = journal_mod.append(
-                journal_path,
-                op="atomize",
-                source=str(md.relative_to(vault)),
-                targets=children_rel,
-                detail={
-                    "parent": parent_slug,
-                    "children": [pathlib.Path(c).stem for c in children_rel],
-                    "original_content_sha": original_sha,
-                },
-            )
-
-        try:
-            for child_path, child_text in child_writes:
+    try:
+        # Children are new files in the same directory; lock each
+        # individually so a concurrent atomize on a different parent
+        # that would land at the same child name (rare collision)
+        # serializes too.
+        for child_path, child_text in child_writes:
+            with vault_lock.acquire(
+                child_path,
+                mode=vault_lock.LockMode.EXCLUSIVE,
+                timeout=_LOCK_TIMEOUT_SECONDS,
+            ):
                 child_path.write_text(child_text, encoding="utf-8")
-            md.write_text(new_parent_text, encoding="utf-8")
-        except OSError as exc:
-            logger.warning("stage_c atomize: write failed for %s: %s", md, exc)
-            continue
+        # Parent rewrite happens under the source lock the caller holds —
+        # no extra acquire needed.
+        md.write_text(new_parent_text, encoding="utf-8")
+    except (OSError, vault_lock.VaultLockTimeout) as exc:
+        logger.warning("stage_c atomize: write failed for %s: %s", md, exc)
+        return False
 
-        if journal_path is not None and entry is not None:
-            journal_mod.commit(journal_path, entry.journal_id)
-        processed += 1
-    return processed
+    if journal_path is not None and entry is not None:
+        journal_mod.commit(journal_path, entry.journal_id)
+    return True
 
 
 # ---------- archive ----------
@@ -613,27 +687,45 @@ def _rewrite_wikilinks_in_file(
 
     Conservative — only rewrites the slug portion, leaving any
     ``#anchor`` and ``|alias`` parts alone.
+
+    Acquires an EXCLUSIVE :func:`vault_lock` on ``path`` for the
+    read-modify-write window — these calls reach into arbitrary
+    referrer files across the vault during archive/dedupe, so each
+    one must serialize against a thinking-side write to the same
+    file. Returns False on lock timeout (treated as "skip this
+    referrer, the next cycle picks it up").
     """
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
+        with vault_lock.acquire(
+            path,
+            mode=vault_lock.LockMode.EXCLUSIVE,
+            timeout=_LOCK_TIMEOUT_SECONDS,
+        ):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                return False
+
+            def repl(match: re.Match[str]) -> str:
+                target = match.group(1).strip()
+                base = target.rsplit("/", 1)[-1]
+                if base != old_slug:
+                    return match.group(0)
+                # Reconstruct with the new slug. Anchor / alias survive
+                # in match.group(0) — we replace only the slug section.
+                full = match.group(0)
+                return full.replace(target, new_slug, 1)
+
+            new_text = _WIKILINK_RE.sub(repl, text)
+            if new_text != text:
+                path.write_text(new_text, encoding="utf-8")
+                return True
+            return False
+    except vault_lock.VaultLockTimeout as exc:
+        logger.warning(
+            "stage_c wikilink-rewrite: lock timeout on %s: %s", path, exc
+        )
         return False
-
-    def repl(match: re.Match[str]) -> str:
-        target = match.group(1).strip()
-        base = target.rsplit("/", 1)[-1]
-        if base != old_slug:
-            return match.group(0)
-        # Reconstruct with the new slug. Anchor / alias survive in
-        # match.group(0) — we replace only the slug section.
-        full = match.group(0)
-        return full.replace(target, new_slug, 1)
-
-    new_text = _WIKILINK_RE.sub(repl, text)
-    if new_text != text:
-        path.write_text(new_text, encoding="utf-8")
-        return True
-    return False
 
 
 def archive(
@@ -720,8 +812,31 @@ def archive(
                 },
             )
 
+        # Lock both endpoints of the rename. Path-order acquisition
+        # (alphabetical) avoids deadlock against any other archive-style
+        # op touching the same files. ``dst`` doesn't exist yet — that's
+        # fine, :func:`vault_lock.acquire` attaches the lock to a
+        # sidecar created on demand.
+        rename_paths = sorted([md, dst])
         try:
-            md.rename(dst)
+            with vault_lock.acquire(
+                rename_paths[0],
+                mode=vault_lock.LockMode.EXCLUSIVE,
+                timeout=_LOCK_TIMEOUT_SECONDS,
+            ), vault_lock.acquire(
+                rename_paths[1],
+                mode=vault_lock.LockMode.EXCLUSIVE,
+                timeout=_LOCK_TIMEOUT_SECONDS,
+            ):
+                md.rename(dst)
+        except vault_lock.VaultLockTimeout as exc:
+            logger.warning(
+                "stage_c archive: lock timeout on rename %s -> %s: %s",
+                md,
+                dst,
+                exc,
+            )
+            continue
         except OSError as exc:
             logger.warning("stage_c archive: rename failed %s -> %s: %s", md, dst, exc)
             continue
@@ -877,92 +992,135 @@ def dedupe_merge(
         if not duplicates:
             continue
 
+        # Acquire EXCLUSIVE locks on canonical + every duplicate up
+        # front, in path order. This prevents another writer (thinking,
+        # a concurrent worker tick) from mutating any of these files
+        # between our reads and the merged-write/unlink. Path-order
+        # acquisition keeps multiple dedupe-merge calls deadlock-free
+        # when they pick overlapping groups.
+        all_paths = sorted({canonical, *duplicates})
         try:
-            canon_text = canonical.read_text(encoding="utf-8")
-        except OSError as exc:
-            logger.warning("stage_c dedupe: canonical read failed %s: %s", canonical, exc)
-            continue
-        canon_fm, canon_body = split_frontmatter(canon_text)
+            with contextlib.ExitStack() as stack:
+                for p in all_paths:
+                    stack.enter_context(
+                        vault_lock.acquire(
+                            p,
+                            mode=vault_lock.LockMode.EXCLUSIVE,
+                            timeout=_LOCK_TIMEOUT_SECONDS,
+                        )
+                    )
 
-        merged_slugs: list[str] = []
-        merged_sections: list[str] = []
-        wikilink_updates: list[dict[str, str]] = []
-
-        for dup in duplicates:
-            if processed >= max_items:
-                break
-            try:
-                dup_text = dup.read_text(encoding="utf-8")
-            except OSError as exc:
-                logger.warning("stage_c dedupe: dup read failed %s: %s", dup, exc)
-                continue
-            dup_fm, dup_body = split_frontmatter(dup_text)
-            dup_created = str(dup_fm.get("created", "unknown"))
-            section = (
-                f"\n## Merged from {dup.stem} ({dup_created})\n\n"
-                f"{dup_body.strip()}\n"
-            )
-            merged_sections.append(section)
-            merged_slugs.append(dup.stem)
-
-            # Wikilinks across vault pointing at duplicate → canonical.
-            for source in vault.rglob("*.md"):
-                if source.resolve() in (canonical.resolve(), dup.resolve()):
-                    continue
                 try:
-                    text = source.read_text(encoding="utf-8")
-                except OSError:
+                    canon_text = canonical.read_text(encoding="utf-8")
+                except OSError as exc:
+                    logger.warning(
+                        "stage_c dedupe: canonical read failed %s: %s",
+                        canonical,
+                        exc,
+                    )
                     continue
-                if f"[[{dup.stem}" not in text:
+                canon_fm, canon_body = split_frontmatter(canon_text)
+
+                merged_slugs: list[str] = []
+                merged_sections: list[str] = []
+                wikilink_updates: list[dict[str, str]] = []
+
+                for dup in duplicates:
+                    if processed >= max_items:
+                        break
+                    try:
+                        dup_text = dup.read_text(encoding="utf-8")
+                    except OSError as exc:
+                        logger.warning(
+                            "stage_c dedupe: dup read failed %s: %s", dup, exc
+                        )
+                        continue
+                    dup_fm, dup_body = split_frontmatter(dup_text)
+                    dup_created = str(dup_fm.get("created", "unknown"))
+                    section = (
+                        f"\n## Merged from {dup.stem} ({dup_created})\n\n"
+                        f"{dup_body.strip()}\n"
+                    )
+                    merged_sections.append(section)
+                    merged_slugs.append(dup.stem)
+
+                    # Wikilinks across vault pointing at duplicate → canonical.
+                    for source in vault.rglob("*.md"):
+                        if source.resolve() in (
+                            canonical.resolve(),
+                            dup.resolve(),
+                        ):
+                            continue
+                        try:
+                            text = source.read_text(encoding="utf-8")
+                        except OSError:
+                            continue
+                        if f"[[{dup.stem}" not in text:
+                            continue
+                        wikilink_updates.append(
+                            {
+                                "file": str(source.relative_to(vault)),
+                                "old": dup.stem,
+                                "new": canonical.stem,
+                            }
+                        )
+
+                if not merged_slugs:
                     continue
-                wikilink_updates.append(
-                    {
-                        "file": str(source.relative_to(vault)),
-                        "old": dup.stem,
-                        "new": canonical.stem,
-                    }
+
+                # Bump canonical frontmatter, append merged sections.
+                new_canon_fm = dict(canon_fm)
+                new_canon_fm["updated"] = today_iso
+                new_canon_fm["last_accessed"] = today_iso
+                try:
+                    ac = int(new_canon_fm.get("access_count") or 0)
+                except (TypeError, ValueError):
+                    ac = 0
+                new_canon_fm["access_count"] = ac + 1
+                new_canon_body = (
+                    canon_body.rstrip() + "\n" + "".join(merged_sections)
                 )
+                new_canon_text = (
+                    _frontmatter_render(new_canon_fm) + "\n" + new_canon_body
+                )
+                if not new_canon_text.endswith("\n"):
+                    new_canon_text += "\n"
 
-        if not merged_slugs:
-            continue
+                entry = None
+                if journal_path is not None:
+                    entry = journal_mod.append(
+                        journal_path,
+                        op="dedupe-merge",
+                        source=str(canonical.relative_to(vault)),
+                        targets=[str(canonical.relative_to(vault))],
+                        detail={
+                            "canonical": canonical.stem,
+                            "merged": merged_slugs,
+                            "wikilink_updates": wikilink_updates,
+                        },
+                    )
 
-        # Bump canonical frontmatter, append merged sections.
-        new_canon_fm = dict(canon_fm)
-        new_canon_fm["updated"] = today_iso
-        new_canon_fm["last_accessed"] = today_iso
-        try:
-            ac = int(new_canon_fm.get("access_count") or 0)
-        except (TypeError, ValueError):
-            ac = 0
-        new_canon_fm["access_count"] = ac + 1
-        new_canon_body = canon_body.rstrip() + "\n" + "".join(merged_sections)
-        new_canon_text = _frontmatter_render(new_canon_fm) + "\n" + new_canon_body
-        if not new_canon_text.endswith("\n"):
-            new_canon_text += "\n"
-
-        entry = None
-        if journal_path is not None:
-            entry = journal_mod.append(
-                journal_path,
-                op="dedupe-merge",
-                source=str(canonical.relative_to(vault)),
-                targets=[str(canonical.relative_to(vault))],
-                detail={
-                    "canonical": canonical.stem,
-                    "merged": merged_slugs,
-                    "wikilink_updates": wikilink_updates,
-                },
+                try:
+                    canonical.write_text(new_canon_text, encoding="utf-8")
+                    for dup in duplicates:
+                        if dup.stem in merged_slugs and dup.exists():
+                            dup.unlink()
+                except OSError as exc:
+                    logger.warning(
+                        "stage_c dedupe: write/unlink failed: %s", exc
+                    )
+                    continue
+        except vault_lock.VaultLockTimeout as exc:
+            logger.warning(
+                "stage_c dedupe: lock timeout on canonical=%s duplicates=%s: %s",
+                canonical,
+                [d.stem for d in duplicates],
+                exc,
             )
-
-        try:
-            canonical.write_text(new_canon_text, encoding="utf-8")
-            for dup in duplicates:
-                if dup.stem in merged_slugs and dup.exists():
-                    dup.unlink()
-        except OSError as exc:
-            logger.warning("stage_c dedupe: write/unlink failed: %s", exc)
             continue
 
+        # Referrer rewrites happen outside the canonical-group locks —
+        # ``_rewrite_wikilinks_in_file`` acquires its own per-file lock.
         for upd in wikilink_updates:
             target_path = vault / upd["file"]
             _rewrite_wikilinks_in_file(target_path, upd["old"], upd["new"])
@@ -1002,35 +1160,57 @@ def _append_linked_notes_section(parent: pathlib.Path, link_line: str) -> bool:
     """Append ``link_line`` (no trailing newline) under a
     ``## Linked notes`` section in ``parent``. Creates the section if
     missing. Idempotent: returns False if the exact line already exists
-    anywhere in the file."""
+    anywhere in the file.
+
+    Holds an EXCLUSIVE :func:`vault_lock` on ``parent`` for the
+    read-modify-write window so a thinking-side append to the same
+    parent can't land in the middle of our rewrite. Returns False on
+    lock timeout (orphan-resolve treats this the same as "already
+    linked" — retry next cycle).
+    """
     try:
-        text = parent.read_text(encoding="utf-8")
-    except OSError:
+        with vault_lock.acquire(
+            parent,
+            mode=vault_lock.LockMode.EXCLUSIVE,
+            timeout=_LOCK_TIMEOUT_SECONDS,
+        ):
+            try:
+                text = parent.read_text(encoding="utf-8")
+            except OSError:
+                return False
+            if link_line in text:
+                return False
+            if "## Linked notes" in text:
+                # Append directly after the section header (or at end).
+                lines = text.splitlines()
+                for i, line in enumerate(lines):
+                    if line.strip() == "## Linked notes":
+                        # Find end of the section: next "## " heading or EOF.
+                        j = i + 1
+                        while j < len(lines) and not (
+                            lines[j].startswith("## ")
+                            and not lines[j].startswith("### ")
+                        ):
+                            j += 1
+                        lines.insert(j, link_line)
+                        new_text = "\n".join(lines)
+                        if not new_text.endswith("\n"):
+                            new_text += "\n"
+                        parent.write_text(new_text, encoding="utf-8")
+                        return True
+            # No section — append at EOF.
+            if text and not text.endswith("\n"):
+                text += "\n"
+            parent.write_text(
+                text + "\n## Linked notes\n\n" + link_line + "\n",
+                encoding="utf-8",
+            )
+            return True
+    except vault_lock.VaultLockTimeout as exc:
+        logger.warning(
+            "stage_c orphan-link: lock timeout on parent %s: %s", parent, exc
+        )
         return False
-    if link_line in text:
-        return False
-    if "## Linked notes" in text:
-        # Append directly after the section header (or at end).
-        lines = text.splitlines()
-        for i, line in enumerate(lines):
-            if line.strip() == "## Linked notes":
-                # Find end of the section: next "## " heading or EOF.
-                j = i + 1
-                while j < len(lines) and not (
-                    lines[j].startswith("## ") and not lines[j].startswith("### ")
-                ):
-                    j += 1
-                lines.insert(j, link_line)
-                new_text = "\n".join(lines)
-                if not new_text.endswith("\n"):
-                    new_text += "\n"
-                parent.write_text(new_text, encoding="utf-8")
-                return True
-    # No section — append at EOF.
-    if text and not text.endswith("\n"):
-        text += "\n"
-    parent.write_text(text + "\n## Linked notes\n\n" + link_line + "\n", encoding="utf-8")
-    return True
 
 
 def orphan_resolve(
@@ -1105,15 +1285,33 @@ def orphan_resolve(
     if pending_lines:
         path = _orphans_pending_path(mind)
         path.parent.mkdir(parents=True, exist_ok=True)
-        existing = ""
-        if path.is_file():
-            try:
-                existing = path.read_text(encoding="utf-8")
-            except OSError:
+        # Lock the pending-queue file: orphan-resolve can append from
+        # multiple cadence ticks if a backlog spills over, and we don't
+        # want two appenders interleaving lines.
+        try:
+            with vault_lock.acquire(
+                path,
+                mode=vault_lock.LockMode.EXCLUSIVE,
+                timeout=_LOCK_TIMEOUT_SECONDS,
+            ):
                 existing = ""
-        if existing and not existing.endswith("\n"):
-            existing += "\n"
-        path.write_text(existing + "\n".join(pending_lines) + "\n", encoding="utf-8")
+                if path.is_file():
+                    try:
+                        existing = path.read_text(encoding="utf-8")
+                    except OSError:
+                        existing = ""
+                if existing and not existing.endswith("\n"):
+                    existing += "\n"
+                path.write_text(
+                    existing + "\n".join(pending_lines) + "\n",
+                    encoding="utf-8",
+                )
+        except vault_lock.VaultLockTimeout as exc:
+            logger.warning(
+                "stage_c orphan-resolve: lock timeout on pending queue %s: %s",
+                path,
+                exc,
+            )
     return processed
 
 
