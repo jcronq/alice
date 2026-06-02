@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# alice-memory-worker-wake — one cadence tick of Alice's memory worker.
+#
+# Thin shim over `python -m alice_thinking.memory_worker`, modeled on
+# `alice-think`. The Python entry point owns config overrides, journal
+# replay, and (post-Phase 1) B/C/D stage dispatch. Phase 1 only runs the
+# scaffolding loop.
+#
+# Usage:
+#   alice-memory-worker-wake             # one full tick
+#   alice-memory-worker-wake --echo      # also emit events to stderr
+#
+# Singleton enforcement is external — the alice-memory-worker s6 service
+# wraps each invocation in `flock -n /state/worker/memory-worker.lock`
+# so two firings can't collide on the journal or the vault.
+set -u
+
+VENV_PY="/opt/alice-venv/bin/python"
+# Monorepo root is bind-mounted at /home/alice/alice; src/ holds all
+# four sibling packages (core, alice_speaking, alice_thinking, viewer).
+ALICE_SRC="${ALICE_SRC:-/home/alice/alice/src}"
+
+# Outer timeout. Same rationale as alice-think — the Python interpreter
+# can block indefinitely in post-return cleanup; this caps the whole
+# process so the supervisor's flock doesn't get held forever. 600s
+# default (half of alice-think's 1200) because the memory worker's
+# Phase 1 body is a journal replay that completes in milliseconds;
+# raised in later phases once Stage D's LLM call lands.
+WAKE_TIMEOUT="${WAKE_TIMEOUT:-600}"
+WAKE_KILL_GRACE="${WAKE_KILL_GRACE:-60}"
+
+if [ ! -x "$VENV_PY" ]; then
+    echo "[alice-memory-worker-wake] venv python missing at $VENV_PY" >&2
+    exit 1
+fi
+
+export PYTHONPATH="$ALICE_SRC"
+export PYTHONUNBUFFERED=1
+exec timeout --kill-after="$WAKE_KILL_GRACE" "$WAKE_TIMEOUT" \
+    "$VENV_PY" -m alice_thinking.memory_worker "$@"

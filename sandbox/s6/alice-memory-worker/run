@@ -1,0 +1,101 @@
+#!/command/with-contenv bash
+# alice-memory-worker — timer loop that fires alice-memory-worker-wake
+# on a fixed cadence (default 30 min, configurable via
+# memory_worker.cadence_minutes in alice.config.json).
+#
+# Mirrors alice-thinker's shape: singleton via `flock -n`, foreground
+# wake invocation so SIGTERM during a wake completes naturally, sleep
+# in the background under `wait` so the trap fires promptly between
+# wakes. Phase 1 ships with a fixed cadence (no exponential backoff)
+# — the design's "30s retry on lock contention" is satisfied by the
+# next tick; full backoff lands when actual B/C/D bodies make
+# "did_work" measurable.
+#
+# Inbox interrupts: NOT wired in Phase 1. Thinking still drains the
+# inbox passively (reads for context); the memory worker's active
+# drain in Phase 2 will subscribe via inotify the same way
+# alice-thinker does. For now the 30-min cadence is the maximum
+# inbox latency for an active drain — well within the design's
+# acceptance window.
+set -e
+
+LOCK=/state/worker/memory-worker.lock
+CONFIG_JSON=/home/alice/alice-mind/config/alice.config.json
+DEFAULT_CADENCE_MIN=30
+
+mkdir -p "$(dirname "$LOCK")"
+touch "$LOCK"
+chown alice:alice "$LOCK" || true
+
+# Graceful shutdown: same pattern as alice-thinker. A deploy SIGTERMs
+# the container, s6 forwards to this supervisor. We do NOT want to
+# kill an in-flight wake — the python subprocess may be mid-journal
+# write, and a SIGKILL at the s6 gracetime cliff leaves a torn
+# record. Bash defers traps for foreground commands, so the
+# in-flight `flock + alice-memory-worker-wake` finishes naturally
+# before the loop checks STOPPING and breaks. Sleeps run in the
+# background under `wait` so the trap fires immediately during
+# quiet periods.
+STOPPING=
+on_signal() {
+    STOPPING=1
+}
+trap on_signal TERM INT
+
+# Stagger startup so memory worker, thinker, and sm-dispatcher don't
+# all wake up in lockstep on container boot. 90s offset chosen to
+# land after both alice-thinker's 60s warmup and alice-sm-dispatcher's
+# 45s warmup, so the journal replay sees a quiescent container.
+sleep 90 &
+wait $! 2>/dev/null || true
+
+while true; do
+    [ -n "$STOPPING" ] && break
+
+    # Read cadence on each cycle so a config edit takes effect on the
+    # next tick (no restart needed).
+    cadence_min="$DEFAULT_CADENCE_MIN"
+    if [ -f "$CONFIG_JSON" ] && command -v jq >/dev/null 2>&1; then
+        v=$(jq -r '.memory_worker.cadence_minutes // empty' "$CONFIG_JSON" 2>/dev/null || true)
+        case "$v" in
+            ''|*[!0-9]*) ;;
+            *) cadence_min="$v" ;;
+        esac
+    fi
+    cadence=$(( cadence_min * 60 ))
+
+    # Honor memory_worker.enabled=false by sleeping the cadence and
+    # rechecking — the python wake also short-circuits on this flag,
+    # but skipping the flock + python startup keeps the no-op cycle
+    # cheap.
+    enabled=true
+    if [ -f "$CONFIG_JSON" ] && command -v jq >/dev/null 2>&1; then
+        e=$(jq -r '.memory_worker.enabled // true' "$CONFIG_JSON" 2>/dev/null || true)
+        case "$e" in
+            false) enabled=false ;;
+            *) ;;
+        esac
+    fi
+
+    if [ "$enabled" = true ]; then
+        start_ts=$(date +%s)
+        # Foreground on purpose: bash defers the trap until the wake
+        # returns, so the cadence tick completes rather than being
+        # SIGKILLed by s6.
+        flock -n "$LOCK" s6-setuidgid alice /usr/local/bin/alice-memory-worker-wake || true
+        end_ts=$(date +%s)
+        elapsed=$(( end_ts - start_ts ))
+        remainder=$(( cadence - elapsed ))
+    else
+        remainder=$cadence
+    fi
+
+    [ -n "$STOPPING" ] && break
+
+    if [ "$remainder" -gt 0 ]; then
+        sleep "$remainder" &
+        wait $! 2>/dev/null || true
+    fi
+
+    [ -n "$STOPPING" ] && break
+done
