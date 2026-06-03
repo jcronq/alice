@@ -738,6 +738,54 @@ async def test_dedup_skips_note_after_three_identical_state_hashes():
     assert len(notes) == 3
 
 
+@pytest.mark.asyncio
+async def test_dedup_skips_when_inferred_state_repeats_with_varying_events():
+    """The case PR #449 was supposed to handle but didn't (see
+    research/2026-06-03-cozylobe-dedup-ineffective.md): four flush
+    cycles where the underlying motion events DIFFER each cycle
+    (different entity_ids and on/off states — simulating sensors
+    cycling) but the inferred state is identical (stub qwen returns
+    the same room / person / next_room every call). With the raw
+    event set removed from the dedup hash, hashes 1-4 all match and
+    the 4th note is suppressed."""
+    qwen = _StubQwen()
+    notes: list[dict] = []
+
+    def _capture(body, *, slug, tags):
+        notes.append({"slug": slug, "tags": tags})
+        return Path("/tmp/x.md")
+
+    clock = _FakeClock()
+    pipeline = MotionPipeline(
+        llm_client=qwen,
+        vault=None,
+        queue=MotionQueue(batch_window_s=30.0, clock=clock),
+        write_note=_capture,
+        security_predicate=lambda _e: False,
+        clock=clock,
+    )
+    # Vary entity_id + state across cycles. Inferred state from
+    # _StubQwen is fixed, so the 4 hashes collide → 4th note deduped.
+    variants = [
+        ("hue_kitchen_motion", "on"),
+        ("hue_office_motion", "off"),
+        ("hue_living_room_motion", "on"),
+        ("hue_hallway_motion", "off"),
+    ]
+    for entity_id, state in variants:
+        await pipeline.handle(
+            _cozyhem(entity_id=entity_id, received_at=clock(), payload={"state": state})
+        )
+        clock.advance(31.0)
+        await pipeline.handle(
+            _cozyhem(entity_id=entity_id, received_at=clock(), payload={"state": state})
+        )
+    # First 3 cycles wrote notes; the 4th was deduped because the
+    # inferred state hash matched the prior 3 even though the raw
+    # event set differed every time.
+    assert len(notes) == 3
+
+
 # ---------------------------------------------------------------------------
 # Burst test: 10 events in 5 seconds without dropping
 

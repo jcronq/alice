@@ -1309,6 +1309,13 @@ class MotionPipeline:
         # note — the guess, trajectory, and actionable-surface paths
         # above/below run unconditionally. Security + actionable tiers
         # are high-signal and bypass the dedup check entirely.
+        #
+        # Hash scope: the INFERRED state only (room + person + next_room
+        # + security). The raw event set was removed (see research note
+        # cortex-memory/research/2026-06-03-cozylobe-dedup-ineffective.md):
+        # motion sensors cycle ON/OFF on every snapshot, so including
+        # the raw events made every consecutive observation hash
+        # differently and defeated dedup entirely.
         zone = inference.current_room or "unknown"
         state_blob = json.dumps(
             {
@@ -1316,7 +1323,6 @@ class MotionPipeline:
                 "person": inference.person_hypothesis,
                 "next_room": inference.next_room_hypothesis,
                 "security": security,
-                "events": sorted((ev.entity_id, ev.state) for ev in batch),
             },
             sort_keys=True,
             default=str,
