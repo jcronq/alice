@@ -72,6 +72,22 @@ log = logging.getLogger(__name__)
 SUMMARY_TAIL_TURNS = 5
 
 
+# Hard ceiling on a single speaking turn (one full agent loop, all its
+# internal tool calls, until the SDK ResultMessage). The whole turn runs
+# under the daemon's single ``_turn_lock`` — so if the embedded SDK stream
+# wedges (e.g. a crashed ``claude`` CLI subprocess: "Stream closed at
+# sendRequest"), an unbounded turn holds that lock forever and every
+# subsequent client on every transport hangs with no reply. A finite cap
+# turns that silent outage into a bounded timeout the kernel reports
+# cleanly (is_error result + "timeout" event), releasing the lock.
+# Generous: real Opus reasoning + multi-tool conversational turns run a
+# few minutes; 20 min is far above any legitimate single turn yet short
+# enough to self-heal. Override per-deployment with
+# ``speaking.turn_max_seconds`` in alice.config.json (0 = unbounded, the
+# old behaviour).
+DEFAULT_TURN_MAX_SECONDS = 1200
+
+
 # Builtin Anthropic tools the kernel always allows. MCP-supplied
 # tools (Alice's send_message, resolve_surface, etc.) get appended
 # at spec-build time.
@@ -264,6 +280,14 @@ class TurnRunner:
             cwd=self._skills_cwd or self._cfg.work_dir,
             add_dirs=[self._mind_dir] if self._mind_dir is not None else None,
             resume=self.session_id,
+            # Bound the turn so a wedged SDK stream can't hold the
+            # daemon's _turn_lock forever and deafen every transport.
+            # See DEFAULT_TURN_MAX_SECONDS.
+            max_seconds=int(
+                self._cfg.speaking.get(
+                    "turn_max_seconds", DEFAULT_TURN_MAX_SECONDS
+                )
+            ),
             # Adaptive thinking with summarized display so
             # ThinkingBlocks come back with non-empty text. Without
             # display='summarized' the SDK omits thinking text
