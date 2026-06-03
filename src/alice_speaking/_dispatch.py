@@ -320,13 +320,16 @@ async def handle_cli(ctx: DaemonContext, event: "CLIEvent") -> None:
         with contextlib.suppress(Exception):
             await ctx.cli_transport.signal_error(msg.origin, error)
     finally:
-        # Always tell the client the turn ended, even if Alice never
-        # called send_message — they need {"type":"done"} to know to
-        # prompt the user again. Errors are sent above, so we only
-        # send "done" on the success path.
-        if error is None:
-            with contextlib.suppress(Exception):
-                await ctx.cli_transport.signal_done(msg.origin)
+        # Always tell the client the turn ended — they drain until
+        # {"type":"done"} and treat "error" as non-terminal (see
+        # bin/alice-client drain_one_turn). So "done" must follow on the
+        # error path too; otherwise a failed/timed-out turn leaves the
+        # client hanging forever waiting for a done that never comes.
+        # signal_error (sent above) carries the failure; this just closes
+        # the turn. Mirrors the error→done sequence the context-probe
+        # path already uses.
+        with contextlib.suppress(Exception):
+            await ctx.cli_transport.signal_done(msg.origin)
         ctx._current_turn_kind = prev_kind
         ctx._current_reply_channel = prev_channel
         ctx._current_principal_display_name = prev_display_name
