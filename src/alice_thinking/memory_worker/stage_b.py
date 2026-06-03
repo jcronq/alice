@@ -81,7 +81,18 @@ EVENT_TAGS = frozenset({"meal", "workout", "weight", "reminder", "error", "lift"
 #: Frontmatter ``tag`` values that route to atomic vault notes
 #: in the matching folder. ``feedback`` lives under ``feedback/``,
 #: ``person`` under ``people/``, etc.
-CONCEPT_TAGS = frozenset({"person", "project", "reference", "design", "feedback", "source"})
+CONCEPT_TAGS = frozenset(
+    {
+        "person",
+        "project",
+        "reference",
+        "reference-candidate",
+        "design",
+        "feedback",
+        "feedback-self",
+        "source",
+    }
+)
 
 #: Frontmatter ``tag`` values that drop to a daily one-liner only
 #: (no vault note). CozyLobe motion batches and similar low-signal
@@ -94,8 +105,10 @@ _CONCEPT_FOLDER = {
     "person": "people",
     "project": "projects",
     "reference": "reference",
+    "reference-candidate": "reference",
     "design": "research",  # design docs live alongside research per current vault
     "feedback": "feedback",
+    "feedback-self": "feedback",
     "source": "sources",
 }
 
@@ -265,7 +278,16 @@ def _route_concept(fm: dict[str, Any], body: str, filename: str) -> Optional[Rou
     if not intersect:
         return None
     # Stable choice when multiple concept tags overlap.
-    for candidate in ("person", "project", "reference", "design", "feedback", "source"):
+    for candidate in (
+        "person",
+        "project",
+        "reference",
+        "reference-candidate",
+        "design",
+        "feedback",
+        "feedback-self",
+        "source",
+    ):
         if candidate in intersect:
             return Route(
                 "concept",

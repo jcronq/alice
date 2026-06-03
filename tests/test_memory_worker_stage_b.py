@@ -204,6 +204,48 @@ def test_concept_duplicate_slug_merges_dated_section(vault: pathlib.Path) -> Non
     assert "Lives in Utah." in text
 
 
+def test_reference_candidate_routes_to_reference_folder(vault: pathlib.Path) -> None:
+    """``tag: reference-candidate`` → new note under ``cortex-memory/reference/``.
+
+    Speaking emits ``reference-candidate`` heavily; it should route to the same
+    folder as the base ``reference`` tag rather than bouncing to ``.failed/``.
+    """
+    _drop_note(
+        vault,
+        "ssh-universal-password.md",
+        "---\ntag: reference-candidate\ntitle: Universal SSH Password\n---\n\nBounce sshpass through aimax1 when alice container key is rejected.\n",
+    )
+    report = stage_b.run(vault)
+    assert report.routed_concept == 1
+
+    target = vault / "cortex-memory" / "reference" / "ssh-universal-password.md"
+    assert target.is_file()
+    text = target.read_text(encoding="utf-8")
+    assert "title: Universal SSH Password" in text
+    assert "Bounce sshpass through aimax1" in text
+
+
+def test_feedback_self_routes_to_feedback_folder(vault: pathlib.Path) -> None:
+    """``tag: feedback-self`` → new note under ``cortex-memory/feedback/``.
+
+    Speaking emits ``feedback-self`` heavily; it should route to the same
+    folder as the base ``feedback`` tag rather than bouncing to ``.failed/``.
+    """
+    _drop_note(
+        vault,
+        "feedback-no-walls-of-text.md",
+        "---\ntag: feedback-self\ntitle: No Walls Of Text\n---\n\nSignal replies stay 1-3 sentences. Long narratives go in thinking notes.\n",
+    )
+    report = stage_b.run(vault)
+    assert report.routed_concept == 1
+
+    target = vault / "cortex-memory" / "feedback" / "feedback-no-walls-of-text.md"
+    assert target.is_file()
+    text = target.read_text(encoding="utf-8")
+    assert "title: No Walls Of Text" in text
+    assert "Signal replies stay 1-3 sentences." in text
+
+
 # ---------- conflict-candidate route ----------
 
 
