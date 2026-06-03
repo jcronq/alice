@@ -96,6 +96,16 @@ TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
 
 
+# How long a built turns snapshot is reused before a rebuild. The turns
+# view re-parses the whole event corpus (load_all) + group_turns + enrich
+# per request; without this every infinite-scroll page fetch and every
+# concurrent request repaid that toll and — since the handlers are async
+# calling synchronous work — blocked the event loop, so the second page
+# would stall behind the first. A few seconds of staleness is invisible in
+# a debug viewer and keeps scroll offsets stable under live writes.
+TURNS_SNAPSHOT_TTL = 3.0
+
+
 def create_app(paths: Paths | None = None) -> FastAPI:
     # Plan 05 Phase 6: load personae before constructing the FastAPI
     # app so the chrome (title, header, narrative copy) can use the
@@ -119,6 +129,11 @@ def create_app(paths: Paths | None = None) -> FastAPI:
     app = FastAPI(title=f"{personae.agent.name} Viewer", version="0.1.0")
     app.state.paths = resolved_paths
     app.state.personae = personae
+    # TTL snapshot cache for the turns view (see TURNS_SNAPSHOT_TTL).
+    # ``(built_monotonic, turns_list)`` or None; the lock dedupes a cold
+    # rebuild so a page-1/page-2 burst builds once and shares the result.
+    app.state.turns_snapshot = None
+    app.state.turns_snapshot_lock = asyncio.Lock()
     # Plan 06 Phase 4: load mind/config/model.yml so the viewer's
     # narrative + run_summary calls can route to the operator's
     # configured backend. Missing file → subscription default
@@ -550,13 +565,52 @@ def create_app(paths: Paths | None = None) -> FastAPI:
                     t.outbound = outbound
                     break
 
-    @app.get("/turns", response_class=HTMLResponse)
-    async def turns_index(request: Request, limit: int = 50):
-        p: Paths = app.state.paths
-        events = sources.load_all(p)
+    def _build_turns_snapshot(p: Paths) -> list:
+        """Speaking events → group turns → enrich outbound → newest-first.
+
+        ``group_turns`` only consumes ``hemisphere == "speaking"`` events,
+        so we read just ``speaking.log`` (incremental-cached) plus the
+        turn-log backfill — NOT ``load_all``, which also parses the
+        multi-GB thinking.log and rescans every ``inner/`` dir on each
+        signature change (~9s when Alice is active). Mirrors load_all's
+        own speaking backfill: fall back to the turn-log when speaking.log
+        has no entries yet. Always invoked off the event loop via
+        :func:`_aggregated_turns`.
+        """
+        events = sources.read_speaking(p.speaking_log)
+        if not any(e.hemisphere == "speaking" for e in events):
+            events = sources.read_turn_log(p.turn_log)
         turns = aggregators.group_turns(events)
         _enrich_turns_with_outbound(turns, p)
         turns.reverse()
+        return turns
+
+    async def _aggregated_turns(p: Paths) -> list:
+        """Newest-first turns list, memoised for ``TURNS_SNAPSHOT_TTL``.
+
+        Cheap wall-clock TTL check (no per-request ``load_all_signature``
+        directory scan); a lock so a cold rebuild runs once instead of
+        once per concurrent request; ``to_thread`` so the rebuild never
+        blocks other endpoints (sidebar, SSE, the next page). The shared
+        snapshot also keeps infinite-scroll offsets from drifting while
+        new turns land mid-scroll.
+        """
+        snap = app.state.turns_snapshot
+        if snap is not None and (time.monotonic() - snap[0]) < TURNS_SNAPSHOT_TTL:
+            return snap[1]
+        async with app.state.turns_snapshot_lock:
+            # Re-check: another request may have rebuilt while we waited.
+            snap = app.state.turns_snapshot
+            if snap is not None and (time.monotonic() - snap[0]) < TURNS_SNAPSHOT_TTL:
+                return snap[1]
+            turns = await asyncio.to_thread(_build_turns_snapshot, p)
+            app.state.turns_snapshot = (time.monotonic(), turns)
+            return turns
+
+    @app.get("/turns", response_class=HTMLResponse)
+    async def turns_index(request: Request, limit: int = 50):
+        p: Paths = app.state.paths
+        turns = await _aggregated_turns(p)
         total = len(turns)
         page = turns[:limit]
         return templates.TemplateResponse(
@@ -579,10 +633,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         infinite-scroll sentinel. Called by HTMX when the previous
         sentinel scrolls into view."""
         p: Paths = app.state.paths
-        events = sources.load_all(p)
-        turns = aggregators.group_turns(events)
-        _enrich_turns_with_outbound(turns, p)
-        turns.reverse()
+        turns = await _aggregated_turns(p)
         page = turns[offset : offset + limit]
         next_offset = offset + limit
         return templates.TemplateResponse(
@@ -599,9 +650,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
     @app.get("/turns/{turn_id}", response_class=HTMLResponse)
     async def turn_detail(request: Request, turn_id: str):
         p: Paths = app.state.paths
-        events = sources.load_all(p)
-        turns = aggregators.group_turns(events)
-        _enrich_turns_with_outbound(turns, p)
+        turns = await _aggregated_turns(p)
         turn = next((t for t in turns if t.turn_id == turn_id), None)
         summary = aggregators.summarize_turn(turn) if turn else None
         return templates.TemplateResponse(
