@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import hashlib
 import json
 import logging
 import time
@@ -925,6 +926,13 @@ class MotionPipeline:
         # ``_classify_surface_tier`` and ``_emit_actionable_surface``
         # can read a consistent decision without re-running the rules.
         self._latest_breach: Optional["TrailClassification"] = None
+        # Phase 1 dedup (research/2026-06-03-cozylobe-observation-
+        # redundancy.md): per-zone ring buffer of recent state hashes.
+        # When the last N=3 hashes are all identical to the incoming
+        # observation, we skip the note write — motion sensors fire
+        # ON/OFF cycles that produce identical state hashes on
+        # repeated snapshots and that's the primary noise source.
+        self._dedup_history: dict[str, deque[str]] = {}
         # Lock-free single-consumer use: the wake loop drains one
         # event at a time on one asyncio task.
 
@@ -1295,6 +1303,40 @@ class MotionPipeline:
         if guess is not None and guess.guess_id is not None:
             tags.append(f"guess-id:{guess.guess_id}")
 
+        # Phase 1 dedup (research/2026-06-03-cozylobe-observation-
+        # redundancy.md): suppress the redundant note when this zone's
+        # state hash matches the last 3. Skips ONLY the observation
+        # note — the guess, trajectory, and actionable-surface paths
+        # above/below run unconditionally. Security + actionable tiers
+        # are high-signal and bypass the dedup check entirely.
+        zone = inference.current_room or "unknown"
+        state_blob = json.dumps(
+            {
+                "room": inference.current_room,
+                "person": inference.person_hypothesis,
+                "next_room": inference.next_room_hypothesis,
+                "security": security,
+                "events": sorted((ev.entity_id, ev.state) for ev in batch),
+            },
+            sort_keys=True,
+            default=str,
+        )
+        state_hash = hashlib.sha1(state_blob.encode()).hexdigest()
+        history = self._dedup_history.setdefault(zone, deque(maxlen=3))
+        dedup_skip = (
+            not security
+            and tier != "actionable"
+            and len(history) == 3
+            and all(h == state_hash for h in history)
+        )
+        history.append(state_hash)
+        if dedup_skip:
+            log.debug(
+                "dedup: zone=%s hash=%s matched last 3 — skipping",
+                zone,
+                state_hash[:8],
+            )
+
         body = self._render_body(batch, inference, security=security)
         # Issue #411: route motion-pipeline notes to inner/notes/noise/
         # by default — motion is the highest-volume noise source and
@@ -1313,10 +1355,11 @@ class MotionPipeline:
             writer = self._write_note
         else:
             writer = self._write_noise
-        try:
-            writer(body, slug=slug, tags=tuple(tags))
-        except OSError as exc:
-            log.warning("cozylobe motion: note write failed: %s", exc)
+        if not dedup_skip:
+            try:
+                writer(body, slug=slug, tags=tuple(tags))
+            except OSError as exc:
+                log.warning("cozylobe motion: note write failed: %s", exc)
 
         if tier == "actionable" and guess is not None:
             self._emit_actionable_surface(guess, batch, security=security)

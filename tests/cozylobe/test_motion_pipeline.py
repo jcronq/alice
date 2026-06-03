@@ -703,6 +703,42 @@ async def test_wake_loop_motion_with_security_bypass_writes_note(
 
 
 # ---------------------------------------------------------------------------
+# Phase 1 dedup — research/2026-06-03-cozylobe-observation-redundancy.md
+
+
+@pytest.mark.asyncio
+async def test_dedup_skips_note_after_three_identical_state_hashes():
+    """Same zone-state observation 4 times → first 3 notes written, the
+    4th is suppressed (matches the last 3 hashes in the ring buffer).
+    Non-security, non-actionable tier so the dedup gate engages."""
+    qwen = _StubQwen()
+    notes: list[dict] = []
+
+    def _capture(body, *, slug, tags):
+        notes.append({"slug": slug, "tags": tags})
+        return Path("/tmp/x.md")
+
+    clock = _FakeClock()
+    pipeline = MotionPipeline(
+        llm_client=qwen,
+        vault=None,
+        queue=MotionQueue(batch_window_s=30.0, clock=clock),
+        write_note=_capture,
+        security_predicate=lambda _e: False,
+        clock=clock,
+    )
+    # Four identical flush cycles: enqueue one event, advance past the
+    # window, enqueue a trailing event to force the flush. Each cycle
+    # produces one identical batch (same entity_id + state) → same hash.
+    for _ in range(4):
+        await pipeline.handle(_cozyhem(received_at=clock()))
+        clock.advance(31.0)
+        await pipeline.handle(_cozyhem(received_at=clock()))
+    # First 3 cycles wrote notes; the 4th was deduped.
+    assert len(notes) == 3
+
+
+# ---------------------------------------------------------------------------
 # Burst test: 10 events in 5 seconds without dropping
 
 
