@@ -199,6 +199,7 @@ FROM base AS main
 #      not try to bring up services whose dirs don't exist.
 COPY sandbox/s6/alice-autopush/         /etc/s6-overlay/s6-rc.d/alice-autopush/
 COPY sandbox/s6/alice-embedder/         /etc/s6-overlay/s6-rc.d/alice-embedder/
+COPY sandbox/s6/alice-face-caption/     /etc/s6-overlay/s6-rc.d/alice-face-caption/
 COPY sandbox/s6/alice-gh-reconciler/    /etc/s6-overlay/s6-rc.d/alice-gh-reconciler/
 COPY sandbox/s6/alice-gh-watcher/       /etc/s6-overlay/s6-rc.d/alice-gh-watcher/
 COPY sandbox/s6/alice-reload-watcher/   /etc/s6-overlay/s6-rc.d/alice-reload-watcher/
@@ -217,6 +218,7 @@ COPY sandbox/s6/signal-daemon/          /etc/s6-overlay/s6-rc.d/signal-daemon/
 COPY sandbox/s6/user/type                                       /etc/s6-overlay/s6-rc.d/user/type
 COPY sandbox/s6/user/contents.d/alice-autopush                  /etc/s6-overlay/s6-rc.d/user/contents.d/alice-autopush
 COPY sandbox/s6/user/contents.d/alice-embedder                  /etc/s6-overlay/s6-rc.d/user/contents.d/alice-embedder
+COPY sandbox/s6/user/contents.d/alice-face-caption              /etc/s6-overlay/s6-rc.d/user/contents.d/alice-face-caption
 COPY sandbox/s6/user/contents.d/alice-gh-reconciler             /etc/s6-overlay/s6-rc.d/user/contents.d/alice-gh-reconciler
 COPY sandbox/s6/user/contents.d/alice-gh-watcher                /etc/s6-overlay/s6-rc.d/user/contents.d/alice-gh-watcher
 COPY sandbox/s6/user/contents.d/alice-reload-watcher            /etc/s6-overlay/s6-rc.d/user/contents.d/alice-reload-watcher

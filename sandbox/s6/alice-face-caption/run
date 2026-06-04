@@ -1,0 +1,41 @@
+#!/command/with-contenv bash
+# alice-face-caption — push a Haiku-summarized "what is thinking working on"
+# caption to the alice-face LCD status panel.
+#
+# Thin shim over `python -m alice_speaking.services.face_caption_loop`. The
+# loop itself sleeps on ALICE_FACE_CAPTION_INTERVAL_S (default 60s), honors
+# quiet hours (23:00–08:00 America/New_York), and never crashes on its own —
+# all error paths log and continue. The supervisor's job is just to keep it
+# alive across container restarts.
+#
+# Depends on alice-speaking transitively (we live in the same venv and read
+# the same source tree), but s6's dependency graph only enforces
+# init-state-perms here — alice-speaking comes up under the same bundle so
+# the venv is warmed naturally. Listing alice-speaking as a hard dep would
+# create a startup-order ordering with no real value (the loop tolerates
+# the daemon being down).
+set -u
+
+VENV_PY="/opt/alice-venv/bin/python"
+ALICE_SRC="${ALICE_SRC:-/home/alice/alice/src}"
+
+if [ ! -x "$VENV_PY" ]; then
+    echo "[alice-face-caption] venv python missing at $VENV_PY" >&2
+    exit 1
+fi
+
+# Brief startup nap — let init-state-perms settle and avoid a tick during
+# alice-speaking's blue/green handoff window. Mirrors the 30s nap at the
+# top of alice-thinker-watchdog/run.
+sleep 30
+
+# Source alice.env so CLAUDE_CODE_OAUTH_TOKEN is visible to the python
+# process. The Haiku summarizer prefers the live env-var token over the
+# credentials.json file, which can lag the daemon's auto-refresh by
+# several hours.
+[ -f /home/alice/.config/alice/alice.env ] && source /home/alice/.config/alice/alice.env
+
+export PYTHONPATH="$ALICE_SRC"
+export PYTHONUNBUFFERED=1
+
+exec s6-setuidgid alice "$VENV_PY" -m alice_speaking.services.face_caption_loop
