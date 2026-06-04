@@ -44,8 +44,14 @@ import httpx
 log = logging.getLogger(__name__)
 
 
-DEFAULT_URL = "http://alice-face.local:8080"
-FALLBACK_URL = "http://10.20.30.171:8080"
+# The alice container runs in Docker's default bridge network and can't
+# resolve LAN-side mDNS hostnames like ``alice-face.local`` — those work
+# from the pi (cronqj@10.20.30.170) where the ``face_state`` CLI lives,
+# not from inside this container. Use the ESP32's actual LAN IP so the
+# first push lands without a wasted DNS-resolution timeout. Override via
+# ``ALICE_FACE_URL`` if the device ever gets a new lease.
+DEFAULT_URL = "http://10.20.30.205:8080"
+FALLBACK_URL = None
 TIMEOUT_SECONDS = 1.0
 
 VALID_STATES = {"idle", "listening", "thinking", "speaking", "happy", "surprised", "sleep"}
@@ -69,7 +75,7 @@ class FacePresence:
         if url is None:
             url = os.environ.get("ALICE_FACE_URL", DEFAULT_URL)
         self._url = (url or "").rstrip("/")
-        self._fallback = FALLBACK_URL if self._url == DEFAULT_URL else None
+        self._fallback = FALLBACK_URL if self._url == DEFAULT_URL and FALLBACK_URL else None
         self._quiet_hours_fn = quiet_hours_fn
         self._last_state: Optional[str] = None
         self._lock = asyncio.Lock()
