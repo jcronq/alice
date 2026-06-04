@@ -117,7 +117,7 @@ wait_health() {
 }
 
 verify_s6_services() {
-    # `s6-svstat` lives in the s6-overlay PATH inside the container.
+    # `s6-svstat` is at `/command/s6-svstat` — not on the `docker exec` PATH.
     # Its first output token is "up" or "down"; we poll until every
     # named service reports "up" or we hit the timeout. Long-running
     # service startup (sci-env venv pull, embedder warmup) means we
@@ -127,7 +127,7 @@ verify_s6_services() {
     for svc in "${S6_SERVICES[@]}"; do
         ok=0
         for ((i=0; i<timeout*2; i++)); do
-            status=$(docker exec "$CONTAINER" s6-svstat "/run/service/$svc" 2>/dev/null || true)
+            status=$(docker exec "$CONTAINER" /command/s6-svstat "/run/service/$svc" 2>/dev/null || true)
             case "$status" in
                 up\ *) ok=1; break ;;
             esac
