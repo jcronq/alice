@@ -2081,6 +2081,21 @@ def main(argv: list[str] | None = None) -> int:
         now = _local_now()
         today_str = now.strftime("%Y-%m-%d")
 
+        # Window-not-closed gate. The wake-counting window is
+        # yesterday-23:00 → today-07:00 local. If the scan fires before
+        # 07:00 (the first sleep-mode thinker wake of the morning, or a
+        # mid-night wake that happens to hit the active.md preamble),
+        # the Stage B/C/D wake files for the night don't all exist on
+        # disk yet — Stage D writes cluster 00:27–02:20. The undercount
+        # produced false ``stage_d_drought: true`` flags and bad totals
+        # in every wake_type_distribution. Silent skip so the next wake
+        # after 07:00 (active-mode 5-min cadence) runs the scan with a
+        # closed, complete window. Pairs with the dedup check below so
+        # exactly one event lands per day.
+        _, today_07, _ = _morning_window(now)
+        if args.check_existing and now < today_07:
+            return 0
+
         if args.check_existing and vault_health_event_exists_for_date(
             args.events, today_str
         ):

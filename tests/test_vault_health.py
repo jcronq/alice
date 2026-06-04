@@ -1612,6 +1612,63 @@ def test_cli_check_existing_continues_when_no_today_event(tmp_path: Path) -> Non
     assert evt["date"] == today
 
 
+def test_cli_check_existing_skips_before_window_close(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """If now < today 07:00 local, --check-existing must silent-skip so
+    the wake-counting window can close before the snapshot is taken.
+
+    Reproduces the 2026-06-04 bug: scan firing at 00:02 produced
+    stage_d: 0 + stage_d_drought: true because Stage D wakes (00:27–02:20)
+    weren't on disk yet.
+    """
+    import json
+
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"  # does not exist yet
+
+    fake_now = datetime.now().replace(hour=2, minute=15, second=0, microsecond=0)
+    monkeypatch.setattr(
+        "metrics.vault_health._local_now", lambda: fake_now
+    )
+
+    rc = vault_health_main(_cli_args(vault, thoughts, events, surface, "--check-existing", "--append"))
+    assert rc == 0
+    # Window not closed yet → no event written.
+    assert not events.exists() or events.stat().st_size == 0
+
+
+def test_cli_check_existing_writes_after_window_close(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """At 07:30 (window closed), --check-existing --append writes today's event."""
+    import json
+
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    fake_now = datetime.now().replace(hour=7, minute=30, second=0, microsecond=0)
+    monkeypatch.setattr(
+        "metrics.vault_health._local_now", lambda: fake_now
+    )
+
+    rc = vault_health_main(_cli_args(vault, thoughts, events, surface, "--check-existing", "--append"))
+    assert rc == 0
+    assert events.exists()
+    lines = events.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    evt = json.loads(lines[0])
+    assert evt["type"] == "vault_health"
+
+
 def test_cli_append_requires_thoughts_and_events(tmp_path: Path) -> None:
     """--append without --thoughts/--events should error via argparse."""
     vault = _make_vault(tmp_path)
