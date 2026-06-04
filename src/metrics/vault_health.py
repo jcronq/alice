@@ -667,6 +667,64 @@ def count_research_decay(
     return decay_count
 
 
+def count_access_decay(
+    vault_dir: Path,
+    cutoff_days: int = 5,
+    access_threshold: int = 0,
+) -> int:
+    """Count notes with zero (or low) access_count older than cutoff_days.
+
+    This is the **behavioral decay** detector — the dominant decay path
+    (99.6% of decayed notes). Unlike ``count_research_decay`` which targets
+    structural isolation, this catches notes that are structurally connected
+    (have inbound links) but have never been retrieved by the cue runner.
+
+    A note *decays* when:
+    - ``created:`` is older than ``cutoff_days``
+    - ``access_count:`` <= ``access_threshold`` (default 0)
+
+    Returns the count of decayed notes. Notes younger than the cutoff are
+    ignored — they haven't had time to be retrieved.
+
+    Folders excluded: dailies, archive, gh-state (same as
+    ``compute_decay_coverage``).
+    """
+    vault_dir = vault_dir.resolve()
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff = today - timedelta(days=cutoff_days)
+
+    decay_count = 0
+    for md in vault_dir.rglob("*.md"):
+        # Skip excluded top-level dirs.
+        rel_parts = md.relative_to(vault_dir).parts
+        if rel_parts and rel_parts[0] in {"dailies", "archive", "gh-state"}:
+            continue
+        if md.name in EXCLUDED_NAMES:
+            continue
+
+        text = _read_text(md)
+        fm, _body = split_frontmatter(text)
+
+        created_raw = fm.get("created")
+        if created_raw is None:
+            continue
+        created_date = _parse_created_date(created_raw)
+        if created_date is None:
+            continue
+        if created_date >= cutoff:
+            continue
+
+        access_count = _parse_access_count(fm.get("access_count"))
+        if access_count is None:
+            continue
+        if access_count > access_threshold:
+            continue
+
+        decay_count += 1
+
+    return decay_count
+
+
 # ---------------------------------------------------------------------------
 # Decay coverage (Layer 1 blind-spot detection)
 # Design: [[2026-05-10-decay-blind-spot-detection-design]]
@@ -1869,6 +1927,7 @@ def build_vault_health_event(
         ),
         "research_decay_count": count_research_decay(vault_dir),
         "decay_coverage": compute_decay_coverage(vault_dir, today=today_midnight),
+        "access_decay": count_access_decay(vault_dir),
     }
 
     # Recovery state uses a 14-day rolling window ending today.
@@ -2141,6 +2200,9 @@ def main(argv: list[str] | None = None) -> int:
     # Decay coverage (Layer 1 blind-spot detection): % of activation-era
     # decayed pool that has been accessed since the cue runner came online.
     out["decay_coverage"] = compute_decay_coverage(args.vault)
+
+    # Behavioral decay: notes with zero access older than 5 days.
+    out["access_decay"] = count_access_decay(args.vault)
 
     if args.thoughts and args.window_start and args.window_end:
         out["wake_type_distribution"] = count_wakes_by_stage(
