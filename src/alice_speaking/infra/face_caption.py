@@ -1,10 +1,10 @@
 """Build and push the "what is thinking thinking about" caption to the alice-face LCD.
 
-Thinking owns the 18x2 caption sidecar on the alice-face ESP32 (the 20x4
+Thinking owns the 16x2 caption sidecar on the alice-face ESP32 (the 20x4
 face panel is Speaking's). The ESP32 firmware exposes ``POST /caption
-{"text": "..."}`` and word-wraps the body into the 36-char (18×2) sidecar.
+{"text": "..."}`` and word-wraps the body into the 32-char (16×2) sidecar.
 This module is the driver: it picks the latest thinking-wake note off
-disk, asks Haiku 4.5 for a ≤36 char summary, and pushes it.
+disk, asks Haiku 4.5 for a ≤32 char summary, and pushes it.
 
 Design choices, all small:
 
@@ -48,10 +48,10 @@ ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 HAIKU_MAX_TOKENS = 64
 
-# Caption sidecar limit. The 18x2 LCD is 18 chars wide x 2 rows = 36
+# Caption sidecar limit. The 16x2 LCD is 16 chars wide x 2 rows = 32
 # chars total. The firmware word-wraps so the model can emit a single
 # line — we just enforce the byte ceiling on output before sending.
-MAX_CAPTION_CHARS = 36
+MAX_CAPTION_CHARS = 32
 
 # Body slice for the summarizer prompt. The wakes are usually < 500
 # chars of meaningful prose; trimming bounds the input token cost.
@@ -82,7 +82,7 @@ DEFAULT_THOUGHTS_ROOT = pathlib.Path.home() / "alice-mind" / "inner" / "thoughts
 SUMMARIZER_SYSTEM_PROMPT = (
     "Summarize what Alice's thinking process is currently working on. "
     "Output ONLY the summary, no preamble, no quotes, no punctuation at "
-    "the end. Max 36 characters. Plain English, like 'reviewing cozyhem' "
+    "the end. Max 32 characters. Plain English, like 'reviewing cozyhem' "
     "or 'idle; queue blocked'."
 )
 
