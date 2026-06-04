@@ -1622,8 +1622,6 @@ def test_cli_check_existing_skips_before_window_close(
     stage_d: 0 + stage_d_drought: true because Stage D wakes (00:27–02:20)
     weren't on disk yet.
     """
-    import json
-
     vault = _make_vault(tmp_path)
     thoughts = tmp_path / "thoughts"
     thoughts.mkdir()
