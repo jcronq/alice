@@ -1,10 +1,10 @@
 """Build and push the "what is thinking thinking about" caption to the alice-face LCD.
 
-The face's 20x4 HD44780 has a 12x4 status panel (cols 8-19, rows 0-3, ~48
-chars). The ESP32 firmware exposes ``POST /status {"text": "..."}`` and
-word-wraps the body into the panel. This module is the driver: it picks
-the latest thinking-wake note off disk, asks Haiku 4.5 for a ≤48 char
-summary, and pushes it to the face.
+Thinking owns the 18x2 caption sidecar on the alice-face ESP32 (the 20x4
+face panel is Speaking's). The ESP32 firmware exposes ``POST /caption
+{"text": "..."}`` and word-wraps the body into the 36-char (18×2) sidecar.
+This module is the driver: it picks the latest thinking-wake note off
+disk, asks Haiku 4.5 for a ≤36 char summary, and pushes it.
 
 Design choices, all small:
 
@@ -18,10 +18,11 @@ Design choices, all small:
 - Cache: in-memory dict keyed by ``(path, mtime_ns)`` so a stable wake
   is summarized once per restart. The loop is a long-running process;
   the dict survives across iterations.
-- Push: ``POST {ALICE_FACE_URL}/status`` matching :mod:`face_presence`
+- Push: ``POST {ALICE_FACE_URL}/caption`` matching :mod:`face_presence`
   conventions. ``ALICE_FACE_URL`` default mirrors :data:`face_presence.DEFAULT_URL`
   (``http://10.20.30.205:8080``). Fallback URL ``http://10.20.30.171:8080``
-  if the primary refuses the connection.
+  if the primary refuses the connection. 503 from the firmware means no
+  sidecar is wired — caller logs and skips.
 
 Every error path logs and returns. Never raise out of :func:`tick`.
 """
@@ -47,10 +48,10 @@ ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 HAIKU_MAX_TOKENS = 64
 
-# Face panel limit. The status panel is 12 chars wide x 4 rows = 48
+# Caption sidecar limit. The 18x2 LCD is 18 chars wide x 2 rows = 36
 # chars total. The firmware word-wraps so the model can emit a single
 # line — we just enforce the byte ceiling on output before sending.
-MAX_CAPTION_CHARS = 48
+MAX_CAPTION_CHARS = 36
 
 # Body slice for the summarizer prompt. The wakes are usually < 500
 # chars of meaningful prose; trimming bounds the input token cost.
@@ -81,8 +82,8 @@ DEFAULT_THOUGHTS_ROOT = pathlib.Path.home() / "alice-mind" / "inner" / "thoughts
 SUMMARIZER_SYSTEM_PROMPT = (
     "Summarize what Alice's thinking process is currently working on. "
     "Output ONLY the summary, no preamble, no quotes, no punctuation at "
-    "the end. Max 48 characters. Plain English, like 'reviewing cozyhem "
-    "bugs' or 'idle; queue blocked on Jason'."
+    "the end. Max 36 characters. Plain English, like 'reviewing cozyhem' "
+    "or 'idle; queue blocked'."
 )
 
 
@@ -223,14 +224,14 @@ def _summarize_via_haiku(
     return _truncate_caption(raw)
 
 
-def _push_status(
+def _push_caption(
     caption: str,
     *,
     primary_url: str,
     fallback_url: Optional[str],
     client: Optional[httpx.Client] = None,
 ) -> bool:
-    """POST ``{"text": caption}`` to ``/status``. Returns True on 2xx."""
+    """POST ``{"text": caption}`` to ``/caption``. Returns True on 2xx."""
     body = {"text": caption}
     owns_client = client is None
     client = client or httpx.Client(timeout=FACE_TIMEOUT_SECONDS)
@@ -239,7 +240,7 @@ def _push_status(
             if not url:
                 continue
             try:
-                resp = client.post(f"{url.rstrip('/')}/status", json=body)
+                resp = client.post(f"{url.rstrip('/')}/caption", json=body)
             except (httpx.HTTPError, OSError) as exc:
                 log.info("face_caption: %s unreachable: %s", url, exc)
                 continue
@@ -337,7 +338,7 @@ class FaceCaptionDriver:
         if not self._face_url:
             log.info("face_caption: ALICE_FACE_URL empty; skip push")
             return None
-        ok = _push_status(
+        ok = _push_caption(
             caption,
             primary_url=self._face_url,
             fallback_url=self._fallback_url,
