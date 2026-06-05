@@ -1479,6 +1479,7 @@ REQUIRED_EVENT_FIELDS = {
     "type",
     "date",
     "time",
+    "sleep_window_closed",
     "total_notes",
     "broken_wikilinks",
     "orphan_notes",
@@ -2598,3 +2599,139 @@ def test_bare_research_note_still_counted_as_dark(tmp_path: Path) -> None:
     counts = count_shadow_and_dark(vault)
     assert counts["truly_dark_count"] == 1
     assert counts["shadow_orphan_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# sleep_window_closed: drought-flag guard against partial-window data
+# Originally surfaced 2026-05-08, re-surfaced 2026-06-04 and 2026-06-05.
+# The morning scan at ~00:14 EDT was firing the wake_type_distribution
+# before the 23:00 → 07:00 sleep window had closed, producing false
+# ``stage_d_drought: true`` flags every night.
+# ---------------------------------------------------------------------------
+
+
+from metrics.vault_health import _sleep_window_closed
+from datetime import timezone as _tz_module
+
+
+def _eastern_dt(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
+    """Construct an Eastern-time-aware datetime for the test fixtures."""
+    from zoneinfo import ZoneInfo
+    return datetime(year, month, day, hour, minute, tzinfo=ZoneInfo("America/New_York"))
+
+
+def test_sleep_window_closed_before_07_returns_false() -> None:
+    """At 00:14 Eastern the sleep window is still open — drought-guard must fire."""
+    assert _sleep_window_closed(_eastern_dt(2026, 6, 5, 0, 14)) is False
+    assert _sleep_window_closed(_eastern_dt(2026, 6, 5, 6, 59)) is False
+
+
+def test_sleep_window_closed_at_or_after_07_returns_true() -> None:
+    """At 07:00 and beyond the window has closed — drought-guard releases."""
+    assert _sleep_window_closed(_eastern_dt(2026, 6, 5, 7, 0)) is True
+    assert _sleep_window_closed(_eastern_dt(2026, 6, 5, 9, 0)) is True
+    assert _sleep_window_closed(_eastern_dt(2026, 6, 5, 15, 30)) is True
+
+
+def test_sleep_window_closed_handles_utc_input() -> None:
+    """The alice container runs in UTC. ``03:30 EDT`` = ``07:30 UTC``; the
+    naive ``now < today_07`` compare used to pass at this moment because
+    the wall-clock arithmetic was UTC-relative. The new helper must
+    correctly identify it as still-inside the sleep window."""
+    # 03:30 EDT == 07:30 UTC (June, so EDT == UTC-4)
+    utc_dt = datetime(2026, 6, 5, 7, 30, tzinfo=_tz_module.utc)
+    assert _sleep_window_closed(utc_dt) is False
+    # 08:00 EDT == 12:00 UTC — clearly past window close
+    utc_dt_open = datetime(2026, 6, 5, 12, 0, tzinfo=_tz_module.utc)
+    assert _sleep_window_closed(utc_dt_open) is True
+
+
+def test_sleep_window_closed_dst_transition_winter() -> None:
+    """In January the zone is EST (UTC-5), not EDT — zoneinfo handles DST."""
+    # 06:59 EST is still inside the window
+    assert _sleep_window_closed(_eastern_dt(2026, 1, 15, 6, 59)) is False
+    assert _sleep_window_closed(_eastern_dt(2026, 1, 15, 7, 0)) is True
+
+
+def test_build_event_flags_window_open_at_0014(tmp_path: Path) -> None:
+    """Scan at 00:14 with partial data (B=2, C=1, D=0) must mark
+    ``sleep_window_closed: False`` so the downstream drought-flag logic
+    does not fire."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    # Build the event at 00:14 Eastern. The stage counters key off the
+    # filename's stage suffix, not contents — we just need the files to
+    # exist in the window to make the diagnostic value non-zero.
+    fake_now = _eastern_dt(2026, 6, 5, 0, 14)
+    event = build_vault_health_event(
+        vault_dir=vault,
+        thoughts_dir=thoughts,
+        events_path=events,
+        surface_dir=surface,
+        now=fake_now,
+    )
+
+    assert event["sleep_window_closed"] is False, (
+        "00:14 Eastern is inside the 23:00→07:00 sleep window; the flag "
+        "must be False so downstream drought logic does not fire"
+    )
+    # Distribution is still computed for diagnostics, but its stage_d=0
+    # value is partial-window and must not drive a drought flag.
+    assert "wake_type_distribution" in event
+    # low_wake_count surface MUST NOT fire on partial data even though
+    # total_sleep_wakes would otherwise be below the threshold.
+    assert event.get("low_wake_count") is not True
+    assert not list(surface.glob("*low-wake-count*"))
+
+
+def test_build_event_flags_window_closed_at_0730(tmp_path: Path) -> None:
+    """At 07:30 Eastern the window has closed; the event sets
+    ``sleep_window_closed: True`` and downstream drought logic is free
+    to evaluate ``stage_d``."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    fake_now = _eastern_dt(2026, 6, 5, 7, 30)
+    event = build_vault_health_event(
+        vault_dir=vault,
+        thoughts_dir=thoughts,
+        events_path=events,
+        surface_dir=surface,
+        now=fake_now,
+    )
+    assert event["sleep_window_closed"] is True
+
+
+def test_build_event_flags_window_closed_at_0900_no_spurious_drought(
+    tmp_path: Path,
+) -> None:
+    """At 09:00 with no Stage D wakes (hypothetically a real drought day)
+    the event still sets ``sleep_window_closed: True``. The drought
+    determination is correctly available to downstream consumers — the
+    point of the guard is to suppress spurious flags, not real ones."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    fake_now = _eastern_dt(2026, 6, 5, 9, 0)
+    event = build_vault_health_event(
+        vault_dir=vault,
+        thoughts_dir=thoughts,
+        events_path=events,
+        surface_dir=surface,
+        now=fake_now,
+    )
+    assert event["sleep_window_closed"] is True
+    assert "wake_type_distribution" in event

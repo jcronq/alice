@@ -36,6 +36,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from indexer.yaml_lite import extract_wikilinks, split_frontmatter
 
@@ -1857,6 +1858,47 @@ def _morning_window(now: datetime | None = None) -> tuple[datetime, datetime, da
     return yesterday_23, today_07, today_midnight
 
 
+# ``America/New_York`` resolves to EDT or EST depending on the calendar
+# date — zoneinfo handles DST without us tracking the schedule. Used by
+# ``_sleep_window_closed`` so the drought-flag guard behaves correctly
+# regardless of the container's system timezone (typically UTC).
+_EASTERN = ZoneInfo("America/New_York")
+
+
+def _sleep_window_closed(scan_dt: datetime) -> bool:
+    """Return True iff ``scan_dt``'s wall time in America/New_York is >= 07:00.
+
+    The overnight sleep window runs 23:00 → 07:00 Eastern. A vault_health
+    scan that fires inside that window sees a *partial* wake distribution
+    — Stage D wakes cluster 00:27–02:20 Eastern, so an early-morning scan
+    at, say, 00:14 reports ``stage_d: 0`` even though six Stage D wakes
+    are queued for later in the night. The downstream thinker prompt
+    treats ``stage_d == 0`` as evidence of a Stage D drought and raises
+    ``stage_d_drought: true`` on the event; firing that flag against
+    partial-window data produces a false positive every night.
+
+    This helper is the single source of truth for "is it safe to draw
+    drought conclusions from the wake distribution yet?". The check is
+    explicitly timezone-aware (the alice container runs in UTC; the
+    sleep schedule is Eastern) and DST-correct.
+
+    ``scan_dt`` may be naive (treated as system local, then converted to
+    Eastern via the runtime's local tz) or timezone-aware (converted
+    directly).
+
+    Originally surfaced 2026-05-08, re-surfaced 2026-06-04 and 2026-06-05.
+    """
+    if scan_dt.tzinfo is None:
+        # Naive datetime: attach the system local tz first, then convert
+        # to Eastern. ``astimezone()`` on a naive value uses the runtime
+        # local timezone in Python 3.6+.
+        aware = scan_dt.astimezone()
+    else:
+        aware = scan_dt
+    eastern = aware.astimezone(_EASTERN)
+    return eastern.hour >= 7
+
+
 # ---------------------------------------------------------------------------
 # Full-event assembly
 # ---------------------------------------------------------------------------
@@ -1899,11 +1941,20 @@ def build_vault_health_event(
     orphan_count, _ = count_orphans(vault_dir)
     shadow_dark = count_shadow_and_dark(vault_dir)
 
+    # Drought-flag guard: the 23:00 → 07:00 Eastern sleep window must be
+    # closed before the wake distribution is safe to draw conclusions
+    # from. See ``_sleep_window_closed`` for the full rationale. The
+    # field rides along on every event so the thinker prompt
+    # (active.md:107) can gate the ``stage_d_drought`` emission without
+    # re-deriving the time check.
+    window_closed = _sleep_window_closed(now)
+
     event: dict[str, Any] = {
         "ts": ts,
         "type": "vault_health",
         "date": now.strftime("%Y-%m-%d"),
         "time": time_str,
+        "sleep_window_closed": window_closed,
         "total_notes": count_total_notes(vault_dir),
         "broken_wikilinks": broken_count,
         "orphan_notes": orphan_count,
@@ -1966,7 +2017,11 @@ def build_vault_health_event(
         + int(dist.get("stage_d", 0))
     )
     event["total_sleep_wakes"] = total_sleep_wakes
-    if total_sleep_wakes < WAKE_COUNT_THRESHOLD:
+    # Same partial-window concern as the drought flag — a low count
+    # before 07:00 Eastern is expected because not all sleep-phase wakes
+    # have written their note yet. Only fire the low-wake surface once
+    # the window has closed.
+    if window_closed and total_sleep_wakes < WAKE_COUNT_THRESHOLD:
         event["low_wake_count"] = True
         try:
             _write_low_wake_count_surface(
@@ -2141,7 +2196,7 @@ def main(argv: list[str] | None = None) -> int:
         today_str = now.strftime("%Y-%m-%d")
 
         # Window-not-closed gate. The wake-counting window is
-        # yesterday-23:00 → today-07:00 local. If the scan fires before
+        # yesterday-23:00 → today-07:00 Eastern. If the scan fires before
         # 07:00 (the first sleep-mode thinker wake of the morning, or a
         # mid-night wake that happens to hit the active.md preamble),
         # the Stage B/C/D wake files for the night don't all exist on
@@ -2151,8 +2206,13 @@ def main(argv: list[str] | None = None) -> int:
         # after 07:00 (active-mode 5-min cadence) runs the scan with a
         # closed, complete window. Pairs with the dedup check below so
         # exactly one event lands per day.
-        _, today_07, _ = _morning_window(now)
-        if args.check_existing and now < today_07:
+        #
+        # The check goes through ``_sleep_window_closed`` so it's
+        # timezone-aware: the alice container runs in UTC, but the
+        # sleep schedule is Eastern. A naive ``now < today_07`` compare
+        # used to let the scan through at, e.g., 03:30 EDT (= 07:30 UTC)
+        # because the wall-clock arithmetic was UTC-relative.
+        if args.check_existing and not _sleep_window_closed(now):
             return 0
 
         if args.check_existing and vault_health_event_exists_for_date(
