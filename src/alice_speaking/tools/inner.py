@@ -38,6 +38,14 @@ def _stamp_utc() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d-%H%M%S")
 
 
+def _derive_title(content: str) -> str:
+    for line in content.splitlines():
+        cleaned = line.strip().lstrip("#*-").strip()
+        if cleaned:
+            return cleaned[:80]
+    return "untitled"
+
+
 def build(cfg: Config, *, personae: Personae | None = None) -> list[SdkMcpTool[Any]]:
     p = personae or placeholder_personae()
     agent = p.agent.name
@@ -93,9 +101,15 @@ def build(cfg: Config, *, personae: Personae | None = None) -> list[SdkMcpTool[A
         slug = _slugify(tag or content.split("\n", 1)[0])
         notes_dir.mkdir(parents=True, exist_ok=True)
         path = notes_dir / f"{_stamp_utc()}-{slug}.md"
-        header = f"# note — {datetime.datetime.now().astimezone().isoformat(timespec='seconds')}\n"
+        created = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+        # frontmatter required for surface_dedup / gh-watcher metadata extraction
+        header = "---\n"
+        header += f"title: {_derive_title(content)}\n"
         if tag:
             header += f"tag: {tag}\n"
+        header += f"created: {created}\n"
+        header += "note_type: fleeting\n"
+        header += "---\n"
         path.write_text(header + "\n" + content.rstrip() + "\n")
         return _ok(f"note written: {path.relative_to(cfg.mind_dir)}")
 
