@@ -81,9 +81,10 @@ import datetime
 import hashlib
 import json
 import logging
+import math
 import pathlib
 import re
-from collections import defaultdict
+from collections import Counter
 from typing import Any, Callable, Iterable, Optional
 
 from indexer.yaml_lite import split_frontmatter
@@ -139,9 +140,9 @@ class DecayPairingResult:
     """Outcome of the Phase 3 decay-aware pre-pass for one Stage D tick.
 
     ``archived`` is the count of decayed notes moved to ``archive/``;
-    ``paired`` is the count of decay pairs that produced a ``decay_event``
-    (consumed by Stage C's atomization priority); ``notes`` carries the
-    ``(a, b, score)`` triples for telemetry / tests.
+    ``paired`` is the count of decay pairs selected by the title-cosine
+    pass (Phase 3.5); ``notes`` carries the ``(a, b, score)`` triples for
+    telemetry / tests.
     """
 
     archived: int = 0
@@ -907,9 +908,11 @@ def _record_null_result(
 #   2. Extraction — intentionally a no-op stub. Filename-keyword grouping
 #      between decayed and accessed cohorts produces zero matches on the
 #      live vault: see ``cortex-memory/research/2026-06-04-decay-extraction-pass-breakdown``.
-#   3. Pairing — directory + title-keyword grouping; emits a ``decay_event``
-#      to ``memory/events.jsonl`` so Stage C's ``atomize()`` can boost the
-#      paired note for atomization priority.
+#   3. Pairing (Phase 3.5) — title cosine similarity (IDF-weighted) with
+#      a TITLE_COSINE_STANDARD floor of 0.40 and fitness-domain exemption.
+#      Records the pair on the DecayPairingResult for telemetry; Stage C's
+#      atomize() boosts decayed notes via _decay_priority_score(), so no
+#      cross-stage event channel is needed.
 #
 # Spec: ``cortex-memory/research/2026-06-04-decay-phase3-spec``.
 # Matching strategy: ``cortex-memory/research/2026-06-04-decay-phase3-matching-strategy``.
@@ -954,6 +957,46 @@ _DECAY_DATE_PREFIX_RE = re.compile(r"^\d{4}[-_]?\d{2}[-_]?\d{2}[-_]")
 
 def _is_fitness_domain(fm: dict[str, Any]) -> bool:
     return bool(_tags_of(fm) & FITNESS_TAGS)
+
+
+#: Phase 3.5 pairing thresholds. ``STANDARD`` is the floor for a pair to
+#: be accepted; ``HIGH_CONFIDENCE`` is the floor above which the pair is
+#: treated as a strong match (telemetry / future tier). Dry-run on the
+#: live vault: 25.7% recovery at >=0.40, versus Phase 3's 81% — the
+#: intentional precision/recall trade-off documented in the spec.
+TITLE_COSINE_STANDARD = 0.40
+TITLE_COSINE_HIGH_CONFIDENCE = 0.5
+
+
+def _precompute_title_idf(vault_notes: list[pathlib.Path]) -> dict[str, float]:
+    """Pre-compute IDF (inverse document frequency) for title tokens across vault."""
+    title_df: Counter = Counter()
+    for md in vault_notes:
+        try:
+            text = md.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fm, _body = split_frontmatter(text)
+        title = fm.get("title", md.stem)
+        for t in re.findall(r"\b\w+\b", title):
+            if len(t) > 2:
+                title_df[t.lower()] += 1
+    total = len(vault_notes)
+    return {t: math.log(total / (1 + df)) for t, df in title_df.items()}
+
+
+def _title_tfidf_vector(title: str, title_idf: dict[str, float]) -> dict[str, float]:
+    """IDF-weighted TF vector for a single note title."""
+    tokens = [t.lower() for t in re.findall(r"\b\w+\b", title) if len(t) > 2]
+    tf: Counter = Counter(tokens)
+    return {tok: cnt * title_idf.get(tok, 1.0) for tok, cnt in tf.items()}
+
+
+def _cosine_similarity(v1: dict[str, float], v2: dict[str, float]) -> float:
+    dot = sum(v1.get(k, 0) * v2.get(k, 0) for k in set(v1) | set(v2))
+    mag1 = math.sqrt(sum(v * v for v in v1.values()))
+    mag2 = math.sqrt(sum(v * v for v in v2.values()))
+    return dot / (mag1 * mag2) if mag1 and mag2 else 0.0
 
 
 def _extract_title_keywords(stem: str) -> list[str]:
@@ -1188,23 +1231,16 @@ def _identify_extraction_candidates(
 def _select_decay_pair(
     decayed_notes: list[pathlib.Path],
     vault: pathlib.Path,
+    title_idf: dict[str, float],
 ) -> Optional[tuple[pathlib.Path, pathlib.Path, float]]:
-    """Best decay→decay pair under the directory+keyword strategy.
+    """Best decay→decay pair under pure title cosine similarity.
 
-    Two-stage matching: same-topic groups (kw overlap >=1) first, then
-    cross-topic within the same top-level directory (kw overlap >=2).
-    Returns ``(a, b, score)`` or ``None`` if no eligible pair exists.
-
-    Fitness domain notes are exempt (fixed-schedule writes are not
-    behavioral decay).
+    Accepts pairs with cosine >= TITLE_COSINE_STANDARD. Fitness domain notes are exempt.
     """
     if len(decayed_notes) < 2:
         return None
 
-    cache: dict[pathlib.Path, set[str]] = {}
-    by_group: dict[tuple[str, str], list[pathlib.Path]] = defaultdict(list)
-    by_dir: dict[str, list[pathlib.Path]] = defaultdict(list)
-
+    vectors: dict[pathlib.Path, dict[str, float]] = {}
     for md in decayed_notes:
         try:
             text = md.read_text(encoding="utf-8")
@@ -1213,90 +1249,29 @@ def _select_decay_pair(
         fm, _body = split_frontmatter(text)
         if _is_fitness_domain(fm):
             continue
-        rel = md.relative_to(vault).parts
-        if not rel:
-            continue
-        kw = _extract_title_keywords(md.stem)
-        if not kw:
-            continue
-        major = _extract_major_topic(kw)
-        cache[md] = set(kw)
-        by_group[(rel[0], major)].append(md)
-        by_dir[rel[0]].append(md)
+        title = fm.get("title", md.stem)
+        vec = _title_tfidf_vector(title, title_idf)
+        if vec:
+            vectors[md] = vec
+
+    if len(vectors) < 2:
+        return None
 
     best: Optional[tuple[float, str, pathlib.Path, pathlib.Path]] = None
-
-    def _consider(a: pathlib.Path, b: pathlib.Path, score: float) -> None:
-        nonlocal best
-        # Higher score wins; alphabetical tiebreak for reproducibility.
-        tiebreak = f"{a.stem}::{b.stem}" if a.stem <= b.stem else f"{b.stem}::{a.stem}"
-        cand = (score, tiebreak, a, b)
-        if best is None:
-            best = cand
-            return
-        if score > best[0]:
-            best = cand
-            return
-        if score == best[0] and tiebreak < best[1]:
-            best = cand
-
-    # Same-topic: shared keywords >=1 (×2 weight so it beats cross-topic ties).
-    for group_paths in by_group.values():
-        if len(group_paths) < 2:
-            continue
-        for i in range(len(group_paths)):
-            a = group_paths[i]
-            for j in range(i + 1, len(group_paths)):
-                b = group_paths[j]
-                shared = cache[a] & cache[b]
-                if shared:
-                    _consider(a, b, float(len(shared)) * 2.0)
-
-    # Cross-topic fallback: same dir, kw overlap >=2.
-    if best is None:
-        for dir_paths in by_dir.values():
-            if len(dir_paths) < 2:
+    keys = list(vectors.keys())
+    for i in range(len(keys)):
+        a = keys[i]
+        for j in range(i + 1, len(keys)):
+            b = keys[j]
+            score = _cosine_similarity(vectors[a], vectors[b])
+            if score < TITLE_COSINE_STANDARD:
                 continue
-            for i in range(len(dir_paths)):
-                a = dir_paths[i]
-                for j in range(i + 1, len(dir_paths)):
-                    b = dir_paths[j]
-                    shared = cache[a] & cache[b]
-                    if len(shared) >= 2:
-                        _consider(a, b, float(len(shared)))
+            tiebreak = f"{a.stem}::{b.stem}" if a.stem <= b.stem else f"{b.stem}::{a.stem}"
+            cand = (score, tiebreak, a, b)
+            if best is None or score > best[0] or (score == best[0] and tiebreak < best[1]):
+                best = cand
 
-    if best is None:
-        return None
-    return best[2], best[3], best[0]
-
-
-def _emit_decay_event(
-    mind: pathlib.Path,
-    note: pathlib.Path,
-    partner: pathlib.Path,
-    score: float,
-) -> None:
-    """Append one ``decay_event`` record to ``memory/events.jsonl``.
-
-    Consumed by Stage C's ``atomize()`` to boost the paired note in
-    candidate selection. Best-effort: a write failure is logged and
-    swallowed (the worker must not crash on observability).
-    """
-    vault = _vault_dir(mind)
-    record = {
-        "ts": _utc_iso(),
-        "type": "decay_event",
-        "note": str(note.relative_to(vault)),
-        "partner": str(partner.relative_to(vault)),
-        "score": round(float(score), 3),
-    }
-    path = mind / "memory" / "events.jsonl"
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except OSError as exc:
-        logger.warning("stage_d: failed to append decay_event: %s", exc)
+    return (best[2], best[3], best[0]) if best else None
 
 
 def run_decay_prepass(
@@ -1335,11 +1310,13 @@ def run_decay_prepass(
     extracted_pairs = _identify_extraction_candidates(remaining, vault)
     result.extracted = len(extracted_pairs)
 
-    # Pass 3: pairing — emit one decay_event per cycle.
-    pair = _select_decay_pair(remaining, vault)
+    # Pass 3.5: pairing — title cosine + high-spec-tag filter. No decay_event
+    # emission: Stage C's _decay_priority_score() uses access_count directly,
+    # so the event was dead weight (no consumers in the live pipeline).
+    title_idf = _precompute_title_idf(remaining)
+    pair = _select_decay_pair(remaining, vault, title_idf)
     if pair is not None:
         a, b, score = pair
-        _emit_decay_event(mind, a, b, score)
         result.paired = 1
         result.score = score
         result.notes.append((a.stem, b.stem, score))
@@ -1417,10 +1394,10 @@ def run(
 
     report = StageDReport(ran=False)
 
-    # Phase 3 pre-pass: archive low-signal decayed notes and emit a
-    # decay_event so Stage C's atomize() can boost the paired note. The
-    # pre-pass is independent of the recombination flow below — it
-    # runs whether or not we have a recombination pair to ship.
+    # Phase 3.5 pre-pass: archive low-signal decayed notes and select a
+    # title-cosine pair for telemetry. The pre-pass is independent of the
+    # recombination flow below — it runs whether or not we have a
+    # recombination pair to ship.
     report.decay_pairing = run_decay_prepass(
         mind, journal_path=journal_path, today=today
     )

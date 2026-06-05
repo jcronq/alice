@@ -235,37 +235,56 @@ def test_extraction_candidates_is_noop(mind: pathlib.Path):
 # ---------- pairing pass ----------
 
 
-def test_select_decay_pair_same_topic_overlap(mind: pathlib.Path):
-    """Two decayed notes in the same directory + same major topic +
-    shared keywords pair up."""
+def test_select_decay_pair_high_overlap_pairs(mind: pathlib.Path):
+    """Two decayed notes whose titles share most tokens pair up under
+    Phase 3.5 title-cosine matching."""
     vault = mind / "cortex-memory"
-    a = _write_note(mind, "research/2026-04-01-decay-phase3-validation.md")
-    b = _write_note(mind, "research/2026-04-02-decay-phase3-experiment-validation.md")
-    pair = stage_d._select_decay_pair([a, b], vault)
+    a = _write_note(
+        mind,
+        "research/2026-04-01-decay-phase-validation.md",
+        title="decay phase validation",
+    )
+    b = _write_note(
+        mind,
+        "research/2026-04-02-decay-phase-experiment-validation.md",
+        title="decay phase experiment validation",
+    )
+    title_idf = stage_d._precompute_title_idf([a, b])
+    pair = stage_d._select_decay_pair([a, b], vault, title_idf)
     assert pair is not None
     paired_a, paired_b, score = pair
     assert {paired_a, paired_b} == {a, b}
-    assert score > 0
+    assert score >= stage_d.TITLE_COSINE_STANDARD
 
 
-def test_select_decay_pair_cross_topic_within_directory(mind: pathlib.Path):
-    """No same-topic match → fall back to ≥2 shared keywords within dir."""
+def test_select_decay_pair_partial_overlap_pairs(mind: pathlib.Path):
+    """Two decayed notes with moderate (but above-threshold) title
+    overlap still pair under cosine similarity."""
     vault = mind / "cortex-memory"
-    a = _write_note(mind, "research/2026-04-01-alpha-beta-gamma-validation.md")
-    b = _write_note(mind, "research/2026-04-02-alpha-beta-experiment.md")
-    pair = stage_d._select_decay_pair([a, b], vault)
-    # alpha + beta is 2 shared, and they don't share a major topic
-    # because 'validation' and 'experiment' are different majors.
+    a = _write_note(
+        mind,
+        "research/2026-04-01-alpha-beta-gamma-validation.md",
+        title="alpha beta gamma validation",
+    )
+    b = _write_note(
+        mind,
+        "research/2026-04-02-alpha-beta-experiment.md",
+        title="alpha beta experiment",
+    )
+    title_idf = stage_d._precompute_title_idf([a, b])
+    pair = stage_d._select_decay_pair([a, b], vault, title_idf)
     assert pair is not None
     paired_a, paired_b, _score = pair
     assert {paired_a, paired_b} == {a, b}
 
 
 def test_select_decay_pair_none_when_no_overlap(mind: pathlib.Path):
+    """Cosine below TITLE_COSINE_STANDARD → no pair."""
     vault = mind / "cortex-memory"
-    a = _write_note(mind, "research/2026-04-01-alpha.md")
-    b = _write_note(mind, "research/2026-04-02-omega.md")
-    assert stage_d._select_decay_pair([a, b], vault) is None
+    a = _write_note(mind, "research/alpha.md", title="alpha")
+    b = _write_note(mind, "research/omega.md", title="omega")
+    title_idf = stage_d._precompute_title_idf([a, b])
+    assert stage_d._select_decay_pair([a, b], vault, title_idf) is None
 
 
 def test_select_decay_pair_excludes_fitness_domain(mind: pathlib.Path):
@@ -274,19 +293,23 @@ def test_select_decay_pair_excludes_fitness_domain(mind: pathlib.Path):
     a = _write_note(
         mind,
         "research/2026-04-01-bench-press-progression.md",
+        title="bench press progression",
         tags=["fitness"],
     )
     b = _write_note(
         mind,
         "research/2026-04-02-bench-press-variations.md",
+        title="bench press variations",
         tags=["workout"],
     )
-    assert stage_d._select_decay_pair([a, b], vault) is None
+    title_idf = stage_d._precompute_title_idf([a, b])
+    assert stage_d._select_decay_pair([a, b], vault, title_idf) is None
 
 
 def test_select_decay_pair_singleton_returns_none(mind: pathlib.Path):
     a = _write_note(mind, "research/lonely.md")
-    assert stage_d._select_decay_pair([a], mind / "cortex-memory") is None
+    title_idf = stage_d._precompute_title_idf([a])
+    assert stage_d._select_decay_pair([a], mind / "cortex-memory", title_idf) is None
 
 
 # ---------- iter decayed notes ----------
@@ -344,30 +367,49 @@ def test_iter_decayed_notes_excludes_archive_and_dailies(mind: pathlib.Path):
     assert out == []
 
 
-# ---------- decay event emission ----------
+# ---------- title-cosine helpers (Phase 3.5) ----------
 
 
-def test_emit_decay_event_appends_to_events_jsonl(mind: pathlib.Path):
-    """One decay_event record per call lands in memory/events.jsonl."""
-    a = _write_note(mind, "research/a.md")
-    b = _write_note(mind, "research/b.md")
-    stage_d._emit_decay_event(mind, a, b, score=3.0)
-    events_path = mind / "memory" / "events.jsonl"
-    assert events_path.is_file()
-    lines = events_path.read_text(encoding="utf-8").strip().splitlines()
-    assert len(lines) == 1
-    rec = json.loads(lines[0])
-    assert rec["type"] == "decay_event"
-    assert rec["note"] == "research/a.md"
-    assert rec["partner"] == "research/b.md"
-    assert rec["score"] == 3.0
+def test_cosine_similarity_identical_orthogonal_partial():
+    """``_cosine_similarity`` returns 1.0 for identical vectors, 0.0 for
+    orthogonal (no shared keys), and a value in (0, 1) for partial
+    overlap."""
+    v1 = {"alpha": 1.0, "beta": 2.0}
+    assert stage_d._cosine_similarity(v1, v1) == pytest.approx(1.0)
+    assert stage_d._cosine_similarity(v1, {"gamma": 3.0}) == 0.0
+    assert stage_d._cosine_similarity({}, {}) == 0.0
+    partial = stage_d._cosine_similarity(
+        {"alpha": 1.0, "beta": 1.0},
+        {"alpha": 1.0, "gamma": 1.0},
+    )
+    assert 0.0 < partial < 1.0
+    assert partial == pytest.approx(0.5)
+
+
+def test_precompute_title_idf_formula(mind: pathlib.Path):
+    """IDF is ``log(N / (1 + df))`` per the spec — tokens that appear in
+    every note get the smallest weight, unique tokens the largest."""
+    import math as _math
+
+    a = _write_note(mind, "research/a.md", title="alpha shared")
+    b = _write_note(mind, "research/b.md", title="beta shared")
+    c = _write_note(mind, "research/c.md", title="gamma shared")
+    idf = stage_d._precompute_title_idf([a, b, c])
+    # ``shared`` appears in all 3 → df=3, N=3 → log(3/4)
+    assert idf["shared"] == pytest.approx(_math.log(3 / 4))
+    # ``alpha`` is unique → df=1, N=3 → log(3/2)
+    assert idf["alpha"] == pytest.approx(_math.log(3 / 2))
+    # Tokens <=2 chars are filtered out of the IDF table.
+    assert all(len(t) > 2 for t in idf)
 
 
 # ---------- pre-pass driver ----------
 
 
 def test_run_decay_prepass_archives_and_pairs(mind: pathlib.Path):
-    """End-to-end: archive-eligible note moves; pair emits an event."""
+    """End-to-end: archive-eligible note moves; title-cosine pair is
+    selected. Phase 3.5 no longer emits a decay_event — Stage C's
+    atomize() uses access_count directly."""
     today = datetime.date(2026, 6, 1)
     # Archive-eligible (no inbound links, superseded).
     _write_note(
@@ -377,16 +419,18 @@ def test_run_decay_prepass_archives_and_pairs(mind: pathlib.Path):
         last_accessed="2026-04-01",
         access_count=0,
     )
-    # Two decayed notes that should pair on same-topic.
+    # Two decayed notes that should pair on title cosine.
     _write_note(
         mind,
         "research/2026-04-01-cue-runner-validation.md",
+        title="cue runner validation",
         last_accessed="2026-04-01",
         access_count=0,
     )
     _write_note(
         mind,
         "research/2026-04-02-cue-runner-experiment-validation.md",
+        title="cue runner experiment validation",
         last_accessed="2026-04-02",
         access_count=0,
     )
@@ -396,11 +440,12 @@ def test_run_decay_prepass_archives_and_pairs(mind: pathlib.Path):
     assert result.extracted == 0  # no-op stub
     assert result.paired == 1
     assert len(result.notes) == 1
+    assert result.score >= stage_d.TITLE_COSINE_STANDARD
 
     archived = mind / "cortex-memory" / "archive" / "old-spec.md"
     assert archived.is_file()
-    events = (mind / "memory" / "events.jsonl").read_text(encoding="utf-8")
-    assert "\"type\": \"decay_event\"" in events
+    # Phase 3.5 dropped the dead-code decay_event emission.
+    assert not (mind / "memory" / "events.jsonl").exists()
 
 
 def test_run_decay_prepass_empty_vault_returns_empty_result(mind: pathlib.Path):
