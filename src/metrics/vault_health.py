@@ -1839,9 +1839,27 @@ def _append_event(events_path: Path, event: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
+# ``America/New_York`` resolves to EDT or EST depending on the calendar
+# date — zoneinfo handles DST without us tracking the schedule. Used by
+# ``_local_now`` and ``_sleep_window_closed`` so the wall-clock semantics
+# are correct regardless of the container's system timezone (the alice
+# container runs in UTC; the sleep schedule is Eastern).
+_EASTERN = ZoneInfo("America/New_York")
+
+
 def _local_now() -> datetime:
-    """Local naive datetime. Used for default ``today``/``yesterday``."""
-    return datetime.now()
+    """Naive Eastern wall-clock datetime.
+
+    The morning scan owns Eastern semantics (sleep window 23:00→07:00
+    Eastern), and the alice container runs in UTC — so a bare
+    ``datetime.now()`` would read the UTC wall clock and silently
+    mis-align every comparison against the ``today_07`` boundary by 4–5
+    hours. Constructing through ``zoneinfo`` gives us the Eastern wall
+    clock regardless of the container's system timezone, then stripping
+    ``tzinfo`` preserves the naive-datetime contract every downstream
+    caller (``_morning_window``, ``count_*_in_window``) already expects.
+    """
+    return datetime.now(_EASTERN).replace(tzinfo=None)
 
 
 def _morning_window(now: datetime | None = None) -> tuple[datetime, datetime, datetime]:
@@ -1856,13 +1874,6 @@ def _morning_window(now: datetime | None = None) -> tuple[datetime, datetime, da
     yesterday_23 = today_midnight - timedelta(hours=1)
     today_07 = today_midnight + timedelta(hours=7)
     return yesterday_23, today_07, today_midnight
-
-
-# ``America/New_York`` resolves to EDT or EST depending on the calendar
-# date — zoneinfo handles DST without us tracking the schedule. Used by
-# ``_sleep_window_closed`` so the drought-flag guard behaves correctly
-# regardless of the container's system timezone (typically UTC).
-_EASTERN = ZoneInfo("America/New_York")
 
 
 def _sleep_window_closed(scan_dt: datetime) -> bool:
@@ -1882,20 +1893,20 @@ def _sleep_window_closed(scan_dt: datetime) -> bool:
     explicitly timezone-aware (the alice container runs in UTC; the
     sleep schedule is Eastern) and DST-correct.
 
-    ``scan_dt`` may be naive (treated as system local, then converted to
-    Eastern via the runtime's local tz) or timezone-aware (converted
-    directly).
+    ``scan_dt`` may be naive (interpreted as Eastern wall-clock — this
+    matches the ``_local_now()`` contract and the legacy ``_morning_window``
+    semantics, both of which represent time in Eastern naive form) or
+    timezone-aware (converted to Eastern explicitly).
 
     Originally surfaced 2026-05-08, re-surfaced 2026-06-04 and 2026-06-05.
     """
     if scan_dt.tzinfo is None:
-        # Naive datetime: attach the system local tz first, then convert
-        # to Eastern. ``astimezone()`` on a naive value uses the runtime
-        # local timezone in Python 3.6+.
-        aware = scan_dt.astimezone()
+        # Naive: caller has already committed to Eastern wall-clock
+        # semantics (see ``_local_now``). Attach the zone without
+        # shifting the clock so ``.hour`` reads the Eastern hour.
+        eastern = scan_dt.replace(tzinfo=_EASTERN)
     else:
-        aware = scan_dt
-    eastern = aware.astimezone(_EASTERN)
+        eastern = scan_dt.astimezone(_EASTERN)
     return eastern.hour >= 7
 
 
