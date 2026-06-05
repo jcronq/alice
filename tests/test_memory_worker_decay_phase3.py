@@ -22,7 +22,6 @@ filesystem ops on a ``tmp_path`` mind, no fs mocking.
 from __future__ import annotations
 
 import datetime
-import json
 import pathlib
 
 import pytest
