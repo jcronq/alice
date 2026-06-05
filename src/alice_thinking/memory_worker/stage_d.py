@@ -1045,8 +1045,15 @@ def _is_archive_eligible(fm: dict[str, Any], body: str) -> bool:
         return True
     note_type = str(fm.get("note_type") or "").strip().lower()
     if note_type in ("investigation", "audit"):
+        # Loose match — vault prose uses both ``next_step`` (frontmatter)
+        # and ``next step``/``next steps`` (markdown headings). Treat any
+        # of them as "still has an open thread".
         body_lower = body.lower()
-        if "next_step" not in body_lower and "action" not in body_lower:
+        if (
+            "next_step" not in body_lower
+            and "next step" not in body_lower
+            and "action" not in body_lower
+        ):
             return True
     stripped = body.strip()
     if (
