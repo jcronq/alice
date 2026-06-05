@@ -1564,7 +1564,7 @@ def test_cli_check_existing_noops_when_event_exists(tmp_path: Path) -> None:
     assert events.stat().st_size == size_before
 
 
-def test_cli_append_writes_full_event(tmp_path: Path) -> None:
+def test_cli_append_writes_full_event(tmp_path: Path, monkeypatch) -> None:
     """--append must write a single JSON line that has every required field."""
     import json
 
@@ -1574,6 +1574,12 @@ def test_cli_append_writes_full_event(tmp_path: Path) -> None:
     surface = tmp_path / "surface"
     surface.mkdir()
     events = tmp_path / "events.jsonl"  # does not exist yet
+
+    # Freeze clock past 07:00 — bare _local_now() would let the today_07
+    # window-not-closed gate silent-skip --check-existing between 00:00 and
+    # 07:00 local, producing CI flake during that 7-hour window.
+    fake_now = datetime.now().replace(hour=15, minute=0, second=0, microsecond=0)
+    monkeypatch.setattr("metrics.vault_health._local_now", lambda: fake_now)
 
     rc = vault_health_main(_cli_args(vault, thoughts, events, surface, "--check-existing", "--append"))
     assert rc == 0
@@ -1586,7 +1592,7 @@ def test_cli_append_writes_full_event(tmp_path: Path) -> None:
     assert evt["type"] == "vault_health"
 
 
-def test_cli_check_existing_continues_when_no_today_event(tmp_path: Path) -> None:
+def test_cli_check_existing_continues_when_no_today_event(tmp_path: Path, monkeypatch) -> None:
     """events.jsonl has a vault_health event for yesterday but not today —
     --check-existing must NOT short-circuit; --append must write today's."""
     import json
@@ -1602,6 +1608,12 @@ def test_cli_check_existing_continues_when_no_today_event(tmp_path: Path) -> Non
         json.dumps({"type": "vault_health", "date": yesterday}) + "\n",
         encoding="utf-8",
     )
+
+    # Freeze clock past 07:00 — bare _local_now() would let the today_07
+    # window-not-closed gate silent-skip --check-existing between 00:00 and
+    # 07:00 local, producing CI flake during that 7-hour window.
+    fake_now = datetime.now().replace(hour=15, minute=0, second=0, microsecond=0)
+    monkeypatch.setattr("metrics.vault_health._local_now", lambda: fake_now)
 
     rc = vault_health_main(_cli_args(vault, thoughts, events, surface, "--check-existing", "--append"))
     assert rc == 0
