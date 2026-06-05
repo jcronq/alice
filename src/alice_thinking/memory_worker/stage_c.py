@@ -426,6 +426,54 @@ def should_run_c(state: StageCState, config: StageCConfig) -> bool:
 # ---------- atomize ----------
 
 
+#: Fitness domain notes are fixed-schedule skill-path writes, not
+#: behavioral decay. Exempt from the decay-priority boost so a weekly
+#: workout log doesn't get atomized just for sitting at access_count=0.
+FITNESS_TAGS = frozenset({"fitness", "workout", "nutrition", "weight"})
+
+#: Cap on the age component of :func:`_decay_priority_score`. A 6-month
+#: old decayed note maxes out the age bonus; older notes don't keep
+#: climbing.
+_DECAY_AGE_CAP = 0.5
+
+#: Atomize threshold relaxation for decay-boosted notes. A decayed note
+#: at 0.8 × :data:`BLOATED_LINE_THRESHOLD` lines is still a viable
+#: atomization target — recovering its content into hub sections is
+#: usually worth a shorter parent. Non-decayed notes still need the
+#: full threshold to qualify.
+_DECAY_ATOMIZE_FRACTION = 0.8
+
+
+def _decay_priority_score(path: pathlib.Path) -> float:
+    """Priority boost for a decayed note in :func:`atomize` selection.
+
+    Returns 0.0 for fitness-domain notes and notes whose ``access_count``
+    is >0 — they don't get the decayed-note treatment. A zero-access
+    note earns a base 10.0 plus up to 0.5 from age (older = decaying
+    longer). Capped so a single note can't dominate the iteration
+    order.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return 0.0
+    fm, _body = split_frontmatter(text)
+    tags = set(_tags_of(fm))
+    if tags & FITNESS_TAGS:
+        return 0.0
+    try:
+        ac = int(fm.get("access_count") or 0)
+    except (TypeError, ValueError):
+        ac = 0
+    if ac > 0:
+        return 0.0
+    created = _parse_created_date(fm.get("created"))
+    if created is None:
+        return 10.0
+    age_days = max(0, (_today() - created).days)
+    return 10.0 + min(age_days / 365.0, _DECAY_AGE_CAP)
+
+
 def _split_on_headings(body: str) -> list[tuple[str, str]]:
     """Split ``body`` on top-level ``## `` headings.
 
@@ -510,10 +558,24 @@ def atomize(
     today_iso = _today().isoformat()
     processed = 0
 
-    for md in _iter_groomable_notes(vault):
+    # Phase 3: decay-priority ordering. Zero-access notes get a boost
+    # so they sort ahead of regular bloated notes within one tick's
+    # cap, and they qualify at a relaxed line-count threshold (the
+    # feedback-loop bet: surfacing decayed content as standalone notes
+    # is worth atomizing slightly-shorter parents).
+    candidates = _iter_groomable_notes(vault)
+    scored = [(md, _decay_priority_score(md)) for md in candidates]
+    scored.sort(key=lambda t: (-t[1], str(t[0])))
+
+    for md, decay_boost in scored:
         if processed >= max_items:
             break
-        if _line_count(md) <= BLOATED_LINE_THRESHOLD:
+        threshold = (
+            BLOATED_LINE_THRESHOLD * _DECAY_ATOMIZE_FRACTION
+            if decay_boost > 0
+            else BLOATED_LINE_THRESHOLD
+        )
+        if _line_count(md) <= threshold:
             continue
 
         # Hold the source EXCLUSIVE lock from read through parent
@@ -1508,6 +1570,7 @@ __all__ = [
     "DECAY_WINDOW_DAYS",
     "DEFAULT_DECAY_THRESHOLD",
     "DEFAULT_MAX_ITEMS_PER_CATEGORY",
+    "FITNESS_TAGS",
     "FUZZY_TITLE_DISTANCE",
     "STALE_DAILY_DAYS",
     "StageCConfig",

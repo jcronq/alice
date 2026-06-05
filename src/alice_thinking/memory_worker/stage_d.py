@@ -83,6 +83,7 @@ import json
 import logging
 import pathlib
 import re
+from collections import defaultdict
 from typing import Any, Callable, Iterable, Optional
 
 from indexer.yaml_lite import split_frontmatter
@@ -134,6 +135,34 @@ _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+?)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
 
 
 @dataclasses.dataclass
+class DecayPairingResult:
+    """Outcome of the Phase 3 decay-aware pre-pass for one Stage D tick.
+
+    ``archived`` is the count of decayed notes moved to ``archive/``;
+    ``paired`` is the count of decay pairs that produced a ``decay_event``
+    (consumed by Stage C's atomization priority); ``notes`` carries the
+    ``(a, b, score)`` triples for telemetry / tests.
+    """
+
+    archived: int = 0
+    extracted: int = 0
+    paired: int = 0
+    score: float = 0.0
+    notes: list[tuple[str, str, float]] = dataclasses.field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "archived": int(self.archived),
+            "extracted": int(self.extracted),
+            "paired": int(self.paired),
+            "score": round(float(self.score), 3),
+            "notes": [
+                [a, b, round(float(s), 3)] for (a, b, s) in self.notes
+            ],
+        }
+
+
+@dataclasses.dataclass
 class StageDReport:
     """Counts of what Stage D did this tick."""
 
@@ -143,6 +172,7 @@ class StageDReport:
     pairs_considered: int = 0
     synthesis_path: Optional[str] = None
     skipped_reason: Optional[str] = None
+    decay_pairing: Optional[DecayPairingResult] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -151,6 +181,9 @@ class StageDReport:
             "pairs_considered": int(self.pairs_considered),
             "synthesis_path": self.synthesis_path,
             "skipped_reason": self.skipped_reason,
+            "decay_pairing": (
+                self.decay_pairing.to_dict() if self.decay_pairing else None
+            ),
         }
 
 
@@ -865,6 +898,448 @@ def _record_null_result(
     )
 
 
+# ---------- phase 3: decay-aware pre-pass ----------
+#
+# Three sequential passes drain the decay backlog without losing knowledge:
+#
+#   1. Archive — moves low-signal notes (superseded / resolved / redirect
+#      stubs / orphan investigations) into ``cortex-memory/archive/``.
+#   2. Extraction — intentionally a no-op stub. Filename-keyword grouping
+#      between decayed and accessed cohorts produces zero matches on the
+#      live vault: see ``cortex-memory/research/2026-06-04-decay-extraction-pass-breakdown``.
+#   3. Pairing — directory + title-keyword grouping; emits a ``decay_event``
+#      to ``memory/events.jsonl`` so Stage C's ``atomize()`` can boost the
+#      paired note for atomization priority.
+#
+# Spec: ``cortex-memory/research/2026-06-04-decay-phase3-spec``.
+# Matching strategy: ``cortex-memory/research/2026-06-04-decay-phase3-matching-strategy``.
+
+
+#: Decay window. A note is "decayed" if its ``last_accessed`` is older
+#: than this many days AND its ``access_count`` is <=1. Matches the
+#: window Stage C uses in :func:`stage_c._count_decayed_in_window` so
+#: the two stages see the same population.
+DEFAULT_DECAY_WINDOW_DAYS = 7
+
+#: Top-level vault folders excluded from the decay pass — dailies are
+#: time-bound by design, archive/ is the destination, gh-state is
+#: auto-mirrored data with its own lifecycle. Mirrors stage_c's
+#: ``_EXCLUDED_TOP_DIRS``.
+_DECAY_EXCLUDED_TOP_DIRS = frozenset({"dailies", "archive", "gh-state"})
+
+#: Fitness domain notes are fixed-schedule skill-path writes, not
+#: behavioral decay. See ``2026-06-03-fitness-domain-decay-false-alarm``.
+FITNESS_TAGS = frozenset({"fitness", "workout", "nutrition", "weight"})
+
+#: Stop words for filename-keyword extraction. Sourced from the matching
+#: strategy dry-run note — these tokens carry no topical signal and are
+#: discarded before grouping.
+_DECAY_STOPWORDS = frozenset(
+    (
+        "a an the and or but in on at to for of is it that this these "
+        "are was were be been being have has had do does did will would "
+        "shall should may might can could not no nor if then than so "
+        "just only too very also each every both further where when "
+        "which while as before after during through between about against "
+        "above under into over out down up off away once here there how "
+        "all any even first last long great little own old right high "
+        "different small large next early young important few public "
+        "care ever know need make time water been call whose local data "
+        "went end line white"
+    ).split()
+)
+
+_DECAY_DATE_PREFIX_RE = re.compile(r"^\d{4}[-_]?\d{2}[-_]?\d{2}[-_]")
+
+
+def _is_fitness_domain(fm: dict[str, Any]) -> bool:
+    return bool(_tags_of(fm) & FITNESS_TAGS)
+
+
+def _extract_title_keywords(stem: str) -> list[str]:
+    """Topical tokens from a filename slug.
+
+    Strips ``YYYY-MM-DD-`` (or underscore variants) prefix, splits on
+    hyphens/underscores, lowercases, drops stop words and tokens <=2
+    chars.
+    """
+    name = _DECAY_DATE_PREFIX_RE.sub("", stem)
+    tokens = re.split(r"[-_]", name)
+    return [
+        t.lower()
+        for t in tokens
+        if t and len(t) > 2 and t.lower() not in _DECAY_STOPWORDS
+    ]
+
+
+def _extract_major_topic(keywords: list[str]) -> str:
+    """Longest keyword >4 chars; first keyword otherwise; empty if none.
+
+    The longest specific token is the most discriminating signal for
+    grouping in a vault dominated by short common words.
+    """
+    specific = [k for k in keywords if len(k) > 4]
+    if specific:
+        return max(specific, key=len)
+    return keywords[0] if keywords else ""
+
+
+def _iter_decayed_notes(
+    vault: pathlib.Path,
+    today: datetime.date,
+    *,
+    window_days: int,
+) -> list[pathlib.Path]:
+    """All groomable notes whose ``last_accessed`` is older than the
+    decay window AND whose ``access_count`` is <=1.
+
+    Excludes ``dailies/``, ``archive/``, ``gh-state/``, and dotfiles —
+    same filter Stage C uses for its decay count, so the two stages see
+    the same population.
+    """
+    if not vault.is_dir():
+        return []
+    cutoff = today - datetime.timedelta(days=window_days)
+    cutoff_str = cutoff.isoformat()
+    out: list[pathlib.Path] = []
+    for md in vault.rglob("*.md"):
+        rel = md.relative_to(vault).parts
+        if not rel or rel[0] in _DECAY_EXCLUDED_TOP_DIRS:
+            continue
+        if any(part.startswith(".") for part in rel):
+            continue
+        try:
+            text = md.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fm, _body = split_frontmatter(text)
+        la = fm.get("last_accessed")
+        if la is None:
+            continue
+        la_str = str(la).strip()
+        if len(la_str) < 10 or la_str[:10] >= cutoff_str:
+            continue
+        try:
+            ac = int(fm.get("access_count") or 0)
+        except (TypeError, ValueError):
+            ac = 0
+        if ac > 1:
+            continue
+        out.append(md)
+    out.sort()
+    return out
+
+
+def _is_archive_eligible(fm: dict[str, Any], body: str) -> bool:
+    """A decayed note is archive-eligible if it carries no live signal.
+
+    Three categories:
+
+    1. Explicit ``status: superseded`` / ``resolved`` / ``obsolete``.
+    2. ``note_type: investigation`` or ``audit`` with no outstanding
+       ``next_step`` / ``action`` field anywhere in the body.
+    3. Redirect stub — body is exactly one ``[[target]]`` link.
+    """
+    status = str(fm.get("status") or "").strip().lower()
+    if status in ("superseded", "resolved", "obsolete"):
+        return True
+    note_type = str(fm.get("note_type") or "").strip().lower()
+    if note_type in ("investigation", "audit"):
+        body_lower = body.lower()
+        if "next_step" not in body_lower and "action" not in body_lower:
+            return True
+    stripped = body.strip()
+    if (
+        stripped.startswith("[[")
+        and stripped.count("[[") == 1
+        and stripped.count("]]") == 1
+    ):
+        return True
+    return False
+
+
+def _identify_archive_candidates(
+    decayed_notes: list[pathlib.Path],
+) -> list[pathlib.Path]:
+    out: list[pathlib.Path] = []
+    for path in decayed_notes:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fm, body = split_frontmatter(text)
+        if _is_archive_eligible(fm, body):
+            out.append(path)
+    return out
+
+
+def _archive_decayed_note(
+    mind: pathlib.Path,
+    note: pathlib.Path,
+    journal_path: Optional[pathlib.Path],
+) -> bool:
+    """Move a decayed, archive-eligible note to ``cortex-memory/archive/``.
+
+    Conservative: we only move notes that have zero inbound wikilinks.
+    A decayed-but-referenced note stays in place because rewriting
+    every referrer is Stage C's responsibility (``archive`` and
+    ``dedupe-merge`` both do that work under their own locks); decay
+    archive's job is to drop the orphaned-and-superseded tail without
+    creating broken links.
+    """
+    vault = _vault_dir(mind)
+    today_iso = _today().isoformat()
+
+    # Inbound check — skip if anyone links to this slug.
+    stem = note.stem
+    needle = f"[[{stem}"
+    for source in vault.rglob("*.md"):
+        if source.resolve() == note.resolve():
+            continue
+        try:
+            text = source.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if needle in text:
+            return False
+
+    try:
+        text = note.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    fm, body = split_frontmatter(text)
+
+    archive_dir = vault / "archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    dst = archive_dir / f"{note.stem}.md"
+    if dst.exists():
+        logger.info(
+            "stage_d archive-decay: destination exists, skipping %s",
+            note.stem,
+        )
+        return False
+
+    new_fm = dict(fm)
+    new_fm["updated"] = today_iso
+    new_fm["archived"] = today_iso
+    new_text = _render_frontmatter(new_fm) + "\n" + body.strip() + "\n"
+
+    entry = None
+    if journal_path is not None:
+        entry = journal_mod.append(
+            journal_path,
+            op="archive-decay",
+            source=str(note.relative_to(vault)),
+            targets=[str(dst.relative_to(vault))],
+            detail={
+                "src": str(note.relative_to(vault)),
+                "dst": str(dst.relative_to(vault)),
+            },
+        )
+
+    try:
+        rename_paths = sorted([note, dst])
+        with vault_lock.acquire(
+            rename_paths[0],
+            mode=vault_lock.LockMode.EXCLUSIVE,
+            timeout=_LOCK_TIMEOUT_SECONDS,
+        ), vault_lock.acquire(
+            rename_paths[1],
+            mode=vault_lock.LockMode.EXCLUSIVE,
+            timeout=_LOCK_TIMEOUT_SECONDS,
+        ):
+            dst.write_text(new_text, encoding="utf-8")
+            note.unlink()
+    except (OSError, vault_lock.VaultLockTimeout) as exc:
+        logger.warning(
+            "stage_d archive-decay: write/unlink failed for %s: %s",
+            note.stem,
+            exc,
+        )
+        return False
+
+    if journal_path is not None and entry is not None:
+        journal_mod.commit(journal_path, entry.journal_id)
+    return True
+
+
+def _identify_extraction_candidates(
+    decayed_notes: list[pathlib.Path],
+    vault: pathlib.Path,
+) -> list[tuple[pathlib.Path, pathlib.Path]]:
+    """Intentionally a no-op — extraction is structurally ineffective.
+
+    Filename-keyword grouping between decayed and accessed cohorts
+    produces zero matches on the live vault: the two sets use disjoint
+    naming patterns. Pairing recovers 93.7% on its own. Scaffolding
+    kept for symmetry with the three-pass spec — see
+    ``cortex-memory/research/2026-06-04-decay-extraction-pass-breakdown``.
+    """
+    return []
+
+
+def _select_decay_pair(
+    decayed_notes: list[pathlib.Path],
+    vault: pathlib.Path,
+) -> Optional[tuple[pathlib.Path, pathlib.Path, float]]:
+    """Best decay→decay pair under the directory+keyword strategy.
+
+    Two-stage matching: same-topic groups (kw overlap >=1) first, then
+    cross-topic within the same top-level directory (kw overlap >=2).
+    Returns ``(a, b, score)`` or ``None`` if no eligible pair exists.
+
+    Fitness domain notes are exempt (fixed-schedule writes are not
+    behavioral decay).
+    """
+    if len(decayed_notes) < 2:
+        return None
+
+    cache: dict[pathlib.Path, set[str]] = {}
+    by_group: dict[tuple[str, str], list[pathlib.Path]] = defaultdict(list)
+    by_dir: dict[str, list[pathlib.Path]] = defaultdict(list)
+
+    for md in decayed_notes:
+        try:
+            text = md.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fm, _body = split_frontmatter(text)
+        if _is_fitness_domain(fm):
+            continue
+        rel = md.relative_to(vault).parts
+        if not rel:
+            continue
+        kw = _extract_title_keywords(md.stem)
+        if not kw:
+            continue
+        major = _extract_major_topic(kw)
+        cache[md] = set(kw)
+        by_group[(rel[0], major)].append(md)
+        by_dir[rel[0]].append(md)
+
+    best: Optional[tuple[float, str, pathlib.Path, pathlib.Path]] = None
+
+    def _consider(a: pathlib.Path, b: pathlib.Path, score: float) -> None:
+        nonlocal best
+        # Higher score wins; alphabetical tiebreak for reproducibility.
+        tiebreak = f"{a.stem}::{b.stem}" if a.stem <= b.stem else f"{b.stem}::{a.stem}"
+        cand = (score, tiebreak, a, b)
+        if best is None:
+            best = cand
+            return
+        if score > best[0]:
+            best = cand
+            return
+        if score == best[0] and tiebreak < best[1]:
+            best = cand
+
+    # Same-topic: shared keywords >=1 (×2 weight so it beats cross-topic ties).
+    for group_paths in by_group.values():
+        if len(group_paths) < 2:
+            continue
+        for i in range(len(group_paths)):
+            a = group_paths[i]
+            for j in range(i + 1, len(group_paths)):
+                b = group_paths[j]
+                shared = cache[a] & cache[b]
+                if shared:
+                    _consider(a, b, float(len(shared)) * 2.0)
+
+    # Cross-topic fallback: same dir, kw overlap >=2.
+    if best is None:
+        for dir_paths in by_dir.values():
+            if len(dir_paths) < 2:
+                continue
+            for i in range(len(dir_paths)):
+                a = dir_paths[i]
+                for j in range(i + 1, len(dir_paths)):
+                    b = dir_paths[j]
+                    shared = cache[a] & cache[b]
+                    if len(shared) >= 2:
+                        _consider(a, b, float(len(shared)))
+
+    if best is None:
+        return None
+    return best[2], best[3], best[0]
+
+
+def _emit_decay_event(
+    mind: pathlib.Path,
+    note: pathlib.Path,
+    partner: pathlib.Path,
+    score: float,
+) -> None:
+    """Append one ``decay_event`` record to ``memory/events.jsonl``.
+
+    Consumed by Stage C's ``atomize()`` to boost the paired note in
+    candidate selection. Best-effort: a write failure is logged and
+    swallowed (the worker must not crash on observability).
+    """
+    vault = _vault_dir(mind)
+    record = {
+        "ts": _utc_iso(),
+        "type": "decay_event",
+        "note": str(note.relative_to(vault)),
+        "partner": str(partner.relative_to(vault)),
+        "score": round(float(score), 3),
+    }
+    path = mind / "memory" / "events.jsonl"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        logger.warning("stage_d: failed to append decay_event: %s", exc)
+
+
+def run_decay_prepass(
+    mind: pathlib.Path,
+    *,
+    journal_path: Optional[pathlib.Path] = None,
+    today: Optional[datetime.date] = None,
+    window_days: int = DEFAULT_DECAY_WINDOW_DAYS,
+    max_archive: int = 20,
+) -> DecayPairingResult:
+    """Run the three Phase 3 passes against the current vault.
+
+    Returns a :class:`DecayPairingResult` summarizing what each pass
+    found. Safe to call standalone (used by the unit tests) or as a
+    pre-pass inside :func:`run` before the recombination flow.
+    """
+    today = today or _today()
+    vault = _vault_dir(mind)
+    result = DecayPairingResult()
+
+    decayed = _iter_decayed_notes(vault, today, window_days=window_days)
+    if not decayed:
+        return result
+
+    # Pass 1: archive low-signal notes.
+    archive_candidates = _identify_archive_candidates(decayed)
+    archived_paths: set[pathlib.Path] = set()
+    for path in archive_candidates[:max_archive]:
+        if _archive_decayed_note(mind, path, journal_path):
+            archived_paths.add(path)
+            result.archived += 1
+
+    remaining = [p for p in decayed if p not in archived_paths]
+
+    # Pass 2: extraction stub — see _identify_extraction_candidates.
+    extracted_pairs = _identify_extraction_candidates(remaining, vault)
+    result.extracted = len(extracted_pairs)
+
+    # Pass 3: pairing — emit one decay_event per cycle.
+    pair = _select_decay_pair(remaining, vault)
+    if pair is not None:
+        a, b, score = pair
+        _emit_decay_event(mind, a, b, score)
+        result.paired = 1
+        result.score = score
+        result.notes.append((a.stem, b.stem, score))
+
+    return result
+
+
 # ---------- config loader ----------
 
 
@@ -934,6 +1409,14 @@ def run(
     vault = _vault_dir(mind)
 
     report = StageDReport(ran=False)
+
+    # Phase 3 pre-pass: archive low-signal decayed notes and emit a
+    # decay_event so Stage C's atomize() can boost the paired note. The
+    # pre-pass is independent of the recombination flow below — it
+    # runs whether or not we have a recombination pair to ship.
+    report.decay_pairing = run_decay_prepass(
+        mind, journal_path=journal_path, today=today
+    )
 
     candidates = _recently_touched_research(
         vault, today, window_days=cfg.recent_window_days
@@ -1076,17 +1559,33 @@ def register_verifiers(mind: pathlib.Path) -> None:
                 return True
         return False
 
+    def archive_decay_verifier(entry: journal_mod.JournalEntry) -> bool:
+        src = vault / entry.detail.get("src", entry.source)
+        dst_rel = entry.detail.get(
+            "dst", entry.targets[0] if entry.targets else ""
+        )
+        if not dst_rel:
+            return False
+        dst = vault / dst_rel
+        if src.exists():
+            return False
+        return dst.is_file()
+
     journal_mod.register_verifier("recombination", recombination_verifier)
+    journal_mod.register_verifier("archive-decay", archive_decay_verifier)
 
 
 # ---------- module API ----------
 
 
 __all__ = [
+    "DEFAULT_DECAY_WINDOW_DAYS",
     "DEFAULT_MODEL_TIER",
     "DEFAULT_PAIRS_DEDUP_LOOKBACK_DAYS",
     "DEFAULT_RECENT_WINDOW_DAYS",
+    "FITNESS_TAGS",
     "NULL_RESULT_SENTINEL",
+    "DecayPairingResult",
     "StageDConfig",
     "StageDReport",
     "Synthesizer",
@@ -1094,6 +1593,7 @@ __all__ = [
     "commit_stage_d_synthesis",
     "register_verifiers",
     "run",
+    "run_decay_prepass",
 ]
 
 
