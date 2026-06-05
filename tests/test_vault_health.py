@@ -1689,6 +1689,73 @@ def test_cli_append_requires_thoughts_and_events(tmp_path: Path) -> None:
         vault_health_main(["--vault", str(vault), "--append"])
 
 
+def test_cli_append_alone_skips_before_window_close(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """--append without --check-existing must also silent-skip when the
+    sleep window hasn't closed yet.
+
+    Reproduces the 2026-06-05 bug: a thinking active wake at 00:14 EDT
+    invoked the writer with --append (no --check-existing) and the
+    window-not-closed gate, conditioned on args.check_existing, let it
+    through. The resulting vault_health event captured only the Stage B
+    wakes already on disk (the Stage D cluster writes 00:27–02:20) and
+    landed with the wrong wake_type_distribution.
+
+    Fix: drop the args.check_existing prefix on the gate so it applies
+    uniformly to every single-command-mode invocation.
+    """
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"  # does not exist yet
+
+    # 00:14 local — well inside the sleep window. Mirrors the production
+    # incident timestamp from 2026-06-05.
+    fake_now = datetime.now().replace(hour=0, minute=14, second=0, microsecond=0)
+    monkeypatch.setattr(
+        "metrics.vault_health._local_now", lambda: fake_now
+    )
+
+    rc = vault_health_main(_cli_args(vault, thoughts, events, surface, "--append"))
+    assert rc == 0
+    # Gate must fire — no event written despite --check-existing being absent.
+    assert not events.exists() or events.stat().st_size == 0
+
+
+def test_cli_append_alone_writes_after_window_close(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """At 07:30 (window closed), --append alone still writes today's event.
+
+    Symmetric coverage for the uniform gate: removing the
+    args.check_existing prefix must not break the post-window path.
+    """
+    import json
+
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    fake_now = datetime.now().replace(hour=7, minute=30, second=0, microsecond=0)
+    monkeypatch.setattr(
+        "metrics.vault_health._local_now", lambda: fake_now
+    )
+
+    rc = vault_health_main(_cli_args(vault, thoughts, events, surface, "--append"))
+    assert rc == 0
+    assert events.exists()
+    lines = events.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    evt = json.loads(lines[0])
+    assert evt["type"] == "vault_health"
+
+
 # ---------------------------------------------------------------------------
 # Decay coverage (Layer 1 blind-spot detection)
 # Design: [[2026-05-10-decay-blind-spot-detection-design]]

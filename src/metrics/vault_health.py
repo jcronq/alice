@@ -2223,7 +2223,14 @@ def main(argv: list[str] | None = None) -> int:
         # sleep schedule is Eastern. A naive ``now < today_07`` compare
         # used to let the scan through at, e.g., 03:30 EDT (= 07:30 UTC)
         # because the wall-clock arithmetic was UTC-relative.
-        if args.check_existing and not _sleep_window_closed(now):
+        #
+        # The gate is unconditional on the single-command-mode path:
+        # any pre-window invocation (``--check-existing``, ``--append``,
+        # or both) silent-skips. A bare ``--append`` call from an active
+        # thinking wake at 00:14 had previously bypassed the gate and
+        # written a partial-window event with the wrong
+        # ``wake_type_distribution``.
+        if not _sleep_window_closed(now):
             return 0
 
         if args.check_existing and vault_health_event_exists_for_date(
