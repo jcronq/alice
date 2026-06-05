@@ -52,6 +52,7 @@ __all__ = [
     "detect_conflict_notes",
     "STAGE_D_NIGHTLY_CAP",
     "STAGE_C_DEBT_ESCALATION_THRESHOLD",
+    "VAULT_HEALTH_FIX_THRESHOLD",
 ]
 
 
@@ -77,6 +78,19 @@ STAGE_D_NIGHTLY_CAP = 5
 #
 # Design: cortex-memory/research/2026-04-26-adaptive-stage-selection-design.md
 STAGE_C_DEBT_ESCALATION_THRESHOLD = 5
+
+
+# Vault-health Tier 1 — composite-score threshold for Rule 2b.
+#
+# When ``vault_health_score`` falls below this value, the
+# consecutive-B loop-break routes to Stage C even when a research
+# corpus exists (and even when debt is below
+# :data:`STAGE_C_DEBT_ESCALATION_THRESHOLD`), so structural debt is
+# fixed before synthesis. 80 maps to: a single broken wikilink, two
+# orphan stubs, or two bloated notes (per the design's weights).
+#
+# Design: cortex-memory/research/2026-06-04-vault-health-driven-stage-selection.md
+VAULT_HEALTH_FIX_THRESHOLD = 80
 
 
 class Phase(enum.Enum):
@@ -147,6 +161,20 @@ class VaultSnapshot:
     # 2e). ``inf`` when no Stage C wake has been recorded; default
     # keeps the field optional for existing call sites.
     hours_since_last_c: float = float("inf")
+    # Vault-health Tier 1 — behavioral access decay signal. True when
+    # any note has ``access_count <= 0`` and ``created`` older than 5
+    # days. Drives Rule 2b: when set, the consecutive-B loop-break
+    # routes to Stage C so atomization can recover decayed notes
+    # before the corpus-driven D-preference fires.
+    # Design: cortex-memory/research/2026-06-04-vault-health-driven-stage-selection.md
+    has_access_decay: bool = False
+    # Vault-health Tier 1 — composite 0–100 health score derived from
+    # broken wikilinks, orphan notes, bloated notes, and stale dailies.
+    # 100 == clean vault. Drives Rule 2b: ``score < 80`` routes the
+    # loop-break to Stage C even when a research corpus exists, so
+    # structural debt is fixed before synthesis runs. Default 100
+    # keeps existing call sites neutral (no change from prior behavior).
+    vault_health_score: int = 100
 
 
 @dataclass(frozen=True)
@@ -570,6 +598,130 @@ def _stage_c_candidates_total(mind: pathlib.Path) -> int:
     return int(result.get("total", 0))
 
 
+# Vault-health Tier 1 cache. 30-min TTL matches the memory worker's
+# grooming cadence — full vault_health scans (broken-link + orphan
+# walks) are too expensive to run every wake at the 5-min sleep
+# cadence. See cortex-memory/research/2026-06-04-vault-health-driven-stage-selection.md.
+_VAULT_HEALTH_CACHE_TTL_SECONDS = 30 * 60
+_VAULT_HEALTH_CACHE_FILENAME = "vault_health_cache.json"
+
+
+def _vault_health_cache_path(state_dir: pathlib.Path) -> pathlib.Path:
+    return state_dir / _VAULT_HEALTH_CACHE_FILENAME
+
+
+def _read_vault_health_cache(
+    state_dir: pathlib.Path, *, now_ts: float
+) -> Optional[dict]:
+    path = _vault_health_cache_path(state_dir)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    written_at = data.get("written_at")
+    if not isinstance(written_at, (int, float)):
+        return None
+    if now_ts - float(written_at) > _VAULT_HEALTH_CACHE_TTL_SECONDS:
+        return None
+    return data
+
+
+def _write_vault_health_cache(
+    state_dir: pathlib.Path,
+    *,
+    now_ts: float,
+    has_access_decay: bool,
+    vault_health_score: int,
+) -> None:
+    path = _vault_health_cache_path(state_dir)
+    payload = {
+        "written_at": now_ts,
+        "has_access_decay": has_access_decay,
+        "vault_health_score": vault_health_score,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic write — a torn cache file is worse than a missing one,
+        # since the next read would silently hit the JSONDecodeError
+        # fallthrough and re-scan anyway.
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload) + "\n")
+        tmp.replace(path)
+    except OSError:
+        return
+
+
+def _compute_vault_health(mind: pathlib.Path) -> tuple[bool, int]:
+    """Run the full vault-health scan: ``(has_access_decay, score)``.
+
+    Composite score formula (per design):
+        score = 100
+              - broken_wikilinks * 5
+              - orphan_notes     * 3
+              - bloated_notes    * 2
+              - stale_dailies    * 1
+        clamped to [0, 100].
+
+    Returns ``(False, 100)`` when the vault is missing or the import /
+    scan fails — fails safe to "clean vault, no decay" so the selector
+    keeps its prior behavior.
+    """
+    vault_dir = mind / "cortex-memory"
+    if not vault_dir.is_dir():
+        return False, 100
+    try:
+        from metrics.vault_health import (
+            count_access_decay,
+            count_broken_wikilinks,
+            count_orphans,
+            count_stage_c_candidates,
+        )
+    except ImportError:
+        return False, 100
+
+    try:
+        broken_count, _ = count_broken_wikilinks(vault_dir)
+        orphan_count, _ = count_orphans(vault_dir)
+        candidates = count_stage_c_candidates(vault_dir)
+        access_decay_count = count_access_decay(vault_dir)
+    except OSError:
+        return False, 100
+
+    bloated = int(candidates.get("bloated_notes", 0))
+    stale = int(candidates.get("stale_dailies", 0))
+    score = 100 - broken_count * 5 - orphan_count * 3 - bloated * 2 - stale
+    score = max(0, min(100, score))
+    return access_decay_count > 0, score
+
+
+def _vault_health_signals(
+    mind: pathlib.Path, *, state_dir: pathlib.Path, now: _dt.datetime
+) -> tuple[bool, int]:
+    """Return ``(has_access_decay, vault_health_score)``, cached.
+
+    Skips recompute on cache hit. The 30-min TTL matches the memory
+    worker's grooming cadence — between groomings the underlying
+    counts don't drift enough to change rule selection.
+    """
+    now_ts = now.timestamp()
+    cached = _read_vault_health_cache(state_dir, now_ts=now_ts)
+    if cached is not None:
+        return (
+            bool(cached.get("has_access_decay", False)),
+            int(cached.get("vault_health_score", 100)),
+        )
+    has_decay, score = _compute_vault_health(mind)
+    _write_vault_health_cache(
+        state_dir,
+        now_ts=now_ts,
+        has_access_decay=has_decay,
+        vault_health_score=score,
+    )
+    return has_decay, score
+
+
 def build_vault_snapshot(
     mind: pathlib.Path,
     *,
@@ -586,6 +738,10 @@ def build_vault_snapshot(
 
     cfg = cfg or PhaseConfig()
     today = now.date().isoformat()
+
+    has_access_decay, vault_health_score = _vault_health_signals(
+        mind, state_dir=state_dir, now=now
+    )
 
     return VaultSnapshot(
         hour=now.hour,
@@ -614,6 +770,8 @@ def build_vault_snapshot(
         today=today,
         stage_c_candidates_total=_stage_c_candidates_total(mind),
         hours_since_last_c=_hours_since_last_c(mind, now=now),
+        has_access_decay=has_access_decay,
+        vault_health_score=vault_health_score,
     )
 
 
@@ -702,6 +860,17 @@ def select_phase(vault: VaultSnapshot, cfg: Optional[PhaseConfig] = None) -> Pha
     # corpus-driven Stage D preference is preserved. Self-correcting:
     # once C drains the candidates below 5, escalation reverts to D.
     if vault.consecutive_b >= cfg.consecutive_b_threshold:
+        # Tier 1 vault-health gates run first: a degraded vault wants
+        # structural fixes (low score) or atomization of decayed
+        # notes (access decay) before synthesis. Both gate Stage C
+        # ahead of the corpus-driven D-preference; order between
+        # them is "structural before behavioral" because broken links
+        # / orphans block thinking's retrieval path entirely, while
+        # access decay degrades it more gradually.
+        if vault.vault_health_score < VAULT_HEALTH_FIX_THRESHOLD:
+            return Phase.SLEEP_C
+        if vault.has_access_decay:
+            return Phase.SLEEP_C
         if vault.stage_c_candidates_total >= STAGE_C_DEBT_ESCALATION_THRESHOLD:
             return Phase.SLEEP_C
         if vault.has_recent_research and not vault.stage_d_cap_exhausted:

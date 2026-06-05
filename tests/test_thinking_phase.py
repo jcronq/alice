@@ -19,14 +19,20 @@ from alice_thinking.phase import (
     CONFLICT_DEFER_THRESHOLD,
     STAGE_C_DEBT_ESCALATION_THRESHOLD,
     STAGE_D_NIGHTLY_CAP,
+    VAULT_HEALTH_FIX_THRESHOLD,
     Phase,
     PhaseConfig,
     PromptFragmentLoader,
     VaultSnapshot,
+    _compute_vault_health,
     _hours_since_last_c,
     _hours_since_last_d,
     _pairs_log_path,
+    _read_vault_health_cache,
     _stage_d_cap_exhausted,
+    _vault_health_cache_path,
+    _vault_health_signals,
+    _write_vault_health_cache,
     build_vault_snapshot,
     detect_commission_notes,
     detect_conflict_notes,
@@ -51,6 +57,8 @@ def _snap(
     today: str = "2026-05-07",
     stage_c_candidates_total: int = 0,
     hours_since_last_c: float = 0.0,
+    has_access_decay: bool = False,
+    vault_health_score: int = 100,
 ) -> VaultSnapshot:
     return VaultSnapshot(
         hour=hour,
@@ -68,6 +76,8 @@ def _snap(
         today=today,
         stage_c_candidates_total=stage_c_candidates_total,
         hours_since_last_c=hours_since_last_c,
+        has_access_decay=has_access_decay,
+        vault_health_score=vault_health_score,
     )
 
 
@@ -1547,3 +1557,331 @@ def test_has_broken_links_stops_at_next_h2_header(
         "- [[resolved-link]] resolved 2026-05-01\n",
     )
     assert _has_broken_links(tmp_path) is False
+
+
+# ---------------------------------------------------------------------------
+# Tier 1 vault-health rule gates — Rule 2b ordering
+#
+# Design: cortex-memory/research/2026-06-04-vault-health-driven-stage-selection.md
+#
+# Both ``vault_health_score < VAULT_HEALTH_FIX_THRESHOLD`` and
+# ``has_access_decay`` route the consecutive-B loop-break to Stage C,
+# ahead of the existing debt and corpus checks. Structural fixes
+# (broken links / orphans) win over behavioral decay because broken
+# retrieval paths block all reads, while access decay degrades quality
+# more gradually.
+# ---------------------------------------------------------------------------
+
+
+def test_rule_2b_low_health_score_routes_to_c_over_corpus() -> None:
+    """Score below the threshold beats the corpus-driven D-preference."""
+    snap = _snap(
+        hour=1,
+        consecutive_b=6,
+        has_recent_research=True,
+        vault_health_score=70,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+def test_rule_2b_low_health_score_routes_to_c_with_zero_debt() -> None:
+    """Even without ``stage_c_candidates_total`` debt, structural issues
+    (reflected in score) route the loop-break to C."""
+    snap = _snap(
+        hour=1,
+        consecutive_b=6,
+        has_recent_research=True,
+        stage_c_candidates_total=0,
+        vault_health_score=65,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+def test_rule_2b_health_score_at_exact_threshold_routes_to_d() -> None:
+    """Boundary: ``score == VAULT_HEALTH_FIX_THRESHOLD`` is healthy
+    enough — the ``<`` comparison lets the corpus-driven D-preference fire."""
+    snap = _snap(
+        hour=1,
+        consecutive_b=6,
+        has_recent_research=True,
+        vault_health_score=VAULT_HEALTH_FIX_THRESHOLD,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_D
+
+
+def test_rule_2b_health_score_just_below_threshold_routes_to_c() -> None:
+    """Boundary: ``score == VAULT_HEALTH_FIX_THRESHOLD - 1`` trips the gate."""
+    snap = _snap(
+        hour=1,
+        consecutive_b=6,
+        has_recent_research=True,
+        vault_health_score=VAULT_HEALTH_FIX_THRESHOLD - 1,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+def test_rule_2b_access_decay_routes_to_c_over_corpus() -> None:
+    """``has_access_decay`` beats the corpus-driven D-preference."""
+    snap = _snap(
+        hour=1,
+        consecutive_b=6,
+        has_recent_research=True,
+        has_access_decay=True,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+def test_rule_2b_access_decay_routes_to_c_with_healthy_score() -> None:
+    """Access decay fires independently of structural score — a vault
+    with broken-link count 0 + bloated 0 can still have decayed notes."""
+    snap = _snap(
+        hour=1,
+        consecutive_b=6,
+        has_recent_research=True,
+        has_access_decay=True,
+        vault_health_score=100,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+def test_rule_2b_clean_vault_with_corpus_still_routes_to_d() -> None:
+    """Neither gate fires on a clean vault — the prior corpus-driven
+    D-preference is preserved when both Tier 1 signals are negative."""
+    snap = _snap(
+        hour=1,
+        consecutive_b=6,
+        has_recent_research=True,
+        has_access_decay=False,
+        vault_health_score=100,
+        stage_c_candidates_total=0,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_D
+
+
+def test_rule_2b_low_score_does_not_fire_below_consecutive_b_threshold() -> None:
+    """Tier 1 gates sit inside the Rule 2b branch — if ``consecutive_b``
+    is below the loop-break threshold, the gates must not fire. Hour 1
+    with ``consecutive_b=0`` lands on Rule 2c (SLEEP_C) — same default
+    as without the low score. Pin so a future refactor can't promote
+    the gates above Rule 2a / 2e or out of the consecutive-B branch."""
+    snap = _snap(
+        hour=1,
+        consecutive_b=0,
+        has_recent_research=True,
+        vault_health_score=30,
+        has_access_decay=True,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_C
+
+
+def test_rule_2b_low_score_does_not_promote_above_rule_2a() -> None:
+    """A degraded vault with inbox items still hits Rule 2a (SLEEP_B)
+    — Tier 1 gates are inside the consecutive-B branch and cannot fire
+    when the inbox is non-empty (unless Rule 2f's C floor is also met,
+    which is unrelated)."""
+    snap = _snap(
+        hour=1,
+        consecutive_b=6,
+        has_inbox_items=True,
+        vault_health_score=30,
+        has_access_decay=True,
+    )
+    assert select_phase(snap, _full_cfg()) is Phase.SLEEP_B
+
+
+def test_vault_health_fix_threshold_constant_matches_design() -> None:
+    """The design (2026-06-04-vault-health-driven-stage-selection) sets
+    80 — a single broken wikilink (weight 5) + orphans/bloated would
+    push the score below this. Pin so a future tune surfaces in review."""
+    assert VAULT_HEALTH_FIX_THRESHOLD == 80
+
+
+# ---------------------------------------------------------------------------
+# Vault-health cache — 30-min TTL persistence to inner/state/
+# ---------------------------------------------------------------------------
+
+
+def _write_cache(
+    state_dir: pathlib.Path,
+    *,
+    written_at: float,
+    has_access_decay: bool = False,
+    vault_health_score: int = 100,
+) -> None:
+    import json as _json
+
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (_vault_health_cache_path(state_dir)).write_text(
+        _json.dumps(
+            {
+                "written_at": written_at,
+                "has_access_decay": has_access_decay,
+                "vault_health_score": vault_health_score,
+            }
+        )
+    )
+
+
+def test_vault_health_cache_hit_within_ttl(tmp_path: pathlib.Path) -> None:
+    """Fresh cache (within 30 min) is returned without recompute."""
+    state_dir = tmp_path / "state"
+    now = _dt.datetime(2026, 6, 4, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    _write_cache(
+        state_dir,
+        written_at=now.timestamp() - 60,
+        has_access_decay=True,
+        vault_health_score=72,
+    )
+    has_decay, score = _vault_health_signals(
+        tmp_path, state_dir=state_dir, now=now
+    )
+    assert has_decay is True
+    assert score == 72
+
+
+def test_vault_health_cache_miss_on_ttl_expiry(tmp_path: pathlib.Path) -> None:
+    """Cache older than 30 min is ignored; falls through to recompute.
+    With no vault, recompute returns the safe default ``(False, 100)``
+    — which is also what the cache should now hold."""
+    state_dir = tmp_path / "state"
+    now = _dt.datetime(2026, 6, 4, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    # 30 min + 1 sec → expired.
+    _write_cache(
+        state_dir,
+        written_at=now.timestamp() - (30 * 60 + 1),
+        has_access_decay=True,
+        vault_health_score=72,
+    )
+    has_decay, score = _vault_health_signals(
+        tmp_path, state_dir=state_dir, now=now
+    )
+    assert has_decay is False
+    assert score == 100
+
+
+def test_vault_health_cache_boundary_at_exact_ttl(tmp_path: pathlib.Path) -> None:
+    """Boundary: written exactly TTL seconds ago → still a hit
+    (``<=`` semantics on the staleness check)."""
+    state_dir = tmp_path / "state"
+    now = _dt.datetime(2026, 6, 4, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    _write_cache(
+        state_dir,
+        written_at=now.timestamp() - (30 * 60),
+        has_access_decay=True,
+        vault_health_score=72,
+    )
+    has_decay, score = _vault_health_signals(
+        tmp_path, state_dir=state_dir, now=now
+    )
+    assert has_decay is True
+    assert score == 72
+
+
+def test_vault_health_cache_miss_creates_cache_file(
+    tmp_path: pathlib.Path,
+) -> None:
+    """First call writes the cache so subsequent wakes can skip the scan."""
+    state_dir = tmp_path / "state"
+    now = _dt.datetime(2026, 6, 4, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    assert not _vault_health_cache_path(state_dir).exists()
+    _vault_health_signals(tmp_path, state_dir=state_dir, now=now)
+    assert _vault_health_cache_path(state_dir).exists()
+
+
+def test_vault_health_cache_corrupt_json_falls_through(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A corrupt cache file must not raise — treat it as a miss."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    _vault_health_cache_path(state_dir).write_text("{not valid json")
+    now = _dt.datetime(2026, 6, 4, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    has_decay, score = _vault_health_signals(
+        tmp_path, state_dir=state_dir, now=now
+    )
+    assert has_decay is False
+    assert score == 100
+
+
+def test_vault_health_cache_read_returns_none_on_expiry(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``_read_vault_health_cache`` returns ``None`` for an expired
+    cache so callers know to recompute."""
+    state_dir = tmp_path / "state"
+    now = _dt.datetime(2026, 6, 4, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    _write_cache(
+        state_dir,
+        written_at=now.timestamp() - (60 * 60),  # 1h ago → expired
+    )
+    assert (
+        _read_vault_health_cache(state_dir, now_ts=now.timestamp())
+        is None
+    )
+
+
+def test_vault_health_cache_write_then_read_round_trip(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``_write_vault_health_cache`` payload is recoverable by
+    ``_read_vault_health_cache`` within the TTL."""
+    state_dir = tmp_path / "state"
+    now_ts = _dt.datetime(2026, 6, 4, 12, 0, tzinfo=_dt.timezone.utc).timestamp()
+    _write_vault_health_cache(
+        state_dir,
+        now_ts=now_ts,
+        has_access_decay=True,
+        vault_health_score=55,
+    )
+    data = _read_vault_health_cache(state_dir, now_ts=now_ts + 60)
+    assert data is not None
+    assert data["has_access_decay"] is True
+    assert data["vault_health_score"] == 55
+
+
+# ---------------------------------------------------------------------------
+# Vault-health computation — defaults when the vault is missing
+# ---------------------------------------------------------------------------
+
+
+def test_compute_vault_health_returns_clean_defaults_when_vault_missing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Missing ``cortex-memory/`` → ``(False, 100)``; selector keeps
+    its prior behavior with no vault present."""
+    has_decay, score = _compute_vault_health(tmp_path)
+    assert has_decay is False
+    assert score == 100
+
+
+# ---------------------------------------------------------------------------
+# build_vault_snapshot — Tier 1 fields wired in
+# ---------------------------------------------------------------------------
+
+
+def test_build_vault_snapshot_populates_tier1_fields_with_defaults(
+    tmp_path: pathlib.Path,
+) -> None:
+    """No vault present → snapshot ships the safe defaults so the
+    selector's existing rules continue to fire as before."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    snap = build_vault_snapshot(tmp_path, now=_now(), state_dir=state_dir)
+    assert snap.has_access_decay is False
+    assert snap.vault_health_score == 100
+
+
+def test_build_vault_snapshot_uses_cached_health(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A fresh cache short-circuits the scan and surfaces on the snapshot."""
+    state_dir = tmp_path / "state"
+    _write_cache(
+        state_dir,
+        written_at=_now().timestamp() - 60,
+        has_access_decay=True,
+        vault_health_score=45,
+    )
+    snap = build_vault_snapshot(tmp_path, now=_now(), state_dir=state_dir)
+    assert snap.has_access_decay is True
+    assert snap.vault_health_score == 45
