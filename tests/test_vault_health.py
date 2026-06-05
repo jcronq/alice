@@ -16,13 +16,15 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as _tz_module
 from pathlib import Path
 from textwrap import dedent
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from metrics.vault_health import (
+    _sleep_window_closed,
     build_vault_health_event,
     compute_continuous_checks,
     compute_decay_coverage,
@@ -2610,13 +2612,8 @@ def test_bare_research_note_still_counted_as_dark(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-from metrics.vault_health import _sleep_window_closed
-from datetime import timezone as _tz_module
-
-
 def _eastern_dt(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
     """Construct an Eastern-time-aware datetime for the test fixtures."""
-    from zoneinfo import ZoneInfo
     return datetime(year, month, day, hour, minute, tzinfo=ZoneInfo("America/New_York"))
 
 
