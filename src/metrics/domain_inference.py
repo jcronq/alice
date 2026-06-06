@@ -21,13 +21,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import re
-import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from indexer.yaml_lite import split_frontmatter, extract_wikilinks
+from indexer.yaml_lite import split_frontmatter
 
 logger = logging.getLogger(__name__)
 
@@ -317,35 +315,35 @@ def main():
 def format_report(report: dict[str, Any]) -> str:
     """Format the analysis report as human-readable text."""
     lines = []
-    lines.append(f"Domain Inference Report")
-    lines.append(f"=" * 40)
-    lines.append(f"")
+    lines.append("Domain Inference Report")
+    lines.append("=" * 40)
+    lines.append("")
     lines.append(f"Total unknown-domain notes: {report['total_unknown']}")
     lines.append(f"Recoverable via tags: {report['recovered_count']}")
     lines.append(f"Not recoverable: {report['not_recovered_count']}")
     rate = report['recovery_rate']
     lines.append(f"Recovery rate: {rate:.1%}")
-    lines.append(f"")
+    lines.append("")
 
     if report["tag_frequency"]:
-        lines.append(f"Top tags driving inference:")
+        lines.append("Top tags driving inference:")
         for tag, count in list(report["tag_frequency"].items())[:15]:
             lines.append(f"  {tag}: {count}")
-        lines.append(f"")
+        lines.append("")
 
     if report["domain_distribution"]:
-        lines.append(f"Domain distribution (recovered notes):")
+        lines.append("Domain distribution (recovered notes):")
         for domain, count in list(report["domain_distribution"].items())[:15]:
             lines.append(f"  {domain}: {count}")
-        lines.append(f"")
+        lines.append("")
 
     if report.get("apply_result"):
         result = report["apply_result"]
-        lines.append(f"Apply result:")
+        lines.append("Apply result:")
         lines.append(f"  Changes: {result['changes_applied']}")
         lines.append(f"  Errors: {len(result['errors'])}")
         if result["errors"]:
-            lines.append(f"  Error details:")
+            lines.append("  Error details:")
             for err in result["errors"][:5]:
                 lines.append(f"    {err['path']}: {err['error']}")
 

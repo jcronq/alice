@@ -19,7 +19,6 @@ from __future__ import annotations
 from pathlib import Path
 from textwrap import dedent
 
-import pytest
 
 from metrics.domain_inference import (
     EXCLUDED_TAGS,
