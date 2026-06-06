@@ -257,6 +257,209 @@ def test_archive_rewrites_wikilinks_pointing_at_moved_daily(mind: pathlib.Path):
     assert "[[archive/dailies/2025/2025-12-01]]" in new_text
 
 
+# ---------- archive-stale-open ----------
+
+
+def _read_status(path: pathlib.Path) -> str:
+    text = path.read_text(encoding="utf-8")
+    for line in text.splitlines():
+        if line.startswith("status:"):
+            return line.split(":", 1)[1].strip().lower()
+    return ""
+
+
+def test_archive_stale_open_matches_open_zero_access_aged(mind: pathlib.Path):
+    """status: open + access_count: 0 + created > 30 days ago = candidate."""
+    today = datetime.date(2026, 6, 6)
+    # 60 days ago = 2026-04-07.
+    target = _write_note(
+        mind,
+        "projects/stale-thing.md",
+        title="Stale thing",
+        created="2026-04-07",
+        extra_fm={"status": "open", "access_count": 0},
+    )
+
+    n = stage_c.archive_stale_open(
+        mind, max_items=10, journal_path=None, today=today, dry_run=False
+    )
+    assert n == 1
+    assert _read_status(target) == "archived"
+
+
+def test_archive_stale_open_skips_nonzero_access_count(mind: pathlib.Path):
+    """access_count > 0 disqualifies even if status: open and old."""
+    today = datetime.date(2026, 6, 6)
+    target = _write_note(
+        mind,
+        "projects/has-been-read.md",
+        title="Has been read",
+        created="2026-04-07",
+        extra_fm={"status": "open", "access_count": 5},
+    )
+
+    n = stage_c.archive_stale_open(
+        mind, max_items=10, journal_path=None, today=today, dry_run=False
+    )
+    assert n == 0
+    assert _read_status(target) == "open"
+
+
+def test_archive_stale_open_skips_recent_creation(mind: pathlib.Path):
+    """A 10-day-old open note is too fresh to archive."""
+    today = datetime.date(2026, 6, 6)
+    # 10 days ago = 2026-05-27.
+    target = _write_note(
+        mind,
+        "projects/fresh-open.md",
+        title="Fresh open",
+        created="2026-05-27",
+        extra_fm={"status": "open", "access_count": 0},
+    )
+
+    n = stage_c.archive_stale_open(
+        mind, max_items=10, journal_path=None, today=today, dry_run=False
+    )
+    assert n == 0
+    assert _read_status(target) == "open"
+
+
+def test_archive_stale_open_skips_non_open_status(mind: pathlib.Path):
+    """status: complete (or anything ≠ open) is ignored even when old."""
+    today = datetime.date(2026, 6, 6)
+    target = _write_note(
+        mind,
+        "projects/done-already.md",
+        title="Done already",
+        created="2026-04-07",
+        extra_fm={"status": "complete", "access_count": 0},
+    )
+
+    n = stage_c.archive_stale_open(
+        mind, max_items=10, journal_path=None, today=today, dry_run=False
+    )
+    assert n == 0
+    assert _read_status(target) == "complete"
+
+
+def test_archive_stale_open_dry_run_does_not_mutate(mind: pathlib.Path):
+    """With dry_run=True (the default), candidates are counted but the
+    vault and today's daily are untouched."""
+    today = datetime.date(2026, 6, 6)
+    target = _write_note(
+        mind,
+        "projects/dry-run-candidate.md",
+        title="Dry run candidate",
+        created="2026-04-07",
+        extra_fm={"status": "open", "access_count": 0},
+    )
+    daily_path = (
+        mind / "cortex-memory" / "dailies" / f"{today.isoformat()}.md"
+    )
+    assert not daily_path.exists()
+
+    # Default is dry_run=True — verify by omitting the kwarg.
+    n = stage_c.archive_stale_open(
+        mind, max_items=10, journal_path=None, today=today
+    )
+    assert n == 1
+    # Frontmatter untouched.
+    assert _read_status(target) == "open"
+    # No daily created by the dry-run pass.
+    assert not daily_path.exists()
+
+
+def test_archive_stale_open_apply_mutates_and_logs_to_daily(mind: pathlib.Path):
+    """With dry_run=False, frontmatter flips and today's daily gets a
+    one-line entry."""
+    today = datetime.date(2026, 6, 6)
+    target = _write_note(
+        mind,
+        "projects/apply-candidate.md",
+        title="Apply candidate",
+        created="2026-04-07",
+        extra_fm={"status": "open", "access_count": 0},
+    )
+
+    n = stage_c.archive_stale_open(
+        mind, max_items=10, journal_path=None, today=today, dry_run=False
+    )
+    assert n == 1
+    assert _read_status(target) == "archived"
+
+    daily_path = (
+        mind / "cortex-memory" / "dailies" / f"{today.isoformat()}.md"
+    )
+    assert daily_path.is_file()
+    daily_text = daily_path.read_text(encoding="utf-8")
+    assert "Archived apply-candidate" in daily_text
+    assert "status: open" in daily_text
+    assert "access_count: 0" in daily_text
+    assert "created: 2026-04-07" in daily_text
+    assert "stale-open-cleanup" in daily_text
+
+
+def test_archive_stale_open_is_idempotent(mind: pathlib.Path):
+    """Running twice with dry_run=False archives once; the second run
+    finds nothing to do because status: archived falls out of the gate."""
+    today = datetime.date(2026, 6, 6)
+    target = _write_note(
+        mind,
+        "projects/idempotent-target.md",
+        title="Idempotent target",
+        created="2026-04-07",
+        extra_fm={"status": "open", "access_count": 0},
+    )
+
+    first = stage_c.archive_stale_open(
+        mind, max_items=10, journal_path=None, today=today, dry_run=False
+    )
+    second = stage_c.archive_stale_open(
+        mind, max_items=10, journal_path=None, today=today, dry_run=False
+    )
+    assert first == 1
+    assert second == 0
+    assert _read_status(target) == "archived"
+
+
+def test_archive_stale_open_treats_missing_access_count_as_zero(
+    mind: pathlib.Path,
+):
+    """A note with no ``access_count`` field is treated as zero (matches)."""
+    today = datetime.date(2026, 6, 6)
+    target = _write_note(
+        mind,
+        "projects/no-ac-field.md",
+        title="No access_count field",
+        created="2026-04-07",
+        extra_fm={"status": "open"},
+    )
+
+    n = stage_c.archive_stale_open(
+        mind, max_items=10, journal_path=None, today=today, dry_run=False
+    )
+    assert n == 1
+    assert _read_status(target) == "archived"
+
+
+def test_archive_stale_open_respects_max_items(mind: pathlib.Path):
+    """max_items caps a large candidate set on a single tick."""
+    today = datetime.date(2026, 6, 6)
+    for i in range(5):
+        _write_note(
+            mind,
+            f"projects/stale-batch-{i:02d}.md",
+            title=f"Stale batch {i}",
+            created="2026-04-07",
+            extra_fm={"status": "open", "access_count": 0},
+        )
+
+    n = stage_c.archive_stale_open(
+        mind, max_items=3, journal_path=None, today=today, dry_run=False
+    )
+    assert n == 3
+
+
 # ---------- dedupe-merge ----------
 
 

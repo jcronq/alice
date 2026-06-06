@@ -107,6 +107,19 @@ BLOATED_LINE_THRESHOLD = 250
 #: Daily older than this many days is an archive candidate.
 STALE_DAILY_DAYS = 90
 
+#: A note with ``status: open`` and zero access count older than this
+#: many days is a stale-open archive candidate. See the 2026-06-06
+#: validation sample (19/20 confirmed genuinely abandoned).
+STALE_OPEN_AGE_DAYS = 30
+
+#: Default for :class:`StageCConfig.archive_stale_open_dry_run`. Ships
+#: dry-run so the first production run logs the ~69 expected candidates
+#: without modifying the vault — Speaking reviews the log before
+#: flipping to apply. Flip via
+#: ``memory_worker.stage_c.archive_stale_open_dry_run`` in
+#: ``alice.config.json``.
+DEFAULT_ARCHIVE_STALE_OPEN_DRY_RUN = True
+
 #: Fuzzy title-match distance for dedupe. A pair of notes whose titles
 #: are within this Levenshtein distance (case-insensitive) is treated as
 #: a duplicate group. Slug-equality is checked independently and always
@@ -146,6 +159,7 @@ class StageCReport:
 
     atomize: int = 0
     archive: int = 0
+    archive_stale_open: int = 0
     dedupe_merge: int = 0
     orphan_resolve: int = 0
     ran: bool = False
@@ -156,6 +170,7 @@ class StageCReport:
         return {
             "atomize": self.atomize,
             "archive": self.archive,
+            "archive_stale_open": self.archive_stale_open,
             "dedupe_merge": self.dedupe_merge,
             "orphan_resolve": self.orphan_resolve,
         }
@@ -410,6 +425,10 @@ def compute_state(mind: pathlib.Path) -> StageCState:
 class StageCConfig:
     decay_threshold: int = DEFAULT_DECAY_THRESHOLD
     max_items_per_category: int = DEFAULT_MAX_ITEMS_PER_CATEGORY
+    #: Dry-run gate for :func:`archive_stale_open`. Ships True; flip to
+    #: False to enable real archival after Speaking reviews the dry-run
+    #: log of candidate slugs.
+    archive_stale_open_dry_run: bool = DEFAULT_ARCHIVE_STALE_OPEN_DRY_RUN
 
 
 def should_run_c(state: StageCState, config: StageCConfig) -> bool:
@@ -910,6 +929,176 @@ def archive(
         if journal_path is not None and entry is not None:
             journal_mod.commit(journal_path, entry.journal_id)
         processed += 1
+    return processed
+
+
+# ---------- archive-stale-open ----------
+
+
+def _daily_path_for(mind: pathlib.Path, day: datetime.date) -> pathlib.Path:
+    return mind / "cortex-memory" / "dailies" / f"{day.isoformat()}.md"
+
+
+def _ensure_daily_for(mind: pathlib.Path, day: datetime.date) -> pathlib.Path:
+    """Create today's daily from the canonical template if missing.
+
+    Mirrors :func:`stage_b._ensure_daily` — keeping the helper local
+    avoids a cross-module import for a single call site.
+    """
+    path = _daily_path_for(mind, day)
+    if path.is_file():
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    iso = day.isoformat()
+    template = (
+        "---\n"
+        f"title: {iso}\n"
+        "tags: [daily]\n"
+        f"created: {iso}\n"
+        f"updated: {iso}\n"
+        f"last_accessed: {iso}\n"
+        "access_count: 0\n"
+        "---\n"
+        "\n"
+        f"# {iso}\n"
+        "\n"
+    )
+    path.write_text(template, encoding="utf-8")
+    return path
+
+
+def _append_daily_line(mind: pathlib.Path, day: datetime.date, line: str) -> None:
+    """Append ``line`` (without trailing newline) to today's daily."""
+    path = _ensure_daily_for(mind, day)
+    existing = path.read_text(encoding="utf-8")
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    path.write_text(existing + line + "\n", encoding="utf-8")
+
+
+def archive_stale_open(
+    mind: pathlib.Path,
+    max_items: int,
+    journal_path: Optional[pathlib.Path],
+    *,
+    today: Optional[datetime.date] = None,
+    dry_run: bool = DEFAULT_ARCHIVE_STALE_OPEN_DRY_RUN,
+) -> int:
+    """Flip ``status: open`` to ``status: archived`` on stale, unread notes.
+
+    Selection rule (UNION of all three):
+
+    * ``status: open`` (case-insensitive frontmatter value)
+    * ``access_count`` is 0, absent, or non-numeric
+    * ``created`` is more than :data:`STALE_OPEN_AGE_DAYS` days ago
+
+    With ``dry_run=True`` (the default), candidates are counted and
+    logged via :mod:`logger`, but neither frontmatter nor the daily is
+    mutated. With ``dry_run=False`` the rule rewrites frontmatter (sets
+    ``status: archived``, bumps ``updated``) and appends one bullet to
+    today's daily per archived note. Idempotent: a note whose status
+    has already been set to ``archived`` falls out of the candidate
+    set and is skipped on subsequent ticks.
+
+    Returns the count of candidates handled this cycle (matched, in
+    dry-run; mutated, in apply). Capped at ``max_items``.
+    """
+    vault = _vault_dir(mind)
+    if not vault.is_dir():
+        return 0
+
+    today = today or _today()
+    cutoff = today - datetime.timedelta(days=STALE_OPEN_AGE_DAYS)
+    today_iso = today.isoformat()
+
+    processed = 0
+    for md in _iter_groomable_notes(vault):
+        if processed >= max_items:
+            break
+        try:
+            text = md.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fm, body = split_frontmatter(text)
+        status = str(fm.get("status") or "").strip().lower()
+        if status != "open":
+            continue
+        try:
+            ac = int(fm.get("access_count") or 0)
+        except (TypeError, ValueError):
+            ac = 0
+        if ac != 0:
+            continue
+        created = _parse_created_date(fm.get("created"))
+        if created is None or created > cutoff:
+            continue
+
+        rel = str(md.relative_to(vault))
+        created_str = created.isoformat()
+        if dry_run:
+            logger.info(
+                "stage_c archive-stale-open[dry-run]: candidate %s "
+                "(status=open, access_count=0, created=%s)",
+                rel,
+                created_str,
+            )
+            processed += 1
+            continue
+
+        new_fm = dict(fm)
+        new_fm["status"] = "archived"
+        new_fm["updated"] = today_iso
+        new_text = _frontmatter_render(new_fm) + "\n" + body.lstrip("\n")
+        original_sha = _sha256_of_text(text)
+
+        entry = None
+        if journal_path is not None:
+            entry = journal_mod.append(
+                journal_path,
+                op="archive-stale-open",
+                source=rel,
+                targets=[rel],
+                detail={
+                    "src": rel,
+                    "src_sha": original_sha,
+                    "created": created_str,
+                    "rule": "stale-open-cleanup",
+                },
+            )
+
+        try:
+            with vault_lock.acquire(
+                md,
+                mode=vault_lock.LockMode.EXCLUSIVE,
+                timeout=_LOCK_TIMEOUT_SECONDS,
+            ):
+                md.write_text(new_text, encoding="utf-8")
+        except (OSError, vault_lock.VaultLockTimeout) as exc:
+            logger.warning(
+                "stage_c archive-stale-open: write failed for %s: %s",
+                rel,
+                exc,
+            )
+            continue
+
+        daily_line = (
+            f"- Archived {md.stem} "
+            f"(status: open, access_count: 0, created: {created_str}) "
+            f"— stale-open-cleanup"
+        )
+        try:
+            _append_daily_line(mind, today, daily_line)
+        except OSError as exc:
+            logger.warning(
+                "stage_c archive-stale-open: daily-append failed for %s: %s",
+                rel,
+                exc,
+            )
+
+        if journal_path is not None and entry is not None:
+            journal_mod.commit(journal_path, entry.journal_id)
+        processed += 1
+
     return processed
 
 
@@ -1454,8 +1643,21 @@ def register_verifiers(mind: pathlib.Path) -> None:
             return False
         return link_line in text
 
+    def archive_stale_open_verifier(entry: journal_mod.JournalEntry) -> bool:
+        src_rel = entry.detail.get("src", entry.source)
+        src_path = vault / src_rel
+        if not src_path.is_file():
+            return False
+        try:
+            text = src_path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        fm, _body = split_frontmatter(text)
+        return str(fm.get("status") or "").strip().lower() == "archived"
+
     journal_mod.register_verifier("atomize", atomize_verifier)
     journal_mod.register_verifier("archive", archive_verifier)
+    journal_mod.register_verifier("archive-stale-open", archive_stale_open_verifier)
     journal_mod.register_verifier("dedupe-merge", dedupe_verifier)
     journal_mod.register_verifier("orphan-link", orphan_link_verifier)
 
@@ -1518,6 +1720,17 @@ def _load_stage_c_config(mind: pathlib.Path) -> StageCConfig:
             cfg.max_items_per_category = int(section["max_items_per_category"])
         except (TypeError, ValueError):
             pass
+    if "archive_stale_open_dry_run" in section:
+        val = section["archive_stale_open_dry_run"]
+        if isinstance(val, bool):
+            cfg.archive_stale_open_dry_run = val
+        elif isinstance(val, str):
+            cfg.archive_stale_open_dry_run = val.strip().lower() not in (
+                "false",
+                "0",
+                "no",
+                "off",
+            )
     return cfg
 
 
@@ -1554,12 +1767,22 @@ def run(
     started = time.monotonic()
     report.atomize = atomize(mind, cfg.max_items_per_category, journal_path)
     report.archive = archive(mind, cfg.max_items_per_category, journal_path)
+    report.archive_stale_open = archive_stale_open(
+        mind,
+        cfg.max_items_per_category,
+        journal_path,
+        dry_run=cfg.archive_stale_open_dry_run,
+    )
     report.dedupe_merge = dedupe_merge(mind, cfg.max_items_per_category, journal_path)
     report.orphan_resolve = orphan_resolve(mind, cfg.max_items_per_category, journal_path)
     elapsed = time.monotonic() - started
 
     total_recovered = (
-        report.atomize + report.archive + report.dedupe_merge + report.orphan_resolve
+        report.atomize
+        + report.archive
+        + report.archive_stale_open
+        + report.dedupe_merge
+        + report.orphan_resolve
     )
     _emit_decay_recovery_event(mind, total_recovered, elapsed)
     return report
@@ -1568,15 +1791,18 @@ def run(
 __all__ = [
     "BLOATED_LINE_THRESHOLD",
     "DECAY_WINDOW_DAYS",
+    "DEFAULT_ARCHIVE_STALE_OPEN_DRY_RUN",
     "DEFAULT_DECAY_THRESHOLD",
     "DEFAULT_MAX_ITEMS_PER_CATEGORY",
     "FITNESS_TAGS",
     "FUZZY_TITLE_DISTANCE",
     "STALE_DAILY_DAYS",
+    "STALE_OPEN_AGE_DAYS",
     "StageCConfig",
     "StageCReport",
     "StageCState",
     "archive",
+    "archive_stale_open",
     "atomize",
     "compute_state",
     "dedupe_merge",
