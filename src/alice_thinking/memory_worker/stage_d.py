@@ -909,7 +909,7 @@ def _record_null_result(
 #      between decayed and accessed cohorts produces zero matches on the
 #      live vault: see ``cortex-memory/research/2026-06-04-decay-extraction-pass-breakdown``.
 #   3. Pairing (Phase 3.5) — title cosine similarity (IDF-weighted) with
-#      a TITLE_COSINE_STANDARD floor of 0.40 and fitness-domain exemption.
+#      a TITLE_COSINE_STANDARD floor of 0.45 and fitness-domain exemption.
 #      Records the pair on the DecayPairingResult for telemetry; Stage C's
 #      atomize() boosts decayed notes via _decay_priority_score(), so no
 #      cross-stage event channel is needed.
@@ -961,10 +961,12 @@ def _is_fitness_domain(fm: dict[str, Any]) -> bool:
 
 #: Phase 3.5 pairing thresholds. ``STANDARD`` is the floor for a pair to
 #: be accepted; ``HIGH_CONFIDENCE`` is the floor above which the pair is
-#: treated as a strong match (telemetry / future tier). Dry-run on the
-#: live vault: 25.7% recovery at >=0.40, versus Phase 3's 81% — the
-#: intentional precision/recall trade-off documented in the spec.
-TITLE_COSINE_STANDARD = 0.40
+#: treated as a strong match (telemetry / future tier). Empirical sweep
+#: (0.40 / 0.45 / 0.50 / 0.55 / 0.60) against M5 behavioral recovery
+#: showed 0.45 is the Pareto sweet spot: M5 jumps 1.71 -> 5.333 with 13
+#: recovered notes (9.1% of decay pool), versus 10 notes (7.0%) at 0.55.
+#: See surface 2026-06-06-130400-decay-recovery-empirical-results.
+TITLE_COSINE_STANDARD = 0.45
 TITLE_COSINE_HIGH_CONFIDENCE = 0.5
 
 

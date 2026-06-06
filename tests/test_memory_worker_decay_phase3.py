@@ -311,6 +311,42 @@ def test_select_decay_pair_singleton_returns_none(mind: pathlib.Path):
     assert stage_d._select_decay_pair([a], mind / "cortex-memory", title_idf) is None
 
 
+def test_title_cosine_standard_is_0_45():
+    """Threshold is pinned at 0.45 (empirical sweep result).
+
+    The 0.40 -> 0.45 bump is backed by the M5 behavioral recovery sweep
+    documented at the constant. If this assertion fails, somebody moved
+    the threshold without re-running the eval — see surface
+    2026-06-06-130400-decay-recovery-empirical-results before changing.
+    """
+    assert stage_d.TITLE_COSINE_STANDARD == 0.45
+
+
+def test_select_decay_pair_threshold_boundary_rejects_0_44_accepts_0_46(
+    monkeypatch: pytest.MonkeyPatch, mind: pathlib.Path
+):
+    """Pin the threshold boundary: cosine 0.44 rejected, 0.46 accepted.
+
+    Drives `_cosine_similarity` via monkeypatch so the test exercises the
+    threshold gate deterministically, independent of IDF-vector arithmetic.
+    """
+    vault = mind / "cortex-memory"
+    a = _write_note(mind, "research/2026-04-01-foo-validation.md", title="foo validation")
+    b = _write_note(mind, "research/2026-04-02-bar-experiment.md", title="bar experiment")
+    title_idf = stage_d._precompute_title_idf([a, b])
+
+    # 0.44 < 0.45 -> rejected, no pair selected.
+    monkeypatch.setattr(stage_d, "_cosine_similarity", lambda v1, v2: 0.44)
+    assert stage_d._select_decay_pair([a, b], vault, title_idf) is None
+
+    # 0.46 >= 0.45 -> accepted.
+    monkeypatch.setattr(stage_d, "_cosine_similarity", lambda v1, v2: 0.46)
+    pair = stage_d._select_decay_pair([a, b], vault, title_idf)
+    assert pair is not None
+    _pa, _pb, score = pair
+    assert score == pytest.approx(0.46)
+
+
 # ---------- iter decayed notes ----------
 
 
