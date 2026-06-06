@@ -2492,11 +2492,17 @@ def test_low_wake_count_tagged_when_under_threshold(tmp_path: Path) -> None:
     # May-22 sleep cycle that motivated the fix).
     _seed_wakes_for_morning_window(thoughts, b=1, c=1, d=1)
 
+    # Freeze the clock past 07:00 EDT so the sleep-window gate added in
+    # #466 evaluates closed and the low_wake_count flag actually fires.
+    # Without this, the test depends on wall-clock time and fails when
+    # run before 07:00 EDT (see PR #462 for the same fix on adjacent tests).
+    fake_now = datetime(2026, 6, 6, 8, 0, tzinfo=ZoneInfo("America/New_York"))
     event = build_vault_health_event(
         vault_dir=vault,
         thoughts_dir=thoughts,
         events_path=events,
         surface_dir=surface,
+        now=fake_now,
     )
 
     assert event["wake_type_distribution"]["stage_b"] + \
@@ -2555,11 +2561,16 @@ def test_low_wake_count_handles_zero_wakes(tmp_path: Path) -> None:
     surface.mkdir()
     events = tmp_path / "events.jsonl"
 
+    # Freeze the clock past 07:00 EDT — same rationale as above: the
+    # sleep-window gate from #466 only sets low_wake_count after the
+    # window closes, so wall-clock-dependent tests are flaky before 07:00.
+    fake_now = datetime(2026, 6, 6, 8, 0, tzinfo=ZoneInfo("America/New_York"))
     event = build_vault_health_event(
         vault_dir=vault,
         thoughts_dir=thoughts,
         events_path=events,
         surface_dir=surface,
+        now=fake_now,
     )
 
     assert event["total_sleep_wakes"] == 0
