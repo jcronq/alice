@@ -117,6 +117,8 @@ def _dump_locked(f: Any, ledger: dict[str, Any]) -> None:
     f.truncate()
     json.dump(ledger, f, indent=2)
     f.write("\n")
+    f.flush()
+    os.fsync(f.fileno())
 
 
 def append_signal(
