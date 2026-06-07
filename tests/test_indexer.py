@@ -70,8 +70,8 @@ def test_extract_wikilinks_still_suppresses_bash_expressions():
     which the slug-like filter rejects. Same guard applies to fenced
     code blocks (multi-line)."""
     body = (
-        "Inline: `if [[ -d \"$x\" ]]; then echo x; fi`.\n"
-        "Fenced:\n```bash\nif [[ -z \"$VAR\" ]]; then echo no; fi\n```\n"
+        'Inline: `if [[ -d "$x" ]]; then echo x; fi`.\n'
+        'Fenced:\n```bash\nif [[ -z "$VAR" ]]; then echo no; fi\n```\n'
         "Real link: [[real-note]]."
     )
     links = extract_wikilinks(body)
@@ -151,9 +151,7 @@ def test_note_metrics_seeded_from_frontmatter_access_count(tmp_path: pathlib.Pat
     (vault / "popular.md").write_text(
         "---\ntitle: Popular\naccess_count: 42\n---\n\nBody.\n"
     )
-    (vault / "fresh.md").write_text(
-        "---\ntitle: Fresh\n---\n\nBody.\n"
-    )
+    (vault / "fresh.md").write_text("---\ntitle: Fresh\n---\n\nBody.\n")
 
     db_path = tmp_path / "index.db"
     build(vault, db_path)
@@ -164,5 +162,205 @@ def test_note_metrics_seeded_from_frontmatter_access_count(tmp_path: pathlib.Pat
     finally:
         conn.close()
 
-    assert rows["popular"] == 42, f"expected 42 from frontmatter, got {rows.get('popular')}"
-    assert rows["fresh"] == 0, f"missing access_count should default to 0, got {rows.get('fresh')}"
+    assert rows["popular"] == 42, (
+        f"expected 42 from frontmatter, got {rows.get('popular')}"
+    )
+    assert rows["fresh"] == 0, (
+        f"missing access_count should default to 0, got {rows.get('fresh')}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# checkpoint snapshots (decay cascade verification infrastructure)
+#
+# Design: cortex-memory/research/2026-06-06-decay-cascade-snapshot-design.md
+# Each rebuild appends one checkpoint_meta row + one checkpoint_snapshots row
+# per note. History is preserved across the atomic-swap rebuild via
+# _preserve_checkpoint_history so the checkpoint counter is monotonic.
+
+
+def _checkpoint_meta_rows(db_path: pathlib.Path) -> list[tuple]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return list(
+            conn.execute(
+                "SELECT checkpoint, built_at, vault_root, note_count, purpose "
+                "FROM checkpoint_meta ORDER BY checkpoint"
+            )
+        )
+    finally:
+        conn.close()
+
+
+def _checkpoint_snapshot_rows(db_path: pathlib.Path, checkpoint: int) -> list[tuple]:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return list(
+            conn.execute(
+                "SELECT slug, access_count, speaking_accessed_at "
+                "FROM checkpoint_snapshots WHERE checkpoint = ? ORDER BY slug",
+                (checkpoint,),
+            )
+        )
+    finally:
+        conn.close()
+
+
+def test_build_creates_checkpoint_tables(tmp_path: pathlib.Path):
+    """First rebuild creates checkpoint_snapshots + checkpoint_meta and
+    seeds checkpoint=1 — the foundation for decay-cascade verification."""
+    vault = tmp_path / "vault"
+    _write_note(vault / "alpha.md", title="Alpha")
+    _write_note(vault / "beta.md", title="Beta")
+
+    db_path = tmp_path / "index.db"
+    stats = build(vault, db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    finally:
+        conn.close()
+
+    assert "checkpoint_snapshots" in tables, f"missing table; have {tables}"
+    assert "checkpoint_meta" in tables, f"missing table; have {tables}"
+
+    meta_rows = _checkpoint_meta_rows(db_path)
+    assert len(meta_rows) == 1, f"expected 1 meta row on first build, got {meta_rows}"
+    checkpoint_id, built_at, vault_root, note_count, purpose = meta_rows[0]
+    assert checkpoint_id == 1
+    assert built_at  # non-empty timestamp
+    assert vault_root == str(vault)
+    assert note_count == 2
+    assert purpose == "routine"
+    assert stats["checkpoint"] == 1
+
+
+def test_checkpoint_snapshot_count_matches_note_count(tmp_path: pathlib.Path):
+    """checkpoint_snapshots mirrors the note_metrics row count for the
+    current checkpoint — design §Storage budget assumes one row per note."""
+    vault = tmp_path / "vault"
+    for name in ("alpha", "beta", "gamma"):
+        _write_note(vault / f"{name}.md", title=name.title())
+
+    db_path = tmp_path / "index.db"
+    build(vault, db_path)
+
+    snapshot_rows = _checkpoint_snapshot_rows(db_path, checkpoint=1)
+    assert len(snapshot_rows) == 3, (
+        f"expected one snapshot per note (3), got {len(snapshot_rows)}"
+    )
+    snapshot_slugs = {row[0] for row in snapshot_rows}
+    assert snapshot_slugs == {"alpha", "beta", "gamma"}
+
+
+def test_checkpoint_id_alignment_meta_and_snapshots(tmp_path: pathlib.Path):
+    """Foreign-key shape (no FK constraint, but logical 1:N).
+    Every checkpoint_snapshots.checkpoint must reference a row in
+    checkpoint_meta — otherwise cascade queries would silently fail."""
+    vault = tmp_path / "vault"
+    _write_note(vault / "alpha.md", title="Alpha")
+    _write_note(vault / "beta.md", title="Beta")
+
+    db_path = tmp_path / "index.db"
+    build(vault, db_path)
+    build(vault, db_path)  # second rebuild to populate two checkpoints
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        meta_ids = {
+            row[0] for row in conn.execute("SELECT checkpoint FROM checkpoint_meta")
+        }
+        snapshot_ids = {
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT checkpoint FROM checkpoint_snapshots"
+            )
+        }
+    finally:
+        conn.close()
+
+    assert snapshot_ids <= meta_ids, (
+        f"orphan snapshot checkpoints: {snapshot_ids - meta_ids}"
+    )
+    assert snapshot_ids == meta_ids, (
+        f"meta without snapshots: {meta_ids - snapshot_ids}"
+    )
+
+
+def test_sequential_rebuilds_increment_checkpoint(tmp_path: pathlib.Path):
+    """Two sequential rebuilds → two distinct, monotonic checkpoint rows.
+    History must survive the atomic-swap rebuild (via _preserve_checkpoint_history)
+    or the counter would always reset to 1."""
+    vault = tmp_path / "vault"
+    _write_note(vault / "alpha.md", title="Alpha")
+    db_path = tmp_path / "index.db"
+
+    stats_1 = build(vault, db_path)
+    # Small sleep so the second built_at timestamp is distinct
+    # at 1-second resolution (time.strftime drops sub-second precision).
+    import time as _time
+
+    _time.sleep(1.1)
+    stats_2 = build(vault, db_path)
+
+    meta_rows = _checkpoint_meta_rows(db_path)
+    assert len(meta_rows) == 2, f"expected 2 checkpoint rows, got {meta_rows}"
+
+    cp_1, built_1, *_ = meta_rows[0]
+    cp_2, built_2, *_ = meta_rows[1]
+
+    assert cp_1 == 1 and cp_2 == 2, (
+        f"checkpoints should increment 1 → 2, got {cp_1}, {cp_2}"
+    )
+    assert stats_1["checkpoint"] == 1
+    assert stats_2["checkpoint"] == 2
+    assert built_1 <= built_2, (
+        f"timestamps must be monotonic, got {built_1!r} then {built_2!r}"
+    )
+    # Both checkpoints have snapshot rows for the single note.
+    assert len(_checkpoint_snapshot_rows(db_path, 1)) == 1
+    assert len(_checkpoint_snapshot_rows(db_path, 2)) == 1
+
+
+def test_checkpoint_tables_idempotent_migration(tmp_path: pathlib.Path):
+    """Build against a DB that already has the tables (e.g. CREATE TABLE
+    IF NOT EXISTS running a second time) must not error. Simulates the
+    in-place migration story where the DB has been through one rebuild
+    on this version of the code."""
+    vault = tmp_path / "vault"
+    _write_note(vault / "alpha.md", title="Alpha")
+    db_path = tmp_path / "index.db"
+
+    # Two builds — second one re-runs the CREATE TABLE IF NOT EXISTS DDL
+    # over a DB whose previous .tmp incarnation already created the tables,
+    # via the history-preservation path.
+    build(vault, db_path)
+    stats = build(vault, db_path)  # must not raise
+
+    assert stats["notes"] == 1
+    assert stats["checkpoint"] == 2
+
+
+def test_checkpoint_snapshot_preserves_access_count(tmp_path: pathlib.Path):
+    """Snapshot rows capture the access_count seeded from frontmatter —
+    this is the field cascade analysis diffs across checkpoints."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "popular.md").write_text(
+        "---\ntitle: Popular\naccess_count: 17\n---\n\nBody.\n"
+    )
+    (vault / "fresh.md").write_text("---\ntitle: Fresh\n---\n\nBody.\n")
+
+    db_path = tmp_path / "index.db"
+    build(vault, db_path)
+
+    rows = {
+        slug: access_count
+        for slug, access_count, _sa in _checkpoint_snapshot_rows(db_path, 1)
+    }
+    assert rows["popular"] == 17, f"expected access_count snapshot of 17, got {rows}"
+    assert rows["fresh"] == 0
