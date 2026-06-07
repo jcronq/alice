@@ -2458,14 +2458,17 @@ def test_continuous_flag_does_not_change_baseline_output(
 # ---------------------------------------------------------------------------
 
 
-def _seed_wakes_for_morning_window(thoughts: Path, *, b: int, c: int, d: int) -> None:
+def _seed_wakes_for_morning_window(
+    thoughts: Path, *, b: int, c: int, d: int, now: datetime | None = None
+) -> None:
     """Drop ``b + c + d`` wake files inside the morning window.
 
     The morning window is yesterday-23:00 → today-07:00 in local time;
     this helper writes wakes at 00:00:NN through the previous-day dir
     so the count is independent of when the test runs.
     """
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    base = now if now is not None else datetime.now()
+    yesterday = (base - timedelta(days=1)).strftime("%Y-%m-%d")
     yday = thoughts / yesterday
     yday.mkdir(parents=True, exist_ok=True)
     seq = 0
@@ -2488,15 +2491,16 @@ def test_low_wake_count_tagged_when_under_threshold(tmp_path: Path) -> None:
     surface.mkdir()
     events = tmp_path / "events.jsonl"
 
-    # 3 total wakes — well under the threshold of 8 (matches the
-    # May-22 sleep cycle that motivated the fix).
-    _seed_wakes_for_morning_window(thoughts, b=1, c=1, d=1)
-
     # Freeze the clock past 07:00 EDT so the sleep-window gate added in
     # #466 evaluates closed and the low_wake_count flag actually fires.
     # Without this, the test depends on wall-clock time and fails when
     # run before 07:00 EDT (see PR #462 for the same fix on adjacent tests).
     fake_now = datetime(2026, 6, 6, 8, 0, tzinfo=ZoneInfo("America/New_York"))
+
+    # 3 total wakes — well under the threshold of 8 (matches the
+    # May-22 sleep cycle that motivated the fix). Pass the frozen clock
+    # so the helper seeds files into the same window the event reader uses.
+    _seed_wakes_for_morning_window(thoughts, b=1, c=1, d=1, now=fake_now)
     event = build_vault_health_event(
         vault_dir=vault,
         thoughts_dir=thoughts,
