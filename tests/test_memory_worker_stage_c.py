@@ -202,6 +202,277 @@ def test_atomize_journals_with_sha(mind: pathlib.Path):
     assert len(entry.detail["original_content_sha"]) == 64
 
 
+# ---------- atomize: slug-uniqueness pre-flight ----------
+#
+# Regression guard for the 2026-06-07 shadow-orphan recurrence: atomize
+# was creating new child notes whose slug already lived elsewhere in
+# the vault, producing two files with the same stem. Wikilinks resolve
+# by slug regardless of folder, so the loser became unreachable.
+
+
+def _bloated_three_section_note(
+    mind: pathlib.Path, rel: str, *, sections: tuple[str, str, str]
+) -> pathlib.Path:
+    """Helper: drop a bloated note with three named ``## `` sections."""
+    body_lines = ["Intro prose.\n"]
+    for section in sections:
+        body_lines.append(f"\n## {section}\n")
+        body_lines.extend(["body line\n"] * 100)
+    return _write_note(
+        mind,
+        rel,
+        title="Big Note",
+        tags=["research"],
+        body="".join(body_lines),
+    )
+
+
+def test_vault_has_slug_finds_match_anywhere_in_vault(mind: pathlib.Path):
+    """`vault_has_slug` is folder-agnostic — a hit in any subdir counts."""
+    _write_note(mind, "research/foo-bar.md", title="Foo Bar", body="body\n")
+    assert stage_c.vault_has_slug(mind / "cortex-memory", "foo-bar") is True
+    # Case-insensitive.
+    assert stage_c.vault_has_slug(mind / "cortex-memory", "FOO-BAR") is True
+    # Negative case.
+    assert stage_c.vault_has_slug(mind / "cortex-memory", "no-such-slug") is False
+
+
+def test_vault_has_slug_empty_vault_is_false(mind: pathlib.Path):
+    """Empty vault: every slug check is a miss."""
+    # `mind` fixture creates empty subdirs but no .md files.
+    assert stage_c.vault_has_slug(mind / "cortex-memory", "anything") is False
+
+
+def test_atomize_skips_section_on_slug_collision_default(
+    mind: pathlib.Path, caplog: pytest.LogCaptureFixture
+):
+    """Default config: a section whose slug already exists somewhere
+    in the vault is SKIPPED — no new child file is created for it,
+    a warning is logged, and the section content is preserved inline
+    in the parent (no data loss)."""
+    # Pre-existing slug in a DIFFERENT folder — exactly the shadow-orphan
+    # case wikilinks can't disambiguate.
+    _write_note(
+        mind,
+        "projects/big-note-beta.md",
+        title="Existing Beta",
+        body="pre-existing content\n",
+    )
+
+    parent = _bloated_three_section_note(
+        mind, "research/big-note.md", sections=("Alpha", "Beta", "Gamma")
+    )
+
+    with caplog.at_level("WARNING"):
+        n = stage_c.atomize(mind, max_items=10, journal_path=None)
+    assert n == 1
+
+    research = mind / "cortex-memory" / "research"
+    # Alpha and Gamma children created; Beta SKIPPED.
+    assert (research / "big-note-alpha.md").exists()
+    assert (research / "big-note-gamma.md").exists()
+    assert not (research / "big-note-beta.md").exists()
+
+    # Pre-existing collision target untouched.
+    existing = mind / "cortex-memory" / "projects" / "big-note-beta.md"
+    assert "pre-existing content" in existing.read_text(encoding="utf-8")
+
+    # Parent rewrite: wikilinks only to created children; Beta content
+    # preserved INLINE (the bytes have to go somewhere).
+    parent_text = parent.read_text(encoding="utf-8")
+    assert "[[big-note-alpha]]" in parent_text
+    assert "[[big-note-gamma]]" in parent_text
+    assert "[[big-note-beta]]" not in parent_text
+    assert "## Beta" in parent_text  # inline-preserved section heading
+    assert "body line" in parent_text  # inline-preserved section content
+
+    # Warning logged with the existing path so a human can diagnose.
+    msgs = [r.message for r in caplog.records]
+    assert any(
+        "atomize-skipped-slug-collision" in m
+        and "big-note-beta" in m
+        and "projects/big-note-beta.md" in m
+        for m in msgs
+    ), f"no slug-collision warning found in {msgs!r}"
+
+
+def test_atomize_disambiguates_on_collision_when_enabled(
+    mind: pathlib.Path, caplog: pytest.LogCaptureFixture
+):
+    """Opt-in flag: instead of skipping, generate `{slug}-2` until
+    vault-unique and force-create the child."""
+    _write_note(
+        mind,
+        "projects/big-note-beta.md",
+        title="Existing Beta",
+        body="pre-existing\n",
+    )
+
+    parent = _bloated_three_section_note(
+        mind, "research/big-note.md", sections=("Alpha", "Beta", "Gamma")
+    )
+
+    with caplog.at_level("INFO"):
+        n = stage_c.atomize(
+            mind,
+            max_items=10,
+            journal_path=None,
+            disambiguate_on_collision=True,
+        )
+    assert n == 1
+
+    research = mind / "cortex-memory" / "research"
+    # Beta got the `-2` suffix; the others land at their natural slugs.
+    assert (research / "big-note-alpha.md").exists()
+    assert (research / "big-note-beta-2.md").exists()
+    assert (research / "big-note-gamma.md").exists()
+    # No `-beta` child in research (would have shadowed the projects one).
+    assert not (research / "big-note-beta.md").exists()
+
+    # Parent wikilinks point at the disambiguated slug.
+    parent_text = parent.read_text(encoding="utf-8")
+    assert "[[big-note-beta-2]]" in parent_text
+
+    # An INFO-level disambiguation log was emitted.
+    msgs = [r.message for r in caplog.records]
+    assert any(
+        "atomize-slug-disambiguated" in m and "big-note-beta-2" in m for m in msgs
+    ), f"no disambiguation log found in {msgs!r}"
+
+
+def test_atomize_empty_vault_no_false_collisions(mind: pathlib.Path):
+    """No pre-existing notes anywhere in the vault → atomize behaves
+    exactly as the no-collision case: all sub-notes created."""
+    _bloated_three_section_note(
+        mind, "research/big-note.md", sections=("Alpha", "Beta", "Gamma")
+    )
+    n = stage_c.atomize(mind, max_items=10, journal_path=None)
+    assert n == 1
+    research = mind / "cortex-memory" / "research"
+    children = sorted(p.name for p in research.glob("big-note-*.md"))
+    assert children == [
+        "big-note-alpha.md",
+        "big-note-beta.md",
+        "big-note-gamma.md",
+    ]
+
+
+def test_atomize_aborts_when_every_section_collides(
+    mind: pathlib.Path, caplog: pytest.LogCaptureFixture
+):
+    """If every proposed child slug collides AND we're in SKIP mode,
+    the source is left untouched and abort is logged."""
+    for section in ("alpha", "beta", "gamma"):
+        _write_note(
+            mind,
+            f"projects/big-note-{section}.md",
+            title=f"Existing {section}",
+            body="pre-existing\n",
+        )
+    parent = _bloated_three_section_note(
+        mind, "research/big-note.md", sections=("Alpha", "Beta", "Gamma")
+    )
+    parent_before = parent.read_text(encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        n = stage_c.atomize(mind, max_items=10, journal_path=None)
+    assert n == 0
+    # Source byte-for-byte unchanged.
+    assert parent.read_text(encoding="utf-8") == parent_before
+    msgs = [r.message for r in caplog.records]
+    assert any(
+        "atomize-aborted-all-collisions" in m for m in msgs
+    ), f"no abort log found in {msgs!r}"
+
+
+def test_atomize_idempotent_under_collision(
+    mind: pathlib.Path, caplog: pytest.LogCaptureFixture
+):
+    """Running atomize twice in a row with a pre-existing collision
+    produces the SAME warning count, not a doubling: the first run
+    rewrites the parent (skipping the colliding section inline), the
+    second run sees the parent under threshold and short-circuits."""
+    _write_note(
+        mind,
+        "projects/big-note-beta.md",
+        title="Existing Beta",
+        body="pre-existing\n",
+    )
+    _bloated_three_section_note(
+        mind, "research/big-note.md", sections=("Alpha", "Beta", "Gamma")
+    )
+
+    with caplog.at_level("WARNING"):
+        first = stage_c.atomize(mind, max_items=10, journal_path=None)
+        warnings_after_first = sum(
+            1
+            for r in caplog.records
+            if "atomize-skipped-slug-collision" in r.message
+        )
+        second = stage_c.atomize(mind, max_items=10, journal_path=None)
+        warnings_after_second = sum(
+            1
+            for r in caplog.records
+            if "atomize-skipped-slug-collision" in r.message
+        )
+
+    assert first == 1
+    # Second pass: the parent is now a pointer-list + small inline
+    # remainder, well under the bloated threshold. No more atomization,
+    # no new collision warnings.
+    assert second == 0
+    assert warnings_after_first == 1
+    assert warnings_after_second == 1
+
+
+def test_atomize_sibling_children_share_collision_set(mind: pathlib.Path):
+    """When two source notes processed in the same tick would both
+    create the same child slug, the second one should detect the
+    in-flight collision (slug_index is mutated as children are
+    written)."""
+    # Two source notes whose stems happen to match — each has a
+    # ``## Shared`` section that slugifies identically when prefixed
+    # by the parent stem. Wait — that's only possible if the two
+    # parents share a stem too, which is its own dupe. So instead,
+    # contrive two distinct parents with section titles that converge
+    # on the same final slug.
+    body_a = (
+        "intro\n\n## Beta\n" + ("body\n" * 100) + "\n## Done\n" + ("body\n" * 100)
+    )
+    body_b = (
+        "intro\n\n## Beta\n" + ("body\n" * 100) + "\n## Done\n" + ("body\n" * 100)
+    )
+    # Distinct parents, distinct child slugs — verifies the no-collision
+    # baseline (both parents atomize cleanly).
+    _write_note(mind, "research/parent-a.md", title="A", body=body_a)
+    _write_note(mind, "research/parent-b.md", title="B", body=body_b)
+
+    n = stage_c.atomize(mind, max_items=10, journal_path=None)
+    assert n == 2
+    research = mind / "cortex-memory" / "research"
+    assert (research / "parent-a-beta.md").exists()
+    assert (research / "parent-b-beta.md").exists()
+    assert (research / "parent-a-done.md").exists()
+    assert (research / "parent-b-done.md").exists()
+
+
+def test_load_stage_c_config_parses_disambiguate_flag(mind: pathlib.Path):
+    """`alice.config.json` can flip the atomize disambiguation flag."""
+    cfg_dir = mind / "config"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "alice.config.json").write_text(
+        json.dumps(
+            {
+                "memory_worker": {
+                    "stage_c": {"atomize_disambiguate_on_collision": True}
+                }
+            }
+        )
+    )
+    cfg = stage_c._load_stage_c_config(mind)
+    assert cfg.atomize_disambiguate_on_collision is True
+
+
 # ---------- archive ----------
 
 

@@ -120,6 +120,22 @@ STALE_OPEN_AGE_DAYS = 30
 #: ``alice.config.json``.
 DEFAULT_ARCHIVE_STALE_OPEN_DRY_RUN = True
 
+#: Default for :class:`StageCConfig.atomize_disambiguate_on_collision`.
+#: When a proposed child slug already exists somewhere in the vault,
+#: ships SKIP-on-collision (False): the colliding section is left
+#: inline in the parent and a warning is logged. Flip to True to
+#: instead generate disambiguated slugs (``{slug}-2``, ``{slug}-3``,
+#: …) and force-create the child.
+#:
+#: Default is SKIP because a cross-vault slug collision is usually a
+#: signal that the source was already atomized in a previous run (or
+#: by an older path) and re-atomizing would manufacture a *shadow
+#: orphan* — two notes with the same slug, where wikilinks only
+#: resolve to one. See the 2026-06-07 slug-dedup-recurrence analysis.
+#: Flip via ``memory_worker.stage_c.atomize_disambiguate_on_collision``
+#: in ``alice.config.json``.
+DEFAULT_ATOMIZE_DISAMBIGUATE_ON_COLLISION = False
+
 #: Fuzzy title-match distance for dedupe. A pair of notes whose titles
 #: are within this Levenshtein distance (case-insensitive) is treated as
 #: a duplicate group. Slug-equality is checked independently and always
@@ -429,6 +445,14 @@ class StageCConfig:
     #: False to enable real archival after Speaking reviews the dry-run
     #: log of candidate slugs.
     archive_stale_open_dry_run: bool = DEFAULT_ARCHIVE_STALE_OPEN_DRY_RUN
+    #: Behavior when :func:`atomize` would create a child note whose
+    #: slug already exists anywhere in the vault. False (default) =
+    #: SKIP that child, preserve its section inline in the parent,
+    #: log a warning. True = generate a disambiguated slug
+    #: (``{slug}-2``, etc.) and force-create the child.
+    atomize_disambiguate_on_collision: bool = (
+        DEFAULT_ATOMIZE_DISAMBIGUATE_ON_COLLISION
+    )
 
 
 def should_run_c(state: StageCState, config: StageCConfig) -> bool:
@@ -531,6 +555,47 @@ def _slugify(title: str) -> str:
     return s.strip("-") or "section"
 
 
+def _build_vault_slug_index(vault: pathlib.Path) -> dict[str, pathlib.Path]:
+    """Map of ``slug.lower() -> first .md path found`` across the whole
+    vault. Used by :func:`atomize` as a pre-flight against shadow-orphan
+    duplicates — wikilinks resolve by slug regardless of folder, so a
+    new note that re-uses an existing slug becomes unreachable.
+
+    Includes ``dailies/``, ``archive/``, and ``gh-state/`` (slug-
+    resolution doesn't respect groomability), but is otherwise
+    best-effort: if the same stem appears twice (which is exactly the
+    bug class this guards against), only the first wins. The caller
+    treats this index as mutable — newly-written children should be
+    added so subsequent sub-notes in the same atomize pass see them.
+    """
+    out: dict[str, pathlib.Path] = {}
+    if not vault.is_dir():
+        return out
+    for md in vault.rglob("*.md"):
+        key = md.stem.lower()
+        if key not in out:
+            out[key] = md
+    return out
+
+
+def vault_has_slug(vault: pathlib.Path, slug: str) -> bool:
+    """Best-effort check: does any ``.md`` file under ``vault`` have a
+    stem that matches ``slug`` case-insensitively?
+
+    Used by :func:`atomize` as a pre-flight to detect cross-vault slug
+    collisions before creating new child notes. The check is
+    O(vault) — for hot paths that need many lookups, build a slug
+    index once with :func:`_build_vault_slug_index` instead.
+    """
+    if not vault.is_dir():
+        return False
+    target = slug.lower()
+    for md in vault.rglob("*.md"):
+        if md.stem.lower() == target:
+            return True
+    return False
+
+
 def _frontmatter_render(fm: dict[str, Any]) -> str:
     """Render a frontmatter dict back into YAML-ish lines.
 
@@ -568,14 +633,28 @@ def atomize(
     mind: pathlib.Path,
     max_items: int,
     journal_path: Optional[pathlib.Path],
+    *,
+    disambiguate_on_collision: bool = DEFAULT_ATOMIZE_DISAMBIGUATE_ON_COLLISION,
 ) -> int:
     """Split bloated notes on top-level ``## `` boundaries.
 
     Returns the count of parent notes atomized this cycle.
+
+    ``disambiguate_on_collision`` controls behavior when a proposed
+    child slug already exists somewhere in the vault — see
+    :data:`DEFAULT_ATOMIZE_DISAMBIGUATE_ON_COLLISION` for the
+    rationale behind the SKIP-by-default policy.
     """
     vault = _vault_dir(mind)
     today_iso = _today().isoformat()
     processed = 0
+
+    # Vault-wide slug index built once per atomize() call. We mutate
+    # it as new children are written so two source notes processed in
+    # the same tick can't collide with each other's freshly-written
+    # children. (Within one source note the existing same-dir clobber
+    # loop already serializes sibling sections.)
+    slug_index = _build_vault_slug_index(vault)
 
     # Phase 3: decay-priority ordering. Zero-access notes get a boost
     # so they sort ahead of regular bloated notes within one tick's
@@ -621,6 +700,8 @@ def atomize(
                     vault=vault,
                     today_iso=today_iso,
                     journal_path=journal_path,
+                    slug_index=slug_index,
+                    disambiguate_on_collision=disambiguate_on_collision,
                 ):
                     processed += 1
         except vault_lock.VaultLockTimeout as exc:
@@ -635,14 +716,22 @@ def _atomize_one(
     vault: pathlib.Path,
     today_iso: str,
     journal_path: Optional[pathlib.Path],
+    slug_index: dict[str, pathlib.Path],
+    disambiguate_on_collision: bool,
 ) -> bool:
     """Atomize a single note. Caller holds the EXCLUSIVE lock on
     ``md``. Returns True on a successful split, False on read failure
-    / no-headings / write failure.
+    / no-headings / write failure / all-sections-collided.
 
     Extracted so the try/except VaultLockTimeout in :func:`atomize`
     cleanly wraps the ``with vault_lock.acquire(...)`` without
     duplicating the per-note body.
+
+    ``slug_index`` is mutated as new children are created so subsequent
+    sub-notes in the same atomize pass see them. ``disambiguate_on_collision``
+    selects between SKIP-and-inline (default, False) and force-create-
+    with-numeric-suffix (True) when a proposed child slug already
+    exists somewhere in the vault.
     """
     try:
         text = md.read_text(encoding="utf-8")
@@ -661,6 +750,11 @@ def _atomize_one(
     parent_slug = md.stem
     children_rel: list[str] = []
     child_writes: list[tuple[pathlib.Path, str]] = []
+    # Sections whose slug already lives somewhere in the vault and
+    # where ``disambiguate_on_collision`` is False. We keep them inline
+    # in the parent rather than atomize them out — losing their
+    # content would be the worst possible failure mode.
+    skipped_sections: list[tuple[str, str]] = []
     # Build child files first so we can journal them with their final paths.
     for title, section_text in sections:
         child_slug = f"{parent_slug}-{_slugify(title)}"
@@ -671,6 +765,53 @@ def _atomize_one(
             child_slug = f"{parent_slug}-{_slugify(title)}-{suffix}"
             child_path = md.parent / f"{child_slug}.md"
             suffix += 1
+
+        # Vault-wide slug-uniqueness pre-flight. The same-directory
+        # ``.exists()`` check above only catches clobbers; a note with
+        # the same stem in a DIFFERENT folder produces a shadow orphan
+        # (wikilinks resolve by slug regardless of folder, so the
+        # newcomer becomes unreachable). See 2026-06-07 slug-dedup
+        # recurrence analysis.
+        collision_key = child_slug.lower()
+        if collision_key in slug_index:
+            existing_path = slug_index[collision_key]
+            try:
+                existing_rel = existing_path.relative_to(vault)
+            except ValueError:
+                existing_rel = existing_path
+            if disambiguate_on_collision:
+                disamb_suffix = 2
+                while True:
+                    candidate_slug = f"{child_slug}-{disamb_suffix}"
+                    candidate_path = md.parent / f"{candidate_slug}.md"
+                    if (
+                        candidate_slug.lower() not in slug_index
+                        and not candidate_path.exists()
+                    ):
+                        break
+                    disamb_suffix += 1
+                logger.info(
+                    "stage_c atomize-slug-disambiguated: %s section %r -> %s "
+                    "(collision with %s)",
+                    md.relative_to(vault),
+                    title,
+                    candidate_slug,
+                    existing_rel,
+                )
+                child_slug = candidate_slug
+                child_path = candidate_path
+            else:
+                logger.warning(
+                    "stage_c atomize-skipped-slug-collision: slug %r already "
+                    "exists (would create duplicate of %s) — leaving section "
+                    "%r inline in %s",
+                    child_slug,
+                    existing_rel,
+                    title,
+                    md.relative_to(vault),
+                )
+                skipped_sections.append((title, section_text))
+                continue
 
         child_fm: dict[str, Any] = {
             "title": title,
@@ -686,6 +827,21 @@ def _atomize_one(
             (child_path, _frontmatter_render(child_fm) + "\n" + child_body)
         )
         children_rel.append(str(child_path.relative_to(vault)))
+        # Reserve the slug so a later sibling section in this same
+        # atomize pass can't collide with it.
+        slug_index[child_slug.lower()] = child_path
+
+    # If literally every section collided and we're in SKIP mode,
+    # there's nothing to atomize — leave the source unchanged so the
+    # next tick can either re-evaluate against a freshly-groomed vault
+    # or surface the collision via a separate cleanup pass.
+    if not children_rel:
+        logger.warning(
+            "stage_c atomize-aborted-all-collisions: every section of %s "
+            "collides with an existing vault slug; source left unchanged",
+            md.relative_to(vault),
+        )
+        return False
 
     # Parent rewrite — replace the body with wikilinks. Keep the original
     # frontmatter intact (atomize is structural, not editorial); bump ``updated``.
@@ -708,6 +864,11 @@ def _atomize_one(
     for child_rel in children_rel:
         child_slug = pathlib.Path(child_rel).stem
         parent_body_lines.append(f"- See [[{child_slug}]]")
+    # Inline-preserved sections (slug-collision SKIPs) — append after
+    # the Sections list so the parent still reads top-to-bottom.
+    for title, section_text in skipped_sections:
+        parent_body_lines.append("")
+        parent_body_lines.append(section_text.rstrip("\n"))
     new_parent_text = (
         _frontmatter_render(new_fm)
         + "\n"
@@ -1731,6 +1892,17 @@ def _load_stage_c_config(mind: pathlib.Path) -> StageCConfig:
                 "no",
                 "off",
             )
+    if "atomize_disambiguate_on_collision" in section:
+        val = section["atomize_disambiguate_on_collision"]
+        if isinstance(val, bool):
+            cfg.atomize_disambiguate_on_collision = val
+        elif isinstance(val, str):
+            cfg.atomize_disambiguate_on_collision = val.strip().lower() in (
+                "true",
+                "1",
+                "yes",
+                "on",
+            )
     return cfg
 
 
@@ -1765,7 +1937,12 @@ def run(
 
     report.ran = True
     started = time.monotonic()
-    report.atomize = atomize(mind, cfg.max_items_per_category, journal_path)
+    report.atomize = atomize(
+        mind,
+        cfg.max_items_per_category,
+        journal_path,
+        disambiguate_on_collision=cfg.atomize_disambiguate_on_collision,
+    )
     report.archive = archive(mind, cfg.max_items_per_category, journal_path)
     report.archive_stale_open = archive_stale_open(
         mind,
@@ -1792,6 +1969,7 @@ __all__ = [
     "BLOATED_LINE_THRESHOLD",
     "DECAY_WINDOW_DAYS",
     "DEFAULT_ARCHIVE_STALE_OPEN_DRY_RUN",
+    "DEFAULT_ATOMIZE_DISAMBIGUATE_ON_COLLISION",
     "DEFAULT_DECAY_THRESHOLD",
     "DEFAULT_MAX_ITEMS_PER_CATEGORY",
     "FITNESS_TAGS",
@@ -1810,4 +1988,5 @@ __all__ = [
     "register_verifiers",
     "run",
     "should_run_c",
+    "vault_has_slug",
 ]
