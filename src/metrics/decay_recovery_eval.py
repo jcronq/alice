@@ -214,7 +214,6 @@ def simulate_pairing(
 
         for decay_slug in decay_slugs:
             decay_freq = title_freqs[decay_slug]
-            decay_title = notes[decay_slug]['title']
 
             for accessed_slug in accessed_slugs:
                 accessed_freq = title_freqs[accessed_slug]
