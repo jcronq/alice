@@ -40,6 +40,12 @@ from zoneinfo import ZoneInfo
 
 from indexer.yaml_lite import extract_wikilinks, split_frontmatter
 
+# Single source of truth for the fitness-domain exemption: stage_d already
+# skips these notes during decay synthesis (see ``_is_fitness_domain`` and
+# ``FITNESS_TAGS`` in stage_d). vault_health imports the same predicate so
+# the two views of the decay pool cannot drift apart.
+from alice_thinking.memory_worker.stage_d import _is_fitness_domain
+
 logger = logging.getLogger(__name__)
 
 # Sanity-check threshold for the truly_dark_count field. With trigger-keyword
@@ -859,6 +865,16 @@ def compute_decay_coverage(
             continue
         text = _read_text(md)
         fm, _body = split_frontmatter(text)
+
+        # Defer to stage_d's fitness exemption so the two views of the
+        # decay pool agree on which notes the intervention actually
+        # targets. Fitness-domain notes are fixed-schedule skill-path
+        # writes (workouts, meals, weights), not behavioral decay — they
+        # never receive cue-runner pressure, so counting them in the
+        # denominator only depresses the recovery signal with notes
+        # nobody is supposed to be reading.
+        if _is_fitness_domain(fm):
+            continue
 
         created = _parse_created_date(fm.get("created"))
         if created is None or created > age_cutoff:

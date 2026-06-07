@@ -2327,6 +2327,121 @@ def test_decay_coverage_structural_ignores_links_from_stale_sources(
 
 
 # ---------------------------------------------------------------------------
+# Fitness-domain exemption — consistency with stage_d
+# Background: ``alice_thinking.memory_worker.stage_d`` already exempts notes
+# tagged ``fitness/workout/nutrition/weight`` from decay synthesis via
+# ``_is_fitness_domain``. ``compute_decay_coverage`` now delegates to that
+# same predicate so the two views of the decay pool cannot drift apart.
+# These tests lock in the shared-source-of-truth invariant.
+# Surface: 2026-06-07-190000-fitness-domain-exemption-vault-health.
+# ---------------------------------------------------------------------------
+
+
+def test_decay_coverage_excludes_fitness_tagged_note(tmp_path: Path) -> None:
+    """A note tagged ``workout`` that would otherwise qualify for the pool
+    is excluded — matching stage_d's existing exemption."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "leg-day.md",
+        """
+        ---
+        slug: leg-day
+        created: 2026-04-15
+        access_count: 0
+        tags: [workout]
+        ---
+        Body.
+        """,
+    )
+    result = compute_decay_coverage(
+        vault, today=_TODAY, activation_date=_ACTIVATION
+    )
+    assert result["total_decayed_notes"] == 0
+    assert result["by_domain"] == {}
+
+
+def test_decay_coverage_includes_non_fitness_note(tmp_path: Path) -> None:
+    """A non-fitness note that meets decay criteria is still counted —
+    the exemption is narrow and tag-driven, not a blanket filter."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "alice-arch.md",
+        """
+        ---
+        slug: alice-arch
+        created: 2026-04-15
+        access_count: 0
+        tags: [architecture]
+        domain: alice-architecture
+        ---
+        Body.
+        """,
+    )
+    result = compute_decay_coverage(
+        vault, today=_TODAY, activation_date=_ACTIVATION
+    )
+    assert result["total_decayed_notes"] == 1
+    assert "alice-architecture" in result["by_domain"]
+
+
+def test_decay_coverage_empty_pool_no_false_positives(tmp_path: Path) -> None:
+    """Vault with zero qualifying notes still returns the vacuous-healthy
+    shape (100% coverage, empty by_domain) — the fitness filter must not
+    introduce phantom pool members."""
+    vault = _make_vault(tmp_path)
+    result = compute_decay_coverage(
+        vault, today=_TODAY, activation_date=_ACTIVATION
+    )
+    assert result["total_decayed_notes"] == 0
+    assert result["decayed_accessed_in_window"] == 0
+    assert result["decay_coverage_pct"] == 100.0
+    assert result["by_domain"] == {}
+
+
+def test_decay_coverage_pool_shrinks_by_fitness_count(tmp_path: Path) -> None:
+    """When a mix of fitness-tagged and untagged notes qualify, the
+    post-fix pool count equals the untagged count — the fitness notes
+    are the entire delta."""
+    vault = _make_vault(tmp_path)
+    # Three fitness-tagged notes that previously would have counted.
+    for name, tag in (
+        ("squat", "workout"),
+        ("breakfast", "nutrition"),
+        ("weigh-in", "weight"),
+    ):
+        _write(
+            vault / "research" / f"{name}.md",
+            f"""
+            ---
+            slug: {name}
+            created: 2026-04-15
+            access_count: 0
+            tags: [{tag}]
+            ---
+            Body.
+            """,
+        )
+    # Two untagged notes that legitimately belong in the pool.
+    for name in ("design-note", "research-note"):
+        _write(
+            vault / "research" / f"{name}.md",
+            f"""
+            ---
+            slug: {name}
+            created: 2026-04-15
+            access_count: 0
+            ---
+            Body.
+            """,
+        )
+    result = compute_decay_coverage(
+        vault, today=_TODAY, activation_date=_ACTIVATION
+    )
+    # Pool = 5 total candidates − 3 fitness-exempt = 2.
+    assert result["total_decayed_notes"] == 2
+
+
+# ---------------------------------------------------------------------------
 # Continuous structural-health checks
 # Design: [[2026-05-20-continuous-structural-health-check]] (Task 1).
 # - zero_edge_notes: shadow_orphan subset surfaced with slug list.
