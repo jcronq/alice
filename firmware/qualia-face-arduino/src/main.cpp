@@ -213,6 +213,10 @@ void registerRoutes() {
 
 void setup() {
     Serial.begin(115200);
+    // wait for USB CDC enumeration so debug output and host comms come up
+    // before we do anything that might block (I2C, panel init).
+    uint32_t t0 = millis();
+    while (!Serial && (millis() - t0) < 3000) delay(50);
     delay(200);
     Serial.println("\nalice-face: boot");
 
