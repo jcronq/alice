@@ -68,7 +68,16 @@ timestamp=$(date -Iseconds)
 # It bounds growth by capping `output` at 2 KB and collapsing consecutive
 # identical failures into a single line with `count` + `last_seen_at`.
 # See bin/_log_auto_commit_failure.py and jcronq/alice#403.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+#
+# realpath resolves symlinks so that when this script is invoked via
+# /usr/local/bin/alice-mind-autopush (a symlink to /home/alice/alice/
+# bin/alice-mind-autopush inside the container) SCRIPT_DIR still
+# resolves to the real bin/ directory where the helper lives. Without
+# realpath, BASH_SOURCE[0] stays as /usr/local/bin/ and the helper isn't
+# found there — silently breaking the failure-log path (the log stops
+# at 2026-05-27 but the service has kept running and failing every 15
+# min since, with no record of what was failing).
+SCRIPT_DIR="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)"
 printf '%s' "$commit_output" | python3 "$SCRIPT_DIR/_log_auto_commit_failure.py" \
     --log-path "$FAILURE_LOG" \
     --timestamp "$timestamp" \
