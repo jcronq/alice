@@ -748,8 +748,14 @@ def _atomize_one(
         return False
 
     parent_slug = md.stem
+    parent_title = fm.get("title") or parent_slug
     children_rel: list[str] = []
     child_writes: list[tuple[pathlib.Path, str]] = []
+    # slug → human-readable title, populated as children are built;
+    # used to render the ``## Sub-notes`` bullets on the parent and to
+    # sort them alphabetically per the parent-link-update protocol
+    # (cortex-memory/research/2026-06-09-atomization-parent-link-update.md).
+    child_titles: dict[str, str] = {}
     # Sections whose slug already lives somewhere in the vault and
     # where ``disambiguate_on_collision`` is False. We keep them inline
     # in the parent rather than atomize them out — losing their
@@ -822,11 +828,20 @@ def _atomize_one(
         }
         if isinstance(child_fm["tags"], str):
             child_fm["tags"] = [child_fm["tags"]]
-        child_body = section_text.strip() + "\n"
+        # Child body = section content + a ``## Related`` block pointing
+        # back at the parent. The backlink closes the parent↔child loop
+        # so children aren't structural orphans (parent-link-update
+        # protocol step 4).
+        child_body = (
+            section_text.strip()
+            + "\n\n## Related\n\n"
+            + f"- [[{parent_slug}]] — {parent_title}\n"
+        )
         child_writes.append(
             (child_path, _frontmatter_render(child_fm) + "\n" + child_body)
         )
         children_rel.append(str(child_path.relative_to(vault)))
+        child_titles[child_slug] = title
         # Reserve the slug so a later sibling section in this same
         # atomize pass can't collide with it.
         slug_index[child_slug.lower()] = child_path
@@ -859,11 +874,24 @@ def _atomize_one(
     if prologue:
         parent_body_lines.append(prologue)
         parent_body_lines.append("")
-    parent_body_lines.append("## Sections")
+    # ``## Sub-notes`` replaces the old ``## Sections`` block. Bullets
+    # render as ``- [[slug]] — title`` (sorted alphabetically by slug
+    # per parent-link-update protocol step 5) so a reader of the parent
+    # can navigate to each child with its title visible. The intro line
+    # is the canonical Stage-C-grooming marker described in the design.
+    parent_body_lines.append("## Sub-notes")
     parent_body_lines.append("")
-    for child_rel in children_rel:
-        child_slug = pathlib.Path(child_rel).stem
-        parent_body_lines.append(f"- See [[{child_slug}]]")
+    parent_body_lines.append(
+        "The following notes were atomized from this parent during Stage C grooming:"
+    )
+    parent_body_lines.append("")
+    sub_note_bullets = [
+        f"- [[{pathlib.Path(child_rel).stem}]] — "
+        f"{child_titles.get(pathlib.Path(child_rel).stem, pathlib.Path(child_rel).stem)}"
+        for child_rel in children_rel
+    ]
+    for bullet in sorted(sub_note_bullets):
+        parent_body_lines.append(bullet)
     # Inline-preserved sections (slug-collision SKIPs) — append after
     # the Sections list so the parent still reads top-to-bottom.
     for title, section_text in skipped_sections:
