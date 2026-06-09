@@ -34,7 +34,14 @@ if [ ! -f "$MANIFEST" ]; then
     exit 1
 fi
 
-SITE_PACKAGES=$("$VENV/bin/python" -c 'import site; print(site.getsitepackages()[0])')
+# site.getsitepackages() can return multiple paths on some interpreter
+# layouts (notably system-site-packages venvs). Iterate so the search
+# covers all of them — the first one only happens to be the wheel
+# install target on the alice container today, but that's not a
+# guarantee any plugin author should have to know about.
+mapfile -t SITE_PACKAGES_DIRS < <("$VENV/bin/python" -c 'import site
+for p in site.getsitepackages():
+    print(p)')
 
 # Parse the manifest with the alice venv's pyyaml (already installed in
 # the base stage; no new dep). Emit one pipe-delimited line per plugin
@@ -72,16 +79,34 @@ for line in "${plugin_lines[@]}"; do
     for svc in "${svc_list[@]}"; do
         [ -z "$svc" ] && continue
 
+        # Refuse to clobber a service dir that already exists — that
+        # would only happen if a native s6 dir at sandbox/s6/<svc>/ was
+        # copied earlier in the Dockerfile and now collides with a
+        # plugin shipping the same service name. Surface the conflict
+        # rather than silently doing the wrong thing.
+        if [ -e "$S6_RC_D/$svc" ]; then
+            echo "install-plugins: service dir '$S6_RC_D/$svc' already" \
+                 "exists — plugin '$name' would clobber it. Rename one" \
+                 "side or remove the native dir." >&2
+            exit 1
+        fi
+
         # Locate the service dir inside site-packages. The expected
         # layout is `<site-packages>/<top_module>/s6/<svc>/`. -path
         # filters on the `/s6/` segment so we don't match an unrelated
-        # directory that happens to share the service name.
-        match=$(find "$SITE_PACKAGES" -mindepth 3 -maxdepth 4 -type d \
-                    -name "$svc" -path "*/s6/$svc" -print -quit)
+        # directory that happens to share the service name. Search each
+        # site-packages dir until a match is found.
+        match=""
+        for sp in "${SITE_PACKAGES_DIRS[@]}"; do
+            [ -d "$sp" ] || continue
+            match=$(find "$sp" -mindepth 3 -maxdepth 4 -type d \
+                        -name "$svc" -path "*/s6/$svc" -print -quit)
+            [ -n "$match" ] && break
+        done
         if [ -z "$match" ]; then
             echo "install-plugins: plugin '$name' declared service '$svc'" \
-                 "but no matching dir found under $SITE_PACKAGES." \
-                 "Expected <pkg>/s6/$svc/." >&2
+                 "but no matching dir found under any site-packages" \
+                 "(${SITE_PACKAGES_DIRS[*]}). Expected <pkg>/s6/$svc/." >&2
             exit 1
         fi
 

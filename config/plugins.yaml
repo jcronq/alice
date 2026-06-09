@@ -12,7 +12,6 @@
 # Schema:
 #   plugins:                       # list (empty = no plugins, fine)
 #     - name: <human-readable>     # logged at build time; not load-bearing
-#       package: <pip-name>        # the canonical pip package name
 #       source: <pip-install spec> # git URL, PyPI name+version, or local
 #                                  # path. Passed verbatim to `pip install`.
 #       services:                  # s6 service names this plugin ships.
@@ -26,7 +25,6 @@
 
 plugins:
   - name: cozylobe
-    package: alice-cozylobe
     source: "git+https://github.com/jcronq/alice-cozylobe@main"
     services:
       - alice-cozylobe
