@@ -47,7 +47,11 @@ dependencies = [
     # PageRank-weighted-sum domain-linkedness metric (metrics.pagerank_metric).
     # Computed once per vault_health scan over the structural wikilink
     # graph from cortex-index.db; AUC=0.969 vs binary linkability.
+    # numpy is a soft-required dep of networkx.pagerank — declared
+    # explicitly because networkx<3.5 doesn't pull it in transitively,
+    # producing a runtime ModuleNotFoundError at first pagerank() call.
     "networkx>=3.0",
+    "numpy>=1.26",
     # alice-cozylobe is a SEPARATE pip-installable package and is NOT a
     # hard dep of alice. The container's `cozylobe` build stage installs
     # it (see sandbox/Dockerfile); the `main` stage does not. Same import
