@@ -184,23 +184,13 @@ def _iter_resolution_targets(vault_dir: Path) -> list[Path]:
     (e.g. ``[[index]]``, ``[[unresolved]]``); they should resolve as
     wikilink targets even though they don't count toward ``total_notes``
     or appear in the orphan candidate set.
-
-    Excludes ``dailies/``, ``archive/``, and ``gh-state/`` — those
-    folders contain operational records, cold storage, and GitHub state
-    mirrors that should not participate in slug resolution. Without
-    this exclusion, archived notes with duplicate slugs hijack
-    resolution in ``_build_resolution_index``.
     """
     if not vault_dir.exists():
         return []
     out: list[Path] = []
     for md in vault_dir.rglob("*.md"):
-        rel = md.relative_to(vault_dir)
-        if any(part.startswith(".") for part in rel.parts):
+        if any(part.startswith(".") for part in md.relative_to(vault_dir).parts):
             continue
-        if rel_parts := rel.parts:
-            if rel_parts[0] in {"dailies", "archive", "gh-state"}:
-                continue
         out.append(md)
     out.sort()
     return out
