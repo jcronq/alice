@@ -1,0 +1,33 @@
+# Plugin manifest for alice's generic plugin loader. Read at image build
+# time by `sandbox/scripts/install-plugins.sh` (RUN step in
+# `sandbox/Dockerfile`'s `main` stage). Each entry declares a separately
+# versioned Python package that ships an s6 service tree as wheel data.
+#
+# Adding a new lobe — write the lobe code as its own pip-installable
+# repo, ship its s6 service directories under
+# `<top_module>/s6/<service_name>/`, declare it here, rebuild. No
+# alice/sandbox/ edits required. Removing a lobe is delete-the-stanza
+# plus rebuild.
+#
+# Schema:
+#   plugins:                       # list (empty = no plugins, fine)
+#     - name: <human-readable>     # logged at build time; not load-bearing
+#       package: <pip-name>        # the canonical pip package name
+#       source: <pip-install spec> # git URL, PyPI name+version, or local
+#                                  # path. Passed verbatim to `pip install`.
+#       services:                  # s6 service names this plugin ships.
+#         - <name>                 # Must match dir name under
+#         - <name>                 # `<site-packages>/*/s6/<name>/`
+#
+# Runtime opt-out lives in each plugin's own run script (env-var gate),
+# not in this manifest. Build-time opt-out: pass `--build-arg
+# INSTALL_PLUGINS=false` to `docker build`, which skips the install step
+# entirely and produces an alice image with no plugins installed.
+
+plugins:
+  - name: cozylobe
+    package: alice-cozylobe
+    source: "git+https://github.com/jcronq/alice-cozylobe@main"
+    services:
+      - alice-cozylobe
+      - alice-cozylobe-reload-watcher

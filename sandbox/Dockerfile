@@ -5,14 +5,19 @@ FROM debian:trixie-slim AS base
 # Dockerfiles stay in place until the docker-compose / alice-deploy cutover
 # lands; this image is additive scaffolding for now.
 #
-# Phase 1 plugin architecture (research/2026-05-30-plugin-architecture-phase1-draft):
-# the build splits into three stages — `base` (shared deps), `main` (default
-# alice, all s6 services except cozylobe), and `cozylobe` (sidecar with the
-# two cozylobe services only). Default `docker compose up -d` builds and runs
-# the `main` target; opt into cozylobe via docker-compose.override.yml.example
-# plus `--profile cozylobe`. Per-stage s6 copy is what makes "code not on disk"
-# real for opt-out users: the main image carries no cozylobe service dirs and
-# no cozylobe entry in the s6 user bundle.
+# Phase 2 plugin architecture (PR thread "Generic plugin loader"):
+# the build is two stages — `base` (shared deps) and `main` (the alice
+# application image). Plugin lobes (cozylobe and any future siblings)
+# are no longer hardcoded as a Dockerfile stage; they're declared in
+# `config/plugins.yaml` and installed by `sandbox/scripts/install-plugins.sh`
+# as a RUN step in `main`. The script pip-installs each declared plugin
+# into /opt/alice-venv and copies its s6 service dirs from
+# `<site-packages>/<pkg>/s6/<svc>/` into `/etc/s6-overlay/s6-rc.d/`.
+# Adding a new lobe is a separate-repo + manifest-entry change with no
+# Dockerfile edits. Build-time opt-out: `--build-arg INSTALL_PLUGINS=false`
+# skips the install step and produces a plugin-free image. Runtime
+# opt-out lives in each plugin's own run script (e.g.
+# `ALICE_COZYLOBE_ENABLED=false`).
 #
 # Layer order in base is least-churning → most-churning so warm rebuilds touch
 # only the top layers: base → OS deps → signal-cli → node globals → python venv
@@ -154,56 +159,20 @@ ENV S6_KEEP_ENV=1
 WORKDIR /home/alice/alice-mind
 
 # ============================================================
-# Stage 2: cozylobe — optional sidecar with cozylobe services only.
+# Stage 2: main — the alice application image.
 # ============================================================
-# Built only when the caller passes `--target cozylobe` (or the compose
-# override's `build.target: cozylobe`). Defined before `main` so that
-# `main` remains the Dockerfile's final stage and is what Docker picks
-# when no `target:` is set — preserving the canonical `docker compose
-# build alice` invocation in docker-compose.yml unchanged (#422 #423 #424).
-# Carries the two cozylobe s6 services plus init-state-perms (their only
-# dependency). No HEALTHCHECK and no EXPOSE — the sidecar publishes no
-# host ports, and its liveness is observed via the shared inner/notes/
-# filesystem, not HTTP.
-FROM base AS cozylobe
-
-# alice-cozylobe ships in its own repo (jcronq/alice-cozylobe) and is
-# installed here, NOT as a dep of the alice package. This keeps the
-# `main` image cozylobe-free at the pip layer too — only the `cozylobe`
-# sidecar pulls the wheel. Bump the @main pin to a tag when stabilizing.
-RUN /opt/alice-venv/bin/pip install --no-cache-dir \
-        "alice-cozylobe @ git+https://github.com/jcronq/alice-cozylobe@main"
-
-COPY sandbox/s6/alice-cozylobe/                /etc/s6-overlay/s6-rc.d/alice-cozylobe/
-COPY sandbox/s6/alice-cozylobe-reload-watcher/ /etc/s6-overlay/s6-rc.d/alice-cozylobe-reload-watcher/
-COPY sandbox/s6/init-state-perms/              /etc/s6-overlay/s6-rc.d/init-state-perms/
-
-# Cozylobe-only user bundle.
-COPY sandbox/s6/user/type                                       /etc/s6-overlay/s6-rc.d/user/type
-COPY sandbox/s6/user/contents.d/alice-cozylobe                  /etc/s6-overlay/s6-rc.d/user/contents.d/alice-cozylobe
-COPY sandbox/s6/user/contents.d/alice-cozylobe-reload-watcher   /etc/s6-overlay/s6-rc.d/user/contents.d/alice-cozylobe-reload-watcher
-COPY sandbox/s6/user/contents.d/init-state-perms                /etc/s6-overlay/s6-rc.d/user/contents.d/init-state-perms
-
-RUN find /etc/s6-overlay/s6-rc.d \( -name 'run' -o -name 'up' -o -name 'finish' \) | xargs -r chmod +x
-
-ENTRYPOINT ["/init"]
-CMD ["/usr/local/bin/entrypoint.sh", "sleep", "infinity"]
-
-# ============================================================
-# Stage 3: main — default alice container, all s6 services except cozylobe.
-# ============================================================
-# Final stage — picked by default when no `--target` is set, so the
-# canonical docker-compose.yml that omits `target:` still produces the
-# cozylobe-free image. This stage must NOT include any cozylobe service
-# dirs or cozylobe entries in the s6 user bundle; that's what makes the
-# opt-out real (issues #422 #423 #424).
+# Single application stage. Native s6 services are copied from
+# `sandbox/s6/` here; plugin s6 services are installed by the
+# `install-plugins.sh` RUN step below, which reads `config/plugins.yaml`
+# and pip-installs each declared plugin (cozylobe, …) into the alice
+# venv. The pre-Phase-2 split that carried cozylobe in its own
+# `--target cozylobe` stage is retired — see the header docstring.
 FROM base AS main
 
-# Per-stage s6 copy: 14 non-cozylobe service dirs plus init-state-perms.
-# Compared with the pre-split blanket `COPY sandbox/s6/`, this:
-#   1. Omits alice-cozylobe/ and alice-cozylobe-reload-watcher/ entirely.
-#   2. Builds a stage-specific user bundle (contents.d/) below, so s6 does
-#      not try to bring up services whose dirs don't exist.
+# Per-stage s6 copy: 14 native service dirs plus init-state-perms.
+# Plugin service dirs (e.g. alice-cozylobe, alice-cozylobe-reload-watcher)
+# are NOT copied here — they ship inside their plugin wheels and land
+# in /etc/s6-overlay/s6-rc.d/ via install-plugins.sh.
 COPY sandbox/s6/alice-autopush/         /etc/s6-overlay/s6-rc.d/alice-autopush/
 COPY sandbox/s6/alice-embedder/         /etc/s6-overlay/s6-rc.d/alice-embedder/
 COPY sandbox/s6/alice-face-caption/     /etc/s6-overlay/s6-rc.d/alice-face-caption/
@@ -238,6 +207,32 @@ COPY sandbox/s6/user/contents.d/alice-viewer                    /etc/s6-overlay/
 COPY sandbox/s6/user/contents.d/init-state-perms                /etc/s6-overlay/s6-rc.d/user/contents.d/init-state-perms
 COPY sandbox/s6/user/contents.d/signal-daemon                   /etc/s6-overlay/s6-rc.d/user/contents.d/signal-daemon
 
+# ---------- Plugin loader ----------
+# `INSTALL_PLUGINS=false` skips this block, producing a plugin-free
+# image (useful for CI smoke tests and for plugin authors iterating on
+# a base image before publishing their wheel). Default true so the
+# canonical `docker compose build alice` keeps producing an image with
+# cozylobe (and any future declared plugins) wired up.
+ARG INSTALL_PLUGINS=true
+
+# Copy the manifest + install script into the image. The script reads
+# the manifest at /tmp/plugins.yaml; both files are throwaway after the
+# RUN step (no runtime path depends on them).
+COPY config/plugins.yaml          /tmp/plugins.yaml
+COPY sandbox/scripts/install-plugins.sh /usr/local/bin/install-plugins.sh
+
+RUN chmod +x /usr/local/bin/install-plugins.sh \
+    && if [ "${INSTALL_PLUGINS}" = "true" ]; then \
+           /usr/local/bin/install-plugins.sh /tmp/plugins.yaml; \
+       else \
+           echo "INSTALL_PLUGINS=${INSTALL_PLUGINS} — skipping plugin install."; \
+       fi \
+    && rm -f /tmp/plugins.yaml
+
+# Run/up/finish chmod sweep — covers both native s6 services (copied
+# above) and plugin services (installed by install-plugins.sh). The cp
+# -a in the install script preserves wheel-built exec bits, but this
+# sweep is belt-and-suspenders for plugins built without them.
 RUN find /etc/s6-overlay/s6-rc.d \( -name 'run' -o -name 'up' -o -name 'finish' \) | xargs -r chmod +x
 
 # Viewer port published from the same container now; speaking + signal-cli
