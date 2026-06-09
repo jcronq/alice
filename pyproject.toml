@@ -44,11 +44,11 @@ dependencies = [
     # the asyncio-native ``websockets`` library — same wire vocabulary
     # as the CLI socket, accessible to off-host clients (iOS, browser).
     "websockets>=15.0",
-    # cozylobe lobe lives in its own repo as of 2026-06-09 (extraction
-    # so the lobe can evolve as a pluggable component). Same import
-    # paths (`alice_cozylobe`, `cozylobe_cortex`); the s6 service still
-    # supervises `python -m alice_cozylobe` against the installed wheel.
-    "alice-cozylobe @ git+https://github.com/jcronq/alice-cozylobe@main",
+    # alice-cozylobe is a SEPARATE pip-installable package and is NOT a
+    # hard dep of alice. The container's `cozylobe` build stage installs
+    # it (see sandbox/Dockerfile); the `main` stage does not. Same import
+    # paths (`alice_cozylobe`, `cozylobe_cortex`); when present, the s6
+    # service supervises `python -m alice_cozylobe` against the wheel.
 ]
 
 [project.scripts]

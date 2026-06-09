@@ -167,6 +167,13 @@ WORKDIR /home/alice/alice-mind
 # filesystem, not HTTP.
 FROM base AS cozylobe
 
+# alice-cozylobe ships in its own repo (jcronq/alice-cozylobe) and is
+# installed here, NOT as a dep of the alice package. This keeps the
+# `main` image cozylobe-free at the pip layer too — only the `cozylobe`
+# sidecar pulls the wheel. Bump the @main pin to a tag when stabilizing.
+RUN /opt/alice-venv/bin/pip install --no-cache-dir \
+        "alice-cozylobe @ git+https://github.com/jcronq/alice-cozylobe@main"
+
 COPY sandbox/s6/alice-cozylobe/                /etc/s6-overlay/s6-rc.d/alice-cozylobe/
 COPY sandbox/s6/alice-cozylobe-reload-watcher/ /etc/s6-overlay/s6-rc.d/alice-cozylobe-reload-watcher/
 COPY sandbox/s6/init-state-perms/              /etc/s6-overlay/s6-rc.d/init-state-perms/
