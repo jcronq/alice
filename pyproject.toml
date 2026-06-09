@@ -44,6 +44,10 @@ dependencies = [
     # the asyncio-native ``websockets`` library — same wire vocabulary
     # as the CLI socket, accessible to off-host clients (iOS, browser).
     "websockets>=15.0",
+    # PageRank-weighted-sum domain-linkedness metric (metrics.pagerank_metric).
+    # Computed once per vault_health scan over the structural wikilink
+    # graph from cortex-index.db; AUC=0.969 vs binary linkability.
+    "networkx>=3.0",
     # alice-cozylobe is a SEPARATE pip-installable package and is NOT a
     # hard dep of alice. The container's `cozylobe` build stage installs
     # it (see sandbox/Dockerfile); the `main` stage does not. Same import

@@ -39,6 +39,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from indexer.yaml_lite import extract_wikilinks, split_frontmatter
+from metrics.pagerank_metric import compute_weighted_sum, tier_counts
 
 # Single source of truth for the fitness-domain exemption: stage_d already
 # skips these notes during decay synthesis (see ``_is_fitness_domain`` and
@@ -1937,6 +1938,7 @@ def build_vault_health_event(
     events_path: Path | None,
     surface_dir: Path | None = None,
     now: datetime | None = None,
+    index_db_path: Path | None = None,
 ) -> dict[str, Any]:
     """Assemble the complete vault_health event dict.
 
@@ -2017,6 +2019,25 @@ def build_vault_health_event(
         window_end=today_midnight,
         events_path=events_path,
     )
+
+    # PageRank-weighted-sum linkedness tier counts. Gated on both
+    # --events (matching recovery_state) and --index-db being supplied;
+    # the metric reads the structural wikilink graph from
+    # cortex-index.db, so we skip silently when the DB isn't wired up.
+    # See ``metrics.pagerank_metric`` for the formula + validation.
+    if (
+        events_path is not None
+        and index_db_path is not None
+        and index_db_path.exists()
+    ):
+        try:
+            pr_ws = compute_weighted_sum(index_db_path)
+        except Exception as exc:  # noqa: BLE001 — never block the event
+            logger.warning(
+                "vault_health: pagerank_linkedness skipped (%s)", exc
+            )
+        else:
+            event["pagerank_linkedness"] = tier_counts(pr_ws)
 
     # Sanity-check: with trigger-keyword backfill complete, a real
     # truly_dark_count above 10 is statistically implausible. Tag the
@@ -2183,6 +2204,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Path to memory/events.jsonl. Required for recovery_state.",
     )
     parser.add_argument(
+        "--index-db",
+        type=Path,
+        default=None,
+        help=(
+            "Path to cortex-index.db. Required for pagerank_linkedness. "
+            "When --events and --index-db are both set, the event gains a "
+            "``pagerank_linkedness`` field with {isolated: N, linked: M}."
+        ),
+    )
+    parser.add_argument(
         "--check-existing",
         action="store_true",
         help=(
@@ -2262,6 +2293,7 @@ def main(argv: list[str] | None = None) -> int:
             events_path=args.events,
             surface_dir=args.surface,
             now=now,
+            index_db_path=args.index_db,
         )
         if args.continuous:
             event["continuous_checks"] = compute_continuous_checks(
@@ -2314,6 +2346,15 @@ def main(argv: list[str] | None = None) -> int:
             window_end=_recovery_we,
             events_path=args.events,
         )
+        if args.index_db is not None and args.index_db.exists():
+            try:
+                _pr_ws = compute_weighted_sum(args.index_db)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "vault_health: pagerank_linkedness skipped (%s)", exc
+                )
+            else:
+                out["pagerank_linkedness"] = tier_counts(_pr_ws)
     if args.continuous:
         out["continuous_checks"] = compute_continuous_checks(args.vault)
     print(json.dumps(out, indent=2, sort_keys=True))
