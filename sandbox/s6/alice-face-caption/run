@@ -29,10 +29,11 @@ fi
 # top of alice-thinker-watchdog/run.
 sleep 30
 
-# Source alice.env so CLAUDE_CODE_OAUTH_TOKEN is visible to the python
-# process. The Haiku summarizer prefers the live env-var token over the
-# credentials.json file, which can lag the daemon's auto-refresh by
-# several hours.
+# Source alice.env so LITELLM_MASTER_KEY (and any face_caption
+# overrides) are visible to the python process. The summarizer reads
+# its endpoint/model/key from alice.config.json and falls back to the
+# in-container defaults; alice.env still exports the same secrets the
+# rest of the venv expects.
 [ -f /home/alice/.config/alice/alice.env ] && source /home/alice/.config/alice/alice.env
 
 export PYTHONPATH="$ALICE_SRC"

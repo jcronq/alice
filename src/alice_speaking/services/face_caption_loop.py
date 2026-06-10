@@ -7,9 +7,9 @@ Module entrypoint::
 Runs forever:
 
 1. Every ``ALICE_FACE_CAPTION_INTERVAL_S`` seconds (default 60), pick
-   the latest wake note, ask Haiku 4.5 to summarize it, and push the
-   summary to the face's ``/status`` endpoint via
-   :class:`alice_speaking.infra.face_caption.FaceCaptionDriver`.
+   the latest wake note, ask the LiteLLM proxy's ``qwen-local`` to
+   summarize it, and push the summary to the face's ``/status`` endpoint
+   via :class:`alice_speaking.infra.face_caption.FaceCaptionDriver`.
 2. During quiet hours (23:00–08:00 America/New_York per spec) skip the
    push and just sleep.
 3. SIGTERM / SIGINT triggers a graceful exit at the next interval

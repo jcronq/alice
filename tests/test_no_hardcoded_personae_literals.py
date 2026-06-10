@@ -69,12 +69,13 @@ ALLOWLIST_FILES: frozenset[str] = frozenset(
         # config defaults — substituting from personae would hurt prompt
         # quality without changing behaviour.
         "viewer/run_summary.py",
-        # Face-caption Haiku summariser system prompt — same shape as
+        # Face-caption summariser system prompt — same shape as
         # viewer/run_summary.py: descriptive prose addressed to the
         # summariser model ("Summarize what Alice's thinking process
         # is currently working on…"). Verbatim per the driver spec;
         # the summary is rendered onto the alice-face LCD, not fed
-        # back through personae substitution.
+        # back through personae substitution. Routes through the
+        # alice-litellm proxy to ``qwen-local`` by default.
         "alice_speaking/infra/face_caption.py",
     }
 )

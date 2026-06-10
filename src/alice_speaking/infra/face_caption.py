@@ -4,17 +4,20 @@ Thinking owns the 16x2 caption sidecar on the alice-face ESP32 (the 20x4
 face panel is Speaking's). The ESP32 firmware exposes ``POST /caption
 {"text": "..."}`` and word-wraps the body into the 32-char (16×2) sidecar.
 This module is the driver: it picks the latest thinking-wake note off
-disk, asks Haiku 4.5 for a ≤32 char summary, and pushes it.
+disk, asks a local model to summarize it, and pushes it.
 
 Design choices, all small:
 
 - Source: ``~/alice-mind/inner/thoughts/$(date +%Y-%m-%d)/`` — files are
   ``HHMMSS-wake.md`` (and longer-prefixed variants). Pick the latest by
   mtime; fall back to yesterday's directory if today's is empty.
-- Summarizer: Haiku 4.5 (``claude-haiku-4-5-20251001``) via the
-  Anthropic ``/v1/messages`` endpoint, authed with the long-lived OAuth
-  token at ``~/.claude/.credentials.json``. Same wire pattern as
-  :mod:`eval.replay`.
+- Summarizer: ``qwen-local`` via the alice-litellm proxy's
+  OpenAI-compatible ``/v1/chat/completions`` endpoint. Defaults target
+  the in-container proxy at ``http://alice-litellm:4000/v1`` with the
+  master key ``sk-alice-local``; override via ``face_caption`` in
+  ``alice.config.json`` (``base_url``, ``model``, ``api_key``). No
+  OAuth — this closes the last Anthropic-direct call site outside
+  Speaking + worker subagents (cost-audit thread, 2026-06-10).
 - Cache: in-memory dict keyed by ``(path, mtime_ns)`` so a stable wake
   is summarized once per restart. The loop is a long-running process;
   the dict survives across iterations.
@@ -34,7 +37,7 @@ import json
 import logging
 import os
 import pathlib
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 
@@ -42,11 +45,16 @@ import httpx
 log = logging.getLogger(__name__)
 
 
-# Anthropic API target — same pattern as eval.replay._call_anthropic.
-ANTHROPIC_API_VERSION = "2023-06-01"
-ANTHROPIC_BASE_URL = "https://api.anthropic.com"
-HAIKU_MODEL = "claude-haiku-4-5-20251001"
-HAIKU_MAX_TOKENS = 64
+# LiteLLM proxy target. From inside the alice container the proxy is
+# reachable as ``alice-litellm:4000``; from the host (or a sibling
+# container without the alice-litellm DNS) point at the LAN IP via
+# ``face_caption.base_url`` in alice.config.json.
+DEFAULT_LITELLM_BASE_URL = "http://alice-litellm:4000/v1"
+DEFAULT_LITELLM_MODEL = "qwen-local"
+# Master key shared by every LiteLLM call site; matches
+# ``LITELLM_MASTER_KEY`` env / sandbox compose default.
+DEFAULT_LITELLM_API_KEY = "sk-alice-local"
+LITELLM_MAX_TOKENS = 64
 
 # Caption sidecar limit. The 16x2 LCD is 16 chars wide x 2 rows = 32
 # chars total. The firmware word-wraps so the model can emit a single
@@ -57,10 +65,15 @@ MAX_CAPTION_CHARS = 32
 # chars of meaningful prose; trimming bounds the input token cost.
 MAX_BODY_CHARS = 500
 
-# Network timeouts. Anthropic is generous (cap at 15s — Haiku is fast),
-# the LCD push is fire-and-forget on a 1s budget.
-ANTHROPIC_TIMEOUT_SECONDS = 15.0
+# Network timeouts. The LiteLLM proxy proxies to a LAN Qwen runtime;
+# 30s mirrors core.llm_client's :data:`DEFAULT_TIMEOUT_SECONDS`. The LCD
+# push is fire-and-forget on a ~2s budget.
+LITELLM_TIMEOUT_SECONDS = 30.0
 FACE_TIMEOUT_SECONDS = 2.0
+
+# Sampling for the summary call. Low temperature — this is a closed-form
+# rewrite task, not generative.
+LITELLM_TEMPERATURE = 0.4
 
 # Default URLs. Primary is the ESP32 on the LAN; fallback is the pi
 # proxy that used to relay through ``face_state``. Override with
@@ -69,14 +82,13 @@ FACE_TIMEOUT_SECONDS = 2.0
 DEFAULT_FACE_URL = "http://10.20.30.205:8080"
 FALLBACK_FACE_URL = "http://10.20.30.171:8080"
 
-# OAuth credentials live at the standard Claude Code path. The token
-# is an ``sk-ant-oat*`` Bearer; the API also accepts ``sk-ant-api*``
-# keys via ``x-api-key``, but the speaking container is configured for
-# subscription mode so we always have the OAuth flavour.
-DEFAULT_CREDENTIALS_PATH = pathlib.Path.home() / ".claude" / ".credentials.json"
-
 # Where the thinking wakes drop their notes.
 DEFAULT_THOUGHTS_ROOT = pathlib.Path.home() / "alice-mind" / "inner" / "thoughts"
+
+# alice.config.json location (mirror of alice_thinking.wake._apply_config_overrides).
+DEFAULT_CONFIG_PATH = (
+    pathlib.Path.home() / "alice-mind" / "config" / "alice.config.json"
+)
 
 # System prompt — verbatim per spec. DO NOT "improve".
 SUMMARIZER_SYSTEM_PROMPT = (
@@ -87,30 +99,39 @@ SUMMARIZER_SYSTEM_PROMPT = (
 )
 
 
-def _read_oauth_token(path: pathlib.Path) -> Optional[str]:
-    """Return the OAuth access token.
+def _load_face_caption_config(
+    path: pathlib.Path = DEFAULT_CONFIG_PATH,
+) -> dict[str, Any]:
+    """Read the ``face_caption`` section of ``alice.config.json``.
 
-    Prefer the ``CLAUDE_CODE_OAUTH_TOKEN`` env var when set — that's what
-    the s6 ``with-contenv`` shell exports from ``alice.env``, and it
-    tracks the speaking daemon's auto-refreshed token. Fall back to
-    reading ``credentials.json`` directly, which is fine for ad-hoc
-    invocations from a developer shell but can lag the live token by
-    hours when the daemon refreshes in-memory without rewriting the
-    file. Returns ``None`` if neither source yields a usable token.
+    Returns a dict with ``base_url`` / ``model`` / ``api_key`` keys,
+    falling back to the module defaults when the file or section is
+    absent or malformed. Mirrors the loader shape in
+    :mod:`alice_thinking.wake._apply_config_overrides` — same
+    "CLI/env > config file > module defaults" precedence is applied
+    by callers that want it (here the defaults live in this module).
     """
-    env_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
-    if env_token:
-        return env_token
+    cfg: dict[str, Any] = {
+        "base_url": DEFAULT_LITELLM_BASE_URL,
+        "model": DEFAULT_LITELLM_MODEL,
+        "api_key": DEFAULT_LITELLM_API_KEY,
+    }
+    if not path.is_file():
+        return cfg
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        parsed = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        log.warning("face_caption: cannot read credentials at %s: %s", path, exc)
-        return None
-    token = (data.get("claudeAiOauth") or {}).get("accessToken")
-    if not isinstance(token, str) or not token:
-        log.warning("face_caption: credentials.json missing claudeAiOauth.accessToken")
-        return None
-    return token
+        log.warning("face_caption: cannot read %s: %s", path, exc)
+        return cfg
+    section = (parsed or {}).get("face_caption") or {}
+    if not isinstance(section, dict):
+        log.warning("face_caption: alice.config.json face_caption is not an object")
+        return cfg
+    for key in ("base_url", "model", "api_key"):
+        value = section.get(key)
+        if isinstance(value, str) and value:
+            cfg[key] = value
+    return cfg
 
 
 def _latest_wake_path(
@@ -164,64 +185,98 @@ def _truncate_caption(text: str) -> str:
     return cleaned.rstrip(".,;:!?")
 
 
-def _summarize_via_haiku(
+def _summarize_via_qwen(
     body: str,
     *,
-    oauth_token: str,
+    base_url: str = DEFAULT_LITELLM_BASE_URL,
+    model: str = DEFAULT_LITELLM_MODEL,
+    api_key: str = DEFAULT_LITELLM_API_KEY,
     client: Optional[httpx.Client] = None,
 ) -> Optional[str]:
-    """Call Anthropic's ``/v1/messages`` with Haiku 4.5 and return the
-    trimmed summary, or ``None`` on any failure.
+    """Call the LiteLLM proxy's OpenAI-compatible ``/chat/completions``
+    endpoint and return the trimmed summary, or ``None`` on failure.
+
+    Same prompt shape as the prior Haiku call site: a ``system`` message
+    pinning the output format and a ``user`` message carrying the wake
+    body (truncated to :data:`MAX_BODY_CHARS`). Qwen3 builds are
+    reasoning models; ``chat_template_kwargs.enable_thinking=false``
+    keeps the assistant emitting prose in ``content`` rather than
+    burning tokens on ``reasoning_content`` — same fix
+    :class:`core.llm_client.LLMClient` uses. LiteLLM's
+    ``drop_params: true`` strips this safely if a backend ignores it.
     """
-    headers = {
-        "anthropic-version": ANTHROPIC_API_VERSION,
-        "content-type": "application/json",
-        "authorization": f"Bearer {oauth_token}",
-        "anthropic-beta": "oauth-2025-04-20",
-    }
+    headers = {"content-type": "application/json"}
+    if api_key:
+        headers["authorization"] = f"Bearer {api_key}"
     payload = {
-        "model": HAIKU_MODEL,
-        "max_tokens": HAIKU_MAX_TOKENS,
-        "system": SUMMARIZER_SYSTEM_PROMPT,
+        "model": model,
+        "max_tokens": LITELLM_MAX_TOKENS,
+        "temperature": LITELLM_TEMPERATURE,
+        "stream": False,
         "messages": [
+            {"role": "system", "content": SUMMARIZER_SYSTEM_PROMPT},
             {"role": "user", "content": body[:MAX_BODY_CHARS]},
         ],
+        "chat_template_kwargs": {"enable_thinking": False},
     }
-    url = ANTHROPIC_BASE_URL + "/v1/messages"
+    url = base_url.rstrip("/") + "/chat/completions"
     owns_client = client is None
     try:
-        client = client or httpx.Client(timeout=ANTHROPIC_TIMEOUT_SECONDS)
+        client = client or httpx.Client(timeout=LITELLM_TIMEOUT_SECONDS)
         try:
             resp = client.post(url, json=payload, headers=headers)
         finally:
             if owns_client:
                 client.close()
     except httpx.HTTPError as exc:
-        log.warning("face_caption: Anthropic POST failed: %s", exc)
+        log.warning("face_caption: LiteLLM POST failed: %s", exc)
         return None
     if resp.status_code != 200:
         log.warning(
-            "face_caption: Anthropic returned %d: %s",
+            "face_caption: LiteLLM returned %d: %s",
             resp.status_code,
             resp.text[:200],
         )
         return None
     try:
         blob = resp.json()
-        chunks = blob.get("content") or []
-        text_pieces = [
-            c.get("text", "")
-            for c in chunks
-            if isinstance(c, dict) and c.get("type") == "text"
-        ]
-    except (ValueError, AttributeError, TypeError) as exc:
-        log.warning("face_caption: malformed Anthropic response: %s", exc)
+        content = blob["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        log.warning("face_caption: malformed LiteLLM response: %s", exc)
         return None
-    raw = "".join(text_pieces).strip()
+    if not isinstance(content, str):
+        log.warning("face_caption: LiteLLM content is not a string")
+        return None
+    raw = content.strip()
     if not raw:
-        log.warning("face_caption: Anthropic returned empty content")
+        log.warning("face_caption: LiteLLM returned empty content")
         return None
     return _truncate_caption(raw)
+
+
+def summarize(
+    body: str,
+    *,
+    config_path: pathlib.Path = DEFAULT_CONFIG_PATH,
+    client: Optional[httpx.Client] = None,
+) -> Optional[str]:
+    """Public single-shot helper: read ``alice.config.json`` for the
+    LiteLLM endpoint and summarize ``body`` into a sidecar caption.
+
+    Returns the trimmed caption string, or ``None`` on any failure
+    (unreachable proxy, malformed response, empty content). Convenience
+    for ad-hoc CLI smoke tests and the in-loop
+    :class:`FaceCaptionDriver`; the loop itself uses
+    :func:`_summarize_via_qwen` directly so it can reuse a client.
+    """
+    cfg = _load_face_caption_config(config_path)
+    return _summarize_via_qwen(
+        body,
+        base_url=cfg["base_url"],
+        model=cfg["model"],
+        api_key=cfg["api_key"],
+        client=client,
+    )
 
 
 def _push_caption(
@@ -273,7 +328,7 @@ class FaceCaptionDriver:
         thoughts_root: Optional[pathlib.Path] = None,
         face_url: Optional[str] = None,
         fallback_url: Optional[str] = FALLBACK_FACE_URL,
-        credentials_path: Optional[pathlib.Path] = None,
+        config_path: Optional[pathlib.Path] = None,
     ) -> None:
         self._thoughts_root = thoughts_root or DEFAULT_THOUGHTS_ROOT
         self._face_url = (
@@ -282,7 +337,7 @@ class FaceCaptionDriver:
             else os.environ.get("ALICE_FACE_URL", DEFAULT_FACE_URL)
         )
         self._fallback_url = fallback_url
-        self._credentials_path = credentials_path or DEFAULT_CREDENTIALS_PATH
+        self._config_path = config_path or DEFAULT_CONFIG_PATH
         self._cache: dict[tuple[str, int], str] = {}
         self._last_pushed: Optional[str] = None
 
@@ -309,10 +364,7 @@ class FaceCaptionDriver:
         if not body:
             log.info("face_caption: %s has empty body after frontmatter", path)
             return None
-        token = _read_oauth_token(self._credentials_path)
-        if not token:
-            return None
-        summary = _summarize_via_haiku(body, oauth_token=token)
+        summary = summarize(body, config_path=self._config_path)
         if not summary:
             return None
         self._cache[key] = summary
@@ -351,12 +403,15 @@ class FaceCaptionDriver:
 
 __all__ = [
     "DEFAULT_FACE_URL",
+    "DEFAULT_LITELLM_BASE_URL",
+    "DEFAULT_LITELLM_MODEL",
     "FALLBACK_FACE_URL",
-    "HAIKU_MODEL",
     "MAX_CAPTION_CHARS",
     "SUMMARIZER_SYSTEM_PROMPT",
     "FaceCaptionDriver",
     "_latest_wake_path",
     "_strip_frontmatter",
+    "_summarize_via_qwen",
     "_truncate_caption",
+    "summarize",
 ]
