@@ -46,15 +46,14 @@ dependencies = [
     "websockets>=15.0",
     # PageRank-weighted-sum domain-linkedness metric (metrics.pagerank_metric).
     # Computed once per vault_health scan over the structural wikilink
-    # graph from cortex-index.db; AUC=0.969 vs binary linkability.
-    # numpy + scipy are soft-required deps of networkx.pagerank in 3.x
-    # — the default solver routes through scipy.sparse, which itself
-    # needs numpy. Neither is pulled in transitively by `networkx>=3.0`
-    # so both must be declared here. Without them pagerank() raises
-    # ModuleNotFoundError at first call.
-    "networkx>=3.0",
-    "numpy>=1.26",
-    "scipy>=1.11",
+    # graph from cortex-index.db; AUC=0.969 vs binary linkability. Pure-
+    # Python power iteration over a predecessor adjacency dict; no
+    # networkx / numpy / scipy dependency. The spec called for pure
+    # Python from the start; PR #487 took a networkx shortcut that
+    # silently broke at runtime because the alice-venv doesn't ship
+    # those three packages (and rebuilding the container for an algorithm
+    # that fits in 40 lines of dict-of-list arithmetic is the wrong
+    # tradeoff).
     # alice-cozylobe is a SEPARATE pip-installable package and is NOT a
     # hard dep of alice. The container's `cozylobe` build stage installs
     # it (see sandbox/Dockerfile); the `main` stage does not. Same import
