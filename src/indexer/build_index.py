@@ -34,6 +34,7 @@ import re
 import sqlite3
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -155,32 +156,121 @@ def vault_mtime(vault: Path) -> float:
     return mtime
 
 
+_BUILT_AT_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _parse_built_at(raw: str) -> float | None:
+    """Parse ``meta.built_at`` ('YYYY-MM-DD HH:MM:SS TZ') into a unix timestamp.
+
+    The timestamp is written by :func:`build` via ``time.strftime('%Y-%m-%d %H:%M:%S %Z')``
+    in local time, so the trailing zone name ('EDT', 'EST', 'UTC', …) is
+    informational only — Python's stdlib can't reliably round-trip arbitrary
+    zone abbreviations. We strip the suffix and treat the timestamp as local
+    time, which matches how it was written.
+
+    Returns None on any parse failure so the caller can fall back to rebuilding.
+    """
+    parts = raw.strip().rsplit(" ", 1)
+    head = parts[0] if len(parts) == 2 else raw.strip()
+    try:
+        return datetime.strptime(head, _BUILT_AT_FORMAT).timestamp()
+    except (ValueError, OSError):
+        return None
+
+
+def _meta_built_at_and_count(db_path: Path) -> tuple[float | None, int | None]:
+    """Read ``built_at`` (as unix ts) and ``note_count`` from the DB's meta row.
+
+    Returns ``(None, None)`` if the DB is unopenable, missing the meta table,
+    or has no meta row. The caller treats a None timestamp as "force rebuild" —
+    a corrupt/legacy DB should always rebuild rather than silently stay stale.
+    """
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error:
+        return None, None
+    try:
+        row = conn.execute("SELECT built_at, note_count FROM meta LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return None, None
+    finally:
+        conn.close()
+    if row is None:
+        return None, None
+    built_at_ts = _parse_built_at(row[0]) if row[0] else None
+    note_count = row[1] if row[1] is not None else None
+    return built_at_ts, note_count
+
+
 def needs_rebuild(vault: Path, db_path: Path, max_stale_seconds: int = 86400) -> bool:
+    """True if the index DB is stale relative to the vault, or missing.
+
+    We compare ``meta.built_at`` (recorded when the rebuild last completed)
+    against ``vault_mtime`` — NOT the DB file's filesystem mtime. SQLite WAL
+    mode, query side-effects, and external opens all bump the file mtime
+    without the index actually being rebuilt; relying on it produced false
+    negatives that hid 6 days of vault drift in June 2026.
+
+    Belt-and-suspenders: if the recorded ``note_count`` doesn't match the
+    number of markdown files currently in the vault, force a rebuild. Both
+    bugs are guarded — a UNIQUE-constraint crash mid-rebuild leaves an old
+    DB in place; the count mismatch catches that on the next check.
+    """
     if not db_path.exists():
         return True
-    db_mtime = db_path.stat().st_mtime
-    # Safety bound: rebuild if DB is older than max_stale_seconds regardless.
-    if (time.time() - db_mtime) > max_stale_seconds:
+    built_at_ts, meta_note_count = _meta_built_at_and_count(db_path)
+    # Fail-safe: legacy/corrupt DB with no meta row → rebuild.
+    if built_at_ts is None:
         return True
-    return vault_mtime(vault) > db_mtime
+    # Safety bound: rebuild if recorded build is older than max_stale_seconds.
+    if (time.time() - built_at_ts) > max_stale_seconds:
+        return True
+    # ``built_at`` is stored at second resolution via ``time.strftime``; the
+    # filesystem mtime carries sub-second precision. Compare at second
+    # resolution to avoid spurious rebuilds when the vault was modified in
+    # the same second the index was built.
+    if int(vault_mtime(vault)) > built_at_ts:
+        return True
+    # Note count mismatch — vault grew or shrank since last build.
+    if meta_note_count is not None:
+        try:
+            vault_note_count = sum(
+                1
+                for md in vault.rglob("*.md")
+                if not any(part.startswith(".") for part in md.relative_to(vault).parts)
+            )
+        except OSError:
+            return True
+        if vault_note_count != meta_note_count:
+            return True
+    return False
 
 
 def slug_for(
     path: Path, vault: Path, colliding_stems: frozenset[str] = frozenset()
 ) -> str:
-    """Slug = filename stem; qualified by folder when stems collide.
+    """Slug = filename stem; qualified by full relative folder path when stems collide.
 
     Filenames are typically unique across a vault, so the bare stem suffices
     for the common case. When two notes share a stem (e.g., decisions/_index.md
-    and findings/_index.md), the slug becomes "<folder>/<stem>" so the UNIQUE
-    constraint on notes.slug holds. Wikilinks usually reference by basename;
-    resolution still falls back to alias and title lookups, so the qualified
-    slug doesn't break inbound links.
+    and findings/_index.md), the slug becomes "<relative/parent>/<stem>" so the
+    UNIQUE constraint on notes.slug holds.
+
+    We use the FULL relative parent — not just the top-level folder — because
+    deep collisions are real: archive/dispatched-inflight/README.md and
+    archive/refactor-plans/README.md both share top-level folder "archive",
+    so a "<top>/<stem>" slug would still collide. Wikilinks resolution falls
+    back to alias and title lookups, so the qualified slug doesn't break
+    inbound links.
+
+    Root-level files (parent == ".") fall through to the bare stem — there is
+    no meaningful folder qualifier at the root, and bare-stem uniqueness is
+    enforced anyway by the file system at that level.
     """
     if path.stem in colliding_stems:
-        folder = folder_for(path, vault)
-        if folder:
-            return f"{folder}/{path.stem}"
+        parent = path.relative_to(vault).parent
+        if str(parent) not in (".", ""):
+            return f"{parent.as_posix()}/{path.stem}"
     return path.stem
 
 
@@ -408,9 +498,7 @@ def build(vault: Path, db_path: Path) -> dict:
     }
 
 
-def _resolve_cozylobe_paths(
-    vault: Path | None, db: Path | None
-) -> tuple[Path, Path]:
+def _resolve_cozylobe_paths(vault: Path | None, db: Path | None) -> tuple[Path, Path]:
     """Pick the cozylobe-cortex vault + db paths for ``--cozylobe`` runs.
 
     Precedence:
