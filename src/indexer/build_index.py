@@ -142,6 +142,34 @@ CREATE TRIGGER notes_au AFTER UPDATE ON notes BEGIN
 END;
 """
 
+# Decay-cascade verification infrastructure. Append-only per-checkpoint
+# snapshot of note_metrics so the cascade mechanism (grooming → access
+# count bump → recovery ratio increase) can be verified at T+3 and
+# future windows. See research/2026-06-06-decay-cascade-snapshot-design.
+# Idempotent migration: IF NOT EXISTS so existing DBs gain these tables
+# without manual SQL. History is preserved across the atomic-swap rebuild
+# by ``_preserve_checkpoint_history``.
+CHECKPOINT_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS checkpoint_snapshots (
+    checkpoint INTEGER NOT NULL,
+    slug TEXT NOT NULL,
+    access_count INTEGER NOT NULL,
+    speaking_accessed_at TEXT,
+    PRIMARY KEY (checkpoint, slug)
+);
+
+CREATE INDEX IF NOT EXISTS idx_checkpoint_snapshots_slug
+    ON checkpoint_snapshots(slug);
+
+CREATE TABLE IF NOT EXISTS checkpoint_meta (
+    checkpoint INTEGER PRIMARY KEY,
+    built_at TEXT NOT NULL,
+    vault_root TEXT NOT NULL,
+    note_count INTEGER NOT NULL,
+    purpose TEXT DEFAULT 'routine'
+);
+"""
+
 
 def vault_mtime(vault: Path) -> float:
     """Maximum mtime over the vault directory + immediate subdirs (cheap)."""
@@ -296,6 +324,51 @@ def resolve_link(
     return None
 
 
+def _preserve_checkpoint_history(
+    live_db: Path,
+) -> tuple[list[tuple], list[tuple]]:
+    """Read checkpoint history from the live DB before atomic swap wipes it.
+
+    Returns ``(snapshots, meta)`` tuples of raw rows ready for re-insert.
+    Returns ``([], [])`` when:
+      - the live DB doesn't exist yet (very first rebuild), or
+      - the live DB exists but pre-dates the checkpoint tables
+        (first rebuild after this change ships → first-time migration).
+
+    The atomic rebuild contract (write to ``.tmp`` → ``os.replace``)
+    blows away any state stored only in the live file. Checkpoint history
+    is append-only and conceptually persistent, so we read it out before
+    the swap and restore it inside the new DB.
+    """
+    if not live_db.exists():
+        return [], []
+    conn = sqlite3.connect(str(live_db))
+    try:
+        existing_tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        snapshots: list[tuple] = []
+        meta: list[tuple] = []
+        if "checkpoint_snapshots" in existing_tables:
+            snapshots = list(
+                conn.execute(
+                    "SELECT checkpoint, slug, access_count, speaking_accessed_at "
+                    "FROM checkpoint_snapshots"
+                )
+            )
+        if "checkpoint_meta" in existing_tables:
+            meta = list(
+                conn.execute(
+                    "SELECT checkpoint, built_at, vault_root, note_count, purpose "
+                    "FROM checkpoint_meta"
+                )
+            )
+        return snapshots, meta
+    finally:
+        conn.close()
+
+
 def build(vault: Path, db_path: Path) -> dict:
     """Rebuild the index. Returns stats dict."""
     if not vault.exists():
@@ -309,10 +382,16 @@ def build(vault: Path, db_path: Path) -> dict:
     records = collect_notes(vault)
     by_slug, by_alias, by_title = build_resolution_maps(records)
 
+    # Capture checkpoint history before the atomic swap. Empty on first-time
+    # migration; populated thereafter so the checkpoint counter and prior
+    # snapshots survive every rebuild.
+    prior_snapshots, prior_meta = _preserve_checkpoint_history(db_path)
+
     conn = sqlite3.connect(str(tmp_path))
     try:
         conn.executescript(SCHEMA_SQL)
         conn.executescript(FTS_TRIGGERS_SQL)
+        conn.executescript(CHECKPOINT_SCHEMA_SQL)
 
         # Insert notes (FTS triggers populate notes_fts automatically).
         for idx, r in enumerate(records, start=1):
@@ -382,11 +461,51 @@ def build(vault: Path, db_path: Path) -> dict:
                 (r["slug"], r["access_count"]),
             )
 
+        # Restore prior checkpoint history (preserved across atomic swap).
+        # Empty on first-time migration → this checkpoint becomes #1.
+        for row in prior_meta:
+            conn.execute(
+                "INSERT INTO checkpoint_meta(checkpoint, built_at, vault_root, "
+                "note_count, purpose) VALUES(?, ?, ?, ?, ?)",
+                row,
+            )
+        for row in prior_snapshots:
+            conn.execute(
+                "INSERT INTO checkpoint_snapshots(checkpoint, slug, access_count, "
+                "speaking_accessed_at) VALUES(?, ?, ?, ?)",
+                row,
+            )
+
+        # Append a new checkpoint for this rebuild. Snapshot mirrors the
+        # state of note_metrics that is about to become live after the
+        # atomic swap — the cue runner / decay analysis can later diff
+        # snapshots across checkpoints to verify the cascade mechanism.
+        cur = conn.execute(
+            "SELECT COALESCE(MAX(checkpoint), 0) + 1 FROM checkpoint_meta"
+        )
+        new_checkpoint = cur.fetchone()[0]
+        built_at = time.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+        conn.execute(
+            "INSERT INTO checkpoint_meta(checkpoint, built_at, vault_root, "
+            "note_count, purpose) VALUES(?, ?, ?, ?, ?)",
+            (new_checkpoint, built_at, str(vault), len(records), "routine"),
+        )
+        snapshot_cur = conn.execute(
+            "SELECT slug, access_count, speaking_accessed_at FROM note_metrics"
+        )
+        for slug, ac, sa in snapshot_cur.fetchall():
+            conn.execute(
+                "INSERT INTO checkpoint_snapshots(checkpoint, slug, access_count, "
+                "speaking_accessed_at) VALUES(?, ?, ?, ?)",
+                (new_checkpoint, slug, ac, sa),
+            )
+
         conn.execute(
             "INSERT INTO meta(schema_version, built_at, vault_root, note_count) VALUES(?, ?, ?, ?)",
             (
                 SCHEMA_VERSION,
-                time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+                built_at,
                 str(vault),
                 len(records),
             ),
@@ -405,12 +524,11 @@ def build(vault: Path, db_path: Path) -> dict:
         "unresolved_links": unresolved_count,
         "elapsed_seconds": round(elapsed, 3),
         "db_path": str(db_path),
+        "checkpoint": new_checkpoint,
     }
 
 
-def _resolve_cozylobe_paths(
-    vault: Path | None, db: Path | None
-) -> tuple[Path, Path]:
+def _resolve_cozylobe_paths(vault: Path | None, db: Path | None) -> tuple[Path, Path]:
     """Pick the cozylobe-cortex vault + db paths for ``--cozylobe`` runs.
 
     Precedence:
