@@ -2441,6 +2441,52 @@ def test_decay_coverage_pool_shrinks_by_fitness_count(tmp_path: Path) -> None:
     assert result["total_decayed_notes"] == 2
 
 
+def test_decay_coverage_excludes_decisions_folder(tmp_path: Path) -> None:
+    """An old, zero-access ADR in decisions/ must not enter the decay pool —
+    decisions are read-once-then-referenced by design, low access_count is
+    expected. Same exclusion pattern as gh-state/."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "decisions" / "adopt-uv.md",
+        """
+        ---
+        slug: adopt-uv
+        created: 2026-04-01
+        access_count: 0
+        ---
+        Decision: adopt uv for python packaging.
+        """,
+    )
+    result = compute_decay_coverage(
+        vault, today=_TODAY, activation_date=_ACTIVATION
+    )
+    assert result["total_decayed_notes"] == 0
+    assert result["by_domain"] == {}
+
+
+def test_decay_coverage_excludes_feedback_folder(tmp_path: Path) -> None:
+    """An old, zero-access feedback note must not enter the decay pool —
+    feedback is one-time observations that shape future behavior without
+    re-query. Same exclusion pattern as gh-state/."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "feedback" / "signal-formatting.md",
+        """
+        ---
+        slug: signal-formatting
+        created: 2026-04-01
+        access_count: 0
+        ---
+        Don't use bullet lists in Signal messages.
+        """,
+    )
+    result = compute_decay_coverage(
+        vault, today=_TODAY, activation_date=_ACTIVATION
+    )
+    assert result["total_decayed_notes"] == 0
+    assert result["by_domain"] == {}
+
+
 # ---------------------------------------------------------------------------
 # Continuous structural-health checks
 # Design: [[2026-05-20-continuous-structural-health-check]] (Task 1).

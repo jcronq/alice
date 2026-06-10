@@ -755,9 +755,15 @@ DECAY_COVERAGE_ACTIVATION_DATE = "2026-05-06"
 # vault scaffolding; archive/ is intentionally cold storage. gh-state
 # holds GitHub issue/PR state-mirror notes — operational records with
 # 0 trigger_keywords by design, so the cue runner is never expected to
-# surface them. Counting them in the decayed pool would depress the
+# surface them. decisions/ holds ADRs that are read once at the time of
+# the decision and then referenced sparsely on revisit; feedback/ holds
+# one-time system observations that shape future behavior without
+# re-query. All five categories are intentionally low-access, not
+# decayed — counting them in the decayed pool would depress the
 # coverage signal with notes that nobody is supposed to be reading.
-_DECAY_EXCLUDED_FOLDERS = frozenset({"dailies", "archive", "gh-state"})
+_DECAY_EXCLUDED_FOLDERS = frozenset(
+    {"dailies", "archive", "gh-state", "decisions", "feedback"}
+)
 
 
 def _parse_access_count(raw: Any) -> int | None:

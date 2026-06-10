@@ -926,9 +926,15 @@ DEFAULT_DECAY_WINDOW_DAYS = 7
 
 #: Top-level vault folders excluded from the decay pass — dailies are
 #: time-bound by design, archive/ is the destination, gh-state is
-#: auto-mirrored data with its own lifecycle. Mirrors stage_c's
-#: ``_EXCLUDED_TOP_DIRS``.
-_DECAY_EXCLUDED_TOP_DIRS = frozenset({"dailies", "archive", "gh-state"})
+#: auto-mirrored data with its own lifecycle, decisions/ are ADRs that
+#: are read-once-then-referenced (intentionally low access_count), and
+#: feedback/ holds one-time system observations that shape future
+#: behavior without re-query. All five are low-access by design, not
+#: by neglect — decaying them would produce false-positive archival
+#: candidates. Mirrors stage_c's ``_EXCLUDED_TOP_DIRS``.
+_DECAY_EXCLUDED_TOP_DIRS = frozenset(
+    {"dailies", "archive", "gh-state", "decisions", "feedback"}
+)
 
 #: Fitness domain notes are fixed-schedule skill-path writes, not
 #: behavioral decay. See ``2026-06-03-fitness-domain-decay-false-alarm``.
