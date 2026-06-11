@@ -73,6 +73,27 @@ WAKE_COUNT_THRESHOLD = 8
 # ``index.md`` / ``README.md`` are vault scaffolding.
 EXCLUDED_NAMES = frozenset({"index.md", "README.md", "unresolved.md"})
 
+# Phase 1 of the structural monitoring design: ADR template-adherence
+# scoring. Each canonical ADR is expected to carry these five top-level
+# ``##`` sections with at least 20 words of content each. ``compute_
+# template_adherence`` scores adherence as the fraction of sections that
+# meet both gates. ADR-only by intent — pilots a two-axis health model
+# (structure × content) before generalizing to other note_types.
+ADR_SCHEMA = ["Context", "Decision", "Alternatives considered", "Consequences", "Related findings"]
+
+# Minimum words a section body needs to count as "present" for template
+# adherence. Below this we treat the heading as a stub — structurally
+# present but empty. Twenty is the same floor stage_d uses for its
+# investigation-completeness check.
+_TEMPLATE_ADHERENCE_MIN_WORDS = 20
+
+# Adherence at or below this counts as a flagged ADR in the aggregate
+# ``below_threshold`` metric. 0.8 == "4 of 5 sections minimum"; matches
+# the design note's recommended floor. The comparison is ``<=`` so an
+# ADR that meets the bare minimum still surfaces for review — only
+# strictly-above-floor adherence is treated as healthy.
+_ADR_ADHERENCE_THRESHOLD = 0.8
+
 # HTML comments can hide wikilink-shaped tokens (``<!-- [[foo]] -->``)
 # that shouldn't count as broken links. ``yaml_lite._strip_code``
 # already strips fenced blocks and inline code spans; HTML comments are
@@ -1002,6 +1023,88 @@ def compute_decay_coverage(
         "activation_date": activation_date,
         "by_domain": domain_payload,
     }
+
+
+def compute_template_adherence(note_path: Path, schema: list[str]) -> float:
+    """Score a note against a list of expected ``##`` section headings.
+
+    Returns a value in ``[0.0, 1.0]``: the fraction of ``schema`` sections
+    that are BOTH structurally present (a ``## <name>`` heading exists)
+    AND have at least ``_TEMPLATE_ADHERENCE_MIN_WORDS`` words of body
+    content between that heading and the next ``##`` heading (or EOF).
+
+    The two-gate design is deliberate. Counting "heading exists" alone
+    would reward stubs — a note can drop the five canonical ADR headings
+    and leave each body blank. The content gate is the second axis of
+    the structural-monitoring design (structure × content).
+
+    Edge cases:
+    - Empty schema → ``1.0`` (vacuously adherent).
+    - File unreadable → ``0.0`` (treat the same as fully non-adherent).
+    - Frontmatter is stripped before scanning, so a ``##`` heading inside
+      the frontmatter block can't false-positive.
+    """
+    if not schema:
+        return 1.0
+
+    try:
+        text = note_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return 0.0
+
+    _fm, body = split_frontmatter(text)
+
+    found = 0
+    for section in schema:
+        heading_re = re.compile(
+            rf"^##\s+{re.escape(section)}\s*$", re.MULTILINE
+        )
+        heading_match = heading_re.search(body)
+        if heading_match is None:
+            continue
+        # Find the next top-level ``##`` heading after this one (or EOF).
+        # ``##`` matches both ``## Foo`` and ``### Foo``; require a word
+        # boundary so subsections don't terminate the parent body.
+        next_heading_re = re.compile(r"^##\s+\S", re.MULTILINE)
+        next_match = next_heading_re.search(body, heading_match.end())
+        section_body = body[heading_match.end(): next_match.start() if next_match else len(body)]
+        if len(section_body.split()) >= _TEMPLATE_ADHERENCE_MIN_WORDS:
+            found += 1
+
+    return found / len(schema)
+
+
+def _aggregate_adr_template_adherence(vault_dir: Path) -> dict[str, Any]:
+    """Aggregate ``compute_template_adherence`` over every ADR-typed note.
+
+    Filters by frontmatter ``note_type == "adr"`` using the same parsing
+    style as the rest of the module. Returns a strictly-additive payload
+    for the ``vault_health`` event:
+
+    ``{avg, count, below_threshold}`` where ``avg`` is the mean adherence
+    across all ADR notes (``0.0`` when count is zero — explicit instead of
+    NaN so downstream consumers don't crash), and ``below_threshold`` is
+    the count of ADRs scoring under ``_ADR_ADHERENCE_THRESHOLD``.
+
+    Phase 1 of the structural-monitoring design: ADR-only on purpose.
+    """
+    scores: list[float] = []
+    for md in _iter_notes(vault_dir):
+        text = _read_text(md)
+        if not text:
+            continue
+        fm, _body = split_frontmatter(text)
+        note_type = str(fm.get("note_type") or "").strip().lower()
+        if note_type != "adr":
+            continue
+        scores.append(compute_template_adherence(md, ADR_SCHEMA))
+
+    count = len(scores)
+    if count == 0:
+        return {"avg": 0.0, "count": 0, "below_threshold": 0}
+    avg = sum(scores) / count
+    below = sum(1 for s in scores if s <= _ADR_ADHERENCE_THRESHOLD)
+    return {"avg": avg, "count": count, "below_threshold": below}
 
 
 # ---------------------------------------------------------------------------
@@ -2014,6 +2117,13 @@ def build_vault_health_event(
         "research_decay_count": count_research_decay(vault_dir),
         "decay_coverage": compute_decay_coverage(vault_dir, today=today_midnight),
         "access_decay": count_access_decay(vault_dir),
+        # Phase 1 of the structural-monitoring design — ADR-only by
+        # intent. See ``compute_template_adherence`` for the per-note
+        # scoring rule and ``_aggregate_adr_template_adherence`` for the
+        # aggregate shape. Strictly additive; existing fields unchanged.
+        "template_adherence": {
+            "adr": _aggregate_adr_template_adherence(vault_dir),
+        },
     }
 
     # Recovery state uses a 14-day rolling window ending today.
@@ -2335,6 +2445,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # Behavioral decay: notes with zero access older than 5 days.
     out["access_decay"] = count_access_decay(args.vault)
+
+    # ADR template-adherence (Phase 1 of the structural-monitoring
+    # design). Strictly additive; existing fields are unchanged.
+    out["template_adherence"] = {
+        "adr": _aggregate_adr_template_adherence(args.vault),
+    }
 
     if args.thoughts and args.window_start and args.window_end:
         out["wake_type_distribution"] = count_wakes_by_stage(

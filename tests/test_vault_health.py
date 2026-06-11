@@ -24,10 +24,12 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from metrics.vault_health import (
+    ADR_SCHEMA,
     _sleep_window_closed,
     build_vault_health_event,
     compute_continuous_checks,
     compute_decay_coverage,
+    compute_template_adherence,
     count_broken_wikilinks,
     count_inbound_links,
     count_orphans,
@@ -1497,6 +1499,7 @@ REQUIRED_EVENT_FIELDS = {
     "decay_coverage",
     "shadow_orphan_count",
     "truly_dark_count",
+    "template_adherence",
 }
 
 
@@ -2975,3 +2978,194 @@ def test_build_event_flags_window_closed_at_0900_no_spurious_drought(
     )
     assert event["sleep_window_closed"] is True
     assert "wake_type_distribution" in event
+
+
+# ---------------------------------------------------------------------------
+# Template adherence: Phase 1 of the structural-monitoring design
+# ADR-only. Scores ``## Section`` heading presence + ≥20-word content.
+# ---------------------------------------------------------------------------
+
+
+_ADR_BODY_FULL = dedent(
+    """\
+    ---
+    note_type: adr
+    created: 2026-06-01
+    ---
+
+    # Some ADR
+
+    ## Context
+    The blue/green worker architecture grew out of a need to roll out
+    Stage D experiments without downtime on the active worker. Both
+    workers share the same vault directory but write to disjoint
+    surface paths so reconciliation is trivial.
+
+    ## Decision
+    We will run two worker processes side by side. The active worker
+    drains the inbox while the standby tails the same notes for
+    shadowing. Promotion is a single env-var flip in supervisor config.
+
+    ## Alternatives considered
+    A single-worker with rolling restart was attempted in May but caused
+    every restart to lose between three and seven inbox notes because
+    the consume-then-delete loop was not crash-safe across signals.
+
+    ## Consequences
+    Operational complexity is roughly doubled, but the loss of inbox
+    notes during deploys is eliminated. The standby worker also serves
+    as a near-zero-cost canary for new memory-grooming heuristics.
+
+    ## Related findings
+    The cluster-pair selector experiment from late May validated the
+    blue-green substrate by running the two heuristics in parallel for
+    eleven days before promotion. See also the tag-disjoint pairing note.
+    """
+)
+
+
+def test_compute_template_adherence_all_sections_present(tmp_path: Path) -> None:
+    note = tmp_path / "adr-full.md"
+    note.write_text(_ADR_BODY_FULL, encoding="utf-8")
+    score = compute_template_adherence(note, ADR_SCHEMA)
+    assert score == 1.0
+
+
+def test_compute_template_adherence_missing_one_section(tmp_path: Path) -> None:
+    # Strip the ``## Related findings`` section to drop one of five.
+    truncated = _ADR_BODY_FULL.split("## Related findings", 1)[0]
+    note = tmp_path / "adr-missing-one.md"
+    note.write_text(truncated, encoding="utf-8")
+    score = compute_template_adherence(note, ADR_SCHEMA)
+    assert score == pytest.approx(0.8)
+
+
+def test_compute_template_adherence_section_present_but_empty_doesnt_count(
+    tmp_path: Path,
+) -> None:
+    # All 5 headings present, but the last has a one-word body. The
+    # content gate (≥20 words) should refuse to count it, giving 4/5.
+    body = dedent(
+        """\
+        ---
+        note_type: adr
+        created: 2026-06-01
+        ---
+
+        ## Context
+        The blue/green worker architecture grew out of a need to roll out
+        Stage D experiments without downtime on the active worker. Both
+        workers share the same vault directory but write to disjoint
+        surface paths so reconciliation is trivial.
+
+        ## Decision
+        We will run two worker processes side by side. The active worker
+        drains the inbox while the standby tails the same notes for
+        shadowing. Promotion is a single env-var flip in supervisor config.
+
+        ## Alternatives considered
+        A single-worker with rolling restart was attempted in May but caused
+        every restart to lose between three and seven inbox notes because
+        the consume-then-delete loop was not crash-safe across signals.
+
+        ## Consequences
+        Operational complexity is roughly doubled, but the loss of inbox
+        notes during deploys is eliminated. The standby worker also serves
+        as a near-zero-cost canary for new memory-grooming heuristics.
+
+        ## Related findings
+        TODO.
+        """
+    )
+    note = tmp_path / "adr-stub-section.md"
+    note.write_text(body, encoding="utf-8")
+    score = compute_template_adherence(note, ADR_SCHEMA)
+    assert score == pytest.approx(0.8)
+
+
+def test_compute_template_adherence_empty_schema_returns_1(tmp_path: Path) -> None:
+    note = tmp_path / "anything.md"
+    note.write_text("Whatever.", encoding="utf-8")
+    assert compute_template_adherence(note, []) == 1.0
+
+
+def test_compute_template_adherence_unreadable_file_returns_0(tmp_path: Path) -> None:
+    # File that doesn't exist on disk → OSError on read → 0.0.
+    ghost = tmp_path / "does-not-exist.md"
+    assert compute_template_adherence(ghost, ADR_SCHEMA) == 0.0
+
+
+def test_vault_health_emits_adr_template_adherence_field(tmp_path: Path) -> None:
+    """Integration: build a tiny vault with two ADRs (one perfect, one
+    missing a section), then assert the event aggregate matches."""
+    vault = _make_vault(tmp_path)
+    (vault / "decisions").mkdir()
+
+    # Perfect ADR — all 5 sections, all bodies > 20 words.
+    (vault / "decisions" / "adr-perfect.md").write_text(
+        _ADR_BODY_FULL, encoding="utf-8"
+    )
+    # Missing-one ADR — same body but with the ``## Related findings``
+    # section sliced off. Scores 4/5 = 0.8.
+    truncated = _ADR_BODY_FULL.split("## Related findings", 1)[0]
+    (vault / "decisions" / "adr-missing.md").write_text(
+        truncated, encoding="utf-8"
+    )
+    # A non-ADR note that must not pollute the aggregate.
+    (vault / "research" / "unrelated.md").write_text(
+        dedent(
+            """\
+            ---
+            note_type: research
+            created: 2026-06-01
+            ---
+
+            ## Context
+            Not an ADR — should be excluded from the ADR-only aggregate
+            regardless of how many template sections it happens to carry.
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    event = build_vault_health_event(
+        vault_dir=vault,
+        thoughts_dir=thoughts,
+        events_path=events,
+        surface_dir=surface,
+    )
+    adr = event["template_adherence"]["adr"]
+    assert adr["count"] == 2
+    assert adr["avg"] == pytest.approx(0.9)  # (1.0 + 0.8) / 2
+    # ``below_threshold`` uses ``score <= threshold`` so an ADR meeting
+    # the bare minimum (4 of 5 sections) still surfaces for review.
+    assert adr["below_threshold"] == 1
+
+
+def test_vault_health_template_adherence_handles_empty_vault(tmp_path: Path) -> None:
+    """No ADR notes → ``{avg: 0.0, count: 0, below_threshold: 0}`` rather
+    than crashing on a zero-division."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    event = build_vault_health_event(
+        vault_dir=vault,
+        thoughts_dir=thoughts,
+        events_path=events,
+        surface_dir=surface,
+    )
+    assert event["template_adherence"]["adr"] == {
+        "avg": 0.0,
+        "count": 0,
+        "below_threshold": 0,
+    }
