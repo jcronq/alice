@@ -1557,7 +1557,10 @@ def test_cli_check_existing_noops_when_event_exists(tmp_path: Path) -> None:
     surface = tmp_path / "surface"
     surface.mkdir()
     events = tmp_path / "events.jsonl"
-    today = datetime.now().strftime("%Y-%m-%d")
+    # Use _local_now() (not datetime.now()) so the event date matches
+    # the date the CLI computes — avoids UTC/EDT desync in CI.
+    from metrics.vault_health import _local_now
+    today = _local_now().strftime("%Y-%m-%d")
     events.write_text(
         json.dumps({"type": "vault_health", "date": today}) + "\n",
         encoding="utf-8",
@@ -2705,13 +2708,20 @@ def test_low_wake_count_not_tagged_when_at_or_above_threshold(
     events = tmp_path / "events.jsonl"
 
     # 16 total wakes — the floor MIN_WAKE_PERIOD guarantees.
-    _seed_wakes_for_morning_window(thoughts, b=8, c=4, d=4)
+    # Pass now=fake_now so _seed_wakes_for_morning_window uses the same
+    # date as _local_now() inside build_vault_health_event. Without this,
+    # datetime.now() (UTC) and _local_now() (EDT) desync during the
+    # 04:00–07:59 UTC window, writing wakes to the wrong directory.
+    from metrics.vault_health import _local_now
+    fake_now = _local_now()
+    _seed_wakes_for_morning_window(thoughts, b=8, c=4, d=4, now=fake_now)
 
     event = build_vault_health_event(
         vault_dir=vault,
         thoughts_dir=thoughts,
         events_path=events,
         surface_dir=surface,
+        now=fake_now,
     )
 
     assert event.get("low_wake_count") is None or event["low_wake_count"] is False
