@@ -71,6 +71,7 @@ from indexer.yaml_lite import split_frontmatter
 
 from alice_thinking import vault_lock
 
+from . import decay_scoring
 from . import journal as journal_mod
 
 
@@ -391,13 +392,27 @@ def _count_broken_wikilinks(vault: pathlib.Path) -> int:
 
 
 def _count_decayed_in_window(vault: pathlib.Path, today: datetime.date) -> int:
-    """Decayed = ``last_accessed`` older than :data:`DECAY_WINDOW_DAYS`
-    AND ``access_count <= 1``. Approximates the design's tier R3-R4
-    decay-backlog signal using only fields already on every note.
+    """Count decayed groomable notes using the multi-signal scoring
+    function.
+
+    A note is decayed when its decay score >= :data:`~decay_scoring.DECAY_THRESHOLD`
+    (0.25). The scoring combines behavioral access (S_access), structural
+    connectivity (S_struct), organic connectivity (S_organic), and age
+    (age_factor).
+
+    An optional 7-day ``last_accessed`` pre-filter (gate) excludes notes
+    accessed recently — they are almost certainly not decayed and scoring
+    them wastes I/O. The gate is an optimization, not a correctness
+    requirement; the multi-signal formula handles recency via S_access.
 
     Counts groomable notes (excludes dailies/archive/gh-state)."""
     cutoff = today - datetime.timedelta(days=DECAY_WINDOW_DAYS)
     cutoff_str = cutoff.isoformat()
+
+    # Precompute the scoring context (single DB query).
+    index_db = vault.parent / "inner" / "state" / "cortex-index.db"
+    ctx = decay_scoring.build_context(index_db)
+
     n = 0
     for md in _iter_groomable_notes(vault):
         try:
@@ -407,19 +422,32 @@ def _count_decayed_in_window(vault: pathlib.Path, today: datetime.date) -> int:
         fm, _body = split_frontmatter(text)
         la = fm.get("last_accessed")
         ac = fm.get("access_count")
-        if la is None:
-            continue
-        la_str = str(la).strip()
-        if len(la_str) < 10:
-            continue
-        if la_str[:10] >= cutoff_str:
-            continue
-        # Inside the decay window — check access count.
+        created = fm.get("created")
+        slug = fm.get("slug")
+
+        # --- last_accessed gate (optimization) ---
+        if la is not None:
+            la_str = str(la).strip()
+            if len(la_str) >= 10 and la_str[:10] >= cutoff_str:
+                continue
+
+        # --- access_count fallback for gate ---
         try:
             ac_int = int(ac) if ac is not None else 0
         except (TypeError, ValueError):
             ac_int = 0
-        if ac_int <= 1:
+
+        # --- multi-signal decay score ---
+        try:
+            score = decay_scoring.decay_score_for(
+                ctx, slug, ac_int, created
+            )
+        except Exception:
+            # If scoring fails for a note, fall back to the old simple
+            # check so we don't silently miss a decayed note.
+            score = 1.0 if ac_int <= 1 else 0.0
+
+        if score >= decay_scoring.DECAY_THRESHOLD:
             n += 1
     return n
 

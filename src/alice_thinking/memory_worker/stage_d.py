@@ -91,6 +91,7 @@ from indexer.yaml_lite import split_frontmatter
 
 from alice_thinking import vault_lock
 
+from . import decay_scoring
 from . import journal as journal_mod
 
 
@@ -1041,18 +1042,25 @@ def _iter_decayed_notes(
     *,
     window_days: int,
 ) -> list[pathlib.Path]:
-    """All groomable notes whose ``last_accessed`` is older than the
-    decay window AND whose ``access_count`` is <=1.
+    """All groomable notes whose decay score >= threshold.
 
-    Excludes ``dailies/``, ``archive/``, ``gh-state/``, and dotfiles —
-    same filter Stage C uses for its decay count, so the two stages see
-    the same population.
+    Uses the multi-signal scoring function (access + structural + organic
+    + age) instead of the old single-axis ``last_accessed`` + ``access_count``
+    check. The 7-day ``last_accessed`` gate is preserved as an optimization.
+
+    Excludes ``dailies/``, ``archive/``, ``gh-state/``, and dotfiles.
+    Returns notes sorted by decay score descending (most decayed first).
     """
     if not vault.is_dir():
         return []
     cutoff = today - datetime.timedelta(days=window_days)
     cutoff_str = cutoff.isoformat()
-    out: list[pathlib.Path] = []
+
+    # Precompute scoring context (single DB query).
+    index_db = vault.parent / "inner" / "state" / "cortex-index.db"
+    ctx = decay_scoring.build_context(index_db)
+
+    scored: list[tuple[float, pathlib.Path]] = []
     for md in vault.rglob("*.md"):
         rel = md.relative_to(vault).parts
         if not rel or rel[0] in _DECAY_EXCLUDED_TOP_DIRS:
@@ -1065,20 +1073,33 @@ def _iter_decayed_notes(
             continue
         fm, _body = split_frontmatter(text)
         la = fm.get("last_accessed")
-        if la is None:
-            continue
-        la_str = str(la).strip()
-        if len(la_str) < 10 or la_str[:10] >= cutoff_str:
-            continue
+
+        # --- last_accessed gate (optimization) ---
+        if la is not None:
+            la_str = str(la).strip()
+            if len(la_str) >= 10 and la_str[:10] >= cutoff_str:
+                continue
+
+        slug = fm.get("slug")
+        created = fm.get("created")
         try:
             ac = int(fm.get("access_count") or 0)
         except (TypeError, ValueError):
             ac = 0
-        if ac > 1:
-            continue
-        out.append(md)
-    out.sort()
-    return out
+
+        try:
+            score = decay_scoring.decay_score_for(
+                ctx, slug, ac, created
+            )
+        except Exception:
+            # Fall back to old simple check on scoring failure.
+            score = 1.0 if ac <= 1 else 0.0
+
+        if score >= decay_scoring.DECAY_THRESHOLD:
+            scored.append((score, md))
+
+    scored.sort(key=lambda x: -x[0])
+    return [md for _, md in scored]
 
 
 def _is_archive_eligible(fm: dict[str, Any], body: str) -> bool:
