@@ -153,6 +153,14 @@ services:
       # entrypoint symlinks .credentials.json into its expected
       # location.
       - ${HOME}/.claude:/host-claude:ro
+      # Host's Codex config — mounted read-only so the entrypoint's
+      # codex-to-pi-auth bridge can translate ~/.codex/auth.json into
+      # ~/alice/.pi/agent/auth.json. The host runs `codex login` (device-
+      # auth flow) to populate ~/.codex/auth.json; without this mount the
+      # entrypoint's `-d /host-codex` check fails fast and pi backends
+      # are unavailable (Anthropic-side functionality unaffected). Empty
+      # source directory is tolerated — the bridge fail-softs.
+      - ${HOME}/.codex:/host-codex:ro
       - ${HOME}/.config/alice:/home/alice/.config/alice:ro
       - ${HOME}/.config/gh:/home/alice/.config/gh:ro
       - ${HOME}/.ssh:/home/alice/.ssh:ro
