@@ -266,7 +266,12 @@ def write_note_atomic(repo: str, number: int, item: dict) -> None:
         )
     else:  # PR
         state = item.get("state", "open")
-        merged = item.get("merged", False)
+        # gh CLI deprecated and removed the `merged` boolean field; the
+        # replacement `mergedAt` is None for unmerged PRs and an ISO
+        # timestamp once a merge has happened. We keep the internal
+        # `merged` boolean shape so downstream consumers and frontmatter
+        # readers don't have to change.
+        merged = item.get("mergedAt") is not None
         draft = item.get("isDraft", False)
         base_branch = item.get("baseRefName", "unknown")
         title = item.get("title", "").strip()
@@ -329,7 +334,7 @@ def main() -> None:
         try:
             prs_json = gh(
                 "pr", "list", "--repo", repo, "--state", "open",
-                "--json", "number,title,state,isDraft,merged,baseRefName,updatedAt,createdAt"
+                "--json", "number,title,state,isDraft,mergedAt,baseRefName,updatedAt,createdAt"
             )
             prs = json.loads(prs_json)
         except (RuntimeError, json.JSONDecodeError) as e:

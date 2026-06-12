@@ -500,3 +500,64 @@ def test_dispatcher_read_path_skip_when_dispatched_inflight(
     assert gh_state_mirror.is_dispatched_inflight(repo, number) is False
     gh_state_mirror.write_dispatched_inflight(repo, number, "bg-xyz")
     assert gh_state_mirror.is_dispatched_inflight(repo, number) is True
+
+
+# ─── PR merged-field parsing (gh CLI mergedAt migration) ──────────────
+#
+# The gh CLI deprecated and removed the `merged` boolean field on
+# `pr list --json`; the replacement is `mergedAt` — None when the PR
+# isn't merged, an ISO timestamp when it is. The parser now derives
+# our internal `merged` boolean from `mergedAt is not None`. These
+# tests pin both branches so a future gh CLI shape regression is loud.
+
+
+def test_write_note_atomic_pr_merged_true_when_mergedAt_present(
+    gh_state_dir: Path,
+) -> None:
+    """gh returns ``mergedAt`` as an ISO timestamp once a PR is merged.
+    The mirror must record ``merged: true`` in the frontmatter."""
+    gh_state_mirror.write_note_atomic(
+        "jcronq/alice",
+        501,
+        {
+            "_type": "pr",
+            "state": "closed",
+            "mergedAt": "2026-01-01T00:00:00Z",
+            "isDraft": False,
+            "baseRefName": "master",
+            "title": "merged PR",
+            "createdAt": "2025-12-31T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+        },
+    )
+    note = gh_state_dir / "jcronq/alice-501.md"
+    assert note.exists()
+    text = note.read_text()
+    assert "merged: true\n" in text
+    assert "Merged: true." in text
+
+
+def test_write_note_atomic_pr_merged_false_when_mergedAt_none(
+    gh_state_dir: Path,
+) -> None:
+    """gh returns ``mergedAt: null`` for an open / unmerged PR. The
+    mirror must record ``merged: false`` in the frontmatter."""
+    gh_state_mirror.write_note_atomic(
+        "jcronq/alice",
+        502,
+        {
+            "_type": "pr",
+            "state": "open",
+            "mergedAt": None,
+            "isDraft": False,
+            "baseRefName": "master",
+            "title": "open PR",
+            "createdAt": "2026-05-19T00:00:00Z",
+            "updatedAt": "2026-05-19T00:00:00Z",
+        },
+    )
+    note = gh_state_dir / "jcronq/alice-502.md"
+    assert note.exists()
+    text = note.read_text()
+    assert "merged: false\n" in text
+    assert "Merged: false." in text

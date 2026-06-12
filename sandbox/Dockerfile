@@ -177,6 +177,7 @@ COPY sandbox/s6/alice-autopush/         /etc/s6-overlay/s6-rc.d/alice-autopush/
 COPY sandbox/s6/alice-embedder/         /etc/s6-overlay/s6-rc.d/alice-embedder/
 COPY sandbox/s6/alice-face-caption/     /etc/s6-overlay/s6-rc.d/alice-face-caption/
 COPY sandbox/s6/alice-gh-reconciler/    /etc/s6-overlay/s6-rc.d/alice-gh-reconciler/
+COPY sandbox/s6/alice-gh-state-mirror/  /etc/s6-overlay/s6-rc.d/alice-gh-state-mirror/
 COPY sandbox/s6/alice-gh-watcher/       /etc/s6-overlay/s6-rc.d/alice-gh-watcher/
 COPY sandbox/s6/alice-reload-watcher/   /etc/s6-overlay/s6-rc.d/alice-reload-watcher/
 COPY sandbox/s6/alice-repo-autopull/    /etc/s6-overlay/s6-rc.d/alice-repo-autopull/
@@ -196,6 +197,7 @@ COPY sandbox/s6/user/contents.d/alice-autopush                  /etc/s6-overlay/
 COPY sandbox/s6/user/contents.d/alice-embedder                  /etc/s6-overlay/s6-rc.d/user/contents.d/alice-embedder
 COPY sandbox/s6/user/contents.d/alice-face-caption              /etc/s6-overlay/s6-rc.d/user/contents.d/alice-face-caption
 COPY sandbox/s6/user/contents.d/alice-gh-reconciler             /etc/s6-overlay/s6-rc.d/user/contents.d/alice-gh-reconciler
+COPY sandbox/s6/user/contents.d/alice-gh-state-mirror           /etc/s6-overlay/s6-rc.d/user/contents.d/alice-gh-state-mirror
 COPY sandbox/s6/user/contents.d/alice-gh-watcher                /etc/s6-overlay/s6-rc.d/user/contents.d/alice-gh-watcher
 COPY sandbox/s6/user/contents.d/alice-reload-watcher            /etc/s6-overlay/s6-rc.d/user/contents.d/alice-reload-watcher
 COPY sandbox/s6/user/contents.d/alice-repo-autopull             /etc/s6-overlay/s6-rc.d/user/contents.d/alice-repo-autopull

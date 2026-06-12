@@ -1,0 +1,55 @@
+#!/command/with-contenv bash
+# alice-gh-state-mirror — timer loop that runs the gh_state_mirror
+# script, which polls watched GitHub repos and writes thin
+# type:issue / type:pr notes into ~/alice-mind/cortex-memory/gh-state/
+# so thinking has visibility into in-flight PRs and open issues.
+#
+# Singleton via `flock -n` so a slow poll can't double-fire.
+#
+# Cadence is read from alice.config.json `gh_state_mirror.poll_interval_seconds`
+# on each cycle (live reconfig, no restart needed). Default: 900s (15 min),
+# floor 60s — same shape as alice-gh-watcher / alice-gh-reconciler.
+set -e
+
+LOCK=/state/worker/gh-state-mirror.lock
+CONFIG_JSON=/home/alice/alice-mind/config/alice.config.json
+DEFAULT_INTERVAL=900
+
+mkdir -p "$(dirname "$LOCK")"
+touch "$LOCK"
+chown alice:alice "$LOCK" || true
+
+# Stagger startup so the mirror, reconciler, dispatcher, and gh-watcher
+# don't all wake up in lockstep when the worker boots. 75s lands
+# between gh-watcher (30s) and gh-reconciler (60s).
+sleep 75
+
+while true; do
+    interval="$DEFAULT_INTERVAL"
+    if [ -f "$CONFIG_JSON" ] && command -v jq >/dev/null 2>&1; then
+        v=$(jq -r '.gh_state_mirror.poll_interval_seconds // empty' "$CONFIG_JSON" 2>/dev/null || true)
+        case "$v" in
+            ''|*[!0-9]*) ;;
+            *) interval="$v" ;;
+        esac
+    fi
+    if [ "$interval" -lt 60 ]; then
+        # Polling faster than once a minute would burn rate limit and
+        # GitHub's secondary-rate-limit thresholds — same reasoning as
+        # alice-gh-watcher.
+        interval=60
+    fi
+
+    start_ts=$(date +%s)
+    # redirfd (execline) opens fd 2 after the privilege drop so the log
+    # file is owned by alice; shell `2>>` would open it as the
+    # supervising root shell.
+    flock -n "$LOCK" s6-setuidgid alice redirfd -a 2 /state/worker/gh-state-mirror-stderr.log \
+        /opt/alice-venv/bin/python -m alice_forge.gh_state_mirror || true
+    end_ts=$(date +%s)
+    elapsed=$(( end_ts - start_ts ))
+    remainder=$(( interval - elapsed ))
+    if [ "$remainder" -gt 0 ]; then
+        sleep "$remainder"
+    fi
+done
