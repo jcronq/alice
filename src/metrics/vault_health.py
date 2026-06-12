@@ -30,7 +30,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import re
+import sqlite3
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -45,6 +47,7 @@ from metrics.pagerank_metric import compute_weighted_sum, tier_counts
 # skips these notes during decay synthesis (see ``_is_fitness_domain`` and
 # ``FITNESS_TAGS`` in stage_d). vault_health imports the same predicate so
 # the two views of the decay pool cannot drift apart.
+from alice_thinking.memory_worker.correction_cascade import detect_corrections
 from alice_thinking.memory_worker.stage_d import _is_fitness_domain
 
 logger = logging.getLogger(__name__)
@@ -752,6 +755,216 @@ def count_access_decay(
         decay_count += 1
 
     return decay_count
+
+
+def _count_correction_cascades(vault_dir: Path) -> dict[str, int]:
+    """Run correction cascade detection and return summary counts.
+
+    Finds all unpropagated corrections (notes that reference a corrected
+    note but not the correction note itself) and returns counts by severity.
+
+    Returns a dict with keys: ``correction_pairs_checked``,
+    ``total_unpropagated``, ``high``, ``medium``, ``low``.
+
+    Gated on import failure — if the correction_cascade module isn't
+    available, returns zeros silently.
+    """
+    try:
+        report = detect_corrections(vault_dir.parent)
+        return {
+            "correction_pairs_checked": report.correction_pairs_checked,
+            "total_unpropagated": report.total_unpropagated,
+            "high": report.high_count,
+            "medium": report.medium_count,
+            "low": report.low_count,
+        }
+    except Exception:
+        # Module import failure or detection error — don't block the event.
+        logger.warning(
+            "vault_health: correction_cascade detection failed, returning zeros",
+            exc_info=True,
+        )
+        return {
+            "correction_pairs_checked": 0,
+            "total_unpropagated": 0,
+            "high": 0,
+            "medium": 0,
+            "low": 0,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Continuous decay scoring
+# Design: [[decay-phase-2-implementation-spec]] + [[decay-recency-exemption]]
+# ---------------------------------------------------------------------------
+
+# Index path — same location the cue runner and thinking services use.
+_INDEX_PATH = Path("/home/alice/alice-mind/inner/state/cortex-index.db")
+
+# Phase A folder resistance constants.
+# Primary stability signal — folders with higher values resist decay longer.
+_FOLDER_RESISTANCE: dict[str, float] = {
+    "archive": 1.0,
+    "dailies": 0.80,
+    "gh-state": 0.95,
+    "decisions": 0.90,
+    "feedback": 0.85,
+    "reference": 0.75,
+    "projects": 0.30,
+    "research": 0.70,
+    "conflicts": 0.50,
+    "sources": 0.60,
+    "people": 0.80,
+    "experiments": 0.0,
+    "tools": 0.0,
+}
+
+# Access weight by folder category — controls how much access_count
+# reduces the decay score. Transient folders get zero weight because
+# repeated access is expected there and shouldn't mask decay.
+_ACCESS_WEIGHT: dict[str, float] = {
+    "reference": 0.25, "projects": 0.25,
+    "decisions": 0.25, "people": 0.25, "feedback": 0.25,
+    "research": 0.10,
+    "dailies": 0.0, "gh-state": 0.0, "experiments": 0.0, "conflicts": 0.0,
+}
+
+
+def _query_all_degree(slug: str) -> int:
+    """Return the all_degree (total outbound links) for a note from the index.
+
+    Queries the ``links`` table in ``cortex-index.db``. Returns 0 if the
+    index is unavailable or the slug is not found — callers should treat
+    a missing index as "unknown connectivity" rather than "no links".
+    """
+    try:
+        conn = sqlite3.connect(str(_INDEX_PATH))
+        row = conn.execute(
+            "SELECT COUNT(*) FROM links WHERE source_slug = ?",
+            (slug,),
+        ).fetchone()
+        conn.close()
+        return row[0] if row else 0
+    except (OSError, sqlite3.Error):
+        return 0
+
+
+def compute_decay_score(
+    fm: dict[str, Any],
+    body: str,
+    in_degree: int,
+    all_degree: int,
+    vault_dir: Path,
+    *,
+    today: datetime.date | None = None,
+) -> float:
+    """Compute continuous decay score ``D \u2208 [0.0, 1.0]`` for a note.
+
+    Args:
+        fm: parsed frontmatter dict.
+        body: note body text (for trigger keyword scan).
+        in_degree: number of inbound structural wikilinks.
+        all_degree: total outbound link count (from index or fallback).
+        vault_dir: path to cortex-memory root (for folder inference).
+        today: date for age calculation (defaults to today).
+
+    Returns:
+        Continuous decay score ``D``. Higher = more decayed.
+        Returns 0.0 for exempt notes.
+
+    Recency exemption: fresh notes (\u2264 7 days) that are structurally
+    isolated (in_degree == 0) but highly connected organically
+    (all_degree \u2265 9) are not decaying — they are actively being
+    worked on. See [[decay-recency-exemption]].
+    """
+    # Per-note frontmatter exemption
+    if str(fm.get("decay_exempt") or "").strip().lower() == "true":
+        return 0.0
+
+    if today is None:
+        today = datetime.date.today()
+
+    # ── Recency exemption ──────────────────────────────────────
+    # Fresh, structurally isolated but highly-connected notes are
+    # not decaying — they are actively being worked on. The zero
+    # access count is a discovery problem, not a decay signal.
+    if in_degree == 0 and all_degree >= 9:
+        try:
+            created_raw = fm.get("created")
+            if created_raw:
+                created_str = str(created_raw).strip()
+                # Parse YYYY-MM-DD or YYYY-MM-DD HH:MM ... formats
+                try:
+                    created_date = datetime.strptime(created_str, "%Y-%m-%d").date()
+                except ValueError:
+                    try:
+                        created_date = datetime.strptime(
+                            created_str, "%Y-%m-%d %H:%M %Z"
+                        ).date()
+                    except ValueError:
+                        created_date = None
+                if created_date is not None:
+                    age_days = (today - created_date).days
+                    if age_days <= 7:
+                        return 0.0
+        except (ValueError, TypeError):
+            pass  # malformed created → fall through to normal formula
+
+    # ── age_factor ─────────────────────────────────────────────
+    created_raw = fm.get("created")
+    if not created_raw:
+        return 0.5  # unknown age: moderate decay
+    created_str = str(created_raw).strip()
+    try:
+        created_date = datetime.strptime(created_str, "%Y-%m-%d").date()
+    except ValueError:
+        try:
+            created_date = datetime.strptime(
+                created_str, "%Y-%m-%d %H:%M %Z"
+            ).date()
+        except ValueError:
+            return 0.5  # unparseable: moderate decay
+    age_days = max(0, (today - created_date).days)
+    tau = 7  # half-life in days
+    age_factor = math.exp(-math.log(2) * age_days / tau)
+
+    # ── link_resistance ────────────────────────────────────────
+    k = 3
+    link_resistance = min(in_degree / (in_degree + k), 0.85)
+
+    # ── folder_resistance ──────────────────────────────────────
+    rel_path = fm.get("_rel_path", "")
+    if rel_path:
+        folder = str(rel_path).split("/", 1)[0]
+    else:
+        # Fallback: infer from slug or path
+        slug = str(fm.get("slug", ""))
+        folder = slug.split("/")[0] if "/" in slug else ""
+    folder_resistance = _FOLDER_RESISTANCE.get(folder, 0.15)
+
+    # ── trigger_proxy ──────────────────────────────────────────
+    trigger_keywords = {"decay", "recovery", "metrics", "health", "score"}
+    body_lower = body.lower()
+    trigger_proxy = 0.5 if any(kw in body_lower for kw in trigger_keywords) else 0.0
+
+    # ── access_weight ──────────────────────────────────────────
+    access_weight = _ACCESS_WEIGHT.get(folder, 0.15)
+    access_count = _parse_access_count(fm.get("access_count")) or 0
+    access_factor = (
+        math.log(1 + access_count) / math.log(1 + 860)
+        if access_weight > 0
+        else 0.0
+    )
+
+    # ── Final score ────────────────────────────────────────────
+    d = (
+        (1 - link_resistance)
+        * (1 - folder_resistance)
+        * (1 - trigger_proxy)
+        * age_factor
+        * (1 - access_weight * access_factor)
+    )
+    return round(min(1.0, max(0.0, d)), 6)
 
 
 # ---------------------------------------------------------------------------
@@ -2117,6 +2330,9 @@ def build_vault_health_event(
         "research_decay_count": count_research_decay(vault_dir),
         "decay_coverage": compute_decay_coverage(vault_dir, today=today_midnight),
         "access_decay": count_access_decay(vault_dir),
+        # Correction cascade: unpropagated corrections during grooming.
+        # See cortex-memory/research/2026-06-11-correction-cascade-detection-design.md.
+        "correction_cascade": _count_correction_cascades(vault_dir),
         # Phase 1 of the structural-monitoring design — ADR-only by
         # intent. See ``compute_template_adherence`` for the per-note
         # scoring rule and ``_aggregate_adr_template_adherence`` for the

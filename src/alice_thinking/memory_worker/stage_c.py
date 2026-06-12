@@ -67,11 +67,12 @@ import time
 from collections import defaultdict
 from typing import Any, Optional
 
-from indexer.yaml_lite import split_frontmatter
+from indexer.yaml_lite import _strip_code, split_frontmatter
 
 from alice_thinking import vault_lock
 
 from . import journal as journal_mod
+from . import correction_cascade as cascade_mod
 
 
 logger = logging.getLogger(__name__)
@@ -178,6 +179,8 @@ class StageCReport:
     archive_stale_open: int = 0
     dedupe_merge: int = 0
     orphan_resolve: int = 0
+    correction_pairs_checked: int = 0
+    unpropagated_corrections: int = 0
     ran: bool = False
 
     def to_dict(self) -> dict[str, int]:
@@ -189,6 +192,8 @@ class StageCReport:
             "archive_stale_open": self.archive_stale_open,
             "dedupe_merge": self.dedupe_merge,
             "orphan_resolve": self.orphan_resolve,
+            "correction_pairs_checked": self.correction_pairs_checked,
+            "unpropagated_corrections": self.unpropagated_corrections,
         }
 
 
@@ -303,9 +308,11 @@ _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+?)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
 
 def _extract_wikilink_targets(body: str) -> list[str]:
     """Pull every ``[[target]]`` (or aliased / anchored variant)
-    target slug out of ``body``. Best-effort — we don't try to strip
-    code fences here, the caller filters as needed."""
-    return [m.group(1).strip() for m in _WIKILINK_RE.finditer(body)]
+    target slug out of ``body``. Strips fenced code blocks and inline
+    code spans via ``_strip_code`` to suppress false positives from
+    bash ``[[ -d ]]`` tests, markdown examples, and backtick spans."""
+    cleaned = _strip_code(body)
+    return [m.group(1).strip() for m in _WIKILINK_RE.finditer(cleaned)]
 
 
 def _slug_of(md: pathlib.Path, vault: pathlib.Path) -> str:
@@ -1851,6 +1858,29 @@ def register_verifiers(mind: pathlib.Path) -> None:
     journal_mod.register_verifier("orphan-link", orphan_link_verifier)
 
 
+# ---------- correction cascade check ----------
+
+
+def correction_cascade_check(
+    mind: pathlib.Path,
+    *,
+    journal_path: Optional[pathlib.Path] = None,
+) -> CascadeReport:
+    """Public wrapper: run correction cascade detection as a standalone
+    Stage C operation.
+
+    This is the hook that the memory worker's grooming pipeline calls
+    during the link-audit phase (after atomize, before dedupe).
+    Standalone invocation is for ad-hoc runs or testing.
+    """
+    return cascade_mod.run(
+        mind,
+        journal_path=journal_path,
+        surface_path=mind / "inner" / "surface" / "correction-cascade-grooming-report.md",
+        daily_path=mind / "cortex-memory" / "dailies" / f"{_today().isoformat()}.md",
+    )
+
+
 # ---------- top-level run ----------
 
 
@@ -1972,6 +2002,19 @@ def run(
         disambiguate_on_collision=cfg.atomize_disambiguate_on_collision,
     )
     report.archive = archive(mind, cfg.max_items_per_category, journal_path)
+    # Link audit phase: correction cascade detection (after atomize,
+    # before dedupe). Runs even if no grooming mutations occurred —
+    # detection is read-only and provides observability into the
+    # vault's correction graph regardless of whether Stage C mutated
+    # any files this cycle.
+    cascade_report = cascade_mod.run(
+        mind,
+        journal_path=journal_path,
+        surface_path=mind / "inner" / "surface" / "correction-cascade-grooming-report.md",
+        daily_path=mind / "cortex-memory" / "dailies" / f"{_today().isoformat()}.md",
+    )
+    report.correction_pairs_checked = cascade_report.correction_pairs_checked
+    report.unpropagated_corrections = cascade_report.total_unpropagated
     report.archive_stale_open = archive_stale_open(
         mind,
         cfg.max_items_per_category,
@@ -2011,6 +2054,7 @@ __all__ = [
     "archive_stale_open",
     "atomize",
     "compute_state",
+    "correction_cascade_check",
     "dedupe_merge",
     "orphan_resolve",
     "register_verifiers",

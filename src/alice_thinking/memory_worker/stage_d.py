@@ -87,7 +87,7 @@ import re
 from collections import Counter
 from typing import Any, Callable, Iterable, Optional
 
-from indexer.yaml_lite import split_frontmatter
+from indexer.yaml_lite import _strip_code, split_frontmatter
 
 from alice_thinking import vault_lock
 
@@ -318,9 +318,13 @@ def _recently_touched_research(
 
 
 def _extract_wikilink_targets(body: str) -> set[str]:
-    """All ``[[target]]`` slug-bases (case-preserved) from ``body``."""
+    """All ``[[target]]`` slug-bases (case-preserved) from ``body``.
+    Strips fenced code blocks and inline code spans via ``_strip_code``
+    to suppress false positives from bash ``[[ -d ]]`` tests, markdown
+    examples, and backtick spans."""
+    cleaned = _strip_code(body)
     out: set[str] = set()
-    for m in _WIKILINK_RE.finditer(body):
+    for m in _WIKILINK_RE.finditer(cleaned):
         raw = m.group(1).strip()
         base = raw.rsplit("/", 1)[-1]
         if base:
@@ -1047,6 +1051,11 @@ def _iter_decayed_notes(
     Excludes ``dailies/``, ``archive/``, ``gh-state/``, and dotfiles —
     same filter Stage C uses for its decay count, so the two stages see
     the same population.
+
+    Applies the continuous decay score from :func:`compute_decay_score`
+    (Phase A formula + recency exemption). Notes with ``D < 0.20`` are
+    excluded — the recency exemption (fresh, structurally isolated but
+    highly-connected notes) short-circuits to ``D = 0.0``.
     """
     if not vault.is_dir():
         return []
@@ -1063,7 +1072,7 @@ def _iter_decayed_notes(
             text = md.read_text(encoding="utf-8")
         except OSError:
             continue
-        fm, _body = split_frontmatter(text)
+        fm, body = split_frontmatter(text)
         la = fm.get("last_accessed")
         if la is None:
             continue
@@ -1076,9 +1085,47 @@ def _iter_decayed_notes(
             ac = 0
         if ac > 1:
             continue
-        out.append(md)
+        # Continuous decay score with recency exemption.
+        # Recency exemption: fresh (<=7d), structurally isolated
+        # (in_degree==0), high all-degree (>=9) → D=0.0.
+        from metrics.vault_health import compute_decay_score
+
+        slug = str(fm.get("slug") or md.stem)
+        all_deg = _query_all_degree(slug)
+        d = compute_decay_score(
+            fm, body,
+            in_degree=0,  # not computed here; binary check is the gate
+            all_degree=all_deg,
+            vault_dir=vault.resolve(),
+            today=today,
+        )
+        if d >= 0.20:
+            out.append(md)
     out.sort()
     return out
+
+
+def _query_all_degree(slug: str) -> int:
+    """Return all_degree (total outbound links) for a slug from the index.
+
+    Queries ``cortex-index.db`` via the same path used by the cue runner.
+    Returns 0 if the index is unavailable — callers treat this as
+    "unknown connectivity" rather than "no links".
+    """
+    try:
+        import sqlite3
+        idx = pathlib.Path(
+            "/home/alice/alice-mind/inner/state/cortex-index.db",
+        )
+        conn = sqlite3.connect(str(idx))
+        row = conn.execute(
+            "SELECT COUNT(*) FROM links WHERE source_slug = ?",
+            (slug,),
+        ).fetchone()
+        conn.close()
+        return row[0] if row else 0
+    except (OSError, Exception):
+        return 0
 
 
 def _is_archive_eligible(fm: dict[str, Any], body: str) -> bool:
