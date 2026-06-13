@@ -46,16 +46,15 @@ grep '"vault_health"' ~/alice-mind/memory/events.jsonl 2>/dev/null \
   | grep "\"date\": \"$(date +%Y-%m-%d)\""
 ```
 
-If no match → run the morning scan and append one `vault_health` event to `memory/events.jsonl`. Schema and example in `memory/EVENTS-SCHEMA.md §vault_health`. The four drift-prone fields (`total_notes`, `broken_wikilinks`, `orphan_notes`, `wake_type_distribution`) come from one consolidated module call:
+If no match → invoke the canonical module call. The module computes the full event itself, gates on `_sleep_window_closed` (silent-skip pre-07:00 EDT), and appends to `events.jsonl`. `--check-existing` makes it idempotent. Schema and field semantics in `memory/EVENTS-SCHEMA.md §vault_health`:
 
 ```bash
-yest=$(date -d 'yesterday' +%Y-%m-%d)
-today=$(date +%Y-%m-%d)
 python3 -m metrics.vault_health \
   --vault ~/alice-mind/cortex-memory \
   --thoughts ~/alice-mind/inner/thoughts \
-  --window-start "${yest}T23:00:00" \
-  --window-end   "${today}T07:00:00"
+  --surface ~/alice-mind/inner/surface \
+  --events ~/alice-mind/memory/events.jsonl \
+  --append --check-existing
 ```
 
 The remaining fields (`research_notes_last_night`, surfaces, `stage_c_candidates`, etc.) still come from the bash recipes below — only the four metrics that drifted moved into the module.
