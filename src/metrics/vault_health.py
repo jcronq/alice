@@ -46,6 +46,7 @@ from metrics.pagerank_metric import compute_weighted_sum, tier_counts
 # skips these notes during decay synthesis (see ``_is_fitness_domain`` and
 # ``FITNESS_TAGS`` in stage_d). vault_health imports the same predicate so
 # the two views of the decay pool cannot drift apart.
+from alice_thinking.memory_worker.correction_cascade import detect_corrections
 from alice_thinking.memory_worker.stage_d import _is_fitness_domain
 
 logger = logging.getLogger(__name__)
@@ -695,6 +696,42 @@ def count_research_decay(
                 decay_count += 1
 
     return decay_count
+
+
+def _count_correction_cascades(vault_dir: Path) -> dict[str, int]:
+    """Run correction cascade detection and return summary counts.
+
+    Finds all unpropagated corrections (notes that reference a corrected
+    note but not the correction note itself) and returns counts by severity.
+
+    Returns a dict with keys: ``correction_pairs_checked``,
+    ``total_unpropagated``, ``high``, ``medium``, ``low``.
+
+    Gated on import failure — if the correction_cascade module isn't
+    available, returns zeros silently.
+    """
+    try:
+        report = detect_corrections(vault_dir.parent)
+        return {
+            "correction_pairs_checked": report.correction_pairs_checked,
+            "total_unpropagated": report.total_unpropagated,
+            "high": report.high_count,
+            "medium": report.medium_count,
+            "low": report.low_count,
+        }
+    except Exception:
+        # Module import failure or detection error — don't block the event.
+        logger.warning(
+            "vault_health: correction_cascade detection failed, returning zeros",
+            exc_info=True,
+        )
+        return {
+            "correction_pairs_checked": 0,
+            "total_unpropagated": 0,
+            "high": 0,
+            "medium": 0,
+            "low": 0,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -2413,6 +2450,9 @@ def build_vault_health_event(
         "research_decay_count": count_research_decay(vault_dir),
         "decay_coverage": compute_decay_coverage(vault_dir, today=today_midnight),
         "access_decay": count_access_decay(vault_dir),
+        # Correction cascade: unpropagated corrections during grooming.
+        # See cortex-memory/research/2026-06-11-correction-cascade-detection-design.md.
+        "correction_cascade": _count_correction_cascades(vault_dir),
         # Phase 1 of the structural-monitoring design — ADR-only by
         # intent. See ``compute_template_adherence`` for the per-note
         # scoring rule and ``_aggregate_adr_template_adherence`` for the

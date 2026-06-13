@@ -87,7 +87,7 @@ import re
 from collections import Counter, defaultdict
 from typing import Any, Callable, Iterable, Optional
 
-from indexer.yaml_lite import split_frontmatter
+from indexer.yaml_lite import _strip_code, split_frontmatter
 
 from alice_thinking import vault_lock
 
@@ -318,9 +318,13 @@ def _recently_touched_research(
 
 
 def _extract_wikilink_targets(body: str) -> set[str]:
-    """All ``[[target]]`` slug-bases (case-preserved) from ``body``."""
+    """All ``[[target]]`` slug-bases (case-preserved) from ``body``.
+    Strips fenced code blocks and inline code spans via ``_strip_code``
+    to suppress false positives from bash ``[[ -d ]]`` tests, markdown
+    examples, and backtick spans."""
+    cleaned = _strip_code(body)
     out: set[str] = set()
-    for m in _WIKILINK_RE.finditer(body):
+    for m in _WIKILINK_RE.finditer(cleaned):
         raw = m.group(1).strip()
         base = raw.rsplit("/", 1)[-1]
         if base:
