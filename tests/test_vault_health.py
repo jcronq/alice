@@ -25,10 +25,13 @@ import pytest
 
 from metrics.vault_health import (
     ADR_SCHEMA,
+    DEFAULT_DECAY_SCORE_THRESHOLD,
     _sleep_window_closed,
     build_vault_health_event,
+    compute_all_links_degree,
     compute_continuous_checks,
     compute_decay_coverage,
+    compute_decay_score,
     compute_template_adherence,
     count_broken_wikilinks,
     count_inbound_links,
@@ -3179,3 +3182,296 @@ def test_vault_health_template_adherence_handles_empty_vault(tmp_path: Path) -> 
         "count": 0,
         "below_threshold": 0,
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 / 2.5: continuous decay scoring
+# Design: cortex-memory/research/2026-06-10-decay-phase-2-implementation-spec.md
+# ---------------------------------------------------------------------------
+
+
+def _decay_fm(
+    *,
+    created: str = "2026-06-10",
+    access_count: int = 0,
+    decay_exempt: bool | None = None,
+) -> dict:
+    fm = {"created": created, "access_count": access_count}
+    if decay_exempt is not None:
+        fm["decay_exempt"] = "true" if decay_exempt else "false"
+    return fm
+
+
+def test_compute_decay_score_archive_note_pinned_to_zero(tmp_path: Path) -> None:
+    """``archive/`` folder has resistance 1.0 — formula collapses to D = 0."""
+    vault = _make_vault(tmp_path)
+    (vault / "archive").mkdir()
+    note = vault / "archive" / "old.md"
+    note.write_text("body", encoding="utf-8")
+    score = compute_decay_score(
+        fm=_decay_fm(created="2026-06-11"),
+        body="body",
+        in_degree=0,
+        vault_dir=vault,
+        note_path=note,
+        today=datetime(2026, 6, 12),
+    )
+    assert score == 0.0
+
+
+def test_compute_decay_score_decay_exempt_returns_zero(tmp_path: Path) -> None:
+    """``decay_exempt: true`` short-circuits the formula."""
+    vault = _make_vault(tmp_path)
+    note = vault / "research" / "pinned.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("body", encoding="utf-8")
+    score = compute_decay_score(
+        fm=_decay_fm(created="2026-06-11", decay_exempt=True),
+        body="body",
+        in_degree=0,
+        vault_dir=vault,
+        note_path=note,
+        today=datetime(2026, 6, 12),
+    )
+    assert score == 0.0
+
+
+def test_compute_decay_score_active_project_above_threshold(tmp_path: Path) -> None:
+    """Fresh ``projects/`` note with zero access scores above 0.20."""
+    vault = _make_vault(tmp_path)
+    note = vault / "projects" / "alpha.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("just a project body", encoding="utf-8")
+    score = compute_decay_score(
+        fm=_decay_fm(created="2026-06-11"),
+        body="just a project body",
+        in_degree=0,
+        vault_dir=vault,
+        note_path=note,
+        today=datetime(2026, 6, 12),
+    )
+    # folder_resistance=0.30, age_factor=exp(-ln(2)*1/7)≈0.906
+    # link_resistance=0, trigger_proxy=0, access_term=0
+    # D = 1 * 0.70 * 1 * 0.906 * 1 ≈ 0.634
+    assert score > DEFAULT_DECAY_SCORE_THRESHOLD
+    assert 0.55 < score < 0.70
+
+
+def test_compute_decay_score_hub_in_degree_caps_at_0_85(tmp_path: Path) -> None:
+    """Very high in_degree saturates link_resistance at 0.85."""
+    vault = _make_vault(tmp_path)
+    note = vault / "projects" / "hub.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("hub body", encoding="utf-8")
+    high = compute_decay_score(
+        fm=_decay_fm(created="2026-06-11"),
+        body="hub body",
+        in_degree=10_000,
+        vault_dir=vault,
+        note_path=note,
+        today=datetime(2026, 6, 12),
+    )
+    extreme = compute_decay_score(
+        fm=_decay_fm(created="2026-06-11"),
+        body="hub body",
+        in_degree=10_000_000,
+        vault_dir=vault,
+        note_path=note,
+        today=datetime(2026, 6, 12),
+    )
+    # Both should compose with link_resistance=0.85 → 15% of base potential.
+    assert high == extreme
+
+
+def test_compute_decay_score_trigger_keyword_halves_score(tmp_path: Path) -> None:
+    """Body with a trigger keyword cuts the score in half."""
+    vault = _make_vault(tmp_path)
+    note = vault / "research" / "regular.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("a", encoding="utf-8")
+    plain = compute_decay_score(
+        fm=_decay_fm(created="2026-06-11"),
+        body="plain body without triggers",
+        in_degree=0,
+        vault_dir=vault,
+        note_path=note,
+        today=datetime(2026, 6, 12),
+    )
+    triggered = compute_decay_score(
+        fm=_decay_fm(created="2026-06-11"),
+        body="this note discusses decay and recovery",
+        in_degree=0,
+        vault_dir=vault,
+        note_path=note,
+        today=datetime(2026, 6, 12),
+    )
+    assert plain > 0
+    assert triggered == pytest.approx(plain * 0.5, abs=1e-4)
+
+
+def test_compute_decay_score_missing_access_field(tmp_path: Path) -> None:
+    """Missing ``access_count`` is treated as 0 (no protection)."""
+    vault = _make_vault(tmp_path)
+    note = vault / "research" / "unknown.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("body", encoding="utf-8")
+    # fm has no access_count key at all
+    score = compute_decay_score(
+        fm={"created": "2026-06-11"},
+        body="body",
+        in_degree=0,
+        vault_dir=vault,
+        note_path=note,
+        today=datetime(2026, 6, 12),
+    )
+    assert score > 0
+
+
+def test_compute_decay_score_invalid_access_field_is_zero(tmp_path: Path) -> None:
+    """Non-int ``access_count`` is coerced to 0 — no crash."""
+    vault = _make_vault(tmp_path)
+    note = vault / "research" / "weird.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("body", encoding="utf-8")
+    score = compute_decay_score(
+        fm={"created": "2026-06-11", "access_count": "garbage"},
+        body="body",
+        in_degree=0,
+        vault_dir=vault,
+        note_path=note,
+        today=datetime(2026, 6, 12),
+    )
+    assert score >= 0
+
+
+def test_compute_decay_score_future_dated_note_no_age_penalty(tmp_path: Path) -> None:
+    """A note dated in the future clamps age_days to 0 (age_factor = 1)."""
+    vault = _make_vault(tmp_path)
+    note = vault / "projects" / "future.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("body", encoding="utf-8")
+    score = compute_decay_score(
+        fm=_decay_fm(created="2027-01-01"),
+        body="body",
+        in_degree=0,
+        vault_dir=vault,
+        note_path=note,
+        today=datetime(2026, 6, 12),
+    )
+    # age_days=0 → age_factor=1, formula = 1*0.7*1*1*1 = 0.7
+    assert 0.65 < score < 0.75
+
+
+def test_compute_decay_score_unparseable_created(tmp_path: Path) -> None:
+    """Unparseable ``created`` falls back to age_factor=1 (no penalty)."""
+    vault = _make_vault(tmp_path)
+    note = vault / "projects" / "garbled.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("body", encoding="utf-8")
+    score = compute_decay_score(
+        fm={"created": "not-a-date", "access_count": 0},
+        body="body",
+        in_degree=0,
+        vault_dir=vault,
+        note_path=note,
+        today=datetime(2026, 6, 12),
+    )
+    # projects folder, age_factor=1.0 → D = 1*0.7*1*1*1 = 0.7
+    assert score > DEFAULT_DECAY_SCORE_THRESHOLD
+
+
+def test_compute_decay_score_access_count_reduces_score(tmp_path: Path) -> None:
+    """A reference note with high access_count scores lower than one with 0."""
+    vault = _make_vault(tmp_path)
+    note = vault / "reference" / "doc.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("body", encoding="utf-8")
+    fresh = compute_decay_score(
+        fm=_decay_fm(created="2026-06-11", access_count=0),
+        body="body",
+        in_degree=0,
+        vault_dir=vault,
+        note_path=note,
+        today=datetime(2026, 6, 12),
+    )
+    accessed = compute_decay_score(
+        fm=_decay_fm(created="2026-06-11", access_count=100),
+        body="body",
+        in_degree=0,
+        vault_dir=vault,
+        note_path=note,
+        today=datetime(2026, 6, 12),
+    )
+    assert accessed < fresh
+
+
+def test_compute_decay_score_unknown_folder_uses_default(tmp_path: Path) -> None:
+    """A folder not in ``_FOLDER_RESISTANCE`` uses the 0.15 default."""
+    vault = _make_vault(tmp_path)
+    note = vault / "wat" / "x.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("body", encoding="utf-8")
+    score = compute_decay_score(
+        fm=_decay_fm(created="2026-06-11"),
+        body="body",
+        in_degree=0,
+        vault_dir=vault,
+        note_path=note,
+        today=datetime(2026, 6, 12),
+    )
+    # folder_resistance=0.15 default, age_factor=0.906 → D ≈ 1*0.85*1*0.906*1 ≈ 0.770
+    assert 0.70 < score < 0.80
+
+
+def test_compute_decay_score_no_note_path_falls_back_to_default(tmp_path: Path) -> None:
+    """When ``note_path`` is omitted, both lookups use the default constants."""
+    vault = _make_vault(tmp_path)
+    score = compute_decay_score(
+        fm=_decay_fm(created="2026-06-11"),
+        body="body",
+        in_degree=0,
+        vault_dir=vault,
+        today=datetime(2026, 6, 12),
+    )
+    # default folder_resistance=0.15, no folder-specific access weight,
+    # age_factor ≈ 0.906, no access protection.
+    assert 0.70 < score < 0.80
+
+
+def test_compute_all_links_degree_counts_body_and_frontmatter(tmp_path: Path) -> None:
+    """Body-level ``[[target]]`` AND frontmatter wikilinks both count.
+
+    Frontmatter convention follows the Obsidian-style quoted-string form
+    (``related: "[[target]]"``) — the un-quoted form ``related: [[x]]``
+    is parsed by ``yaml_lite`` as a flow-style list with the outer
+    brackets stripped, so we don't exercise that path in this test."""
+    vault = _make_vault(tmp_path)
+    target = vault / "research" / "target.md"
+    target.write_text("---\nslug: target\n---\nbody\n", encoding="utf-8")
+    # Source 1: links via body
+    src1 = vault / "research" / "src1.md"
+    src1.write_text("---\nslug: src1\n---\nrefers to [[target]] here\n", encoding="utf-8")
+    # Source 2: links via frontmatter (quoted-string form)
+    src2 = vault / "research" / "src2.md"
+    src2.write_text(
+        '---\nslug: src2\nrelated: "[[target]]"\n---\nbody\n',
+        encoding="utf-8",
+    )
+    # Source 3: doesn't link anywhere
+    src3 = vault / "research" / "src3.md"
+    src3.write_text("---\nslug: src3\n---\nno links\n", encoding="utf-8")
+
+    assert compute_all_links_degree(vault, target) == 2
+
+
+def test_compute_all_links_degree_dedupes_per_source(tmp_path: Path) -> None:
+    """A source that links twice to the same target only counts as +1."""
+    vault = _make_vault(tmp_path)
+    target = vault / "research" / "target.md"
+    target.write_text("body\n", encoding="utf-8")
+    src = vault / "research" / "src.md"
+    src.write_text(
+        "links [[target]] and [[target]] again and [[target]] more\n",
+        encoding="utf-8",
+    )
+    assert compute_all_links_degree(vault, target) == 1

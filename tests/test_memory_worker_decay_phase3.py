@@ -350,56 +350,125 @@ def test_select_decay_pair_threshold_boundary_rejects_0_44_accepts_0_46(
 # ---------- iter decayed notes ----------
 
 
-def test_iter_decayed_notes_filters_by_access_and_window(mind: pathlib.Path):
-    """Decayed = stale ``last_accessed`` AND ``access_count`` <=1."""
-    today = datetime.date(2026, 6, 1)
-    decayed = _write_note(
+def test_iter_decay_candidates_threshold_gate(mind: pathlib.Path):
+    """Phase 2: a fresh ``research/`` note with access_count=0 scores
+    above threshold (decayed). A heavily-accessed note in a stable
+    folder (``reference/``: folder_resistance=0.75, access_weight=0.25)
+    composes below threshold."""
+    today = datetime.date(2026, 6, 12)
+    (mind / "cortex-memory" / "reference").mkdir(exist_ok=True)
+    fresh = _write_note(
         mind,
-        "research/decayed.md",
-        last_accessed="2026-04-01",
+        "research/fresh.md",
+        created="2026-06-11",
         access_count=0,
     )
+    # reference + heavy access → (1-0)*(1-0.75)*(1-0)*0.906*(1-0.237) ≈ 0.17 < threshold
     hot = _write_note(
         mind,
-        "research/hot.md",
-        last_accessed="2026-04-01",
-        access_count=15,
+        "reference/hot.md",
+        created="2026-06-11",
+        access_count=600,
     )
-    recent = _write_note(
-        mind,
-        "research/recent.md",
-        last_accessed="2026-05-30",
-        access_count=0,
-    )
-    out = stage_d._iter_decayed_notes(
-        mind / "cortex-memory", today, window_days=7
-    )
-    assert decayed in out
-    assert hot not in out
-    assert recent not in out
+    out = stage_d._iter_decay_candidates(mind / "cortex-memory", today)
+    paths = [p for _s, p in out]
+    assert fresh in paths
+    assert hot not in paths
+    # Output is sorted by score descending, so the fresh research note
+    # (lowest resistance, no access) appears at the top.
+    assert out and out[0][1] == fresh
 
 
-def test_iter_decayed_notes_excludes_archive_and_dailies(mind: pathlib.Path):
-    """``dailies/`` and ``archive/`` are never decay candidates."""
-    today = datetime.date(2026, 6, 1)
-    (mind / "cortex-memory" / "dailies").mkdir(exist_ok=True)
-    (mind / "cortex-memory" / "archive").mkdir(exist_ok=True)
+def test_iter_decay_candidates_excludes_decisions_and_feedback(
+    mind: pathlib.Path,
+):
+    """Phase 2: ``decisions/`` and ``feedback/`` are excluded outright
+    (intentionally low-access folders), in addition to the existing
+    dailies / archive / gh-state exclusions."""
+    today = datetime.date(2026, 6, 12)
+    for sub in ("decisions", "feedback", "dailies", "archive", "gh-state"):
+        (mind / "cortex-memory" / sub).mkdir(exist_ok=True)
+    # Each of these would be a strong decay candidate by formula
+    # (fresh, no access, low-resistance default folder math), but the
+    # top-dir exclusion drops them before scoring.
     _write_note(
         mind,
-        "dailies/2026-04-01.md",
-        last_accessed="2026-04-01",
+        "decisions/adr-001.md",
+        created="2026-06-11",
+        access_count=0,
+    )
+    _write_note(
+        mind,
+        "feedback/observation.md",
+        created="2026-06-11",
+        access_count=0,
+    )
+    _write_note(
+        mind,
+        "dailies/2026-06-11.md",
+        created="2026-06-11",
         access_count=0,
     )
     _write_note(
         mind,
         "archive/old.md",
-        last_accessed="2026-04-01",
+        created="2026-06-11",
+        access_count=0,
+    )
+    _write_note(
+        mind,
+        "gh-state/mirror.md",
+        created="2026-06-11",
+        access_count=0,
+    )
+    out = stage_d._iter_decay_candidates(mind / "cortex-memory", today)
+    assert out == []
+
+
+def test_iter_decay_candidates_phase_2_5_all_links_exemption(
+    mind: pathlib.Path,
+):
+    """Phase 2.5: an otherwise-decayed isolated note with >=10 all-links
+    referrers is exempt (D pinned to 0)."""
+    today = datetime.date(2026, 6, 12)
+    target = _write_note(
+        mind,
+        "research/well-connected.md",
+        created="2026-06-11",
+        access_count=0,
+    )
+    # 10 source notes link to ``well-connected`` via body text. They
+    # themselves are heavily-accessed (so they don't decay) and live in
+    # ``reference/`` where the folder default keeps them protected.
+    for i in range(10):
+        _write_note(
+            mind,
+            f"reference/src{i}.md",
+            created="2026-06-11",
+            access_count=400,
+            body=f"src{i} references [[well-connected]]\n",
+        )
+    out = stage_d._iter_decay_candidates(mind / "cortex-memory", today)
+    paths = [p for _s, p in out]
+    assert target not in paths
+
+
+def test_iter_decayed_notes_compat_shim_returns_paths_only(
+    mind: pathlib.Path,
+):
+    """The legacy ``_iter_decayed_notes`` shim drops the score and
+    returns paths only (for callers that still need ``list[Path]``)."""
+    today = datetime.date(2026, 6, 12)
+    _write_note(
+        mind,
+        "research/fresh.md",
+        created="2026-06-11",
         access_count=0,
     )
     out = stage_d._iter_decayed_notes(
         mind / "cortex-memory", today, window_days=7
     )
-    assert out == []
+    assert all(isinstance(p, pathlib.Path) for p in out)
 
 
 # ---------- title-cosine helpers (Phase 3.5) ----------
@@ -444,13 +513,18 @@ def test_precompute_title_idf_formula(mind: pathlib.Path):
 def test_run_decay_prepass_archives_and_pairs(mind: pathlib.Path):
     """End-to-end: archive-eligible note moves; title-cosine pair is
     selected. Phase 3.5 no longer emits a decay_event — Stage C's
-    atomize() uses access_count directly."""
+    atomize() uses access_count directly.
+
+    Phase 2 update: ``created`` dates moved close to ``today`` so the
+    continuous decay formula actually surfaces these notes as
+    candidates (the new formula favors fresh-but-unaccessed notes)."""
     today = datetime.date(2026, 6, 1)
     # Archive-eligible (no inbound links, superseded).
     _write_note(
         mind,
         "research/old-spec.md",
         status="superseded",
+        created="2026-05-31",
         last_accessed="2026-04-01",
         access_count=0,
     )
@@ -459,6 +533,7 @@ def test_run_decay_prepass_archives_and_pairs(mind: pathlib.Path):
         mind,
         "research/2026-04-01-cue-runner-validation.md",
         title="cue runner validation",
+        created="2026-05-31",
         last_accessed="2026-04-01",
         access_count=0,
     )
@@ -466,6 +541,7 @@ def test_run_decay_prepass_archives_and_pairs(mind: pathlib.Path):
         mind,
         "research/2026-04-02-cue-runner-experiment-validation.md",
         title="cue runner experiment validation",
+        created="2026-05-31",
         last_accessed="2026-04-02",
         access_count=0,
     )
@@ -497,18 +573,24 @@ def test_run_decay_prepass_empty_vault_returns_empty_result(mind: pathlib.Path):
 
 
 def test_run_populates_decay_pairing_field(mind: pathlib.Path):
-    """The full Stage D tick should populate StageDReport.decay_pairing."""
+    """The full Stage D tick should populate StageDReport.decay_pairing.
+
+    Phase 2 update: ``created`` close to ``today`` so the continuous
+    decay formula surfaces these notes (older notes get age-discounted
+    out of the candidate pool)."""
     today = datetime.date(2026, 6, 1)
     # Pair of decayed notes for the pre-pass.
     _write_note(
         mind,
         "research/2026-04-01-foo-validation.md",
+        created="2026-05-31",
         last_accessed="2026-04-01",
         access_count=0,
     )
     _write_note(
         mind,
         "research/2026-04-02-foo-experiment-validation.md",
+        created="2026-05-31",
         last_accessed="2026-04-02",
         access_count=0,
     )
@@ -526,22 +608,57 @@ def test_run_populates_decay_pairing_field(mind: pathlib.Path):
 # ---------- stage_c decay-priority score ----------
 
 
-def test_decay_priority_score_zero_access_gets_base_boost(mind: pathlib.Path):
-    """A note with access_count == 0 earns the base 10.0 boost."""
+def test_decay_priority_score_decayed_note_gets_boost(mind: pathlib.Path):
+    """Phase 2: a fresh zero-access research note scores above
+    threshold and earns a non-zero priority boost (decay_score × 10).
+    The exact value depends on (today - created); a 1-2 day old
+    research note lands somewhere in the 2-3 range."""
+    # ``created`` is set close to ``today`` so age_factor stays high
+    # and the formula yields D > threshold for the research folder.
     note = _write_note(
         mind,
         "research/decayed.md",
         access_count=0,
-        created="2026-05-30",
+        created=datetime.date.today().isoformat(),
     )
     score = stage_c._decay_priority_score(note)
-    assert score >= 10.0
+    # research folder_resistance=0.70, link_resistance=0, age_factor≈1,
+    # so D ≈ 0.30 → boost ≈ 3.0. Allow a generous floor so the test
+    # tolerates the day-boundary drift of "today".
+    assert score > 0.0
+    assert score >= 1.0
 
 
-def test_decay_priority_score_accessed_note_gets_zero(mind: pathlib.Path):
-    """Any access at all → no decay boost."""
-    note = _write_note(mind, "research/touched.md", access_count=3)
-    assert stage_c._decay_priority_score(note) == 0.0
+def test_decay_priority_score_low_score_returns_zero(mind: pathlib.Path):
+    """Phase 2: a note whose decay score is below
+    ``DEFAULT_DECAY_SCORE_THRESHOLD`` gets no boost. ``decay_exempt:
+    true`` short-circuits the formula to D = 0, the simplest way to
+    construct a deterministic "low-score" candidate."""
+    note = _write_note(
+        mind,
+        "research/exempt.md",
+        access_count=0,
+        created=datetime.date.today().isoformat(),
+        extra_fm={"decay_exempt": "true"},
+    )
+    vault = mind / "cortex-memory"
+    assert stage_c._decay_priority_score(note, vault=vault) == 0.0
+
+
+def test_decay_priority_score_without_vault_uses_defaults(mind: pathlib.Path):
+    """Phase 2 contract: when ``vault`` is omitted, folder lookups fall
+    back to the default constants (0.15 resistance, 0.15 access
+    weight). The score is still meaningful but doesn't reflect
+    per-folder protection."""
+    note = _write_note(
+        mind,
+        "reference/freshly-untouched.md",
+        access_count=0,
+        created=datetime.date.today().isoformat(),
+    )
+    # Default-folder math: 1 * 0.85 * 1 * age_factor * 1 — should land
+    # well above threshold for a fresh note.
+    assert stage_c._decay_priority_score(note) > 0.0
 
 
 def test_decay_priority_score_fitness_exempt(mind: pathlib.Path):
@@ -555,15 +672,22 @@ def test_decay_priority_score_fitness_exempt(mind: pathlib.Path):
     assert stage_c._decay_priority_score(note) == 0.0
 
 
-def test_decay_priority_score_age_bonus(mind: pathlib.Path):
-    """Older zero-access notes score higher than newer ones."""
+def test_decay_priority_score_younger_outranks_older(mind: pathlib.Path):
+    """Phase 2: the formula uses ``age_factor = exp(-ln(2) * age_days / 7)``
+    — younger notes have higher age_factor → higher D → higher boost.
+    This inverts the legacy "older = more decayed" intuition, matching
+    the spec's design that newly-created notes that aren't being
+    accessed yet are the surfacing candidates."""
+    today_iso = datetime.date.today().isoformat()
     older = _write_note(
         mind, "research/older.md", access_count=0, created="2024-01-01"
     )
     newer = _write_note(
-        mind, "research/newer.md", access_count=0, created="2026-05-30"
+        mind, "research/newer.md", access_count=0, created=today_iso
     )
-    assert stage_c._decay_priority_score(older) > stage_c._decay_priority_score(newer)
+    assert stage_c._decay_priority_score(newer) > stage_c._decay_priority_score(
+        older
+    )
 
 
 # ---------- stage_c.atomize() decay priority ----------
@@ -573,7 +697,14 @@ def _build_bloated_note(
     mind: pathlib.Path, slug: str, *, sections: int, access_count: int,
     section_lines: int = 100,
 ) -> pathlib.Path:
-    """A multi-section note above the bloated threshold."""
+    """A multi-section note above the bloated threshold.
+
+    ``created`` defaults to today so the Phase 2 continuous decay
+    formula reads "fresh + unaccessed = decayed" and the atomize
+    priority boost kicks in. The legacy helper used 2026-04-01 (years
+    old), which under Phase 2's age_factor (exp(-ln2 * age_days / 7))
+    would crush the decay score to near zero.
+    """
     body_lines = ["Intro prose.\n"]
     for i in range(sections):
         body_lines.append(f"\n## Section {i}\n")
@@ -584,6 +715,7 @@ def _build_bloated_note(
         title=slug.replace("-", " ").title(),
         tags=["research"],
         access_count=access_count,
+        created=datetime.date.today().isoformat(),
         body="".join(body_lines),
     )
 
@@ -605,7 +737,11 @@ def test_atomize_prefers_decayed_notes_within_cap(mind: pathlib.Path):
 
 def test_atomize_processes_decayed_at_relaxed_threshold(mind: pathlib.Path):
     """A decayed note between the 0.8 × threshold and the full threshold
-    qualifies for atomization (where an accessed note would not)."""
+    qualifies for atomization (where an accessed note would not).
+
+    Phase 2 update: ``created`` must be near ``today`` for the
+    continuous decay formula to score above threshold — the legacy
+    helper default of 2026-04-01 age-discounts the boost to zero."""
     # ~210 lines: above 250 * 0.8 = 200, below 250.
     body_lines = ["Intro\n"]
     for i in range(2):
@@ -616,6 +752,7 @@ def test_atomize_processes_decayed_at_relaxed_threshold(mind: pathlib.Path):
         "research/mid-decayed.md",
         title="Mid",
         access_count=0,
+        created=datetime.date.today().isoformat(),
         body="".join(body_lines),
     )
 

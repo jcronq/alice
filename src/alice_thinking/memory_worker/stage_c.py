@@ -146,9 +146,15 @@ FUZZY_TITLE_DISTANCE = 3
 DECAY_WINDOW_DAYS = 7
 
 #: Folders within ``cortex-memory/`` that are excluded from grooming
-#: candidate sets (dailies are archive-managed; archive/ is the
-#: destination; gh-state is auto-generated mirror data).
-_EXCLUDED_TOP_DIRS = frozenset({"dailies", "archive", "gh-state"})
+#: candidate sets. Phase 2 expansion (cortex-memory/research/
+#: 2026-06-10-decay-phase-2-implementation-spec.md): ``decisions/`` and
+#: ``feedback/`` are read-once-referenced — intentionally low-access by
+#: design — and shouldn't be groomed for decay. Same as
+#: :data:`alice_thinking.memory_worker.stage_d._DECAY_EXCLUDED_TOP_DIRS`
+#: so the two passes see the same population.
+_EXCLUDED_TOP_DIRS = frozenset(
+    {"dailies", "archive", "gh-state", "decisions", "feedback"}
+)
 
 #: Files that aren't real notes — mirrors
 #: :data:`metrics.vault_health.EXCLUDED_NAMES`.
@@ -391,36 +397,75 @@ def _count_broken_wikilinks(vault: pathlib.Path) -> int:
 
 
 def _count_decayed_in_window(vault: pathlib.Path, today: datetime.date) -> int:
-    """Decayed = ``last_accessed`` older than :data:`DECAY_WINDOW_DAYS`
-    AND ``access_count <= 1``. Approximates the design's tier R3-R4
-    decay-backlog signal using only fields already on every note.
+    """Phase 2: count groomable notes with continuous decay score
+    ``D >= 0.20`` (cortex-memory/research/2026-06-10-decay-phase-2-
+    implementation-spec.md).
 
-    Counts groomable notes (excludes dailies/archive/gh-state)."""
-    cutoff = today - datetime.timedelta(days=DECAY_WINDOW_DAYS)
-    cutoff_str = cutoff.isoformat()
+    Replaces the binary ``last_accessed > 7d AND access_count <= 1``
+    check with the continuous scoring formula from
+    :func:`metrics.vault_health.compute_decay_score`. Phase 2.5 all-
+    links exemption is applied for structurally-isolated notes that
+    would otherwise be flagged.
+
+    Excludes ``dailies/``, ``archive/``, ``gh-state/``, ``decisions/``,
+    ``feedback/`` per :data:`_EXCLUDED_TOP_DIRS`. Returns an ``int`` so
+    the Stage C trigger logic (``state.decayed_notes_in_window >
+    config.decay_threshold``) is unchanged.
+    """
+    # Lazy import — :mod:`metrics.vault_health` imports
+    # :func:`alice_thinking.memory_worker.stage_d._is_fitness_domain`
+    # at module load. Importing :mod:`metrics.vault_health` at the top
+    # of this file would form an import cycle through stage_d.
+    from metrics.vault_health import (
+        DEFAULT_DECAY_SCORE_THRESHOLD,
+        compute_all_links_degree,
+        compute_decay_score,
+    )
+    from alice_thinking.memory_worker.stage_d import _phase_2_5_exempt
+
+    if not vault.is_dir():
+        return 0
+
+    # Build structural inbound index once for the whole pass.
+    inbound: dict[str, set[str]] = defaultdict(set)
+    for md in _iter_groomable_notes(vault):
+        try:
+            text = md.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        _fm, body = split_frontmatter(text)
+        source_rel = str(md.relative_to(vault))
+        for target in _extract_wikilink_targets(body):
+            base = target.rsplit("/", 1)[-1]
+            if base:
+                inbound[base.lower()].add(source_rel)
+
     n = 0
     for md in _iter_groomable_notes(vault):
         try:
             text = md.read_text(encoding="utf-8")
         except OSError:
             continue
-        fm, _body = split_frontmatter(text)
-        la = fm.get("last_accessed")
-        ac = fm.get("access_count")
-        if la is None:
+        fm, body = split_frontmatter(text)
+        in_deg = len(inbound.get(md.stem.lower(), set()))
+        score = compute_decay_score(
+            fm=fm,
+            body=body,
+            in_degree=in_deg,
+            vault_dir=vault,
+            note_path=md,
+            today=today,
+        )
+        if score < DEFAULT_DECAY_SCORE_THRESHOLD:
             continue
-        la_str = str(la).strip()
-        if len(la_str) < 10:
-            continue
-        if la_str[:10] >= cutoff_str:
-            continue
-        # Inside the decay window — check access count.
-        try:
-            ac_int = int(ac) if ac is not None else 0
-        except (TypeError, ValueError):
-            ac_int = 0
-        if ac_int <= 1:
-            n += 1
+        # Phase 2.5: pay the all-links walk only on notes that would
+        # otherwise be counted. Keeps the worst-case bounded; on a typical
+        # vault only ~12% of notes trip the threshold.
+        if in_deg < 10:
+            all_deg = compute_all_links_degree(vault, md)
+            if _phase_2_5_exempt(in_deg, all_deg):
+                continue
+        n += 1
     return n
 
 
@@ -487,34 +532,90 @@ _DECAY_AGE_CAP = 0.5
 _DECAY_ATOMIZE_FRACTION = 0.8
 
 
-def _decay_priority_score(path: pathlib.Path) -> float:
-    """Priority boost for a decayed note in :func:`atomize` selection.
+def _decay_priority_score(
+    path: pathlib.Path,
+    *,
+    vault: pathlib.Path | None = None,
+) -> float:
+    """Phase 2: priority boost for a decayed note in :func:`atomize`
+    selection. Returns the continuous decay score from
+    :func:`metrics.vault_health.compute_decay_score`, scaled to
+    ``[0.0, 10.0]`` so the existing sort key (decay-boosted notes
+    first, regular bloated notes second) still works.
 
-    Returns 0.0 for fitness-domain notes and notes whose ``access_count``
-    is >0 — they don't get the decayed-note treatment. A zero-access
-    note earns a base 10.0 plus up to 0.5 from age (older = decaying
-    longer). Capped so a single note can't dominate the iteration
-    order.
+    Returns ``0.0`` for fitness-domain notes (fixed-schedule writes,
+    not behavioral decay — see :data:`FITNESS_TAGS`). Also returns 0.0
+    when the score is below the decay threshold, so the atomize
+    selection only boosts notes that are actually decayed.
+
+    Phase 2.5 (all-links exemption) is applied via
+    :func:`alice_thinking.memory_worker.stage_d._phase_2_5_exempt`:
+    well-connected isolated notes get no boost.
+
+    ``vault`` may be passed for accurate ``in_degree`` lookup; without
+    it the in_degree defaults to 0 (worst-case for the candidate, but
+    folder_resistance still dominates the formula for stable folders).
     """
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return 0.0
-    fm, _body = split_frontmatter(text)
+    fm, body = split_frontmatter(text)
     tags = set(_tags_of(fm))
     if tags & FITNESS_TAGS:
         return 0.0
-    try:
-        ac = int(fm.get("access_count") or 0)
-    except (TypeError, ValueError):
-        ac = 0
-    if ac > 0:
+
+    # Lazy import — see _count_decayed_in_window for cycle rationale.
+    from metrics.vault_health import (
+        DEFAULT_DECAY_SCORE_THRESHOLD,
+        compute_all_links_degree,
+        compute_decay_score,
+    )
+    from alice_thinking.memory_worker.stage_d import _phase_2_5_exempt
+
+    # in_degree: 0 unless ``vault`` is supplied; even with vault we keep
+    # the lookup cheap (one walk over groomable notes).
+    in_deg = 0
+    if vault is not None and vault.is_dir():
+        stem_key = path.stem.lower()
+        for md in _iter_groomable_notes(vault):
+            try:
+                if md.resolve() == path.resolve():
+                    continue
+            except OSError:
+                if md == path:
+                    continue
+            try:
+                t = md.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            _fm, b = split_frontmatter(t)
+            for target in _extract_wikilink_targets(b):
+                base = target.rsplit("/", 1)[-1].lower()
+                if base == stem_key:
+                    in_deg += 1
+                    break
+
+    score = compute_decay_score(
+        fm=fm,
+        body=body,
+        in_degree=in_deg,
+        vault_dir=vault if vault is not None else path.parent,
+        note_path=path,
+        today=_today(),
+    )
+    if score < DEFAULT_DECAY_SCORE_THRESHOLD:
         return 0.0
-    created = _parse_created_date(fm.get("created"))
-    if created is None:
-        return 10.0
-    age_days = max(0, (_today() - created).days)
-    return 10.0 + min(age_days / 365.0, _DECAY_AGE_CAP)
+
+    # Phase 2.5: zero out if the all-links exemption applies.
+    if vault is not None and vault.is_dir() and in_deg < 10:
+        all_deg = compute_all_links_degree(vault, path)
+        if _phase_2_5_exempt(in_deg, all_deg):
+            return 0.0
+
+    # Scale [0.0, 1.0] → [0.0, 10.0] so the boost slots above non-decay
+    # bloated candidates (which score 0) in the atomize sort.
+    return round(score * 10.0, 4)
 
 
 def _split_on_headings(body: str) -> list[tuple[str, str]]:
@@ -662,7 +763,7 @@ def atomize(
     # feedback-loop bet: surfacing decayed content as standalone notes
     # is worth atomizing slightly-shorter parents).
     candidates = _iter_groomable_notes(vault)
-    scored = [(md, _decay_priority_score(md)) for md in candidates]
+    scored = [(md, _decay_priority_score(md, vault=vault)) for md in candidates]
     scored.sort(key=lambda t: (-t[1], str(t[0])))
 
     for md, decay_boost in scored:

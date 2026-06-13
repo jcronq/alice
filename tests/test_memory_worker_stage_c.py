@@ -429,23 +429,27 @@ def test_atomize_sibling_children_share_collision_set(mind: pathlib.Path):
     """When two source notes processed in the same tick would both
     create the same child slug, the second one should detect the
     in-flight collision (slug_index is mutated as children are
-    written)."""
-    # Two source notes whose stems happen to match — each has a
-    # ``## Shared`` section that slugifies identically when prefixed
-    # by the parent stem. Wait — that's only possible if the two
-    # parents share a stem too, which is its own dupe. So instead,
-    # contrive two distinct parents with section titles that converge
-    # on the same final slug.
+    written).
+
+    Phase 2 update: ``created`` set to today so the continuous decay
+    formula registers these (fresh, zero-access research) notes as
+    decay candidates → relaxed atomize threshold (0.8 × bloated_lines)
+    activates. The legacy ``created=2026-05-01`` would age-discount
+    the decay boost and require the full bloated threshold, which the
+    contrived 205-line bodies don't reach."""
     body_a = (
         "intro\n\n## Beta\n" + ("body\n" * 100) + "\n## Done\n" + ("body\n" * 100)
     )
     body_b = (
         "intro\n\n## Beta\n" + ("body\n" * 100) + "\n## Done\n" + ("body\n" * 100)
     )
-    # Distinct parents, distinct child slugs — verifies the no-collision
-    # baseline (both parents atomize cleanly).
-    _write_note(mind, "research/parent-a.md", title="A", body=body_a)
-    _write_note(mind, "research/parent-b.md", title="B", body=body_b)
+    today_iso = datetime.date.today().isoformat()
+    _write_note(
+        mind, "research/parent-a.md", title="A", body=body_a, created=today_iso
+    )
+    _write_note(
+        mind, "research/parent-b.md", title="B", body=body_b, created=today_iso
+    )
 
     n = stage_c.atomize(mind, max_items=10, journal_path=None)
     assert n == 2

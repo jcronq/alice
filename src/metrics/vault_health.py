@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import re
 import sys
 from collections import defaultdict
@@ -694,6 +695,301 @@ def count_research_decay(
                 decay_count += 1
 
     return decay_count
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Continuous decay scoring
+# Design: cortex-memory/research/2026-06-10-decay-phase-2-implementation-spec.md
+#         cortex-memory/research/2026-06-10-decay-phase-2-file-changes.md
+#         cortex-memory/research/2026-06-10-decay-phase-2-sensitivity-analysis.md
+# Phase 2.5: all-links degree sub-tier stratification — exempts well-connected
+# isolated notes (research notes with body-level wikilinks) from decay.
+# Design: cortex-memory/research/2026-06-10-decay-phase-2-5-subtier-stratification.md
+#
+# Replaces the binary decay flag (access_count <=1 AND last_accessed >7d) with
+# a continuous score D in [0.0, 1.0]. Threshold D >= 0.20 = "decayed".
+# ---------------------------------------------------------------------------
+
+
+#: Per-folder protection against decay. Higher = harder to decay. ``archive``
+#: at 1.0 is the destination (shouldn't be scored at all); transient folders
+#: (``experiments``, ``tools``) get 0.0 so decay flows naturally. See the
+#: implementation spec for the rationale behind each constant.
+_FOLDER_RESISTANCE: dict[str, float] = {
+    "archive": 1.0,
+    "dailies": 0.80,
+    "gh-state": 0.95,
+    "decisions": 0.90,
+    "feedback": 0.85,
+    "reference": 0.75,
+    "projects": 0.30,
+    "research": 0.70,
+    "conflicts": 0.50,
+    "sources": 0.60,
+    "people": 0.80,
+    "experiments": 0.0,
+    "tools": 0.0,
+}
+_DEFAULT_FOLDER_RESISTANCE = 0.15
+
+#: Per-folder weighting on the access-count protection term. Stable folders
+#: (reference, projects, decisions, people, feedback) treat repeated access
+#: as a strong stability signal; research gets a smaller weight; transient
+#: folders get zero — accessing a daily/gh-state mirror note doesn't make
+#: it less decay-eligible.
+_ACCESS_WEIGHT: dict[str, float] = {
+    # Stable folders — access matters
+    "reference": 0.25,
+    "projects": 0.25,
+    "decisions": 0.25,
+    "people": 0.25,
+    "feedback": 0.25,
+    # Research — mild access benefit
+    "research": 0.10,
+    "cognitive-science": 0.10,
+    "memory-design": 0.10,
+    # Transient — access doesn't help
+    "dailies": 0.0,
+    "gh-state": 0.0,
+    "experiments": 0.0,
+    "conflicts": 0.0,
+}
+_DEFAULT_ACCESS_WEIGHT = 0.15
+
+#: in_degree saturation constant. link_resistance = in_degree / (in_degree + k),
+#: capped at 0.85 so a single hub with thousands of inbound links can't
+#: zero out decay entirely.
+_LINK_K = 3
+#: Link-resistance saturation cap. Even an extremely well-connected note
+#: keeps at least 15% of its decay potential.
+_LINK_RESISTANCE_CAP = 0.85
+
+#: Age half-life in days. age_factor = exp(-ln(2) * age_days / tau).
+_AGE_TAU = 7
+
+#: Body trigger keywords that proxy-boost a note (cuts decay by 50%).
+#: A note whose body literally contains "decay" / "recovery" / "metrics" /
+#: "health" / "score" is presumed worth surfacing regardless of access
+#: pattern. Trigger detection is case-insensitive substring on the body.
+_TRIGGER_KEYWORDS = frozenset({"decay", "recovery", "metrics", "health", "score"})
+
+#: Normalizer for the access term. f(access_count) = log(1 + access_count) /
+#: log(1 + 860); 860 is the saturation ceiling from the sensitivity
+#: analysis (P99 access_count across the vault, kept fixed so the term
+#: doesn't drift as vault-wide reads grow).
+_ACCESS_SATURATION = 860
+_ACCESS_LOG_BASE = math.log(1 + _ACCESS_SATURATION)
+
+#: Notes whose frontmatter declares ``decay_exempt: true`` are pinned to
+#: D = 0.0 regardless of formula inputs. Used for edge cases that folder-
+#: based resistance can't cover (e.g. a single archive-bound note inside
+#: an otherwise-active folder).
+_DECAY_EXEMPT_VALUE = "true"
+
+#: Decay threshold — notes with D >= this are considered "decayed". From
+#: the sensitivity analysis: 255 notes (12.1% of vault) at 0.20, matching
+#: the binary-flag behavior's intent while protecting stable folders.
+DEFAULT_DECAY_SCORE_THRESHOLD = 0.20
+
+
+def _decay_folder_of(note_path: Path | None, vault_dir: Path) -> str:
+    """Top-level folder of ``note_path`` relative to ``vault_dir``. Empty
+    string if ``note_path`` is None or doesn't sit under the vault."""
+    if note_path is None:
+        return ""
+    try:
+        rel_parts = note_path.relative_to(vault_dir).parts
+    except ValueError:
+        return ""
+    return rel_parts[0] if rel_parts else ""
+
+
+def compute_decay_score(
+    fm: dict[str, Any],
+    body: str,
+    in_degree: int,
+    vault_dir: Path,
+    *,
+    note_path: Path | None = None,
+    today: Any = None,
+) -> float:
+    """Continuous decay score D in [0.0, 1.0] for one note.
+
+    Formula::
+
+        D = (1 - link_resistance)
+            * (1 - folder_resistance)
+            * (1 - trigger_proxy)
+            * age_factor
+            * (1 - access_term)
+
+    Components:
+
+    * ``link_resistance = min(in_degree / (in_degree + 3), 0.85)`` —
+      structural connectivity from the wikilink graph.
+    * ``folder_resistance`` — folder-based stability (lookup, default 0.15).
+    * ``trigger_proxy = 0.5`` if body contains any of {decay, recovery,
+      metrics, health, score}; ``0.0`` otherwise.
+    * ``age_factor = exp(-ln(2) * age_days / 7)`` — half-life 7 days
+      against ``fm['created']`` (today if unparseable).
+    * ``access_term = access_weight[folder] * log(1+access_count) /
+      log(1+860)`` — folder-weighted access protection.
+
+    Returns ``0.0`` when ``fm['decay_exempt'] == 'true'``.
+
+    ``note_path`` is optional — passing it lets the function derive the
+    folder for the per-folder lookups. Without it, both folder lookups
+    fall back to the default constants. ``today`` may be a
+    ``datetime.date`` or ``datetime.datetime``; defaults to ``_local_now()``.
+
+    The output is clamped to ``[0.0, 1.0]`` and rounded to 6 decimals for
+    stable JSON serialization downstream.
+    """
+    # ── Exemption ────────────────────────────────────────────────
+    if str(fm.get("decay_exempt") or "").strip().lower() == _DECAY_EXEMPT_VALUE:
+        return 0.0
+
+    # ── today ────────────────────────────────────────────────────
+    if today is None:
+        today_date = _local_now().date()
+    elif isinstance(today, datetime):
+        today_date = today.date()
+    else:
+        today_date = today
+
+    # ── Folder ───────────────────────────────────────────────────
+    folder = _decay_folder_of(note_path, vault_dir)
+    folder_resistance = _FOLDER_RESISTANCE.get(folder, _DEFAULT_FOLDER_RESISTANCE)
+
+    # ── Link resistance ─────────────────────────────────────────
+    try:
+        in_deg = max(0, int(in_degree))
+    except (TypeError, ValueError):
+        in_deg = 0
+    link_resistance = min(in_deg / (in_deg + _LINK_K), _LINK_RESISTANCE_CAP)
+
+    # ── Trigger proxy ───────────────────────────────────────────
+    body_lower = (body or "").lower()
+    trigger_proxy = 0.5 if any(kw in body_lower for kw in _TRIGGER_KEYWORDS) else 0.0
+
+    # ── Age factor ──────────────────────────────────────────────
+    created_dt = _parse_created_date(fm.get("created"))
+    if created_dt is None:
+        # No created date → can't age. Treat as just-created (no penalty).
+        age_factor = 1.0
+    else:
+        created_date = created_dt.date() if isinstance(created_dt, datetime) else created_dt
+        age_days = max(0, (today_date - created_date).days)
+        age_factor = math.exp(-math.log(2) * age_days / _AGE_TAU)
+
+    # ── Access term ─────────────────────────────────────────────
+    access_weight = _ACCESS_WEIGHT.get(folder, _DEFAULT_ACCESS_WEIGHT)
+    raw_ac = fm.get("access_count")
+    try:
+        access_count = max(0, int(raw_ac)) if raw_ac is not None else 0
+    except (TypeError, ValueError):
+        access_count = 0
+    if _ACCESS_LOG_BASE > 0 and access_count > 0:
+        access_term = access_weight * (math.log(1 + access_count) / _ACCESS_LOG_BASE)
+    else:
+        access_term = 0.0
+    # f saturates at 1.0 when access_count = 860, so access_term is
+    # capped at access_weight by construction; clamp defensively anyway.
+    access_term = min(access_term, access_weight)
+
+    # ── Compose ────────────────────────────────────────────────
+    score = (
+        (1.0 - link_resistance)
+        * (1.0 - folder_resistance)
+        * (1.0 - trigger_proxy)
+        * age_factor
+        * (1.0 - access_term)
+    )
+    return round(max(0.0, min(1.0, score)), 6)
+
+
+# Internal wikilink-target extraction regex matching the lightweight
+# pattern stage_c / stage_d use. We don't pull in
+# yaml_lite.extract_wikilinks here because the all-links walk has to be
+# fast across thousands of notes — a compiled regex is enough, and we
+# only care about the basename target, not full slug normalization.
+_ALL_LINKS_WIKILINK_RE = re.compile(
+    r"\[\[([^\]|#]+?)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]"
+)
+
+
+def compute_all_links_degree(
+    vault_dir: Path,
+    target_path: Path,
+) -> int:
+    """All-links in_degree for ``target_path``: count of other notes that
+    wikilink to it via body OR frontmatter values.
+
+    Differs from structural in_degree (which only counts Tier-4 / spec
+    links): this captures the organic body-level wikilinks research notes
+    use heavily. Phase 2.5 uses this signal to exempt well-connected
+    isolated notes from decay — 1D sub-tier in the stratification
+    analysis.
+
+    Matches case-insensitively on the basename of the target's filename
+    stem; folder qualifiers and section anchors on the source side are
+    stripped before comparison. A source note that links to the target
+    via multiple shapes (body + frontmatter, or twice in body) still
+    counts as ``+1`` — we count source notes, not link occurrences.
+    """
+    target_stem = target_path.stem.lower()
+    try:
+        target_resolved = target_path.resolve()
+    except OSError:
+        target_resolved = target_path
+    count = 0
+    for md in _iter_resolution_targets(vault_dir):
+        try:
+            if md.resolve() == target_resolved:
+                continue
+        except OSError:
+            if md == target_path:
+                continue
+        text = _read_text(md)
+        if not text:
+            continue
+        fm, body = split_frontmatter(text)
+
+        matched = False
+        # Body wikilinks
+        for m in _ALL_LINKS_WIKILINK_RE.finditer(body):
+            raw = m.group(1).strip()
+            base = raw.rsplit("/", 1)[-1].lower()
+            if base == target_stem:
+                matched = True
+                break
+        # Frontmatter wikilinks (strings or lists of strings)
+        if not matched:
+            for val in fm.values():
+                if isinstance(val, str):
+                    for m in _ALL_LINKS_WIKILINK_RE.finditer(val):
+                        raw = m.group(1).strip()
+                        base = raw.rsplit("/", 1)[-1].lower()
+                        if base == target_stem:
+                            matched = True
+                            break
+                elif isinstance(val, list):
+                    for item in val:
+                        if isinstance(item, str):
+                            for m in _ALL_LINKS_WIKILINK_RE.finditer(item):
+                                raw = m.group(1).strip()
+                                base = raw.rsplit("/", 1)[-1].lower()
+                                if base == target_stem:
+                                    matched = True
+                                    break
+                            if matched:
+                                break
+                if matched:
+                    break
+
+        if matched:
+            count += 1
+    return count
 
 
 def count_access_decay(

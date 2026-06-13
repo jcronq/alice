@@ -84,7 +84,7 @@ import logging
 import math
 import pathlib
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Any, Callable, Iterable, Optional
 
 from indexer.yaml_lite import split_frontmatter
@@ -1035,24 +1035,50 @@ def _extract_major_topic(keywords: list[str]) -> str:
     return keywords[0] if keywords else ""
 
 
-def _iter_decayed_notes(
-    vault: pathlib.Path,
-    today: datetime.date,
-    *,
-    window_days: int,
-) -> list[pathlib.Path]:
-    """All groomable notes whose ``last_accessed`` is older than the
-    decay window AND whose ``access_count`` is <=1.
+#: Phase 2.5 all-links degree exemption thresholds.
+#:
+#: A structurally-isolated note (``in_degree == 0``) is exempt from the
+#: decay pool when EITHER condition holds:
+#:
+#: 1. ``all_links_degree >= 10`` — densely cross-linked at the body level
+#:    even without spec/parent links (1D sub-tier from the stratification
+#:    analysis: 37.7% decay rate, comparable to linked Tier-2 notes).
+#: 2. ``in_degree >= 5 AND all_links_degree >= 14`` — partly structurally
+#:    linked AND heavily body-linked.
+#:
+#: Source: cortex-memory/research/2026-06-10-decay-phase-2-5-subtier-
+#: stratification.md and the speaking-side editorial decision documented
+#: in the dispatch (refined heuristic, prioritizes recovery order).
+_PHASE_2_5_ALL_LINKS_PRIMARY = 10
+_PHASE_2_5_INDEGREE_SECONDARY = 5
+_PHASE_2_5_ALL_LINKS_SECONDARY = 14
 
-    Excludes ``dailies/``, ``archive/``, ``gh-state/``, and dotfiles —
-    same filter Stage C uses for its decay count, so the two stages see
-    the same population.
+
+def _phase_2_5_exempt(in_degree: int, all_links_degree: int) -> bool:
+    """Phase 2.5 exemption predicate. True ⇒ note pinned to D = 0.0."""
+    if all_links_degree >= _PHASE_2_5_ALL_LINKS_PRIMARY:
+        return True
+    if (
+        in_degree >= _PHASE_2_5_INDEGREE_SECONDARY
+        and all_links_degree >= _PHASE_2_5_ALL_LINKS_SECONDARY
+    ):
+        return True
+    return False
+
+
+def _build_structural_inbound_index(
+    vault: pathlib.Path,
+) -> dict[str, set[str]]:
+    """``{slug_lower: {source_rel_path, ...}}`` over groomable notes.
+
+    Single pass over the vault. Used by :func:`_iter_decay_candidates`
+    so the per-candidate ``in_degree`` lookup is O(1) instead of
+    O(vault). Excludes the same top-level dirs the decay walk excludes
+    — links from dailies don't count toward decay resistance.
     """
+    inbound: dict[str, set[str]] = defaultdict(set)
     if not vault.is_dir():
-        return []
-    cutoff = today - datetime.timedelta(days=window_days)
-    cutoff_str = cutoff.isoformat()
-    out: list[pathlib.Path] = []
+        return inbound
     for md in vault.rglob("*.md"):
         rel = md.relative_to(vault).parts
         if not rel or rel[0] in _DECAY_EXCLUDED_TOP_DIRS:
@@ -1063,22 +1089,113 @@ def _iter_decayed_notes(
             text = md.read_text(encoding="utf-8")
         except OSError:
             continue
-        fm, _body = split_frontmatter(text)
-        la = fm.get("last_accessed")
-        if la is None:
+        _fm, body = split_frontmatter(text)
+        source_rel = str(md.relative_to(vault))
+        for m in _WIKILINK_RE.finditer(body):
+            raw = m.group(1).strip()
+            base = raw.rsplit("/", 1)[-1]
+            if base:
+                inbound[base.lower()].add(source_rel)
+    return inbound
+
+
+def _iter_decay_candidates(
+    vault: pathlib.Path,
+    today: datetime.date,
+    threshold: float = 0.20,
+) -> list[tuple[float, pathlib.Path]]:
+    """Phase 2 + 2.5: all groomable notes with decay score >= ``threshold``.
+
+    Replaces the binary ``access_count <= 1 AND last_accessed > 7d``
+    check with the continuous decay score from
+    :func:`metrics.vault_health.compute_decay_score`. Returns a list of
+    ``(decay_score, path)`` tuples sorted by score descending — highest
+    first so downstream passes prioritize the most-decayed notes.
+
+    Phase 2.5 exemption (per
+    :func:`_phase_2_5_exempt`): structurally-isolated notes with high
+    all-links degree are pinned to D = 0.0 and excluded. The all-links
+    walk is only triggered for notes that would otherwise score above
+    threshold, keeping the cost bounded.
+
+    Excludes ``dailies/``, ``archive/``, ``gh-state/``, ``decisions/``,
+    ``feedback/``, and dotfiles — same filter Stage C uses.
+    """
+    # Lazy import — vault_health imports from this module elsewhere
+    # (``_is_fitness_domain``), so a top-level import would re-introduce
+    # the circular dependency.
+    from metrics.vault_health import (
+        compute_all_links_degree,
+        compute_decay_score,
+    )
+
+    if not vault.is_dir():
+        return []
+
+    inbound = _build_structural_inbound_index(vault)
+    scored: list[tuple[float, pathlib.Path]] = []
+    for md in vault.rglob("*.md"):
+        rel = md.relative_to(vault).parts
+        if not rel or rel[0] in _DECAY_EXCLUDED_TOP_DIRS:
             continue
-        la_str = str(la).strip()
-        if len(la_str) < 10 or la_str[:10] >= cutoff_str:
+        if any(part.startswith(".") for part in rel):
             continue
         try:
-            ac = int(fm.get("access_count") or 0)
-        except (TypeError, ValueError):
-            ac = 0
-        if ac > 1:
+            text = md.read_text(encoding="utf-8")
+        except OSError:
             continue
-        out.append(md)
-    out.sort()
-    return out
+        fm, body = split_frontmatter(text)
+        stem_key = md.stem.lower()
+        in_deg = len(inbound.get(stem_key, set()))
+
+        score = compute_decay_score(
+            fm=fm,
+            body=body,
+            in_degree=in_deg,
+            vault_dir=vault,
+            note_path=md,
+            today=today,
+        )
+        if score < threshold:
+            continue
+
+        # Phase 2.5: only pay the all-links walk when the note would
+        # otherwise be flagged. Spending O(vault) per candidate on the
+        # 70-80% of notes that don't trip the threshold would be ruinous;
+        # confining it to the small flagged set keeps the worst-case
+        # bounded.
+        if in_deg < _PHASE_2_5_ALL_LINKS_PRIMARY:
+            all_deg = compute_all_links_degree(vault, md)
+            if _phase_2_5_exempt(in_deg, all_deg):
+                continue
+
+        scored.append((score, md))
+
+    # Highest decay score first; stable tie-break on path so a partial
+    # tick is reproducible.
+    scored.sort(key=lambda t: (-t[0], str(t[1])))
+    return scored
+
+
+def _iter_decayed_notes(
+    vault: pathlib.Path,
+    today: datetime.date,
+    *,
+    window_days: int = DEFAULT_DECAY_WINDOW_DAYS,
+    threshold: float = 0.20,
+) -> list[pathlib.Path]:
+    """Phase 2 compatibility shim: returns only the paths from
+    :func:`_iter_decay_candidates`, dropping the score.
+
+    The ``window_days`` keyword is retained for caller compatibility but
+    is now a no-op — Phase 2's age contribution is computed inside
+    ``compute_decay_score`` against the formula's 7-day half-life, not a
+    hard cutoff. Existing callers that pass ``window_days=7`` see the
+    same population (and a continuous-score-derived superset is fine for
+    archive/pair passes, which down-select further). Returns paths sorted
+    by decay score descending.
+    """
+    return [p for _score, p in _iter_decay_candidates(vault, today, threshold=threshold)]
 
 
 def _is_archive_eligible(fm: dict[str, Any], body: str) -> bool:
