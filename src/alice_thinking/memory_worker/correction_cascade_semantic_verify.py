@@ -46,19 +46,12 @@ import dataclasses
 import json
 import logging
 import pathlib
-import time
-from collections import defaultdict
 from typing import Optional
 
 from indexer.yaml_lite import _strip_code, split_frontmatter
 
-from alice_thinking import vault_lock
 from alice_thinking.memory_worker.correction_cascade import (
     CascadeReport,
-    UnpropagatedCorrection,
-    _frontmatter_read,
-    _slug_of,
-    _title_of,
     _try_resolve_slug,
 )
 

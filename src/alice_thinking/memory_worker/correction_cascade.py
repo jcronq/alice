@@ -44,7 +44,6 @@ Limitations
 from __future__ import annotations
 
 import dataclasses
-import json
 import logging
 import pathlib
 import re
@@ -54,7 +53,6 @@ from typing import Any, Optional
 
 from indexer.yaml_lite import _strip_code, split_frontmatter
 
-from alice_thinking import vault_lock
 
 
 logger = logging.getLogger(__name__)
@@ -246,8 +244,6 @@ def _has_specific_quantitative_correction(correction_body: str) -> tuple[bool, s
     metric) by requiring the number to be part of a comparative or
     measurement claim.
     """
-    corr_lower = correction_body.lower()
-
     # Specific ratio/percentage with count: "98.1% (159/162)"
     # Ratio format (X/Y) is the key signal — a single count in parens
     # (e.g. "100% (104 notes)") is just a coverage metric, not a
@@ -741,7 +737,6 @@ def run(
 
     # Surface high-severity findings to Speaking
     if report.high_count > 0 and surface_path is not None:
-        surface_name = surface_path.name.replace(".md", "")
         high_items = [u for u in report.unpropagated if u.severity == "high"]
         high_desc = ", ".join(
             f"[[{u.referencing_slug}]] still cites [[{u.corrected_slug}]] "

@@ -1966,7 +1966,7 @@ def correction_cascade_check(
     mind: pathlib.Path,
     *,
     journal_path: Optional[pathlib.Path] = None,
-) -> CascadeReport:
+) -> "cascade_mod.CascadeReport":
     """Public wrapper: run correction cascade detection as a standalone
     Stage C operation.
 

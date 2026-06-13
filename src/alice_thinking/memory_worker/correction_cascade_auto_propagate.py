@@ -56,7 +56,6 @@ from alice_thinking.memory_worker.correction_cascade import (
     CascadeReport,
     _frontmatter_read,
     _slug_of,
-    _title_of,
     _try_resolve_slug,
 )
 

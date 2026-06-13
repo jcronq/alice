@@ -14,10 +14,7 @@ Covers:
 """
 
 import pathlib
-import tempfile
-import textwrap
 
-import pytest
 
 from alice_thinking.memory_worker.correction_cascade import (
     CascadeReport,
@@ -108,10 +105,10 @@ class TestSlugOf:
 
 class TestFrontmatterRead:
     def test_valid_frontmatter(self):
-        text = "---\nslug: foo\nnote_type: correction\n---\nbody text"
+        # _frontmatter_read reads from a file, not text — coverage via
+        # test_file_read below; this slot is kept for symmetry.
         fm, body = _frontmatter_read(pathlib.Path())
-        # _frontmatter_read reads from a file, not text — test via tmp_path
-        pass
+        assert fm == {} and body == ""
 
     def test_file_read(self, tmp_path):
         md = tmp_path / "test.md"
