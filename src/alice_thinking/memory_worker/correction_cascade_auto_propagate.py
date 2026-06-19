@@ -42,12 +42,15 @@ Safety
 
 from __future__ import annotations
 
+import json
 import logging
 import pathlib
 import re
 import time
 from collections import defaultdict
+from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from indexer.yaml_lite import split_frontmatter
 
@@ -111,6 +114,52 @@ _MAX_CORRECTIONS_PER_NOTE = 10
 _DRY_RUN = True
 
 _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+?)(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
+
+#: Timezone for event timestamps (events.jsonl convention).
+_EDT = ZoneInfo("America/New_York")
+
+
+def _write_propagation_event(
+    mind: pathlib.Path,
+    *,
+    total_resolved: int,
+    pairs_affected: int,
+    mode: str,
+    duration_seconds: float,
+    high_severity: int,
+    medium_severity: int,
+    low_severity: int,
+) -> None:
+    """Write a ``correction_cascade_auto_propagate`` event to events.jsonl.
+
+    Called at the end of :func:`auto_propagate` to log the run. The write
+    is non-fatal: the propagation has already happened, so a failed event
+    write is logged and swallowed rather than raised.
+    """
+    now = datetime.now(_EDT)
+    event = {
+        "ts": now.isoformat(),
+        "type": "correction_cascade_auto_propagate",
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H:%M EDT"),
+        "total_resolved": total_resolved,
+        "pairs_affected": pairs_affected,
+        "mode": mode,
+        "duration_seconds": round(duration_seconds, 2),
+        "high_severity": high_severity,
+        "medium_severity": medium_severity,
+        "low_severity": low_severity,
+    }
+    events_path = mind / "memory" / "events.jsonl"
+    try:
+        with open(events_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event) + "\n")
+    except OSError as exc:
+        logger.warning(
+            "auto-propagate: event write failed for %s: %s",
+            event["type"],
+            exc,
+        )
 
 
 def _already_references(md: pathlib.Path, correction_slug: str) -> bool:
@@ -294,6 +343,8 @@ def auto_propagate(
     if dry_run is not None:
         _DRY_RUN = dry_run
 
+    wall_start = time.time()
+
     changes: dict[str, int] = {}
     total_added = 0
     skipped = 0
@@ -353,6 +404,8 @@ def auto_propagate(
         if _update_corrected_by(corrected_md, correction_slug, dry_run=dry_run):
             corrected_by_updates += 1
 
+    wall_elapsed = time.time() - wall_start
+
     logger.info(
         "auto-propagate: added %d correction links to %d notes, "
         "updated corrected_by: on %d notes, skipped %d",
@@ -360,6 +413,17 @@ def auto_propagate(
         len(changes),
         corrected_by_updates,
         skipped,
+    )
+
+    _write_propagation_event(
+        mind,
+        total_resolved=total_added,
+        pairs_affected=len(changes),
+        mode="dry-run" if _DRY_RUN else "production",
+        duration_seconds=wall_elapsed,
+        high_severity=report.high_count,
+        medium_severity=report.medium_count,
+        low_severity=report.low_count,
     )
 
     return changes
