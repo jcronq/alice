@@ -358,6 +358,162 @@ def assertions_for_case(case: dict) -> AssertionFile:
     )
 
 
+# ---------------------------------------------------------------------------
+# Spec label set: schema, offline reconstruction, label-driven assertions
+#
+# The canonical ground-truth labels live at
+# ``~/alice-mind/inner/state/speaking-harness-eval-labels.jsonl`` (built by
+# ``eval.build_harness_labels``). Each row carries ``channel``,
+# ``action_required``, ``acceptable_ack_only`` and ``expected_tools``; this
+# section turns one row into the three spec-named failure-mode assertions
+# and, for offline mode, reconstructs a faithful HarnessResult from the
+# historical record without any model call.
+
+DEFAULT_LABELS = "~/alice-mind/inner/state/speaking-harness-eval-labels.jsonl"
+
+# Tool names that mean "Alice delivered a reply to a human".
+_SEND_NAMES = ("send_message", "mcp__alice__send_message")
+
+
+def load_labels(path: str | pathlib.Path = DEFAULT_LABELS) -> list[dict]:
+    """Load the canonical labelled set (skips any ``_seed_meta`` line)."""
+    return _load_jsonl(path, skip_meta=True)
+
+
+def label_category(label: dict) -> str:
+    """A reporting bucket for the ``by_category`` table."""
+    if label.get("acceptable_ack_only"):
+        return "ack"
+    if not label.get("action_required"):
+        return "fyi"
+    return "action-cli" if label.get("channel") == "cli" else "action-signal"
+
+
+def offline_result(label: dict) -> HarnessResult:
+    """Reconstruct a HarnessResult from the historical record — no model.
+
+    Faithful reconstruction of what the daemon actually did:
+
+    - On a **Signal** turn a non-empty historical outbound means
+      ``send_message`` was called with that text (that's how it reached the
+      user); an empty outbound means ``missed_reply`` — no send. So we
+      synthesise a ``send_message`` call (with the real message body, so the
+      bare-ack check can see whether it was emoji-only) iff the outbound is
+      non-empty.
+    - On a **CLI** turn the final assistant text IS the reply (no send), so
+      no tool call is synthesised.
+
+    Non-send tool calls cannot be recovered from this log, so offline mode
+    can only score the bare-ack and missing-send modes precisely; a
+    completion claim that needed a *non-send* tool (e.g. "filed an issue")
+    will read as unbacked offline. That's a documented limitation — live
+    mode is the ground truth for claim-backing of non-send tools.
+    """
+    outbound = label.get("historical_outbound") or ""
+    channel = label.get("channel", "signal")
+    tool_calls: list[dict] = []
+    if channel == "signal" and outbound.strip():
+        tool_calls = [
+            {
+                "name": "mcp__alice__send_message",
+                "id": "offline-send",
+                "input": {"message": outbound},
+            }
+        ]
+    return HarnessResult(
+        turn_id=label.get("turn_id") or "turn_unknown",
+        inbound=label.get("inbound") or "",
+        outbound_text=outbound,
+        tool_calls=tool_calls,
+        sent=bool(tool_calls),
+        error=None,
+    )
+
+
+def assertions_for_label(label: dict) -> AssertionFile:
+    """Build the three spec-named failure-mode assertions for one label.
+
+    - ``claim_backed_by_tool`` (pass_to_pass): always — a completion claim
+      must be backed by the corresponding tool (false-completion mode).
+    - ``action_taken_when_required`` (fail_to_pass): when action_required —
+      a substantive tool (or, on CLI, substantive text) must have fired
+      (bare-ack mode).
+    - ``send_message_when_expected`` (fail_to_pass): on Signal turns whose
+      ``expected_tools`` includes send_message — send_message must have been
+      called (missing-send mode).
+    """
+    channel = label.get("channel", "signal")
+    expected_tools = list(label.get("expected_tools") or [])
+    action_required = bool(label.get("action_required"))
+
+    pass_to_pass: list[dict] = [
+        {
+            "type": "claim_backed_by_tool",
+            "acceptable_ack_only": bool(label.get("acceptable_ack_only")),
+        }
+    ]
+    fail_to_pass: list[dict] = []
+    if action_required:
+        fail_to_pass.append(
+            {"type": "action_taken_when_required", "channel": channel}
+        )
+    if channel == "signal" and any(
+        t in _SEND_NAMES for t in expected_tools
+    ):
+        fail_to_pass.append(
+            {"type": "send_message_when_expected", "channel": channel}
+        )
+    return AssertionFile(
+        turn_id=label.get("turn_id") or "turn_unknown",
+        category=label_category(label),
+        channel=channel,
+        pass_to_pass=pass_to_pass,
+        fail_to_pass=fail_to_pass,
+    )
+
+
+def score_label_results(
+    labels: Sequence[dict],
+    results: Sequence[HarnessResult],
+    *,
+    candidate_id: str = "alice",
+) -> list[dict]:
+    """Score harness results against the spec labels' failure-mode
+    assertions. Returns rows consumable by :func:`eval.score.score_results`
+    (each row carries ``resolved``, ``category`` and the per-assertion
+    ``assertions`` list the per-failure-mode breakdown reads)."""
+    by_turn = {r.turn_id: r for r in results}
+    rows: list[dict] = []
+    for label in labels:
+        turn_id = label.get("turn_id")
+        result = by_turn.get(turn_id)
+        af = assertions_for_label(label)
+        if result is None:
+            rows.append(
+                {
+                    "turn_id": turn_id,
+                    "category": af.category,
+                    "candidate_id": candidate_id,
+                    "resolved": False,
+                    "error": "no harness result",
+                    "assertions": [],
+                }
+            )
+            continue
+        instance = evaluate_instance(
+            af,
+            result.outbound_text,
+            candidate_id=candidate_id,
+            tool_calls=result.tool_calls,
+        )
+        row = instance.to_dict()
+        row["error"] = result.error
+        row["sent"] = result.sent
+        row["tool_calls"] = result.tool_calls
+        rows.append(row)
+    return rows
+
+
 def score_harness_results(
     cases: Sequence[dict],
     results: Sequence[HarnessResult],
@@ -486,17 +642,96 @@ def _cmd_score(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_eval(args: argparse.Namespace) -> int:
+    """End-to-end: load labels -> produce results (offline reconstruction
+    or live TurnRunner replay) -> score the three failure-mode assertions
+    -> print the table (with per-failure-mode breakdown).
+
+    ``--offline`` (default) reconstructs results from the historical record
+    with NO model call (free, deterministic, CI-safe). ``--live`` drives the
+    real TurnRunner per turn against the subscription backend.
+    """
+    from eval import score as _score
+
+    labels = load_labels(args.labels)
+    if not labels:
+        print(f"no labels loaded from {args.labels}", file=sys.stderr)
+        return 1
+
+    results: list[HarnessResult]
+    if args.live:
+        import tempfile
+
+        results = []
+        with tempfile.TemporaryDirectory(prefix="alice-harness-") as td:
+            td_path = pathlib.Path(td)
+            for i, label in enumerate(labels):
+                results.append(
+                    run_case_sync(label, tmp_dir=td_path / f"case-{i}")
+                )
+    else:
+        results = [offline_result(label) for label in labels]
+
+    rows = score_label_results(labels, results, candidate_id=args.candidate)
+    report = _score.score_results(rows, candidate_id=args.candidate)
+    mode = "LIVE" if args.live else "OFFLINE (historical reconstruction)"
+    print(f"=== speaking-harness correctness eval — mode: {mode} ===")
+    print(_score.format_report(report))
+
+    if args.results_out:
+        out = pathlib.Path(args.results_out).expanduser()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("w", encoding="utf-8") as fh:
+            for r in results:
+                fh.write(json.dumps(r.to_dict(), ensure_ascii=False) + "\n")
+    if args.out:
+        pathlib.Path(args.out).expanduser().write_text(
+            json.dumps(report.to_dict(), indent=2), encoding="utf-8"
+        )
+    return 0
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m eval harness",
         description=(
             "Real-TurnRunner correctness harness: drives Alice's actual "
-            "turn loop, captures structured tool calls, and scores the "
-            "two correctness assertions (action_requires_send, "
-            "no_unbacked_completion_claim)."
+            "turn loop, captures structured tool calls (with inputs), and "
+            "scores the three failure-mode assertions "
+            "(action_taken_when_required, claim_backed_by_tool, "
+            "send_message_when_expected)."
         ),
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    eval_p = sub.add_parser(
+        "eval",
+        help="One-shot: labels -> (offline|live) results -> score table",
+    )
+    eval_p.add_argument("--labels", default=DEFAULT_LABELS)
+    eval_p.add_argument(
+        "--offline",
+        dest="live",
+        action="store_false",
+        default=False,
+        help="Reconstruct from historical record, no model call (default)",
+    )
+    eval_p.add_argument(
+        "--live",
+        dest="live",
+        action="store_true",
+        help="Drive the real TurnRunner against the subscription backend",
+    )
+    eval_p.add_argument("--candidate", default="alice")
+    eval_p.add_argument(
+        "--results-out",
+        default=None,
+        help="Optional path to write per-turn HarnessResult rows",
+    )
+    eval_p.add_argument(
+        "--out", default=None, help="Optional path to write the JSON report"
+    )
+    eval_p.set_defaults(func=_cmd_eval)
 
     run_p = sub.add_parser(
         "run", help="Drive the labelled set through a real TurnRunner"

@@ -505,6 +505,32 @@ __all__ = [
 ]
 
 
+# Per-value cap on captured tool input (chars). Big enough to keep a
+# send_message body for the bare-ack check, small enough that the in-memory
+# capture stays bounded. The turn log never persists input (see
+# ``_dispatch._tool_calls_snapshot``), so this only bounds the eval surface.
+_TOOL_INPUT_MAX_CHARS = 4000
+
+
+def _truncate_tool_input(input: Any) -> dict:
+    """Return a shallow, size-bounded copy of a tool's input dict.
+
+    Non-dict inputs collapse to ``{}``. String values longer than
+    :data:`_TOOL_INPUT_MAX_CHARS` are truncated; non-string values are
+    coerced to a short ``repr`` so the capture can't blow up on a large
+    nested payload.
+    """
+    if not isinstance(input, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key, val in input.items():
+        if isinstance(val, str):
+            out[str(key)] = val[:_TOOL_INPUT_MAX_CHARS]
+        else:
+            out[str(key)] = repr(val)[:_TOOL_INPUT_MAX_CHARS]
+    return out
+
+
 class ToolCaptureHandler(NullHandler):
     """Record the kernel's structured tool calls for the current turn.
 
@@ -516,18 +542,26 @@ class ToolCaptureHandler(NullHandler):
     called*, which is exactly the signal the regex-over-prose approach in
     the legacy benchmark cannot recover.
 
-    We retain only ``name`` and ``id`` — not the (potentially large)
-    tool input — to honour the turn log's ``MAX_FIELD_BYTES`` discipline
-    and because the correctness eval only needs the tool identity. The
-    handler appends to a caller-owned list so the :class:`TurnRunner`
-    can read the result back after the kernel returns.
+    Each entry is ``{"name", "id", "input"}`` where ``input`` is a
+    *truncated* copy of the tool arguments (capped at
+    :data:`_TOOL_INPUT_MAX_CHARS` per string value). The correctness eval
+    reads the ``input`` — specifically the ``send_message`` ``message``
+    arg — to tell a real, substantive reply from a bare-emoji send, which
+    is the whole point of the bare-ack check. The live turn-log writer
+    (:func:`alice_speaking._dispatch._tool_calls_snapshot`) strips
+    ``input`` back to ``{"name", "id"}`` before persisting, so the log's
+    ``MAX_FIELD_BYTES`` discipline is unchanged. The handler appends to a
+    caller-owned list so the :class:`TurnRunner` can read it back after
+    the kernel returns.
     """
 
     def __init__(self, sink: list[dict]) -> None:
         self._sink = sink
 
     async def on_tool_use(self, name: str, input: Any, id: str) -> None:
-        self._sink.append({"name": name, "id": id})
+        self._sink.append(
+            {"name": name, "id": id, "input": _truncate_tool_input(input)}
+        )
 
 
 class PiSendMessageHandler(NullHandler):

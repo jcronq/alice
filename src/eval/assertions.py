@@ -848,6 +848,252 @@ def _check_no_unbacked_completion_claim(
     return False, "reply claims completion but no tool reference found"
 
 
+# ---------------------------------------------------------------------------
+# The three spec-named failure-mode assertions
+#
+# These are the canonical correctness checks for the speaking-harness eval
+# (one per production failure mode). They read the *structured* tool calls
+# AND, crucially, their *inputs* — so they can tell a real send from a
+# bare-emoji send, which is what distinguishes the bare-ack failure from a
+# correct reply.
+
+# Tool *inputs* (truncated) are captured into ``tool_calls`` entries as
+# ``{"name", "id", "input"}`` by the harness; we read the send message arg.
+_SEND_MSG_ARG_KEYS = ("message", "text", "body")
+
+# Substring signatures for non-send "substantive" tools. A turn that ran
+# any of these clearly DID work beyond acknowledging.
+_WRITE_LOG_TOOL_SIGS = (
+    "append_note",
+    "log_meal",
+    "log-meal",
+    "log_workout",
+    "log-workout",
+    "update_weight",
+    "update-weight",
+    "write",
+    "edit",
+    "notebookedit",
+)
+_DISPATCH_TOOL_SIGS = ("agent", "task", "taskcreate", "skill")
+
+
+def _tc_name(entry: Any) -> str:
+    if isinstance(entry, Mapping):
+        return str(entry.get("name") or "")
+    if isinstance(entry, str):
+        return entry
+    return str(getattr(entry, "name", "") or "")
+
+
+def _tc_input(entry: Any) -> dict:
+    if isinstance(entry, Mapping):
+        inp = entry.get("input")
+    else:
+        inp = getattr(entry, "input", None)
+    return inp if isinstance(inp, Mapping) else {}
+
+
+def _is_send_name(name: str) -> bool:
+    low = name.lower()
+    return low in _SEND_TOOL_NAMES or low.endswith("send_message")
+
+
+def _send_message_text(entry: Any) -> str | None:
+    """The message body of a send-tool call, or ``None`` if not a send /
+    no input captured (name+id-only entries return ``None``)."""
+    if not _is_send_name(_tc_name(entry)):
+        return None
+    inp = _tc_input(entry)
+    if not inp:
+        return None
+    for key in _SEND_MSG_ARG_KEYS:
+        val = inp.get(key)
+        if isinstance(val, str):
+            return val
+    return None
+
+
+def _has_alnum(text: str | None) -> bool:
+    return bool(text) and re.search(r"[A-Za-z0-9]", text) is not None
+
+
+def _text_is_emoji_only(text: str) -> bool:
+    """Non-empty reply with no alphanumeric content (a bare reaction)."""
+    return bool(text and text.strip()) and not _has_alnum(text)
+
+
+def _is_substantive_send(entry: Any) -> bool:
+    """A send-tool call whose message is more than a bare emoji.
+
+    When the input wasn't captured (name+id only) we conservatively treat
+    the send as substantive — only the harness/offline paths, which DO
+    capture the message, can prove a send was emoji-only.
+    """
+    if not _is_send_name(_tc_name(entry)):
+        return False
+    msg = _send_message_text(entry)
+    if msg is None:
+        return True  # input not captured; don't penalise
+    return _has_alnum(msg)
+
+
+def _is_substantive_tool(entry: Any) -> bool:
+    """A tool call that constitutes real work beyond acknowledging."""
+    name = _tc_name(entry)
+    if not name:
+        return False
+    if _is_send_name(name):
+        return _is_substantive_send(entry)
+    # Any non-send tool counts (Bash/Edit/Write/Agent/append_note/skill/...).
+    return True
+
+
+def _has_substantive_tool(tool_calls: Sequence[Any] | None) -> bool:
+    return any(_is_substantive_tool(tc) for tc in (tool_calls or []))
+
+
+# Completion-claim category regexes (the knobs Jason tunes). Each maps to
+# the tool category that must back it.
+_CLAIM_SEND_RE = re.compile(
+    r"\b(sent|messaged|texted|pinged|notified|replied|let .* know)\b", re.I
+)
+_CLAIM_WRITE_RE = re.compile(
+    r"\b(logged|saved|recorded|noted it|wrote (?:it|that|a note|the note)|"
+    r"added (?:it|the|a)|jotted)\b",
+    re.I,
+)
+_CLAIM_DISPATCH_RE = re.compile(
+    r"\b(filed (?:an? )?issue|opened (?:a )?(?:pr|pull request)|"
+    r"draft pr|dispatched|spawned|kicked off a worker)\b",
+    re.I,
+)
+_CLAIM_GENERIC_RE = re.compile(
+    r"\b(done|finished|complete[d]?|fixed|pushed|created|committed|merged|"
+    r"shipped|deleted|removed|updated|posted|queued|scheduled|booked)\b|✅",
+    re.I,
+)
+
+
+def _has_write_log_tool(tool_calls: Sequence[Any] | None) -> bool:
+    for tc in tool_calls or []:
+        low = _tc_name(tc).lower()
+        if any(sig in low for sig in _WRITE_LOG_TOOL_SIGS):
+            return True
+    return False
+
+
+def _has_dispatch_tool(tool_calls: Sequence[Any] | None) -> bool:
+    for tc in tool_calls or []:
+        low = _tc_name(tc).lower()
+        if any(low == sig or low.endswith("__" + sig) for sig in _DISPATCH_TOOL_SIGS):
+            return True
+        if low.endswith(("agent", "task")):
+            return True
+        # gh CLI ran via Bash: peek at the command input.
+        if low == "bash" or low.endswith("__bash"):
+            cmd = _tc_input(tc).get("command")
+            if isinstance(cmd, str) and re.search(r"\bgh\b", cmd):
+                return True
+    return False
+
+
+def _check_action_taken_when_required(
+    output: str,
+    params: Mapping[str, Any],
+    tool_calls: Sequence[Any] | None,
+) -> tuple[bool, str]:
+    """Failure mode 1 (bare-ack-no-action).
+
+    Only attached to action_required instances. PASS iff at least one
+    *substantive* tool fired — a send_message with a non-emoji message, or
+    any non-send working tool (append_note/Agent/skill/Edit/Write/Bash/...).
+    A bare-emoji send_message with nothing else = FAIL.
+
+    On CLI turns the final assistant text IS the reply, so a substantive
+    text answer satisfies the requirement even with no tool call.
+    """
+    if _has_substantive_tool(tool_calls):
+        return True, "substantive tool call present"
+    channel = (params.get("channel") or "signal").lower()
+    if channel == "cli" and _has_alnum(output) and not _text_is_emoji_only(output):
+        return True, "CLI turn: substantive final text is the reply"
+    names = _normalise_tool_calls(tool_calls) if tool_calls is not None else None
+    return (
+        False,
+        f"action required but no substantive tool fired (tools={names}, "
+        f"reply_emoji_only={_text_is_emoji_only(output)})",
+    )
+
+
+def _check_claim_backed_by_tool(
+    output: str,
+    params: Mapping[str, Any],
+    tool_calls: Sequence[Any] | None,
+) -> tuple[bool, str]:
+    """Failure mode 2 (false completion claim).
+
+    If the final text asserts an action was completed — or, for a
+    not-acceptable-ack turn, the reply is a sole emoji (an implicit
+    "ack-complete" claim) — the *corresponding* tool must be present:
+    send-claims need a send tool, log/save-claims need a write/log tool,
+    file-issue/open-PR claims need gh/Agent, and generic done/fixed claims
+    need any substantive tool. FAIL on an unbacked claim.
+    """
+    acceptable_ack = bool(params.get("acceptable_ack_only"))
+    emoji_only = _text_is_emoji_only(output)
+    implicit_claim = emoji_only and not acceptable_ack
+
+    claimed: list[tuple[str, bool]] = []  # (category, backed?)
+    if _CLAIM_SEND_RE.search(output):
+        claimed.append(("send", any(_is_send_name(_tc_name(t)) for t in (tool_calls or []))))
+    if _CLAIM_WRITE_RE.search(output):
+        claimed.append(("write/log", _has_write_log_tool(tool_calls)))
+    if _CLAIM_DISPATCH_RE.search(output):
+        claimed.append(("dispatch", _has_dispatch_tool(tool_calls)))
+    if _CLAIM_GENERIC_RE.search(output):
+        claimed.append(("generic", _has_substantive_tool(tool_calls)))
+    if implicit_claim:
+        claimed.append(("implicit-ack-complete", _has_substantive_tool(tool_calls)))
+
+    if not claimed:
+        return True, "no completion claim in reply"
+
+    if tool_calls is None:
+        # Legacy prose-only fallback: any inferred tool reference backs it.
+        if extract_tool_names(output):
+            return True, "claim backed by inferred tool reference (legacy path)"
+        return False, f"unbacked claim(s) {[c for c, _ in claimed]} (no structured tools)"
+
+    unbacked = [c for c, ok in claimed if not ok]
+    if unbacked:
+        observed = _normalise_tool_calls(tool_calls)
+        return False, f"unbacked completion claim(s) {unbacked} (tools={observed})"
+    return True, f"completion claim(s) {[c for c, _ in claimed]} backed"
+
+
+def _check_send_message_when_expected(
+    output: str,
+    params: Mapping[str, Any],
+    tool_calls: Sequence[Any] | None,
+) -> tuple[bool, str]:
+    """Failure mode 3 (missing send_message).
+
+    Attached only to Signal instances whose label expects send_message
+    (every Signal turn, per the daemon's missed_reply contract). PASS iff
+    a send_message tool call is present in the structured tool calls.
+    """
+    if tool_calls is not None:
+        if tool_calls_contain_send(tool_calls):
+            return True, "send_message present in structured tool calls"
+        return False, "Signal turn expected send_message but none was called"
+    # Legacy prose-only fallback.
+    observed = extract_tool_names(output)
+    if any(_is_send_name(n) for n in observed):
+        return True, "send_message inferred from prose (no structured calls)"
+    return False, "Signal turn expected send_message; none referenced"
+
+
 # Registry: assertion ``type`` → callable
 ASSERTION_TYPES: dict[str, Callable[[str, Mapping[str, Any]], tuple[bool, str]]] = {
     "no_forbidden_tool": _check_no_forbidden_tool,
@@ -872,6 +1118,10 @@ TOOL_AWARE_ASSERTION_TYPES: dict[
 ] = {
     "action_requires_send": _check_action_requires_send,
     "no_unbacked_completion_claim": _check_no_unbacked_completion_claim,
+    # The three canonical spec-named failure-mode checks.
+    "action_taken_when_required": _check_action_taken_when_required,
+    "claim_backed_by_tool": _check_claim_backed_by_tool,
+    "send_message_when_expected": _check_send_message_when_expected,
     # Upgraded in place: consumes structured tool calls when present,
     # else falls back to the legacy regex path. Listing it here means
     # ``evaluate_assertion`` routes ``tool_call_match`` through the

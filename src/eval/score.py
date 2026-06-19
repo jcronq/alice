@@ -68,6 +68,11 @@ class ScoreReport:
     aggregate_pass_rate: float
     weighted_pass_rate: float
     by_category: dict[str, CategoryStat] = field(default_factory=dict)
+    # Per-assertion-type pass rates — one entry per failure-mode check
+    # (action_taken_when_required / claim_backed_by_tool /
+    # send_message_when_expected). Populated when the scored rows carry an
+    # ``assertions`` list (the harness eval path); empty otherwise.
+    by_assertion: dict[str, CategoryStat] = field(default_factory=dict)
     verdict: str = "NEEDS_WORK"
 
     def to_dict(self) -> dict[str, Any]:
@@ -77,6 +82,9 @@ class ScoreReport:
             "weighted_pass_rate": round(self.weighted_pass_rate, 3),
             "by_category": {
                 cat: stat.to_dict() for cat, stat in self.by_category.items()
+            },
+            "by_assertion": {
+                a: stat.to_dict() for a, stat in self.by_assertion.items()
             },
             "verdict": self.verdict,
         }
@@ -100,6 +108,7 @@ def score_results(
     ``candidate_id`` filter are skipped.
     """
     by_category: dict[str, CategoryStat] = defaultdict(CategoryStat)
+    by_assertion: dict[str, CategoryStat] = defaultdict(CategoryStat)
     matched_candidate: str | None = candidate_id
     n_total = 0
     n_passed = 0
@@ -116,6 +125,15 @@ def score_results(
         if resolved:
             stat.passed += 1
             n_passed += 1
+        # Per-failure-mode breakdown: tally each assertion type's pass/total
+        # so tuning can target one mode. Rows from the harness eval carry an
+        # ``assertions`` list; legacy rows don't and are simply skipped here.
+        for a in row.get("assertions") or []:
+            a_type = a.get("type") or "unknown"
+            a_stat = by_assertion[a_type]
+            a_stat.total += 1
+            if a.get("passed"):
+                a_stat.passed += 1
 
     aggregate = n_passed / n_total if n_total else 0.0
 
@@ -135,6 +153,7 @@ def score_results(
         aggregate_pass_rate=aggregate,
         weighted_pass_rate=weighted,
         by_category=dict(by_category),
+        by_assertion=dict(by_assertion),
         verdict=(
             "ACCEPTABLE" if weighted >= DECISION_THRESHOLD else "NEEDS_WORK"
         ),
@@ -176,6 +195,18 @@ def format_report(report: ScoreReport) -> str:
     lines.append(
         f"{'weighted':<16}{'':>6}{'':>8}{report.weighted_pass_rate:>8.3f}"
     )
+    if report.by_assertion:
+        lines.append("")
+        lines.append(f"{'failure mode (assertion)':<30}{'pass':>6}{'total':>8}{'rate':>8}")
+        lines.append("-" * 52)
+        for a_type in sorted(report.by_assertion):
+            stat = report.by_assertion[a_type]
+            if stat.total == 0:
+                continue
+            lines.append(
+                f"{a_type:<30}{stat.passed:>6}{stat.total:>8}{stat.rate:>8.3f}"
+            )
+        lines.append("-" * 52)
     lines.append(f"verdict: {report.verdict} (threshold {DECISION_THRESHOLD})")
     return "\n".join(lines)
 

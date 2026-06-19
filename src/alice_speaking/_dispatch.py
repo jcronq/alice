@@ -57,7 +57,13 @@ def _tool_calls_snapshot(ctx: DaemonContext) -> list[dict]:
     runner = getattr(ctx, "turn_runner", None)
     if runner is None:
         return []
-    return list(getattr(runner, "last_tool_calls", None) or [])
+    # ``last_tool_calls`` entries carry a truncated ``input`` for the eval
+    # harness; strip it here so the persisted turn log stays name+id only
+    # and the ``MAX_FIELD_BYTES`` discipline is unchanged.
+    return [
+        {"name": tc.get("name"), "id": tc.get("id")}
+        for tc in (getattr(runner, "last_tool_calls", None) or [])
+    ]
 
 if TYPE_CHECKING:
     from .daemon import (
