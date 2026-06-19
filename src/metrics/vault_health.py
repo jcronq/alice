@@ -1219,6 +1219,11 @@ def compute_decay_coverage(
     decayed_by_slug: dict[str, str] = {}       # slug_lower → domain
     decayed_rel_to_slug: dict[str, str] = {}   # rel_lower → slug_lower
     accessed_decay_slugs: set[str] = set()     # directly-accessed decayed slugs
+    # Split the decayed pool by access history so structural recovery can be
+    # diagnosed separately for "ever read" vs "never read" notes. Every
+    # decayed note lands in exactly one of these two sets.
+    ever_accessed_in_pool: set[str] = set()
+    zero_access_in_pool: set[str] = set()
 
     for md in _iter_notes(vault_dir):
         rel_parts = md.relative_to(vault_dir).parts
@@ -1271,10 +1276,19 @@ def compute_decay_coverage(
         decayed_by_slug[slug_lower] = domain
         decayed_rel_to_slug[rel.lower()] = slug_lower
 
+        # Classify into exactly one of the access-history sets: a note with
+        # any access history (access_count > 0) is "ever accessed"; an
+        # untouched note is "zero access".
+        if access_count > 0:
+            ever_accessed_in_pool.add(slug_lower)
+        else:
+            zero_access_in_pool.add(slug_lower)
+
         if last_accessed is not None and last_accessed >= window_floor:
             total_accessed += 1
             by_domain[domain]["accessed"] += 1
             accessed_decay_slugs.add(slug_lower)
+            ever_accessed_in_pool.add(slug_lower)
 
     # ── Structural reachability ──────────────────────────────────
     # A decayed note is "structurally covered" if it was directly
@@ -1312,18 +1326,60 @@ def compute_decay_coverage(
                         decayed_rel_to_slug[resolved.lower()],
                     )
 
-    # Union of direct access + structural support
-    struct_recovered_set = accessed_decay_slugs | struct_links_slugs
+    # Union of direct access + structural support, split by access history.
+    # ``struct_recovered_accessed`` starts as a copy of the directly-accessed
+    # slugs (all of which are "ever accessed" by construction); every
+    # structural-link slug not already directly accessed is then routed to the
+    # accessed or zero-access bucket. The union of the two buckets is therefore
+    # identical to the old ``accessed_decay_slugs | struct_links_slugs``, so
+    # ``struct_coverage`` (decay_coverage_structural_pct) is unchanged.
+    struct_recovered_accessed: set[str] = set(accessed_decay_slugs)
+    struct_recovered_zero_access: set[str] = set()
+    for slug in struct_links_slugs:
+        if slug in accessed_decay_slugs:
+            continue
+        if slug in ever_accessed_in_pool:
+            struct_recovered_accessed.add(slug)
+        elif slug in zero_access_in_pool:
+            struct_recovered_zero_access.add(slug)
+    struct_recovered_set = struct_recovered_accessed | struct_recovered_zero_access
     struct_coverage = (
         round(100.0 * len(struct_recovered_set) / total_decayed, 2)
         if total_decayed > 0
         else 100.0
+    )
+    n_accessed = len(ever_accessed_in_pool)
+    n_zero = len(zero_access_in_pool)
+    struct_recovery_accessed = (
+        round(100.0 * len(struct_recovered_accessed) / n_accessed, 2)
+        if n_accessed > 0
+        else 100.0
+    )
+    struct_recovery_zero_access = (
+        round(100.0 * len(struct_recovered_zero_access) / n_zero, 2)
+        if n_zero > 0
+        else 0.0
     )
 
     # Per-domain structural counts
     struct_by_domain: dict[str, int] = defaultdict(int)
     for slug_lower in struct_recovered_set:
         struct_by_domain[decayed_by_slug[slug_lower]] += 1
+
+    # Per-domain access-history split: numerators (recovered) and
+    # denominators (pool members) for the accessed / zero-access buckets.
+    accessed_recovered_by_domain: dict[str, int] = defaultdict(int)
+    for slug_lower in struct_recovered_accessed:
+        accessed_recovered_by_domain[decayed_by_slug[slug_lower]] += 1
+    zero_recovered_by_domain: dict[str, int] = defaultdict(int)
+    for slug_lower in struct_recovered_zero_access:
+        zero_recovered_by_domain[decayed_by_slug[slug_lower]] += 1
+    accessed_pool_by_domain: dict[str, int] = defaultdict(int)
+    for slug_lower in ever_accessed_in_pool:
+        accessed_pool_by_domain[decayed_by_slug[slug_lower]] += 1
+    zero_pool_by_domain: dict[str, int] = defaultdict(int)
+    for slug_lower in zero_access_in_pool:
+        zero_pool_by_domain[decayed_by_slug[slug_lower]] += 1
 
     coverage_pct = (
         round(100.0 * total_accessed / total_decayed, 2)
@@ -1339,12 +1395,30 @@ def compute_decay_coverage(
         d_struct_pct = (
             round(100.0 * d_struct / d_total, 2) if d_total > 0 else 0.0
         )
+        d_acc_pool = accessed_pool_by_domain.get(domain, 0)
+        d_zero_pool = zero_pool_by_domain.get(domain, 0)
+        d_acc_recovered = accessed_recovered_by_domain.get(domain, 0)
+        d_zero_recovered = zero_recovered_by_domain.get(domain, 0)
+        d_struct_recovery_accessed = (
+            round(100.0 * d_acc_recovered / d_acc_pool, 2)
+            if d_acc_pool > 0
+            else 100.0
+        )
+        d_struct_recovery_zero_access = (
+            round(100.0 * d_zero_recovered / d_zero_pool, 2)
+            if d_zero_pool > 0
+            else 0.0
+        )
         domain_payload[domain] = {
             "decayed": d_total,
             "accessed": d_acc,
             "coverage_pct": d_pct,
             "struct_recovered": d_struct,
             "structural_coverage_pct": d_struct_pct,
+            "structural_recovery_for_accessed_notes": d_struct_recovery_accessed,
+            "structural_recovery_for_zero_access_notes": (
+                d_struct_recovery_zero_access
+            ),
         }
 
     return {
@@ -1352,6 +1426,8 @@ def compute_decay_coverage(
         "decayed_accessed_in_window": total_accessed,
         "decay_coverage_pct": coverage_pct,
         "decay_coverage_structural_pct": struct_coverage,
+        "structural_recovery_for_accessed_notes": struct_recovery_accessed,
+        "structural_recovery_for_zero_access_notes": struct_recovery_zero_access,
         "window_days": window_days,
         "activation_date": activation_date,
         "by_domain": domain_payload,

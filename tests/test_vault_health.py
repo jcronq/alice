@@ -1815,6 +1815,10 @@ def test_decay_coverage_all_decayed_returns_zero(tmp_path: Path) -> None:
         "coverage_pct": 0.0,
         "struct_recovered": 0,
         "structural_coverage_pct": 0.0,
+        # No accessed-pool members in this domain → vacuous 100.0.
+        "structural_recovery_for_accessed_notes": 100.0,
+        # 3 zero-access members, none recovered → 0.0.
+        "structural_recovery_for_zero_access_notes": 0.0,
     }
 
 
@@ -2333,6 +2337,197 @@ def test_decay_coverage_structural_ignores_links_from_stale_sources(
     assert result["decayed_accessed_in_window"] == 0
     assert result["decay_coverage_pct"] == 0.0
     assert result["decay_coverage_structural_pct"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Structural recovery split — "ever accessed" vs "zero access" sub-metrics.
+# Design: [[2026-06-19-structural-recovery-metric-split]]
+# The combined ``decay_coverage_structural_pct`` conflates two causes of
+# decay. We split structural recovery by access history while keeping the
+# combined metric numerically identical.
+# ---------------------------------------------------------------------------
+
+
+def test_decay_coverage_structural_split_keys_present(tmp_path: Path) -> None:
+    """The two new sub-metric keys appear at top-level and per-domain even
+    on the empty/vacuous path."""
+    vault = _make_vault(tmp_path)
+    result = compute_decay_coverage(
+        vault, today=_TODAY, activation_date=_ACTIVATION
+    )
+    assert "structural_recovery_for_accessed_notes" in result
+    assert "structural_recovery_for_zero_access_notes" in result
+    # Empty pool → no accessed members (vacuous 100.0), no zero-access
+    # members (0.0 by convention).
+    assert result["structural_recovery_for_accessed_notes"] == 100.0
+    assert result["structural_recovery_for_zero_access_notes"] == 0.0
+
+
+def test_decay_coverage_structural_split_mixed_pool(tmp_path: Path) -> None:
+    """A pool mixing ever-accessed and zero-access decayed notes splits the
+    structural-recovery signal by access history, while the combined
+    ``decay_coverage_structural_pct`` stays equal to the old union value.
+
+    Fixture (activation 2026-04-01, today 2026-05-10, window_days 7 →
+    window_floor 2026-05-03):
+
+    Ever-accessed pool (access_count > 0, last_accessed >= activation):
+    - ``acc-direct``  — accessed in window (2026-05-09); links the two
+      "linked" notes so they gain structural coverage.
+    - ``acc-linked``  — last accessed 2026-04-20 (in pool, NOT in window);
+      recovered only via the inbound link from ``acc-direct``.
+    - ``acc-orphan``  — last accessed 2026-04-10; no inbound link → not
+      recovered.
+
+    Zero-access pool (access_count == 0):
+    - ``zero-linked`` — recovered via the inbound link from ``acc-direct``.
+    - ``zero-orphan`` — no inbound link → not recovered.
+    """
+    activation = "2026-04-01"
+    today = datetime(2026, 5, 10)
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "acc-direct.md",
+        """
+        ---
+        slug: acc-direct
+        created: 2026-03-01
+        access_count: 3
+        last_accessed: 2026-05-09
+        domain: fitness
+        ---
+        See [[acc-linked]] and [[zero-linked]].
+        """,
+    )
+    _write(
+        vault / "research" / "acc-linked.md",
+        """
+        ---
+        slug: acc-linked
+        created: 2026-03-01
+        access_count: 2
+        last_accessed: 2026-04-20
+        domain: fitness
+        ---
+        Body.
+        """,
+    )
+    _write(
+        vault / "research" / "acc-orphan.md",
+        """
+        ---
+        slug: acc-orphan
+        created: 2026-03-01
+        access_count: 1
+        last_accessed: 2026-04-10
+        domain: fitness
+        ---
+        Body.
+        """,
+    )
+    _write(
+        vault / "research" / "zero-linked.md",
+        """
+        ---
+        slug: zero-linked
+        created: 2026-03-01
+        access_count: 0
+        domain: fitness
+        ---
+        Body.
+        """,
+    )
+    _write(
+        vault / "research" / "zero-orphan.md",
+        """
+        ---
+        slug: zero-orphan
+        created: 2026-03-01
+        access_count: 0
+        domain: fitness
+        ---
+        Body.
+        """,
+    )
+
+    result = compute_decay_coverage(
+        vault, today=today, activation_date=activation, window_days=7
+    )
+
+    assert result["total_decayed_notes"] == 5
+    # Direct: only acc-direct accessed in window → 1/5.
+    assert result["decayed_accessed_in_window"] == 1
+    assert result["decay_coverage_pct"] == 20.0
+    # Combined structural union: acc-direct + acc-linked + zero-linked = 3/5.
+    # Backward-compat invariant: equals the old
+    #   ``accessed_decay_slugs | struct_links_slugs`` union.
+    assert result["decay_coverage_structural_pct"] == 60.0
+
+    # Accessed split: 3 ever-accessed members, 2 recovered
+    # (acc-direct direct + acc-linked via link) → 66.67.
+    assert result["structural_recovery_for_accessed_notes"] == 66.67
+    # Zero-access split: 2 members, 1 recovered (zero-linked) → 50.0.
+    assert result["structural_recovery_for_zero_access_notes"] == 50.0
+
+    # Per-domain split mirrors top-level (single domain here).
+    fitness = result["by_domain"]["fitness"]
+    assert fitness["decayed"] == 5
+    assert fitness["struct_recovered"] == 3
+    assert fitness["structural_coverage_pct"] == 60.0
+    assert fitness["structural_recovery_for_accessed_notes"] == 66.67
+    assert fitness["structural_recovery_for_zero_access_notes"] == 50.0
+
+
+def test_decay_coverage_structural_combined_unchanged_backward_compat(
+    tmp_path: Path,
+) -> None:
+    """Backward-compat guard: the combined structural metric must equal the
+    explicit ``accessed | structural-link`` union, independent of the new
+    split. Mirrors the original inbound-link fixture (2/3 covered)."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "accessed.md",
+        """
+        ---
+        slug: accessed
+        created: 2026-04-01
+        access_count: 1
+        last_accessed: 2026-05-09
+        domain: fitness
+        ---
+        Links to [[linked-only]].
+        """,
+    )
+    _write(
+        vault / "research" / "linked-only.md",
+        """
+        ---
+        slug: linked-only
+        created: 2026-04-01
+        access_count: 0
+        domain: fitness
+        ---
+        Body.
+        """,
+    )
+    _write(
+        vault / "research" / "isolated.md",
+        """
+        ---
+        slug: isolated
+        created: 2026-04-01
+        access_count: 0
+        domain: fitness
+        ---
+        Body.
+        """,
+    )
+    result = compute_decay_coverage(
+        vault, today=_TODAY, activation_date=_ACTIVATION
+    )
+    # accessed (direct) ∪ linked-only (structural) = 2/3, unchanged by the
+    # split introduction.
+    assert result["decay_coverage_structural_pct"] == round(200.0 / 3, 2)
 
 
 # ---------------------------------------------------------------------------
