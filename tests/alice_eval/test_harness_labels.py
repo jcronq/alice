@@ -9,9 +9,8 @@ the assertions grade structured tool-call lists directly.
 
 from __future__ import annotations
 
-from eval.assertions import evaluate_assertion, evaluate_instance, AssertionFile
+from eval.assertions import evaluate_assertion
 from eval.harness_replay import (
-    HarnessResult,
     assertions_for_label,
     label_category,
     offline_result,
