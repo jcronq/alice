@@ -695,8 +695,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m eval harness",
         description=(
-            "Real-TurnRunner correctness harness: drives Alice's actual "
-            "turn loop, captures structured tool calls (with inputs), and "
+            "Real-TurnRunner correctness harness: drives the speaking "
+            "daemon's actual turn loop, captures structured tool calls "
+            "(with inputs), and "
             "scores the three failure-mode assertions "
             "(action_taken_when_required, claim_backed_by_tool, "
             "send_message_when_expected)."

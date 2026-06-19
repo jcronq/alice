@@ -28,8 +28,8 @@ def main(argv: list[str] | None = None) -> int:
             "(sample / replay / ui) remain available for the in-flight "
             "rating UI but are superseded by the SWE-Bench-style "
             "speaking-benchmark — see `speaking` group (issue #237). The "
-            "`harness` group drives Alice's REAL TurnRunner and grades "
-            "structured tool calls (correctness eval)."
+            "`harness` group drives the speaking daemon's REAL TurnRunner "
+            "and grades structured tool calls (correctness eval)."
         ),
     )
     sub = parser.add_subparsers(dest="cmd", required=True)

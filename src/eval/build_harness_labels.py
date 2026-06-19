@@ -65,7 +65,7 @@ HAND_LABELS: dict[str, tuple[bool, bool, list[str], str]] = {
     "turn_1780408465148": (False, True, _SEND, "'happy with current naming' — confirmation; ack acceptable."),
     "turn_1780444134734": (False, True, _SEND, "'are you back?' presence check; an affirmative 👍 is acceptable."),
     "turn_1780538060039": (False, True, _SEND, "FYI: Jason updated the face script; ack acceptable."),
-    "turn_1781808472250": (True, False, _SEND_DISPATCH, "Design instruction (make it say just 'Alice' for a 3D print) implies an edit/render; 👍 is bare-ack."),
+    "turn_1781808472250": (True, False, _SEND_DISPATCH, "Design instruction (make the 3D print say just the agent name) implies an edit/render; 👍 is bare-ack."),
     "turn_1781809242089": (False, True, _SEND, "'Ok.' — pure ack."),
     "turn_1781809552562": (True, False, _SEND_DISPATCH, "'Remove the extra stuff' — explicit model edit; 👍 is bare-ack."),
     "turn_1781809565989": (True, False, _SEND, "'And send me the result' — explicit send request; a bare 👍 sends no file."),
