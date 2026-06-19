@@ -14,6 +14,7 @@ from __future__ import annotations
 import datetime
 import json
 import pathlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -955,6 +956,75 @@ def test_run_empty_vault_returns_zero(mind: pathlib.Path):
     assert report.archive == 0
     assert report.dedupe_merge == 0
     assert report.orphan_resolve == 0
+
+
+# ---------- auto-propagate wiring ----------
+
+
+def _force_trigger_stale_daily(mind: pathlib.Path) -> None:
+    """Drop an aged daily so ``should_run_c`` fires."""
+    today = datetime.date.today()
+    stale_day = today - datetime.timedelta(days=120)
+    (mind / "cortex-memory" / "dailies" / f"{stale_day.isoformat()}.md").write_text(
+        "---\ntitle: old\n---\n", encoding="utf-8"
+    )
+
+
+def test_run_invokes_auto_propagate_when_unpropagated(
+    mind: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+    """When cascade detection finds unpropagated corrections, ``run`` calls
+    ``auto_propagate`` and records its return value on the report."""
+    _force_trigger_stale_daily(mind)
+
+    fake_cascade = SimpleNamespace(correction_pairs_checked=3, total_unpropagated=2)
+    monkeypatch.setattr(stage_c.cascade_mod, "run", lambda *a, **k: fake_cascade)
+
+    calls: list[tuple] = []
+
+    def _spy(passed_mind, passed_report):
+        calls.append((passed_mind, passed_report))
+        return {"slug-a": 2, "slug-b": 1}
+
+    monkeypatch.setattr(stage_c.autoprop_mod, "auto_propagate", _spy)
+
+    report = stage_c.run(mind, journal_path=None)
+
+    # Called exactly once, with the cascade report (dry-run default untouched).
+    assert len(calls) == 1
+    assert calls[0][0] == mind
+    assert calls[0][1] is fake_cascade
+    # added = sum(changes.values()); pairs = len(changes)
+    assert report.auto_propagate_added == 3
+    assert report.auto_propagate_pairs == 2
+
+    d = report.to_dict()
+    assert d["auto_propagate_added"] == 3
+    assert d["auto_propagate_pairs"] == 2
+
+
+def test_run_skips_auto_propagate_when_nothing_to_propagate(
+    mind: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+    """No unpropagated corrections → ``auto_propagate`` is not called and the
+    report fields stay zero (but are still present in ``to_dict``)."""
+    _force_trigger_stale_daily(mind)
+
+    fake_cascade = SimpleNamespace(correction_pairs_checked=4, total_unpropagated=0)
+    monkeypatch.setattr(stage_c.cascade_mod, "run", lambda *a, **k: fake_cascade)
+
+    def _fail(*a, **k):  # pragma: no cover - must not be called
+        raise AssertionError("auto_propagate should not run with nothing to propagate")
+
+    monkeypatch.setattr(stage_c.autoprop_mod, "auto_propagate", _fail)
+
+    report = stage_c.run(mind, journal_path=None)
+
+    assert report.auto_propagate_added == 0
+    assert report.auto_propagate_pairs == 0
+    d = report.to_dict()
+    assert d["auto_propagate_added"] == 0
+    assert d["auto_propagate_pairs"] == 0
 
 
 # ---------- journal replay (crash recovery) ----------

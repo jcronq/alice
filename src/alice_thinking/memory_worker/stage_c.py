@@ -73,6 +73,7 @@ from alice_thinking import vault_lock
 
 from . import journal as journal_mod
 from . import correction_cascade as cascade_mod
+from . import correction_cascade_auto_propagate as autoprop_mod
 
 
 logger = logging.getLogger(__name__)
@@ -187,6 +188,8 @@ class StageCReport:
     orphan_resolve: int = 0
     correction_pairs_checked: int = 0
     unpropagated_corrections: int = 0
+    auto_propagate_added: int = 0
+    auto_propagate_pairs: int = 0
     ran: bool = False
 
     def to_dict(self) -> dict[str, int]:
@@ -200,6 +203,8 @@ class StageCReport:
             "orphan_resolve": self.orphan_resolve,
             "correction_pairs_checked": self.correction_pairs_checked,
             "unpropagated_corrections": self.unpropagated_corrections,
+            "auto_propagate_added": self.auto_propagate_added,
+            "auto_propagate_pairs": self.auto_propagate_pairs,
         }
 
 
@@ -2116,6 +2121,16 @@ def run(
     )
     report.correction_pairs_checked = cascade_report.correction_pairs_checked
     report.unpropagated_corrections = cascade_report.total_unpropagated
+    # Auto-propagate phase: wire in the dead-code observability event from
+    # PR #503 (task-0477). Runs in DRY-RUN mode (auto_propagate's module
+    # default ``_DRY_RUN = True`` is left untouched) so it logs + writes a
+    # dry-run-mode event WITHOUT mutating the vault. Only fires when there
+    # is something to propagate; the returned ``changes`` dict maps
+    # referencing_slug -> corrections_added.
+    if cascade_report.total_unpropagated > 0:
+        autoprop_changes = autoprop_mod.auto_propagate(mind, cascade_report)
+        report.auto_propagate_added = sum(autoprop_changes.values())
+        report.auto_propagate_pairs = len(autoprop_changes)
     report.archive_stale_open = archive_stale_open(
         mind,
         cfg.max_items_per_category,
