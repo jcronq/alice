@@ -11,7 +11,7 @@ import json
 import os
 import pathlib
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Optional
 
 
@@ -56,6 +56,17 @@ class Turn:
     # via the defaults.
     vault_context: Optional[str] = None
     vault_candidates: Optional[list[dict[str, Any]]] = None
+    # Structured record of the tool calls Alice's kernel actually made
+    # during this turn — one dict per ``tool_use`` block the kernel
+    # emitted (see ``alice_speaking.turn_runner.ToolCaptureHandler``).
+    # Each entry is ``{"name": <tool>, "id": <tool_use_id>}``; large
+    # tool *inputs* are deliberately omitted to honour the
+    # ``MAX_FIELD_BYTES`` discipline (only name + id are retained, which
+    # is all the correctness eval needs to tell "Alice called X" from
+    # "Alice's reply claims she did X"). Defaults to ``[]`` so older log
+    # lines without the field still parse cleanly via the
+    # unknown-key/missing-key tolerance in :meth:`TurnLog.tail`.
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 class TurnLog:
@@ -163,6 +174,7 @@ def new_turn(
     error: Optional[str] = None,
     vault_context: Optional[str] = None,
     vault_candidates: Optional[list[dict[str, Any]]] = None,
+    tool_calls: Optional[list[dict[str, Any]]] = None,
 ) -> Turn:
     return Turn(
         ts=time.time(),
@@ -173,6 +185,7 @@ def new_turn(
         error=error,
         vault_context=vault_context,
         vault_candidates=vault_candidates,
+        tool_calls=list(tool_calls) if tool_calls else [],
     )
 
 

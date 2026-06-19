@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from eval import bench, rating_ui, replay, sampling
+from eval import bench, harness_replay, rating_ui, replay, sampling
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -27,7 +27,9 @@ def main(argv: list[str] | None = None) -> int:
             "Speaking-quality eval. The legacy blind-A/B subcommands "
             "(sample / replay / ui) remain available for the in-flight "
             "rating UI but are superseded by the SWE-Bench-style "
-            "speaking-benchmark — see `speaking` group (issue #237)."
+            "speaking-benchmark — see `speaking` group (issue #237). The "
+            "`harness` group drives Alice's REAL TurnRunner and grades "
+            "structured tool calls (correctness eval)."
         ),
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -37,6 +39,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser(
         "speaking",
         help="SWE-Bench-style speaking-benchmark (instances / run / score)",
+        add_help=False,
+    )
+    sub.add_parser(
+        "harness",
+        help="Real-TurnRunner correctness harness (run / score)",
         add_help=False,
     )
 
@@ -53,6 +60,8 @@ def main(argv: list[str] | None = None) -> int:
         return rating_ui.main(rest)
     if cmd == "speaking":
         return bench.main(rest)
+    if cmd == "harness":
+        return harness_replay.main(rest)
 
     parser.print_help()
     return 2

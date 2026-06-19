@@ -91,10 +91,42 @@ parameters. Supported types:
     skill and mention each required field. Numeric fields tolerate a
     ±10% deviation.
 
-The runner is intentionally string-pattern based: candidate outputs
-are typically free-form text describing or executing tool calls, not
-structured JSON. Tighter structured-tool detection is a future
-upgrade once the candidate harness emits structured tool_use blocks.
+``action_requires_send`` (tool-aware)
+    ``{"type": "action_requires_send"}``
+    For instances labelled *action-required*. PASS iff a structured
+    ``send_message`` tool call (either the bare ``send_message`` or the
+    MCP-qualified ``mcp__alice__send_message``) appears in the turn's
+    **captured/structured** tool calls. This catches the
+    bare-"👍"-no-action failure: a reply that acknowledges but never
+    actually sends anything where a send was required. Unlike
+    ``tool_call_match`` this reads the structured ``tool_calls`` the
+    kernel emitted, not regex-over-prose — so it cannot be fooled by a
+    reply that merely *talks about* sending.
+
+``no_unbacked_completion_claim`` (tool-aware)
+    ``{"type": "no_unbacked_completion_claim",
+       "claim_keywords": ["sent", "logged", ...]}``
+    PASS unless the outbound text asserts an action was completed
+    (per a tunable keyword set — see :data:`COMPLETION_CLAIM_KEYWORDS`)
+    while the turn made **no** structured tool calls at all. This
+    catches hallucinated "done / sent / logged" claims where Alice says
+    she did the thing but the kernel never invoked a tool. The
+    keyword-based claim detector (:func:`text_claims_completion`) is a
+    deliberately simple, documented heuristic so the list is easy to
+    tune.
+
+Both tool-aware assertions read the structured ``tool_calls`` list
+threaded through :func:`evaluate_assertion` /
+:func:`evaluate_instance`. When that list is absent they fall back to
+the regex-inferred tool names so the legacy (prose-only) path keeps
+working — see :data:`TOOL_AWARE_ASSERTION_TYPES`.
+
+The runner is otherwise intentionally string-pattern based: candidate
+outputs are typically free-form text describing or executing tool
+calls, not structured JSON. The two tool-aware assertions above are
+the first to consume real structured tool_use blocks, emitted by the
+:class:`alice_speaking.turn_runner.ToolCaptureHandler` and surfaced by
+``eval.harness_replay``.
 """
 
 from __future__ import annotations
@@ -110,6 +142,8 @@ from typing import Any, Callable, Mapping, Sequence
 
 __all__ = [
     "ASSERTION_TYPES",
+    "COMPLETION_CLAIM_KEYWORDS",
+    "TOOL_AWARE_ASSERTION_TYPES",
     "AssertionFile",
     "AssertionResult",
     "InstanceResult",
@@ -117,6 +151,9 @@ __all__ = [
     "evaluate_instance",
     "load_assertion_file",
     "register_assertion_type",
+    "register_tool_aware_assertion_type",
+    "text_claims_completion",
+    "tool_calls_contain_send",
 ]
 
 log = logging.getLogger(__name__)
@@ -610,6 +647,207 @@ def _check_skill_invocation(
     return True, ""
 
 
+# ---------------------------------------------------------------------------
+# Tool-aware assertions
+#
+# These read the *structured* tool calls the turn actually made (the
+# ``tool_calls`` list captured by
+# ``alice_speaking.turn_runner.ToolCaptureHandler``), not regex over the
+# reply prose. That distinction is the whole point of the correctness
+# eval: it tells "Alice called tool X" apart from "Alice's reply *claims*
+# she did X".
+
+# Tool names that count as "Alice sent a reply to a human". Both the
+# bare MCP tool name and the namespaced form show up depending on
+# backend / how the kernel reports the block.
+_SEND_TOOL_NAMES = frozenset({"send_message", "mcp__alice__send_message"})
+
+# Keyword set the completion-claim detector keys off. JUDGMENT CALL —
+# this list is the knob Jason should tune. It errs toward common
+# past-tense "I did the thing" verbs Alice uses when she reports an
+# action as complete. Kept as whole-word matches so "update" in
+# "I'll update you later" is matched (acceptable — better a false
+# positive that a human reviews than a missed hallucination), while
+# substrings inside unrelated words don't trip it.
+COMPLETION_CLAIM_KEYWORDS: tuple[str, ...] = (
+    "sent",
+    "added",
+    "logged",
+    "updated",
+    "created",
+    "posted",
+    "queued",
+    "scheduled",
+    "done",
+    "saved",
+    "recorded",
+    "booked",
+    "deleted",
+    "removed",
+)
+
+
+def _normalise_tool_calls(
+    tool_calls: Sequence[Any] | None,
+) -> list[str]:
+    """Return the lowercased tool *names* from a structured tool-call
+    list. Each entry may be a dict (``{"name": ...}``) or a bare string.
+    Non-conforming entries are skipped."""
+    names: list[str] = []
+    for entry in tool_calls or []:
+        if isinstance(entry, Mapping):
+            name = entry.get("name")
+        elif isinstance(entry, str):
+            name = entry
+        else:
+            name = getattr(entry, "name", None)
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+def tool_calls_contain_send(tool_calls: Sequence[Any] | None) -> bool:
+    """True iff the structured ``tool_calls`` include a send tool.
+
+    Matches both ``send_message`` and ``mcp__alice__send_message`` (and,
+    defensively, any name ending in ``send_message`` so an
+    ``mcp__<server>__send_message`` from a renamed server still counts).
+    """
+    for name in _normalise_tool_calls(tool_calls):
+        lowered = name.lower()
+        if lowered in _SEND_TOOL_NAMES or lowered.endswith("send_message"):
+            return True
+    return False
+
+
+_WORD_RE_CACHE: dict[tuple[str, ...], re.Pattern[str]] = {}
+
+
+def text_claims_completion(
+    text: str, keywords: Sequence[str] = COMPLETION_CLAIM_KEYWORDS
+) -> bool:
+    """True iff ``text`` contains any completion-claim keyword as a whole
+    word (case-insensitive).
+
+    Deliberately small and dumb: a whole-word regex over a tunable
+    keyword list. This is the documented knob — widen/narrow
+    :data:`COMPLETION_CLAIM_KEYWORDS` (or pass ``keywords``) to adjust
+    sensitivity. It does NOT try to parse what was completed; pairing it
+    with the structured tool-call check (in
+    :func:`_check_no_unbacked_completion_claim`) is what makes it useful.
+    """
+    if not text:
+        return False
+    key = tuple(keywords)
+    pattern = _WORD_RE_CACHE.get(key)
+    if pattern is None:
+        alternation = "|".join(re.escape(k) for k in key if k)
+        if not alternation:
+            return False
+        pattern = re.compile(rf"\b(?:{alternation})\b", re.IGNORECASE)
+        _WORD_RE_CACHE[key] = pattern
+    return pattern.search(text) is not None
+
+
+_MCP_PREFIX_RE = re.compile(r"^mcp__[A-Za-z0-9]+__")
+
+
+def _canonical_tool(name: str) -> str:
+    """Strip the ``mcp__<server>__`` prefix so ``mcp__alice__send_message``
+    compares equal to a label's bare ``send_message``."""
+    return _MCP_PREFIX_RE.sub("", name).lower()
+
+
+def _check_tool_call_match_structured(
+    output: str,
+    params: Mapping[str, Any],
+    tool_calls: Sequence[Any] | None,
+) -> tuple[bool, str]:
+    """Structured-aware ``tool_call_match``.
+
+    When the turn's structured ``tool_calls`` are available we match the
+    *expected* tool set against what the kernel actually called
+    (canonicalising MCP names so ``send_message`` ==
+    ``mcp__alice__send_message``). With no structured calls we delegate
+    to the legacy regex-over-prose implementation so the old benchmark
+    path is unchanged.
+    """
+    if tool_calls is None:
+        return _check_tool_call_match(output, params)
+    expected = [_canonical_tool(str(t)) for t in (params.get("expected_tools") or [])]
+    match_mode = params.get("match") or "set"
+    observed = [_canonical_tool(n) for n in _normalise_tool_calls(tool_calls)]
+    if match_mode == "exact_sequence":
+        if observed[: len(expected)] == expected:
+            return True, ""
+        return False, f"expected ordered {expected!r}, got {observed!r}"
+    if set(expected).issubset(set(observed)):
+        return True, ""
+    missing = set(expected) - set(observed)
+    return False, f"missing tools {missing!r} (observed: {observed!r})"
+
+
+def _check_action_requires_send(
+    output: str,
+    params: Mapping[str, Any],
+    tool_calls: Sequence[Any] | None,
+) -> tuple[bool, str]:
+    """PASS iff a structured send_message tool call was made.
+
+    Falls back to the regex-inferred tool surface when no structured
+    ``tool_calls`` were supplied (legacy prose-only candidates) so the
+    assertion still does *something* useful in that mode — though the
+    structured path is the one that catches the bare-ack failure.
+    """
+    if tool_calls is not None:
+        if tool_calls_contain_send(tool_calls):
+            return True, "send_message present in structured tool calls"
+        names = _normalise_tool_calls(tool_calls)
+        return (
+            False,
+            f"action required but no send_message tool call (saw: {names})",
+        )
+    # Legacy fallback: regex over prose.
+    observed = extract_tool_names(output)
+    if any(
+        n.lower() in _SEND_TOOL_NAMES or n.lower().endswith("send_message")
+        for n in observed
+    ):
+        return True, "send_message inferred from output prose (no structured calls)"
+    return False, "action required but no send_message reference found"
+
+
+def _check_no_unbacked_completion_claim(
+    output: str,
+    params: Mapping[str, Any],
+    tool_calls: Sequence[Any] | None,
+) -> tuple[bool, str]:
+    """FAIL when the reply claims completion but no tool call backs it.
+
+    "Backed" is coarse-grained on purpose: any structured tool call at
+    all counts as backing. The failure mode this targets is the
+    *hallucinated* completion — "done! logged it 👍" with the kernel
+    never invoking a single tool. Verifying the claim against the
+    *specific* expected tool is a future tightening; documented as a
+    judgment call.
+    """
+    keywords = params.get("claim_keywords") or COMPLETION_CLAIM_KEYWORDS
+    claims = text_claims_completion(output, keywords)
+    if not claims:
+        return True, "no completion claim in reply"
+    if tool_calls is not None:
+        if tool_calls:
+            names = _normalise_tool_calls(tool_calls)
+            return True, f"completion claim backed by tool calls {names}"
+        return False, "reply claims completion but made no tool calls"
+    # Legacy fallback: regex-inferred tool surface stands in for the
+    # structured calls.
+    observed = extract_tool_names(output)
+    if observed:
+        return True, f"completion claim backed by inferred tools {observed}"
+    return False, "reply claims completion but no tool reference found"
+
+
 # Registry: assertion ``type`` → callable
 ASSERTION_TYPES: dict[str, Callable[[str, Mapping[str, Any]], tuple[bool, str]]] = {
     "no_forbidden_tool": _check_no_forbidden_tool,
@@ -625,6 +863,23 @@ ASSERTION_TYPES: dict[str, Callable[[str, Mapping[str, Any]], tuple[bool, str]]]
 }
 
 
+# Tool-aware registry: assertion ``type`` → callable taking the extra
+# structured ``tool_calls`` argument. Kept separate from
+# :data:`ASSERTION_TYPES` so the legacy 2-arg callables stay untouched;
+# :func:`evaluate_assertion` checks this registry first.
+TOOL_AWARE_ASSERTION_TYPES: dict[
+    str, Callable[[str, Mapping[str, Any], "Sequence[Any] | None"], tuple[bool, str]]
+] = {
+    "action_requires_send": _check_action_requires_send,
+    "no_unbacked_completion_claim": _check_no_unbacked_completion_claim,
+    # Upgraded in place: consumes structured tool calls when present,
+    # else falls back to the legacy regex path. Listing it here means
+    # ``evaluate_assertion`` routes ``tool_call_match`` through the
+    # tool-aware dispatch (which threads ``tool_calls``).
+    "tool_call_match": _check_tool_call_match_structured,
+}
+
+
 def register_assertion_type(
     name: str, fn: Callable[[str, Mapping[str, Any]], tuple[bool, str]]
 ) -> None:
@@ -632,15 +887,49 @@ def register_assertion_type(
     ASSERTION_TYPES[name] = fn
 
 
+def register_tool_aware_assertion_type(
+    name: str,
+    fn: Callable[[str, Mapping[str, Any], "Sequence[Any] | None"], tuple[bool, str]],
+) -> None:
+    """Plug-in point for custom assertions that need the structured
+    ``tool_calls`` argument."""
+    TOOL_AWARE_ASSERTION_TYPES[name] = fn
+
+
 # ---------------------------------------------------------------------------
 # Evaluation entry points
 
 
 def evaluate_assertion(
-    output: str, assertion: Mapping[str, Any], bucket: str
+    output: str,
+    assertion: Mapping[str, Any],
+    bucket: str,
+    *,
+    tool_calls: Sequence[Any] | None = None,
 ) -> AssertionResult:
-    """Evaluate a single ``assertion`` against ``output``."""
+    """Evaluate a single ``assertion`` against ``output``.
+
+    ``tool_calls`` is the structured list of tool calls the turn made
+    (``[{"name", "id"}, ...]``). It's only consumed by the tool-aware
+    assertion types; the legacy 2-arg assertions ignore it. ``None``
+    means "no structured calls available" — tool-aware assertions then
+    fall back to regex over ``output``.
+    """
     a_type = assertion.get("type")
+    tool_fn = TOOL_AWARE_ASSERTION_TYPES.get(a_type or "")
+    if tool_fn is not None:
+        try:
+            passed, detail = tool_fn(output, assertion, tool_calls)
+        except Exception as exc:  # pragma: no cover - defensive
+            return AssertionResult(
+                type=a_type,
+                bucket=bucket,
+                passed=False,
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+        return AssertionResult(
+            type=a_type, bucket=bucket, passed=passed, detail=detail
+        )
     fn = ASSERTION_TYPES.get(a_type or "")
     if fn is None:
         return AssertionResult(
@@ -666,18 +955,29 @@ def evaluate_instance(
     candidate_output: str,
     *,
     candidate_id: str = "candidate",
+    tool_calls: Sequence[Any] | None = None,
 ) -> InstanceResult:
     """Evaluate every assertion in ``assertion_file`` against
     ``candidate_output`` and return the per-instance verdict.
 
     An instance resolves iff every ``fail_to_pass`` AND every
-    ``pass_to_pass`` assertion holds.
+    ``pass_to_pass`` assertion holds. ``tool_calls`` (when provided) is
+    threaded to the tool-aware assertions so they grade against the
+    structured tool surface rather than regex-over-prose.
     """
     results: list[AssertionResult] = []
     for entry in assertion_file.pass_to_pass:
-        results.append(evaluate_assertion(candidate_output, entry, "pass_to_pass"))
+        results.append(
+            evaluate_assertion(
+                candidate_output, entry, "pass_to_pass", tool_calls=tool_calls
+            )
+        )
     for entry in assertion_file.fail_to_pass:
-        results.append(evaluate_assertion(candidate_output, entry, "fail_to_pass"))
+        results.append(
+            evaluate_assertion(
+                candidate_output, entry, "fail_to_pass", tool_calls=tool_calls
+            )
+        )
 
     resolved = all(r.passed for r in results)
     return InstanceResult(

@@ -189,6 +189,20 @@ class TurnRunner:
         # persists this alongside ``last_vault_context`` so the per-turn
         # log captures *what* was retrieved, not just the rendered text.
         self.last_vault_candidates: Optional[list[dict]] = None
+        # Structured tool calls the kernel made during the most recent
+        # turn. Populated by :class:`ToolCaptureHandler` (installed in
+        # :meth:`_build_handlers`) which records every ``on_tool_use``
+        # callback the kernel fans out — including the MCP
+        # ``send_message`` tool on the subscription backend. ``_dispatch``
+        # reads this off the runner (mirroring ``last_vault_*``) to
+        # persist structured tool calls in the per-turn log, and the
+        # correctness-eval harness reads it to tell a real tool call from
+        # a reply that merely *claims* one. ``_tool_capture`` is the live
+        # accumulator the handler appends to; its identity is stable
+        # (we ``.clear()`` rather than reassign) so handlers rebuilt on a
+        # session-resume retry keep writing to the same list.
+        self._tool_capture: list[dict] = []
+        self.last_tool_calls: Optional[list[dict]] = None
 
     # ------------------------------------------------------------------
     # Bootstrap preamble (Layer 2)
@@ -316,6 +330,10 @@ class TurnRunner:
             self._compaction.arm()
 
         handlers: list = [
+            # Capture the kernel's structured tool calls for this turn.
+            # Installed first (and for silent turns too) so nothing is
+            # missed; it's a pure observer with no side effects.
+            ToolCaptureHandler(self._tool_capture),
             SessionHandler(
                 session_path=self._session_path,
                 set_session_id=_set_session_id,
@@ -392,6 +410,12 @@ class TurnRunner:
         # noise on the hot internal-turn path.
         self.last_vault_context = None
         self.last_vault_candidates = None
+        # Fresh tool-call accumulator for this turn. ``.clear()`` keeps
+        # the list identity stable so any handler already holding a
+        # reference (e.g. one rebuilt on the resume retry below) writes
+        # into the same buffer.
+        self._tool_capture.clear()
+        self.last_tool_calls = None
         if not silent:
             cue_ctx = await self._build_cue_packet(prompt)
             if cue_ctx.text:
@@ -438,12 +462,20 @@ class TurnRunner:
                 self.prime_bootstrap_preamble()
                 retry_prompt = self.compose_prompt(prompt)
                 retry_spec = self._build_spec()
+                # Drop any tool calls captured before the resume failure;
+                # the retry is the turn that actually runs.
+                self._tool_capture.clear()
                 retry_handlers = self._build_handlers(silent=silent)
                 result = await kernel.run(
                     retry_prompt, retry_spec, handlers=retry_handlers
                 )
             else:
                 raise
+
+        # Snapshot the captured tool calls for this turn so callers
+        # (_dispatch's turn-log writer, the correctness-eval harness)
+        # can read them off the runner, mirroring ``last_vault_*``.
+        self.last_tool_calls = list(self._tool_capture)
 
         if result.is_error or result.error:
             # Kernel returned an error result (timeout, etc.). Callers
@@ -465,7 +497,37 @@ class TurnRunner:
         return result.text
 
 
-__all__ = ["BUILTIN_TOOLS", "SUMMARY_TAIL_TURNS", "TurnRunner"]
+__all__ = [
+    "BUILTIN_TOOLS",
+    "SUMMARY_TAIL_TURNS",
+    "ToolCaptureHandler",
+    "TurnRunner",
+]
+
+
+class ToolCaptureHandler(NullHandler):
+    """Record the kernel's structured tool calls for the current turn.
+
+    The anthropic kernel fans every ``ToolUseBlock`` out to handlers via
+    :meth:`on_tool_use` — including MCP tools like ``send_message`` on
+    the subscription backend (see
+    ``kernels.anthropic.kernel.AnthropicKernel._dispatch_block``). This
+    handler captures the structured truth of *what Alice actually
+    called*, which is exactly the signal the regex-over-prose approach in
+    the legacy benchmark cannot recover.
+
+    We retain only ``name`` and ``id`` — not the (potentially large)
+    tool input — to honour the turn log's ``MAX_FIELD_BYTES`` discipline
+    and because the correctness eval only needs the tool identity. The
+    handler appends to a caller-owned list so the :class:`TurnRunner`
+    can read the result back after the kernel returns.
+    """
+
+    def __init__(self, sink: list[dict]) -> None:
+        self._sink = sink
+
+    async def on_tool_use(self, name: str, input: Any, id: str) -> None:
+        self._sink.append({"name": name, "id": id})
 
 
 class PiSendMessageHandler(NullHandler):
