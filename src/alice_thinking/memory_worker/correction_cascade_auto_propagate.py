@@ -385,7 +385,7 @@ def auto_propagate(
         for corr_slug, corr_title, _corrected_slug in corrections:
             if _already_references(ref_md, corr_slug):
                 continue
-            if _add_backlink(ref_md, corr_slug, corr_title, dry_run=dry_run):
+            if _add_backlink(ref_md, corr_slug, corr_title, dry_run=_DRY_RUN):
                 added += 1
 
         if added > 0:
@@ -401,7 +401,7 @@ def auto_propagate(
                 corrected_slug,
             )
             continue
-        if _update_corrected_by(corrected_md, correction_slug, dry_run=dry_run):
+        if _update_corrected_by(corrected_md, correction_slug, dry_run=_DRY_RUN):
             corrected_by_updates += 1
 
     wall_elapsed = time.time() - wall_start

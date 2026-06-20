@@ -12,6 +12,7 @@ from alice_thinking.memory_worker.correction_cascade import (
     CascadeReport,
     UnpropagatedCorrection,
 )
+from alice_thinking.memory_worker import correction_cascade_auto_propagate as acp
 from alice_thinking.memory_worker.correction_cascade_auto_propagate import (
     auto_propagate,
 )
@@ -99,3 +100,54 @@ class TestPropagationEvent:
         assert ev["total_resolved"] == 0
         assert ev["pairs_affected"] == 0
         assert ev["high_severity"] == 0
+
+
+class TestDryRunGate:
+    """The write-gate must hold on the default-None path, not just when
+    dry_run is passed explicitly.
+
+    Regression for the gate-defeat bug: the helper call sites passed the
+    raw local ``dry_run`` (``None`` on the default path) instead of the
+    resolved module ``_DRY_RUN``. ``dry_run=None`` overrode each helper's
+    ``= _DRY_RUN`` default and was falsy inside ``if dry_run:``, so files
+    were written while the event still labeled the run "dry-run".
+    Stage C (live since #504) calls ``auto_propagate`` with no ``dry_run``.
+    """
+
+    def test_default_no_kwarg_does_not_write(self, tmp_path, monkeypatch):
+        # Pin the module default to True (its real default) so this test is
+        # independent of ordering — other tests toggle the module global.
+        monkeypatch.setattr(acp, "_DRY_RUN", True)
+        mind = _mk_mind(tmp_path)
+        ref_note = mind / "cortex-memory" / "ref-note.md"
+        corrected_note = mind / "cortex-memory" / "corrected-note.md"
+        before_ref = ref_note.read_bytes()
+        before_corrected = corrected_note.read_bytes()
+
+        # No dry_run kwarg — exactly how stage_c.run() calls it.
+        auto_propagate(mind, _mk_report())
+
+        # Byte-identical: the gate held, nothing was written.
+        assert ref_note.read_bytes() == before_ref
+        assert corrected_note.read_bytes() == before_corrected
+
+        events = _read_events(mind)
+        assert len(events) == 1
+        assert events[0]["mode"] == "dry-run"
+
+    def test_explicit_production_writes_backlink(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(acp, "_DRY_RUN", True)
+        mind = _mk_mind(tmp_path)
+        ref_note = mind / "cortex-memory" / "ref-note.md"
+        before_ref = ref_note.read_bytes()
+
+        auto_propagate(mind, _mk_report(), dry_run=False)
+
+        after_ref = ref_note.read_bytes()
+        assert after_ref != before_ref
+        # The correction backlink was actually appended.
+        assert "[[correction-note" in ref_note.read_text(encoding="utf-8")
+
+        events = _read_events(mind)
+        assert len(events) == 1
+        assert events[0]["mode"] == "production"
