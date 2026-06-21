@@ -1,0 +1,65 @@
+#!/command/with-contenv bash
+# alice-index-rebuild — periodic safety-net rebuild of the cortex FTS
+# indices.
+#
+# The cortex-index.db is only rebuilt at daemon startup by
+# CortexIndexFreshnessStartup (src/alice_speaking/startup/cortex_index_freshness.py).
+# That check NEVER re-runs on a long-lived daemon, so on a quiet day
+# (no commits -> no deploy re-exec -> no restart) the index drifts
+# stale for hours and FTS misses newly-written notes. Observed: 13h
+# stale, ~49 research notes invisible to retrieval.
+#
+# This loop bounds staleness to the cadence below (default 15 min) by
+# running `build_index --check && build_index` for both the main
+# cortex-memory index and the cozylobe-cortex index. `--check` exits 0
+# when a rebuild is needed and 1 when the index is fresh, so the `&&`
+# only rebuilds when the vault has actually drifted.
+#
+# Shape mirrors alice-memory-worker: graceful SIGTERM trap, staggered
+# startup, sleep in the background under `wait` so the trap fires
+# promptly between cycles. No flock/config gate is needed — build()
+# does an atomic .tmp -> os.replace, so concurrent runs are safe and a
+# missed cycle is self-correcting on the next tick.
+#
+# Design: cortex-memory/research/2026-06-21-index-auto-rebuild-implementation-spec.md
+set -e
+
+export PYTHONPATH=/home/alice/alice/src
+CADENCE=900
+
+# Graceful shutdown: defer the trap so an in-flight rebuild finishes
+# naturally. build_index writes a .tmp then os.replace; a SIGKILL at
+# the s6 gracetime cliff could leave a torn .tmp. Bash defers traps
+# for foreground commands, so the in-flight rebuild completes before
+# the loop checks STOPPING and breaks. Sleeps run in the background
+# under `wait` so the trap fires immediately during quiet periods.
+STOPPING=
+on_signal() {
+    STOPPING=1
+}
+trap on_signal TERM INT
+
+# Stagger startup so this lands after the memory worker's 90s offset
+# (and the thinker/sm-dispatcher warmups) — the container is quiescent
+# by the time the first rebuild runs.
+sleep 120 &
+wait $! 2>/dev/null || true
+
+while true; do
+    [ -n "$STOPPING" ] && break
+
+    # Foreground on purpose: bash defers the trap until this returns,
+    # so a rebuild in flight finishes rather than being SIGKILLed by
+    # s6. `|| true` keeps the loop alive if a build exits non-zero.
+    s6-setuidgid alice bash -c '
+        python3 -m indexer.build_index --check && python3 -m indexer.build_index || true
+        python3 -m indexer.build_index --cozylobe --check && python3 -m indexer.build_index --cozylobe || true
+    ' || true
+
+    [ -n "$STOPPING" ] && break
+
+    sleep "$CADENCE" &
+    wait $! 2>/dev/null || true
+
+    [ -n "$STOPPING" ] && break
+done

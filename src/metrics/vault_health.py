@@ -33,12 +33,14 @@ import logging
 import math
 import re
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from indexer.build_index import _meta_built_at_and_count
 from indexer.yaml_lite import extract_wikilinks, split_frontmatter
 from metrics.pagerank_metric import compute_weighted_sum, tier_counts
 
@@ -2450,6 +2452,69 @@ def _sleep_window_closed(scan_dt: datetime) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _compute_index_staleness(index_db_path: Path | None) -> dict[str, Any] | None:
+    """Return cortex-index staleness metrics, or None if the DB is missing.
+
+    Observability companion to the auto-rebuild service (Path B) in
+    2026-06-21-index-auto-rebuild-implementation-spec.md. Reads
+    ``meta.built_at`` / ``meta.note_count`` from the index DB and compares
+    the recorded note count against the markdown files actually on disk.
+
+    Returns::
+
+        {
+            "staleness_seconds": int | null,    # seconds since last build
+            "note_count_in_index": int | null,  # meta.note_count from DB
+            "note_count_expected": int | null,  # actual .md count on disk
+            "note_count_mismatch": bool | null, # True if counts differ
+        }
+    """
+    if index_db_path is None or not index_db_path.exists():
+        return None
+
+    built_at_ts, meta_note_count = _meta_built_at_and_count(index_db_path)
+    if built_at_ts is None:
+        # Corrupt/legacy DB with no meta row — report max staleness so
+        # Speaking/dashboards notice and the rebuild service kicks in.
+        return {
+            "staleness_seconds": 999999,
+            "note_count_in_index": None,
+            "note_count_expected": None,
+            "note_count_mismatch": None,
+        }
+
+    staleness = int(time.time() - built_at_ts)
+
+    # Expected note count from disk. The DB lives at
+    # alice-mind/inner/state/cortex-index.db and the vault at
+    # alice-mind/cortex-memory/, so the shared root is three parents up
+    # from the DB file (state -> inner -> alice-mind). Mirror
+    # build_index's exclusion of dotfile-prefixed paths.
+    expected: int | None
+    try:
+        vault_root = index_db_path.parents[2] / "cortex-memory"
+        expected = sum(
+            1
+            for md in vault_root.rglob("*.md")
+            if not any(part.startswith(".") for part in md.relative_to(vault_root).parts)
+        )
+    except OSError:
+        expected = None
+
+    mismatch = (
+        expected is not None
+        and meta_note_count is not None
+        and expected != meta_note_count
+    )
+
+    return {
+        "staleness_seconds": staleness,
+        "note_count_in_index": meta_note_count,
+        "note_count_expected": expected,
+        "note_count_mismatch": mismatch if mismatch else None,
+    }
+
+
 def build_vault_health_event(
     vault_dir: Path,
     thoughts_dir: Path,
@@ -2566,6 +2631,20 @@ def build_vault_health_event(
             )
         else:
             event["pagerank_linkedness"] = tier_counts(pr_ws)
+
+    # Index staleness — how long since the cortex-index was last rebuilt,
+    # plus a note-count drift check. Paired with the periodic rebuild
+    # service (Path B) in
+    # 2026-06-21-index-auto-rebuild-implementation-spec.md. Skipped
+    # silently when the DB isn't wired up.
+    index_staleness = _compute_index_staleness(index_db_path)
+    if index_staleness is not None:
+        event["index_staleness"] = index_staleness
+        # Flag when staleness exceeds 1 hour — should be rare once the
+        # 15-min rebuild service is wired, but useful for catching edge
+        # cases (service down, build failures, corrupt DB).
+        if index_staleness.get("staleness_seconds", 0) > 3600:
+            event["index_stale"] = True
 
     # Sanity-check: with trigger-keyword backfill complete, a real
     # truly_dark_count above 10 is statistically implausible. Tag the
