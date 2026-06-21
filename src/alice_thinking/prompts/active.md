@@ -54,6 +54,7 @@ python3 -m metrics.vault_health \
   --thoughts ~/alice-mind/inner/thoughts \
   --surface ~/alice-mind/inner/surface \
   --events ~/alice-mind/memory/events.jsonl \
+  --index-db ~/alice-mind/inner/state/cortex-index.db \
   --append --check-existing
 ```
 
