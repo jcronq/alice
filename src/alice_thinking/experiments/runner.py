@@ -141,6 +141,16 @@ DEFAULT_REPO_SOURCE = pathlib.Path("/home/alice/alice")
 DEFAULT_TMP_ROOT = pathlib.Path("/tmp")
 
 
+# StreamReader line-buffer limit for the subagent's stdout/stderr. The CLI's
+# ``--output-format stream-json`` emits each event as a SINGLE line; when the
+# subagent Reads a large file or receives a large tool_result, that one line
+# can far exceed asyncio's default 64 KiB readline limit and raise
+# ``LimitOverrunError``. 16 MiB gives ample headroom; ``_pump`` still defends
+# against pathologically larger lines so a single bad event never kills the
+# whole stream.
+_STREAM_LINE_LIMIT = 16 * 1024 * 1024  # 16 MiB — stream-json tool_result lines can be large
+
+
 class ExperimentDispatchError(RuntimeError):
     """Raised when :meth:`ExperimentRunner.dispatch` cannot accept the input.
 
@@ -590,6 +600,7 @@ class ExperimentRunner:
         start_time = time.monotonic()
         timeout_hit = False
         process_returncode: Optional[int] = None
+        subprocess_exc: Optional[BaseException] = None
         try:
             try:
                 process_returncode = await asyncio.wait_for(
@@ -610,7 +621,8 @@ class ExperimentRunner:
                     experiment_id,
                     timeout_seconds,
                 )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            subprocess_exc = exc
             log.exception("experiment %s subprocess raised", experiment_id)
         duration = time.monotonic() - start_time
 
@@ -634,6 +646,12 @@ class ExperimentRunner:
         elif process_returncode is not None and process_returncode != 0:
             status = "failed"
             failure_reason = f"subagent exited with code {process_returncode}"
+        elif subprocess_exc is not None:
+            status = "failed"
+            failure_reason = (
+                f"subprocess error: {type(subprocess_exc).__name__}: "
+                f"{subprocess_exc}"
+            )
         else:
             status = "failed"
             failure_reason = (
@@ -931,6 +949,7 @@ class ExperimentRunner:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                limit=_STREAM_LINE_LIMIT,
             )
             assert process.stdin is not None
             process.stdin.write(prompt.encode("utf-8"))
@@ -959,14 +978,53 @@ class ExperimentRunner:
             if reader is None:
                 return
             while True:
-                raw = await reader.readline()
-                if not raw:
-                    break
-                line = raw.decode("utf-8", errors="replace").rstrip("\n")
                 record: dict[str, Any] = {
                     "ts": time.time(),
                     "source": source,
                 }
+                try:
+                    raw = await reader.readline()
+                except (asyncio.LimitOverrunError, ValueError) as exc:
+                    # A single stream-json event exceeded the StreamReader's
+                    # line buffer (default 64 KiB; raised to _STREAM_LINE_LIMIT
+                    # for the real subprocess). Drain/skip the oversized line so
+                    # one giant tool_result can't kill the whole pump — and the
+                    # subprocess returncode still gets captured downstream.
+                    consumed = getattr(exc, "consumed", 0) or 0
+                    skipped = 0
+                    try:
+                        if consumed:
+                            # Discard the buffered-but-unreturned overflow.
+                            await reader.read(consumed)
+                            skipped += consumed
+                        # Drain the rest of the line up to the next newline so
+                        # the next readline() starts on a clean boundary.
+                        while True:
+                            chunk = await reader.read(65536)
+                            if not chunk:
+                                break
+                            skipped += len(chunk)
+                            if b"\n" in chunk:
+                                break
+                    except (asyncio.LimitOverrunError, ValueError, OSError):
+                        # Best-effort drain. Even if it fails, contain it here.
+                        pass
+                    record["text"] = (
+                        f"[runner] skipped oversized stream line "
+                        f"(~{skipped} bytes, {type(exc).__name__})"
+                    )
+                    try:
+                        with transcript_path.open("a") as f:
+                            f.write(
+                                json.dumps(record, ensure_ascii=False, default=str)
+                                + "\n"
+                            )
+                    except OSError:
+                        log.exception("transcript write failed")
+                    continue
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").rstrip("\n")
                 stripped = line.strip()
                 if stripped.startswith("{") and stripped.endswith("}"):
                     try:

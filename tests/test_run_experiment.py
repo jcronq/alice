@@ -17,6 +17,7 @@ real submit_result MCP server would do in production.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 import pathlib
@@ -344,6 +345,118 @@ class _FakeStream:
         if not self._lines:
             return b""
         return self._lines.pop(0)
+
+
+class _OverflowStream:
+    """readline() that raises LimitOverrunError on an oversized line.
+
+    Mimics asyncio.StreamReader hitting its line-buffer limit on a single
+    huge stream-json event. The overflow bytes are exposed via ``read(n)``
+    so the runner's drain path can be exercised, after which EOF is served.
+    """
+
+    def __init__(self, oversized: bytes) -> None:
+        self._oversized = oversized
+        self._raised = False
+        self._drained = False
+
+    async def readline(self) -> bytes:
+        if not self._raised:
+            self._raised = True
+            # consumed = how many bytes sit in the buffer unreturned.
+            raise asyncio.LimitOverrunError(
+                "Separator is not found, and chunk exceed the limit",
+                len(self._oversized),
+            )
+        return b""  # EOF after the bad line is drained
+
+    async def read(self, n: int = -1) -> bytes:
+        if self._drained:
+            return b""
+        self._drained = True
+        # Serve the oversized payload (with a trailing newline) once.
+        return self._oversized + b"\n"
+
+
+class _OverflowProcess:
+    """_FakeProcess whose stdout overflows on its first (only) line."""
+
+    def __init__(self, oversized: bytes, rc: int = 0) -> None:
+        self.stdout = _OverflowStream(oversized)
+        self.stderr = _FakeStream([b""])
+        self.stdin: Optional[Any] = None
+        self.returncode: Optional[int] = None
+        self._rc = rc
+
+    async def wait(self) -> int:
+        self.returncode = self._rc
+        return self._rc
+
+
+@pytest.mark.asyncio
+async def test_oversized_stream_line_does_not_kill_run(tmp_path: pathlib.Path) -> None:
+    """A >64 KiB stream-json line must not propagate LimitOverrunError.
+
+    Regression for the bug where one giant tool_result line overran the
+    StreamReader's default 64 KiB buffer, raised LimitOverrunError out of
+    ``_pump``, left ``process_returncode=None``, and mislabeled the failure
+    as ``returncode=None``. The pump must skip the line, the returncode must
+    be captured, and the run must NOT be classified as ``returncode=None``.
+    """
+    oversized = b'{"type":"tool_result","content":"' + b"x" * (100 * 1024) + b'"}'
+    assert len(oversized) > 64 * 1024
+
+    async def fake_subprocess_runner(args: list[str], *, env: dict, prompt: str) -> _OverflowProcess:
+        # Subagent crashes without submitting (rc=0, no status file): the
+        # interesting bit is that streaming itself doesn't blow up.
+        return _OverflowProcess(oversized, rc=0)
+
+    runner = _make_runner(tmp_path, subprocess_runner=fake_subprocess_runner)
+    meta = runner.dispatch(
+        hypothesis="Does a huge stream line crash the pump?",
+        method=None,
+        inline_instructions="Emit one enormous line.",
+        expected_output="summary-text",
+    )
+    # Must not raise; background task drains cleanly.
+    await runner.wait_for(meta.experiment_id, timeout=10)
+
+    # The transcript was written and notes the skipped oversized line.
+    transcript = (tmp_path / "state" / meta.experiment_id / "transcript.jsonl").read_text()
+    assert "skipped oversized stream line" in transcript
+
+    # The failure is NOT mislabeled as returncode=None — the subprocess
+    # returncode (0) was captured because no exception propagated.
+    card_body = meta.card_path.read_text()
+    assert "returncode=None" not in card_body
+
+
+@pytest.mark.asyncio
+async def test_streaming_exception_surfaces_in_failure_reason(tmp_path: pathlib.Path) -> None:
+    """When streaming raises, failure_reason names the exception, not returncode=None."""
+
+    async def fake_subprocess_runner(args: list[str], *, env: dict, prompt: str) -> _FakeProcess:
+        return _FakeProcess(stdout_lines=[b""], stderr_lines=[b""], rc=0)
+
+    # Force the streaming step itself to raise so the broad except is hit.
+    runner = _make_runner(tmp_path, subprocess_runner=fake_subprocess_runner)
+
+    async def raising_stream(process: Any, transcript_path: pathlib.Path) -> None:
+        raise RuntimeError("kaboom in stream")
+
+    runner._stream_to_transcript = raising_stream  # type: ignore[method-assign,attr-defined]
+
+    meta = runner.dispatch(
+        hypothesis="Does a streaming crash surface the real error?",
+        method=None,
+        inline_instructions="Crash mid-stream.",
+        expected_output="summary-text",
+    )
+    await runner.wait_for(meta.experiment_id, timeout=10)
+
+    card_body = meta.card_path.read_text()
+    assert "subprocess error: RuntimeError" in card_body
+    assert "returncode=None" not in card_body
 
 
 @pytest.mark.asyncio
