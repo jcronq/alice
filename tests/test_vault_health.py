@@ -1054,6 +1054,33 @@ def test_recovery_state_baseline_available(tmp_path: Path) -> None:
     assert result["status"] in {"consolidating", "deteriorating"}
 
 
+def test_recovery_state_active_burst_metadata(tmp_path: Path) -> None:
+    """Burst streak → status=active_burst with start date + window length."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    from datetime import datetime, timedelta
+
+    # Three consecutive burst days (research_notes_last_night > 20),
+    # written oldest-first into the log.
+    for day, rnl in (("2026-06-14", 47), ("2026-06-15", 38), ("2026-06-16", 64)):
+        _write_event(events, f"{day}T08:00:00-04:00", {
+            "date": day,
+            "research_notes_last_night": rnl,
+        })
+
+    we = datetime(2026, 6, 16, 7, 0, 0)
+    ws = we - timedelta(days=14)
+    result = compute_recovery_state(
+        vault, thoughts, window_start=ws, window_end=we, events_path=events
+    )
+    assert result["status"] == "active_burst"
+    assert result["burst_start_date"] == "2026-06-14"
+    assert result["day_in_window"] == 3
+
+
 # ---------------------------------------------------------------------------
 # Research note decay: [[2026-05-09-research-note-decay-metric]]
 # Count research/ notes older than 60 days with fewer than 2 inbound links.

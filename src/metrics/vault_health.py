@@ -1791,23 +1791,27 @@ def compute_recovery_state(
     if events_path and events_path.exists():
         events = _read_events_jsonl(events_path)
         last_night_counts: list[int] = []
+        last_night_dates: list[str] = []
         for evt in reversed(events):
             if evt.get("type") != "vault_health":
                 continue
             rnl = evt.get("research_notes_last_night", 0)
             if isinstance(rnl, (int, float)) and rnl > 20:
                 last_night_counts.append(int(rnl))
+                last_night_dates.append(evt.get("date") or evt.get("ts", "")[:10])
             elif len(last_night_counts) > 0:
                 break  # once we hit a non-burst, stop looking back
         if len(last_night_counts) >= 2:
+            # last_night_dates is newest-first (we iterate reversed events),
+            # so the oldest streak day — the burst start — is the last entry.
             return {
                 "status": "active_burst",
                 "tier_1_ratio": None,
                 "output_rate_slope": None,
                 "structural_debt_delta": None,
                 "estimated_recovery_tier": "R0",
-                "burst_start_date": None,
-                "day_in_window": None,
+                "burst_start_date": last_night_dates[-1] if last_night_dates else None,
+                "day_in_window": len(last_night_counts),
             }
 
     # --- Compute three signals ---
