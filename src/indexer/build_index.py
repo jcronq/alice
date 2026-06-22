@@ -323,6 +323,7 @@ def collect_notes(vault: Path) -> list[dict]:
             tags = [tags] if tags else []
         record = {
             "slug": slug,
+            "_fm_slug": str(fm.get("slug") or "").strip(),
             "path": str(md.relative_to(vault)),
             "folder": folder_for(md, vault),
             "title": str(title),
@@ -351,6 +352,12 @@ def build_resolution_maps(
     by_title: dict[str, dict] = {}
     for r in records:
         by_slug[r["slug"]] = r
+        # A note may be linked by its frontmatter `slug:` when that differs
+        # from the filename stem. Register it as a secondary resolution key,
+        # but never let it shadow a canonical filename-stem slug (setdefault).
+        fm_slug = r.get("_fm_slug")
+        if fm_slug and fm_slug != r["slug"]:
+            by_slug.setdefault(fm_slug, r)
         # Wikilinks may also reference by basename without folder; same as slug here.
         for alias in r["_aliases"]:
             if isinstance(alias, str) and alias:

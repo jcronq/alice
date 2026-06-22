@@ -304,6 +304,89 @@ def test_needs_rebuild_triggers_on_note_count_mismatch(tmp_path: pathlib.Path):
     assert needs_rebuild(vault, db_path) is True
 
 
+def test_wikilink_resolves_via_frontmatter_slug(tmp_path: pathlib.Path):
+    """A note may carry a frontmatter ``slug:`` that differs from its
+    filename stem (e.g. dailies/research notes named with a date prefix).
+    Wikilinks frequently address the note by that frontmatter slug. The
+    indexer previously keyed resolution only on the filename stem, so such
+    links were wrongly marked ``resolved=0`` — ~1,000 false positives in the
+    live vault. The resolution map must register the frontmatter slug too.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    # Target file is named with a date prefix but has a bare slug.
+    (vault / "2026-06-21-decay-structural-linking.md").write_text(
+        "---\ntitle: Decay Structural Linking\n"
+        "slug: decay-structural-linking\n---\n\nTarget body.\n"
+    )
+    # Source links to the target by its frontmatter slug, not the stem.
+    (vault / "source.md").write_text(
+        "---\ntitle: Source\n---\n\nSee [[decay-structural-linking]].\n"
+    )
+
+    db_path = tmp_path / "index.db"
+    build(vault, db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = list(
+            conn.execute(
+                "SELECT target_slug, resolved FROM links "
+                "WHERE target_raw = 'decay-structural-linking'"
+            )
+        )
+    finally:
+        conn.close()
+
+    assert rows, "expected the frontmatter-slug wikilink to be indexed"
+    assert all(r[1] == 1 for r in rows), (
+        f"frontmatter-slug wikilink should resolve, got {rows}"
+    )
+    # Resolves to the canonical filename-stem slug of the target note.
+    assert rows[0][0] == "2026-06-21-decay-structural-linking", (
+        f"expected resolution to the filename-stem slug, got {rows[0][0]}"
+    )
+
+
+def test_filename_stem_slug_wins_over_colliding_frontmatter_slug(
+    tmp_path: pathlib.Path,
+):
+    """The frontmatter slug is registered with ``setdefault`` so the
+    canonical filename-stem slug always wins a collision. A note whose
+    filename stem equals another note's frontmatter slug must not be
+    shadowed."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    # Canonical: filename stem == "alpha".
+    (vault / "alpha.md").write_text("---\ntitle: Canonical Alpha\n---\n\nBody.\n")
+    # A different note declares slug: alpha in frontmatter.
+    (vault / "other.md").write_text(
+        "---\ntitle: Other\nslug: alpha\n---\n\nBody.\n"
+    )
+    (vault / "source.md").write_text(
+        "---\ntitle: Source\n---\n\nLink [[alpha]].\n"
+    )
+
+    db_path = tmp_path / "index.db"
+    build(vault, db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        target_slug = list(
+            conn.execute(
+                "SELECT target_slug FROM links "
+                "WHERE target_raw = 'alpha' AND resolved = 1"
+            )
+        )
+    finally:
+        conn.close()
+
+    assert target_slug, "the [[alpha]] link should resolve"
+    assert target_slug[0][0] == "alpha", (
+        f"filename-stem slug must win the collision, got {target_slug[0][0]}"
+    )
+
+
 def test_needs_rebuild_force_rebuild_on_unparseable_built_at(tmp_path: pathlib.Path):
     """Legacy/corrupt DBs without a parseable ``built_at`` should force a
     rebuild rather than silently stay stale — fail-safe direction."""
