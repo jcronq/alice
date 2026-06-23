@@ -614,8 +614,15 @@ def detect_corrections(
             ref_slug = _slug_of(ref_md)
             _, ref_body = _frontmatter_read(ref_md)
 
-            # Check if this note also references the correction
-            if f"[[{correction_slug}" in ref_body:
+            # Check if this note also references the correction.
+            # Resolve both the frontmatter slug form and the filename-stem
+            # form — a referencing note may wikilink the correction by either,
+            # and missing the stem form falsely flags it as unpropagated.
+            correction_forms = [correction_slug]
+            stem = correction_md.stem
+            if stem != correction_slug:
+                correction_forms.append(stem)
+            if any(f"[[{form}" in ref_body for form in correction_forms):
                 logger.info(
                     "correction_cascade: %s already references %s — OK",
                     ref_slug,

@@ -576,6 +576,45 @@ class TestDetectCorrections:
         assert report.correction_pairs_checked == 1
         assert report.total_unpropagated == 0
 
+    def test_no_unpropagated_when_referenced_by_stem_form(self, tmp_path):
+        """Regression: a correction whose frontmatter slug differs from its
+        filename stem must still count notes that wikilink it by the STEM
+        form as propagated. Otherwise total_unpropagated is inflated and
+        spurious propagation work is dispatched.
+        """
+        vault = tmp_path / "cortex-memory"
+        vault.mkdir()
+        (vault / "reference").mkdir()
+
+        # Correction note: filename stem 'foo-correction' but explicit
+        # frontmatter slug 'custom-correction-slug' (the two diverge).
+        correction = vault / "reference" / "foo-correction.md"
+        correction.write_text(
+            "---\nnote_type: correction\nslug: custom-correction-slug\n---\n"
+            "98.1% (159/162) were decayed.",
+            encoding="utf-8",
+        )
+
+        # corrected_by points at the correction by its frontmatter SLUG so the
+        # pair forms cleanly — the bug under test is purely the propagation
+        # check on the referencing note below.
+        corrected = vault / "reference" / "bar.md"
+        corrected.write_text(
+            "---\ncorrected_by: [custom-correction-slug]\n---\nnotes were decayed.",
+            encoding="utf-8",
+        )
+
+        # Referencing note links the correction by its FILENAME STEM, not its
+        # frontmatter slug — the case that was falsely flagged before the fix.
+        ref = vault / "reference" / "baz.md"
+        ref.write_text(
+            "See [[bar]] and [[foo-correction]].", encoding="utf-8"
+        )
+
+        report = detect_corrections(tmp_path)
+        assert report.correction_pairs_checked == 1
+        assert report.total_unpropagated == 0
+
     def test_no_corrections_found(self, tmp_path):
         vault = tmp_path / "cortex-memory"
         vault.mkdir()
