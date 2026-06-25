@@ -56,6 +56,7 @@ import logging
 import os
 import pathlib
 import shutil
+import time
 import uuid
 from typing import Any, Awaitable, Callable, Optional, Union
 
@@ -100,6 +101,32 @@ _SELF_ALIASES = frozenset({"self", "reply", "user", "sender"})
 # Resolved recipient — either the SELF_RECIPIENT sentinel or a concrete
 # :class:`ChannelRef` produced by the address book / E.164 parser.
 ResolvedRecipient = Union[str, ChannelRef]
+
+
+# Idempotency guard. The MCP server is built in-process (tools/__init__.py
+# creates one create_sdk_mcp_server per daemon), so this module-level dict
+# persists across turns for the life of the speaking process. It suppresses
+# duplicate deliveries of the same message to the same recipient inside a
+# short window — the failure mode seen during the 2026-06-24 MCP
+# "Stream closed" outage, where a transport hiccup could replay a send.
+_SEND_DEDUP_TTL_S = 30.0
+_recent_sends: dict[tuple[str, str], float] = {}
+
+
+def _dedup_key(resolved: ResolvedRecipient, message: str) -> tuple[str, str]:
+    if isinstance(resolved, ChannelRef):
+        addr = f"{resolved.transport}:{resolved.address}"
+    else:
+        addr = str(resolved)
+    return (addr, message)
+
+
+def _seen_recently(key: tuple[str, str], now: float) -> bool:
+    # Opportunistically evict expired entries (cheap: bounded by send volume).
+    for k in [k for k, ts in _recent_sends.items() if now - ts > _SEND_DEDUP_TTL_S]:
+        del _recent_sends[k]
+    last = _recent_sends.get(key)
+    return last is not None and (now - last) <= _SEND_DEDUP_TTL_S
 
 
 def _resolve_recipient(
@@ -207,6 +234,22 @@ async def send_message_from_args(
             "E.164 number (+...)."
         )
 
+    dedup_key = _dedup_key(resolved, message)
+    now = time.monotonic()
+    if _seen_recently(dedup_key, now):
+        log.warning(
+            "send_message deduplicated: identical message to %s within %.0fs",
+            dedup_key[0],
+            _SEND_DEDUP_TTL_S,
+        )
+        return _ok(
+            f"duplicate suppressed (identical message to {dedup_key[0]} "
+            f"within {_SEND_DEDUP_TTL_S:.0f}s); not re-sent"
+        )
+    # Mark before sending so a concurrent/replayed call is suppressed even
+    # while the first is in flight; evict on failure so a real retry works.
+    _recent_sends[dedup_key] = now
+
     spool_dir = outbox_dir if outbox_dir is not None else DEFAULT_OUTBOX_DIR
     raw_attachments = args.get("attachments")
     attachment_paths: Optional[list[str]] = None
@@ -214,10 +257,12 @@ async def send_message_from_args(
         if not isinstance(raw_attachments, list) or not all(
             isinstance(p, str) for p in raw_attachments
         ):
+            _recent_sends.pop(dedup_key, None)
             return _err("attachments must be a list of filesystem path strings")
         try:
             staged, cleanups = _stage_attachments(list(raw_attachments), spool_dir)
         except (FileNotFoundError, IsADirectoryError, PermissionError) as exc:
+            _recent_sends.pop(dedup_key, None)
             return _err(f"{type(exc).__name__}: {exc}")
         attachment_paths = staged
     else:
@@ -226,6 +271,7 @@ async def send_message_from_args(
     try:
         await sender(resolved, message, attachment_paths)
     except Exception as exc:  # noqa: BLE001
+        _recent_sends.pop(dedup_key, None)
         _cleanup(cleanups)
         return _err(f"{type(exc).__name__}: {exc}")
     _cleanup(cleanups)

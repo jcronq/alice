@@ -12,6 +12,15 @@ from alice_speaking.tools import messaging
 from alice_speaking.transports import ChannelRef
 
 
+@pytest.fixture(autouse=True)
+def _reset_send_dedup():
+    """The idempotency guard keeps module-level state across calls; clear it
+    between tests so dedup hits don't leak from one test into the next."""
+    messaging._recent_sends.clear()
+    yield
+    messaging._recent_sends.clear()
+
+
 # ---------------------------------------------------------------------------
 # Recipient resolution
 
@@ -406,3 +415,112 @@ def test_send_message_send_failure_cleans_up_staged_files(cfg, address_book, tmp
     # No leftover copies — everything we staged was cleaned up.
     assert outbox.exists()
     assert list(outbox.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# Idempotency guard (task-0496)
+
+
+def test_send_message_deduplicates_identical_resend(cfg, address_book, tmp_path):
+    """A second identical send to the same recipient inside the TTL window
+    is suppressed — the underlying sender fires exactly once."""
+    sent: list[tuple[Any, str, Optional[list[str]]]] = []
+
+    async def fake_sender(
+        recipient: messaging.ResolvedRecipient,
+        message: str,
+        attachments: Optional[list[str]] = None,
+    ) -> None:
+        sent.append((recipient, message, attachments))
+
+    tools = messaging.build(
+        cfg, address_book=address_book, sender=fake_sender, outbox_dir=tmp_path / "o"
+    )
+    send_tool = tools[0]
+
+    first = asyncio.run(send_tool.handler({"recipient": "owner", "message": "ping"}))
+    second = asyncio.run(send_tool.handler({"recipient": "owner", "message": "ping"}))
+
+    assert first.get("isError") is not True
+    assert second.get("isError") is not True
+    assert "duplicate suppressed" in second["content"][0]["text"]
+    assert len(sent) == 1  # the resend never reached the sender
+
+
+def test_send_message_distinct_messages_not_deduplicated(cfg, address_book, tmp_path):
+    sent: list[str] = []
+
+    async def fake_sender(
+        recipient: messaging.ResolvedRecipient,
+        message: str,
+        attachments: Optional[list[str]] = None,
+    ) -> None:
+        sent.append(message)
+
+    tools = messaging.build(
+        cfg, address_book=address_book, sender=fake_sender, outbox_dir=tmp_path / "o"
+    )
+    send_tool = tools[0]
+
+    asyncio.run(send_tool.handler({"recipient": "owner", "message": "one"}))
+    asyncio.run(send_tool.handler({"recipient": "owner", "message": "two"}))
+
+    assert sent == ["one", "two"]
+
+
+def test_send_message_failed_send_allows_retry(cfg, address_book, tmp_path):
+    """A send that raises must NOT poison the dedup cache — the user's retry
+    of the same message has to go through."""
+    calls = {"n": 0}
+
+    async def flaky_then_ok(
+        recipient: messaging.ResolvedRecipient,
+        message: str,
+        attachments: Optional[list[str]] = None,
+    ) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("signal offline")
+
+    tools = messaging.build(
+        cfg, address_book=address_book, sender=flaky_then_ok, outbox_dir=tmp_path / "o"
+    )
+    send_tool = tools[0]
+
+    first = asyncio.run(send_tool.handler({"recipient": "owner", "message": "retry me"}))
+    second = asyncio.run(
+        send_tool.handler({"recipient": "owner", "message": "retry me"})
+    )
+
+    assert first["isError"] is True
+    assert second.get("isError") is not True
+    assert "duplicate suppressed" not in second["content"][0]["text"]
+    assert calls["n"] == 2  # retry reached the sender, was not deduped
+
+
+def test_send_message_dedup_expires_after_ttl(
+    cfg, address_book, tmp_path, monkeypatch
+):
+    """Once the TTL window passes, the same message sends again."""
+    sent: list[str] = []
+
+    async def fake_sender(
+        recipient: messaging.ResolvedRecipient,
+        message: str,
+        attachments: Optional[list[str]] = None,
+    ) -> None:
+        sent.append(message)
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(messaging.time, "monotonic", lambda: clock["t"])
+
+    tools = messaging.build(
+        cfg, address_book=address_book, sender=fake_sender, outbox_dir=tmp_path / "o"
+    )
+    send_tool = tools[0]
+
+    asyncio.run(send_tool.handler({"recipient": "owner", "message": "tick"}))
+    clock["t"] += messaging._SEND_DEDUP_TTL_S + 1
+    asyncio.run(send_tool.handler({"recipient": "owner", "message": "tick"}))
+
+    assert sent == ["tick", "tick"]
