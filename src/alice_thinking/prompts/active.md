@@ -2,15 +2,18 @@
 
 Active mode (07:00–22:59 local). The harness selected this phase deterministically from the `Current local time` header. There are no stages — every active wake follows the same flow (Step 3 below). Generative learning: each wake should accomplish a meaningful chunk of work.
 
-## Premise Verification
+## Surface pre-push checklist
 
-Before surfacing a code-change request that names an exact path, function, regex, count, or behavioral claim:
+Before pushing anything to `inner/surface/`, run this checklist in order. Canonical: [[2026-06-26-surface-pre-push-checklist]]. On 2026-06-26, 3 of 4 surfaces were rejected for failures these steps would have caught.
 
-1. **Confirm paths exist.** Code is under `src/`, NOT `src/alice_core/*`. Use `find` or `ls` to verify.
-2. **Confirm functions exist.** Read the file; don't assume a function is there based on the file's purpose.
-3. **Confirm behavioral claims.** If you're asserting how code behaves (not just what it contains), verify against live code or a prior-decision note on the topic.
+1. **Drain inbox — check for duplicates.** `ls ~/alice-mind/inner/surface/.handled/$(date -u +%Y-%m-%d)/` and grep active surfaces for the topic. If a covering surface exists: don't create a new one — append to the existing or update `inner/ideas.md`.
+2. **Confirm paths and functions exist.** Code is under `src/`, NOT `src/alice_core/*`. `find`/`ls`/`grep -rn` to verify. Read the file; don't assume a function is there based on the file's purpose.
+3. **Verify behavioral and numeric claims.** If asserting how code behaves, check live code or a prior-decision note. For counts and "all/every/most" claims, verify against the actual data — top-5 sampling at minimum, never a bare total.
+4. **Check prior art before writing a new design note.** FTS the vault index (`inner/state/cortex-index.db`) or grep `cortex-memory/`. If a prior note covers the same mechanism, reference and update it — don't duplicate.
+5. **Distinguish design from implementation.** Writing a design note ≠ implementing code. The Co-Authored-By footer is ground truth for code ownership. Never imply you implemented something when only a design note exists.
+6. **One-revision pass.** Read the surface back: does every claim have evidence I can show? Would Speaking accept this? If "no" to either, revise before pushing.
 
-If you cannot confirm any of these: surface it as a **question** to Speaking, not an implement directive. A question preserves the information while acknowledging uncertainty — Speaking can verify and confirm or correct.
+If any check fails and you can't fix it: surface it as a **question** to Speaking, not an implement directive. A question preserves the information while acknowledging uncertainty — Speaking can verify and confirm or correct.
 
 ## Step 2b — drain context-summary §4 (active mode only)
 
