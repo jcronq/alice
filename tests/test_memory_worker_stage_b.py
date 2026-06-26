@@ -179,7 +179,14 @@ def test_new_concept_creates_atomic_note(vault: pathlib.Path) -> None:
 
 
 def test_concept_duplicate_slug_merges_dated_section(vault: pathlib.Path) -> None:
-    """Re-dropping a note with the same slug appends, doesn't overwrite."""
+    """Re-dropping a note with the same slug appends, doesn't overwrite.
+
+    Retry semantics: a prior tick already consumed ``mike.md`` (so it
+    sits under ``.consumed/<date>/``). The current tick sees the same
+    filename in the inbox and the same slug in the vault — that's a
+    crash-retry, not a genuine collision, so the existing merge
+    behavior must be preserved.
+    """
     target_dir = vault / "cortex-memory" / "people"
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / "mike.md"
@@ -187,6 +194,15 @@ def test_concept_duplicate_slug_merges_dated_section(vault: pathlib.Path) -> Non
         "---\ntitle: Mike\ntags: [person]\ncreated: 2026-04-01\n---\n\n# Mike\n\nJason's younger brother.\n",
         encoding="utf-8",
     )
+
+    # Seed a prior consumed copy so the retry-detection check fires.
+    today = datetime.date.today().isoformat()
+    consumed_dir = vault / "inner" / "notes" / ".consumed" / today
+    consumed_dir.mkdir(parents=True, exist_ok=True)
+    (consumed_dir / "mike.md").write_text(
+        "---\ntag: person\n---\n\nPrior consumed copy.\n", encoding="utf-8"
+    )
+
     _drop_note(
         vault,
         "mike.md",
@@ -199,9 +215,134 @@ def test_concept_duplicate_slug_merges_dated_section(vault: pathlib.Path) -> Non
     # Original content preserved.
     assert "Jason's younger brother." in text
     # Merge section appended with today's date.
-    today = datetime.date.today().isoformat()
     assert f"## Update {today}" in text
     assert "Lives in Utah." in text
+
+
+def test_concept_same_folder_genuine_collision_renames_existing(
+    vault: pathlib.Path,
+) -> None:
+    """Different ``filename`` deriving the same slug as an existing
+    note → existing renamed to ``-v2.md``, new note written as
+    ``slug.md``. The two distinct sources are preserved instead of
+    being silently merged (the old behavior welded them together)."""
+    target_dir = vault / "cortex-memory" / "projects"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    existing = target_dir / "alice-body.md"
+    existing.write_text(
+        "---\ntitle: Alice Body (original)\ntags: [project]\ncreated: 2026-04-01\n---\n\n"
+        "# Alice Body (original)\n\nOriginal-source content.\n",
+        encoding="utf-8",
+    )
+    # No matching ``.consumed/<date>/alice-body.md`` — this is a
+    # genuine collision, not a retry.
+
+    _drop_note(
+        vault,
+        "alice-body.md",
+        "---\ntag: project\ntitle: Alice Body (new source)\n---\n\nDifferent source content.\n",
+    )
+    report = stage_b.run(vault)
+    assert report.routed_concept == 1
+
+    # Existing renamed to -v2.md, preserving original content.
+    renamed = target_dir / "alice-body-v2.md"
+    assert renamed.is_file()
+    renamed_text = renamed.read_text(encoding="utf-8")
+    assert "Original-source content." in renamed_text
+    assert "title: Alice Body (original)" in renamed_text
+
+    # New note occupies the bare slug.
+    new = target_dir / "alice-body.md"
+    assert new.is_file()
+    new_text = new.read_text(encoding="utf-8")
+    assert "Different source content." in new_text
+    assert "title: Alice Body (new source)" in new_text
+    # No silent merge: the new file does NOT carry the original body.
+    assert "Original-source content." not in new_text
+
+
+def test_concept_cross_folder_collision_renames_in_existing_folder(
+    vault: pathlib.Path,
+) -> None:
+    """An existing note with the same slug in a DIFFERENT concept
+    folder → that note is renamed in-place to ``-v2.md`` (NOT moved
+    across folders); the new note is written as ``slug.md`` in the
+    requested folder."""
+    # Seed a colliding slug in ``reference/`` (existing).
+    ref_dir = vault / "cortex-memory" / "reference"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    cross_existing = ref_dir / "shared-slug.md"
+    cross_existing.write_text(
+        "---\ntitle: Shared Slug (in reference)\ntags: [reference]\ncreated: 2026-04-01\n---\n\n"
+        "# Shared Slug\n\nReference-folder content.\n",
+        encoding="utf-8",
+    )
+
+    # Drop an inbox note that routes to ``projects/`` with the same slug.
+    _drop_note(
+        vault,
+        "shared-slug.md",
+        "---\ntag: project\ntitle: Shared Slug (in projects)\n---\n\nProjects-folder content.\n",
+    )
+    report = stage_b.run(vault)
+    assert report.routed_concept == 1
+
+    # Existing renamed IN ITS OWN folder (reference/), not moved.
+    renamed_in_reference = ref_dir / "shared-slug-v2.md"
+    assert renamed_in_reference.is_file()
+    assert "Reference-folder content." in renamed_in_reference.read_text(encoding="utf-8")
+    # The old slug.md in reference/ is gone (renamed away).
+    assert not (ref_dir / "shared-slug.md").is_file()
+
+    # New note written in the requested folder (projects/) at the bare slug.
+    new_in_projects = vault / "cortex-memory" / "projects" / "shared-slug.md"
+    assert new_in_projects.is_file()
+    assert "Projects-folder content." in new_in_projects.read_text(encoding="utf-8")
+    # The new file was NOT auto-renamed to -v2.
+    assert not (vault / "cortex-memory" / "projects" / "shared-slug-v2.md").is_file()
+
+
+def test_concept_multi_collision_picks_next_available_suffix(
+    vault: pathlib.Path,
+) -> None:
+    """If ``slug-v2.md`` already exists, the rename picks ``slug-v3.md``.
+    Same-folder genuine collision, but the v2 slot is taken from a
+    prior collision round."""
+    target_dir = vault / "cortex-memory" / "projects"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    existing = target_dir / "shared.md"
+    existing.write_text(
+        "---\ntitle: Shared (current head)\ntags: [project]\ncreated: 2026-05-01\n---\n\n"
+        "# Shared\n\nCurrent-head content.\n",
+        encoding="utf-8",
+    )
+    # v2 already taken from a prior collision.
+    (target_dir / "shared-v2.md").write_text(
+        "---\ntitle: Shared (v2)\ntags: [project]\ncreated: 2026-04-15\n---\n\n"
+        "# Shared\n\nPrior v2 content.\n",
+        encoding="utf-8",
+    )
+
+    _drop_note(
+        vault,
+        "shared.md",
+        "---\ntag: project\ntitle: Shared (newest)\n---\n\nNewest content.\n",
+    )
+    report = stage_b.run(vault)
+    assert report.routed_concept == 1
+
+    # Existing head renamed to v3 (since v2 was taken), v2 untouched.
+    renamed_v3 = target_dir / "shared-v3.md"
+    assert renamed_v3.is_file()
+    assert "Current-head content." in renamed_v3.read_text(encoding="utf-8")
+
+    v2_text = (target_dir / "shared-v2.md").read_text(encoding="utf-8")
+    assert "Prior v2 content." in v2_text
+
+    # Newest note holds the bare slug.
+    new = target_dir / "shared.md"
+    assert "Newest content." in new.read_text(encoding="utf-8")
 
 
 def test_reference_candidate_routes_to_reference_folder(vault: pathlib.Path) -> None:

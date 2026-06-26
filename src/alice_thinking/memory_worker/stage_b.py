@@ -546,6 +546,92 @@ def _event_summary(record: dict[str, Any], body: str, filename: str) -> str:
     return _slug_from_filename(filename)
 
 
+#: Folders that ``_write_concept`` may direct notes into, used for
+#: cross-folder slug-collision checks. Built from the values of
+#: :data:`_CONCEPT_FOLDER` (the canonical set the worker can produce)
+#: plus ``conflicts`` (written by :func:`_write_conflict`). Kept as a
+#: frozenset to make membership tests cheap and ordering irrelevant.
+_CONCEPT_FOLDERS_ALL: frozenset[str] = frozenset(_CONCEPT_FOLDER.values()) | {"conflicts"}
+
+
+def _check_slug_uniqueness(
+    vault: pathlib.Path,
+    folder: str,
+    slug: str,
+    filename: str,
+) -> tuple[str, Optional[pathlib.Path]]:
+    """Classify a would-be vault write against the existing vault.
+
+    Returns a ``(kind, existing_path)`` tuple where ``kind`` is one of:
+
+    - ``"none"``: no existing note conflicts; the caller may write
+      the fresh template.
+    - ``"retry"``: a note with the same slug exists in ``folder`` AND
+      the inbox source (``filename``) is already present under
+      ``inner/notes/.consumed/<any-date>/<filename>`` — i.e. the
+      memory worker has previously consumed this exact source. The
+      caller preserves the existing merge-on-collision behavior
+      (append a ``## Update YYYY-MM-DD`` section), which is
+      idempotent for crash-retries of the same source.
+    - ``"same_folder_collision"``: a note with the same slug exists
+      in ``folder`` but ``filename`` is NOT in any ``.consumed/``
+      subdir — two different inbox notes derive the same slug. The
+      caller renames the existing file to ``{slug}-v2.md`` (or
+      v3..v9) in ``folder`` and writes the new note as ``{slug}.md``.
+    - ``"cross_folder_collision"``: no note with the same slug exists
+      in ``folder``, but one exists in a different concept folder.
+      The caller renames the existing file IN ITS OWN FOLDER to
+      ``{slug}-v2.md`` (does not move it across folders) and writes
+      the new note as ``{slug}.md`` in ``folder``.
+
+    ``existing_path`` is the absolute path of the colliding file when
+    ``kind != "none"``, else ``None``. For ``"retry"`` we still return
+    the same-folder target so the caller can read+merge without
+    recomputing the path.
+    """
+    target = vault / "cortex-memory" / folder / f"{slug}.md"
+    if target.is_file():
+        # Distinguish retry-of-same-source from genuine collision.
+        # The source filename is present under .consumed/<date>/ iff
+        # the worker previously consumed it (any date — survives the
+        # ~30-day rolling cleanup window because we only check while
+        # the consumed copy still exists).
+        consumed_root = _inbox_dir(vault) / ".consumed"
+        if consumed_root.is_dir():
+            for day_dir in consumed_root.iterdir():
+                if not day_dir.is_dir():
+                    continue
+                if (day_dir / filename).is_file():
+                    return ("retry", target)
+        return ("same_folder_collision", target)
+    # Same-folder slot is free; check the other concept folders for a
+    # cross-folder collision on the same slug.
+    for other_folder in _CONCEPT_FOLDERS_ALL:
+        if other_folder == folder:
+            continue
+        cross = vault / "cortex-memory" / other_folder / f"{slug}.md"
+        if cross.is_file():
+            return ("cross_folder_collision", cross)
+    return ("none", None)
+
+
+def _pick_collision_rename_slug(
+    folder_path: pathlib.Path, slug: str
+) -> Optional[str]:
+    """Return the lowest-numbered free ``{slug}-vN`` (N in 2..9) in
+    ``folder_path``, or ``None`` if v2..v9 are all taken.
+
+    Defensive: in practice the same slug colliding nine times across
+    distinct source notes is implausible; ``None`` lets the caller
+    fall back to the existing merge behavior with a strong warning.
+    """
+    for n in range(2, 10):
+        candidate = f"{slug}-v{n}"
+        if not (folder_path / f"{candidate}.md").is_file():
+            return candidate
+    return None
+
+
 def _write_concept(
     vault: pathlib.Path,
     fm: dict[str, Any],
@@ -557,21 +643,36 @@ def _write_concept(
     """Write a new atomic vault note, or merge into an existing
     one with the same slug.
 
-    Merge semantics: the existing note is preserved as-is and a
-    dated section is appended (``## Update YYYY-MM-DD``). We do
-    NOT rewrite the frontmatter; the cortex-memory skill is the
-    authoritative editor for top-level fields.
+    Pre-write the caller runs :func:`_check_slug_uniqueness` to
+    distinguish three failure modes that all used to silently merge:
+
+    1. **Retry** of a source already consumed — append a dated
+       section to the existing note (the legacy merge path). Safe
+       and idempotent across crash-retries.
+    2. **Same-folder genuine collision** — two different inbox notes
+       derive the same slug. The existing note is renamed to
+       ``{slug}-v2.md`` (or v3..v9) and the new note takes ``{slug}.md``.
+    3. **Cross-folder collision** — a note with the same slug lives
+       in a different concept folder. The existing file is renamed
+       IN ITS OWN FOLDER to ``{slug}-v2.md`` (not moved across
+       folders) and the new note is written as ``{slug}.md`` in
+       ``folder``.
 
     Fresh notes get a frontmatter block conforming to the vault
     convention (``created``, ``updated``, ``last_accessed``,
-    ``access_count: 0``).
+    ``access_count: 0``). Merge writes do NOT rewrite the
+    frontmatter; the cortex-memory skill is the authoritative editor
+    for top-level fields.
     """
     target_dir = vault / "cortex-memory" / folder
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"{slug}.md"
     today = _today().isoformat()
-    if target.is_file():
-        # Merge — append a dated section, leave frontmatter alone.
+
+    kind, existing_path = _check_slug_uniqueness(vault, folder, slug, filename)
+
+    if kind == "retry":
+        # Crash-retry of the same source — preserve legacy merge.
         existing = target.read_text(encoding="utf-8")
         if existing and not existing.endswith("\n"):
             existing += "\n"
@@ -581,7 +682,73 @@ def _write_concept(
         )
         target.write_text(existing + section, encoding="utf-8")
         return
-    # Fresh note — full template.
+
+    if kind == "same_folder_collision":
+        assert existing_path is not None  # mypy / readability
+        rename_slug = _pick_collision_rename_slug(target_dir, slug)
+        if rename_slug is None:
+            # v2..v9 all taken — implausible. Fall back to the legacy
+            # merge to avoid losing data, but warn loudly.
+            logger.warning(
+                "memory-worker stage_b: same-folder slug collision on "
+                "%s/%s with v2..v9 all taken; falling back to merge",
+                folder,
+                slug,
+            )
+            existing = target.read_text(encoding="utf-8")
+            if existing and not existing.endswith("\n"):
+                existing += "\n"
+            section = (
+                f"\n## Update {today}\n\n"
+                f"{body.strip()}\n"
+            )
+            target.write_text(existing + section, encoding="utf-8")
+            return
+        renamed_to = target_dir / f"{rename_slug}.md"
+        os.replace(existing_path, renamed_to)
+        logger.info(
+            "memory-worker stage_b: same-folder slug collision on "
+            "%s/%s; renamed existing to %s",
+            folder,
+            slug,
+            renamed_to.name,
+        )
+        # Fall through to fresh-template write below.
+
+    elif kind == "cross_folder_collision":
+        assert existing_path is not None
+        existing_folder = existing_path.parent
+        rename_slug = _pick_collision_rename_slug(existing_folder, slug)
+        if rename_slug is None:
+            # v2..v9 all taken in the existing file's folder —
+            # implausible. Fall back: just write the new note in the
+            # requested folder and leave the existing file alone.
+            # That preserves both notes (different folders) but the
+            # index may resolve ambiguously. Warn loudly.
+            logger.warning(
+                "memory-worker stage_b: cross-folder slug collision on "
+                "%s (existing in %s) with v2..v9 all taken in source "
+                "folder; writing new without rename",
+                slug,
+                existing_folder.name,
+            )
+        else:
+            renamed_to = existing_folder / f"{rename_slug}.md"
+            os.replace(existing_path, renamed_to)
+            logger.info(
+                "memory-worker stage_b: cross-folder slug collision on "
+                "%s; renamed existing %s/%s.md to %s/%s",
+                slug,
+                existing_folder.name,
+                slug,
+                existing_folder.name,
+                renamed_to.name,
+            )
+        # Fall through to fresh-template write below.
+
+    # Fresh note — full template. Reached for kind == "none",
+    # "same_folder_collision" (after rename), and
+    # "cross_folder_collision" (after rename).
     title = str(fm.get("title") or slug)
     fm_tag = _frontmatter_tag(fm) or folder
     header = (
