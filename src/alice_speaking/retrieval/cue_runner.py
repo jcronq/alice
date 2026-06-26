@@ -1076,7 +1076,8 @@ async def build_cue_context(
             # note's frontmatter is in the user query, multiply by 1.5×.
             kws = _read_trigger_keywords(resolved_vault, path) if path else []
             if kws and any(kw in query_lower for kw in kws):
-                boost *= TRIGGER_KEYWORD_EXTRA
+                kw_boost = 1.2 if note_type in ("synthesis", "design") else TRIGGER_KEYWORD_EXTRA
+                boost *= kw_boost
             # Access-count recency boost (closes Phase 0). Counteracts the
             # decay cliff: notes the user touches repeatedly stay
             # retrievable. Capped so popularity can't drown out topical
