@@ -27,7 +27,6 @@ import pytest
 
 from metrics.birth_signal import (
     BURST_SESSION_MIN_NOTES,
-    DEFAULT_ZERO_ACCESS_AGE_DAYS,
     birth_signal_event_exists_for_date,
     build_birth_signal_event,
     classify_keywords,
