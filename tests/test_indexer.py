@@ -21,7 +21,7 @@ import time
 
 import pytest
 
-from indexer.build_index import build, needs_rebuild, slug_for
+from indexer.build_index import build, collect_notes, needs_rebuild, slug_for
 from indexer.yaml_lite import extract_wikilinks, split_frontmatter
 
 
@@ -403,3 +403,124 @@ def test_needs_rebuild_force_rebuild_on_unparseable_built_at(tmp_path: pathlib.P
         conn.close()
 
     assert needs_rebuild(vault, db_path) is True
+
+
+# ---------------------------------------------------------------------------
+# Regression: frontmatter `references:` were silently dropped from the link
+# graph. ~930 vault notes carry frontmatter references in the form
+# ``"[[slug]] — description"``; the indexer only mined the body, losing
+# ~2,500-3,000 declared links and inflating isolated-note counts.
+# Fix reuses ``extract_wikilinks`` over each reference entry.
+
+
+def _by_slug(records: list[dict], slug: str) -> dict:
+    for r in records:
+        if r["slug"] == slug:
+            return r
+    raise AssertionError(f"no record with slug={slug!r}")
+
+
+def test_collect_notes_extracts_frontmatter_references_list(tmp_path: pathlib.Path):
+    """Frontmatter ``references:`` declared as a list of
+    ``"[[slug]] — description"`` strings (the live-vault format) must
+    surface every wikilink target in ``_fm_references``."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "source.md").write_text(
+        "---\n"
+        "title: Source\n"
+        "references:\n"
+        '  - "[[foo]] — project goal"\n'
+        '  - "[[bar|alias]] — desc"\n'
+        "---\n\n"
+        "Body without links.\n"
+    )
+
+    records = collect_notes(vault)
+    src = _by_slug(records, "source")
+    assert "foo" in src["_fm_references"]
+    assert "bar" in src["_fm_references"]
+
+
+def test_collect_notes_extracts_frontmatter_references_scalar_string(
+    tmp_path: pathlib.Path,
+):
+    """A scalar ``references:`` string (single entry, not a list) is
+    still parsed. Some live-vault notes use this shape."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "source.md").write_text(
+        "---\n"
+        "title: Source\n"
+        'references: "[[single-string]] — desc"\n'
+        "---\n\n"
+        "Body.\n"
+    )
+
+    records = collect_notes(vault)
+    src = _by_slug(records, "source")
+    assert src["_fm_references"] == ["single-string"]
+
+
+def test_collect_notes_no_references_field(tmp_path: pathlib.Path):
+    """A note without a ``references:`` field gets an empty
+    ``_fm_references`` list and doesn't crash collect_notes."""
+    vault = tmp_path / "vault"
+    _write_note(vault / "plain.md", title="Plain", body="Just prose.")
+
+    records = collect_notes(vault)
+    src = _by_slug(records, "plain")
+    assert src["_fm_references"] == []
+
+
+def test_collect_notes_references_non_wikilink_string(tmp_path: pathlib.Path):
+    """A ``references:`` entry that contains no wikilink syntax should
+    produce zero targets — extract_wikilinks naturally returns []."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "source.md").write_text(
+        "---\n"
+        "title: Source\n"
+        "references:\n"
+        '  - "plain text, not a wikilink"\n'
+        "---\n\n"
+        "Body.\n"
+    )
+
+    records = collect_notes(vault)
+    src = _by_slug(records, "source")
+    assert src["_fm_references"] == []
+
+
+def test_build_inserts_link_rows_for_frontmatter_references(tmp_path: pathlib.Path):
+    """End-to-end: frontmatter references must land in the ``links`` table
+    alongside body-extracted wikilinks. This is the contract that drives
+    PageRank / isolated-note metrics — body-only extraction was the bug."""
+    vault = tmp_path / "vault"
+    _write_note(vault / "foo.md", title="Foo")
+    _write_note(vault / "bar.md", title="Bar")
+    (vault / "source.md").write_text(
+        "---\n"
+        "title: Source\n"
+        "references:\n"
+        '  - "[[foo]] — project goal"\n'
+        '  - "[[bar|alias]] — desc"\n'
+        "---\n\n"
+        "Body without inline links.\n"
+    )
+
+    db_path = tmp_path / "index.db"
+    build(vault, db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        targets = {
+            row[0]
+            for row in conn.execute(
+                "SELECT target_slug FROM links WHERE source_slug = 'source'"
+            )
+        }
+    finally:
+        conn.close()
+    assert "foo" in targets, f"frontmatter ref 'foo' not in links table: {targets}"
+    assert "bar" in targets, f"frontmatter ref 'bar' not in links table: {targets}"

@@ -339,6 +339,20 @@ def collect_notes(vault: Path) -> list[dict]:
             "_wikilink_targets": extract_wikilinks(body),
             "_path_obj": md,
         }
+        # Frontmatter `references:` lists declare wikilinks too (typical entry:
+        # ``"[[slug]] — description"`` or ``"[[slug|alias]] — desc"``). The
+        # indexer previously only mined the body, silently dropping those
+        # links and inflating the isolated-note count. Reuse the body parser
+        # so `[[slug]] — desc`, alias forms, and the triple-bracket typo
+        # variant all decode cleanly.
+        fm_refs = fm.get("references") or []
+        if isinstance(fm_refs, str):
+            fm_refs = [fm_refs]
+        fm_targets: list[str] = []
+        for ref in fm_refs:
+            if isinstance(ref, str):
+                fm_targets.extend(extract_wikilinks(ref))
+        record["_fm_references"] = fm_targets
         records.append(record)
     return records
 
@@ -441,7 +455,7 @@ def build(vault: Path, db_path: Path) -> dict:
         link_count = 0
         for r in records:
             seen: set[tuple[str, str]] = set()
-            for raw in r["_wikilink_targets"]:
+            for raw in r["_wikilink_targets"] + r.get("_fm_references", []):
                 target_record = resolve_link(raw, by_slug, by_alias, by_title)
                 if target_record is None:
                     target_slug = raw.rsplit("/", 1)[-1]
