@@ -411,11 +411,13 @@ def count_orphans(vault_dir: Path) -> tuple[int, list[str]]:
     orphans: list[str] = []
     for md in _iter_notes(vault_dir):
         rel_parts = md.relative_to(vault_dir).parts
-        # Dailies, archive, and gh-state are always excluded — dailies and
-        # archive are date-stamped activity logs that wouldn't normally be
-        # linked to; gh-state holds GitHub issue/PR state-mirror notes,
-        # which by design carry 0 wikilinks (see issue tracker context).
-        if rel_parts and rel_parts[0] in {"dailies", "archive", "gh-state"}:
+        # Dailies, archive, gh-state, and experiments are always excluded —
+        # dailies and archive are date-stamped activity logs that wouldn't
+        # normally be linked to; gh-state holds GitHub issue/PR state-mirror
+        # notes, which by design carry 0 wikilinks (see issue tracker
+        # context); experiments are one-shot experiment-runner artifacts
+        # with 0 trigger_keywords and 0 wikilinks by design.
+        if rel_parts and rel_parts[0] in {"dailies", "archive", "gh-state", "experiments"}:
             continue
         text = _read_text(md)
         fm, _body = split_frontmatter(text)
@@ -470,8 +472,9 @@ def count_shadow_and_dark(vault_dir: Path) -> dict[str, int]:
         # gh-state holds GitHub issue/PR state-mirror notes — operational
         # records with 0 trigger_keywords and 0 wikilinks by design. They
         # are not knowledge notes and would otherwise dominate the
-        # truly_dark_count signal.
-        if rel_parts and rel_parts[0] in {"dailies", "archive", "gh-state"}:
+        # truly_dark_count signal. experiments/ holds one-shot experiment-
+        # runner artifacts with the same 0/0 shape, also non-knowledge.
+        if rel_parts and rel_parts[0] in {"dailies", "archive", "gh-state", "experiments"}:
             continue
         if md.name in EXCLUDED_NAMES:
             continue
@@ -560,9 +563,10 @@ def compute_continuous_checks(
 
     for md in _iter_notes(vault_dir):
         rel_parts = md.relative_to(vault_dir).parts
-        # gh-state mirrors are excluded for the same reason as in
-        # count_shadow_and_dark — operational records, not knowledge.
-        if rel_parts and rel_parts[0] in {"dailies", "archive", "gh-state"}:
+        # gh-state mirrors and experiments artifacts are excluded for the
+        # same reason as in count_shadow_and_dark — operational / one-shot
+        # records, not knowledge.
+        if rel_parts and rel_parts[0] in {"dailies", "archive", "gh-state", "experiments"}:
             continue
         rel = str(md.relative_to(vault_dir))
         text = _read_text(md)
@@ -1050,7 +1054,7 @@ def count_access_decay(
     Returns the count of decayed notes. Notes younger than the cutoff are
     ignored — they haven't had time to be retrieved.
 
-    Folders excluded: dailies, archive, gh-state (same as
+    Folders excluded: dailies, archive, gh-state, experiments (same as
     ``compute_decay_coverage``).
     """
     vault_dir = vault_dir.resolve()
@@ -1061,7 +1065,7 @@ def count_access_decay(
     for md in vault_dir.rglob("*.md"):
         # Skip excluded top-level dirs.
         rel_parts = md.relative_to(vault_dir).parts
-        if rel_parts and rel_parts[0] in {"dailies", "archive", "gh-state"}:
+        if rel_parts and rel_parts[0] in {"dailies", "archive", "gh-state", "experiments"}:
             continue
         if md.name in EXCLUDED_NAMES:
             continue
