@@ -305,6 +305,19 @@ class TestFindCorrectionNotes:
         notes = _find_correction_notes(vault)
         assert len(notes) == 0
 
+    def test_excluded_experiments(self, tmp_path):
+        """experiments/ contains one-shot runner artifacts (exp-*.md), not
+        knowledge notes; the auto-propagate dispatcher emits "not found,
+        skipping" warnings for them because their slugs don't resolve via
+        the known folder list. Mirrors the vault_health PR #514 fix."""
+        vault = tmp_path / "cortex-memory"
+        vault.mkdir()
+        (vault / "experiments").mkdir()
+        md = vault / "experiments" / "exp-2026-06-19-correction.md"
+        md.write_text("---\nnote_type: correction\n---\n", encoding="utf-8")
+        notes = _find_correction_notes(vault)
+        assert len(notes) == 0
+
     def test_excluded_index_readme(self, tmp_path):
         vault = tmp_path / "cortex-memory"
         vault.mkdir()
@@ -467,16 +480,21 @@ class TestBuildReferenceIndex:
         vault = tmp_path / "cortex-memory"
         vault.mkdir()
         (vault / "dailies").mkdir()
+        (vault / "experiments").mkdir()
         (vault / "reference").mkdir()
 
         daily = vault / "dailies" / "2026-01-01.md"
         daily.write_text("See [[foo]].", encoding="utf-8")
 
+        exp = vault / "experiments" / "exp-2026-06-19.md"
+        exp.write_text("See [[foo]].", encoding="utf-8")
+
         ref = vault / "reference" / "a.md"
         ref.write_text("See [[foo]].", encoding="utf-8")
 
         idx = _build_reference_index(vault)
-        assert len(idx["foo"]) == 1  # Only the reference note, not the daily
+        # Only the reference note — daily and experiment are both excluded.
+        assert len(idx["foo"]) == 1
 
     def test_case_insensitive(self, tmp_path):
         vault = tmp_path / "cortex-memory"

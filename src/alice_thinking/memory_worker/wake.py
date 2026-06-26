@@ -36,7 +36,14 @@ from typing import Any
 
 from core.events import EventLogger
 
-from . import journal, stage_b, stage_c, stage_d
+from . import (
+    correction_cascade as cascade_mod,
+    correction_cascade_auto_propagate as autoprop_mod,
+    journal,
+    stage_b,
+    stage_c,
+    stage_d,
+)
 
 
 DEFAULT_MIND = pathlib.Path("/home/alice/alice-mind")
@@ -172,6 +179,23 @@ def main() -> int:
     # :func:`journal.replay` and recorded as ``skipped`` rather than
     # crashing the wake.
     report = journal.replay(journal_path)
+
+    # Pre-stage hook: correction-cascade auto-propagation. Fires on
+    # EVERY wake (not gated to Stage C) so corrections drain on the
+    # 30-min cadence instead of piling up between nightly Stage C
+    # runs. Empirical inflow was ~32 corrections/hr; 191 piled up over
+    # 18h before manual drain triggered this fix. Per-file vault locks
+    # are acquired inside :func:`autoprop_mod.auto_propagate`, so the
+    # hook is safe to run alongside Stage B/C/D's own locking.
+    # ``trigger="periodic_wake"`` makes the source identifiable in
+    # events.jsonl; Stage C's own call site keeps the default
+    # ``"stage_c"`` so both call sites stay distinguishable. Skip when
+    # ``total_unpropagated == 0`` so quiet cycles emit no event.
+    cascade_report = cascade_mod.detect_corrections(mind)
+    if cascade_report.total_unpropagated > 0:
+        autoprop_mod.auto_propagate(
+            mind, cascade_report, trigger="periodic_wake"
+        )
 
     # Phase 2: Stage B inbox drain. Deterministic routing; no LLM
     # calls. Each note's vault write + journal commit must succeed

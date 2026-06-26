@@ -85,7 +85,7 @@ def _resolve_slug_by_frontmatter(slug: str, vault: pathlib.Path) -> Optional[pat
 
     for md in vault.rglob("*.md"):
         rel_parts = md.relative_to(vault).parts
-        if rel_parts and rel_parts[0] in ("dailies", "archive", "gh-state"):
+        if rel_parts and rel_parts[0] in ("dailies", "archive", "gh-state", "experiments"):
             continue
         if any(part.startswith(".") for part in rel_parts):
             continue
@@ -130,6 +130,7 @@ def _write_propagation_event(
     high_severity: int,
     medium_severity: int,
     low_severity: int,
+    trigger: str = "stage_c",
 ) -> None:
     """Write a ``correction_cascade_auto_propagate`` event to events.jsonl.
 
@@ -140,6 +141,11 @@ def _write_propagation_event(
     Severity counts reflect what was *actually propagated* (not what was
     detected). Low-severity entries are filtered out before propagation
     and do not appear in the propagated count.
+
+    ``trigger`` debuggability tag: defaults to ``"stage_c"`` (the original
+    nightly call site). Per-wake hook invocations pass
+    ``trigger="periodic_wake"`` so the source is identifiable in
+    events.jsonl.
     """
     now = datetime.now(_EDT)
     event = {
@@ -154,6 +160,7 @@ def _write_propagation_event(
         "high_severity": high_severity,
         "medium_severity": medium_severity,
         "low_severity": low_severity,
+        "trigger": trigger,
     }
     events_path = mind / "memory" / "events.jsonl"
     try:
@@ -341,6 +348,7 @@ def auto_propagate(
     report: CascadeReport,
     *,
     dry_run: Optional[bool] = None,
+    trigger: str = "stage_c",
 ) -> dict[str, int]:
     """Auto-propagate corrections from a detection report.
 
@@ -358,6 +366,11 @@ def auto_propagate(
     dry_run
         Override the module-level ``_DRY_RUN`` setting. ``None`` uses
         the default.
+    trigger
+        Debuggability tag forwarded into the events.jsonl event so the
+        call site is identifiable. Defaults to ``"stage_c"`` (the
+        original nightly call site). The per-wake hook passes
+        ``"periodic_wake"``.
 
     Returns
     -------
@@ -475,6 +488,7 @@ def auto_propagate(
         high_severity=propagated_high,
         medium_severity=propagated_medium,
         low_severity=skipped,
+        trigger=trigger,
     )
 
     return changes

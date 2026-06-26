@@ -322,7 +322,7 @@ def _find_correction_notes(vault: pathlib.Path) -> list[pathlib.Path]:
     for md in vault.rglob("*.md"):
         # Skip non-groomable paths
         rel_parts = md.relative_to(vault).parts
-        if rel_parts and rel_parts[0] in ("dailies", "archive", "gh-state"):
+        if rel_parts and rel_parts[0] in ("dailies", "archive", "gh-state", "experiments"):
             continue
         if any(part.startswith(".") for part in rel_parts):
             continue
@@ -399,7 +399,7 @@ def _find_corrected_note(
     if vault.is_dir():
         for md in vault.rglob("*.md"):
             rel_parts = md.relative_to(vault).parts
-            if rel_parts and rel_parts[0] in ("dailies", "archive", "gh-state"):
+            if rel_parts and rel_parts[0] in ("dailies", "archive", "gh-state", "experiments"):
                 continue
             if any(part.startswith(".") for part in rel_parts):
                 continue
@@ -513,7 +513,7 @@ def _build_reference_index(vault: pathlib.Path) -> dict[str, list[pathlib.Path]]
 
     for md in vault.rglob("*.md"):
         rel_parts = md.relative_to(vault).parts
-        if rel_parts and rel_parts[0] in ("dailies", "archive", "gh-state"):
+        if rel_parts and rel_parts[0] in ("dailies", "archive", "gh-state", "experiments"):
             continue
         if any(part.startswith(".") for part in rel_parts):
             continue
