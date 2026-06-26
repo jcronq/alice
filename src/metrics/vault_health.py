@@ -2874,6 +2874,29 @@ def build_vault_health_event(
         },
     }
 
+    # Birth signal — zero-access notes >= 30d, classified into burst
+    # artifacts (Bucket A) and useful-but-poorly-linked (Bucket B). The
+    # birth signal is the "birth → zero" complement to access_decay's
+    # "touched → cold" path. Observability only here; archival /
+    # bridge-builder action wiring lives downstream. See
+    # cortex-memory/research/2026-06-25-birth-signal-implementation-spec.md.
+    #
+    # Local import — birth_signal pulls helpers from this module, so a
+    # top-of-file import would deadlock the wheel build. The metric runs
+    # at the speed of access_decay (single vault walk).
+    try:
+        from metrics.birth_signal import compute_birth_signal
+
+        event["birth_signal"] = compute_birth_signal(
+            vault_dir, today=today_midnight,
+        )
+        # Drop the per-bucket slug lists from the embedded payload —
+        # the standalone birth_signal event carries the summary; the
+        # vault_health event only needs the counts for correlation.
+        event["birth_signal"].pop("by_bucket", None)
+    except Exception as exc:  # noqa: BLE001 — never block vault_health
+        logger.warning("vault_health: birth_signal skipped (%s)", exc)
+
     # Drought flag — computed in-code with sleep_window_closed awareness,
     # replacing the prompt-level instruction that used to live in
     # active.md:107. The prompt couldn't read the event's own
