@@ -505,11 +505,16 @@ def _build_reference_index(vault: pathlib.Path) -> dict[str, list[pathlib.Path]]
     Scans all groomable vault files once and extracts wikilink targets.
     This is O(vault) — called once per detection run instead of O(pairs × vault).
 
-    Keys are lowercase slugs for case-insensitive lookup.
+    Keys are lowercase slugs for case-insensitive lookup. A note that
+    wikilinks the same target multiple times still contributes ONE
+    entry — set-based dedup during scan, then collapsed back to a list
+    of unique paths. Without this, downstream consumers (correction
+    detection, unpropagated counts) double-count the same referencing
+    note and inflate the backlog metric by ~30% on this vault.
     """
-    index: dict[str, list[pathlib.Path]] = defaultdict(list)
+    accum: dict[str, set[pathlib.Path]] = defaultdict(set)
     if not vault.is_dir():
-        return index
+        return {}
 
     for md in vault.rglob("*.md"):
         rel_parts = md.relative_to(vault).parts
@@ -528,9 +533,9 @@ def _build_reference_index(vault: pathlib.Path) -> dict[str, list[pathlib.Path]]
         for target in _extract_wikilink_targets(text):
             base = target.rsplit("/", 1)[-1].lower()
             if base:
-                index[base].append(md)
+                accum[base].add(md)
 
-    return index
+    return {k: list(v) for k, v in accum.items()}
 
 
 def _find_notes_referencing(
