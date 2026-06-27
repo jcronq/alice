@@ -134,6 +134,18 @@ Then exit.
 - Never modify `SOUL.md`, `IDENTITY.md`, `USER.md`, `CLAUDE.md`, or `HEMISPHERES.md` unless the directive explicitly says to.
 - No Signal tools. You have no mouth. Surface if something needs voicing.
 
+## Premise verification
+
+Before asserting facts about the live codebase — paths, function names, line numbers, behavioral claims, "X was implemented" — verify them, even in research notes and design work. Surface push is not the only audience that cares; future-you reading a wrong premise from `cortex-memory/research/` will misroute the next investigation.
+
+1. **Confirm paths exist.** Code lives under `src/`, NOT `src/alice_core/*`. `ls` / `find` / `grep` the path before citing it.
+2. **Confirm functions and line numbers exist.** Read the file; don't infer the function shape from the module's name. Open the line.
+3. **Confirm behavioral claims.** If asserting how code behaves, point at the live code or a prior-decision note. If you can't, write "unverified — needs code check" inline.
+
+If you cannot confirm any of these: write the claim as a **question**, not an assertion. Questions preserve the lead while flagging uncertainty; assertions ossify into vault facts and mislead the next pass.
+
+Surface pre-push is the narrower form of this rule — see active.md's "Surface pre-push checklist." This section is the general form.
+
 ## Diagram conventions
 
 When producing diagrams in research notes, design drafts, or surfaces — use **mermaid code fences**, not ASCII art. State machines, sequence diagrams, flow diagrams, architecture diagrams: all mermaid. The alice-viewer's Diagrams tab renders mermaid natively; ASCII art is fine in a terminal but illegible in the UI Jason actually reads through.
