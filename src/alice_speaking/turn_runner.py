@@ -39,8 +39,10 @@ What it doesn't touch:
 
 from __future__ import annotations
 
+import json
 import logging
 import pathlib
+import subprocess
 from typing import Any, Awaitable, Callable, Optional
 
 from core.config.model import BackendSpec
@@ -86,6 +88,44 @@ SUMMARY_TAIL_TURNS = 5
 # ``speaking.turn_max_seconds`` in alice.config.json (0 = unbounded, the
 # old behaviour).
 DEFAULT_TURN_MAX_SECONDS = 1200
+
+
+# MCP bridge watchdog — Component 1 (Component 2 = send_message idempotency
+# guard, shipped in PR #513). The in-process MCP server <-> claude CLI
+# subprocess bridge drops intermittently after long healthy stretches; the
+# kernel surfaces this as a "Stream closed" error either in
+# ``result.error`` (post-hoc) or as an exception during ``kernel.run``.
+# The reload-requested sentinel is the proven recovery path (s6
+# alice-reload-watcher picks it up and recycles the speaking process); we
+# write it directly via the filesystem rather than via the MCP tool because
+# the bridge is precisely what's broken at the moment of detection.
+_WATCHDOG_SENTINEL_PATH = pathlib.Path("/state/worker/reload-requested")
+_WATCHDOG_BRIDGE_DOWN_MARKER = "Stream closed"
+
+
+def _write_watchdog_sentinel(reason: str) -> None:
+    """Drop a hot-reload sentinel so alice-reload-watcher recycles us.
+
+    Bypasses the MCP tool path because the MCP bridge is what's broken
+    when this fires. Best-effort: any error is swallowed so the watchdog
+    cannot itself raise into the turn loop.
+    """
+    try:
+        head = subprocess.check_output(
+            ["git", "-C", "/home/alice/alice", "rev-parse", "--short", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).strip()
+    except Exception:  # noqa: BLE001 — never block the turn loop
+        head = "unknown"
+    payload = {"type": "hot", "git_head": head, "reason": reason}
+    try:
+        _WATCHDOG_SENTINEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _WATCHDOG_SENTINEL_PATH.write_text(json.dumps(payload))
+    except Exception as exc:  # noqa: BLE001 — never block the turn loop
+        log.warning("watchdog: sentinel write failed (%s)", exc)
+
 
 
 # Builtin Anthropic tools the kernel always allows. MCP-supplied
@@ -475,6 +515,20 @@ class TurnRunner:
                     retry_prompt, retry_spec, handlers=retry_handlers
                 )
             else:
+                # MCP bridge watchdog: a "Stream closed" exception that's
+                # NOT a stale-resume hit means the in-process bridge died.
+                # Drop the reload sentinel so alice-reload-watcher recycles
+                # us before re-raising — the next turn starts on a fresh
+                # process with a fresh bridge.
+                if _WATCHDOG_BRIDGE_DOWN_MARKER in str(exc):
+                    log.warning(
+                        "watchdog: MCP bridge dropped mid-turn (%s); "
+                        "requesting hot reload",
+                        type(exc).__name__,
+                    )
+                    _write_watchdog_sentinel(
+                        f"MCP bridge dropped mid-turn ({type(exc).__name__})"
+                    )
                 raise
 
         # Snapshot the captured tool calls for this turn so callers
@@ -486,7 +540,19 @@ class TurnRunner:
             # Kernel returned an error result (timeout, etc.). Callers
             # see an empty / partial text; the kernel already emitted
             # the specific error event.
-            pass
+            # MCP bridge watchdog: a "Stream closed" message on the
+            # error result is the post-hoc form of the same bridge
+            # death we catch in the except branch above.
+            err_text = str(result.error or "")
+            if _WATCHDOG_BRIDGE_DOWN_MARKER in err_text:
+                log.warning(
+                    "watchdog: MCP bridge dropped (result.error: %s); "
+                    "requesting hot reload",
+                    err_text[:200],
+                )
+                _write_watchdog_sentinel(
+                    "MCP bridge dropped (result.error)"
+                )
 
         # Missed-reply observability: only meaningful when the turn
         # was supposed to be able to reach a user and Alice skipped
