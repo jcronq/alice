@@ -510,6 +510,24 @@ class TestBuildReferenceIndex:
         idx = _build_reference_index(vault)
         assert len(idx["foo"]) == 2
 
+    def test_dedups_repeated_wikilinks_in_same_note(self, tmp_path):
+        """A note that references the same target multiple times still
+        contributes ONE entry. Without dedup, downstream unpropagated
+        counts inflate (~30% on the production vault, 2026-06-27)."""
+        vault = tmp_path / "cortex-memory"
+        vault.mkdir()
+        (vault / "reference").mkdir()
+
+        md = vault / "reference" / "a.md"
+        md.write_text(
+            "See [[foo]]. Also [[foo]]. And again [[foo|alias]] and [[foo#anchor]].",
+            encoding="utf-8",
+        )
+
+        idx = _build_reference_index(vault)
+        assert len(idx["foo"]) == 1
+        assert idx["foo"][0] == md
+
 
 # ── Notes referencing ───────────────────────────────────────────────
 
