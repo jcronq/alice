@@ -1605,7 +1605,10 @@ def test_cli_check_existing_noops_when_event_exists(tmp_path: Path) -> None:
 
 
 def test_cli_append_writes_full_event(tmp_path: Path, monkeypatch) -> None:
-    """--append must write a single JSON line that has every required field."""
+    """--append must write a vault_health JSON line that has every required
+    field, plus a standalone birth_signal event (per
+    cortex-memory/research/2026-06-25-birth-signal-implementation-spec.md
+    §"Future enhancements" item 4)."""
     import json
 
     vault = _make_vault(tmp_path)
@@ -1625,11 +1628,12 @@ def test_cli_append_writes_full_event(tmp_path: Path, monkeypatch) -> None:
     assert rc == 0
     assert events.exists()
     lines = events.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 1
-    evt = json.loads(lines[0])
+    assert len(lines) == 2
+    events_by_type = {json.loads(line)["type"]: json.loads(line) for line in lines}
+    assert set(events_by_type.keys()) == {"vault_health", "birth_signal"}
+    evt = events_by_type["vault_health"]
     missing = REQUIRED_EVENT_FIELDS - set(evt.keys())
     assert not missing, f"appended event missing fields: {missing}"
-    assert evt["type"] == "vault_health"
 
 
 def test_cli_check_existing_continues_when_no_today_event(tmp_path: Path, monkeypatch) -> None:
@@ -1658,10 +1662,11 @@ def test_cli_check_existing_continues_when_no_today_event(tmp_path: Path, monkey
     rc = vault_health_main(_cli_args(vault, thoughts, events, surface, "--check-existing", "--append"))
     assert rc == 0
     lines = events.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 2
-    evt = json.loads(lines[1])
+    # Yesterday's vault_health + today's vault_health + today's birth_signal.
+    assert len(lines) == 3
     today = datetime.now().strftime("%Y-%m-%d")
-    assert evt["date"] == today
+    today_events = [json.loads(line) for line in lines if json.loads(line).get("date") == today]
+    assert {e["type"] for e in today_events} == {"vault_health", "birth_signal"}
 
 
 def test_cli_check_existing_skips_before_window_close(
@@ -1714,9 +1719,9 @@ def test_cli_check_existing_writes_after_window_close(
     assert rc == 0
     assert events.exists()
     lines = events.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 1
-    evt = json.loads(lines[0])
-    assert evt["type"] == "vault_health"
+    assert len(lines) == 2
+    types = {json.loads(line)["type"] for line in lines}
+    assert types == {"vault_health", "birth_signal"}
 
 
 def test_cli_append_requires_thoughts_and_events(tmp_path: Path) -> None:
@@ -1788,9 +1793,9 @@ def test_cli_append_alone_writes_after_window_close(
     assert rc == 0
     assert events.exists()
     lines = events.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 1
-    evt = json.loads(lines[0])
-    assert evt["type"] == "vault_health"
+    assert len(lines) == 2
+    types = {json.loads(line)["type"] for line in lines}
+    assert types == {"vault_health", "birth_signal"}
 
 
 # ---------------------------------------------------------------------------

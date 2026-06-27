@@ -3213,6 +3213,33 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.append:
             _append_event(args.events, event)
+
+            # Standalone birth_signal event — per spec
+            # (cortex-memory/research/2026-06-25-birth-signal-implementation-spec.md
+            # §"Future enhancements" item 4). vault_health embeds the
+            # metrics for correlation; the standalone event is the
+            # canonical record consumed by downstream tooling. Honor
+            # --check-existing so the daily scan can call this
+            # unconditionally without producing duplicates.
+            try:
+                from metrics.birth_signal import (
+                    birth_signal_event_exists_for_date,
+                    build_birth_signal_event,
+                )
+
+                if not (
+                    args.check_existing
+                    and birth_signal_event_exists_for_date(
+                        args.events, today_str,
+                    )
+                ):
+                    bs_event = build_birth_signal_event(args.vault, now=now)
+                    _append_event(args.events, bs_event)
+            except Exception as exc:  # noqa: BLE001 — never block vault_health
+                logger.warning(
+                    "vault_health: birth_signal standalone event skipped (%s)",
+                    exc,
+                )
         else:
             print(json.dumps(event))
         return 0
