@@ -717,8 +717,14 @@ def test_cli_writes_event(tmp_path: Path) -> None:
 
 def test_cli_check_existing_skips(tmp_path: Path) -> None:
     """--check-existing skips the write when today's event is on disk."""
+    from metrics.vault_health import _local_now
+
     vault = _make_vault(tmp_path)
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    # CLI computes today's date via Eastern wall-clock _local_now(); the
+    # seeded event must match that, NOT datetime.now() (which is UTC on
+    # CI). Without this, the test flakes whenever CI runs between 00:00
+    # and 04:00 UTC, since the UTC date is one day ahead of Eastern.
+    today_str = _local_now().strftime("%Y-%m-%d")
     events = tmp_path / "events.jsonl"
     events.write_text(
         json.dumps(
