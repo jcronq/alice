@@ -30,8 +30,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import pathlib
 import sys
+from datetime import datetime, timezone
 from typing import Any
 
 from core.events import EventLogger
@@ -44,6 +46,8 @@ from . import (
     stage_c,
     stage_d,
 )
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_MIND = pathlib.Path("/home/alice/alice-mind")
@@ -242,6 +246,38 @@ def main() -> int:
         **{f"stage_d_{k}": v for k, v in synth.to_dict().items()},
         stage_d_ran=bool(synth.ran),
     )
+
+    # Structured heartbeats file for vault_health consumption. The
+    # event-log emit above goes to ``/state/worker/memory-worker.log``
+    # which is opaque to vault_health; this companion file at a
+    # well-known vault-relative path is the authoritative record of
+    # what the code actually executed (vs. the model-written ``stage:``
+    # frontmatter that ``count_wakes_by_stage`` reads). Best-effort —
+    # any I/O failure falls through to a warning so the wake loop does
+    # not abort. Append-only, no rotation here (Stage C's daily
+    # housekeeping handles archival downstream).
+    heartbeats_path = mind / "inner" / "state" / "memory-worker-heartbeats.jsonl"
+    try:
+        heartbeats_path.parent.mkdir(parents=True, exist_ok=True)
+        heartbeat_record = {
+            "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "type": "memory_worker_heartbeat",
+            "phase": heartbeat_phase,
+            "stage_b_ran": True,
+            "stage_c_ran": bool(groom.ran),
+            "stage_d_ran": bool(synth.ran),
+            "cadence_minutes": int(
+                cfg.get("cadence_minutes", DEFAULT_CADENCE_MINUTES)
+            ),
+        }
+        with heartbeats_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(heartbeat_record) + "\n")
+    except OSError as exc:
+        logger.warning(
+            "memory_worker: failed to append heartbeat to %s (%s)",
+            heartbeats_path,
+            exc,
+        )
 
     return 0
 

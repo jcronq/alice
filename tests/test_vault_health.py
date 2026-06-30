@@ -48,6 +48,7 @@ from metrics.vault_health import (
     count_tier1_ratio,
     count_total_notes,
     count_wakes_by_stage,
+    count_wakes_by_stage_from_heartbeats,
     compute_recovery_state,
     main as vault_health_main,
     vault_health_event_exists_for_date,
@@ -3795,3 +3796,250 @@ def test_compute_stage_d_drought_missing_file(tmp_path: Path) -> None:
         )
         is False
     )
+
+
+# ---------------------------------------------------------------------------
+# count_wakes_by_stage_from_heartbeats
+# ---------------------------------------------------------------------------
+
+
+def _write_heartbeats(path: Path, records: list[dict]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8"
+    )
+    return path
+
+
+def test_heartbeats_counts_by_phase_in_window(tmp_path: Path) -> None:
+    """Records inside the half-open window are bucketed by ``phase``."""
+    hb = tmp_path / "memory-worker-heartbeats.jsonl"
+    _write_heartbeats(
+        hb,
+        [
+            # In-window — counted.
+            {"ts": "2026-05-07T23:30:00Z", "type": "memory_worker_heartbeat",
+             "phase": "stage_b"},
+            {"ts": "2026-05-08T01:15:00Z", "type": "memory_worker_heartbeat",
+             "phase": "stage_d"},
+            {"ts": "2026-05-08T03:00:00Z", "type": "memory_worker_heartbeat",
+             "phase": "stage_c"},
+            {"ts": "2026-05-08T05:45:00Z", "type": "memory_worker_heartbeat",
+             "phase": "stage_b"},
+            # Out of window (after we = 07:00) — ignored.
+            {"ts": "2026-05-08T07:30:00Z", "type": "memory_worker_heartbeat",
+             "phase": "stage_d"},
+            # Out of window (before ws = 23:00) — ignored.
+            {"ts": "2026-05-07T22:00:00Z", "type": "memory_worker_heartbeat",
+             "phase": "stage_d"},
+        ],
+    )
+    ws = datetime(2026, 5, 7, 23, 0, 0)
+    we = datetime(2026, 5, 8, 7, 0, 0)
+    assert count_wakes_by_stage_from_heartbeats(hb, ws, we) == {
+        "stage_b": 2, "stage_c": 1, "stage_d": 1,
+    }
+
+
+def test_heartbeats_returns_none_when_file_missing(tmp_path: Path) -> None:
+    """Drop-in fallback signal: caller can substitute the legacy field."""
+    ws = datetime(2026, 5, 7, 23, 0, 0)
+    we = datetime(2026, 5, 8, 7, 0, 0)
+    assert (
+        count_wakes_by_stage_from_heartbeats(
+            tmp_path / "absent.jsonl", ws, we
+        )
+        is None
+    )
+
+
+def test_heartbeats_skips_malformed_lines(tmp_path: Path) -> None:
+    """Bad JSON, wrong ``type``, unknown ``phase``, unparseable ``ts``: all skipped."""
+    hb = tmp_path / "heartbeats.jsonl"
+    hb.parent.mkdir(parents=True, exist_ok=True)
+    hb.write_text(
+        "\n".join([
+            "not-json-at-all",
+            json.dumps({"ts": "2026-05-08T00:30:00Z",
+                        "type": "something_else", "phase": "stage_d"}),
+            json.dumps({"ts": "2026-05-08T00:30:00Z",
+                        "type": "memory_worker_heartbeat",
+                        "phase": "stage_x"}),
+            json.dumps({"ts": "not-a-timestamp",
+                        "type": "memory_worker_heartbeat",
+                        "phase": "stage_d"}),
+            json.dumps({"ts": "2026-05-08T00:45:00Z",
+                        "type": "memory_worker_heartbeat",
+                        "phase": "stage_d"}),  # the only valid one
+            "",  # blank line
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    ws = datetime(2026, 5, 7, 23, 0, 0)
+    we = datetime(2026, 5, 8, 7, 0, 0)
+    assert count_wakes_by_stage_from_heartbeats(hb, ws, we) == {
+        "stage_b": 0, "stage_c": 0, "stage_d": 1,
+    }
+
+
+def test_heartbeats_accepts_offset_and_z_timestamps(tmp_path: Path) -> None:
+    """Both ``...Z`` and ``...+00:00`` ISO timestamps are accepted."""
+    hb = tmp_path / "heartbeats.jsonl"
+    _write_heartbeats(
+        hb,
+        [
+            {"ts": "2026-05-08T01:00:00Z", "type": "memory_worker_heartbeat",
+             "phase": "stage_d"},
+            {"ts": "2026-05-08T02:00:00+00:00", "type": "memory_worker_heartbeat",
+             "phase": "stage_c"},
+        ],
+    )
+    ws = datetime(2026, 5, 7, 23, 0, 0)
+    we = datetime(2026, 5, 8, 7, 0, 0)
+    assert count_wakes_by_stage_from_heartbeats(hb, ws, we) == {
+        "stage_b": 0, "stage_c": 1, "stage_d": 1,
+    }
+
+
+# ---------------------------------------------------------------------------
+# compute_stage_d_drought — backward-compat with dual fields
+# ---------------------------------------------------------------------------
+
+
+def _write_drought_events_with_actual(
+    path: Path, specs: list[tuple[int | None, int | None, int]]
+) -> Path:
+    """Emit vault_health events with optional legacy + actual fields.
+
+    Each spec is ``(legacy_stage_d, actual_stage_d, research_notes)``;
+    ``None`` for a stage_d count omits that field entirely so the
+    caller can mix legacy-only, actual-only, and dual events in one
+    file and exercise the precedence rule.
+    """
+    lines = []
+    for legacy_sd, actual_sd, research in specs:
+        evt: dict = {
+            "type": "vault_health",
+            "research_notes_last_night": research,
+        }
+        if legacy_sd is not None:
+            evt["wake_type_distribution"] = {
+                "stage_b": 5, "stage_c": 1, "stage_d": legacy_sd,
+            }
+        if actual_sd is not None:
+            evt["wake_type_distribution_actual"] = {
+                "stage_b": 5, "stage_c": 1, "stage_d": actual_sd,
+            }
+        lines.append(json.dumps(evt))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def test_drought_prefers_actual_field_when_present(tmp_path: Path) -> None:
+    """``actual`` field wins: legacy says drought, actual says ran -> False."""
+    events = _write_drought_events_with_actual(
+        tmp_path / "events.jsonl",
+        [(0, 1, 2), (0, 2, 1), (0, 3, 0)],
+    )
+    assert (
+        compute_stage_d_drought(events, tmp_path, window_closed=True)
+        is False
+    )
+
+
+def test_drought_falls_back_to_legacy_when_actual_absent(tmp_path: Path) -> None:
+    """Historical events without ``actual`` still read the legacy field."""
+    events = _write_drought_events_with_actual(
+        tmp_path / "events.jsonl",
+        [(0, None, 0), (0, None, 2), (0, None, 0)],
+    )
+    assert (
+        compute_stage_d_drought(events, tmp_path, window_closed=True)
+        is True
+    )
+
+
+def test_drought_actual_zero_fires_even_with_nonzero_legacy(
+    tmp_path: Path,
+) -> None:
+    """Authoritative field fires drought even when legacy frontmatter
+    was mislabelled (the exact bug this fix targets)."""
+    events = _write_drought_events_with_actual(
+        tmp_path / "events.jsonl",
+        [(3, 0, 0), (2, 0, 2), (1, 0, 0)],
+    )
+    assert (
+        compute_stage_d_drought(events, tmp_path, window_closed=True)
+        is True
+    )
+
+
+def test_drought_mixed_legacy_and_actual_events(tmp_path: Path) -> None:
+    """Each event independently picks ``actual`` then ``legacy``."""
+    events = _write_drought_events_with_actual(
+        tmp_path / "events.jsonl",
+        [
+            (0, None, 0),   # legacy-only, stage_d == 0
+            (0, 0, 2),      # both, both zero
+            (5, 0, 0),      # both — actual wins -> zero
+        ],
+    )
+    assert (
+        compute_stage_d_drought(events, tmp_path, window_closed=True)
+        is True
+    )
+
+
+# ---------------------------------------------------------------------------
+# build_vault_health_event — dual-field emission
+# ---------------------------------------------------------------------------
+
+
+def test_build_event_emits_both_distribution_fields(tmp_path: Path) -> None:
+    """``wake_type_distribution_actual`` falls back to legacy when no heartbeats."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "inner" / "thoughts"
+    thoughts.mkdir(parents=True)
+
+    # Force a deterministic ``now`` past the 07:00 sleep window so the
+    # morning window is fully closed and the field assembly path runs.
+    now = datetime(2026, 5, 8, 9, 0, 0, tzinfo=ZoneInfo("America/New_York"))
+    evt = build_vault_health_event(
+        vault_dir=vault, thoughts_dir=thoughts,
+        events_path=None, now=now,
+    )
+    assert "wake_type_distribution" in evt
+    assert "wake_type_distribution_actual" in evt
+    # No heartbeats file -> fallback to legacy counts (both empty here,
+    # but the field is present so dashboards/drought see a populated dict).
+    assert evt["wake_type_distribution_actual"] == evt["wake_type_distribution"]
+
+
+def test_build_event_uses_heartbeats_when_present(tmp_path: Path) -> None:
+    """When the heartbeats file exists, ``actual`` reflects code execution."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "inner" / "thoughts"
+    thoughts.mkdir(parents=True)
+    state = tmp_path / "inner" / "state"
+    # In-window heartbeat shows Stage D actually ran, even though no
+    # wake file frontmatter exists to back the legacy field.
+    _write_heartbeats(
+        state / "memory-worker-heartbeats.jsonl",
+        [
+            {"ts": "2026-05-08T01:00:00Z",
+             "type": "memory_worker_heartbeat", "phase": "stage_d"},
+            {"ts": "2026-05-08T02:00:00Z",
+             "type": "memory_worker_heartbeat", "phase": "stage_b"},
+        ],
+    )
+    now = datetime(2026, 5, 8, 9, 0, 0, tzinfo=ZoneInfo("America/New_York"))
+    evt = build_vault_health_event(
+        vault_dir=vault, thoughts_dir=thoughts,
+        events_path=None, now=now,
+    )
+    assert evt["wake_type_distribution"] == {
+        "stage_b": 0, "stage_c": 0, "stage_d": 0,
+    }
+    assert evt["wake_type_distribution_actual"] == {
+        "stage_b": 1, "stage_c": 0, "stage_d": 1,
+    }
