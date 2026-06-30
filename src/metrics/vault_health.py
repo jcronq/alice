@@ -2300,6 +2300,82 @@ def count_wakes_by_stage(
     return counts
 
 
+def count_wakes_by_stage_from_heartbeats(
+    heartbeats_path: Path,
+    window_start: datetime,
+    window_end: datetime,
+) -> dict[str, int] | None:
+    """Count memory_worker_heartbeat records in the window, bucketed by phase.
+
+    Reads ``inner/state/memory-worker-heartbeats.jsonl`` (one JSON
+    object per line, append-only, written by
+    ``alice_thinking.memory_worker.wake``). Returns the same shape as
+    :func:`count_wakes_by_stage` — ``{"stage_b": N, "stage_c": N,
+    "stage_d": N}`` — so the two functions are interchangeable at call
+    sites that want either source.
+
+    The legacy frontmatter-based ``count_wakes_by_stage`` counts what
+    the model *labeled* a wake as. This function counts what the
+    memory worker code *actually ran* (D > C > B precedence on the
+    heaviest stage that fired). Since Phase 5, the two can diverge —
+    see ``2026-06-30-wake-type-distribution-metric-fix-spec.md``.
+
+    Window is half-open ``[window_start, window_end)``. Records with
+    unparseable ``ts``, missing/unknown ``phase``, or non-heartbeat
+    ``type`` are skipped silently. Returns ``None`` when the file is
+    missing or wholly unreadable so callers can fall back to the
+    legacy field.
+    """
+    if not heartbeats_path.exists():
+        return None
+
+    ws = _strip_tz(window_start)
+    we = _strip_tz(window_end)
+
+    counts = {"stage_b": 0, "stage_c": 0, "stage_d": 0}
+    try:
+        with heartbeats_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("type") != "memory_worker_heartbeat":
+                    continue
+                phase = rec.get("phase")
+                if phase not in counts:
+                    continue
+                raw_ts = rec.get("ts")
+                if not isinstance(raw_ts, str):
+                    continue
+                # Parse ISO8601 — tolerate both ``...Z`` and explicit
+                # offsets. The wake writer emits ``...Z``; older lines
+                # written by hand may carry ``+00:00``.
+                try:
+                    if raw_ts.endswith("Z"):
+                        parsed = datetime.fromisoformat(raw_ts[:-1] + "+00:00")
+                    else:
+                        parsed = datetime.fromisoformat(raw_ts)
+                except ValueError:
+                    continue
+                # Normalize to naive UTC for window comparison —
+                # ``_strip_tz`` on the bounds is naive, so we have to
+                # match. (Callers pass naive-Eastern bounds via
+                # ``_morning_window``; this is intentional and mirrors
+                # the legacy ``count_wakes_by_stage`` window contract.)
+                ts_naive = _strip_tz(parsed)
+                if not (ws <= ts_naive < we):
+                    continue
+                counts[phase] += 1
+    except OSError:
+        return None
+
+    return counts
+
+
 # ---------------------------------------------------------------------------
 # Stage C candidates: bloated notes + stale dailies
 # Previously computed inline in the wake template via `find | wc -l` bash.
@@ -2702,7 +2778,14 @@ def compute_stage_d_drought(
         return False
 
     for evt in events:
-        wd = evt.get("wake_type_distribution", {})
+        # Prefer the heartbeat-derived ``wake_type_distribution_actual``
+        # (added 2026-06-30) over the legacy frontmatter-derived
+        # ``wake_type_distribution``. Falls back when the new field is
+        # absent from older events so historical replay stays correct.
+        # See 2026-06-30-wake-type-distribution-metric-fix-spec.md.
+        wd = evt.get("wake_type_distribution_actual")
+        if not isinstance(wd, dict):
+            wd = evt.get("wake_type_distribution", {})
         if isinstance(wd, dict) and wd.get("stage_d", 0) != 0:
             return False
 
@@ -2873,6 +2956,24 @@ def build_vault_health_event(
             "adr": _aggregate_adr_template_adherence(vault_dir),
         },
     }
+
+    # ``wake_type_distribution_actual``: code-execution-derived counts
+    # from the memory worker's structured heartbeat file. The legacy
+    # ``wake_type_distribution`` above reads model-written ``stage:``
+    # frontmatter from wake files; since Phase 5 (PR #527) the model's
+    # label and the code's executed phase are independent decisions, so
+    # the heartbeat-derived count is the authoritative signal. Falls back
+    # to the legacy counts when the heartbeats file is missing
+    # (pre-deployment, first run after wipe) so downstream consumers
+    # always see a populated field. Spec:
+    # cortex-memory/research/2026-06-30-wake-type-distribution-metric-fix-spec.md.
+    heartbeats_path = thoughts_dir.parent / "state" / "memory-worker-heartbeats.jsonl"
+    wd_actual = count_wakes_by_stage_from_heartbeats(
+        heartbeats_path, yesterday_23, today_07
+    )
+    event["wake_type_distribution_actual"] = (
+        wd_actual if wd_actual is not None else event["wake_type_distribution"]
+    )
 
     # Birth signal — zero-access notes >= 30d, classified into burst
     # artifacts (Bucket A) and useful-but-poorly-linked (Bucket B). The

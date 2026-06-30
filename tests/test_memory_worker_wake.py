@@ -316,6 +316,60 @@ def test_per_wake_hook_respects_enabled_false(
     )
 
 
+def test_heartbeat_jsonl_record_written_alongside_log(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wake writes a structured heartbeat to
+    ``<mind>/inner/state/memory-worker-heartbeats.jsonl`` alongside
+    the legacy event-log line. Vault_health reads this file as the
+    authoritative wake_type_distribution_actual source; see
+    cortex-memory/research/2026-06-30-wake-type-distribution-metric-fix-spec.md.
+    """
+    mind = tmp_path / "mind"
+    log = tmp_path / "memory-worker.log"
+    journal_path = tmp_path / "journal.jsonl"
+    _write_config(
+        mind,
+        {
+            "memory_worker": {
+                "enabled": True,
+                "cadence_minutes": 5,
+                "journal_path": str(journal_path),
+            }
+        },
+    )
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["memory-worker", "--mind", str(mind), "--log", str(log)],
+    )
+    monkeypatch.setattr(
+        wake, "MEMORY_WORKER_LIVENESS_PATH", tmp_path / "liveness"
+    )
+
+    rc = wake.main()
+    assert rc == 0
+
+    hb_path = mind / "inner" / "state" / "memory-worker-heartbeats.jsonl"
+    assert hb_path.is_file(), (
+        "structured heartbeat file should be written alongside the "
+        "event log"
+    )
+    lines = [ln for ln in hb_path.read_text().splitlines() if ln.strip()]
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["type"] == "memory_worker_heartbeat"
+    # Phase B is the default heartbeat phase when neither groom nor
+    # synth ran (no Stage C/D candidates in an empty vault).
+    assert rec["phase"] == "stage_b"
+    assert rec["stage_b_ran"] is True
+    assert isinstance(rec["stage_c_ran"], bool)
+    assert isinstance(rec["stage_d_ran"], bool)
+    assert rec["cadence_minutes"] == 5
+    # Timestamp parseable as ISO8601.
+    assert rec["ts"].endswith("Z") or "+" in rec["ts"]
+
+
 def test_journal_cli_override_wins_over_config(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
