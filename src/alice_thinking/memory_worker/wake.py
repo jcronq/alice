@@ -38,8 +38,6 @@ from typing import Any
 
 from core.events import EventLogger
 
-logger = logging.getLogger(__name__)
-
 from . import (
     correction_cascade as cascade_mod,
     correction_cascade_auto_propagate as autoprop_mod,
@@ -48,6 +46,8 @@ from . import (
     stage_c,
     stage_d,
 )
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_MIND = pathlib.Path("/home/alice/alice-mind")
