@@ -2667,14 +2667,22 @@ def compute_stage_d_drought(
     1. ``window_closed`` is True — the 23:00→07:00 Eastern sleep window has
        fully elapsed. Before that the wake distribution is partial and
        ``stage_d == 0`` is meaningless (Stage D wakes cluster 00:27–02:20).
-    2. The last ``lookback_days`` vault_health events all have
+    2. Every ``vault_health`` event on the most recent ``lookback_days``
+       distinct Eastern calendar days with any event on record has
        ``wake_type_distribution.stage_d == 0``.
     3. At least one of those events has ``research_notes_last_night > 0``
        (eligible vault state — there was something for Stage D to chew on).
 
     Returns False on any of: window not closed, fewer than ``lookback_days``
-    events on record, a missing/unreadable events file, any event with
-    ``stage_d > 0``, or no event with research notes.
+    distinct calendar days on record, a missing/unreadable events file, any
+    event on any of those days with ``stage_d > 0``, or no event with
+    research notes.
+
+    Calendar-day (not raw-event) semantics matter: a single day with many
+    scans followed by one Stage-D wake the next day used to slip past the
+    old event-count check (2026-07-01 false positive — three back-to-back
+    2026-06-30 stage_d=0 events triggered drought despite 2026-06-29
+    stage_d=1).
 
     Design: cortex-memory/research/2026-06-24-stage-d-drought-code-design.md.
     """
@@ -2682,31 +2690,42 @@ def compute_stage_d_drought(
         return False
 
     try:
-        lines = list(reversed(events_path.read_text().strip().splitlines()))
+        raw = events_path.read_text()
     except (FileNotFoundError, OSError):
         return False
 
-    events: list[dict[str, Any]] = []
-    for line in lines:
+    events_by_date: dict[Any, list[dict[str, Any]]] = defaultdict(list)
+    for line in raw.strip().splitlines():
         try:
             evt = json.loads(line)
         except json.JSONDecodeError:
             continue
         if evt.get("type") != "vault_health":
             continue
-        events.append(evt)
-        if len(events) >= lookback_days:
-            break
+        ts_raw = evt.get("ts")
+        if not isinstance(ts_raw, str):
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_raw)
+        except ValueError:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        date_key = ts.astimezone(_EASTERN).date()
+        events_by_date[date_key].append(evt)
 
-    if len(events) < lookback_days:
+    if len(events_by_date) < lookback_days:
         return False
 
-    for evt in events:
+    recent_dates = sorted(events_by_date.keys(), reverse=True)[:lookback_days]
+    window_events = [evt for d in recent_dates for evt in events_by_date[d]]
+
+    for evt in window_events:
         wd = evt.get("wake_type_distribution", {})
         if isinstance(wd, dict) and wd.get("stage_d", 0) != 0:
             return False
 
-    for evt in events:
+    for evt in window_events:
         if evt.get("research_notes_last_night", 0) > 0:
             return True
 
