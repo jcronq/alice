@@ -3711,19 +3711,22 @@ def test_compute_all_links_degree_dedupes_per_source(tmp_path: Path) -> None:
 
 
 def _write_vault_health_events(
-    path: Path, specs: list[tuple[int, int]]
+    path: Path, specs: list[tuple[str, int, int]]
 ) -> Path:
     """Write vault_health events to ``path`` as jsonl.
 
-    ``specs`` is a list of ``(stage_d, research_notes_last_night)`` tuples,
-    oldest first (the function reads most-recent-last in file order).
+    ``specs`` is a list of ``(ts_iso, stage_d, research_notes_last_night)``
+    tuples. ``ts_iso`` is an ISO-8601 timestamp string. Ordering doesn't
+    matter to the function (it groups by Eastern calendar date); write in
+    caller-supplied order for readability.
     """
     lines = []
-    for stage_d, research in specs:
+    for ts_iso, stage_d, research in specs:
         lines.append(
             json.dumps(
                 {
                     "type": "vault_health",
+                    "ts": ts_iso,
                     "wake_type_distribution": {
                         "stage_b": 5,
                         "stage_c": 1,
@@ -3740,7 +3743,12 @@ def _write_vault_health_events(
 def test_compute_stage_d_drought_window_not_closed(tmp_path: Path) -> None:
     """False when the sleep window hasn't closed, regardless of data."""
     events = _write_vault_health_events(
-        tmp_path / "events.jsonl", [(0, 2), (0, 1), (0, 3)]
+        tmp_path / "events.jsonl",
+        [
+            ("2026-06-28T12:00:00+00:00", 0, 2),
+            ("2026-06-29T12:00:00+00:00", 0, 1),
+            ("2026-06-30T12:00:00+00:00", 0, 3),
+        ],
     )
     assert (
         compute_stage_d_drought(events, tmp_path, window_closed=False) is False
@@ -3748,9 +3756,13 @@ def test_compute_stage_d_drought_window_not_closed(tmp_path: Path) -> None:
 
 
 def test_compute_stage_d_drought_insufficient_data(tmp_path: Path) -> None:
-    """False with fewer than lookback_days events on record."""
+    """False with fewer than lookback_days distinct calendar days on record."""
     events = _write_vault_health_events(
-        tmp_path / "events.jsonl", [(0, 2), (0, 1)]
+        tmp_path / "events.jsonl",
+        [
+            ("2026-06-29T12:00:00+00:00", 0, 2),
+            ("2026-06-30T12:00:00+00:00", 0, 1),
+        ],
     )
     assert (
         compute_stage_d_drought(events, tmp_path, window_closed=True) is False
@@ -3758,9 +3770,14 @@ def test_compute_stage_d_drought_insufficient_data(tmp_path: Path) -> None:
 
 
 def test_compute_stage_d_drought_stage_d_nonzero(tmp_path: Path) -> None:
-    """False when any event in the window has stage_d > 0."""
+    """False when any event on any day in the window has stage_d > 0."""
     events = _write_vault_health_events(
-        tmp_path / "events.jsonl", [(0, 2), (2, 1), (0, 3)]
+        tmp_path / "events.jsonl",
+        [
+            ("2026-06-28T12:00:00+00:00", 0, 2),
+            ("2026-06-29T12:00:00+00:00", 2, 1),  # middle day nonzero
+            ("2026-06-30T12:00:00+00:00", 0, 3),
+        ],
     )
     assert (
         compute_stage_d_drought(events, tmp_path, window_closed=True) is False
@@ -3770,7 +3787,12 @@ def test_compute_stage_d_drought_stage_d_nonzero(tmp_path: Path) -> None:
 def test_compute_stage_d_drought_no_research_notes(tmp_path: Path) -> None:
     """False when no event in the window has research_notes_last_night > 0."""
     events = _write_vault_health_events(
-        tmp_path / "events.jsonl", [(0, 0), (0, 0), (0, 0)]
+        tmp_path / "events.jsonl",
+        [
+            ("2026-06-28T12:00:00+00:00", 0, 0),
+            ("2026-06-29T12:00:00+00:00", 0, 0),
+            ("2026-06-30T12:00:00+00:00", 0, 0),
+        ],
     )
     assert (
         compute_stage_d_drought(events, tmp_path, window_closed=True) is False
@@ -3778,9 +3800,14 @@ def test_compute_stage_d_drought_no_research_notes(tmp_path: Path) -> None:
 
 
 def test_compute_stage_d_drought_true(tmp_path: Path) -> None:
-    """True when window closed, last 3 events stage_d==0, research present."""
+    """True when window closed, 3 distinct days all stage_d==0, research present."""
     events = _write_vault_health_events(
-        tmp_path / "events.jsonl", [(0, 0), (0, 2), (0, 0)]
+        tmp_path / "events.jsonl",
+        [
+            ("2026-06-28T12:00:00+00:00", 0, 0),
+            ("2026-06-29T12:00:00+00:00", 0, 2),
+            ("2026-06-30T12:00:00+00:00", 0, 0),
+        ],
     )
     assert (
         compute_stage_d_drought(events, tmp_path, window_closed=True) is True
@@ -3794,4 +3821,90 @@ def test_compute_stage_d_drought_missing_file(tmp_path: Path) -> None:
             tmp_path / "nope.jsonl", tmp_path, window_closed=True
         )
         is False
+    )
+
+
+def test_compute_stage_d_drought_empty_file(tmp_path: Path) -> None:
+    """False when the events file exists but is empty."""
+    events = tmp_path / "events.jsonl"
+    events.write_text("", encoding="utf-8")
+    assert (
+        compute_stage_d_drought(events, tmp_path, window_closed=True) is False
+    )
+
+
+def test_compute_stage_d_drought_regression_2026_07_01(tmp_path: Path) -> None:
+    """Regression: 2026-07-01 false positive from raw-event-count semantics.
+
+    On disk when the 2026-07-01 event was being computed:
+    - 2026-06-28: 5 events, stage_d=1
+    - 2026-06-29: 2 events, stage_d=1
+    - 2026-06-30: 6 events, stage_d=0
+
+    The last 3 raw events were all from 2026-06-30 stage_d=0, so the old
+    event-count implementation returned True even though the 3-day
+    Eastern-calendar window (06-28, 06-29, 06-30) contains stage_d>0 on
+    two of those days. Calendar-day semantics must return False.
+    """
+    specs: list[tuple[str, int, int]] = []
+    # 06-28: 5 events, stage_d=1
+    for hour in (7, 19, 20, 21, 22):
+        specs.append((f"2026-06-28T{hour:02d}:00:00-04:00", 1, 3))
+    # 06-29: 2 events, stage_d=1
+    for hour in (7, 8):
+        specs.append((f"2026-06-29T{hour:02d}:00:00-04:00", 1, 3))
+    # 06-30: 6 events, stage_d=0 (three near end-of-day, mirroring the
+    # actual event stream)
+    for hour in (4, 14, 20, 21, 22, 22):
+        specs.append((f"2026-06-30T{hour:02d}:30:00-04:00", 0, 3))
+    events = _write_vault_health_events(tmp_path / "events.jsonl", specs)
+    assert (
+        compute_stage_d_drought(events, tmp_path, window_closed=True) is False
+    ), "06-29 has stage_d>0; the 3-day calendar window must reject drought"
+
+
+def test_compute_stage_d_drought_groups_by_eastern_date(tmp_path: Path) -> None:
+    """Timezone handling: events near midnight UTC group by Eastern date.
+
+    03:30 UTC on 2026-06-29 == 23:30 EDT on 2026-06-28. That event must
+    count toward the 2026-06-28 date bucket, not 2026-06-29. Two distinct
+    Eastern dates in the fixture below (06-28 and 06-30 — with the 06-29
+    UTC event landing in the 06-28 bucket, plus the 12:00 UTC 06-29 event
+    landing in the 06-29 bucket) actually produce 3 distinct Eastern
+    dates. Verify the group boundaries by giving each Eastern date a
+    distinct stage_d and asserting the drought call yields True — which
+    can only happen if 06-28 has stage_d=0 (satisfied by the UTC-midnight
+    event that grouped correctly).
+    """
+    events = _write_vault_health_events(
+        tmp_path / "events.jsonl",
+        [
+            # 03:30 UTC 2026-06-29 == 23:30 EDT 2026-06-28 → 06-28 bucket
+            ("2026-06-29T03:30:00+00:00", 0, 2),
+            # Noon UTC 2026-06-29 == 08:00 EDT 2026-06-29 → 06-29 bucket
+            ("2026-06-29T12:00:00+00:00", 0, 1),
+            # Noon UTC 2026-06-30 == 08:00 EDT 2026-06-30 → 06-30 bucket
+            ("2026-06-30T12:00:00+00:00", 0, 0),
+        ],
+    )
+    assert (
+        compute_stage_d_drought(events, tmp_path, window_closed=True) is True
+    )
+
+
+def test_compute_stage_d_drought_naive_ts_treated_as_utc(tmp_path: Path) -> None:
+    """Naive ts (no offset) is assumed UTC, then converted to Eastern."""
+    events = _write_vault_health_events(
+        tmp_path / "events.jsonl",
+        [
+            # 04:00 naive == 04:00 UTC == 00:00 EDT (2026-06-29) → 06-29 bucket
+            # but the intent is that naive-as-UTC produces a stable date.
+            # Choose noon UTC to be unambiguously mid-Eastern-day.
+            ("2026-06-28T12:00:00", 0, 2),
+            ("2026-06-29T12:00:00", 0, 1),
+            ("2026-06-30T12:00:00", 0, 3),
+        ],
+    )
+    assert (
+        compute_stage_d_drought(events, tmp_path, window_closed=True) is True
     )
