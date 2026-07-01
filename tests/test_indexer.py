@@ -37,6 +37,22 @@ def test_split_frontmatter_extracts_metadata():
     assert content.strip() == "Body content here."
 
 
+def test_split_frontmatter_block_list_unindented():
+    """Unindented block-style YAML lists must parse the same as indented ones.
+
+    Both forms are valid YAML. The parser previously broke out of the block-list
+    loop the moment a line had no leading whitespace, silently dropping lists
+    written in the unindented form. Regression coverage for a real vault bug:
+    projects/alice-viewer.md and people/jason.md both use unindented backlinks.
+    """
+    indented = "---\nbacklinks:\n  - alpha\n  - beta\n  - gamma\n---\n"
+    unindented = "---\nbacklinks:\n- alpha\n- beta\n- gamma\n---\n"
+    meta_i, _ = split_frontmatter(indented)
+    meta_u, _ = split_frontmatter(unindented)
+    assert meta_i["backlinks"] == ["alpha", "beta", "gamma"]
+    assert meta_u["backlinks"] == ["alpha", "beta", "gamma"]
+
+
 def test_split_frontmatter_no_frontmatter():
     """Plain markdown with no frontmatter returns an empty dict
     and the original body unchanged."""
