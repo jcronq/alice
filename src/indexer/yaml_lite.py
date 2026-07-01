@@ -70,14 +70,16 @@ def parse_frontmatter(text: str) -> dict[str, Any]:
                 if not lj.strip():
                     j += 1
                     continue
-                if not lj.startswith(" ") and not lj.startswith("\t"):
-                    break
                 stripped = lj.lstrip()
+                # Block-list items belong to the parent key whether they're
+                # indented ("  - item") or unindented ("- item"). Both are valid YAML.
                 if stripped.startswith("- "):
                     block_items.append(_unquote(stripped[2:].strip()))
-                else:
-                    # nested mapping; ignore content but consume
-                    pass
+                    j += 1
+                    continue
+                if not lj.startswith(" ") and not lj.startswith("\t"):
+                    break
+                # Indented non-list line: nested mapping — ignore content but consume.
                 j += 1
             if block_items:
                 out[key] = block_items
