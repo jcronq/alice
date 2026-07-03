@@ -2912,19 +2912,27 @@ def _seed_wakes_for_morning_window(
 ) -> None:
     """Drop ``b + c + d`` wake files inside the morning window.
 
-    The morning window is yesterday-23:00 → today-07:00 in local time;
-    this helper writes wakes at 00:00:NN through the previous-day dir
-    so the count is independent of when the test runs.
+    The morning window is yesterday-23:00 → today-07:00 in Eastern
+    (per :func:`_morning_window` sourcing :func:`_local_now`).
+    Filenames use UTC HHMMSS (per ``alice_thinking/prompts/prelude.md``).
+
+    Wakes are seeded at UTC 05:MM:00 in today's Eastern-dated UTC
+    directory. UTC 05:00 = 01:00 EDT / 00:00 EST — safely inside the
+    23:00-07:00 Eastern window regardless of DST.
     """
     base = now if now is not None else datetime.now()
-    yesterday = (base - timedelta(days=1)).strftime("%Y-%m-%d")
-    yday = thoughts / yesterday
-    yday.mkdir(parents=True, exist_ok=True)
+    # Eastern-today's date; UTC time 05:00+ on the same date puts the
+    # wake safely in the today-UTC dir (Eastern-today == UTC-today for
+    # UTC times >= 05:00 in EST, >= 04:00 in EDT).
+    today = base.strftime("%Y-%m-%d")
+    tday = thoughts / today
+    tday.mkdir(parents=True, exist_ok=True)
     seq = 0
     for stage, n in (("B", b), ("C", c), ("D", d)):
         for _ in range(n):
             seq += 1
-            _write_wake(yday, f"23{seq:02d}00-wake.md", stage)
+            # UTC 05:{seq:02d}:00 — 01:{seq:02d} EDT, well inside window.
+            _write_wake(tday, f"05{seq:02d}00-wake.md", stage)
 
 
 def test_low_wake_count_tagged_when_under_threshold(tmp_path: Path) -> None:
