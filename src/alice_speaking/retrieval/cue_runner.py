@@ -558,10 +558,11 @@ async def _bump_access(
             # (rare — the indexer seeds every slug — but defensive).
             conn.execute(
                 """
-                INSERT INTO note_metrics(slug, access_count)
-                VALUES(?, 1)
+                INSERT INTO note_metrics(slug, access_count, speaking_accessed_at)
+                VALUES(?, 1, datetime('now'))
                 ON CONFLICT(slug) DO UPDATE SET
-                    access_count = access_count + 1
+                    access_count = access_count + 1,
+                    speaking_accessed_at = datetime('now')
                 """,
                 (target_slug,),
             )
