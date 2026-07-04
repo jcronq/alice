@@ -371,28 +371,41 @@ def _write_wake(dir_path: Path, name: str, stage: str) -> None:
 
 
 def test_wake_distribution_spans_midnight(tmp_path: Path) -> None:
+    """Filename HHMMSS is UTC (per alice_thinking/prompts/prelude.md);
+    window bounds are Eastern (per _morning_window / _local_now).
+    Both UTC directories flanking the Eastern window must be scanned,
+    and only wakes whose UTC-to-Eastern-converted time falls inside
+    the Eastern window are counted. In EDT (UTC-4) the Eastern window
+    23:00-07:00 maps to UTC 03:00-11:00 on the second calendar day.
+    """
     thoughts = tmp_path / "thoughts"
-    yest = thoughts / "2026-05-07"
-    today = thoughts / "2026-05-08"
-    yest.mkdir(parents=True)
-    today.mkdir(parents=True)
+    yest_utc = thoughts / "2026-05-07"
+    today_utc = thoughts / "2026-05-08"
+    yest_utc.mkdir(parents=True)
+    today_utc.mkdir(parents=True)
 
-    _write_wake(yest, "235500-wake.md", "B")
-    _write_wake(yest, "233000-wake.md", "C")
-    _write_wake(today, "001500-wake.md", "D")
-    _write_wake(today, "063000-wake.md", "B")
-    # One outside the window (08:00) — must be ignored.
-    _write_wake(today, "080000-wake.md", "B")
+    # Yesterday UTC dir sentinel — 23:55 UTC on 2026-05-07 = 19:55 EDT,
+    # outside the 23:00-07:00 EDT window. Verifies both UTC directories
+    # are scanned but this wake is correctly excluded.
+    _write_wake(yest_utc, "235500-wake.md", "B")
+
+    # In-window wakes in today UTC dir.
+    _write_wake(today_utc, "030500-wake.md", "B")   # 23:05 EDT (window start)
+    _write_wake(today_utc, "040000-wake.md", "C")   # 00:00 EDT (midnight EDT)
+    _write_wake(today_utc, "070000-wake.md", "D")   # 03:00 EDT
+    _write_wake(today_utc, "103000-wake.md", "B")   # 06:30 EDT (near end)
+    # Out-of-window: 12:00 UTC = 08:00 EDT (past window end).
+    _write_wake(today_utc, "120000-wake.md", "B")
 
     window_start = datetime(2026, 5, 7, 23, 0, 0)
     window_end = datetime(2026, 5, 8, 7, 0, 0)
     counts = count_wakes_by_stage(thoughts, window_start, window_end)
     assert counts == {"stage_b": 2, "stage_c": 1, "stage_d": 1}, counts
 
-    # Buggy baseline (yesterday-only scan) misses today's two in-window
-    # wakes entirely.
+    # Buggy baseline (yesterday-only scan) misses today's in-window
+    # wakes entirely and treats the yesterday sentinel as in-window.
     buggy = _buggy_wake_distribution_yesterday_only(thoughts, "2026-05-07")
-    assert buggy == {"stage_b": 1, "stage_c": 1, "stage_d": 0}, buggy
+    assert buggy == {"stage_b": 1, "stage_c": 0, "stage_d": 0}, buggy
 
 
 # ---------------------------------------------------------------------------
@@ -401,13 +414,17 @@ def test_wake_distribution_spans_midnight(tmp_path: Path) -> None:
 
 def test_wake_distribution_accepts_sleep_prefix(tmp_path: Path) -> None:
     """Production wake frontmatter uses ``sleep_b``/``sleep_c``/``sleep_d``;
-    _read_stage must accept that form, not just the bare letter."""
+    _read_stage must accept that form, not just the bare letter.
+    Filename HHMMSS is UTC (per the prelude template); UTC 04:05/06:00/
+    09:00 on 2026-05-08 are 00:05/02:00/05:00 EDT, all inside the
+    23:00-07:00 EDT window.
+    """
     thoughts = tmp_path / "thoughts"
     today = thoughts / "2026-05-08"
     today.mkdir(parents=True)
-    _write_wake(today, "000500-wake.md", "sleep_b")
-    _write_wake(today, "001500-wake.md", "sleep_c")
-    _write_wake(today, "003000-wake.md", "sleep_d")
+    _write_wake(today, "040500-wake.md", "sleep_b")   # 00:05 EDT
+    _write_wake(today, "060000-wake.md", "sleep_c")   # 02:00 EDT
+    _write_wake(today, "090000-wake.md", "sleep_d")   # 05:00 EDT
 
     window_start = datetime(2026, 5, 7, 23, 0, 0)
     window_end = datetime(2026, 5, 8, 7, 0, 0)
@@ -416,18 +433,23 @@ def test_wake_distribution_accepts_sleep_prefix(tmp_path: Path) -> None:
 
 
 def test_wake_distribution_filename_formats(tmp_path: Path) -> None:
+    """All three filename formats parse correctly. Filename HHMMSS is
+    UTC; times chosen here convert to Eastern times inside the 23:00-
+    07:00 EDT window (UTC 03:00-11:00 on the second day in EDT).
+    """
     thoughts = tmp_path / "thoughts"
-    yest = thoughts / "2026-05-07"
     today = thoughts / "2026-05-08"
-    yest.mkdir(parents=True)
     today.mkdir(parents=True)
 
-    # Format 1: HHMMSS-wake.md (date from parent dir)
-    _write_wake(yest, "235500-wake.md", "B")
-    # Format 2: YYYYMMDD-HHMMSS-wake.md
-    _write_wake(today, "20260508-001500-wake.md", "D")
-    # Format 3: YYYYMMDDHHMMSS-wake.md
-    _write_wake(today, "20260508003000-wake.md", "C")
+    # Format 1: HHMMSS-wake.md (date from parent dir).
+    # 03:05 UTC = 23:05 EDT — inside window.
+    _write_wake(today, "030500-wake.md", "B")
+    # Format 2: YYYYMMDD-HHMMSS-wake.md.
+    # 06:00 UTC = 02:00 EDT — inside window.
+    _write_wake(today, "20260508-060000-wake.md", "D")
+    # Format 3: YYYYMMDDHHMMSS-wake.md.
+    # 09:00 UTC = 05:00 EDT — inside window.
+    _write_wake(today, "20260508090000-wake.md", "C")
     # Plus a non-matching filename — must be rejected silently.
     _write_wake(today, "scratch.md", "B")
 
@@ -435,6 +457,30 @@ def test_wake_distribution_filename_formats(tmp_path: Path) -> None:
     window_end = datetime(2026, 5, 8, 7, 0, 0)
     counts = count_wakes_by_stage(thoughts, window_start, window_end)
     assert counts == {"stage_b": 1, "stage_c": 1, "stage_d": 1}, counts
+
+
+def test_wake_distribution_applies_utc_to_eastern_conversion(tmp_path: Path) -> None:
+    """Regression guard for the UTC-vs-Eastern comparison bug fixed
+    2026-07-03. Filename HHMMSS is UTC (per prompts/prelude.md) but
+    window bounds arrive in Eastern (per _morning_window). A wake at
+    10:06 UTC is at 06:06 EDT — inside the 23:00-07:00 EDT window.
+    Under the pre-fix naive comparison ``10:06 < 07:00`` failed and
+    the wake was silently excluded.
+
+    Physical example: ``inner/thoughts/2026-07-02/100659-wake.md``
+    (stage D) was silently dropped from vault_health's
+    wake_type_distribution before this fix.
+    """
+    thoughts = tmp_path / "thoughts"
+    today = thoughts / "2026-07-02"
+    today.mkdir(parents=True)
+    # 10:06:59 UTC = 06:06:59 EDT — well inside 23:00-07:00 EDT window.
+    _write_wake(today, "100659-wake.md", "D")
+
+    window_start = datetime(2026, 7, 1, 23, 0, 0)
+    window_end = datetime(2026, 7, 2, 7, 0, 0)
+    counts = count_wakes_by_stage(thoughts, window_start, window_end)
+    assert counts == {"stage_b": 0, "stage_c": 0, "stage_d": 1}, counts
 
 
 # ---------------------------------------------------------------------------
@@ -1459,16 +1505,21 @@ def test_count_productive_wakes_did_work_filter(tmp_path: Path) -> None:
             """,
         )
 
+    # Yesterday UTC dir sentinels — 23:30 UTC = 19:30 EDT (outside
+    # window before conversion) and 23:55 UTC = 19:55 EDT (also
+    # outside). Both must be excluded even though did_work differs.
     _wake(yest, "233000-wake.md", "true")
     _wake(yest, "235500-wake.md", "false")
-    _wake(today, "010000-wake.md", "true")
-    _wake(today, "030000-wake.md", "true")
-    # Out of window — must be excluded.
-    _wake(today, "080000-wake.md", "true")
+    # In-window in today UTC dir. Eastern window 23:00-07:00 EDT
+    # = UTC 03:00-11:00 on 2026-05-10 (EDT is UTC-4).
+    _wake(today, "040000-wake.md", "true")   # 00:00 EDT
+    _wake(today, "070000-wake.md", "true")   # 03:00 EDT
+    # Out of window — 12:00 UTC = 08:00 EDT.
+    _wake(today, "120000-wake.md", "true")
 
     ws = datetime(2026, 5, 9, 23, 0, 0)
     we = datetime(2026, 5, 10, 7, 0, 0)
-    assert count_productive_wakes(thoughts, ws, we) == 3
+    assert count_productive_wakes(thoughts, ws, we) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -2861,19 +2912,27 @@ def _seed_wakes_for_morning_window(
 ) -> None:
     """Drop ``b + c + d`` wake files inside the morning window.
 
-    The morning window is yesterday-23:00 → today-07:00 in local time;
-    this helper writes wakes at 00:00:NN through the previous-day dir
-    so the count is independent of when the test runs.
+    The morning window is yesterday-23:00 → today-07:00 in Eastern
+    (per :func:`_morning_window` sourcing :func:`_local_now`).
+    Filenames use UTC HHMMSS (per ``alice_thinking/prompts/prelude.md``).
+
+    Wakes are seeded at UTC 05:MM:00 in today's Eastern-dated UTC
+    directory. UTC 05:00 = 01:00 EDT / 00:00 EST — safely inside the
+    23:00-07:00 Eastern window regardless of DST.
     """
     base = now if now is not None else datetime.now()
-    yesterday = (base - timedelta(days=1)).strftime("%Y-%m-%d")
-    yday = thoughts / yesterday
-    yday.mkdir(parents=True, exist_ok=True)
+    # Eastern-today's date; UTC time 05:00+ on the same date puts the
+    # wake safely in the today-UTC dir (Eastern-today == UTC-today for
+    # UTC times >= 05:00 in EST, >= 04:00 in EDT).
+    today = base.strftime("%Y-%m-%d")
+    tday = thoughts / today
+    tday.mkdir(parents=True, exist_ok=True)
     seq = 0
     for stage, n in (("B", b), ("C", c), ("D", d)):
         for _ in range(n):
             seq += 1
-            _write_wake(yday, f"23{seq:02d}00-wake.md", stage)
+            # UTC 05:{seq:02d}:00 — 01:{seq:02d} EDT, well inside window.
+            _write_wake(tday, f"05{seq:02d}00-wake.md", stage)
 
 
 def test_low_wake_count_tagged_when_under_threshold(tmp_path: Path) -> None:

@@ -2215,6 +2215,33 @@ def _parse_wake_filename(name: str, dir_date: datetime | None) -> datetime | Non
     return None
 
 
+def _parse_wake_ts_eastern(name: str, dir_date: datetime | None) -> datetime | None:
+    """Parse wake filename to naive Eastern-time datetime.
+
+    Wake files are written by thinking's prelude template with UTC date
+    and UTC HHMMSS components (see ``alice_thinking/prompts/prelude.md``
+    which dictates ``date -u +%Y-%m-%d`` and ``date -u +%H%M%S``). Metric
+    windows are computed in Eastern via :func:`_morning_window` (which
+    reads :func:`_local_now`, itself ``datetime.now(_EASTERN)``).
+    Comparing the raw parsed UTC timestamp against the Eastern window
+    bounds treats both as naive and does not apply the offset — a wake
+    at ``10:06 UTC`` (``06:06 EDT``, inside the 23:00-07:00 Eastern
+    sleep window) fails ``10:06 < 07:00`` and is silently excluded.
+
+    This helper closes that gap: parse the filename as naive UTC,
+    localize to UTC, convert to Eastern, then strip tzinfo to match the
+    naive-Eastern contract the callers already use for window bounds.
+    """
+    ts_utc = _parse_wake_filename(name, dir_date)
+    if ts_utc is None:
+        return None
+    return (
+        ts_utc.replace(tzinfo=timezone.utc)
+        .astimezone(_EASTERN)
+        .replace(tzinfo=None)
+    )
+
+
 def _intersecting_date_dirs(
     thoughts_dir: Path, window_start: datetime, window_end: datetime
 ) -> list[Path]:
@@ -2288,7 +2315,7 @@ def count_wakes_by_stage(
         except ValueError:
             continue
         for md in sorted(date_dir.glob("*.md")):
-            ts = _parse_wake_filename(md.name, dir_date)
+            ts = _parse_wake_ts_eastern(md.name, dir_date)
             if ts is None:
                 continue
             if not (ws <= ts < we):
@@ -2500,7 +2527,7 @@ def count_productive_wakes(
         except ValueError:
             continue
         for md in date_dir.glob("*.md"):
-            ts = _parse_wake_filename(md.name, dir_date)
+            ts = _parse_wake_ts_eastern(md.name, dir_date)
             if ts is None:
                 continue
             if not (ws <= ts < we):
@@ -2530,7 +2557,7 @@ def count_all_wakes_in_window(
         except ValueError:
             continue
         for md in date_dir.glob("*.md"):
-            ts = _parse_wake_filename(md.name, dir_date)
+            ts = _parse_wake_ts_eastern(md.name, dir_date)
             if ts is None:
                 continue
             if not (ws <= ts < we):
