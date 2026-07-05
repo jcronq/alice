@@ -1420,6 +1420,23 @@ def test_read_stm_context_slugs_missing_table_returns_empty(
     assert _read_stm_context_slugs(db) == []
 
 
+def test_read_stm_context_slugs_falls_back_when_column_all_null(
+    tmp_path: pathlib.Path,
+):
+    """Column exists but no writer has populated it — the live-DB state
+    between PR #532's merge and the container restart. Ordering by an
+    all-NULL column would return arbitrary rows; the function must fall
+    back to access_count instead so Hebbian STM context reflects real
+    usage."""
+    db = tmp_path / "cortex-index.db"
+    _seed_db(db, [{"slug": "a", "title": "A", "body": "x"}])
+    _make_metrics_db_inplace(db, [("cold", 1), ("hot", 100)])
+    # Column exists (created by _make_metrics_db_inplace) but every row
+    # has speaking_accessed_at = NULL — the pre-writer-deploy state.
+    slugs = _read_stm_context_slugs(db, limit=10)
+    assert slugs[0] == "hot"
+
+
 @pytest.mark.asyncio
 async def test_build_cue_packet_hebbian_disabled_is_noop(
     tmp_path: pathlib.Path,
