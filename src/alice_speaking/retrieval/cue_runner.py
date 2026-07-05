@@ -681,21 +681,44 @@ def _read_stm_context_slugs(
 
     Tries ``speaking_accessed_at`` first (the timestamp column added
     for Hebbian context); falls back to ``access_count DESC`` when the
-    column doesn't exist (legacy / freshly-seeded DBs). Returns ``[]``
-    on any DB error — graceful degradation, the caller substitutes the
-    FTS candidate slugs as the STM proxy.
+    column doesn't exist OR exists but is unpopulated across all rows.
+    The unpopulated case is the live-DB state between PR #532's merge
+    and the next container restart: the column is present in the schema
+    but no writer has bumped it yet, so ordering by it returns arbitrary
+    rows and the Hebbian boost degrades into noise. Returns ``[]`` on
+    any DB error — graceful degradation, the caller substitutes the FTS
+    candidate slugs as the STM proxy.
     """
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         try:
-            # Prefer the explicit timestamp column. Fallback to popularity
-            # when the column doesn't exist (legacy seeded DBs).
+            # Prefer the explicit timestamp column when it exists AND has
+            # been populated by at least one writer. When the column
+            # exists but is empty across the vault (post-schema,
+            # pre-writer-deploy), fall back to access_count so STM
+            # context reflects real usage instead of arbitrary row order.
             try:
-                rows = conn.execute(
-                    "SELECT slug FROM note_metrics "
-                    "ORDER BY speaking_accessed_at DESC LIMIT ?",
-                    (limit,),
-                ).fetchall()
+                has_valid = (
+                    conn.execute(
+                        "SELECT COUNT(*) FROM note_metrics "
+                        "WHERE speaking_accessed_at IS NOT NULL "
+                        "AND speaking_accessed_at != '' "
+                        "AND speaking_accessed_at != '0'"
+                    ).fetchone()[0]
+                    > 0
+                )
+                if has_valid:
+                    rows = conn.execute(
+                        "SELECT slug FROM note_metrics "
+                        "ORDER BY speaking_accessed_at DESC LIMIT ?",
+                        (limit,),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT slug FROM note_metrics "
+                        "ORDER BY access_count DESC LIMIT ?",
+                        (limit,),
+                    ).fetchall()
             except sqlite3.OperationalError:
                 rows = conn.execute(
                     "SELECT slug FROM note_metrics "
