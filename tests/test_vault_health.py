@@ -1151,12 +1151,13 @@ def test_research_decay_young_note_not_counted(tmp_path: Path) -> None:
     """A note with a `created:` date only 10 days ago should not be counted
     as decayed, even with zero inbound links."""
     vault = _make_vault(tmp_path)
+    young_date = (datetime.now() - timedelta(days=10)).date().isoformat()
     _write(
         vault / "research" / "foo.md",
-        """
+        f"""
         ---
         slug: foo
-        created: 2026-05-05
+        created: {young_date}
         ---
         Young note with no inbound links.
         """,
