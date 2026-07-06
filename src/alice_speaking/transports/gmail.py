@@ -108,6 +108,102 @@ def _message_ids(value: str) -> tuple[str, ...]:
     return tuple(part for part in value.split() if part.startswith("<") and part.endswith(">"))
 
 
+# ---------------------------------------------------------------------------
+# Sender authentication (SPF / DKIM / DMARC).
+#
+# Alice fetches mail via IMAP from Gmail's own servers, which means Gmail has
+# already validated SPF/DKIM/DMARC and stamped the verdict into an
+# ``Authentication-Results`` header. We read that verdict rather than doing
+# the crypto ourselves — but only the copy stamped by Gmail's own
+# authserv-id is trustworthy. A receiving MTA strips any inbound
+# ``Authentication-Results`` bearing its own authserv-id before adding its
+# real one (RFC 8601 §5), so a match on ``mx.google.com`` is Gmail's genuine
+# verdict; an attacker-forged copy sitting in the message body carries a
+# different authserv-id (or none) and is ignored. Missing verdict → fail
+# closed (treated as unverified), never open.
+
+
+def _parse_authentication_results(
+    raw_values: list[str], trusted_authserv_id: str
+) -> dict[str, str]:
+    """Extract SPF/DKIM/DMARC results from the trusted ``Authentication-Results``.
+
+    Returns ``{}`` when no header stamped by ``trusted_authserv_id`` is
+    present. Otherwise returns ``{dkim, spf, dmarc, dkim_domain}`` where each
+    method is its result token (``pass`` / ``fail`` / ``none`` / …) and
+    ``dkim_domain`` is the DKIM signing domain (``header.d`` preferred, else
+    ``header.i``) used for alignment checks.
+    """
+    trusted = trusted_authserv_id.strip().lower()
+    for value in raw_values:
+        collapsed = " ".join(str(value).split())
+        if not collapsed:
+            continue
+        head, _sep, rest = collapsed.partition(";")
+        head_tokens = head.strip().split()
+        authserv_id = head_tokens[0].lower() if head_tokens else ""
+        if authserv_id != trusted:
+            continue
+        results: dict[str, str] = {"dkim": "none", "spf": "none", "dmarc": "none"}
+        dkim_domain = ""
+        for chunk in rest.split(";"):
+            method, sep, tail = chunk.strip().partition("=")
+            method = method.strip().lower()
+            if not sep or method not in results or results[method] != "none":
+                # Unknown method, malformed, or already recorded (first
+                # entry wins when a message carries multiple signatures).
+                continue
+            tokens = tail.split()
+            results[method] = tokens[0].strip().lower() if tokens else "none"
+            if method == "dkim":
+                d_domain = ""
+                i_domain = ""
+                for tok in tokens[1:]:
+                    low = tok.lower()
+                    if low.startswith("header.d="):
+                        d_domain = tok.partition("=")[2]
+                    elif low.startswith("header.i="):
+                        i_domain = tok.partition("=")[2].lstrip("@").rpartition("@")[2]
+                dkim_domain = (d_domain or i_domain).strip().lower().rstrip(";")
+        results["dkim_domain"] = dkim_domain
+        return results
+    return {}
+
+
+def _domains_aligned(a: str, b: str) -> bool:
+    """Relaxed DMARC-style alignment: equal domains or one a subdomain of
+    the other (case-insensitive, trailing dot ignored)."""
+    a = (a or "").strip().lower().rstrip(".")
+    b = (b or "").strip().lower().rstrip(".")
+    if not a or not b:
+        return False
+    return a == b or a.endswith("." + b) or b.endswith("." + a)
+
+
+def _evaluate_sender_auth(auth: dict[str, str], from_domain: str) -> tuple[bool, str]:
+    """Decide whether the ``From`` domain is authenticated.
+
+    A ``dmarc=pass`` verdict already proves an SPF- or DKIM-based
+    identifier aligned with the ``From`` domain, so it is sufficient on its
+    own. As a fallback (for senders whose domain publishes no DMARC record)
+    we accept a ``dkim=pass`` whose signing domain aligns with ``From``.
+    SPF alone is intentionally NOT sufficient — it authenticates the
+    envelope sender, not the visible ``From`` header.
+    """
+    if not auth:
+        return False, "no Authentication-Results header from trusted authserv-id"
+    if auth.get("dmarc") == "pass":
+        return True, "dmarc=pass"
+    if auth.get("dkim") == "pass" and _domains_aligned(
+        from_domain, auth.get("dkim_domain", "")
+    ):
+        return True, f"dkim=pass aligned ({auth.get('dkim_domain')})"
+    return False, (
+        f"unauthenticated (dkim={auth.get('dkim')} spf={auth.get('spf')} "
+        f"dmarc={auth.get('dmarc')}); no aligned pass"
+    )
+
+
 class _HTMLText(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -146,6 +242,8 @@ class GmailTransport:
         mailbox: str = "INBOX",
         poll_seconds: float = 30.0,
         inbox_size: int = 64,
+        require_verified_sender: bool = True,
+        trusted_authserv_id: str = "mx.google.com",
         imap_factory: Callable[..., imaplib.IMAP4_SSL] = imaplib.IMAP4_SSL,
         smtp_factory: Callable[..., smtplib.SMTP_SSL] = smtplib.SMTP_SSL,
     ) -> None:
@@ -159,6 +257,8 @@ class GmailTransport:
         self._smtp_port = smtp_port
         self._mailbox = mailbox
         self._poll_seconds = max(1.0, poll_seconds)
+        self._require_verified_sender = require_verified_sender
+        self._trusted_authserv_id = trusted_authserv_id.strip().lower()
         self._inbox: asyncio.Queue[InboundMessage] = asyncio.Queue(maxsize=inbox_size)
         self._imap_factory = imap_factory
         self._smtp_factory = smtp_factory
@@ -182,31 +282,7 @@ class GmailTransport:
             try:
                 fetched = await asyncio.to_thread(self._fetch_unseen)
                 for uid, inbound in fetched:
-                    principal = ctx.address_book.lookup_by_native(
-                        self.name, inbound.principal.native_id
-                    )
-                    if principal is None or not principal.allowed:
-                        log.info(
-                            "ignoring Gmail message from unknown sender %s",
-                            inbound.principal.native_id,
-                        )
-                        await asyncio.to_thread(self._mark_seen, uid)
-                        continue
-                    inbound.principal = Principal(
-                        transport=self.name,
-                        native_id=inbound.principal.native_id,
-                        display_name=principal.display_name,
-                    )
-                    ctx.address_book.learn(inbound)
-                    event = GmailEvent(message=inbound)
-                    divert = getattr(ctx, "divert_to_mid_turn", None)
-                    if divert is not None and divert(
-                        inbound.origin, inbound.text, event
-                    ):
-                        await asyncio.to_thread(self._mark_seen, uid)
-                        continue
-                    await ctx._queue.put(event)
-                    await asyncio.to_thread(self._mark_seen, uid)
+                    await self._accept_message(ctx, uid, inbound)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -217,6 +293,61 @@ class GmailTransport:
                 )
             except asyncio.TimeoutError:
                 pass
+
+    async def _accept_message(
+        self, ctx: DaemonContext, uid: bytes, inbound: InboundMessage
+    ) -> None:
+        """Apply the intake gates to one fetched message and enqueue it.
+
+        Two gates, both fail closed by marking the message ``\\Seen`` and
+        returning without running a turn:
+
+        1. **ACL** — the ``From`` address must map to a known, allowed
+           principal.
+        2. **Sender verification** — Gmail's SPF/DKIM/DMARC verdict must
+           authenticate the ``From`` address (see
+           :func:`_evaluate_sender_auth`). A verified ``From`` is the only
+           thing that lets an inbound run a turn *as* the matched principal;
+           an unverified message that merely claims a known address is a
+           spoof and is dropped.
+        """
+        principal = ctx.address_book.lookup_by_native(
+            self.name, inbound.principal.native_id
+        )
+        if principal is None or not principal.allowed:
+            log.info(
+                "ignoring Gmail message from unknown sender %s",
+                inbound.principal.native_id,
+            )
+            await asyncio.to_thread(self._mark_seen, uid)
+            return
+        if self._require_verified_sender and not inbound.metadata.get(
+            "sender_verified"
+        ):
+            reason = inbound.metadata.get("sender_auth", {}).get(
+                "reason", "no auth verdict"
+            )
+            log.warning(
+                "rejecting unverified Gmail message claiming to be %s (%s); "
+                "sender identity not authenticated",
+                inbound.principal.native_id,
+                reason,
+            )
+            await asyncio.to_thread(self._mark_seen, uid)
+            return
+        inbound.principal = Principal(
+            transport=self.name,
+            native_id=inbound.principal.native_id,
+            display_name=principal.display_name,
+        )
+        ctx.address_book.learn(inbound)
+        event = GmailEvent(message=inbound)
+        divert = getattr(ctx, "divert_to_mid_turn", None)
+        if divert is not None and divert(inbound.origin, inbound.text, event):
+            await asyncio.to_thread(self._mark_seen, uid)
+            return
+        await ctx._queue.put(event)
+        await asyncio.to_thread(self._mark_seen, uid)
 
     def _imap(self):
         client = self._imap_factory(
@@ -296,6 +427,12 @@ class GmailTransport:
             timestamp = parsedate_to_datetime(str(msg.get("Date"))).timestamp()
         except (TypeError, ValueError, OverflowError):
             timestamp = time.time()
+        auth = _parse_authentication_results(
+            [str(v) for v in msg.get_all("Authentication-Results") or ()],
+            self._trusted_authserv_id,
+        )
+        from_domain = sender_address.rpartition("@")[2]
+        verified, reason = _evaluate_sender_auth(auth, from_domain)
         return InboundMessage(
             principal=Principal(
                 transport=self.name,
@@ -316,6 +453,15 @@ class GmailTransport:
                 "thread_root_message_id": root,
                 "subject": subject,
                 "references": list(all_refs),
+                "sender_verified": verified,
+                "sender_auth": {
+                    "verified": verified,
+                    "reason": reason,
+                    "dkim": auth.get("dkim", "none"),
+                    "spf": auth.get("spf", "none"),
+                    "dmarc": auth.get("dmarc", "none"),
+                    "dkim_domain": auth.get("dkim_domain", ""),
+                },
             },
         )
 

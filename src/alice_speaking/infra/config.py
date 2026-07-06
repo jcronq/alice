@@ -185,6 +185,12 @@ class Config:
     gmail_smtp_port: int = 465
     gmail_mailbox: str = "INBOX"
     gmail_poll_seconds: float = 30.0
+    # Fail closed on inbound sender identity: require Gmail's SPF/DKIM/DMARC
+    # verdict to authenticate the From address before running a turn as the
+    # matched principal. Disable only for testing / non-Gmail IMAP servers
+    # that don't stamp an Authentication-Results header we trust.
+    gmail_require_verified: bool = True
+    gmail_trusted_authserv_id: str = "mx.google.com"
 
     # API-key auth mode. When ``anthropic_base_url`` or ``anthropic_api_key``
     # is set, core.auth picks "api" mode and routes the CLI through
@@ -361,6 +367,19 @@ def load() -> Config:
         )
     except ValueError:
         gmail_poll_seconds = 30.0
+    gmail_require_verified_raw = (
+        from_any("GMAIL_REQUIRE_VERIFIED", "1") or "1"
+    ).strip().lower()
+    gmail_require_verified = gmail_require_verified_raw not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }
+    gmail_trusted_authserv_id = (
+        from_any("GMAIL_TRUSTED_AUTHSERV_ID", "mx.google.com") or "mx.google.com"
+    ).strip().lower()
 
     viewer_chat_enabled_raw = (
         from_any("ALICE_VIEWER_CHAT_ENABLED", "1") or "1"
@@ -461,6 +480,8 @@ def load() -> Config:
         gmail_smtp_port=gmail_smtp_port,
         gmail_mailbox=gmail_mailbox,
         gmail_poll_seconds=gmail_poll_seconds,
+        gmail_require_verified=gmail_require_verified,
+        gmail_trusted_authserv_id=gmail_trusted_authserv_id,
         viewer_chat_enabled=viewer_chat_enabled,
         viewer_chat_host=viewer_chat_host,
         viewer_chat_port=viewer_chat_port,

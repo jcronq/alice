@@ -82,7 +82,7 @@ from .pipeline.dedup import DedupStore
 from .pipeline.outbox import OutboxRouter
 from .pipeline.quiet_hours import QuietQueue, is_quiet_hours
 from .pipeline.quiet_queue_runner import QuietQueueRunner
-from .tools.messaging import SELF_RECIPIENT, ResolvedRecipient
+from .tools.messaging import SELF_RECIPIENT, ResolvedRecipient, _resolve_recipient
 from .transports import (
     CLITransport,
     ChannelRef,
@@ -135,6 +135,58 @@ __all__ = [
     "SurfaceEvent",
     "ViewerChatEvent",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Limited-trust channel gate (Gmail).
+#
+# A verified email authenticates *who* sent it, but email is a request
+# channel, not an authorization channel. Sensitive tools are therefore
+# refused during a Gmail turn; Alice must escalate to a trusted channel
+# (Signal) and act only once Jason confirms there. This covers the four
+# sensitive categories: third-party outbound, physical/smart-home,
+# worker/code, and destructive/financial actions. Read-only tools (Read,
+# Grep, Glob, WebFetch), internal note-taking (append_note), and replying
+# in-thread / pinging Jason on Signal via send_message stay allowed.
+GMAIL_SENSITIVE_TOOLS = frozenset(
+    {
+        # Worker/code + arbitrary shell (also the physical/smart-home and
+        # destructive/financial surface, which run through Bash here).
+        "Bash",
+        "Write",
+        "Edit",
+        "Task",
+        "Agent",
+        "mcp__alice__write_file",
+        "mcp__alice__edit_file",
+        "mcp__alice__write_directive",
+        "mcp__alice__write_config",
+        "mcp__alice__request_worker_reload",
+        "mcp__alice__request_cozylobe_reload",
+        "mcp__alice__request_host_claude",
+        # Outbound messaging — conditionally allowed (self-reply + Signal
+        # escalation to a known human); see ``_gmail_send_allowed``.
+        "mcp__alice__send_message",
+    }
+)
+
+# PreToolUse matcher regex. Our tool names contain no regex metacharacters,
+# so a plain alternation is a safe pattern. Task/Agent are included both
+# for this gate AND for the existing background-dispatch interception.
+_PRETOOLUSE_MATCHER = "|".join(sorted(GMAIL_SENSITIVE_TOOLS))
+
+_GMAIL_TRUST_DENY_REASON = (
+    "BLOCKED — limited-trust channel. This turn came from EMAIL. The "
+    "sender's identity is authenticated, but email is a request channel, "
+    "NOT an authorization channel, so the sensitive tool {tool!r} cannot "
+    "run here (it performs an external send, a physical/smart-home action, "
+    "a worker/code change, or a destructive/financial operation). Do NOT "
+    "retry the tool. To move this forward: (1) reply in the email thread "
+    "(send_message recipient='self') telling the sender you need Jason to "
+    "confirm, and (2) send Jason a Signal heads-up (send_message "
+    "recipient='jason') describing exactly what was requested. Jason "
+    "approving over Signal is what unlocks the action."
+)
 
 
 class SpeakingDaemon:
@@ -358,6 +410,8 @@ class SpeakingDaemon:
                 smtp_port=cfg.gmail_smtp_port,
                 mailbox=cfg.gmail_mailbox,
                 poll_seconds=cfg.gmail_poll_seconds,
+                require_verified_sender=cfg.gmail_require_verified,
+                trusted_authserv_id=cfg.gmail_trusted_authserv_id,
             )
 
         # A2A transport — optional. Constructed only when explicitly
@@ -606,7 +660,7 @@ class SpeakingDaemon:
             hooks={
                 "PreToolUse": [
                     HookMatcher(
-                        matcher="Task|Agent",
+                        matcher=_PRETOOLUSE_MATCHER,
                         hooks=[self._pretooluse_hook],
                     ),
                 ],
@@ -1295,13 +1349,63 @@ class SpeakingDaemon:
     # which is what we need to intercept Task before it blocks the
     # parent turn for minutes on a synchronous sub-agent run.
 
+    def _gmail_send_allowed(self, tool_input: dict[str, Any]) -> bool:
+        """Whether a ``send_message`` call is permitted on a Gmail turn.
+
+        Allowed: replying in the same email thread (``self``/``reply``) and
+        escalating to a known human over Signal (e.g. ``jason``/``katie``).
+        Denied: raw phone numbers and any third-party principal — those are
+        outbound-to-third-party actions that need Signal authorization.
+        """
+        raw = str(tool_input.get("recipient") or "").strip()
+        resolved = _resolve_recipient(raw, self.address_book)
+        if resolved == SELF_RECIPIENT:
+            return True
+        if raw.startswith("+"):
+            # A raw number is not a known principal — treat as third party.
+            return False
+        return isinstance(resolved, ChannelRef) and resolved.transport == "signal"
+
+    def _gmail_trust_deny(
+        self, tool_name: str, tool_input: dict[str, Any]
+    ) -> Optional[dict[str, Any]]:
+        """Return a PreToolUse ``deny`` decision when ``tool_name`` is a
+        sensitive action on a limited-trust (Gmail) turn, else ``None``.
+
+        Keys off ``self._current_turn_kind`` — only Gmail turns are
+        limited-trust today. ``send_message`` is allowed for in-thread
+        replies and Signal escalation (see :meth:`_gmail_send_allowed`).
+        """
+        if self._current_turn_kind != "gmail":
+            return None
+        if tool_name not in GMAIL_SENSITIVE_TOOLS:
+            return None
+        if tool_name == "mcp__alice__send_message" and self._gmail_send_allowed(
+            tool_input
+        ):
+            return None
+        log.warning(
+            "gmail limited-trust gate denied %s (principal=%s)",
+            tool_name,
+            self._current_principal_display_name,
+        )
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": _GMAIL_TRUST_DENY_REASON.format(
+                    tool=tool_name
+                ),
+            }
+        }
+
     async def _pretooluse_hook(
         self,
         input_data: dict[str, Any],
         tool_use_id: Optional[str],
         context: Any,
     ) -> dict[str, Any]:
-        """PreToolUse hook callback — intercepts Task/Agent.
+        """PreToolUse hook callback — trust gate + intercepts Task/Agent.
 
         Hook input shape (per :class:`PreToolUseHookInput` in the SDK):
         ``{"hook_event_name": "PreToolUse", "tool_name": str,
@@ -1313,6 +1417,19 @@ class SpeakingDaemon:
         tool result. Any other tool returns an empty dict (pass-through).
         """
         tool_name = input_data.get("tool_name") or ""
+
+        # Limited-trust gate runs first (deterministic ordering matters:
+        # Task/Agent is both sensitive here AND intercepted below — on a
+        # Gmail turn we must DENY it, not background-dispatch it). Skip
+        # inside sub-agents (agent_id set): they are already walled to
+        # BUILTIN_TOOLS with no Signal/MCP access.
+        if not input_data.get("agent_id"):
+            gate = self._gmail_trust_deny(
+                tool_name, input_data.get("tool_input") or {}
+            )
+            if gate is not None:
+                return gate
+
         # Pass through anything that isn't Task. Empty dict = no
         # decision = SDK proceeds normally.
         if tool_name not in ("Task", "Agent"):
