@@ -293,6 +293,9 @@ _TRIGGER_KEYWORDS_RE = re.compile(
 )
 _ACCESS_COUNT_RE = re.compile(r"^access_count:\s*(\d+)\s*$", re.MULTILINE)
 _LAST_ACCESSED_RE = re.compile(r"^last_accessed:\s*[^\n]*$", re.MULTILINE)
+_SPEAKING_ACCESSED_AT_RE = re.compile(
+    r"^speaking_accessed_at:\s*[^\n]*$", re.MULTILINE
+)
 # Captures the date value (YYYY-MM-DD prefix) from a `last_accessed:` line.
 # Tolerates trailing time / timezone (e.g. `2026-05-19 12:38 EDT`) — only the
 # leading ISO date is required for the 7-day window check.
@@ -536,6 +539,17 @@ async def _bump_access(
             new_fm = _ACCESS_COUNT_RE.sub(f"access_count: {cur + 1}", new_fm, count=1)
         else:
             new_fm = new_fm.rstrip() + "\naccess_count: 1"
+        # Mirror the DB write of speaking_accessed_at into frontmatter so
+        # an index rebuild (which reseeds note_metrics from frontmatter)
+        # doesn't wipe the column back to NULL. Matches the datetime('now')
+        # precision the DB path uses.
+        now_ts = datetime.datetime.utcnow().isoformat(timespec="seconds")
+        if _SPEAKING_ACCESSED_AT_RE.search(new_fm):
+            new_fm = _SPEAKING_ACCESSED_AT_RE.sub(
+                f"speaking_accessed_at: {now_ts}", new_fm, count=1
+            )
+        else:
+            new_fm = new_fm.rstrip() + f"\nspeaking_accessed_at: {now_ts}"
         new_text = "---\n" + new_fm + "\n---\n" + text[fm_match.end() :]
         try:
             path.write_text(new_text, encoding="utf-8")

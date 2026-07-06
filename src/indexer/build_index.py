@@ -334,6 +334,7 @@ def collect_notes(vault: Path) -> list[dict]:
             "created": str(fm.get("created") or ""),
             "updated": str(fm.get("updated") or ""),
             "access_count": int(fm.get("access_count") or 0),
+            "speaking_accessed_at": fm.get("speaking_accessed_at") or None,
             "body": body,
             "_aliases": aliases,
             "_wikilink_targets": extract_wikilinks(body),
@@ -487,10 +488,15 @@ def build(vault: Path, db_path: Path) -> dict:
         # Seed note_metrics from frontmatter. Frontmatter is canonical;
         # the cue runner bumps both frontmatter and DB on each retrieval,
         # so reading from frontmatter on rebuild preserves accumulated counts.
+        # speaking_accessed_at is mirrored the same way — the DB write in
+        # _do_db_bump is fast-path telemetry; frontmatter is the durable
+        # store that survives a rebuild. last_queried is a schema ghost
+        # (no writer yet — task-0538) — seed NULL, keep the column.
         for r in records:
             conn.execute(
-                "INSERT INTO note_metrics(slug, access_count) VALUES(?, ?)",
-                (r["slug"], r["access_count"]),
+                "INSERT INTO note_metrics(slug, access_count, last_queried, "
+                "speaking_accessed_at) VALUES(?, ?, ?, ?)",
+                (r["slug"], r["access_count"], None, r["speaking_accessed_at"]),
             )
 
         conn.execute(

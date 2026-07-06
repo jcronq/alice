@@ -749,6 +749,58 @@ async def test_bump_access_db_write_failure_does_not_block_frontmatter(
     assert "access_count: 2" in note.read_text()
 
 
+@pytest.mark.asyncio
+async def test_bump_access_appends_speaking_accessed_at_to_frontmatter(
+    tmp_path: pathlib.Path,
+):
+    """The bump must mirror ``speaking_accessed_at`` into frontmatter so
+    an index rebuild — which reseeds ``note_metrics`` from frontmatter —
+    doesn't wipe the column back to NULL. Missing key → append; the
+    value must parse as an ISO datetime with second precision."""
+    note = tmp_path / "n.md"
+    note.write_text("---\ntitle: N\naccess_count: 0\n---\nbody\n")
+
+    await _bump_access(tmp_path, "n.md")
+
+    text = note.read_text()
+    # Extract the value the writer set. Regex mirrors the module-level one.
+    import re
+
+    m = re.search(r"^speaking_accessed_at:\s*(\S+)\s*$", text, re.MULTILINE)
+    assert m is not None, f"speaking_accessed_at missing from frontmatter: {text!r}"
+    # Round-trip the value through fromisoformat — proves the writer
+    # emitted a real ISO timestamp with second precision.
+    parsed = datetime.datetime.fromisoformat(m.group(1))
+    # Second precision means no microseconds component.
+    assert parsed.microsecond == 0, (
+        f"expected second-precision timestamp, got microsecond={parsed.microsecond}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_bump_access_updates_existing_speaking_accessed_at(
+    tmp_path: pathlib.Path,
+):
+    """When ``speaking_accessed_at`` is already present in frontmatter,
+    the bump must replace it in place (not append a duplicate line)."""
+    note = tmp_path / "n.md"
+    note.write_text(
+        "---\ntitle: N\naccess_count: 0\n"
+        "speaking_accessed_at: 2020-01-01T00:00:00\n---\nbody\n"
+    )
+
+    await _bump_access(tmp_path, "n.md")
+
+    text = note.read_text()
+    # Exactly one speaking_accessed_at line — no duplicate appended.
+    lines = [
+        ln for ln in text.splitlines() if ln.startswith("speaking_accessed_at:")
+    ]
+    assert len(lines) == 1, f"expected 1 speaking_accessed_at line, got {lines}"
+    # Old value replaced.
+    assert "2020-01-01T00:00:00" not in lines[0]
+
+
 # ---------------------------------------------------------------------------
 # Access-count recency boost (Phase 0 closure)
 #
