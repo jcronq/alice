@@ -44,6 +44,7 @@ Limitations
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import pathlib
 import re
@@ -103,12 +104,71 @@ class UnpropagatedCorrection:
     claim_changed: str
 
 
+#: Path (relative to ``mind``) of the human/thinking-authored allowlist
+#: of correction pairs that have been manually reviewed and confirmed as
+#: false positives. Pairs here are skipped by :func:`detect_corrections`.
+#: The detector treats this file as read-only — it never overwrites.
+_VERIFIED_PATH = pathlib.Path("inner") / "state" / "correction-cascade-verified.json"
+
+
+def _load_verified(mind: pathlib.Path) -> set[tuple[str, str]]:
+    """Load the manually-verified false-positive allowlist.
+
+    Returns an empty set when:
+    - The file doesn't exist (routine — allowlist not yet seeded).
+    - The file exists but is malformed JSON (log a warning, then treat
+      as empty rather than hard-failing the whole detection run).
+
+    Expected schema — pair order is ``[corrected_slug, correction_slug]``,
+    matching the ``(corrected_slug, correction_slug)`` skip check in
+    :func:`detect_corrections`:
+
+    .. code-block:: json
+
+        {
+          "verified": [
+            ["corrected-slug", "correction-slug"]
+          ]
+        }
+    """
+    path = mind / _VERIFIED_PATH
+    if not path.is_file():
+        return set()
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "correction_cascade: verified allowlist at %s malformed or unreadable "
+            "(%s) — treating as empty set",
+            path,
+            exc,
+        )
+        return set()
+
+    verified: set[tuple[str, str]] = set()
+    for pair in data.get("verified") or []:
+        # Accept lists or tuples with exactly two string slugs.
+        if isinstance(pair, (list, tuple)) and len(pair) == 2:
+            a, b = pair
+            if isinstance(a, str) and isinstance(b, str):
+                verified.add((a, b))
+    return verified
+
+
 @dataclasses.dataclass
 class CascadeReport:
     """Aggregated results from a detection run."""
 
     correction_pairs_checked: int = 0
     unpropagated: list[UnpropagatedCorrection] = dataclasses.field(default_factory=list)
+    #: Set of ``(corrected_slug, correction_slug)`` pairs that have been
+    #: manually reviewed and confirmed as false positives. Loaded from
+    #: ``inner/state/correction-cascade-verified.json`` at the start of
+    #: :func:`detect_corrections`. Pairs in this set are SKIPPED — no
+    #: cascade rows are emitted for them. Design:
+    #: ``cortex-memory/research/2026-07-07-correction-cascade-improvement-design.md``.
+    verified: set[tuple[str, str]] = dataclasses.field(default_factory=set)
 
     @property
     def total_unpropagated(self) -> int:
@@ -143,6 +203,10 @@ class CascadeReport:
                 }
                 for u in self.unpropagated
             ],
+            # Deterministic order so JSON serialization is stable across
+            # runs (sets are unordered). Rendered as list-of-lists rather
+            # than tuples for downstream JSON consumers.
+            "verified": sorted([list(pair) for pair in self.verified]),
         }
 
     def to_markdown_table(self) -> str:
@@ -420,11 +484,21 @@ def _find_corrected_note(
 
     # Strategy 4: check ``references:`` on the correction note.
     # Heuristic — the first reference might be the corrected note.
-    references = _fm.get("references")
-    if references:
-        target = _resolve_field_value(references, vault)
-        if target:
-            return target
+    #
+    # Guard: only fall through to this heuristic when the correction
+    # author did NOT state an explicit target via ``supersedes:`` or
+    # ``corrected_note:``. If either field was present but unresolvable
+    # (broken wikilink, moved note, typo), the author's intended target
+    # is known-unknown — falling through to ``references:`` risks
+    # picking up a context note as the "corrected" target and producing
+    # a false positive. See
+    # ``cortex-memory/research/2026-07-07-correction-cascade-improvement-design.md``.
+    if not supersedes and not corrected_note:
+        references = _fm.get("references")
+        if references:
+            target = _resolve_field_value(references, vault)
+            if target:
+                return target
 
     # Strategy 5: look in the correction body for wikilinks to other
     # notes. The first wikilink that isn't this note itself is likely
@@ -568,6 +642,16 @@ def detect_corrections(
     vault = mind / "cortex-memory"
     report = CascadeReport()
 
+    # Load the human/thinking-authored allowlist of confirmed false
+    # positives. Pairs here are skipped entirely — no cascade rows,
+    # no correction_pairs_checked bump. Missing / malformed → empty set.
+    report.verified = _load_verified(mind)
+    if report.verified:
+        logger.info(
+            "correction_cascade: loaded %d verified false-positive pair(s)",
+            len(report.verified),
+        )
+
     corrections = _find_correction_notes(vault)
     logger.info(
         "correction_cascade: found %d correction notes", len(corrections)
@@ -591,6 +675,21 @@ def detect_corrections(
 
         correction_slug = _slug_of(correction_md)
         corrected_slug = _slug_of(corrected_md)
+
+        # Skip pairs manually reviewed and confirmed as false positives.
+        # These do NOT count toward correction_pairs_checked — the pair
+        # was already accounted for on the run that first flagged it.
+        # Pair order: (corrected, correction) — matches the JSON schema
+        # and the design spec.
+        if (corrected_slug, correction_slug) in report.verified:
+            logger.info(
+                "correction_cascade: pair (corrected=%s, correction=%s) is in "
+                "verified allowlist — skipping",
+                corrected_slug,
+                correction_slug,
+            )
+            continue
+
         report.correction_pairs_checked += 1
 
         logger.info(
