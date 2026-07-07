@@ -1082,3 +1082,86 @@ def run(
         report.scanned += 1
         _process_one(note, vault, journal_path, report, on_route=on_route)
     return report
+
+
+# ---------- predicate extraction (typed-edge Phase 1) ----------
+
+
+def run_predicate_extraction(
+    mind_root: pathlib.Path,
+    *,
+    schema_path: Optional[pathlib.Path] = None,
+    state_path: Optional[pathlib.Path] = None,
+    db_path: Optional[pathlib.Path] = None,
+    force_full: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Extract GBrain-style typed edges from vault notes.
+
+    Runs as a separate operation after Stage B's inbox drain — the
+    inbox notes have already been promoted into the vault (via the
+    memory worker's routing chain), so scanning the vault picks up
+    the newly-consumed content.
+
+    Parameters
+    ----------
+    mind_root
+        Root of ``~/alice-mind/`` (same as :func:`run`'s ``vault``).
+    schema_path
+        Override for the schema-pack YAML. Defaults to
+        ``mind_root/config/typed_edges_schema.yaml``.
+    state_path
+        Override for the state file. Defaults to
+        ``mind_root/config/typed_edges_state.json``.
+    db_path
+        Override for the cortex-index DB. Defaults to
+        ``mind_root/inner/state/cortex-index.db``.
+    force_full
+        Force a full-vault sweep, ignoring ``last_run_at``.
+
+    Returns the extraction report as a dict, or ``None`` if the
+    schema pack or DB isn't present (extraction is best-effort — a
+    missing schema shouldn't kill the memory worker).
+    """
+    # Deferred import so tests that don't exercise extraction don't
+    # pay the module-load cost.
+    from alice_thinking.memory_worker import predicate_extraction
+
+    schema_path = schema_path or mind_root / "config" / "typed_edges_schema.yaml"
+    state_path = state_path or mind_root / "config" / "typed_edges_state.json"
+    db_path = db_path or mind_root / "inner" / "state" / "cortex-index.db"
+    vault_root = mind_root / "cortex-memory"
+
+    if not schema_path.exists():
+        logger.info(
+            "memory-worker stage_b: typed_edges schema pack missing at %s — "
+            "skipping predicate extraction",
+            schema_path,
+        )
+        return None
+    if not db_path.exists():
+        logger.info(
+            "memory-worker stage_b: cortex-index.db missing at %s — "
+            "skipping predicate extraction",
+            db_path,
+        )
+        return None
+    if not vault_root.exists():
+        logger.info(
+            "memory-worker stage_b: vault root missing at %s — "
+            "skipping predicate extraction",
+            vault_root,
+        )
+        return None
+
+    report = predicate_extraction.extract_all(
+        vault_root, db_path, schema_path, state_path, force_full=force_full
+    )
+    logger.info(
+        "memory-worker stage_b: predicate extraction wrote %d typed edges "
+        "over %d notes in %.3fs (%s)",
+        report.edges_written,
+        report.notes_scanned,
+        report.elapsed_seconds,
+        report.edges_by_type,
+    )
+    return report.to_dict()
