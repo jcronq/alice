@@ -51,7 +51,7 @@ def test_sdk_auth_smoke() -> None:
 
     async def go() -> str:
         opts = ClaudeAgentOptions(
-            model="claude-sonnet-4-6",
+            model="claude-sonnet-5",
             allowed_tools=[],
             system_prompt=load_prompt("meta.sanity"),
         )

@@ -268,7 +268,7 @@ Shape (first draft — will grow):
     "bypass_quiet_hours": true
   },
   "thinking": {
-    "model": "claude-sonnet-4-6",
+    "model": "claude-sonnet-5",
     "cadence_minutes": 30,
     "max_wake_seconds": 600,
     "allowed_tools": ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch"],
@@ -278,7 +278,7 @@ Shape (first draft — will grow):
     }
   },
   "tasks": {
-    "default_model": "claude-sonnet-4-6",
+    "default_model": "claude-sonnet-5",
     "concurrent_cap": 4,
     "allowed_tools": ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch"]
   }

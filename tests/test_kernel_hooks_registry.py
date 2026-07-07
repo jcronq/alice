@@ -76,7 +76,7 @@ def _reset_registry():
 
 @pytest.fixture
 def spec() -> KernelSpec:
-    return KernelSpec(model="claude-sonnet-4-5", allowed_tools=["Read"])
+    return KernelSpec(model="claude-sonnet-5", allowed_tools=["Read"])
 
 
 @pytest.fixture

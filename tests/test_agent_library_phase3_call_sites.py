@@ -207,7 +207,7 @@ async def test_review_via_agent_library_uses_registered_reviewer_spec(
     monkeypatch.setattr(agent_library_pkg, "run_agent", _fake_run_agent)
 
     runner = design_pipeline.SubAgentRunner(
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         system_prompt="DESIGN_REVIEWER_SYSTEM_PROMPT_TEST",
         max_seconds=120,
     )
@@ -223,7 +223,7 @@ async def test_review_via_agent_library_uses_registered_reviewer_spec(
     # Per-call override pinned the kernel_spec to the runner's model /
     # max_seconds / system prompt, and the policy was cleared so the
     # explicit allowed_tools=[] override stays empty.
-    assert agent.kernel_spec.model == "claude-sonnet-4-6"
+    assert agent.kernel_spec.model == "claude-sonnet-5"
     assert agent.kernel_spec.max_seconds == 120
     assert agent.kernel_spec.allowed_tools == []
     assert agent.kernel_spec.append_system_prompt == "DESIGN_REVIEWER_SYSTEM_PROMPT_TEST"
@@ -252,7 +252,7 @@ async def test_review_via_agent_library_does_not_mutate_registered_spec(
     monkeypatch.setattr(agent_library_pkg, "run_agent", _fake_run_agent)
 
     runner = design_pipeline.SubAgentRunner(
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         system_prompt="EPHEMERAL_PROMPT",
     )
     await runner._review_via_agent_library("hello")

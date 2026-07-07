@@ -275,7 +275,7 @@ def test_stage_override_applies_when_configured(monkeypatch, tmp_path) -> None:
             active:
               backend: subscription
               harness: claude-code
-              model: claude-sonnet-4-6
+              model: claude-sonnet-5
         """,
     )
     captured = _stub_main_dependencies(monkeypatch, tmp_path, phase_value=Phase.ACTIVE)
@@ -300,14 +300,14 @@ def test_stage_override_applies_when_configured(monkeypatch, tmp_path) -> None:
     backend = runs[-1]["backend"]
     assert backend.backend == "subscription"
     assert backend.harness == "claude-code"
-    assert backend.model == "claude-sonnet-4-6"
+    assert backend.model == "claude-sonnet-5"
 
     events = captured["events_in"]
     overrides = [f for ev, f in events if ev == "stage_backend_override"]
     assert overrides, f"no stage_backend_override event in {events!r}"
     assert overrides[0]["phase"] == "active"
     assert overrides[0]["backend"] == "subscription"
-    assert overrides[0]["model"] == "claude-sonnet-4-6"
+    assert overrides[0]["model"] == "claude-sonnet-5"
 
 
 def test_stage_override_absent_leaves_thinking_spec_unchanged(
@@ -368,7 +368,7 @@ def test_cli_backend_flag_wins_over_stage_override(monkeypatch, tmp_path) -> Non
             active:
               backend: subscription
               harness: claude-code
-              model: claude-sonnet-4-6
+              model: claude-sonnet-5
         """,
     )
     captured = _stub_main_dependencies(monkeypatch, tmp_path, phase_value=Phase.ACTIVE)

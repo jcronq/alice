@@ -133,7 +133,7 @@ DEFAULT_TIMEOUT_SECONDS = 30 * 60
 # leaves it unset. A get-default would return "" and dispatch ``--model ""``,
 # which the API rejects with "model: String should have at least 1 character".
 DEFAULT_SUBAGENT_MODEL = (
-    os.environ.get("ALICE_EXPERIMENT_SUBAGENT_MODEL") or "claude-sonnet-4-6"
+    os.environ.get("ALICE_EXPERIMENT_SUBAGENT_MODEL") or "claude-sonnet-5"
 )
 
 

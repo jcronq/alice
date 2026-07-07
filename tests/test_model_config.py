@@ -41,13 +41,13 @@ def test_load_minimal_config(tmp_path: pathlib.Path) -> None:
           model: claude-opus-4-7
         thinking:
           backend: subscription
-          model: claude-sonnet-4-6
+          model: claude-sonnet-5
         """,
     )
     cfg = load(tmp_path)
     assert cfg.speaking == BackendSpec(backend="subscription", model="claude-opus-4-7")
     assert cfg.thinking == BackendSpec(
-        backend="subscription", model="claude-sonnet-4-6"
+        backend="subscription", model="claude-sonnet-5"
     )
     # Viewer absent → defaults to subscription with no model override.
     assert cfg.viewer.backend == "subscription"
@@ -371,7 +371,7 @@ def test_stage_block_overrides_backend_harness_and_model() -> None:
                 "stages": {
                     "sleep_d": {
                         "backend": "subscription",
-                        "model": "claude-sonnet-4-6",
+                        "model": "claude-sonnet-5",
                         "harness": "claude-code",
                     },
                 },
@@ -382,7 +382,7 @@ def test_stage_block_overrides_backend_harness_and_model() -> None:
     assert spec is not None
     assert spec.backend == "subscription"
     assert spec.harness == "claude-code"
-    assert spec.model == "claude-sonnet-4-6"
+    assert spec.model == "claude-sonnet-5"
 
 
 def test_stage_block_unknown_stage_key_raises() -> None:

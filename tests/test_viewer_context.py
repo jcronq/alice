@@ -31,7 +31,7 @@ from viewer import context_probe_client
 def _example_snapshot() -> dict:
     return {
         "ts": 1000.0,
-        "model": "claude-sonnet-4-5",
+        "model": "claude-sonnet-5",
         "backend": "subscription",
         "session_id": "s-1",
         "system_prompt": {"chars": 14, "text": "you are alice."},
@@ -108,7 +108,7 @@ def _make_probe(**overrides) -> ContextProbe:
         "get_session_id": lambda: "sess-abc",
         "get_pending_preamble": lambda: None,
         "get_current_turn_kind": lambda: None,
-        "get_model": lambda: "claude-sonnet-4-5",
+        "get_model": lambda: "claude-sonnet-5",
         "get_backend": lambda: "subscription",
         "get_mind_dir": lambda: "/m",
         "get_skills_cwd": lambda: "/s",
@@ -163,7 +163,7 @@ def test_fetch_snapshot_returns_snapshot_payload(tmp_path, loop_thread):
     finally:
         _run(loop_thread, transport.stop())
     assert snapshot["session_id"] == "sess-abc"
-    assert snapshot["model"] == "claude-sonnet-4-5"
+    assert snapshot["model"] == "claude-sonnet-5"
     assert snapshot["tools"]["count"] == 2 + 1
 
 

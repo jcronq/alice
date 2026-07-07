@@ -32,7 +32,7 @@ def _build(**overrides):
         "get_session_id": lambda: "sess-abc",
         "get_pending_preamble": lambda: None,
         "get_current_turn_kind": lambda: None,
-        "get_model": lambda: "claude-sonnet-4-5-20250929",
+        "get_model": lambda: "claude-sonnet-5",
         "get_backend": lambda: "subscription",
         "get_mind_dir": lambda: "/home/alice/alice-mind",
         "get_skills_cwd": lambda: "/state/alice-skills/speaking",
@@ -165,5 +165,5 @@ def test_to_dict_roundtrips_through_dataclass_asdict():
     snap = probe.snapshot()
     d = snap.to_dict()
     assert d["session_id"] == "sess-abc"
-    assert d["model"] == "claude-sonnet-4-5-20250929"
+    assert d["model"] == "claude-sonnet-5"
     assert d["tools"]["count"] == 5
