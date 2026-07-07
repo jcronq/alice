@@ -139,7 +139,7 @@ Three backends are supported through the Claude Agent SDK:
   `~/.aws/:/home/alice/.aws/:ro` mounted; add to `docker-compose.yml`.
   Bedrock model IDs differ from the subscription ones — they look
   like `anthropic.claude-sonnet-4-5-20250929-v1:0` rather than
-  `claude-sonnet-4-6`.
+  `claude-sonnet-5`.
 
 Each hemisphere (speaking, thinking, viewer) picks its own backend +
 model. When `model.yml` is absent every hemisphere falls back to

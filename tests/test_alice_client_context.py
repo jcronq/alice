@@ -54,7 +54,7 @@ def _make_probe(**overrides) -> ContextProbe:
         "get_session_id": lambda: "sess-cli",
         "get_pending_preamble": lambda: None,
         "get_current_turn_kind": lambda: None,
-        "get_model": lambda: "claude-sonnet-4-5",
+        "get_model": lambda: "claude-sonnet-5",
         "get_backend": lambda: "subscription",
         "get_mind_dir": lambda: "/m",
         "get_skills_cwd": lambda: "/s",
@@ -108,7 +108,7 @@ def test_human_mode_prints_readable_summary(
     assert rc == 0
     out = capsys.readouterr().out
     assert "alice context snapshot" in out
-    assert "claude-sonnet-4-5" in out
+    assert "claude-sonnet-5" in out
     assert "sess-cli" in out
     assert "system prompt: 14 chars" in out
     assert "tools:        4 total (2 builtin + 2 custom)" in out

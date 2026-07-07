@@ -31,7 +31,7 @@ def _make_probe(**overrides) -> ContextProbe:
         "get_session_id": lambda: "sess-xyz",
         "get_pending_preamble": lambda: None,
         "get_current_turn_kind": lambda: None,
-        "get_model": lambda: "claude-sonnet-4-5",
+        "get_model": lambda: "claude-sonnet-5",
         "get_backend": lambda: "subscription",
         "get_mind_dir": lambda: "/m",
         "get_skills_cwd": lambda: "/s",
@@ -148,7 +148,7 @@ def test_context_request_returns_snapshot(tmp_path, loop_thread):
     assert "done" in types
     snap = next(e for e in events if e["type"] == "context_snapshot")
     assert snap["data"]["session_id"] == "sess-xyz"
-    assert snap["data"]["model"] == "claude-sonnet-4-5"
+    assert snap["data"]["model"] == "claude-sonnet-5"
     assert snap["data"]["tools"]["count"] == 2 + 1
     assert snap["data"]["system_prompt"]["text"] == "you are alice."
 
