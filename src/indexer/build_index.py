@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from yaml_lite import extract_wikilinks, split_frontmatter  # noqa: E402
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Belt-and-suspenders frontmatter stripper applied to the raw file text
 # before ``split_frontmatter`` runs. ``split_frontmatter`` is line-based
@@ -128,6 +128,27 @@ CREATE VIRTUAL TABLE notes_fts USING fts5(
     content_rowid='rowid',
     tokenize='porter unicode61'
 );
+
+-- Typed edges (Phase 1: GBrain-style deterministic predicate extraction).
+-- Populated by the memory worker's Stage B; the indexer only creates the
+-- shape. See cortex-memory/research/2026-07-07-gbrain-predicate-extraction-design.md
+-- and alice_thinking/memory_worker/stage_b.py::_extract_typed_edges.
+CREATE TABLE typed_edges (
+    id             INTEGER PRIMARY KEY,
+    from_slug      TEXT NOT NULL,
+    to_slug        TEXT NOT NULL,
+    link_type      TEXT NOT NULL,
+    link_source    TEXT NOT NULL DEFAULT 'predicate',
+    context        TEXT,
+    confidence     TEXT NOT NULL DEFAULT 'high',
+    created_at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(from_slug, to_slug, link_type, link_source)
+);
+
+CREATE INDEX idx_typed_edges_from ON typed_edges(from_slug);
+CREATE INDEX idx_typed_edges_to ON typed_edges(to_slug);
+CREATE INDEX idx_typed_edges_type ON typed_edges(link_type);
 """
 
 FTS_TRIGGERS_SQL = """
