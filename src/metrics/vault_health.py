@@ -1932,6 +1932,126 @@ def _event_structural_debt(event: dict[str, Any]) -> int:
     return event.get("orphan_notes", 0) + event.get("broken_wikilinks", 0)
 
 
+# Default lookback for the observation-only trend fields introduced by
+# [[recovery-classification-improvement]]. N=10 vault_health events is
+# ~3-4 days of active-mode data. The pre-dispatch baseline analysis
+# [[2026-06-30-tier1-trend-observation-baseline]] found R² is often
+# negative at this window size; that's expected — the observation-only
+# rollout exists precisely to collect the data needed to tune this.
+_TREND_LOOKBACK_EVENTS = 10
+
+
+def _linear_regression_r_squared(x: list[float], y: list[float]) -> float:
+    """Coefficient of determination for the OLS fit of y on x.
+
+    Returns 0.0 for pathological inputs (fewer than 2 points, zero
+    variance in x, or zero variance in y). Values in [0, 1] indicate
+    the fraction of variance in ``y`` explained by the linear fit.
+    Values below 0 are clipped to 0 — negative R² means the fit is
+    worse than the mean, which for the significance question is the
+    same signal as "no linear structure" (i.e., 0).
+
+    Paired with :func:`_linear_regression_slope` as the significance
+    indicator for the observation-only trend fields (see
+    [[recovery-classification-improvement]]). Prefer this over a
+    Student-t p-value because the vault_health series is short (N=10)
+    and non-independent; a proper p-value would require assumptions
+    we can't validate, while R² is a defensible descriptive statistic
+    that matches the pre-dispatch baseline analysis.
+    """
+    n = len(x)
+    if n < 2 or len(y) != n:
+        return 0.0
+    mean_x = sum(x) / n
+    mean_y = sum(y) / n
+    ss_xx = sum((xi - mean_x) ** 2 for xi in x)
+    ss_yy = sum((yi - mean_y) ** 2 for yi in y)
+    if ss_xx == 0.0 or ss_yy == 0.0:
+        return 0.0
+    ss_xy = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
+    slope = ss_xy / ss_xx
+    intercept = mean_y - slope * mean_x
+    ss_res = sum((yi - (slope * xi + intercept)) ** 2 for xi, yi in zip(x, y))
+    r_squared = 1.0 - (ss_res / ss_yy)
+    if r_squared < 0.0:
+        return 0.0
+    if r_squared > 1.0:
+        return 1.0
+    return r_squared
+
+
+def _extract_recovery_tier1_ratio(event: dict[str, Any]) -> float | None:
+    """Pull ``tier_1_ratio`` out of a vault_health event.
+
+    Production events nest recovery fields under ``recovery_state``
+    (per ``memory/EVENTS-SCHEMA.md §vault_health``). Older or
+    test-synthesized events may inline the field at the top level;
+    accept both shapes so the trend series survives event-format
+    drift.
+    """
+    rs = event.get("recovery_state")
+    if isinstance(rs, dict) and "tier_1_ratio" in rs:
+        return rs.get("tier_1_ratio")
+    return event.get("tier_1_ratio")
+
+
+def _extract_recovery_debt_delta(event: dict[str, Any]) -> float | None:
+    """Pull ``structural_debt_delta`` out of a vault_health event.
+
+    See :func:`_extract_recovery_tier1_ratio` for shape rationale.
+    """
+    rs = event.get("recovery_state")
+    if isinstance(rs, dict) and "structural_debt_delta" in rs:
+        return rs.get("structural_debt_delta")
+    return event.get("structural_debt_delta")
+
+
+def _trend_over_last_events(
+    events: list[dict[str, Any]],
+    field_extractor: Any,
+    n: int = _TREND_LOOKBACK_EVENTS,
+) -> tuple[float | None, float | None]:
+    """Slope + R² over the last ``n`` vault_health events for one field.
+
+    ``field_extractor`` is a callable that receives a vault_health
+    event dict and returns a ``float | int | None`` value. ``None``
+    (missing or explicitly null — active_burst events carry
+    ``tier_1_ratio: null``) causes the event to be skipped, matching
+    the baseline analysis which excludes burst events from the trend
+    window.
+
+    Returns ``(slope, r_squared)``. Both are ``None`` if fewer than 3
+    usable events are available — the slope of a 2-point line is
+    trivially defined but carries no meaningful trend information, and
+    R² is undefined for N<3.
+
+    The ``x`` axis is the event's sequence index in the tail (0, 1,
+    2, ...) — units are "per event," not "per day." At N=10 events and
+    ~3 vault_health events per day, 1 unit ≈ 8 hours. The
+    ``recovery-classification-improvement`` design note is explicit
+    about this units convention.
+    """
+    values: list[float] = []
+    for evt in events:
+        if evt.get("type") != "vault_health":
+            continue
+        raw = field_extractor(evt)
+        if raw is None:
+            continue
+        try:
+            values.append(float(raw))
+        except (TypeError, ValueError):
+            continue
+    # events.jsonl is oldest-first; take the last N usable values.
+    tail = values[-n:]
+    if len(tail) < 3:
+        return None, None
+    x_vals = [float(i) for i in range(len(tail))]
+    slope = _linear_regression_slope(x_vals, tail)
+    r_squared = _linear_regression_r_squared(x_vals, tail)
+    return slope, r_squared
+
+
 def compute_recovery_state(
     vault_dir: Path,
     thoughts_dir: Path,
@@ -1964,6 +2084,15 @@ def compute_recovery_state(
 
     Default when no burst is active and no window data available:
     ``{"status": "baseline", "window": "N/A"}``.
+
+    **Observation-only trend fields:** ``tier_1_trend``,
+    ``tier_1_trend_significance``, and ``structural_debt_trend`` are
+    additive data-collection fields introduced by
+    [[recovery-classification-improvement]]. They are computed from
+    the last :data:`_TREND_LOOKBACK_EVENTS` vault_health events read
+    from ``events.jsonl`` and do NOT influence the classification
+    (``status`` or ``estimated_recovery_tier``). All three are
+    ``None`` when insufficient history is available.
     """
     if window_start is None:
         window_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=14)
@@ -2003,6 +2132,17 @@ def compute_recovery_state(
         elif len(last_night_counts) >= 2:
             # last_night_dates is newest-first (we iterate reversed events),
             # so the oldest streak day — the burst start — is the last entry.
+            # Trend fields still computed from prior (pre-burst) vault_health
+            # events — they observe the recovery signal, not the burst itself.
+            # Fields live under event['recovery_state'] in production events
+            # (see EVENTS-SCHEMA.md §vault_health); older/test-shaped events
+            # may inline them at the top level, so fall back accordingly.
+            burst_t1_trend, burst_t1_sig = _trend_over_last_events(
+                events, _extract_recovery_tier1_ratio
+            )
+            burst_debt_trend, _ = _trend_over_last_events(
+                events, _extract_recovery_debt_delta
+            )
             return {
                 "status": "active_burst",
                 "tier_1_ratio": None,
@@ -2011,6 +2151,9 @@ def compute_recovery_state(
                 "estimated_recovery_tier": "R0",
                 "burst_start_date": last_night_dates[-1] if last_night_dates else None,
                 "day_in_window": len(last_night_dates),
+                "tier_1_trend": burst_t1_trend,
+                "tier_1_trend_significance": burst_t1_sig,
+                "structural_debt_trend": burst_debt_trend,
             }
 
     # --- Compute three signals ---
@@ -2149,6 +2292,25 @@ def compute_recovery_state(
     else:
         tier_label = "N/A"
 
+    # --- Observation-only trend fields ---
+    # Compute directional trends over the last N vault_health events.
+    # These are ADDITIVE data-collection fields (see
+    # [[recovery-classification-improvement]]) — they do NOT influence
+    # the classification decisions above. Empty/no-history →
+    # (None, None, None). Reads events.jsonl fresh; classification
+    # path may not have loaded events (no events_path passed).
+    tier1_trend: float | None = None
+    tier1_trend_sig: float | None = None
+    debt_trend: float | None = None
+    if events_path and events_path.exists():
+        trend_events = _read_events_jsonl(events_path)
+        tier1_trend, tier1_trend_sig = _trend_over_last_events(
+            trend_events, _extract_recovery_tier1_ratio
+        )
+        debt_trend, _ = _trend_over_last_events(
+            trend_events, _extract_recovery_debt_delta
+        )
+
     return {
         "status": status,
         "tier_1_ratio": tier1_ratio,
@@ -2157,6 +2319,9 @@ def compute_recovery_state(
         "estimated_recovery_tier": tier_label,
         "burst_start_date": None,
         "day_in_window": None,
+        "tier_1_trend": tier1_trend,
+        "tier_1_trend_significance": tier1_trend_sig,
+        "structural_debt_trend": debt_trend,
     }
 
 

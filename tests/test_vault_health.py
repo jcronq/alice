@@ -1129,6 +1129,239 @@ def test_recovery_state_active_burst_metadata(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Observation-only trend fields: [[recovery-classification-improvement]]
+# Additive fields (tier_1_trend, tier_1_trend_significance,
+# structural_debt_trend) computed from the last N vault_health events
+# in events.jsonl. Data-collection only — MUST NOT influence
+# classification.
+# ---------------------------------------------------------------------------
+
+
+def _write_recovery_event(
+    path: Path,
+    date_str: str,
+    *,
+    tier_1_ratio: float | None = None,
+    structural_debt_delta: int | None = None,
+) -> None:
+    """Append a vault_health event with recovery_state populated."""
+    recovery_state: dict = {"status": "recovering"}
+    if tier_1_ratio is not None:
+        recovery_state["tier_1_ratio"] = tier_1_ratio
+    if structural_debt_delta is not None:
+        recovery_state["structural_debt_delta"] = structural_debt_delta
+    evt = {
+        "ts": f"{date_str}T08:00:00-04:00",
+        "type": "vault_health",
+        "date": date_str,
+        "recovery_state": recovery_state,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(evt) + "\n")
+
+
+def _synth_recovery_events(
+    path: Path, tier1_series: list[float], debt_series: list[int] | None = None
+) -> None:
+    """Write a chronological run of vault_health events with the given series."""
+    if debt_series is None:
+        debt_series = [0] * len(tier1_series)
+    base = datetime(2026, 5, 1)
+    for i, (r, d) in enumerate(zip(tier1_series, debt_series)):
+        day = (base + timedelta(days=i)).strftime("%Y-%m-%d")
+        _write_recovery_event(
+            path, day, tier_1_ratio=r, structural_debt_delta=d
+        )
+
+
+def _run_recovery(vault: Path, thoughts: Path, events: Path, end: datetime) -> dict:
+    ws = end - timedelta(days=14)
+    return compute_recovery_state(
+        vault, thoughts, window_start=ws, window_end=end, events_path=events
+    )
+
+
+def test_recovery_state_trend_fields_present(tmp_path: Path) -> None:
+    """The three trend fields are always in the returned dict, even when None."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    events = tmp_path / "events.jsonl"  # doesn't exist
+
+    result = _run_recovery(vault, thoughts, events, datetime(2026, 5, 15))
+    assert "tier_1_trend" in result
+    assert "tier_1_trend_significance" in result
+    assert "structural_debt_trend" in result
+    # No history → None.
+    assert result["tier_1_trend"] is None
+    assert result["tier_1_trend_significance"] is None
+    assert result["structural_debt_trend"] is None
+
+
+def test_recovery_state_trend_ascending_positive_slope(tmp_path: Path) -> None:
+    """Strictly-ascending tier_1_ratio → positive tier_1_trend + high R²."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    # 10 ascending points, monotonically increasing.
+    series = [0.10 + 0.005 * i for i in range(10)]
+    _synth_recovery_events(events, series)
+
+    result = _run_recovery(vault, thoughts, events, datetime(2026, 5, 20))
+    assert result["tier_1_trend"] is not None
+    assert result["tier_1_trend"] > 0.0
+    # Perfect linear ascent → R² near 1.0.
+    assert result["tier_1_trend_significance"] is not None
+    assert result["tier_1_trend_significance"] > 0.95
+
+
+def test_recovery_state_trend_descending_negative_slope(tmp_path: Path) -> None:
+    """Strictly-descending tier_1_ratio → negative tier_1_trend."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    series = [0.30 - 0.005 * i for i in range(10)]
+    _synth_recovery_events(events, series)
+
+    result = _run_recovery(vault, thoughts, events, datetime(2026, 5, 20))
+    assert result["tier_1_trend"] is not None
+    assert result["tier_1_trend"] < 0.0
+    assert result["tier_1_trend_significance"] is not None
+    assert result["tier_1_trend_significance"] > 0.95
+
+
+def test_recovery_state_trend_flat_noise_insignificant(tmp_path: Path) -> None:
+    """Flat oscillating noise → near-zero slope AND low R² (insignificant)."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    # Deterministic zero-mean noise around 0.20 — no trend, low R².
+    noise = [+0.001, -0.001, +0.002, -0.002, +0.001, -0.001, +0.002, -0.002, +0.001, -0.001]
+    series = [0.20 + n for n in noise]
+    _synth_recovery_events(events, series)
+
+    result = _run_recovery(vault, thoughts, events, datetime(2026, 5, 20))
+    assert result["tier_1_trend"] is not None
+    # Slope is dominated by noise → tiny absolute value.
+    assert abs(result["tier_1_trend"]) < 0.001
+    # R² clamps to 0 when the linear fit is no better than the mean.
+    assert result["tier_1_trend_significance"] is not None
+    assert result["tier_1_trend_significance"] < 0.3
+
+
+def test_recovery_state_structural_debt_trend_reads_debt_delta_history(
+    tmp_path: Path,
+) -> None:
+    """structural_debt_trend follows the historical structural_debt_delta series."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    # Debt-delta series climbing from -5 to +4 (getting worse).
+    tier1_series = [0.20] * 10  # flat tier_1_ratio; debt is the interesting axis
+    debt_series = list(range(-5, 5))
+    _synth_recovery_events(events, tier1_series, debt_series)
+
+    result = _run_recovery(vault, thoughts, events, datetime(2026, 5, 20))
+    assert result["structural_debt_trend"] is not None
+    assert result["structural_debt_trend"] > 0.0
+
+
+def test_recovery_state_trend_fields_do_not_change_status(tmp_path: Path) -> None:
+    """Adding trend fields must not alter the existing classification.
+
+    Compare `status`, `estimated_recovery_tier`, `tier_1_ratio`,
+    `output_rate_slope`, `structural_debt_delta` against the values
+    produced when trend history is present vs absent. The three
+    trend fields are the ONLY dict keys that should differ.
+    """
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    events_with_history = tmp_path / "with_history.jsonl"
+    events_no_history = tmp_path / "no_history.jsonl"
+
+    # Two anchor events for the debt_delta computation (start/end
+    # boundaries). These are identical in both files so the
+    # classification path sees the same signal.
+    for evt_path in (events_with_history, events_no_history):
+        _write_event(evt_path, "2026-05-01T08:00:00-04:00", {
+            "date": "2026-05-01",
+            "total_notes": 100,
+            "orphan_notes": 6,
+            "broken_wikilinks": 4,
+        })
+        _write_event(evt_path, "2026-05-10T08:00:00-04:00", {
+            "date": "2026-05-10",
+            "total_notes": 105,
+            "orphan_notes": 3,
+            "broken_wikilinks": 2,
+        })
+
+    # Add 10 ascending recovery_state events ONLY to the history file,
+    # BEFORE the 2026-05-01 boundary. These add a strong positive
+    # tier_1_ratio trend signal without disturbing the debt-delta
+    # computation: each carries the same top-level orphan_notes /
+    # broken_wikilinks as the 2026-05-01 anchor (6/4 → debt=10), so
+    # the newest pre-window event (2026-04-24) matches the 2026-05-01
+    # event's debt value. The debt path picks the newest event <=
+    # window_start; whether that's 04-24 or 05-01, the value is 10.
+    for i in range(10):
+        day = (datetime(2026, 4, 15) + timedelta(days=i)).strftime("%Y-%m-%d")
+        evt = {
+            "ts": f"{day}T08:00:00-04:00",
+            "type": "vault_health",
+            "date": day,
+            "orphan_notes": 6,
+            "broken_wikilinks": 4,
+            "recovery_state": {
+                "status": "recovering",
+                "tier_1_ratio": 0.10 + 0.01 * i,
+                "structural_debt_delta": -i,
+            },
+        }
+        with open(events_with_history, "a") as f:
+            f.write(json.dumps(evt) + "\n")
+
+    we = datetime(2026, 5, 10, 7, 0, 0)
+    ws = we - timedelta(days=14)
+    with_history = compute_recovery_state(
+        vault, thoughts, window_start=ws, window_end=we, events_path=events_with_history
+    )
+    without_history = compute_recovery_state(
+        vault, thoughts, window_start=ws, window_end=we, events_path=events_no_history
+    )
+
+    # Classification-critical fields are byte-identical.
+    for key in (
+        "status",
+        "tier_1_ratio",
+        "output_rate_slope",
+        "structural_debt_delta",
+        "estimated_recovery_tier",
+    ):
+        assert with_history[key] == without_history[key], key
+
+    # Only the trend fields differ.
+    diff_keys = {
+        k for k in with_history
+        if with_history.get(k) != without_history.get(k)
+    }
+    assert diff_keys <= {"tier_1_trend", "tier_1_trend_significance", "structural_debt_trend"}
+    # And the trend fields ARE populated when history exists.
+    assert with_history["tier_1_trend"] is not None
+    assert with_history["structural_debt_trend"] is not None
+
+
+# ---------------------------------------------------------------------------
 # Research note decay: [[2026-05-09-research-note-decay-metric]]
 # Count research/ notes older than 60 days with fewer than 2 inbound links.
 # Age determined by the `created:` frontmatter field.
