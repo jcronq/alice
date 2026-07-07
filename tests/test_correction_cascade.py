@@ -28,6 +28,7 @@ from alice_thinking.memory_worker.correction_cascade import (
     _find_notes_referencing,
     _frontmatter_read,
     _has_specific_quantitative_correction,
+    _load_verified,
     _resolve_field_value,
     _slug_of,
     _try_resolve_slug,
@@ -980,3 +981,312 @@ class TestFindCorrectedNotePriority:
 
         result = _find_corrected_note(correction, vault)
         assert result == bar
+
+
+# ── Improvement 1: strategy-4 guard on explicit-target presence ──────
+#
+# See ``cortex-memory/research/2026-07-07-correction-cascade-improvement-design.md``
+# and the false-positive pattern note referenced from there.
+#
+# The bug: a correction note with ``supersedes: [[broken-slug]]`` (field
+# present but wikilink unresolvable) used to fall through to strategy 4
+# and pick up an unrelated ``references:`` target as the corrected note.
+# The fix guards strategy 4 to only fire when BOTH ``supersedes:`` and
+# ``corrected_note:`` are absent from the frontmatter.
+
+
+class TestStrategy4Guard:
+    """Verify strategy 4 (references: fallback) respects explicit-target
+    field presence."""
+
+    def test_broken_supersedes_does_not_fall_through_to_references(self, tmp_path):
+        """A correction with ``supersedes:`` pointing to a nonexistent slug
+        must NOT quietly pick up the ``references:`` target — that produced
+        the 22% false-positive rate documented in the pattern note.
+        """
+        vault = tmp_path / "cortex-memory"
+        vault.mkdir()
+        (vault / "reference").mkdir()
+
+        # references: target exists (would resolve if strategy 4 ran).
+        (vault / "reference" / "unrelated-context.md").write_text(
+            "---\n---\ncontext note", encoding="utf-8"
+        )
+
+        # supersedes: target doesn't resolve.
+        correction = vault / "reference" / "foo-correction.md"
+        correction.write_text(
+            "---\nnote_type: correction\n"
+            "supersedes: [[nonexistent-slug]]\n"
+            "references: [[unrelated-context]]\n"
+            "---\nfixed something",
+            encoding="utf-8",
+        )
+
+        assert _find_corrected_note(correction, vault) is None
+
+    def test_broken_corrected_note_does_not_fall_through(self, tmp_path):
+        """Same guard for ``corrected_note:`` — if the author stated a
+        target and it didn't resolve, don't guess."""
+        vault = tmp_path / "cortex-memory"
+        vault.mkdir()
+        (vault / "reference").mkdir()
+
+        (vault / "reference" / "unrelated-context.md").write_text(
+            "---\n---\ncontext", encoding="utf-8"
+        )
+
+        correction = vault / "reference" / "foo-correction.md"
+        correction.write_text(
+            "---\nnote_type: correction\n"
+            "corrected_note: [[nonexistent-slug]]\n"
+            "references: [[unrelated-context]]\n"
+            "---\nfixed",
+            encoding="utf-8",
+        )
+
+        assert _find_corrected_note(correction, vault) is None
+
+    def test_references_fallback_still_works_when_no_explicit_target(
+        self, tmp_path
+    ):
+        """Backwards compat: when NEITHER ``supersedes:`` nor
+        ``corrected_note:`` is present, strategy 4 must still resolve via
+        ``references:`` (this is the legitimate fallback path)."""
+        vault = tmp_path / "cortex-memory"
+        vault.mkdir()
+        (vault / "reference").mkdir()
+
+        target = vault / "reference" / "real-target.md"
+        target.write_text("---\n---\nreal target", encoding="utf-8")
+
+        # No supersedes, no corrected_note — only references.
+        correction = vault / "reference" / "foo-correction.md"
+        correction.write_text(
+            "---\nnote_type: correction\n"
+            "references: [[real-target]]\n"
+            "---\nfixed",
+            encoding="utf-8",
+        )
+
+        assert _find_corrected_note(correction, vault) == target
+
+    def test_supersedes_resolves_before_references_even_when_both_present(
+        self, tmp_path
+    ):
+        """When ``supersedes:`` resolves cleanly, strategy 1 wins outright
+        — strategy 4's guard is never exercised on this path, but this
+        confirms the existing priority ordering is unaffected."""
+        vault = tmp_path / "cortex-memory"
+        vault.mkdir()
+        (vault / "reference").mkdir()
+
+        supersedes_target = vault / "reference" / "the-real-target.md"
+        supersedes_target.write_text("---\n---\nreal", encoding="utf-8")
+        (vault / "reference" / "context-only.md").write_text(
+            "---\n---\ncontext", encoding="utf-8"
+        )
+
+        correction = vault / "reference" / "foo-correction.md"
+        correction.write_text(
+            "---\nnote_type: correction\n"
+            "supersedes: [[the-real-target]]\n"
+            "references: [[context-only]]\n"
+            "---\nfixed",
+            encoding="utf-8",
+        )
+
+        assert _find_corrected_note(correction, vault) == supersedes_target
+
+
+class TestKnownFalsePositivePattern:
+    """Reproduce the 4 known false-positive cases from
+    ``cortex-memory/research/2026-07-07-correction-cascade-false-positive-pattern.md``
+    and confirm the strategy-4 guard eliminates them.
+
+    Structural mimic (real slugs):
+
+    - Correction: ``stale-dispatch-quantitative-correction``
+      - ``supersedes: [[stale-dispatch-pattern]]`` — resolves (existing note).
+      - ``references: [[quantitative-prevention-protocol]]`` — context, not
+        the corrected note.
+    - Four notes wikilink ``quantitative-prevention-protocol`` for its
+      prevention rules (unchanged by the correction).
+
+    Before the fix, strategy 1 resolves supersedes → strategy 4 never
+    fired, but ``_build_reference_index`` still surfaced the 4 refs to
+    ``quantitative-prevention-protocol`` through the wrong pair. The
+    real bug per the pattern note was that when ``supersedes:`` was NOT
+    the actual corrected note but strategy 4's ``references:`` was
+    picked, the cascade flagged notes citing the ``references:`` target.
+
+    Setup here forces the pathological case: supersedes points at a
+    broken slug so strategy 4 would have fired without the guard.
+    """
+
+    def test_four_notes_no_longer_flagged(self, tmp_path):
+        vault = tmp_path / "cortex-memory"
+        vault.mkdir()
+        (vault / "research").mkdir()
+
+        # "quantitative-prevention-protocol" — the note that used to be
+        # falsely flagged as the corrected note.
+        qpp = vault / "research" / "quantitative-prevention-protocol.md"
+        qpp.write_text(
+            "---\nslug: quantitative-prevention-protocol\n---\n"
+            "Prevention rules, unchanged by the correction.",
+            encoding="utf-8",
+        )
+
+        # "stale-dispatch-quantitative-correction" — the correction note.
+        # Its supersedes points at a slug that doesn't exist in this
+        # fixture (mimicking a broken-wikilink real-world case).
+        correction = vault / "research" / "stale-dispatch-quantitative-correction.md"
+        correction.write_text(
+            "---\nnote_type: correction\n"
+            "supersedes: [[stale-dispatch-pattern]]\n"
+            "references: [[quantitative-prevention-protocol]]\n"
+            "---\n98.1% (159/162) were quantitative.",
+            encoding="utf-8",
+        )
+
+        # The four notes that reference quantitative-prevention-protocol
+        # for its rules (they SHOULD NOT be flagged).
+        for slug in (
+            "retrieval-domain-fresh-index-verification",
+            "structural-recovery-p0-pre-implementation-checklist",
+            "structural-recovery-pre-p0-baseline",
+            "both-hemispheres-unverified-premises",
+        ):
+            (vault / "research" / f"{slug}.md").write_text(
+                f"---\n---\nCites [[quantitative-prevention-protocol]] for its rules.",
+                encoding="utf-8",
+            )
+
+        report = detect_corrections(tmp_path)
+
+        # correction_pairs_checked == 0: strategy 1 fails (broken slug),
+        # strategy 4 is guarded off, strategy 3 finds nothing (no
+        # corrected_by:), strategy 5 wikilink fallback finds the same
+        # broken slug in the body — nothing resolves.
+        assert report.correction_pairs_checked == 0
+        assert report.total_unpropagated == 0
+        # And critically: quantitative-prevention-protocol is NOT in the
+        # flagged output at all.
+        assert not any(
+            u.corrected_slug == "quantitative-prevention-protocol"
+            for u in report.unpropagated
+        )
+
+
+# ── Improvement 2: verified allowlist ────────────────────────────────
+
+
+class TestVerifiedAllowlist:
+    """Verify that pairs in
+    ``inner/state/correction-cascade-verified.json`` are skipped by
+    :func:`detect_corrections`."""
+
+    @staticmethod
+    def _mk_flagged_pair(vault: pathlib.Path) -> tuple[str, str]:
+        """Build a vault fixture that would flag exactly one pair
+        (corrected='bar', correction='foo-correction') and return the
+        (corrected_slug, correction_slug) pair."""
+        (vault / "reference").mkdir()
+        correction = vault / "reference" / "foo-correction.md"
+        correction.write_text(
+            "---\nnote_type: correction\n---\n98.1% (159/162) were decayed.",
+            encoding="utf-8",
+        )
+        corrected = vault / "reference" / "bar.md"
+        corrected.write_text(
+            "---\ncorrected_by: [foo-correction]\n---\nnotes were decayed.",
+            encoding="utf-8",
+        )
+        # Referencing note — cites bar but not the correction.
+        ref = vault / "reference" / "baz.md"
+        ref.write_text("See [[bar]].", encoding="utf-8")
+        return ("bar", "foo-correction")
+
+    def test_verified_pair_is_skipped(self, tmp_path):
+        vault = tmp_path / "cortex-memory"
+        vault.mkdir()
+        corrected_slug, correction_slug = self._mk_flagged_pair(vault)
+
+        # Seed the allowlist with the pair.
+        state_dir = tmp_path / "inner" / "state"
+        state_dir.mkdir(parents=True)
+        (state_dir / "correction-cascade-verified.json").write_text(
+            '{"verified": [["' + corrected_slug + '", "' + correction_slug + '"]]}',
+            encoding="utf-8",
+        )
+
+        report = detect_corrections(tmp_path)
+        assert (corrected_slug, correction_slug) in report.verified
+        # The pair is skipped — no correction_pairs_checked bump, no rows.
+        assert report.correction_pairs_checked == 0
+        assert report.total_unpropagated == 0
+
+    def test_missing_file_is_empty_set(self, tmp_path):
+        vault = tmp_path / "cortex-memory"
+        vault.mkdir()
+        self._mk_flagged_pair(vault)
+        # No inner/state directory at all — must not raise.
+        report = detect_corrections(tmp_path)
+        assert report.verified == set()
+        assert report.correction_pairs_checked == 1
+        assert report.total_unpropagated == 1
+
+    def test_malformed_json_is_empty_set_with_warning(self, tmp_path, caplog):
+        vault = tmp_path / "cortex-memory"
+        vault.mkdir()
+        self._mk_flagged_pair(vault)
+
+        state_dir = tmp_path / "inner" / "state"
+        state_dir.mkdir(parents=True)
+        (state_dir / "correction-cascade-verified.json").write_text(
+            "{not valid json,", encoding="utf-8"
+        )
+
+        with caplog.at_level("WARNING"):
+            report = detect_corrections(tmp_path)
+        assert report.verified == set()
+        # Warning was logged (don't hard-fail the run).
+        assert any(
+            "malformed or unreadable" in rec.message
+            or "malformed" in rec.message.lower()
+            for rec in caplog.records
+        )
+        # Detection still runs — pair is NOT in the allowlist, so it flags.
+        assert report.correction_pairs_checked == 1
+        assert report.total_unpropagated == 1
+
+    def test_load_verified_missing_file(self, tmp_path):
+        assert _load_verified(tmp_path) == set()
+
+    def test_load_verified_ignores_bad_pairs(self, tmp_path):
+        state_dir = tmp_path / "inner" / "state"
+        state_dir.mkdir(parents=True)
+        (state_dir / "correction-cascade-verified.json").write_text(
+            '{"verified": [["a", "b"], ["c"], "not-a-pair", '
+            '["d", 42], ["e", "f", "g"]]}',
+            encoding="utf-8",
+        )
+        # Only the well-formed 2-string pair is loaded.
+        assert _load_verified(tmp_path) == {("a", "b")}
+
+    def test_to_dict_includes_verified_as_sorted_list_of_lists(self):
+        """Serialization: verified is JSON-safe (list of lists, not
+        tuples/sets) and deterministically ordered."""
+        report = CascadeReport()
+        report.verified = {("b", "beta"), ("a", "alpha")}
+        d = report.to_dict()
+        assert d["verified"] == [["a", "alpha"], ["b", "beta"]]
+        # And it round-trips through json without error.
+        import json as _json
+        _json.dumps(d)
+
+    def test_to_dict_empty_verified(self):
+        report = CascadeReport()
+        d = report.to_dict()
+        assert d["verified"] == []
