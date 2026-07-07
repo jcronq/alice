@@ -1,14 +1,22 @@
 """Tests for :mod:`alice_thinking.memory_worker.predicate_extraction`.
 
-Covers Phase 1 of GBrain-style typed-edge extraction:
+Covers Phase 1 + Phase 2.0 of GBrain-style typed-edge extraction:
   - Schema pack loader (valid + malformed).
-  - Verb regex matching for the initial pack (owns, mentions, etc.).
+  - Verb regex matching against the shipped pack (``cites``,
+    ``contributes_to``, ``connects_to``).
   - Code-block stripping (no edges from ``[[wikilink]]`` inside fences).
   - Idempotency (two runs = same edges).
   - Ignore-list + min_name_length filters honor the "unless the slug
     exists as a real note" override.
   - ReDoS budget aborts remaining patterns without failing extraction.
   - build_index.py produces schema_version=2 with the typed_edges table.
+
+Phase 2.0-specific coverage:
+  - The shipped schema drops ``runs`` (was 100% FP on the v2 run).
+  - Word-boundary lookbehind blocks substring matches on ``cites`` /
+    ``connects_to`` (e.g., "reconnects to" no longer matches).
+  - ``target_types`` enforcement in :func:`extract_from_body` — positive,
+    negative, and empty-list (NOOP) cases.
 
 Every test seeds a tmp-path vault + cortex-index.db so no real state
 is touched.
@@ -84,19 +92,22 @@ def _build_db(mind: pathlib.Path) -> pathlib.Path:
 
 def test_schema_loader_accepts_valid(mind: pathlib.Path) -> None:
     pack = pe.load_schema_pack(mind / "config" / "typed_edges_schema.yaml")
-    assert pack.schema_version == 1
+    # v3 = Phase 2.0 (dropped ``runs``, added word-boundary lookbehind).
+    assert pack.schema_version == 3
     assert pack.regex_budget_ms == 50
     assert pack.min_name_length == 4
     assert "AI" in pack.ignore_list
     assert "GitHub" in pack.ignore_list
     names = [lt.name for lt in pack.link_types]
-    assert names == ["runs", "owns", "contributes_to", "runs_on", "connects_to", "mentions"]
+    assert "runs" not in names, "runs was dropped in Phase 2.0 (100% FP on v2 run)"
+    # Order matters (first-match wins); assert exact declaration order.
+    assert names == ["cites", "contributes_to", "connects_to"]
 
 
 def test_schema_loader_rejects_malformed_regex(tmp_path: pathlib.Path) -> None:
     bad = tmp_path / "bad.yaml"
     bad.write_text(
-        "schema_version: 1\n"
+        "schema_version: 3\n"
         "regex_budget_ms: 50\n"
         "min_name_length: 4\n"
         "ignore_list: []\n"
@@ -115,7 +126,7 @@ def test_schema_loader_rejects_malformed_regex(tmp_path: pathlib.Path) -> None:
 def test_schema_loader_rejects_empty_link_types(tmp_path: pathlib.Path) -> None:
     bad = tmp_path / "empty.yaml"
     bad.write_text(
-        "schema_version: 1\n"
+        "schema_version: 3\n"
         "regex_budget_ms: 50\n"
         "min_name_length: 4\n"
         "ignore_list: []\n"
@@ -126,12 +137,32 @@ def test_schema_loader_rejects_empty_link_types(tmp_path: pathlib.Path) -> None:
         pe.load_schema_pack(bad)
 
 
+def test_schema_drops_runs_verb(mind: pathlib.Path) -> None:
+    """Phase 2.0: ``runs`` was dropped because all 5 v2 edges validated FP.
+
+    Concrete guard so a future edit that adds it back has to justify
+    the change against a test failure — not just a code review skim.
+    """
+    pack = pe.load_schema_pack(mind / "config" / "typed_edges_schema.yaml")
+    assert not any(lt.name == "runs" for lt in pack.link_types)
+
+
 # ---------- extraction: verb regexes ----------
 
 
-def test_owns_edge_extracted(mind: pathlib.Path) -> None:
-    _drop_note(mind, "projects", "cozyhem", "cozyhem project")
-    _drop_note(mind, "people", "jason", "I run [[cozyhem]] daily.")
+def test_cites_edge_extracted(mind: pathlib.Path) -> None:
+    """``cites`` is the highest-precision verb in the v3 pack (12/12 in
+    the v2 audit). A note body with an explicit provenance phrase
+    ("validated by") targeting an existing vault slug should produce
+    exactly one ``cites`` edge.
+    """
+    _drop_note(mind, "reference", "graduated-response", "source of truth")
+    _drop_note(
+        mind,
+        "reference",
+        "degradation-api",
+        "The migration path was validated by [[graduated-response]] before merge.",
+    )
     db = _build_db(mind)
     report = pe.extract_all(
         mind / "cortex-memory",
@@ -143,14 +174,12 @@ def test_owns_edge_extracted(mind: pathlib.Path) -> None:
     try:
         rows = conn.execute(
             "SELECT from_slug, to_slug, link_type FROM typed_edges "
-            "WHERE from_slug='jason' AND to_slug='cozyhem'"
+            "WHERE from_slug='degradation-api' AND to_slug='graduated-response'"
         ).fetchall()
     finally:
         conn.close()
     verbs = {r[2] for r in rows}
-    # "I run [[cozyhem]]" matches BOTH runs and owns; the first
-    # declaration in the pack (runs) wins per first-match rule.
-    assert "runs" in verbs
+    assert "cites" in verbs
     assert report.edges_written > 0
 
 
@@ -181,8 +210,13 @@ def test_wikilink_in_code_block_produces_no_edge(mind: pathlib.Path) -> None:
 
 
 def test_idempotent_two_runs(mind: pathlib.Path) -> None:
-    _drop_note(mind, "projects", "cozyhem", "cozyhem project")
-    _drop_note(mind, "people", "jason", "I run [[cozyhem]] daily.")
+    _drop_note(mind, "reference", "src-note", "provenance source")
+    _drop_note(
+        mind,
+        "reference",
+        "claim-note",
+        "Argument sourced from [[src-note]] for the record.",
+    )
     db = _build_db(mind)
     schema = mind / "config" / "typed_edges_schema.yaml"
     state = mind / "config" / "typed_edges_state.json"
@@ -208,9 +242,10 @@ def test_idempotent_two_runs(mind: pathlib.Path) -> None:
 
 
 def test_ignore_list_ai_skipped_unless_note_exists(mind: pathlib.Path) -> None:
-    # No AI.md in the vault, so [[AI]] must be dropped.
+    # No AI.md in the vault, so [[AI]] must be dropped even though the
+    # essay body triggers the ``cites`` verb.
     _drop_note(
-        mind, "reference", "essay", "Some thoughts about [[AI]] and its future."
+        mind, "reference", "essay", "Argument sourced from [[AI]] research."
     )
     db = _build_db(mind)
     pe.extract_all(
@@ -232,7 +267,7 @@ def test_ignore_list_ai_skipped_unless_note_exists(mind: pathlib.Path) -> None:
 def test_ignore_list_ai_kept_when_note_exists(mind: pathlib.Path) -> None:
     _drop_note(mind, "reference", "AI", "AI concept note.")
     _drop_note(
-        mind, "reference", "essay", "Some thoughts about [[AI]] and its future."
+        mind, "reference", "essay", "Argument sourced from [[AI]] research."
     )
     db = _build_db(mind)
     pe.extract_all(
@@ -248,13 +283,13 @@ def test_ignore_list_ai_kept_when_note_exists(mind: pathlib.Path) -> None:
         ).fetchall()
     finally:
         conn.close()
-    # Real AI note exists → edge kept.
+    # Real AI note exists → ignore_list override honored → edge kept.
     assert len(rows) >= 1
 
 
 def test_github_skipped_unless_note_exists(mind: pathlib.Path) -> None:
     _drop_note(
-        mind, "reference", "notes", "Repo hosted on [[GitHub]] for sure."
+        mind, "reference", "notes", "Snippet sourced from [[GitHub]] for sure."
     )
     db = _build_db(mind)
     pe.extract_all(
@@ -285,7 +320,7 @@ def test_redos_budget_bounded(mind: pathlib.Path, tmp_path: pathlib.Path) -> Non
     # backslashes in the YAML text, which the schema loader then
     # decodes to a single backslash before compiling the regex.
     schema_path.write_text(
-        "schema_version: 1\n"
+        "schema_version: 3\n"
         "regex_budget_ms: 1\n"
         "min_name_length: 4\n"
         "ignore_list: []\n"
@@ -365,8 +400,13 @@ def test_typed_edges_unique_constraint(mind: pathlib.Path) -> None:
 
 
 def test_state_file_updated_after_extraction(mind: pathlib.Path) -> None:
-    _drop_note(mind, "projects", "cozyhem", "cozyhem project")
-    _drop_note(mind, "people", "jason", "I run [[cozyhem]] daily.")
+    _drop_note(mind, "reference", "src-note", "provenance source")
+    _drop_note(
+        mind,
+        "reference",
+        "claim-note",
+        "Argument sourced from [[src-note]] for the record.",
+    )
     db = _build_db(mind)
     state_path = mind / "config" / "typed_edges_state.json"
     pe.extract_all(
@@ -377,5 +417,174 @@ def test_state_file_updated_after_extraction(mind: pathlib.Path) -> None:
     )
     state = json.loads(state_path.read_text())
     assert state["last_run_at"] is not None
-    assert state["schema_version"] == 1
+    # v3 = Phase 2.0 (dropped ``runs``, added word-boundary lookbehind).
+    assert state["schema_version"] == 3
     assert state["total_edges_extracted"] >= 1
+
+
+# ---------- Phase 2.0: word-boundary lookbehind ----------
+
+
+def test_word_boundary_blocks_substring_verb_match(mind: pathlib.Path) -> None:
+    """The v3 ``connects_to`` regex is anchored by ``(?:^|(?<= ))`` so a
+    verb-prefix inside a longer word — the "dry-run" class of false
+    positive that killed the ``runs`` verb — cannot fire an edge.
+
+    Concrete: ``"reconnects to [[bar]]"`` reads to a human as a
+    single-word action ("reconnects", verb=reconnect). Without the
+    lookbehind the regex would still latch onto "connects to" starting
+    at position 2, misattributing the edge as a ``connects_to``. With
+    the lookbehind the substring is preceded by "re" (not space, not
+    BOL) → no match.
+    """
+    _drop_note(mind, "reference", "bar", "target for the reconnects clause")
+    _drop_note(
+        mind,
+        "reference",
+        "essay",
+        "The service reconnects to [[bar]] on every reload.",
+    )
+    db = _build_db(mind)
+    pe.extract_all(
+        mind / "cortex-memory",
+        db,
+        mind / "config" / "typed_edges_schema.yaml",
+        mind / "config" / "typed_edges_state.json",
+    )
+    conn = sqlite3.connect(str(db))
+    try:
+        rows = conn.execute(
+            "SELECT link_type FROM typed_edges "
+            "WHERE from_slug='essay' AND to_slug='bar'"
+        ).fetchall()
+    finally:
+        conn.close()
+    verbs = {r[0] for r in rows}
+    assert "connects_to" not in verbs, (
+        f"word-boundary lookbehind should block substring match on "
+        f"'reconnects to'; got verbs={verbs!r}"
+    )
+
+
+# ---------- Phase 2.0: target_types enforcement ----------
+
+
+def _write_target_types_schema(
+    path: pathlib.Path, verb_name: str, target_types: list[str]
+) -> None:
+    """Write a minimal schema pack with a single verb + declared
+    target_types. The verb regex is ``example [[X]]`` so tests can craft
+    a body that reliably triggers it without accidentally matching one
+    of the shipped verbs."""
+    types_yaml = "[" + ", ".join(target_types) + "]"
+    path.write_text(
+        "schema_version: 3\n"
+        "regex_budget_ms: 50\n"
+        "min_name_length: 4\n"
+        "ignore_list: []\n"
+        "link_types:\n"
+        f"  - name: {verb_name}\n"
+        '    regex: "(?:^|(?<= ))example ?`?\\\\[\\\\[([\\\\w-]+)\\\\]\\\\]`?"\n'
+        f"    target_types: {types_yaml}\n",
+        encoding="utf-8",
+    )
+
+
+def test_target_types_positive_target_in_declared_folder(
+    mind: pathlib.Path,
+) -> None:
+    """target_types=[projects] + target in projects/ → edge kept."""
+    schema = mind / "config" / "typed_edges_schema.yaml"
+    _write_target_types_schema(schema, "example", ["projects"])
+    _drop_note(mind, "projects", "cozyhem", "the cozyhem project")
+    _drop_note(
+        mind,
+        "reference",
+        "src",
+        "This is an example [[cozyhem]] mention.",
+    )
+    db = _build_db(mind)
+    pe.extract_all(
+        mind / "cortex-memory",
+        db,
+        schema,
+        mind / "config" / "typed_edges_state.json",
+    )
+    conn = sqlite3.connect(str(db))
+    try:
+        rows = conn.execute(
+            "SELECT link_type FROM typed_edges "
+            "WHERE from_slug='src' AND to_slug='cozyhem'"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert [r[0] for r in rows] == ["example"]
+
+
+def test_target_types_negative_target_in_other_folder(
+    mind: pathlib.Path,
+) -> None:
+    """target_types=[projects] + target in research/ → edge dropped."""
+    schema = mind / "config" / "typed_edges_schema.yaml"
+    _write_target_types_schema(schema, "example", ["projects"])
+    (mind / "cortex-memory" / "research").mkdir(parents=True, exist_ok=True)
+    _drop_note(mind, "research", "some-research", "a research note")
+    _drop_note(
+        mind,
+        "reference",
+        "src",
+        "This is an example [[some-research]] mention.",
+    )
+    db = _build_db(mind)
+    pe.extract_all(
+        mind / "cortex-memory",
+        db,
+        schema,
+        mind / "config" / "typed_edges_state.json",
+    )
+    conn = sqlite3.connect(str(db))
+    try:
+        rows = conn.execute(
+            "SELECT link_type FROM typed_edges "
+            "WHERE from_slug='src' AND to_slug='some-research'"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert rows == [], (
+        f"target_types=[projects] should block a target in research/; "
+        f"got rows={rows!r}"
+    )
+
+
+def test_target_types_empty_list_accepts_any_target(
+    mind: pathlib.Path,
+) -> None:
+    """target_types=[] preserves pre-Phase-2.0 behavior — no filtering,
+    any folder accepted. Guards against a regression that ships an
+    unintentionally restrictive default."""
+    schema = mind / "config" / "typed_edges_schema.yaml"
+    _write_target_types_schema(schema, "example", [])
+    (mind / "cortex-memory" / "research").mkdir(parents=True, exist_ok=True)
+    _drop_note(mind, "research", "any-note", "a note anywhere")
+    _drop_note(
+        mind,
+        "reference",
+        "src",
+        "This is an example [[any-note]] mention.",
+    )
+    db = _build_db(mind)
+    pe.extract_all(
+        mind / "cortex-memory",
+        db,
+        schema,
+        mind / "config" / "typed_edges_state.json",
+    )
+    conn = sqlite3.connect(str(db))
+    try:
+        rows = conn.execute(
+            "SELECT link_type FROM typed_edges "
+            "WHERE from_slug='src' AND to_slug='any-note'"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert [r[0] for r in rows] == ["example"]

@@ -31,7 +31,7 @@ import pathlib
 import re
 import sqlite3
 import time
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 
 logger = logging.getLogger(__name__)
@@ -577,7 +577,8 @@ def extract_from_body(
     pack: SchemaPack,
     body: str,
     *,
-    slug_exists_fn,
+    slug_exists_fn: Callable[[str], bool],
+    slug_folder_fn: Optional[Callable[[str], Optional[str]]] = None,
 ) -> tuple[list[tuple[str, str, str]], bool]:
     """Extract typed edges from a single note body.
 
@@ -598,6 +599,14 @@ def extract_from_body(
          patterns when exceeded.
       h. Skip ignore_list wikilinks unless the slug exists.
       i. Skip short wikilinks (< min_name_length) unless the slug exists.
+      j. Enforce ``target_types`` (Phase 2.0): if a matched ``LinkType``
+         declares a non-empty ``target_types`` list, the target slug's
+         folder — as recorded in the ``notes`` table — must be in that
+         list. Root-level notes (folder == "") pass through; unknown
+         targets (slug not in the notes table) are dropped. When
+         ``slug_folder_fn`` is ``None`` the guard is disabled (used by
+         callers that don't have vault-folder context, e.g. unit tests
+         that only exercise regex behavior).
     """
     cleaned = strip_code_blocks(body)
     edges_map: dict[tuple[str, str], tuple[str, str, str]] = {}
@@ -665,6 +674,18 @@ def extract_from_body(
                     # don't attribute this verb to our mention. Keep
                     # searching remaining verbs.
                     continue
+            # target_types enforcement (Phase 2.0). Non-empty
+            # target_types restricts the target to notes in one of the
+            # declared vault folders. Root-level notes (folder == "")
+            # are accepted per the design's structural-note carve-out;
+            # unknown slugs (not in the notes table) are dropped so a
+            # broken wikilink can't slip a typed verb past the guard.
+            if lt.target_types and slug_folder_fn is not None:
+                folder = slug_folder_fn(basename)
+                if folder is None:
+                    continue
+                if folder != "" and folder not in lt.target_types:
+                    continue
             matched_verb = lt.name
             break
 
@@ -727,14 +748,21 @@ def extract_all(
                 "run build_index.py to migrate to schema_version=2 first"
             )
 
-        # Cheap slug-exists cache from the notes table (avoids per-mention
-        # filesystem probes for the common path).
+        # Cheap slug-exists + slug-folder cache from the notes table
+        # (avoids per-mention filesystem probes for the common path).
+        # Folder lookup drives target_types enforcement inside
+        # extract_from_body — see the "Phase 2.0" note there.
         vault_slugs: set[str] = set()
-        for (slug,) in conn.execute("SELECT slug FROM notes"):
+        slug_folder: dict[str, str] = {}
+        for (slug, folder) in conn.execute("SELECT slug, folder FROM notes"):
             vault_slugs.add(slug)
+            slug_folder[slug] = folder or ""
 
         def slug_exists(slug: str) -> bool:
             return slug in vault_slugs or _slug_exists(vault_root, slug)
+
+        def slug_folder_fn(slug: str) -> Optional[str]:
+            return slug_folder.get(slug)
 
         batch: list[tuple[str, str, str, str]] = []
 
@@ -777,7 +805,10 @@ def extract_all(
 
             from_slug = md.stem
             edges, budget_tripped = extract_from_body(
-                pack, body, slug_exists_fn=slug_exists
+                pack,
+                body,
+                slug_exists_fn=slug_exists,
+                slug_folder_fn=slug_folder_fn,
             )
             if budget_tripped:
                 report.warnings.append(f"regex budget exhausted: {md.name}")
