@@ -37,12 +37,14 @@ from alice_speaking.retrieval.cue_runner import (
     FITNESS_RECENCY_WINDOW_DAYS,
     HEBBIAN_DEFAULTS,
     STATE_BOOST,
+    TYPED_EDGE_DEFAULTS,
     _bump_access,
     _build_fts_match,
     _Candidate,
     _fitness_recency_score,
     _format_packet,
     _query_edge_weights,
+    _query_typed_edge_weights,
     _read_access_counts,
     _read_last_accessed,
     _read_stm_context_slugs,
@@ -1416,6 +1418,216 @@ def test_query_edge_weights_skips_unresolved_links(tmp_path: pathlib.Path):
         conn.close()
     weights = _query_edge_weights(db, ["hub"])
     assert weights == {"target-a": 1.0}
+
+
+# ---------------------------------------------------------------------------
+# Typed edge weights (GBrain predicate extraction Phase 2.1).
+
+
+def _make_typed_edges_db_inplace(
+    path: pathlib.Path,
+    rows: list[tuple[str, str, str]],
+) -> None:
+    """Add a ``typed_edges`` table to an existing DB and seed it with
+    ``(from_slug, to_slug, link_type)`` rows.
+
+    Shape mirrors the GBrain predicate-extraction indexer output.
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE typed_edges (
+                from_slug TEXT NOT NULL,
+                to_slug TEXT NOT NULL,
+                link_type TEXT NOT NULL
+            );
+            CREATE INDEX idx_typed_edges_from ON typed_edges(from_slug);
+            CREATE INDEX idx_typed_edges_to ON typed_edges(to_slug);
+            """
+        )
+        for from_slug, to_slug, link_type in rows:
+            conn.execute(
+                "INSERT INTO typed_edges(from_slug, to_slug, link_type) "
+                "VALUES(?, ?, ?)",
+                (from_slug, to_slug, link_type),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_typed_edge_defaults_match_calibration_harness():
+    """Guardrail: the in-module fallback config must match the
+    calibration harness's recommended values
+    (cortex-memory/research/2026-07-07-typed-edge-calibration-harness.md
+    — N=15, 5×5 grid, P@3 +6.7%, MRR +42%, zero regressions)."""
+    assert TYPED_EDGE_DEFAULTS["enabled"] is True
+    assert TYPED_EDGE_DEFAULTS["cites_weight"] == 2.0
+    assert TYPED_EDGE_DEFAULTS["connects_to_weight"] == 0.1
+    assert TYPED_EDGE_DEFAULTS["min_edge_weight_sum"] == 1
+
+
+def test_query_typed_edge_weights_empty_context_returns_empty(
+    tmp_path: pathlib.Path,
+):
+    db = tmp_path / "cortex-index.db"
+    _seed_db(db, [{"slug": "a", "title": "A", "body": "x"}])
+    _make_typed_edges_db_inplace(db, [("hub", "target-a", "cites")])
+    assert _query_typed_edge_weights(db, []) == {}
+    assert _query_typed_edge_weights(db, [""]) == {}
+
+
+def test_query_typed_edge_weights_no_matching_rows_returns_empty(
+    tmp_path: pathlib.Path,
+):
+    """Context slug points nowhere → empty dict, not an error."""
+    db = tmp_path / "cortex-index.db"
+    _seed_db(db, [{"slug": "a", "title": "A", "body": "x"}])
+    _make_typed_edges_db_inplace(db, [("hub", "target-a", "cites")])
+    assert _query_typed_edge_weights(db, ["stranger"]) == {}
+
+
+def test_query_typed_edge_weights_aggregates_cites_and_connects_to(
+    tmp_path: pathlib.Path,
+):
+    """Two cites edges + one connects_to → weighted sum matches
+    2 × cites_weight + connects_to_weight."""
+    db = tmp_path / "cortex-index.db"
+    _seed_db(db, [{"slug": "a", "title": "A", "body": "x"}])
+    _make_typed_edges_db_inplace(
+        db,
+        [
+            ("hub", "target-a", "cites"),
+            ("hub", "target-a", "cites"),
+            ("hub", "target-a", "connects_to"),
+        ],
+    )
+    weights = _query_typed_edge_weights(
+        db,
+        ["hub"],
+        cites_weight=2.0,
+        connects_to_weight=0.1,
+        min_edge_weight_sum=1,
+    )
+    # 2 * 2.0 + 1 * 0.1 = 4.1
+    assert weights == {"target-a": pytest.approx(4.1)}
+
+
+def test_query_typed_edge_weights_respects_min_edge_weight_sum(
+    tmp_path: pathlib.Path,
+):
+    """A single ``connects_to`` edge (weight 0.1) falls below the
+    default threshold of 1 and is filtered out; a single ``cites``
+    edge (weight 2.0) clears it and is retained."""
+    db = tmp_path / "cortex-index.db"
+    _seed_db(db, [{"slug": "a", "title": "A", "body": "x"}])
+    _make_typed_edges_db_inplace(
+        db,
+        [
+            ("hub", "weak-target", "connects_to"),  # 0.1 — below threshold
+            ("hub", "strong-target", "cites"),      # 2.0 — above threshold
+        ],
+    )
+    weights = _query_typed_edge_weights(
+        db,
+        ["hub"],
+        cites_weight=2.0,
+        connects_to_weight=0.1,
+        min_edge_weight_sum=1,
+    )
+    assert weights == {"strong-target": pytest.approx(2.0)}
+
+
+def test_query_typed_edge_weights_missing_table_returns_empty(
+    tmp_path: pathlib.Path,
+):
+    """Legacy DB with no ``typed_edges`` table → graceful degradation."""
+    db = tmp_path / "cortex-index.db"
+    _seed_db(db, [{"slug": "a", "title": "A", "body": "x"}])
+    # No typed_edges table created.
+    assert _query_typed_edge_weights(db, ["hub"]) == {}
+
+
+@pytest.mark.asyncio
+async def test_build_cue_packet_typed_edge_fires_bonus_in_log(
+    tmp_path: pathlib.Path,
+    caplog,
+):
+    """Integration: when the STM context has a typed edge to a
+    candidate, the scoring path emits a non-zero ``typed_bonus`` in
+    the debug log."""
+    import logging
+
+    db = tmp_path / "cortex-index.db"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    notes = [{"slug": "linked", "title": "Linked", "body": "cozyhem details\n"}]
+    _seed_db(db, notes)
+    _seed_vault(vault, notes)
+    _make_typed_edges_db_inplace(db, [("hub", "linked", "cites")])
+
+    cfg = {
+        "enabled": True,
+        "top_n": 1,
+        "hebbian": {"enabled": True, "edge_boost": 0.5},
+        "typed_edge": {
+            "enabled": True,
+            "cites_weight": 2.0,
+            "connects_to_weight": 0.1,
+            "min_edge_weight_sum": 1,
+        },
+    }
+    with caplog.at_level(logging.DEBUG, logger="alice_speaking.retrieval.cue_runner"):
+        await build_cue_packet(
+            "cozyhem",
+            cfg,
+            db_path=db,
+            vault_root=vault,
+            context_slugs=("hub",),
+        )
+    # Look for a slug=linked line with a positive typed_bonus.
+    matching = [r.getMessage() for r in caplog.records if "slug=linked" in r.getMessage()]
+    assert matching, "expected a cue_runner debug line for slug=linked"
+    # 0.5 (edge_boost) * 2.0 (cites_weight) = 1.0
+    assert any("typed_bonus=1.0000" in m for m in matching), matching
+
+
+@pytest.mark.asyncio
+async def test_build_cue_packet_typed_edge_disabled_yields_zero_bonus(
+    tmp_path: pathlib.Path,
+    caplog,
+):
+    """Zero-effect fallback: with ``typed_edge.enabled=False`` the
+    scoring path emits ``typed_bonus=0.0000`` even when typed edges
+    exist."""
+    import logging
+
+    db = tmp_path / "cortex-index.db"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    notes = [{"slug": "linked", "title": "Linked", "body": "cozyhem details\n"}]
+    _seed_db(db, notes)
+    _seed_vault(vault, notes)
+    _make_typed_edges_db_inplace(db, [("hub", "linked", "cites")])
+
+    cfg = {
+        "enabled": True,
+        "top_n": 1,
+        "hebbian": {"enabled": True, "edge_boost": 0.5},
+        "typed_edge": {"enabled": False},
+    }
+    with caplog.at_level(logging.DEBUG, logger="alice_speaking.retrieval.cue_runner"):
+        await build_cue_packet(
+            "cozyhem",
+            cfg,
+            db_path=db,
+            vault_root=vault,
+            context_slugs=("hub",),
+        )
+    matching = [r.getMessage() for r in caplog.records if "slug=linked" in r.getMessage()]
+    assert matching, "expected a cue_runner debug line for slug=linked"
+    assert all("typed_bonus=0.0000" in m for m in matching), matching
 
 
 def test_read_stm_context_slugs_prefers_speaking_accessed_at(

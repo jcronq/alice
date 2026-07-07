@@ -130,6 +130,12 @@ SPEAKING_DEFAULTS: dict[str, Any] = {
             "casual_weight": 0.5,
             "min_edge_weight_sum": 2,
         },
+        "typed_edge": {
+            "enabled": True,
+            "cites_weight": 2.0,
+            "connects_to_weight": 0.1,
+            "min_edge_weight_sum": 1,
+        },
     },
 }
 
