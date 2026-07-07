@@ -1159,7 +1159,7 @@ class TestKnownFalsePositivePattern:
             "both-hemispheres-unverified-premises",
         ):
             (vault / "research" / f"{slug}.md").write_text(
-                f"---\n---\nCites [[quantitative-prevention-protocol]] for its rules.",
+                "---\n---\nCites [[quantitative-prevention-protocol]] for its rules.",
                 encoding="utf-8",
             )
 
