@@ -102,6 +102,21 @@ HEBBIAN_DEFAULTS: dict[str, Any] = {
     "min_edge_weight_sum": 2,
 }
 
+# Typed edge weight boost (GBrain predicate extraction, Phase 2.1).
+# Adds an additive score bump when STM context notes carry explicit
+# ``cites``/``connects_to`` edges to a target. Same additive-floor shape
+# as the Hebbian boost and separate from it — plain wikilinks feed
+# Hebbian, typed edges (semantic provenance from predicate extraction)
+# feed this. Weights calibrated by the harness at
+# cortex-memory/research/2026-07-07-typed-edge-calibration-harness.md
+# (N=15, 5×5 grid, P@3 +6.7%, MRR +42%, zero regressions).
+TYPED_EDGE_DEFAULTS: dict[str, Any] = {
+    "enabled": True,
+    "cites_weight": 2.0,
+    "connects_to_weight": 0.1,
+    "min_edge_weight_sum": 1,
+}
+
 # Fitness-domain recency boost (#246). The static type-aware constants
 # above are calibrated to 1.0× across the board — a documented no-op
 # pending re-evaluation. For the fitness domain that no-op is load-bearing:
@@ -795,6 +810,51 @@ def _query_edge_weights(
     return {row[0]: float(row[1]) for row in rows}
 
 
+def _query_typed_edge_weights(
+    db_path: pathlib.Path,
+    context_slugs: Iterable[str],
+    *,
+    cites_weight: float = 2.0,
+    connects_to_weight: float = 0.1,
+    min_edge_weight_sum: int = 1,
+) -> dict[str, float]:
+    """Compute typed edge weight sum per target from ``typed_edges``.
+
+    Same shape as :func:`_query_edge_weights` — returns
+    ``{target_slug: edge_weight_sum}`` for targets whose typed
+    edge weight from the STM context meets the minimum.
+
+    Only counts ``cites`` and ``connects_to`` link types. Other
+    types (future-proofing) contribute a baseline 0.25.
+    """
+    slug_list = [s for s in context_slugs if s]
+    if not slug_list:
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            placeholders = ",".join("?" * len(slug_list))
+            rows = conn.execute(
+                f"""
+                SELECT te.to_slug,
+                       SUM(CASE te.link_type
+                           WHEN 'cites' THEN ?
+                           WHEN 'connects_to' THEN ?
+                           ELSE ? END) AS typed_weight_sum
+                FROM typed_edges te
+                WHERE te.from_slug IN ({placeholders})
+                GROUP BY te.to_slug
+                HAVING typed_weight_sum >= ?
+                """,
+                (cites_weight, connects_to_weight, 0.25, *slug_list, min_edge_weight_sum),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {}
+    return {row[0]: float(row[1]) for row in rows}
+
+
 # ---------------------------------------------------------------------------
 # Reranker (Phase 2 — gated)
 
@@ -1146,6 +1206,23 @@ async def build_cue_context(
                 if ew >= min_floor:
                     hebbian_bonus += edge_boost * 2.0
                 final_score += hebbian_bonus
+            # Typed edge bonus (GBrain predicate extraction, Phase 2.1).
+            # Additive, same shape as Hebbian — zero unless typed edges
+            # from STM context notes point to this target. Low-risk:
+            # ~16 edges in vault, only fires when context explicitly
+            # cites/connects to a target.
+            typed_bonus = 0.0
+            typed_cfg = cfg.get("typed_edge") or {}
+            if typed_cfg.get("enabled", TYPED_EDGE_DEFAULTS["enabled"]):
+                typed_weights = _query_typed_edge_weights(
+                    resolved_db, context_slugs,
+                    cites_weight=typed_cfg.get("cites_weight", TYPED_EDGE_DEFAULTS["cites_weight"]),
+                    connects_to_weight=typed_cfg.get("connects_to_weight", TYPED_EDGE_DEFAULTS["connects_to_weight"]),
+                    min_edge_weight_sum=typed_cfg.get("min_edge_weight_sum", TYPED_EDGE_DEFAULTS["min_edge_weight_sum"]),
+                )
+                if slug in typed_weights:
+                    typed_bonus = edge_boost * typed_weights[slug]
+                    final_score += typed_bonus
             # Fitness-domain recency boost (#246). Additive on top of
             # the multiplicative score; zero when the note isn't
             # fitness-tagged or hasn't been touched inside the recency
@@ -1163,13 +1240,14 @@ async def build_cue_context(
             log.debug(
                 "cue_runner: slug=%s fts_rank=%.4f type_boost=%.4f "
                 "access_count=%d recency_boost=%.4f hebbian_bonus=%.4f "
-                "fitness_bonus=%.4f final=%.4f",
+                "typed_bonus=%.4f fitness_bonus=%.4f final=%.4f",
                 slug,
                 fts_rank,
                 boost,
                 ac,
                 recency_boost,
                 hebbian_bonus,
+                typed_bonus,
                 fitness_bonus,
                 final_score,
             )
@@ -1375,6 +1453,7 @@ __all__ = [
     "FITNESS_RECENCY_COEFFICIENT",
     "FITNESS_RECENCY_CAP",
     "HEBBIAN_DEFAULTS",
+    "TYPED_EDGE_DEFAULTS",
     "COZYLOBE_DB_PATH",
     "COZYLOBE_VAULT_ROOT",
     "VAULT_COZYLOBE",
