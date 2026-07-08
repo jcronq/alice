@@ -578,3 +578,166 @@ def test_build_inserts_link_rows_for_frontmatter_references(tmp_path: pathlib.Pa
         conn.close()
     assert "foo" in targets, f"frontmatter ref 'foo' not in links table: {targets}"
     assert "bar" in targets, f"frontmatter ref 'bar' not in links table: {targets}"
+
+
+# ---------------------------------------------------------------------------
+# Regression: typed_edges must be populated after rebuild (task-0556).
+# Before the fix, ``build()`` created ``typed_edges`` with a bare
+# ``CREATE TABLE`` on the .tmp DB, then atomic-swapped it into place —
+# which wiped all typed edges on every rebuild because nothing called
+# the predicate extractor after the swap. Same class of bug as PR #536
+# (speaking_accessed_at reset on rebuild).
+
+
+_MINIMAL_SCHEMA_YAML = """schema_version: 3
+regex_budget_ms: 50
+min_name_length: 4
+ignore_list: []
+link_types:
+  - name: cites
+    description: "Note cites another note"
+    regex: "(?:^|(?<= ))(?:cites|based on) ?`?\\\\[\\\\[([\\\\w-]+)\\\\]\\\\]`?"
+    target_types: []
+"""
+
+
+def _write_typed_edges_schema(mind_root: pathlib.Path) -> pathlib.Path:
+    """Drop a minimal schema pack at ``<mind_root>/config/`` so
+    ``run_predicate_extraction`` doesn't bail out with ``None``."""
+    config_dir = mind_root / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    schema_path = config_dir / "typed_edges_schema.yaml"
+    schema_path.write_text(_MINIMAL_SCHEMA_YAML)
+    return schema_path
+
+
+def test_build_populates_typed_edges_after_rebuild(tmp_path: pathlib.Path):
+    """After ``build()`` runs, the ``typed_edges`` table must be populated
+    from the vault. Before task-0556 the table was created empty on the
+    .tmp DB and atomic-swapped in, wiping any prior extraction output on
+    every rebuild.
+    """
+    mind_root = tmp_path / "mind"
+    vault = mind_root / "cortex-memory"
+    _write_typed_edges_schema(mind_root)
+
+    _write_note(vault / "target.md", title="Target")
+    _write_note(
+        vault / "source.md",
+        title="Source",
+        body="This note cites [[target]] for the claim.",
+    )
+
+    db_path = mind_root / "inner" / "state" / "cortex-index.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    build(vault, db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = list(
+            conn.execute(
+                "SELECT from_slug, to_slug, link_type FROM typed_edges "
+                "WHERE link_type = 'cites'"
+            )
+        )
+    finally:
+        conn.close()
+
+    assert any(
+        r[0] == "source" and r[1] == "target" for r in rows
+    ), f"expected source->target cites edge after rebuild, got {rows!r}"
+
+
+def test_build_typed_edges_import_error_falls_back_cleanly(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+    """If ``alice_thinking.memory_worker.stage_b`` isn't importable, the
+    rebuild must still complete cleanly. ``typed_edges`` will exist but
+    be empty — a degraded but functional index is preferable to a hard
+    crash for callers running without the memory-worker package.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _blocking_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "alice_thinking.memory_worker.stage_b":
+            raise ImportError("stage_b unavailable (simulated)")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _blocking_import)
+
+    vault = tmp_path / "vault"
+    _write_note(vault / "alpha.md", title="Alpha", body="Body.")
+
+    db_path = tmp_path / "index.db"
+    # Must NOT raise despite the simulated ImportError.
+    build(vault, db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        edge_count = conn.execute("SELECT COUNT(*) FROM typed_edges").fetchone()[0]
+    finally:
+        conn.close()
+
+    assert "typed_edges" in tables, (
+        f"typed_edges table missing after fallback rebuild; tables={tables}"
+    )
+    assert edge_count == 0, (
+        f"typed_edges should be empty on ImportError fallback, got {edge_count}"
+    )
+
+
+def test_build_typed_edges_if_not_exists_preserves_rows(tmp_path: pathlib.Path):
+    """The typed_edges CREATE is now ``IF NOT EXISTS``. A pre-existing
+    table with rows must not error out on the second rebuild — and the
+    schema shape stays intact. (Rebuild-to-rebuild row preservation
+    itself is covered by extract_all's ``INSERT OR IGNORE`` UNIQUE
+    constraint on subsequent runs.)
+    """
+    mind_root = tmp_path / "mind"
+    vault = mind_root / "cortex-memory"
+    _write_typed_edges_schema(mind_root)
+
+    _write_note(vault / "target.md", title="Target")
+    _write_note(
+        vault / "source.md",
+        title="Source",
+        body="Reference: cites [[target]].",
+    )
+
+    db_path = mind_root / "inner" / "state" / "cortex-index.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # First rebuild — table is created and populated.
+    build(vault, db_path)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        first_rows = conn.execute(
+            "SELECT COUNT(*) FROM typed_edges"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    # Second rebuild — table already exists; IF NOT EXISTS means no
+    # error, and the rows aren't wiped (they're re-inserted by the
+    # extraction pass with INSERT OR IGNORE on the UNIQUE constraint).
+    build(vault, db_path)
+    conn = sqlite3.connect(str(db_path))
+    try:
+        second_rows = conn.execute(
+            "SELECT COUNT(*) FROM typed_edges"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert first_rows > 0, "first rebuild produced no typed edges"
+    assert second_rows >= first_rows, (
+        f"second rebuild lost rows: first={first_rows}, second={second_rows}"
+    )

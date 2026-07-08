@@ -130,10 +130,11 @@ CREATE VIRTUAL TABLE notes_fts USING fts5(
 );
 
 -- Typed edges (Phase 1: GBrain-style deterministic predicate extraction).
--- Populated by the memory worker's Stage B; the indexer only creates the
--- shape. See cortex-memory/research/2026-07-07-gbrain-predicate-extraction-design.md
--- and alice_thinking/memory_worker/stage_b.py::_extract_typed_edges.
-CREATE TABLE typed_edges (
+-- Populated by predicate extraction (stage_b.py::run_predicate_extraction).
+-- The indexer creates the table (idempotent via IF NOT EXISTS so existing
+-- rows survive rebuilds) and re-runs extraction after the atomic swap in
+-- build(). See research/2026-07-08-typed-edges-index-rebuild-fix-spec.md.
+CREATE TABLE IF NOT EXISTS typed_edges (
     id             INTEGER PRIMARY KEY,
     from_slug      TEXT NOT NULL,
     to_slug        TEXT NOT NULL,
@@ -535,6 +536,22 @@ def build(vault: Path, db_path: Path) -> dict:
 
     # Atomic swap: rename .tmp into place.
     os.replace(str(tmp_path), str(db_path))
+
+    # Repopulate typed_edges from the freshly-rebuilt index. The rebuild
+    # creates the table empty; the memory worker's Stage B extractor
+    # reads note bodies and writes back the typed edges. Failing silently
+    # here is intentional — a rebuild that succeeds without typed edges
+    # is degraded but functional, so an ImportError should not break
+    # rebuild callers.
+    try:
+        from alice_thinking.memory_worker.stage_b import run_predicate_extraction
+        run_predicate_extraction(
+            mind_root=vault.parent,
+            db_path=db_path,
+            force_full=True,
+        )
+    except ImportError:
+        pass
 
     elapsed = time.time() - started
     return {
