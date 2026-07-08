@@ -27,12 +27,9 @@ If gold_relevant is absent or empty, relevance is inferred from typed edges
 
 import argparse
 import json
-import math
-import pathlib
 import sqlite3
-import sys
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 # ---------------------------------------------------------------------------
@@ -303,7 +300,6 @@ def run_sweep(
         pass
 
     # Score baseline (hebbian only, no typed edges)
-    baseline_results = {}
     typed_results = {}
 
     for combo in WEIGHT_GRID:
@@ -313,7 +309,6 @@ def run_sweep(
         regression_counts = []
 
         for q in queries:
-            qid = q.get("id", "unknown")
             query_text = q["query"]
             context = q.get("context_slugs", [])
             gold = set(q.get("gold_relevant", []))
