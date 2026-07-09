@@ -23,6 +23,7 @@ from ..domain.principals import AddressBook
 from ..infra.config import Config
 from ..infra.signal_rpc import SignalRPC as SignalClient
 from . import (
+    arm_control,
     config_tools,
     deploy,
     fs,
@@ -132,6 +133,7 @@ def build(
         *fs.build(cfg, personae=personae),
         *deploy.build(cfg, personae=personae),
         *host_claude.build(cfg, personae=personae),
+        *arm_control.build(cfg, personae=personae),
     ]
     if sender is not None or signal is not None:
         tool_list.extend(
