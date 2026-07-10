@@ -2103,7 +2103,7 @@ def test_decay_coverage_empty_pool_returns_one_hundred(tmp_path: Path) -> None:
     assert result["decayed_accessed_in_window"] == 0
     assert result["decay_coverage_pct"] == 100.0
     assert result["activation_date"] == _ACTIVATION
-    assert result["window_days"] == 7
+    assert result["window_days"] == 14
     assert result["by_domain"] == {}
 
 
