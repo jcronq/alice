@@ -1158,7 +1158,7 @@ def _note_domain(fm: dict[str, Any], rel: str) -> str:
 
 def compute_decay_coverage(
     vault_dir: Path,
-    window_days: int = 7,
+    window_days: int = 14,
     activation_date: str = DECAY_COVERAGE_ACTIVATION_DATE,
     cutoff_days: int = 5,
     today: datetime | None = None,
