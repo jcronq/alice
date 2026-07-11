@@ -28,6 +28,7 @@ take filesystem paths in, return values out, and never write. The
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import math
@@ -2462,7 +2463,7 @@ def _read_stage(path: Path) -> str | None:
 
 def count_wakes_by_stage(
     thoughts_dir: Path, window_start: datetime, window_end: datetime
-) -> dict[str, int]:
+) -> dict[str, int | None]:
     """Count wake files whose parsed start time falls in the window,
     bucketed by stage frontmatter.
 
@@ -2470,8 +2471,20 @@ def count_wakes_by_stage(
     function scans every date subdirectory whose calendar date
     intersects the window — this is the bug fix for wakes that landed
     in tomorrow's dir after midnight.
+
+    **Single-mode guard:** If the window contains wake files but NONE
+    of them carry a ``stage:`` frontmatter (i.e. all are active-mode
+    after Phase 5), return ``{"stage_b": None, "stage_c": None,
+    "stage_d": None}`` instead of zeros. Downstream consumers
+    (``compute_stage_d_drought``, low-wake-count detector) treat
+    ``None`` as "metric not applicable" and skip the check.
+
+    Returns ``int | None`` per value; ``None`` signals single-mode
+    thinking where sleep-stage buckets are N/A.
     """
     counts = {"stage_b": 0, "stage_c": 0, "stage_d": 0}
+    wakes_with_stage = 0
+    wakes_in_window = 0
     ws = _strip_tz(window_start)
     we = _strip_tz(window_end)
     for date_dir in _intersecting_date_dirs(thoughts_dir, ws, we):
@@ -2485,10 +2498,17 @@ def count_wakes_by_stage(
                 continue
             if not (ws <= ts < we):
                 continue
+            wakes_in_window += 1
             stage = _read_stage(md)
             if stage is None:
                 continue
             counts[f"stage_{stage.lower()}"] += 1
+            wakes_with_stage += 1
+    # Single-mode guard: wakes exist but none have stage frontmatter.
+    # This happens when thinking is always ``mode: active`` (Phase 5+).
+    # Return nulls so downstream knows the metric is N/A, not zero.
+    if wakes_in_window > 0 and wakes_with_stage == 0:
+        return {"stage_b": None, "stage_c": None, "stage_d": None}
     return counts
 
 
@@ -2895,8 +2915,15 @@ def compute_stage_d_drought(
 
     for evt in events:
         wd = evt.get("wake_type_distribution", {})
-        if isinstance(wd, dict) and wd.get("stage_d", 0) != 0:
-            return False
+        if isinstance(wd, dict):
+            # Single-mode guard: None values mean no wake in this
+            # window carried a stage frontmatter (Phase 5+ active
+            # thinking). Drought detection is N/A — return False.
+            stage_d = wd.get("stage_d")
+            if stage_d is None:
+                return False
+            if stage_d != 0:
+                return False
 
     for evt in events:
         if evt.get("research_notes_last_night", 0) > 0:
@@ -3162,17 +3189,22 @@ def build_vault_health_event(
     # the next morning surface scan. Background: May-22 sleep cycle
     # had 3 wakes in 8 hours; healthy is 15–19.
     dist = event["wake_type_distribution"]
-    total_sleep_wakes = (
-        int(dist.get("stage_b", 0))
-        + int(dist.get("stage_c", 0))
-        + int(dist.get("stage_d", 0))
-    )
+    # Single-mode guard: null values mean no wake carried a stage
+    # frontmatter (Phase 5+ active thinking). Skip the check.
+    if dist.get("stage_b") is None:
+        total_sleep_wakes = None
+    else:
+        total_sleep_wakes = (
+            int(dist.get("stage_b", 0))
+            + int(dist.get("stage_c", 0))
+            + int(dist.get("stage_d", 0))
+        )
     event["total_sleep_wakes"] = total_sleep_wakes
     # Same partial-window concern as the drought flag — a low count
     # before 07:00 Eastern is expected because not all sleep-phase wakes
     # have written their note yet. Only fire the low-wake surface once
     # the window has closed.
-    if window_closed and total_sleep_wakes < WAKE_COUNT_THRESHOLD:
+    if window_closed and total_sleep_wakes is not None and total_sleep_wakes < WAKE_COUNT_THRESHOLD:
         event["low_wake_count"] = True
         try:
             _write_low_wake_count_surface(
@@ -3383,58 +3415,71 @@ def main(argv: list[str] | None = None) -> int:
         if not _sleep_window_closed(now):
             return 0
 
-        if args.check_existing and vault_health_event_exists_for_date(
-            args.events, today_str
-        ):
-            # Today's event already on disk. Silent no-op so the morning
-            # scan can call this unconditionally.
-            return 0
+        # Serialize check-existing + build + append under a per-file
+        # advisory lock. Without it, two vault_health invocations that
+        # start within the ~seconds-long build_vault_health_event()
+        # window both see check-existing=False and both append,
+        # producing duplicate events for the same date. Observed
+        # 2026-07-10: 181 events across 46 dates, 38 with dupes (worst
+        # 23-for-1 on 2026-07-03). Lock file is per-events-path so
+        # concurrent vault_health calls against the same events.jsonl
+        # coordinate.
+        lock_path = args.events.with_suffix(args.events.suffix + ".lock")
+        with open(lock_path, "w") as _lock_fh:
+            fcntl.flock(_lock_fh.fileno(), fcntl.LOCK_EX)
 
-        event = build_vault_health_event(
-            vault_dir=args.vault,
-            thoughts_dir=args.thoughts,
-            events_path=args.events,
-            surface_dir=args.surface,
-            now=now,
-            index_db_path=args.index_db,
-        )
-        if args.continuous:
-            event["continuous_checks"] = compute_continuous_checks(
-                args.vault, today=now,
+            if args.check_existing and vault_health_event_exists_for_date(
+                args.events, today_str
+            ):
+                # Today's event already on disk. Silent no-op so the morning
+                # scan can call this unconditionally.
+                return 0
+
+            event = build_vault_health_event(
+                vault_dir=args.vault,
+                thoughts_dir=args.thoughts,
+                events_path=args.events,
+                surface_dir=args.surface,
+                now=now,
+                index_db_path=args.index_db,
             )
-
-        if args.append:
-            _append_event(args.events, event)
-
-            # Standalone birth_signal event — per spec
-            # (cortex-memory/research/2026-06-25-birth-signal-implementation-spec.md
-            # §"Future enhancements" item 4). vault_health embeds the
-            # metrics for correlation; the standalone event is the
-            # canonical record consumed by downstream tooling. Honor
-            # --check-existing so the daily scan can call this
-            # unconditionally without producing duplicates.
-            try:
-                from metrics.birth_signal import (
-                    birth_signal_event_exists_for_date,
-                    build_birth_signal_event,
+            if args.continuous:
+                event["continuous_checks"] = compute_continuous_checks(
+                    args.vault, today=now,
                 )
 
-                if not (
-                    args.check_existing
-                    and birth_signal_event_exists_for_date(
-                        args.events, today_str,
+            if args.append:
+                _append_event(args.events, event)
+
+                # Standalone birth_signal event — per spec
+                # (cortex-memory/research/2026-06-25-birth-signal-implementation-spec.md
+                # §"Future enhancements" item 4). vault_health embeds the
+                # metrics for correlation; the standalone event is the
+                # canonical record consumed by downstream tooling. Honor
+                # --check-existing so the daily scan can call this
+                # unconditionally without producing duplicates.
+                try:
+                    from metrics.birth_signal import (
+                        birth_signal_event_exists_for_date,
+                        build_birth_signal_event,
                     )
-                ):
-                    bs_event = build_birth_signal_event(args.vault, now=now)
-                    _append_event(args.events, bs_event)
-            except Exception as exc:  # noqa: BLE001 — never block vault_health
-                logger.warning(
-                    "vault_health: birth_signal standalone event skipped (%s)",
-                    exc,
-                )
-        else:
-            print(json.dumps(event))
-        return 0
+
+                    if not (
+                        args.check_existing
+                        and birth_signal_event_exists_for_date(
+                            args.events, today_str,
+                        )
+                    ):
+                        bs_event = build_birth_signal_event(args.vault, now=now)
+                        _append_event(args.events, bs_event)
+                except Exception as exc:  # noqa: BLE001 — never block vault_health
+                    logger.warning(
+                        "vault_health: birth_signal standalone event skipped (%s)",
+                        exc,
+                    )
+            else:
+                print(json.dumps(event))
+            return 0
 
     # Legacy mode: emit partial-metric JSON for ad-hoc inspection.
     out: dict[str, Any] = {
