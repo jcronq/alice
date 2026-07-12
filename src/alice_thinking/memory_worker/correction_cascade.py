@@ -399,6 +399,17 @@ def _find_correction_notes(vault: pathlib.Path) -> list[pathlib.Path]:
             continue
         fm, _body = split_frontmatter(text)
 
+        # Meta-correction hubs (reference notes ABOUT corrections, not
+        # corrections themselves) are explicitly marked with
+        # ``is_meta_correction: true``. Skip them regardless of filename
+        # or note_type — otherwise a hub whose filename matches
+        # ``-correction-`` (e.g. ``hub-correction-cascade.md``) gets
+        # picked up and its ``references:`` field is treated as a
+        # supersedes-target, generating false-positive unpropagated
+        # corrections for every note that references the same target.
+        if fm.get("is_meta_correction"):
+            continue
+
         note_type = str(fm.get("note_type") or "").strip().lower()
         if note_type == "correction":
             corrections.append(md)
