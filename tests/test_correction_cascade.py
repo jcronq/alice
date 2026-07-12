@@ -337,6 +337,30 @@ class TestFindCorrectionNotes:
         notes = _find_correction_notes(vault)
         assert len(notes) == 0
 
+    def test_meta_correction_hub_excluded_by_filename(self, tmp_path):
+        vault = tmp_path / "cortex-memory"
+        vault.mkdir()
+        (vault / "reference").mkdir()
+        md = vault / "reference" / "hub-correction-cascade.md"
+        md.write_text(
+            "---\nis_meta_correction: true\nnote_type: reference\n---\nhub note",
+            encoding="utf-8",
+        )
+        notes = _find_correction_notes(vault)
+        assert len(notes) == 0
+
+    def test_meta_correction_hub_excluded_over_note_type(self, tmp_path):
+        vault = tmp_path / "cortex-memory"
+        vault.mkdir()
+        (vault / "reference").mkdir()
+        md = vault / "reference" / "some-note.md"
+        md.write_text(
+            "---\nis_meta_correction: true\nnote_type: correction\n---\nmislabeled",
+            encoding="utf-8",
+        )
+        notes = _find_correction_notes(vault)
+        assert len(notes) == 0
+
     def test_hidden_folder_excluded(self, tmp_path):
         vault = tmp_path / "cortex-memory"
         vault.mkdir()
