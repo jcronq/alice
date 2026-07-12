@@ -548,6 +548,9 @@ def _try_resolve_slug(slug: str, vault: pathlib.Path) -> Optional[pathlib.Path]:
     Then tries:
     1. <slug>.md at vault root
     2. <folder>/<slug>.md for each known folder
+    3. <folder>/YYYY-MM-DD-<slug>.md date-prefixed fallback
+       (common in research/ where notes are date-stamped on creation).
+       Multiple matches → latest by filename sort (chronological).
     """
     clean = slug.strip()
     # Strip wikilink syntax [[slug]]
@@ -570,6 +573,17 @@ def _try_resolve_slug(slug: str, vault: pathlib.Path) -> Optional[pathlib.Path]:
         candidate = vault / folder / f"{clean}.md"
         if candidate.is_file():
             return candidate
+    # Date-prefixed fallback — many research notes are stored as
+    # YYYY-MM-DD-<slug>.md but referenced as just <slug>. Prior art:
+    # cortex-memory/research/2026-06-12-slug-resolution-date-prefix-bug.md
+    date_glob = f"[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-{clean}.md"
+    for folder in ("projects", "reference", "research"):
+        folder_path = vault / folder
+        if not folder_path.is_dir():
+            continue
+        matches = sorted(folder_path.glob(date_glob))
+        if matches:
+            return matches[-1]
     return None
 
 
