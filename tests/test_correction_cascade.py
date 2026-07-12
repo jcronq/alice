@@ -874,6 +874,34 @@ class TestTryResolveSlug:
         result = _try_resolve_slug("projects/bar", tmp_path)
         assert result is None
 
+    def test_date_prefixed_fallback(self, tmp_path):
+        (tmp_path / "research").mkdir(parents=True)
+        (tmp_path / "research" / "2026-04-28-cortex-index-design.md").write_text(
+            "---\n---\nbody", encoding="utf-8"
+        )
+        result = _try_resolve_slug("cortex-index-design", tmp_path)
+        assert result == tmp_path / "research" / "2026-04-28-cortex-index-design.md"
+
+    def test_date_prefixed_multiple_picks_latest(self, tmp_path):
+        (tmp_path / "research").mkdir(parents=True)
+        older = tmp_path / "research" / "2026-04-28-mempalace-analysis.md"
+        newer = tmp_path / "research" / "2026-05-30-mempalace-analysis.md"
+        older.write_text("---\n---\nold", encoding="utf-8")
+        newer.write_text("---\n---\nnew", encoding="utf-8")
+        result = _try_resolve_slug("mempalace-analysis", tmp_path)
+        assert result == newer
+
+    def test_exact_match_wins_over_date_prefixed(self, tmp_path):
+        (tmp_path / "research").mkdir(parents=True)
+        (tmp_path / "research" / "cortex-index-design.md").write_text(
+            "---\n---\nexact", encoding="utf-8"
+        )
+        (tmp_path / "research" / "2026-04-28-cortex-index-design.md").write_text(
+            "---\n---\ndated", encoding="utf-8"
+        )
+        result = _try_resolve_slug("cortex-index-design", tmp_path)
+        assert result == tmp_path / "research" / "cortex-index-design.md"
+
 
 # ── Priority ordering ───────────────────────────────────────────────
 
