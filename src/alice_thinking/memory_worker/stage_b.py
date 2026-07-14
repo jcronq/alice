@@ -91,6 +91,7 @@ CONCEPT_TAGS = frozenset(
         "feedback",
         "feedback-self",
         "source",
+        "for-thinking",
     }
 )
 
@@ -110,6 +111,7 @@ _CONCEPT_FOLDER = {
     "feedback": "feedback",
     "feedback-self": "feedback",
     "source": "sources",
+    "for-thinking": "research",
 }
 
 #: Body markers that promote a note to a structured event when the
@@ -287,6 +289,7 @@ def _route_concept(fm: dict[str, Any], body: str, filename: str) -> Optional[Rou
         "feedback",
         "feedback-self",
         "source",
+        "for-thinking",
     ):
         if candidate in intersect:
             return Route(
