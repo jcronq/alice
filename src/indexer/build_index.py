@@ -52,7 +52,7 @@ SCHEMA_VERSION = 2
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 
 # Folders whose inbound links count as structural citations.
-STRUCTURAL_FOLDERS = {"projects", "reference", "people", "decisions"}
+STRUCTURAL_FOLDERS = {"projects", "reference", "people", "decisions", "research"}
 STRUCTURAL_ROOT_FILES = {"index"}  # /index.md at vault root
 
 DEFAULT_VAULT = Path.home() / "alice-mind" / "cortex-memory"
