@@ -2144,11 +2144,56 @@ def compute_recovery_state(
             burst_debt_trend, _ = _trend_over_last_events(
                 events, _extract_recovery_debt_delta
             )
+            # Compute structural_debt_delta during burst using the same
+            # logic as the non-burst path so the observation-only
+            # structural_debt_trend field reflects actual vault health
+            # movement during bursts (see
+            # [[research/2026-07-21-structural-debt-trend-blind-spot-fix-design]]).
+            # `events` is already loaded above; reuse it directly.
+            debt_delta = 0
+            debt_at_start_pre = None
+            debt_at_start_in = None
+            debt_at_end = None
+            for evt in events:
+                if evt.get("type") != "vault_health":
+                    continue
+                evt_date_str = evt.get("date")
+                if not evt_date_str:
+                    continue
+                try:
+                    evt_date = datetime.strptime(evt_date_str, "%Y-%m-%d")
+                except ValueError:
+                    continue
+                evt_naive = evt_date.replace(hour=0, minute=0, second=0, microsecond=0)
+                if evt_naive <= ws and (debt_at_start_pre is None or evt_date > debt_at_start_pre):
+                    debt_at_start_pre = evt_date
+                if evt_naive > ws and (debt_at_start_in is None or evt_date < debt_at_start_in):
+                    debt_at_start_in = evt_date
+                if debt_at_end is None or evt_date > debt_at_end:
+                    debt_at_end = evt_date
+            debt_at_start = debt_at_start_pre or debt_at_start_in
+            if (
+                debt_at_start is not None
+                and debt_at_end is not None
+                and debt_at_start != debt_at_end
+            ):
+                start_evt = next(
+                    (e for e in events if e.get("date") == debt_at_start.strftime("%Y-%m-%d")),
+                    None,
+                )
+                end_evt = next(
+                    (e for e in events if e.get("date") == debt_at_end.strftime("%Y-%m-%d")),
+                    None,
+                )
+                if start_evt and end_evt:
+                    debt_delta = _event_structural_debt(end_evt) - _event_structural_debt(
+                        start_evt
+                    )
             return {
                 "status": "active_burst",
                 "tier_1_ratio": None,
                 "output_rate_slope": None,
-                "structural_debt_delta": None,
+                "structural_debt_delta": debt_delta,
                 "estimated_recovery_tier": "R0",
                 "burst_start_date": last_night_dates[-1] if last_night_dates else None,
                 "day_in_window": len(last_night_dates),
