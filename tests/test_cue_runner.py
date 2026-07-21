@@ -1789,3 +1789,80 @@ async def test_build_cue_packet_hebbian_missing_links_table_is_noop(
     }
     packet = await build_cue_packet("cozyhem", cfg, db_path=db, vault_root=vault)
     assert "cozyhem details" in packet
+
+
+# ---------------------------------------------------------------------------
+# Per-turn observability log (_log_cue_event)
+
+
+@pytest.mark.asyncio
+async def test_log_cue_event_appends_valid_jsonl(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_log_cue_event`` must append exactly one JSON line matching
+    the schema described in
+    ``cortex-memory/research/2026-07-21-cue-runner-observability-design.md``.
+    Follow-up calls must append (not overwrite), and non-serialisable
+    or unwritable event/paths must NOT propagate exceptions to the
+    caller (the turn loop must never break on a failed log write).
+    """
+    events_path = tmp_path / "state" / "cue-runner-events.jsonl"
+    monkeypatch.setattr(cue_runner, "_CUE_EVENT_PATH", events_path)
+
+    event = {
+        "schema_version": 1,
+        "ts": 1_721_580_000.0,
+        "event": "cue_runner_match",
+        "query_tokens": 5,
+        "fts_over_fetch": 15,
+        "fts_candidates": 12,
+        "top_n": 3,
+        "packet_tokens_est": 450,
+        "latency_ms": 23,
+        "candidates": [
+            {
+                "slug": "note-a",
+                "score": 1.23,
+                "boost": 1.0,
+                "hebbian_bonus": 0.0,
+                "typed_bonus": 0.0,
+                "fitness_bonus": 0.0,
+            }
+        ],
+        "bumps_ok": True,
+    }
+    await cue_runner._log_cue_event(event)
+
+    assert events_path.exists(), "expected the JSONL file to be created"
+    lines = events_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1, f"expected exactly one line, got {len(lines)}"
+    round_tripped = json.loads(lines[0])
+    assert round_tripped == event
+
+    # Second call — must append, not overwrite.
+    empty_event = {
+        "schema_version": 1,
+        "ts": 1_721_580_001.0,
+        "event": "cue_runner_empty",
+        "reason": "no_tokens",
+        "query_tokens": 0,
+    }
+    await cue_runner._log_cue_event(empty_event)
+    lines = events_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[1]) == empty_event
+
+    # Non-serialisable payload must be swallowed (no line written, no raise).
+    await cue_runner._log_cue_event({"not-serialisable": object()})
+    lines = events_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2, "non-serialisable event must NOT append a line"
+
+    # Unwritable path (parent is a file, not a directory) must also be
+    # swallowed. Simulate by pointing at a nested path under an existing
+    # regular file.
+    a_file = tmp_path / "not-a-dir"
+    a_file.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(
+        cue_runner, "_CUE_EVENT_PATH", a_file / "sub" / "events.jsonl"
+    )
+    await cue_runner._log_cue_event({"any": 1})  # must NOT raise

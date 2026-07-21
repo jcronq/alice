@@ -82,6 +82,15 @@ SPEAKING_DEFAULTS: dict[str, Any] = {
     # in alice.config.json. Phase 2 reranker is gated separately.
     "cue_runner": {
         "enabled": False,
+        # Advisory safety gate: the cue runner should NOT be enabled
+        # without observability=True. Before flipping enabled=True,
+        # confirm cue-runner-events.jsonl is being written (48h burn-in
+        # per cortex-memory/research/2026-07-21-cue-runner-observability-design.md).
+        # This key is currently informational — build_cue_context() reads
+        # it to gate the JSONL write, but does NOT hard-refuse to run
+        # when enabled=True + observability=False. Enforced structural
+        # check is a follow-up.
+        "observability": True,
         # Empty string defaults to ~/alice-mind/inner/state/cortex-index.db
         # at call time. Override here if the indexer DB lives elsewhere.
         "db_path": "",
