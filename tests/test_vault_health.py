@@ -1128,6 +1128,64 @@ def test_recovery_state_active_burst_metadata(tmp_path: Path) -> None:
     assert result["day_in_window"] == 3
 
 
+def test_recovery_state_active_burst_computes_structural_debt_delta(
+    tmp_path: Path,
+) -> None:
+    """During active_burst, structural_debt_delta is computed (not None).
+
+    Regression test for the trend blind-spot bug (design:
+    ``research/2026-07-21-structural-debt-trend-blind-spot-fix-design``).
+    The burst return path used to hardcode ``structural_debt_delta: None``,
+    which caused the observation-only ``structural_debt_trend`` field to
+    freeze at the pre-burst value. Now it uses the same computation as
+    the non-burst path so the trend field reflects actual movement during
+    bursts.
+    """
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    from datetime import datetime, timedelta
+
+    # Pre-burst baseline event with real orphan/broken counts.
+    _write_event(events, "2026-06-01T08:00:00-04:00", {
+        "date": "2026-06-01",
+        "total_notes": 100,
+        "orphan_notes": 18,
+        "broken_wikilinks": 4,
+    })
+    # Three consecutive burst days — carry real orphan/broken counts
+    # (though the burst-return path uses top-level structural fields
+    # via _event_structural_debt, not the recovery_state sub-object).
+    burst_days = (
+        ("2026-06-14", 47, 12, 3),
+        ("2026-06-15", 38, 5, 2),
+        ("2026-06-16", 64, 1, 1),
+    )
+    for day, rnl, orphans, broken in burst_days:
+        _write_event(events, f"{day}T08:00:00-04:00", {
+            "date": day,
+            "research_notes_last_night": rnl,
+            "orphan_notes": orphans,
+            "broken_wikilinks": broken,
+        })
+
+    we = datetime(2026, 6, 16, 7, 0, 0)
+    ws = we - timedelta(days=14)
+    result = compute_recovery_state(
+        vault, thoughts, window_start=ws, window_end=we, events_path=events
+    )
+    assert result["status"] == "active_burst"
+    # The regression: structural_debt_delta must be computed, not None.
+    assert result["structural_debt_delta"] is not None
+    assert isinstance(result["structural_debt_delta"], int)
+    # Start event: pre-burst 2026-06-01 has debt = 18 + 4 = 22.
+    # End event: 2026-06-16 has debt = 1 + 1 = 2.
+    # Delta = 2 - 22 = -20 (improvement).
+    assert result["structural_debt_delta"] == -20
+
+
 # ---------------------------------------------------------------------------
 # Observation-only trend fields: [[recovery-classification-improvement]]
 # Additive fields (tier_1_trend, tier_1_trend_significance,
