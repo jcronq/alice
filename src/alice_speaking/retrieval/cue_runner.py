@@ -36,6 +36,7 @@ import os
 import pathlib
 import re
 import sqlite3
+import time
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -338,6 +339,14 @@ class _Candidate:
     final_score: float
     matched_lines: list[dict[str, Any]]
     why_relevant: str = ""
+    # Additive bonus components attached during scoring so the per-turn
+    # observability log (_log_cue_event) can attribute the final_score
+    # back to its sources. Defaults keep prior in-memory shape when the
+    # respective code paths don't fire (Hebbian disabled, no typed edges,
+    # non-fitness note, etc.).
+    hebbian_bonus: float = 0.0
+    typed_bonus: float = 0.0
+    fitness_bonus: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -1071,18 +1080,47 @@ async def build_cue_context(
         packet so we don't re-summarise notes Speaking is already
         looking at.
     """
+    # Observability: emit one JSONL event per turn to
+    # ~/alice-mind/inner/state/cue-runner-events.jsonl (schema v1).
+    # Gated on cfg["observability"] (advisory default True) — see
+    # cortex-memory/research/2026-07-21-cue-runner-observability-design.md.
+    # Logging is only meaningful when the cue runner is actually running,
+    # so the enabled=False short-circuit below skips it entirely.
+    observability = bool(cfg.get("observability", True))
+    start: float | None = None
+    tokens: list[str] = []
     try:
         if not cfg.get("enabled", False):
             return _EMPTY_CUE_CONTEXT
 
         tokens = _tokenize_query(query)
         if not tokens:
+            if observability:
+                await _log_cue_event(
+                    {
+                        "schema_version": 1,
+                        "ts": time.time(),
+                        "event": "cue_runner_empty",
+                        "reason": "no_tokens",
+                        "query_tokens": 0,
+                    }
+                )
             return _EMPTY_CUE_CONTEXT
 
         resolved_db = _resolve_db_path(cfg, db_path)
         resolved_vault = _resolve_vault_root(vault_root)
         if not resolved_db.exists():
             log.debug("cue_runner: db_path %s does not exist", resolved_db)
+            if observability:
+                await _log_cue_event(
+                    {
+                        "schema_version": 1,
+                        "ts": time.time(),
+                        "event": "cue_runner_empty",
+                        "reason": "no_fts_hits",
+                        "query_tokens": len(tokens),
+                    }
+                )
             return _EMPTY_CUE_CONTEXT
 
         timeout_s = cfg.get("timeout_ms", _DEFAULT_TIMEOUT_MS) / 1000.0
@@ -1093,6 +1131,10 @@ async def build_cue_context(
         )
 
         fts_match = _build_fts_match(tokens)
+        # Latency clock covers the FTS query + all scoring + packet build.
+        # time.monotonic() (not time.time()) — durations must be immune to
+        # wall-clock adjustments (NTP, DST).
+        start = time.monotonic()
         try:
             rows = await asyncio.wait_for(
                 asyncio.to_thread(_query_fts, resolved_db, fts_match),
@@ -1100,6 +1142,28 @@ async def build_cue_context(
             )
         except asyncio.TimeoutError:
             log.debug("cue_runner: FTS query timed out (%.0fms)", timeout_s * 1000)
+            if observability:
+                await _log_cue_event(
+                    {
+                        "schema_version": 1,
+                        "ts": time.time(),
+                        "event": "cue_runner_empty",
+                        "reason": "no_fts_hits",
+                        "query_tokens": len(tokens),
+                    }
+                )
+            return _EMPTY_CUE_CONTEXT
+        if not rows:
+            if observability:
+                await _log_cue_event(
+                    {
+                        "schema_version": 1,
+                        "ts": time.time(),
+                        "event": "cue_runner_empty",
+                        "reason": "no_fts_hits",
+                        "query_tokens": len(tokens),
+                    }
+                )
             return _EMPTY_CUE_CONTEXT
 
         # Pull access_count from note_metrics for the recency boost.
@@ -1264,10 +1328,23 @@ async def build_cue_context(
                     boost=boost,
                     final_score=final_score,
                     matched_lines=matched,
+                    hebbian_bonus=hebbian_bonus,
+                    typed_bonus=typed_bonus,
+                    fitness_bonus=fitness_bonus,
                 )
             )
 
         if not candidates:
+            if observability:
+                await _log_cue_event(
+                    {
+                        "schema_version": 1,
+                        "ts": time.time(),
+                        "event": "cue_runner_empty",
+                        "reason": "all_excluded",
+                        "query_tokens": len(tokens),
+                    }
+                )
             return _EMPTY_CUE_CONTEXT
 
         # Sort by boosted score (descending).
@@ -1283,6 +1360,16 @@ async def build_cue_context(
         final = candidates[:top_n]
         packet = _format_packet(final, packet_ceiling)
         if not packet:
+            if observability:
+                await _log_cue_event(
+                    {
+                        "schema_version": 1,
+                        "ts": time.time(),
+                        "event": "cue_runner_empty",
+                        "reason": "all_excluded",
+                        "query_tokens": len(tokens),
+                    }
+                )
             return _EMPTY_CUE_CONTEXT
 
         # Fire-and-forget access_count bumps. Don't await — the bumps
@@ -1292,16 +1379,69 @@ async def build_cue_context(
         # note_metrics table — without this the SQL recency boost
         # cannot fire (see
         # cortex-memory/research/2026-05-11-retrieval-data-pipeline-critical.md).
+        # bumps_ok tracks *scheduling* success — the actual writes are
+        # background tasks (see _spawn_bump); a False here means we
+        # couldn't even queue the bump (no running loop / scheduling
+        # error), not that the DB write failed.
+        bumps_ok = True
         for c in final:
             if c.path:
-                _spawn_bump(resolved_vault, c.path, db_path=resolved_db, slug=c.slug)
+                try:
+                    _spawn_bump(
+                        resolved_vault, c.path, db_path=resolved_db, slug=c.slug
+                    )
+                except Exception:  # noqa: BLE001
+                    bumps_ok = False
+
+        if observability:
+            latency_ms = int((time.monotonic() - start) * 1000) if start is not None else 0
+            await _log_cue_event(
+                {
+                    "schema_version": 1,
+                    "ts": time.time(),
+                    "event": "cue_runner_match",
+                    "query_tokens": len(tokens),
+                    "fts_over_fetch": _FTS_OVER_FETCH,
+                    "fts_candidates": len(rows),
+                    "top_n": top_n,
+                    "packet_tokens_est": len(packet) // 4,
+                    "latency_ms": latency_ms,
+                    "candidates": [
+                        {
+                            "slug": c.slug,
+                            "score": c.final_score,
+                            "boost": c.boost,
+                            "hebbian_bonus": c.hebbian_bonus,
+                            "typed_bonus": c.typed_bonus,
+                            "fitness_bonus": c.fitness_bonus,
+                        }
+                        for c in final
+                    ],
+                    "bumps_ok": bumps_ok,
+                }
+            )
 
         return CueContext(
             text=packet,
             candidates=[_candidate_to_log_dict(c) for c in final],
         )
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         log.exception("cue_runner: unexpected error; returning empty packet")
+        if observability:
+            try:
+                await _log_cue_event(
+                    {
+                        "schema_version": 1,
+                        "ts": time.time(),
+                        "event": "cue_runner_error",
+                        "error": str(exc)[:200],
+                    }
+                )
+            except Exception:  # noqa: BLE001
+                # _log_cue_event already swallows write errors; this catch
+                # is belt-and-suspenders so a logging bug never masks the
+                # original exception path.
+                log.debug("cue_runner: error-event logging failed", exc_info=True)
         return _EMPTY_CUE_CONTEXT
 
 
@@ -1431,6 +1571,70 @@ def _log_bump_failure(task: "asyncio.Task[Any]") -> None:
     exc = task.exception()
     if exc is not None:
         log.debug("cue_runner: access_count bump task failed: %r", exc)
+
+
+# ---------------------------------------------------------------------------
+# Per-turn observability log
+#
+# One JSONL event per Speaking turn that hits the cue runner. Sidecar file
+# alongside the other inner/state/ runtime artifacts (quiet-queue.jsonl,
+# vault-access-log.jsonl). Schema v1 is defined in
+# cortex-memory/research/2026-07-21-cue-runner-observability-design.md
+# §Event types. Three event types: cue_runner_match, cue_runner_empty,
+# cue_runner_error.
+#
+# The write is off-thread (asyncio.to_thread) so the ~1ms disk-append
+# doesn't stall the event loop, but IS awaited so scheduling can't drop
+# it (a bare `asyncio.to_thread(...)` returns an unscheduled coroutine
+# that GC eats — the log would never fire). Any exception in the write
+# is swallowed here so a bad disk state cannot break a Speaking turn.
+
+_CUE_EVENT_PATH = (
+    pathlib.Path.home() / "alice-mind" / "inner" / "state" / "cue-runner-events.jsonl"
+)
+
+
+async def _log_cue_event(event: dict[str, Any]) -> None:
+    """Append one JSONL event to ``cue-runner-events.jsonl``.
+
+    Best-effort: any exception during path setup or the append is
+    logged at debug level and swallowed. The caller's happy path must
+    NEVER be broken by an observability write failure.
+    """
+
+    def _do_write() -> None:
+        try:
+            _CUE_EVENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            log.debug(
+                "cue_runner: could not create %s parent dir",
+                _CUE_EVENT_PATH,
+                exc_info=True,
+            )
+            return
+        try:
+            line = json.dumps(event, separators=(",", ":"))
+        except (TypeError, ValueError):
+            log.debug("cue_runner: event not JSON-serialisable", exc_info=True)
+            return
+        try:
+            with _CUE_EVENT_PATH.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+                fh.write("\n")
+        except OSError:
+            log.debug(
+                "cue_runner: failed to append event to %s",
+                _CUE_EVENT_PATH,
+                exc_info=True,
+            )
+
+    try:
+        await asyncio.to_thread(_do_write)
+    except Exception:  # noqa: BLE001
+        # Belt-and-suspenders: _do_write already swallows OSError; this
+        # catches anything the to_thread wrapper itself might raise so
+        # the observability path is truly non-blocking to the turn.
+        log.debug("cue_runner: _log_cue_event dispatch failed", exc_info=True)
 
 
 __all__ = [
