@@ -129,7 +129,7 @@ def query_typed_edge_weights(
             SELECT to_slug,
                    SUM(CASE WHEN link_type='cites' THEN ?
                              WHEN link_type='connects_to' THEN ?
-                             ELSE 0 END) AS typed_weight_sum
+                             ELSE 0.25 END) AS typed_weight_sum
             FROM typed_edges
             WHERE from_slug IN ({placeholders})
               AND confidence='high'
