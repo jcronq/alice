@@ -28,6 +28,7 @@ set -e
 
 LOCK=/state/worker/repo-autopull.lock
 NOOP_STAMP=/state/worker/repo-autopull-last-noop
+SKIP_STAMP=/state/worker/repo-autopull-last-skip
 CONFIG_JSON=/home/alice/alice-mind/config/alice.config.json
 REPO=/home/alice/alice
 DEFAULT_INTERVAL=60
@@ -66,7 +67,28 @@ while true; do
 set -u
 REPO=/home/alice/alice
 NOOP_STAMP=/state/worker/repo-autopull-last-noop
+SKIP_STAMP=/state/worker/repo-autopull-last-skip
 NOOP_THROTTLE_SECONDS='"$NOOP_THROTTLE_SECONDS"'
+
+# Throttled skip-event write. The event log gets flooded when the working
+# tree stays dirty (or on any persistent skip reason) since the poll fires
+# every 60s. Throttle to once per NOOP_THROTTLE_SECONDS, matching the noop
+# throttle. The stderr log line always fires unconditionally — that is not
+# what floods events.jsonl.
+skip_event() {
+    local reason="$1"
+    shift
+    local now last=0
+    now=$(date +%s)
+    if [ -f "$SKIP_STAMP" ]; then
+        last=$(cat "$SKIP_STAMP" 2>/dev/null || echo 0)
+    fi
+    if [ $(( now - last )) -ge "$NOOP_THROTTLE_SECONDS" ]; then
+        /usr/local/bin/event-log alice_repo_autopull_skipped system \
+            reason="$reason" "$@" --source cron >/dev/null 2>&1 || true
+        echo "$now" > "$SKIP_STAMP"
+    fi
+}
 
 cd "$REPO" || { echo "alice-repo-autopull: cannot cd $REPO" >&2; exit 0; }
 
@@ -75,8 +97,7 @@ cd "$REPO" || { echo "alice-repo-autopull: cannot cd $REPO" >&2; exit 0; }
 # them.
 if ! git diff --quiet || ! git diff --cached --quiet; then
     echo "alice-repo-autopull: uncommitted changes in $REPO; skipping pull" >&2
-    /usr/local/bin/event-log alice_repo_autopull_skipped system \
-        reason=dirty_worktree repo="$REPO" --source cron >/dev/null 2>&1 || true
+    skip_event dirty_worktree repo="$REPO"
     exit 0
 fi
 
@@ -84,24 +105,20 @@ fi
 current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "DETACHED")
 if [ "$current_branch" != "master" ]; then
     echo "alice-repo-autopull: on branch $current_branch (not master); skipping pull" >&2
-    /usr/local/bin/event-log alice_repo_autopull_skipped system \
-        reason=not_on_master branch="$current_branch" repo="$REPO" --source cron \
-        >/dev/null 2>&1 || true
+    skip_event not_on_master branch="$current_branch" repo="$REPO"
     exit 0
 fi
 
 before=$(git rev-parse HEAD)
 if ! git fetch origin master 2>&1; then
     echo "alice-repo-autopull: git fetch failed" >&2
-    /usr/local/bin/event-log alice_repo_autopull_skipped system \
-        reason=fetch_failed repo="$REPO" --source cron >/dev/null 2>&1 || true
+    skip_event fetch_failed repo="$REPO"
     exit 0
 fi
 
 if ! git merge --ff-only origin/master 2>&1; then
     echo "alice-repo-autopull: ff merge refused (local has diverged?)" >&2
-    /usr/local/bin/event-log alice_repo_autopull_skipped system \
-        reason=ff_refused repo="$REPO" --source cron >/dev/null 2>&1 || true
+    skip_event ff_refused repo="$REPO"
     exit 0
 fi
 
@@ -112,9 +129,11 @@ if [ "$before" != "$after" ]; then
     /usr/local/bin/event-log alice_repo_autopull_advanced system \
         from_sha="$before" to_sha="$after" repo="$REPO" --source cron \
         >/dev/null 2>&1 || true
-    # Reset noop throttle so the next noop after a real advance is logged
-    # immediately (useful for "did the catch-up actually quiesce?").
+    # Reset noop + skip throttles so a fresh noop or skip after a real
+    # advance is logged immediately (useful for "did the catch-up actually
+    # quiesce?" and for surfacing a persistent skip that resumes post-FF).
     rm -f "$NOOP_STAMP" 2>/dev/null || true
+    rm -f "$SKIP_STAMP" 2>/dev/null || true
 else
     # Throttle the noop event to once per NOOP_THROTTLE_SECONDS so the
     # event log does not get flooded by the 60s polling cadence.
