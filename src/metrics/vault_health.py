@@ -343,6 +343,11 @@ def count_broken_wikilinks(
     Code spans, fenced code blocks, and HTML comment blocks are
     excluded. Resolution checks slug, filename stem, and aliases (case
     insensitive).
+
+    See :doc:`/reference/structural-link-counting-canonical-source` for
+    the canonical definition of structural links and why frontmatter
+    wikilinks are counted separately from body wikilinks in downstream
+    metrics.
     """
     by_slug, _slugs_to_aliases, alias_lower_to_slug = _build_resolution_index(vault_dir)
     broken: list[tuple[str, str]] = []
@@ -374,6 +379,11 @@ def count_orphans(vault_dir: Path) -> tuple[int, list[str]]:
     candidate set. A note is orphan iff none of (slug, aliases,
     filename-stem) appears among the union of referenced targets
     across the whole vault.
+
+    See :doc:`/reference/structural-link-counting-canonical-source` for
+    the canonical definition of structural links and the distinction
+    between Definition 1 (indexer ``is_structural=1``) and the
+    frontmatter+body scanning used here.
     """
     by_slug, slugs_to_aliases, _alias_lower_to_slug = _build_resolution_index(vault_dir)
     # Build the referenced set: every wikilink target seen anywhere,
@@ -457,6 +467,11 @@ def count_shadow_and_dark(vault_dir: Path) -> dict[str, int]:
     Dailies, archive, and scaffolding (``index.md``, ``README.md``,
     ``unresolved.md``) are excluded from both categories. Inbound counts
     use the alias-resolved definition from ``count_inbound_links``.
+
+    See :doc:`/reference/structural-link-counting-canonical-source` for
+    the canonical definition of structural links and the distinction
+    between indexer ``is_structural=1`` and the scanning approach used
+    here.
 
     ``frontmatter_parse_failures`` counts notes whose first line is the
     ``---`` frontmatter fence but ``split_frontmatter`` returned an empty
@@ -552,6 +567,11 @@ def compute_continuous_checks(
     Reuses the inbound link graph from :func:`count_inbound_links` and
     the wikilink extractor from :func:`_extract_targets`, so the regex
     walk isn't duplicated.
+
+    See :doc:`/reference/structural-link-counting-canonical-source` for
+    the canonical definition of structural links and the distinction
+    between Definition 1 (indexer ``is_structural=1``) and the
+    body+frontmatter scanning used by :func:`count_inbound_links`.
     """
     if today is None:
         today = _local_now().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -622,6 +642,12 @@ def count_research_decay(
     A note *decays* when it is older than ``age_days`` (based on the
     ``created:`` frontmatter field) and has fewer than ``link_threshold``
     inbound wikilinks from other vault notes.
+
+    See :doc:`/reference/structural-link-counting-canonical-source` for
+    the canonical definition of structural links. This function uses a
+    simplified inbound-count approach (Definition 2: body + frontmatter
+    wikilinks from any source) rather than the indexer's
+    ``is_structural=1`` (Definition 1).
 
     Returns the count of decayed notes.
 
@@ -1165,6 +1191,14 @@ def compute_decay_coverage(
     today: datetime | None = None,
 ) -> dict[str, Any]:
     """Compute Layer 1 decay coverage — see design note for the contract.
+
+    **Definition note:** This function's ``structural_coverage_pct`` field
+    uses Definition 3 from :doc:`/reference/structural-link-counting-canonical-source`
+    — a link is structural if it comes from a *recently-accessed* note, regardless
+    of target folder. This differs from Definition 1 (indexer
+    ``is_structural=1``), which requires the *target note's folder* to be in
+    ``STRUCTURAL_FOLDERS``. The canonical source note reconciles these definitions
+    and recommends Definition 1 for D-sweep verification.
 
     **Decayed pool** (at activation):
     - ``created`` <= ``activation_date - cutoff_days`` (note was already
@@ -1720,6 +1754,11 @@ def count_inbound_links(
     Returns ``{relpath: count}`` where *relpath* is relative to ``vault_dir``
     and *count* is the number of other notes that reference this note via
     a wikilink (in body or frontmatter).
+
+    See :doc:`/reference/structural-link-counting-canonical-source` for
+    the canonical definition of structural links and why this function
+    counts body + frontmatter wikilinks (Definition 2) rather than the
+    indexer's ``is_structural=1`` (Definition 1).
 
     ``exclude`` is an optional set of relpaths to ignore as both sources
     and targets (useful for ignoring dailies when computing hub ratios).
