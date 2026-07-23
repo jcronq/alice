@@ -3192,6 +3192,7 @@ def build_vault_health_event(
 
         event["birth_signal"] = compute_birth_signal(
             vault_dir, today=today_midnight,
+            patterns_path=vault_dir / "reference" / "birth-signal-patterns.yaml",
         )
         # Drop the per-bucket slug lists from the embedded payload —
         # the standalone birth_signal event carries the summary; the
@@ -3554,7 +3555,10 @@ def main(argv: list[str] | None = None) -> int:
                             args.events, today_str,
                         )
                     ):
-                        bs_event = build_birth_signal_event(args.vault, now=now)
+                        bs_event = build_birth_signal_event(
+                            args.vault, now=now,
+                            patterns_path=args.vault / "reference" / "birth-signal-patterns.yaml",
+                        )
                         _append_event(args.events, bs_event)
                 except Exception as exc:  # noqa: BLE001 — never block vault_health
                     logger.warning(
