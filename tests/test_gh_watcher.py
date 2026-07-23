@@ -318,6 +318,41 @@ def test_disabled_or_empty_repos_is_noop(
     ) in (None, {}), "no state should be written when there are no repos to poll"
 
 
+def test_rate_limit_403_not_classified_as_auth_failure() -> None:
+    """A 403 whose body is a rate-limit message must NOT trigger the
+    auth-failure branch. Rate limits self-heal (window resets ~1 hr);
+    misclassifying them as auth failures produces false-positive
+    `github-watcher-auth-failed` notes. See
+    research/2026-07-23-gh-watcher-rate-limit-403-misdiagnosis.md.
+    """
+    err = gh_watcher.GHCommandError(
+        returncode=1,
+        stderr=(
+            'gh: HTTP 403: {"message":"API rate limit exceeded for user ID '
+            "2053475. If you reach out to GitHub Support for help, please "
+            'include the request ID XYZ.","documentation_url":"..."}'
+        ),
+        args=["gh", "api", "repos/acme/widgets/issues"],
+    )
+    assert err.looks_like_auth_failure is False
+
+
+def test_bad_credentials_403_still_classified_as_auth_failure() -> None:
+    """A 403 with a real auth-failure body (no rate-limit markers) must
+    still route through the auth-failure branch. This is the case we
+    have always caught; the rate-limit exception must not weaken it.
+    """
+    err = gh_watcher.GHCommandError(
+        returncode=1,
+        stderr=(
+            'gh: HTTP 403: {"message":"Bad credentials",'
+            '"documentation_url":"https://docs.github.com/rest"}'
+        ),
+        args=["gh", "api", "repos/acme/widgets/issues"],
+    )
+    assert err.looks_like_auth_failure is True
+
+
 def test_auth_failure_emits_loud_note_and_dedups(
     mind_dir: pathlib.Path, state_path: pathlib.Path
 ) -> None:

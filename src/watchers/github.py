@@ -187,6 +187,19 @@ class GHCommandError(RuntimeError):
     @property
     def looks_like_auth_failure(self) -> bool:
         msg = self.stderr.lower()
+        # Rate-limit 403s are self-healing (window resets ~1 hr) and must
+        # not be misclassified as auth failures — otherwise the watcher
+        # emits a `github-watcher-auth-failed` note for a transient
+        # condition. All `gh` calls on a host share one user bucket, so
+        # rate-limit hits are recurring; see
+        # research/2026-07-23-gh-watcher-rate-limit-403-misdiagnosis.md
+        # and research/2026-07-09-gh-watcher-rate-limit-root-cause.md.
+        if self.returncode == 403 or "403" in msg:
+            if any(
+                n in msg
+                for n in ("rate limit", "rate-limit", "abuse detection")
+            ):
+                return False
         return any(
             needle in msg
             for needle in (
