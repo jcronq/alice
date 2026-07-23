@@ -78,6 +78,24 @@ WAKE_COUNT_THRESHOLD = 8
 # ``index.md`` / ``README.md`` are vault scaffolding.
 EXCLUDED_NAMES = frozenset({"index.md", "README.md", "unresolved.md"})
 
+# Top-level folders whose contents are NOT knowledge notes and therefore
+# should be skipped by orphan / dark / decay / coverage scans:
+#   - ``dailies`` / ``archive`` — date-stamped activity logs; not link targets.
+#   - ``gh-state`` — GitHub issue/PR state-mirror notes with 0 wikilinks by design.
+#   - ``experiments`` — one-shot experiment-runner artifacts, 0/0 by design.
+#   - ``thinking-replies`` — Speaking→Thinking reply confirmations using bare-
+#     text "Re: <slug>" refs, not [[wikilinks]]; conversation logs, not knowledge.
+# Kept as a module-level constant because the same set was previously
+# duplicated inline at 4 scan sites and drifted whenever a new non-knowledge
+# folder was added.
+NON_KNOWLEDGE_FOLDERS: frozenset[str] = frozenset({
+    "dailies",
+    "archive",
+    "gh-state",
+    "experiments",
+    "thinking-replies",
+})
+
 # Phase 1 of the structural monitoring design: ADR template-adherence
 # scoring. Each canonical ADR is expected to carry these five top-level
 # ``##`` sections with at least 20 words of content each. ``compute_
@@ -422,13 +440,9 @@ def count_orphans(vault_dir: Path) -> tuple[int, list[str]]:
     orphans: list[str] = []
     for md in _iter_notes(vault_dir):
         rel_parts = md.relative_to(vault_dir).parts
-        # Dailies, archive, gh-state, and experiments are always excluded —
-        # dailies and archive are date-stamped activity logs that wouldn't
-        # normally be linked to; gh-state holds GitHub issue/PR state-mirror
-        # notes, which by design carry 0 wikilinks (see issue tracker
-        # context); experiments are one-shot experiment-runner artifacts
-        # with 0 trigger_keywords and 0 wikilinks by design.
-        if rel_parts and rel_parts[0] in {"dailies", "archive", "gh-state", "experiments"}:
+        # Skip non-knowledge folders — see NON_KNOWLEDGE_FOLDERS at module
+        # top for the folder-by-folder rationale.
+        if rel_parts and rel_parts[0] in NON_KNOWLEDGE_FOLDERS:
             continue
         text = _read_text(md)
         fm, _body = split_frontmatter(text)
@@ -485,12 +499,10 @@ def count_shadow_and_dark(vault_dir: Path) -> dict[str, int]:
     parse_failures = 0
     for md in _iter_notes(vault_dir):
         rel_parts = md.relative_to(vault_dir).parts
-        # gh-state holds GitHub issue/PR state-mirror notes — operational
-        # records with 0 trigger_keywords and 0 wikilinks by design. They
-        # are not knowledge notes and would otherwise dominate the
-        # truly_dark_count signal. experiments/ holds one-shot experiment-
-        # runner artifacts with the same 0/0 shape, also non-knowledge.
-        if rel_parts and rel_parts[0] in {"dailies", "archive", "gh-state", "experiments"}:
+        # Skip non-knowledge folders — see NON_KNOWLEDGE_FOLDERS at module
+        # top. Otherwise gh-state (0/0 by design) would dominate the
+        # truly_dark_count signal.
+        if rel_parts and rel_parts[0] in NON_KNOWLEDGE_FOLDERS:
             continue
         if md.name in EXCLUDED_NAMES:
             continue
@@ -584,10 +596,9 @@ def compute_continuous_checks(
 
     for md in _iter_notes(vault_dir):
         rel_parts = md.relative_to(vault_dir).parts
-        # gh-state mirrors and experiments artifacts are excluded for the
-        # same reason as in count_shadow_and_dark — operational / one-shot
-        # records, not knowledge.
-        if rel_parts and rel_parts[0] in {"dailies", "archive", "gh-state", "experiments"}:
+        # Skip non-knowledge folders — see NON_KNOWLEDGE_FOLDERS at module
+        # top; same rationale as in count_shadow_and_dark.
+        if rel_parts and rel_parts[0] in NON_KNOWLEDGE_FOLDERS:
             continue
         rel = str(md.relative_to(vault_dir))
         text = _read_text(md)
@@ -1090,9 +1101,9 @@ def count_access_decay(
 
     decay_count = 0
     for md in vault_dir.rglob("*.md"):
-        # Skip excluded top-level dirs.
+        # Skip non-knowledge folders — see NON_KNOWLEDGE_FOLDERS at module top.
         rel_parts = md.relative_to(vault_dir).parts
-        if rel_parts and rel_parts[0] in {"dailies", "archive", "gh-state", "experiments"}:
+        if rel_parts and rel_parts[0] in NON_KNOWLEDGE_FOLDERS:
             continue
         if md.name in EXCLUDED_NAMES:
             continue
@@ -2623,6 +2634,12 @@ def count_stage_c_candidates(
     if vault_dir.exists():
         for md in vault_dir.rglob("*.md"):
             rel_parts = md.relative_to(vault_dir).parts
+            # Intentionally narrower than NON_KNOWLEDGE_FOLDERS: this is a
+            # bloat / atomization-candidate scan, not a knowledge-orphan scan.
+            # gh-state / experiments / thinking-replies can still legitimately
+            # be bloat targets worth flagging (a fat auto-generated dump or a
+            # runaway experiment log is a real atomization signal), so they
+            # are intentionally NOT excluded here.
             if rel_parts and rel_parts[0] in {"dailies", "archive"}:
                 continue
             if md.name in EXCLUDED_NAMES:
