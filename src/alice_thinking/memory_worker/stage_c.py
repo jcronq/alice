@@ -292,12 +292,33 @@ def _line_count(path: pathlib.Path) -> int:
         return 0
 
 
-def _count_bloated(vault: pathlib.Path) -> int:
-    n = 0
-    for md in _iter_groomable_notes(vault):
-        if _line_count(md) > BLOATED_LINE_THRESHOLD:
-            n += 1
-    return n
+def _count_bloated(vault: pathlib.Path, mind: pathlib.Path | None = None) -> int:
+    """Count atomization candidates.
+
+    Delegates to :func:`metrics.vault_health.count_stage_c_candidates`
+    so ``state.bloated_notes`` and the morning vault-health snapshot
+    use the same ARS filter (line > 300 AND heading > 25 AND
+    structural_inbound <= 2 AND created > 7 days ago). When ``mind``
+    is supplied the cortex-index DB at ``mind/inner/state/cortex-index.db``
+    is passed through for the inbound + age gates; otherwise
+    ``count_stage_c_candidates`` falls back to its conservative
+    line+heading heuristic.
+    """
+    # Lazy import to avoid a hard dependency at module load — the
+    # memory worker starts up in contexts where ``metrics`` may not
+    # be on the path.
+    from metrics.vault_health import count_stage_c_candidates
+
+    index_db: pathlib.Path | None = None
+    if mind is not None:
+        candidate = mind / "inner" / "state" / "cortex-index.db"
+        if candidate.exists():
+            index_db = candidate
+    try:
+        result = count_stage_c_candidates(vault, index_db_path=index_db)
+    except OSError:
+        return 0
+    return int(result.get("bloated_notes", 0))
 
 
 def _count_stale_dailies(vault: pathlib.Path, today: datetime.date) -> int:
@@ -486,7 +507,7 @@ def compute_state(mind: pathlib.Path) -> StageCState:
     vault = _vault_dir(mind)
     today = _today()
     return StageCState(
-        bloated_notes=_count_bloated(vault),
+        bloated_notes=_count_bloated(vault, mind),
         stale_dailies=_count_stale_dailies(vault, today),
         decayed_notes_in_window=_count_decayed_in_window(vault, today),
         orphans=_count_orphans(vault),
