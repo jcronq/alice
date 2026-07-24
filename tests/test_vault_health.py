@@ -846,15 +846,18 @@ def test_build_vault_health_event_includes_frontmatter_parse_failures(
     assert "parse_quality" not in event
 
 
-def test_build_vault_health_event_tags_suspect_when_truly_dark_exceeds_threshold(
+def test_build_vault_health_event_does_not_tag_suspect_on_truly_dark_alone(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """When ``truly_dark_count`` exceeds the sanity threshold, the event
-    must be tagged ``parse_quality: "suspect"`` AND a WARNING logged.
-    Vault context: with trigger-keyword backfill complete, >10 truly
-    dark notes is statistically implausible — the 07:49 EDT 2026-05-19
-    event that recorded shadow_orphan:1, truly_dark:20 is the reference
-    failure mode (issue #249)."""
+    """A large ``truly_dark_count`` with zero ``frontmatter_parse_failures``
+    must NOT be tagged ``parse_quality: "suspect"``.
+
+    Regression pin for the decoupling in the parse-quality Option C change:
+    truly_dark_count is a linking-completeness signal that spikes during
+    normal new-note creation cycles. Prior behavior fired on
+    ``truly_dark_count > 10`` and produced persistent false positives
+    since ~2026-06-25. parse_quality now gates on
+    ``frontmatter_parse_failures > 0`` only. See issue #249."""
     vault = _make_vault(tmp_path)
     thoughts = tmp_path / "thoughts"
     thoughts.mkdir()
@@ -863,7 +866,7 @@ def test_build_vault_health_event_tags_suspect_when_truly_dark_exceeds_threshold
     events = tmp_path / "events.jsonl"
 
     # Seed 11 notes that have no frontmatter at all → each counts as
-    # truly dark. 11 > the threshold of 10.
+    # truly dark, but none is a parse failure (no ``---`` fence at all).
     for i in range(11):
         _write(
             vault / "research" / f"dark_{i}.md",
@@ -878,9 +881,54 @@ def test_build_vault_health_event_tags_suspect_when_truly_dark_exceeds_threshold
             surface_dir=surface,
         )
     assert event["truly_dark_count"] >= 11
+    assert event["frontmatter_parse_failures"] == 0
+    # New behavior: truly_dark_count alone does NOT trigger parse_quality.
+    assert "parse_quality" not in event
+
+
+def test_build_vault_health_event_tags_suspect_on_frontmatter_parse_failures(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When ``frontmatter_parse_failures > 0``, the event must be tagged
+    ``parse_quality: "suspect"`` AND a WARNING logged.
+
+    This is the intended detection target from issue #249: a note that
+    opens with a ``---`` fence but has malformed frontmatter (e.g. no
+    closing fence) silently parses to an empty dict and falls into the
+    truly-dark bucket. ``frontmatter_parse_failures`` counts these
+    directly, which is what parse_quality was designed to surface."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    # Seed one note with malformed frontmatter: opens with ``---`` but
+    # no closing fence → split_frontmatter returns empty dict → this
+    # counts as a frontmatter parse failure.
+    _write(
+        vault / "research" / "malformed.md",
+        """
+        ---
+        title: never closed
+        Body text with no closing fence.
+        """,
+    )
+
+    with caplog.at_level("WARNING", logger="metrics.vault_health"):
+        event = build_vault_health_event(
+            vault_dir=vault,
+            thoughts_dir=thoughts,
+            events_path=events,
+            surface_dir=surface,
+        )
+    assert event["frontmatter_parse_failures"] >= 1
     assert event.get("parse_quality") == "suspect"
     assert any(
-        "exceeds suspect threshold" in rec.message for rec in caplog.records
+        "frontmatter_parse_failures" in rec.message
+        and "parse_quality=suspect" in rec.message
+        for rec in caplog.records
     )
 
 

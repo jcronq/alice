@@ -54,13 +54,6 @@ from alice_thinking.memory_worker.stage_d import _is_fitness_domain
 
 logger = logging.getLogger(__name__)
 
-# Sanity-check threshold for the truly_dark_count field. With trigger-keyword
-# backfill complete across the vault (1593/1593 notes as of 2026-05-19), a
-# real truly_dark_count above this ceiling is statistically implausible and
-# almost always indicates silent frontmatter parse failures upstream.
-# See issue #249 / cortex-memory/research/2026-05-19-vault-health-shadow-dark-swap.md.
-_TRULY_DARK_SUSPECT_THRESHOLD = 10
-
 # Low-wake-count detector (issue #323 fix 3). Total of Stage B + C + D
 # wakes in the morning window. The May-22 sleep cycle produced 3 wakes
 # in 8 hours; a healthy 8h sleep should produce 15–19. Anything under 8
@@ -3271,17 +3264,17 @@ def build_vault_health_event(
         if index_staleness.get("staleness_seconds", 0) > 3600:
             event["index_stale"] = True
 
-    # Sanity-check: with trigger-keyword backfill complete, a real
-    # truly_dark_count above 10 is statistically implausible. Tag the
-    # event so downstream consumers (vault_linking_protocol, dashboards)
-    # can distinguish a suspect reading from a clean one. See #249.
-    if event["truly_dark_count"] > _TRULY_DARK_SUSPECT_THRESHOLD:
+    # parse_quality signal — gates on frontmatter parse failures (issue #249),
+    # NOT on truly_dark_count. truly_dark_count is a linking-completeness signal
+    # that produces false positives during normal new-note creation cycles.
+    # frontmatter_parse_failures directly counts silent parse failures, which
+    # is exactly what parse_quality was designed to detect.
+    if event["frontmatter_parse_failures"] > 0:
         logger.warning(
-            "vault_health: truly_dark_count=%d exceeds suspect threshold (%d); "
-            "tagging event parse_quality=suspect (likely silent frontmatter "
-            "parse failures upstream — see issue #249)",
-            event["truly_dark_count"],
-            _TRULY_DARK_SUSPECT_THRESHOLD,
+            "vault_health: frontmatter_parse_failures=%d > 0; "
+            "tagging event parse_quality=suspect (silent frontmatter parse "
+            "failures — see issue #249)",
+            event["frontmatter_parse_failures"],
         )
         event["parse_quality"] = "suspect"
 
