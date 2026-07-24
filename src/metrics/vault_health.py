@@ -33,6 +33,7 @@ import json
 import logging
 import math
 import re
+import sqlite3
 import sys
 import time
 from collections import defaultdict
@@ -2605,24 +2606,148 @@ def count_wakes_by_stage(
 # Previously computed inline in the wake template via `find | wc -l` bash.
 # Moved into Python so the morning vault scan collapses to a single command
 # (the manual JSON-assembly step kept dropping fields).
+#
+# 2026-07-24: atomization-candidate filter tightened to the ARS criteria
+# (line_count > 300 AND heading_count > 25 AND structural_inbound <= 2 AND
+# created > 7 days ago). See the ``[[2026-07-22-improved-atomization-criteria]]``
+# design note — the previous 250-line-only heuristic produced ~62 candidates
+# against the live vault when only ~1 was a genuine atomization target
+# (false-positive rate confirmed 100% against the 4 verified D-3 samples).
+# When ``index_db_path`` is not supplied the function falls back to a
+# conservative line+heading check so unit tests and non-indexed callers
+# still get a stable answer.
 # ---------------------------------------------------------------------------
+
+
+# H2 heading pattern used by the atomization filter. Matches ``## `` at the
+# start of a line but NOT ``### `` or deeper — subsections don't count
+# toward topic-sprawl signal.
+_H2_HEADING_RE = re.compile(r"^##\s+\S", re.MULTILINE)
+
+# ARS filter tunables. Named constants (not magic numbers) so the design
+# note ↔ code correspondence is auditable.
+_ARS_MIN_HEADINGS = 25
+_ARS_MAX_STRUCTURAL_INBOUND = 2
+_ARS_MIN_AGE_DAYS = 7
+
+
+def _count_structural_inbound(slug: str, index_db_path: Path) -> int:
+    """Return the count of structural inbound links to ``slug``.
+
+    Queries the ``links`` table of the cortex-index DB for rows where
+    ``target_slug = ? AND is_structural = 1``. Returns 0 on any error
+    (missing table, corrupt DB, missing file) so a broken index degrades
+    to "conservative: don't filter" rather than crashing the scan.
+
+    Because ``count_stage_c_candidates`` doesn't know which of the two
+    slug forms (bare stem vs. qualified ``<parent>/<stem>``) the indexer
+    used for a given note (see ``indexer.build_index.slug_for``), the
+    caller may pass a bare stem and this helper will match either form
+    that reduces to the same file. Callers that already know the exact
+    slug can pass it directly; the ``OR`` clause is safe either way.
+    """
+    if not index_db_path.exists():
+        return 0
+    try:
+        conn = sqlite3.connect(str(index_db_path))
+    except sqlite3.Error:
+        return 0
+    try:
+        # Match either the exact slug OR any qualified form ending in
+        # ``/<slug>`` — covers the rare stem-collision case where the
+        # indexer qualified the note as ``<parent>/<stem>``.
+        row = conn.execute(
+            "SELECT COUNT(*) FROM links "
+            "WHERE (target_slug = ? OR target_slug LIKE ?) "
+            "AND is_structural = 1",
+            (slug, f"%/{slug}"),
+        ).fetchone()
+    except sqlite3.Error:
+        # Missing ``links`` table on a freshly-built or partial index.
+        return 0
+    finally:
+        conn.close()
+    if row is None:
+        return 0
+    return int(row[0])
+
+
+def _parse_created_date_frontmatter(md_path: Path) -> datetime | None:
+    """Extract the ``created:`` frontmatter field from ``md_path``.
+
+    Returns a naive midnight-of-day ``datetime`` when parseable, ``None``
+    otherwise. Malformed frontmatter, missing ``created:``, or an
+    unreadable file all yield ``None`` — callers should treat unknown
+    ages as "cannot age → exclude" (see ARS filter below).
+    """
+    try:
+        text = md_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    try:
+        fm, _body = split_frontmatter(text)
+    except Exception:  # noqa: BLE001 — best-effort frontmatter parse
+        return None
+    if not isinstance(fm, dict):
+        return None
+    return _parse_created_date(fm.get("created"))
+
+
+def _count_h2_headings(text: str) -> int:
+    """Count ``## `` (H2) headings in ``text``. ``### `` and deeper skip."""
+    return len(_H2_HEADING_RE.findall(text))
+
+
+def _slug_for_path(md: Path, vault_dir: Path) -> str:
+    """Best-effort slug for ``md`` relative to ``vault_dir``.
+
+    Mirrors ``indexer.build_index.slug_for``'s common case: bare stem.
+    Stem collisions across the vault are rare enough that
+    ``_count_structural_inbound`` covers them separately with an
+    ``OR target_slug LIKE '%/<stem>'`` clause; passing the bare stem
+    here is correct for both the collision and non-collision paths.
+    """
+    del vault_dir  # kept in the signature for future qualified-slug logic
+    return md.stem
 
 
 def count_stage_c_candidates(
     vault_dir: Path,
-    bloated_min_lines: int = 250,
+    bloated_min_lines: int = 300,
     stale_days: int = 90,
     today: datetime | None = None,
+    index_db_path: Path | None = None,
 ) -> dict[str, int]:
     """Stage C workload snapshot.
 
-    - ``bloated_notes``: vault ``.md`` files with > ``bloated_min_lines``
-      lines, excluding ``dailies/``, ``index.md``, ``README.md``,
-      ``unresolved.md``. Atomization candidates.
+    - ``bloated_notes``: vault ``.md`` files that pass the atomization
+      filter. When ``index_db_path`` is supplied and exists, the full
+      ARS criteria apply (line_count > ``bloated_min_lines`` AND
+      H2-heading count > 25 AND structural_inbound <= 2 AND
+      created > 7 days ago). When it isn't supplied, a conservative
+      line+heading check runs (line_count > ``bloated_min_lines`` AND
+      H2-heading count > 25) — the ARS gates that depend on the index
+      are skipped so unit tests and non-indexed callers still get a
+      stable answer. Notes without a parseable ``created:`` field are
+      excluded from the ARS path (can't age → don't flag).
     - ``stale_dailies``: dailies whose filename date is older than
       ``stale_days``. Archive-eligible.
     - ``total``: sum.
+
+    ``dailies/``, ``archive/``, and vault-scaffolding files
+    (``index.md``, ``README.md``, ``unresolved.md``) are always
+    excluded from the atomization scan.
     """
+    use_ars = index_db_path is not None and index_db_path.exists()
+
+    if today is None:
+        today_dt = datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+    else:
+        today_dt = today.replace(hour=0, minute=0, second=0, microsecond=0)
+    age_cutoff = today_dt - timedelta(days=_ARS_MIN_AGE_DAYS)
+
     bloated = 0
     if vault_dir.exists():
         for md in vault_dir.rglob("*.md"):
@@ -2638,16 +2763,39 @@ def count_stage_c_candidates(
             if md.name in EXCLUDED_NAMES:
                 continue
             try:
-                with md.open("r", encoding="utf-8", errors="ignore") as fh:
-                    line_count = sum(1 for _ in fh)
+                text = md.read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 continue
-            if line_count > bloated_min_lines:
-                bloated += 1
+            line_count = text.count("\n") + (
+                0 if text.endswith("\n") or not text else 1
+            )
+            if line_count <= bloated_min_lines:
+                continue
+            heading_count = _count_h2_headings(text)
+            if heading_count <= _ARS_MIN_HEADINGS:
+                continue
+            if use_ars:
+                # Full ARS: also require low structural inbound AND age gate.
+                slug = _slug_for_path(md, vault_dir)
+                inbound = _count_structural_inbound(slug, index_db_path)
+                if inbound > _ARS_MAX_STRUCTURAL_INBOUND:
+                    continue
+                # ``_parse_created_date_frontmatter`` re-reads the file; the
+                # extra IO is fine because we only reach this branch for the
+                # small set of notes past the line+heading gates.
+                created = _parse_created_date_frontmatter(md)
+                if created is None:
+                    # Can't age the note — be conservative, don't flag.
+                    continue
+                if created > age_cutoff:
+                    # created > cutoff means the note is younger than the
+                    # ``_ARS_MIN_AGE_DAYS`` window — recent enough that a
+                    # low inbound count could just mean "hasn't accumulated
+                    # links yet", not "genuine topic sprawl".
+                    continue
+            bloated += 1
 
-    if today is None:
-        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    cutoff = today - timedelta(days=stale_days)
+    cutoff = today_dt - timedelta(days=stale_days)
     cutoff_str = cutoff.strftime("%Y-%m-%d")
 
     stale = 0
@@ -3163,7 +3311,11 @@ def build_vault_health_event(
         "total_wakes_last_night": count_all_wakes_in_window(
             thoughts_dir, yesterday_23, today_07
         ),
-        "stage_c_candidates": count_stage_c_candidates(vault_dir, today=today_midnight),
+        "stage_c_candidates": count_stage_c_candidates(
+            vault_dir,
+            today=today_midnight,
+            index_db_path=index_db_path,
+        ),
         "wake_type_distribution": count_wakes_by_stage(
             thoughts_dir, yesterday_23, today_07
         ),

@@ -1657,22 +1657,43 @@ def test_research_decay_cross_directory_link_counts(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _bloated_note_text(
+    n_headings: int = 30, extra_lines_per_section: int = 10
+) -> str:
+    """Synth an atomization-candidate note body.
+
+    Constructs a note with ``n_headings`` ``## `` H2 headings and enough
+    filler lines to comfortably exceed the 300-line gate. Default of
+    30 headings + 10 filler lines per section yields ~310 lines with
+    30 H2 headings — trips both the line and heading gates that
+    ``count_stage_c_candidates`` applies in its backward-compat path.
+    """
+    parts: list[str] = []
+    for i in range(n_headings):
+        parts.append(f"## Section {i}\n")
+        parts.append("filler content line\n" * extra_lines_per_section)
+    return "".join(parts)
+
+
 def test_stage_c_candidates_bloated_threshold(tmp_path: Path) -> None:
+    """Backward-compat: line > 300 AND heading > 25 with no index DB."""
     vault = _make_vault(tmp_path)
-    # Three notes: 100 lines, 251 lines (just over), 1000 lines.
+    # small.md — 100 lines, no headings → fails line gate.
     _write(vault / "research" / "small.md", "x\n" * 100)
-    _write(vault / "research" / "over.md", "x\n" * 251)
-    _write(vault / "research" / "big.md", "x\n" * 1000)
+    # over.md — 400 lines but zero headings → passes line, fails heading.
+    _write(vault / "research" / "over.md", "x\n" * 400)
+    # big.md — 30 headings + filler → passes both.
+    _write(vault / "research" / "big.md", _bloated_note_text())
     result = count_stage_c_candidates(vault)
-    assert result["bloated_notes"] == 2
+    assert result["bloated_notes"] == 1
     assert result["stale_dailies"] == 0
-    assert result["total"] == 2
+    assert result["total"] == 1
 
 
 def test_stage_c_candidates_excludes_dailies_and_scaffolding(tmp_path: Path) -> None:
     """Bloated count must skip dailies/, index.md, README.md, unresolved.md."""
     vault = _make_vault(tmp_path)
-    big = "x\n" * 500
+    big = _bloated_note_text()
     _write(vault / "dailies" / "2026-01-01.md", big)
     _write(vault / "index.md", big)
     _write(vault / "README.md", big)
@@ -1693,6 +1714,161 @@ def test_stage_c_candidates_stale_dailies(tmp_path: Path) -> None:
     result = count_stage_c_candidates(vault, today=today)
     # Two strictly older than the cutoff (2026-02-09).
     assert result["stale_dailies"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Stage C candidates — improved atomization criteria (ARS filter).
+# See design note ``[[2026-07-22-improved-atomization-criteria]]``: the
+# old 250-line threshold produced ~62 false positives on the live vault.
+# The ARS filter (line > 300 AND heading > 25 AND structural_inbound <= 2
+# AND created > 7 days ago) drops that to ~1 with 100% true-negative
+# rate on the 4 verified D-3 samples. These tests lock in the four
+# gates so a regression to the drift-prone shape is caught.
+# ---------------------------------------------------------------------------
+
+
+def _make_index_db(
+    tmp_path: Path,
+    inbound_by_slug: dict[str, int] | None = None,
+) -> Path:
+    """Build a minimal cortex-index.db with a ``links`` table.
+
+    Only the columns ``count_stage_c_candidates`` reads (``target_slug``,
+    ``is_structural``) are populated. ``inbound_by_slug[slug] = n``
+    inserts ``n`` structural inbound links to ``slug`` from an arbitrary
+    source. Matches the real indexer's schema shape (see
+    ``indexer/build_index.py``).
+    """
+    import sqlite3
+
+    db_path = tmp_path / "cortex-index.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE links (
+            source_slug TEXT NOT NULL,
+            target_slug TEXT NOT NULL,
+            target_raw TEXT NOT NULL,
+            is_structural INTEGER NOT NULL DEFAULT 0,
+            resolved INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+    for slug, n in (inbound_by_slug or {}).items():
+        for i in range(n):
+            conn.execute(
+                "INSERT INTO links(source_slug, target_slug, target_raw, is_structural, resolved) "
+                "VALUES (?, ?, ?, 1, 1)",
+                (f"source-{slug}-{i}", slug, f"[[{slug}]]"),
+            )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def _ars_note(
+    slug: str, created: str, *, n_headings: int = 30
+) -> str:
+    """Body with frontmatter for ARS-path tests."""
+    return f"---\nslug: {slug}\ncreated: {created}\n---\n" + _bloated_note_text(
+        n_headings=n_headings
+    )
+
+
+def test_stage_c_candidates_with_ars_criteria_full_filter(tmp_path: Path) -> None:
+    """A note that satisfies all four ARS criteria is flagged."""
+    vault = _make_vault(tmp_path)
+    today = datetime(2026, 7, 24)  # noqa: DTZ001
+    # 300+ lines, 30 headings, created 30 days ago, 1 inbound (<= 2).
+    _write(
+        vault / "research" / "genuine-sprawl.md",
+        _ars_note("genuine-sprawl", "2026-06-24"),
+    )
+    db = _make_index_db(tmp_path, inbound_by_slug={"genuine-sprawl": 1})
+    result = count_stage_c_candidates(vault, today=today, index_db_path=db)
+    assert result["bloated_notes"] == 1
+
+
+def test_stage_c_candidates_ars_excludes_low_inbound_short(tmp_path: Path) -> None:
+    """Line > 300 but heading <= 25 → not flagged (heading gate)."""
+    vault = _make_vault(tmp_path)
+    today = datetime(2026, 7, 24)  # noqa: DTZ001
+    # 400 lines, but only 5 headings — fails heading gate.
+    body = "---\nslug: too-flat\ncreated: 2026-06-24\n---\n" + _bloated_note_text(
+        n_headings=5, extra_lines_per_section=80
+    )
+    _write(vault / "research" / "too-flat.md", body)
+    db = _make_index_db(tmp_path, inbound_by_slug={"too-flat": 0})
+    result = count_stage_c_candidates(vault, today=today, index_db_path=db)
+    assert result["bloated_notes"] == 0
+
+
+def test_stage_c_candidates_ars_excludes_recent(tmp_path: Path) -> None:
+    """Satisfies line/heading/inbound but created 3 days ago → not flagged."""
+    vault = _make_vault(tmp_path)
+    today = datetime(2026, 7, 24)  # noqa: DTZ001
+    _write(
+        vault / "research" / "too-new.md",
+        _ars_note("too-new", "2026-07-21"),  # 3 days before today
+    )
+    db = _make_index_db(tmp_path, inbound_by_slug={"too-new": 0})
+    result = count_stage_c_candidates(vault, today=today, index_db_path=db)
+    assert result["bloated_notes"] == 0
+
+
+def test_stage_c_candidates_ars_excludes_hub_note(tmp_path: Path) -> None:
+    """Satisfies line/heading/age but has 10 structural inbound → not flagged."""
+    vault = _make_vault(tmp_path)
+    today = datetime(2026, 7, 24)  # noqa: DTZ001
+    _write(
+        vault / "research" / "well-linked-hub.md",
+        _ars_note("well-linked-hub", "2026-06-01"),
+    )
+    db = _make_index_db(tmp_path, inbound_by_slug={"well-linked-hub": 10})
+    result = count_stage_c_candidates(vault, today=today, index_db_path=db)
+    assert result["bloated_notes"] == 0
+
+
+def test_stage_c_candidates_ars_excludes_unparseable_created(
+    tmp_path: Path,
+) -> None:
+    """Missing/unparseable ``created:`` → excluded (can't age → don't flag)."""
+    vault = _make_vault(tmp_path)
+    today = datetime(2026, 7, 24)  # noqa: DTZ001
+    body = "---\nslug: no-date\n---\n" + _bloated_note_text()
+    _write(vault / "research" / "no-date.md", body)
+    db = _make_index_db(tmp_path, inbound_by_slug={"no-date": 0})
+    result = count_stage_c_candidates(vault, today=today, index_db_path=db)
+    assert result["bloated_notes"] == 0
+
+
+def test_stage_c_candidates_backward_compat_when_no_index_db(
+    tmp_path: Path,
+) -> None:
+    """Without an index DB, only line + heading gates apply.
+
+    Inbound and age gates are skipped, so a hub-like note that would be
+    filtered under full ARS still counts as bloated in the backward-compat
+    path — this is intentional: the fallback is deliberately looser than
+    ARS so callers without index access don't get zero atomization
+    coverage.
+    """
+    vault = _make_vault(tmp_path)
+    # Note with 30 headings, 300+ lines, "created" 2 days ago — the age
+    # gate WOULD exclude this under ARS. With index_db_path=None the
+    # gate is skipped and the note counts as bloated.
+    _write(
+        vault / "research" / "recent-but-fat.md",
+        _ars_note("recent-but-fat", "2026-07-22"),
+    )
+    result = count_stage_c_candidates(vault, today=datetime(2026, 7, 24))  # noqa: DTZ001
+    assert result["bloated_notes"] == 1
+    # Also verify: passing a non-existent DB path takes the same fallback.
+    missing = tmp_path / "does-not-exist.db"
+    result2 = count_stage_c_candidates(
+        vault, today=datetime(2026, 7, 24), index_db_path=missing  # noqa: DTZ001
+    )
+    assert result2["bloated_notes"] == 1
 
 
 # ---------------------------------------------------------------------------

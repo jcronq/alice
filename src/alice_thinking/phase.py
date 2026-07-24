@@ -591,8 +591,15 @@ def _stage_c_candidates_total(mind: pathlib.Path) -> int:
         from metrics.vault_health import count_stage_c_candidates
     except ImportError:
         return 0
+    # ARS atomization filter needs the cortex-index DB for the
+    # structural-inbound gate. Pass ``None`` when the DB isn't present
+    # (fresh checkout / test tmp dir); ``count_stage_c_candidates`` falls
+    # back to the conservative line+heading heuristic.
+    index_db = mind / "inner" / "state" / "cortex-index.db"
     try:
-        result = count_stage_c_candidates(vault_dir)
+        result = count_stage_c_candidates(
+            vault_dir, index_db_path=index_db if index_db.exists() else None
+        )
     except OSError:
         return 0
     return int(result.get("total", 0))
@@ -681,10 +688,14 @@ def _compute_vault_health(mind: pathlib.Path) -> tuple[bool, int]:
     except ImportError:
         return False, 100
 
+    # See ``_stage_c_candidates_total`` for the DB-path rationale.
+    index_db = mind / "inner" / "state" / "cortex-index.db"
     try:
         broken_count, _ = count_broken_wikilinks(vault_dir)
         orphan_count, _ = count_orphans(vault_dir)
-        candidates = count_stage_c_candidates(vault_dir)
+        candidates = count_stage_c_candidates(
+            vault_dir, index_db_path=index_db if index_db.exists() else None
+        )
         access_decay_count = count_access_decay(vault_dir)
     except OSError:
         return False, 100
