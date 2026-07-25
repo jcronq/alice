@@ -37,6 +37,7 @@ from alice_speaking.retrieval.cue_runner import (
     FITNESS_RECENCY_WINDOW_DAYS,
     HEBBIAN_DEFAULTS,
     STATE_BOOST,
+    TITLE_BOOST_FACTOR,
     TYPED_EDGE_DEFAULTS,
     _bump_access,
     _build_fts_match,
@@ -49,6 +50,7 @@ from alice_speaking.retrieval.cue_runner import (
     _read_last_accessed,
     _read_stm_context_slugs,
     _read_trigger_keywords,
+    _title_match_ratio,
     _tokenize_query,
     build_cue_packet,
     classify_note,
@@ -96,6 +98,52 @@ def test_tokenize_dedupes_preserving_order():
 def test_tokenize_empty_when_only_stopwords():
     # All words below are in the stopword list; result must be empty.
     assert _tokenize_query("the of to and") == []
+
+
+# ---------------------------------------------------------------------------
+# _title_match_ratio (validates the title-match boost input; the multiplier
+# is applied in build_cue_context — see the +12pp top-3 evaluation at
+# cortex-memory/research/2026-06-16-fts-title-boost-evaluation.md).
+
+
+def test_title_match_ratio_all_tokens_present_returns_1():
+    tokens = _tokenize_query("cozyhem light sync")
+    # Title contains every query token; ratio = 1.0 => final multiplier 2.0×.
+    assert _title_match_ratio(tokens, "CozyHem light sync design") == 1.0
+
+
+def test_title_match_ratio_no_tokens_present_returns_0():
+    tokens = _tokenize_query("cozyhem light sync")
+    # Title shares no tokens => ratio 0.0 => multiplier unchanged (1.0×).
+    assert _title_match_ratio(tokens, "unrelated fitness notes") == 0.0
+
+
+def test_title_match_ratio_half_tokens_present_returns_half():
+    tokens = _tokenize_query("cozyhem light sync fitness")
+    assert len(tokens) == 4
+    # Title matches exactly two of the four query tokens => ratio 0.5.
+    assert _title_match_ratio(tokens, "cozyhem light diagnostic") == 0.5
+
+
+def test_title_match_ratio_empty_query_returns_0():
+    # Empty tokens must short-circuit to 0.0 (no divide-by-zero, no boost).
+    assert _title_match_ratio([], "anything at all") == 0.0
+
+
+def test_title_match_ratio_case_insensitive():
+    # Query is uppercased at intake but _tokenize_query lowercases; the
+    # ratio computation must fold title case the same way.
+    tokens = _tokenize_query("ALICE")
+    assert tokens == ["alice"]
+    assert _title_match_ratio(tokens, "The Alice Vault") == 1.0
+    assert _title_match_ratio(tokens, "The alice vault") == 1.0
+
+
+def test_title_boost_factor_matches_validated_value():
+    # Guard against silent tuning; the June 2026 eval saturates at 1.0
+    # and the Phase 4b design pins the factor there. Any change to this
+    # constant should be preceded by a re-run of the eval.
+    assert TITLE_BOOST_FACTOR == 1.0
 
 
 # ---------------------------------------------------------------------------

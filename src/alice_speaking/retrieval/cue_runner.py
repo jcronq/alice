@@ -82,6 +82,17 @@ TRIGGER_KEYWORD_EXTRA = 1.5
 ACCESS_COUNT_ALPHA = 0.15
 ACCESS_COUNT_CAP = 100
 
+# Title-match multiplicative boost. Post-query re-scoring: for each candidate,
+# compute the fraction of query tokens that appear in the note title (case-
+# insensitive), then multiply the final score by (1.0 + TITLE_BOOST_FACTOR *
+# ratio). Validated in the June 2026 eval (100 decayed notes queried by
+# title): +12pp top-3 recovery (81% -> 93%) with zero any-position degradation,
+# saturation at factor = 1.0. See cortex-memory/research/2026-06-16-fts-title-
+# boost-evaluation.md and cortex-memory/research/2026-07-23-fts-relevance-
+# phase-4b-design.md. Multiplicative so it cannot displace higher-scoring
+# topical hits, only lift notes whose titles match query terms.
+TITLE_BOOST_FACTOR = 1.0
+
 # Hebbian edge-weight constants (#219, #254). Notes wikilinked from the
 # user's STM context (most-recently-accessed slugs) get an ADDITIVE boost
 # proportional to their edge-weight sum, with structural (intentional
@@ -386,6 +397,29 @@ def _tokenize_query(query: str) -> list[str]:
         seen.add(raw)
         tokens.append(raw)
     return tokens
+
+
+def _title_match_ratio(query_tokens: list[str], title: str) -> float:
+    """Fraction of ``query_tokens`` that appear in ``title`` (case-insensitive).
+
+    Tokenises ``title`` with the same rules as :func:`_tokenize_query`
+    (regex, lowercased, stopword-filtered) so a query token matches iff
+    it would survive tokenisation on either side. Returns 0.0 for an
+    empty ``query_tokens`` (no boost, no divide-by-zero).
+
+    Used by :func:`build_cue_context` to apply the title-match boost
+    (see :data:`TITLE_BOOST_FACTOR`).
+    """
+    if not query_tokens:
+        return 0.0
+    title_tokens = {
+        t for t in _TOKEN_RE.findall(title.lower())
+        if len(t) >= 2 and t not in _STOPWORDS
+    }
+    if not title_tokens:
+        return 0.0
+    hits = sum(1 for t in query_tokens if t in title_tokens)
+    return hits / len(query_tokens)
 
 
 def _build_fts_match(tokens: list[str]) -> str:
@@ -1252,7 +1286,13 @@ async def build_cue_context(
             # invert so higher final_score = better, then multiply by
             # boost to keep the boost meaningful.
             base_score = -float(fts_rank)
-            final_score = base_score * boost * recency_boost
+            # Title-match multiplicative boost (validated: +12pp top-3,
+            # saturation at factor=1.0). Applied after the type/trigger
+            # and recency multipliers so it compounds symmetrically.
+            # See cortex-memory/research/2026-06-16-fts-title-boost-evaluation.md.
+            title_ratio = _title_match_ratio(tokens, title or "")
+            title_boost = 1.0 + TITLE_BOOST_FACTOR * title_ratio
+            final_score = base_score * boost * recency_boost * title_boost
             # Hebbian edge-weight boost (#219, #254). Additive on top
             # of the multiplicative score; zero unless Hebbian is
             # enabled AND the candidate has positive edge weight from
@@ -1303,13 +1343,15 @@ async def build_cue_context(
                     final_score += fitness_bonus
             log.debug(
                 "cue_runner: slug=%s fts_rank=%.4f type_boost=%.4f "
-                "access_count=%d recency_boost=%.4f hebbian_bonus=%.4f "
-                "typed_bonus=%.4f fitness_bonus=%.4f final=%.4f",
+                "access_count=%d recency_boost=%.4f title_boost=%.4f "
+                "hebbian_bonus=%.4f typed_bonus=%.4f fitness_bonus=%.4f "
+                "final=%.4f",
                 slug,
                 fts_rank,
                 boost,
                 ac,
                 recency_boost,
+                title_boost,
                 hebbian_bonus,
                 typed_bonus,
                 fitness_bonus,
