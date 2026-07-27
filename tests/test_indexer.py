@@ -21,7 +21,13 @@ import time
 
 import pytest
 
-from indexer.build_index import build, collect_notes, needs_rebuild, slug_for
+from indexer.build_index import (
+    _save_manual_edges,
+    build,
+    collect_notes,
+    needs_rebuild,
+    slug_for,
+)
 from indexer.yaml_lite import extract_wikilinks, split_frontmatter
 
 
@@ -741,3 +747,116 @@ def test_build_typed_edges_if_not_exists_preserves_rows(tmp_path: pathlib.Path):
     assert second_rows >= first_rows, (
         f"second rebuild lost rows: first={first_rows}, second={second_rows}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression: manual-source typed edges must survive rebuild (task-0592).
+# Before the fix, ``build()`` atomic-swapped a fresh DB into place and
+# only ``run_predicate_extraction`` repopulated ``typed_edges`` — with
+# ``link_source='predicate'`` rows only. Manual edges (hand-written or
+# injected by ``typed_edge_inject.py``) were destroyed on every rebuild.
+
+
+def test_save_manual_edges_missing_db_returns_empty(tmp_path: pathlib.Path):
+    """First-run guard: no DB file yet → return ``[]``, don't raise."""
+    missing = tmp_path / "does-not-exist.db"
+    assert _save_manual_edges(missing) == []
+
+
+def test_save_manual_edges_missing_table_returns_empty(tmp_path: pathlib.Path):
+    """First-run guard: DB exists but has no ``typed_edges`` table → ``[]``."""
+    db_path = tmp_path / "empty.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE something_else(x INTEGER)")
+        conn.commit()
+    finally:
+        conn.close()
+    assert _save_manual_edges(db_path) == []
+
+
+def test_build_preserves_manual_edges_across_rebuild(tmp_path: pathlib.Path):
+    """Manual edges written before a rebuild must be present in the new DB
+    alongside predicate edges re-derived from vault content.
+    """
+    mind_root = tmp_path / "mind"
+    vault = mind_root / "cortex-memory"
+    _write_typed_edges_schema(mind_root)
+
+    _write_note(vault / "target.md", title="Target")
+    _write_note(
+        vault / "source.md",
+        title="Source",
+        body="This note cites [[target]] for the claim.",
+    )
+
+    db_path = mind_root / "inner" / "state" / "cortex-index.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # First build populates the DB (predicate edges only from vault content).
+    build(vault, db_path)
+
+    # Seed two manual edges directly into typed_edges.
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executemany(
+            "INSERT INTO typed_edges("
+            "from_slug, to_slug, link_type, link_source, context, "
+            "confidence, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            [
+                (
+                    "source", "target", "supports", "manual",
+                    "hand-written support edge", "high",
+                    "2026-07-27 00:00:00", "2026-07-27 00:00:00",
+                ),
+                (
+                    "target", "source", "contradicts", "manual",
+                    "hand-written contradict edge", "medium",
+                    "2026-07-27 00:00:00", "2026-07-27 00:00:00",
+                ),
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Rebuild — atomic swap normally destroys typed_edges.
+    build(vault, db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        manual_rows = list(
+            conn.execute(
+                "SELECT from_slug, to_slug, link_type, context, confidence, "
+                "created_at, updated_at FROM typed_edges "
+                "WHERE link_source='manual' ORDER BY link_type"
+            )
+        )
+        predicate_rows = list(
+            conn.execute(
+                "SELECT from_slug, to_slug, link_type FROM typed_edges "
+                "WHERE link_source='predicate' AND link_type='cites'"
+            )
+        )
+    finally:
+        conn.close()
+
+    assert len(manual_rows) == 2, (
+        f"expected 2 manual edges after rebuild, got {len(manual_rows)}: {manual_rows!r}"
+    )
+    # Manual metadata (context, confidence, timestamps) must round-trip exactly.
+    assert manual_rows[0] == (
+        "target", "source", "contradicts",
+        "hand-written contradict edge", "medium",
+        "2026-07-27 00:00:00", "2026-07-27 00:00:00",
+    )
+    assert manual_rows[1] == (
+        "source", "target", "supports",
+        "hand-written support edge", "high",
+        "2026-07-27 00:00:00", "2026-07-27 00:00:00",
+    )
+    # Predicate extraction still runs — the source→target cites edge must
+    # be present alongside the restored manual rows.
+    assert any(
+        r[0] == "source" and r[1] == "target" for r in predicate_rows
+    ), f"predicate cites edge missing after rebuild: {predicate_rows!r}"
