@@ -1985,6 +1985,17 @@ def _event_structural_debt(event: dict[str, Any]) -> int:
 # rollout exists precisely to collect the data needed to tune this.
 _TREND_LOOKBACK_EVENTS = 10
 
+# R² threshold above which a ``structural_debt_trend`` slope is considered
+# "actionable" — i.e. the linear fit explains enough of the variance for
+# downstream consumers (recovery classification, thinking heuristics) to
+# treat the slope as signal rather than noise. 0.7 is the standard
+# social-science / engineering convention for a moderate-to-strong linear
+# fit; below it, the slope carries too much noise to base decisions on.
+# See [[research/2026-07-27-structural-debt-trend-actionability]] for the
+# threshold rationale and the 2026-07-26 spike that motivated the fix.
+# Kept as a module-level constant so future tuning is a one-line change.
+_STRUCTURAL_DEBT_TREND_R2_THRESHOLD = 0.7
+
 
 def _linear_regression_r_squared(x: list[float], y: list[float]) -> float:
     """Coefficient of determination for the OLS fit of y on x.
@@ -2185,7 +2196,14 @@ def compute_recovery_state(
             burst_t1_trend, burst_t1_sig = _trend_over_last_events(
                 events, _extract_recovery_tier1_ratio
             )
-            burst_debt_trend, _ = _trend_over_last_events(
+            # ``burst_debt_r2`` gates the ``structural_debt_trend_actionable``
+            # flag below. R² ≥ _STRUCTURAL_DEBT_TREND_R2_THRESHOLD (0.7) marks
+            # the slope as signal; anything below is dominated by noise and
+            # consumers should ignore the direction. This separates a real
+            # trend from an artifact of 10-event window composition — see
+            # [[research/2026-07-27-structural-debt-trend-actionability]] for
+            # the 2026-07-26 spike (slope 6.27 at R²=0.57) that motivated it.
+            burst_debt_trend, burst_debt_r2 = _trend_over_last_events(
                 events, _extract_recovery_debt_delta
             )
             # Compute structural_debt_delta during burst using the same
@@ -2244,6 +2262,10 @@ def compute_recovery_state(
                 "tier_1_trend": burst_t1_trend,
                 "tier_1_trend_significance": burst_t1_sig,
                 "structural_debt_trend": burst_debt_trend,
+                "structural_debt_trend_actionable": (
+                    burst_debt_r2 is not None
+                    and burst_debt_r2 >= _STRUCTURAL_DEBT_TREND_R2_THRESHOLD
+                ),
             }
 
     # --- Compute three signals ---
@@ -2392,12 +2414,13 @@ def compute_recovery_state(
     tier1_trend: float | None = None
     tier1_trend_sig: float | None = None
     debt_trend: float | None = None
+    debt_r2: float | None = None
     if events_path and events_path.exists():
         trend_events = _read_events_jsonl(events_path)
         tier1_trend, tier1_trend_sig = _trend_over_last_events(
             trend_events, _extract_recovery_tier1_ratio
         )
-        debt_trend, _ = _trend_over_last_events(
+        debt_trend, debt_r2 = _trend_over_last_events(
             trend_events, _extract_recovery_debt_delta
         )
 
@@ -2412,6 +2435,10 @@ def compute_recovery_state(
         "tier_1_trend": tier1_trend,
         "tier_1_trend_significance": tier1_trend_sig,
         "structural_debt_trend": debt_trend,
+        "structural_debt_trend_actionable": (
+            debt_r2 is not None
+            and debt_r2 >= _STRUCTURAL_DEBT_TREND_R2_THRESHOLD
+        ),
     }
 
 
