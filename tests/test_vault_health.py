@@ -1381,6 +1381,73 @@ def test_recovery_state_structural_debt_trend_reads_debt_delta_history(
     assert result["structural_debt_trend"] > 0.0
 
 
+# ---------------------------------------------------------------------------
+# structural_debt_trend_actionable: boolean flag gated on R² >= 0.7.
+# See [[research/2026-07-27-structural-debt-trend-actionability]] — the
+# raw slope alone is noise-prone (2026-07-26 spike: slope 6.27 at R²=0.57
+# with flat daily deltas). The actionable flag lets consumers filter out
+# noise-driven slopes without changing the underlying signal.
+# ---------------------------------------------------------------------------
+
+
+def test_structural_debt_trend_actionable_true_high_r2(tmp_path: Path) -> None:
+    """A clean linear debt-delta trend (R² >> 0.7) → actionable=True."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    # Strictly-ascending debt_delta gives a perfect linear fit (R² ≈ 1.0),
+    # well above the 0.7 threshold. tier_1_ratio is held flat so the debt
+    # axis is the one under test.
+    tier1_series = [0.20] * 10
+    debt_series = list(range(-5, 5))
+    _synth_recovery_events(events, tier1_series, debt_series)
+
+    result = _run_recovery(vault, thoughts, events, datetime(2026, 5, 20))
+    assert result["structural_debt_trend"] is not None
+    assert result["structural_debt_trend_actionable"] is True
+
+
+def test_structural_debt_trend_actionable_false_low_r2(tmp_path: Path) -> None:
+    """A noisy/flat debt-delta trend (R² < 0.7) → actionable=False."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    # Zero-mean oscillating noise around 0: no directional trend, R²
+    # clamps to ~0. The raw slope is still returned (near-zero) but the
+    # actionable flag must be False.
+    tier1_series = [0.20] * 10
+    debt_series = [+1, -1, +2, -2, +1, -1, +2, -2, +1, -1]
+    _synth_recovery_events(events, tier1_series, debt_series)
+
+    result = _run_recovery(vault, thoughts, events, datetime(2026, 5, 20))
+    assert result["structural_debt_trend"] is not None
+    assert result["structural_debt_trend_actionable"] is False
+
+
+def test_structural_debt_trend_actionable_none_insufficient_data(
+    tmp_path: Path,
+) -> None:
+    """No events history → _trend_over_last_events returns (None, None) → actionable=False.
+
+    The actionable flag must be a strict bool (never None), because
+    downstream consumers treat it as a filter guard. When R² is
+    unavailable (fewer than 3 usable events), the flag defaults to False
+    — absence of evidence is not evidence of a meaningful trend.
+    """
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    events = tmp_path / "events.jsonl"  # never created — no history at all
+
+    result = _run_recovery(vault, thoughts, events, datetime(2026, 5, 15))
+    assert result["structural_debt_trend"] is None
+    assert result["structural_debt_trend_actionable"] is False
+
+
 def test_recovery_state_trend_fields_do_not_change_status(tmp_path: Path) -> None:
     """Adding trend fields must not alter the existing classification.
 
@@ -1461,7 +1528,12 @@ def test_recovery_state_trend_fields_do_not_change_status(tmp_path: Path) -> Non
         k for k in with_history
         if with_history.get(k) != without_history.get(k)
     }
-    assert diff_keys <= {"tier_1_trend", "tier_1_trend_significance", "structural_debt_trend"}
+    assert diff_keys <= {
+        "tier_1_trend",
+        "tier_1_trend_significance",
+        "structural_debt_trend",
+        "structural_debt_trend_actionable",
+    }
     # And the trend fields ARE populated when history exists.
     assert with_history["tier_1_trend"] is not None
     assert with_history["structural_debt_trend"] is not None
