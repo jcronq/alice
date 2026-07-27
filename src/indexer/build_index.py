@@ -430,6 +430,37 @@ def resolve_link(
     return None
 
 
+def _save_manual_edges(db_path: Path) -> list[tuple]:
+    """Snapshot manual-source typed edges from ``db_path`` before rebuild.
+
+    Manual edges (``link_source='manual'``) are hand-written or injected via
+    experiment scripts; they aren't derivable from vault content, so a fresh
+    rebuild would lose them permanently. ``build()`` calls this before the
+    atomic swap to restore them afterwards. See task-0592.
+
+    First-run guard: returns ``[]`` if ``db_path`` doesn't exist or the
+    ``typed_edges`` table is absent, so cold-start rebuilds don't crash.
+    """
+    if not db_path.exists():
+        return []
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        has_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='typed_edges'"
+        ).fetchone()
+        if has_table is None:
+            return []
+        return list(
+            conn.execute(
+                "SELECT from_slug, to_slug, link_type, link_source, context, "
+                "confidence, created_at, updated_at FROM typed_edges "
+                "WHERE link_source='manual'"
+            )
+        )
+    finally:
+        conn.close()
+
+
 def build(vault: Path, db_path: Path) -> dict:
     """Rebuild the index. Returns stats dict."""
     if not vault.exists():
@@ -534,6 +565,13 @@ def build(vault: Path, db_path: Path) -> dict:
     finally:
         conn.close()
 
+    # Snapshot manual-source typed edges from the OLD DB before the atomic
+    # swap wipes them. Predicate edges are re-derived by
+    # ``run_predicate_extraction`` below, but manual edges (hand-written or
+    # experiment-injected via typed_edge_inject.py) aren't recoverable from
+    # vault content. See task-0592.
+    saved_manual = _save_manual_edges(db_path)
+
     # Atomic swap: rename .tmp into place.
     os.replace(str(tmp_path), str(db_path))
 
@@ -552,6 +590,23 @@ def build(vault: Path, db_path: Path) -> dict:
         )
     except ImportError:
         pass
+
+    # Restore manual-source typed edges snapshotted before the atomic swap.
+    # ``INSERT OR IGNORE`` is safe under UNIQUE(from_slug, to_slug, link_type,
+    # link_source) — the exact 8-tuple is preserved so the original
+    # created_at/updated_at survive the round-trip.
+    if saved_manual:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.executemany(
+                "INSERT OR IGNORE INTO typed_edges("
+                "from_slug, to_slug, link_type, link_source, context, "
+                "confidence, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                saved_manual,
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     elapsed = time.time() - started
     return {
