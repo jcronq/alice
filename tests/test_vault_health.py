@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import re
+import sys
+import time
 from datetime import datetime, timedelta, timezone as _tz_module
 from pathlib import Path
 from textwrap import dedent
@@ -2435,6 +2437,251 @@ def test_cli_append_alone_writes_after_window_close(
     assert len(lines) == 2
     types = {json.loads(line)["type"] for line in lines}
     assert types == {"vault_health", "birth_signal"}
+
+
+# ---------------------------------------------------------------------------
+# Duplicate-entry regression (task-0595)
+# Design: cortex-memory/research/2026-07-28-vault-health-duplicate-entry-bug.md
+#
+# The 2026-07-28 investigation found 6 dates in 15 days with identical-
+# state duplicates (cluster size 2 → 5, worsening). fcntl.flock was the
+# guard in place at the time; it failed because flock is recursive
+# within a process. These tests lock in the mkdir replacement + the
+# scan_id observability field + the timeout / stale-lock recovery
+# paths so we can prove the fix cross-process and detect regression.
+# ---------------------------------------------------------------------------
+
+
+def _make_scratch_scan_env(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    """Fresh (vault, thoughts, surface, events) scaffolding for lock tests."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"
+    return vault, thoughts, surface, events
+
+
+def _subprocess_runner_script(
+    src_dir: Path,
+    argv: list[str],
+    fake_now: datetime,
+    lock_timeout_override: float | None = None,
+) -> str:
+    """Wrapper script that patches ``_local_now`` (so the sleep-window
+    gate doesn't silent-skip in subprocess), optionally shortens the
+    lock timeout for the timeout test, then calls ``main()``.
+
+    Runs in a fresh interpreter — no shared state with pytest.
+    """
+    timeout_line = ""
+    if lock_timeout_override is not None:
+        timeout_line = (
+            f"vh._LOCK_ACQUIRE_TIMEOUT_SECONDS = {lock_timeout_override}\n"
+        )
+    return (
+        "import sys\n"
+        f"sys.path.insert(0, {str(src_dir)!r})\n"
+        "from datetime import datetime\n"
+        "from metrics import vault_health as vh\n"
+        f"vh._local_now = lambda: datetime({fake_now.year}, {fake_now.month}, "
+        f"{fake_now.day}, {fake_now.hour}, {fake_now.minute}, {fake_now.second})\n"
+        + timeout_line +
+        f"sys.exit(vh.main({argv!r}))\n"
+    )
+
+
+def _src_dir() -> Path:
+    """Locate the ``src/`` root that ``metrics.vault_health`` lives in.
+
+    pytest.pythonpath already adds it — we mirror the resolution for
+    subprocess env so a fresh interpreter can import the module.
+    """
+    import metrics.vault_health as _vh
+    # ``.../src/metrics/vault_health.py`` → ``.../src``
+    return Path(_vh.__file__).resolve().parent.parent
+
+
+def test_concurrent_subprocess_writes_produce_single_event(tmp_path: Path) -> None:
+    """Spawn 5 concurrent subprocesses that each try to append today's
+    vault_health event. mkdir-based locking must serialize them so
+    only ONE event lands.
+
+    This is the direct regression test for the 2026-07-27 incident
+    (5 duplicates in 2m16s). The old fcntl.flock guard let all 5
+    through; mkdir must block 4 of them at the lock acquire and
+    ``vault_health_event_exists_for_date`` must short-circuit the
+    other 3 once the first write lands.
+    """
+    import json
+    import subprocess
+
+    vault, thoughts, surface, events = _make_scratch_scan_env(tmp_path)
+
+    # Freeze all subprocesses to the same post-07:00 wall clock so
+    # the sleep-window gate can't silent-skip.
+    fake_now = datetime(2026, 7, 28, 15, 0, 0)
+    argv = [
+        "--vault", str(vault),
+        "--thoughts", str(thoughts),
+        "--events", str(events),
+        "--surface", str(surface),
+        "--check-existing",
+        "--append",
+    ]
+    script = _subprocess_runner_script(_src_dir(), argv, fake_now)
+
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for _ in range(5)
+    ]
+    for p in procs:
+        rc = p.wait(timeout=120)
+        # Every subprocess must exit clean — no crash, no unhandled
+        # lock-timeout in either the writer or a check-existing skipper.
+        assert rc == 0, (
+            f"subprocess exited rc={rc}; "
+            f"stderr={p.stderr.read().decode(errors='replace')[:400]}"
+        )
+
+    assert events.exists()
+    lines = [
+        json.loads(line)
+        for line in events.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    vault_health_events = [e for e in lines if e.get("type") == "vault_health"]
+    assert len(vault_health_events) == 1, (
+        f"expected exactly 1 vault_health event under concurrent writers, "
+        f"got {len(vault_health_events)}: "
+        f"{[e.get('scan_id') for e in vault_health_events]}"
+    )
+    # Post-run lock cleanup — the finally block must have released it.
+    assert not Path(str(events) + ".lockdir").exists()
+
+
+def test_scan_id_field_present_and_uuid_shaped(tmp_path: Path, monkeypatch) -> None:
+    """A single --append run must emit a ``scan_id`` field that matches
+    a UUID4 shape. Downstream tooling relies on this being a stable
+    grep-anchor across events.jsonl and stderr logs.
+    """
+    import json
+    import re as _re
+
+    vault, thoughts, surface, events = _make_scratch_scan_env(tmp_path)
+    fake_now = datetime.now().replace(hour=15, minute=0, second=0, microsecond=0)
+    monkeypatch.setattr("metrics.vault_health._local_now", lambda: fake_now)
+
+    rc = vault_health_main(_cli_args(vault, thoughts, events, surface, "--append"))
+    assert rc == 0
+    lines = [json.loads(line) for line in events.read_text().splitlines() if line.strip()]
+    vh_events = [e for e in lines if e.get("type") == "vault_health"]
+    assert len(vh_events) == 1
+    scan_id = vh_events[0].get("scan_id")
+    assert scan_id, "scan_id field missing from vault_health event"
+    # UUID4 shape: 8-4-4-4-12 hex chars with the version-4 nibble.
+    uuid_re = _re.compile(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        _re.IGNORECASE,
+    )
+    assert uuid_re.match(scan_id), f"scan_id {scan_id!r} is not a UUID4"
+
+
+def test_scan_id_unique_across_two_dates(tmp_path: Path, monkeypatch) -> None:
+    """Two --append runs across two different dates must produce two
+    distinct scan_id values. Confirms the field is per-scan, not
+    a class-level constant that got cached across builds.
+    """
+    import json
+
+    vault, thoughts, surface, events = _make_scratch_scan_env(tmp_path)
+
+    # First run — day A.
+    day_a = datetime(2026, 7, 28, 15, 0, 0)
+    monkeypatch.setattr("metrics.vault_health._local_now", lambda: day_a)
+    rc = vault_health_main(_cli_args(vault, thoughts, events, surface, "--append"))
+    assert rc == 0
+
+    # Second run — day B (next day, --check-existing off so it runs).
+    day_b = datetime(2026, 7, 29, 15, 0, 0)
+    monkeypatch.setattr("metrics.vault_health._local_now", lambda: day_b)
+    rc = vault_health_main(_cli_args(vault, thoughts, events, surface, "--append"))
+    assert rc == 0
+
+    lines = [json.loads(line) for line in events.read_text().splitlines() if line.strip()]
+    vh_events = [e for e in lines if e.get("type") == "vault_health"]
+    assert len(vh_events) == 2
+    scan_ids = {e["scan_id"] for e in vh_events}
+    assert len(scan_ids) == 2, f"expected 2 distinct scan_ids, got {scan_ids}"
+
+
+def test_stale_lock_is_recovered(tmp_path: Path, monkeypatch) -> None:
+    """A leftover lock dir older than ``_LOCK_STALE_SECONDS`` must be
+    detected as stale, cleaned up, and the write must proceed.
+
+    Reproduces the crash-during-critical-section case: a previous
+    invocation aborted (SIGKILL, host reboot, container OOM) after
+    ``os.mkdir(lock_dir)`` but before the ``finally`` release. Without
+    stale-lock recovery every subsequent run would hit
+    ``FileExistsError``, wait 30 seconds, then silent-skip forever.
+    """
+    import json
+
+    vault, thoughts, surface, events = _make_scratch_scan_env(tmp_path)
+    fake_now = datetime.now().replace(hour=15, minute=0, second=0, microsecond=0)
+    monkeypatch.setattr("metrics.vault_health._local_now", lambda: fake_now)
+
+    # Plant a stale lock — mtime 10 minutes in the past (well past
+    # the 5-minute stale threshold).
+    lock_dir = Path(str(events) + ".lockdir")
+    lock_dir.mkdir()
+    stale_time = time.time() - 600  # 10 minutes ago
+    import os as _os
+    _os.utime(lock_dir, (stale_time, stale_time))
+
+    rc = vault_health_main(_cli_args(vault, thoughts, events, surface, "--append"))
+    assert rc == 0
+
+    # The write must have proceeded despite the pre-existing lock dir.
+    assert events.exists() and events.stat().st_size > 0
+    lines = [json.loads(line) for line in events.read_text().splitlines() if line.strip()]
+    vh_events = [e for e in lines if e.get("type") == "vault_health"]
+    assert len(vh_events) == 1
+
+    # And the finally block released the lock.
+    assert not lock_dir.exists()
+
+
+def test_fresh_lock_forces_timeout_skip(tmp_path: Path, monkeypatch) -> None:
+    """A fresh (non-stale) lock dir must block acquisition until the
+    configured timeout expires, and the writer must return 0 without
+    creating an event — the "someone is stuck holding it" safety net.
+    Verifies both the timeout path AND the refuse-to-write behavior.
+    """
+    vault, thoughts, surface, events = _make_scratch_scan_env(tmp_path)
+    fake_now = datetime.now().replace(hour=15, minute=0, second=0, microsecond=0)
+    monkeypatch.setattr("metrics.vault_health._local_now", lambda: fake_now)
+
+    # Shorten the timeout so the test doesn't wait 30 seconds. Still
+    # long enough for the acquire loop to iterate a few times.
+    monkeypatch.setattr("metrics.vault_health._LOCK_ACQUIRE_TIMEOUT_SECONDS", 0.3)
+
+    # Plant a fresh (not stale) lock dir — mtime = now.
+    lock_dir = Path(str(events) + ".lockdir")
+    lock_dir.mkdir()  # mtime defaults to now
+
+    rc = vault_health_main(_cli_args(vault, thoughts, events, surface, "--append"))
+    # Refuse-to-write silent-skip semantics: rc=0, no event written.
+    assert rc == 0
+    assert not events.exists() or events.stat().st_size == 0
+
+    # The blocker is still there — we never stole it.
+    assert lock_dir.exists()
 
 
 # ---------------------------------------------------------------------------

@@ -28,14 +28,15 @@ take filesystem paths in, return values out, and never write. The
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import logging
 import math
+import os
 import re
 import sqlite3
 import sys
 import time
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -3056,6 +3057,96 @@ def _append_event(events_path: Path, event: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cross-process serialization for the events.jsonl write path.
+#
+# Replaces the previous ``fcntl.flock`` guard, which failed to prevent
+# the vault_health duplicate-entry regression documented in
+# ``cortex-memory/research/2026-07-28-vault-health-duplicate-entry-bug.md``
+# (cluster size 2 → 5 duplicates over 15 days, all inside single
+# 3-minute windows). ``flock(LOCK_EX)`` is recursive per open file
+# description on Linux: if the same process (or a subprocess sharing
+# fd state) re-enters the critical section, it re-acquires the lock
+# instantly instead of blocking, so check-existing + append can
+# happen against a partially-flushed events.jsonl and both writers
+# see ``vault_health_event_exists_for_date == False``.
+#
+# ``os.mkdir`` is atomic on every POSIX filesystem and is NOT
+# recursive — a second ``mkdir`` on the same path raises
+# ``FileExistsError`` regardless of the caller. That gives us a
+# true mutex across every invoker, including thread + subprocess
+# fan-outs from the same parent.
+# ---------------------------------------------------------------------------
+
+
+# Module-level constants so tests can monkeypatch a shorter timeout to
+# exercise the fallback path without waiting 30 real seconds.
+_LOCK_ACQUIRE_TIMEOUT_SECONDS = 30.0
+_LOCK_POLL_INTERVAL_SECONDS = 0.1
+_LOCK_STALE_SECONDS = 300.0  # 5 minutes — beyond any real critical section
+
+
+def _acquire_events_lock(lock_dir: str) -> bool:
+    """Acquire ``lock_dir`` atomically via ``os.mkdir``.
+
+    Returns True on success. Returns False if the lock cannot be
+    acquired within ``_LOCK_ACQUIRE_TIMEOUT_SECONDS``; callers must
+    treat this as "someone is stuck holding the lock" and skip the
+    write rather than proceed unlocked (which would reintroduce the
+    duplicate-entry race).
+
+    Includes a stale-lock recovery hop: if the lock dir's mtime is
+    older than ``_LOCK_STALE_SECONDS`` (default 5 minutes), we assume
+    the previous holder crashed mid-critical-section, log a warning,
+    ``rmdir`` the stale lock, and try once more. The retry is bounded
+    (a single attempt) so a legitimately-held lock cannot be stolen
+    just because the caller thought it was stale.
+    """
+    deadline = time.monotonic() + _LOCK_ACQUIRE_TIMEOUT_SECONDS
+    stale_retry_done = False
+    while True:
+        try:
+            os.mkdir(lock_dir)
+            return True
+        except FileExistsError:
+            if not stale_retry_done:
+                try:
+                    lock_age = time.time() - os.stat(lock_dir).st_mtime
+                except FileNotFoundError:
+                    # Holder released between our mkdir and stat — loop.
+                    continue
+                if lock_age > _LOCK_STALE_SECONDS:
+                    sys.stderr.write(
+                        f"vault_health: stale lock at {lock_dir} "
+                        f"(age {lock_age:.0f}s > {_LOCK_STALE_SECONDS:.0f}s) "
+                        f"— cleaning up and retrying once\n"
+                    )
+                    try:
+                        os.rmdir(lock_dir)
+                    except (FileNotFoundError, OSError):
+                        # Another cleaner won the race; that's fine —
+                        # try mkdir again next iteration.
+                        pass
+                    stale_retry_done = True
+                    continue
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_LOCK_POLL_INTERVAL_SECONDS)
+
+
+def _release_events_lock(lock_dir: str) -> None:
+    """Best-effort ``rmdir`` — never raises. Used inside ``finally``.
+
+    A missing lock dir means the stale-lock cleanup already removed it,
+    or the process is unwinding after a partial acquire. Neither is a
+    programming error worth propagating out of the ``finally`` block.
+    """
+    try:
+        os.rmdir(lock_dir)
+    except (FileNotFoundError, OSError):
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Local-time helpers for the morning window
 # ---------------------------------------------------------------------------
 
@@ -3315,8 +3406,17 @@ def build_vault_health_event(
     # re-deriving the time check.
     window_closed = _sleep_window_closed(now)
 
+    # scan_id: opaque per-scan UUID. Grep-friendly across events.jsonl,
+    # stderr logs, and any downstream artifact that carries the event
+    # forward. Also gives post-hoc cleanup a durable idempotency key
+    # for dedup — two rows with the same ``scan_id`` are guaranteed to
+    # be the same underlying scan (the mkdir lock guarantees at-most-one
+    # per date, but scan_id is what proves it after the fact). Added
+    # per ``cortex-memory/research/2026-07-28-vault-health-duplicate-entry-bug.md``
+    # Layer 2 remediation.
     event: dict[str, Any] = {
         "ts": ts,
+        "scan_id": str(uuid.uuid4()),
         "type": "vault_health",
         "date": now.strftime("%Y-%m-%d"),
         "time": time_str,
@@ -3567,6 +3667,23 @@ def _parse_iso(s: str) -> datetime:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Invoker breadcrumb — logged before any argument parsing so it fires
+    # even on argparse failure paths. When the next unexpected
+    # vault_health duplicate cluster shows up, we grep this line by
+    # timestamp / PID to identify the parent process that spawned us
+    # (the 2026-07-28 investigation spec found NO known invoker in
+    # shell / docker / s6 / cron, so this is the mystery-solver
+    # observability layer). ``os.getcwd`` can fail on rare NFS states —
+    # swallow that so logging never blocks the write path.
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = "<unavailable>"
+    logger.info(
+        "vault_health: invoker pid=%d ppid=%d argv=%r cwd=%s",
+        os.getpid(), os.getppid(), sys.argv, cwd,
+    )
+
     parser = argparse.ArgumentParser(
         description=(
             "Compute vault-health metrics and (optionally) append a "
@@ -3689,19 +3806,38 @@ def main(argv: list[str] | None = None) -> int:
         if not _sleep_window_closed(now):
             return 0
 
-        # Serialize check-existing + build + append under a per-file
-        # advisory lock. Without it, two vault_health invocations that
-        # start within the ~seconds-long build_vault_health_event()
-        # window both see check-existing=False and both append,
-        # producing duplicate events for the same date. Observed
-        # 2026-07-10: 181 events across 46 dates, 38 with dupes (worst
-        # 23-for-1 on 2026-07-03). Lock file is per-events-path so
-        # concurrent vault_health calls against the same events.jsonl
-        # coordinate.
-        lock_path = args.events.with_suffix(args.events.suffix + ".lock")
-        with open(lock_path, "w") as _lock_fh:
-            fcntl.flock(_lock_fh.fileno(), fcntl.LOCK_EX)
-
+        # Serialize check-existing + build + append with an atomic
+        # ``mkdir``-based lock. The previous implementation used
+        # ``fcntl.flock(LOCK_EX)`` — which failed to prevent the
+        # 2026-07-28 duplicate-entry regression (2 → 5 same-date
+        # dupes over 15 days; worst case 5 events in 2m16s). See
+        # ``cortex-memory/research/2026-07-28-vault-health-duplicate-entry-bug.md``.
+        # ``flock`` is recursive per open file description on Linux:
+        # a caller (or a subprocess sharing fd state) can re-acquire
+        # the lock instantly, letting check-existing + append happen
+        # against a partially-flushed events.jsonl and letting both
+        # writers see ``vault_health_event_exists_for_date == False``.
+        #
+        # ``os.mkdir`` is atomic and NOT recursive — a second mkdir on
+        # the same path always raises ``FileExistsError`` regardless
+        # of the caller, giving us a true mutex across every invoker.
+        # Prior lock incident: 2026-07-10, 181 events across 46 dates,
+        # 38 with dupes (worst 23-for-1 on 2026-07-03) — the original
+        # motivation for adding a lock at all.
+        lock_dir = str(args.events) + ".lockdir"
+        if not _acquire_events_lock(lock_dir):
+            # Someone is stuck holding the lock beyond the timeout.
+            # Refuse to write rather than reintroduce the race — a
+            # missing daily event is a much smaller problem than a
+            # duplicate one (the next-cadence invocation will retry
+            # and produce a clean single entry).
+            sys.stderr.write(
+                f"vault_health: could not acquire {lock_dir} within "
+                f"{_LOCK_ACQUIRE_TIMEOUT_SECONDS:.0f}s — skipping write "
+                f"to avoid duplicate entry\n"
+            )
+            return 0
+        try:
             if args.check_existing and vault_health_event_exists_for_date(
                 args.events, today_str
             ):
@@ -3757,6 +3893,8 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(json.dumps(event))
             return 0
+        finally:
+            _release_events_lock(lock_dir)
 
     # Legacy mode: emit partial-metric JSON for ad-hoc inspection.
     out: dict[str, Any] = {
