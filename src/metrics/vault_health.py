@@ -3056,6 +3056,67 @@ def _append_event(events_path: Path, event: dict[str, Any]) -> None:
         fh.write(line + "\n")
 
 
+def _last_event_has_same_state(
+    events_path: Path, new_event: dict, today_str: str,
+) -> bool:
+    """True if the last vault_health event is same-day *and* identical state.
+
+    Guards against rapid-fire invocations (same wake thread, concurrent
+    calls) that produce identical structural health snapshots.  The
+    date-based ``check_existing`` only catches same-day events; it misses
+    rapid-fire clusters where the vault state hasn't changed between
+    scans.
+
+    Precondition — same-day only: the suppression fires ONLY when the
+    last event's ``date`` field equals ``today_str``.  Rapid-fire dedup
+    is a *same-scan-cluster* concern; state that happens to match an
+    event from a prior day is not a duplicate — it's a fresh daily
+    snapshot that must be recorded so downstream slope / drought /
+    stage-D counters see a real event for today.  Without this check a
+    day whose structural state is unchanged from yesterday would be
+    silently skipped, corrupting date-indexed metrics.
+
+    Compares three core state fields:
+      - orphan_notes          — structural isolation count
+      - broken_wikilinks      — link integrity count
+      - structural_debt_delta — net debt change (inside recovery_state)
+
+    See: 2026-07-28-intraday-rapid-fire-cluster-impact (29.8 % slope
+    distortion from 11 same-state events across 6 clusters).
+    """
+    if not events_path.exists():
+        return False
+    try:
+        with events_path.open("r", encoding="utf-8") as fh:
+            last = None
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if evt.get("type") == "vault_health":
+                    last = evt
+            if last is None:
+                return False
+        # Same-day precondition: dedup applies only to today's cluster.
+        # A same-state match against a prior-day event is a fresh daily
+        # snapshot, not a duplicate — record it.
+        if last.get("date") != today_str:
+            return False
+        new_rs = new_event.get("recovery_state", {})
+        old_rs = last.get("recovery_state", {})
+        return (
+            last.get("orphan_notes") == new_event.get("orphan_notes")
+            and last.get("broken_wikilinks") == new_event.get("broken_wikilinks")
+            and old_rs.get("structural_debt_delta") == new_rs.get("structural_debt_delta")
+        )
+    except OSError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Cross-process serialization for the events.jsonl write path.
 #
@@ -3859,7 +3920,23 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
             if args.append:
-                _append_event(args.events, event)
+                # State dedup: skip if the last event is same-day AND has
+                # identical core state.  Catches rapid-fire invocations
+                # where the vault hasn't changed between scans within a
+                # single day (the date-based check_existing only prevents
+                # duplicate same-day entries, not intraday clusters).
+                # Same-day precondition inside the helper prevents a
+                # cross-day state match from silently skipping today's
+                # snapshot.
+                if _last_event_has_same_state(args.events, event, today_str):
+                    sys.stderr.write(
+                        f"vault_health: last event today has identical core state "
+                        f"(orphans={event['orphan_notes']}, broken={event['broken_wikilinks']}, "
+                        f"delta={event['recovery_state']['structural_debt_delta']}) "
+                        f"— skipping duplicate write\n"
+                    )
+                else:
+                    _append_event(args.events, event)
 
                 # Standalone birth_signal event — per spec
                 # (cortex-memory/research/2026-06-25-birth-signal-implementation-spec.md
