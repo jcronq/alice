@@ -28,6 +28,7 @@ import pytest
 from metrics.vault_health import (
     ADR_SCHEMA,
     DEFAULT_DECAY_SCORE_THRESHOLD,
+    _last_event_has_same_state,
     _sleep_window_closed,
     build_vault_health_event,
     compute_all_links_degree,
@@ -4689,3 +4690,96 @@ def test_compute_stage_d_drought_missing_file(tmp_path: Path) -> None:
         )
         is False
     )
+
+
+# ---------------------------------------------------------------------------
+# _last_event_has_same_state — same-day rapid-fire dedup with cross-day guard
+# (task-0599: adds ``today_str`` precondition so a state match against a
+# prior-day event does NOT silently suppress today's snapshot).
+
+
+def _write_last_event(
+    events_path: Path,
+    date_str: str,
+    orphans: int,
+    broken: int,
+    delta: float,
+) -> None:
+    """Append one ``vault_health`` event with the given core state."""
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+    evt = {
+        "type": "vault_health",
+        "date": date_str,
+        "orphan_notes": orphans,
+        "broken_wikilinks": broken,
+        "recovery_state": {"structural_debt_delta": delta},
+    }
+    with events_path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(evt) + "\n")
+
+
+def test_last_event_has_same_state_same_day_same_state_skips(tmp_path: Path) -> None:
+    """Same-day + identical core state → True (rapid-fire cluster suppressed)."""
+    events = tmp_path / "events.jsonl"
+    _write_last_event(events, "2026-07-29", orphans=25, broken=23, delta=-1.5)
+    new_event = {
+        "orphan_notes": 25,
+        "broken_wikilinks": 23,
+        "recovery_state": {"structural_debt_delta": -1.5},
+    }
+    assert _last_event_has_same_state(events, new_event, "2026-07-29") is True
+
+
+def test_last_event_has_same_state_cross_day_same_state_records(tmp_path: Path) -> None:
+    """Different-day + identical core state → False (regression test for task-0599).
+
+    Without the ``today_str`` precondition, a day whose structural state
+    happens to match yesterday's last event would be silently skipped,
+    corrupting date-indexed metrics (slope, drought, stage-D counters).
+    """
+    events = tmp_path / "events.jsonl"
+    _write_last_event(events, "2026-07-28", orphans=25, broken=23, delta=-1.5)
+    new_event = {
+        "orphan_notes": 25,
+        "broken_wikilinks": 23,
+        "recovery_state": {"structural_debt_delta": -1.5},
+    }
+    assert _last_event_has_same_state(events, new_event, "2026-07-29") is False
+
+
+def test_last_event_has_same_state_same_day_diff_state_records(tmp_path: Path) -> None:
+    """Same-day + different core state → False (real state change, not a duplicate)."""
+    events = tmp_path / "events.jsonl"
+    _write_last_event(events, "2026-07-29", orphans=25, broken=23, delta=-1.5)
+    new_event = {
+        "orphan_notes": 26,  # orphans changed
+        "broken_wikilinks": 23,
+        "recovery_state": {"structural_debt_delta": -1.5},
+    }
+    assert _last_event_has_same_state(events, new_event, "2026-07-29") is False
+
+
+def test_last_event_has_same_state_missing_file(tmp_path: Path) -> None:
+    """No events file → False (nothing to compare against)."""
+    events = tmp_path / "nope.jsonl"
+    new_event = {
+        "orphan_notes": 25,
+        "broken_wikilinks": 23,
+        "recovery_state": {"structural_debt_delta": -1.5},
+    }
+    assert _last_event_has_same_state(events, new_event, "2026-07-29") is False
+
+
+def test_last_event_has_same_state_no_vault_health_events(tmp_path: Path) -> None:
+    """Events file exists with only non-vault_health events → False."""
+    events = tmp_path / "events.jsonl"
+    events.parent.mkdir(parents=True, exist_ok=True)
+    with events.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "meal", "date": "2026-07-29"}) + "\n")
+        fh.write(json.dumps({"type": "workout", "date": "2026-07-29"}) + "\n")
+    new_event = {
+        "orphan_notes": 25,
+        "broken_wikilinks": 23,
+        "recovery_state": {"structural_debt_delta": -1.5},
+    }
+    assert _last_event_has_same_state(events, new_event, "2026-07-29") is False
