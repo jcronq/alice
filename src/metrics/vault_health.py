@@ -1178,6 +1178,37 @@ def _parse_last_accessed(raw: Any) -> datetime | None:
     return _parse_created_date(raw)
 
 
+def _parse_speaking_accessed(raw: Any) -> datetime | None:
+    """Parse ``speaking_accessed_at`` ISO 8601 frontmatter to a datetime.
+
+    Unlike ``last_accessed`` (date-only, ``YYYY-MM-DD``), the cue runner
+    writes ``speaking_accessed_at`` as an ISO 8601 timestamp with second
+    precision (e.g. ``2026-07-29T14:38:13`` — see ``cue_runner.py``
+    ``_bump_access``). This is the pure behavioral signal: grooming
+    passes bump ``last_accessed`` but never touch ``speaking_accessed_at``.
+
+    Returns a naive datetime (tz-aware inputs are converted to UTC and
+    stripped) so downstream comparisons against the naive
+    ``window_floor``/``activation`` values don't raise ``TypeError``.
+    Returns ``None`` for missing, empty, malformed, or unparseable input.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        dt = raw
+    else:
+        s = str(raw).strip()
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(s)
+        except (ValueError, TypeError):
+            return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
 def _note_domain(fm: dict[str, Any], rel: str) -> str:
     """Domain bucket for a note: frontmatter ``domain:`` or folder name."""
     raw = fm.get("domain")
@@ -1211,17 +1242,20 @@ def compute_decay_coverage(
       ``cutoff_days`` old at activation; the 5-day cliff had already passed
       so it was eligible to decay)
     - At activation, either still untouched (currently ``access_count == 0``)
-      OR touched only post-activation (``last_accessed >= activation_date``).
-      That gives us the set of notes that *were* in the decayed pool when
-      the cue runner came online, regardless of whether they've since been
-      recovered.
+      OR read only post-activation by the cue runner
+      (``speaking_accessed_at >= activation_date``). That gives us the set
+      of notes that *were* in the decayed pool when the cue runner came
+      online, regardless of whether they've since been recovered.
     - Excludes ``dailies/`` and ``archive/`` (and the standard scaffolding
       files via :func:`_iter_notes`).
 
-    **Accessed in window**: pool members whose ``last_accessed`` is on or
-    after ``max(today - window_days, activation_date)``. The activation
-    floor matters in the first weeks post-activation, when ``today -
-    window_days`` predates the cue runner and would inflate the window.
+    **Accessed in window**: pool members whose ``speaking_accessed_at``
+    is on or after ``max(today - window_days, activation_date)``. The
+    activation floor matters in the first weeks post-activation, when
+    ``today - window_days`` predates the cue runner and would inflate the
+    window. ``speaking_accessed_at`` (not ``last_accessed``) is used
+    because grooming passes bump ``last_accessed`` without a read — see
+    [[decay-coverage-source-fix-implementation-design]].
 
     Returns the payload shape documented in the design note:
 
@@ -1297,16 +1331,29 @@ def compute_decay_coverage(
         if access_count is None:
             continue
 
-        last_accessed = _parse_last_accessed(fm.get("last_accessed"))
+        speaking_accessed_at = _parse_speaking_accessed(
+            fm.get("speaking_accessed_at")
+        )
 
         # Was this note in the decayed pool at activation?
-        # Yes if either: never accessed (count == 0), or every access has
-        # happened on/after activation (count > 0 AND last_accessed >=
-        # activation). A note with count > 0 and last_accessed < activation
-        # was already in active circulation pre-cue and isn't a decay case.
+        # Yes if either: never accessed (count == 0), or every read the cue
+        # runner saw happened on/after activation (count > 0 AND
+        # ``speaking_accessed_at >= activation``). A note with count > 0
+        # and no ``speaking_accessed_at`` (or one before activation) was
+        # already in active circulation pre-cue and isn't a decay case.
+        #
+        # We deliberately use ``speaking_accessed_at`` — not
+        # ``last_accessed`` — because grooming passes (atomization,
+        # dedupe, recombination) bump ``last_accessed`` without a human
+        # or cue-runner ever having read the note, which used to inflate
+        # pool membership and coverage by ~5.9x.
+        # See [[decay-coverage-source-fix-implementation-design]].
         if access_count == 0:
             in_pool = True
-        elif last_accessed is not None and last_accessed >= activation:
+        elif (
+            speaking_accessed_at is not None
+            and speaking_accessed_at >= activation
+        ):
             in_pool = True
         else:
             in_pool = False
@@ -1331,7 +1378,10 @@ def compute_decay_coverage(
         else:
             zero_access_in_pool.add(slug_lower)
 
-        if last_accessed is not None and last_accessed >= window_floor:
+        if (
+            speaking_accessed_at is not None
+            and speaking_accessed_at >= window_floor
+        ):
             total_accessed += 1
             by_domain[domain]["accessed"] += 1
             accessed_decay_slugs.add(slug_lower)
@@ -1344,12 +1394,21 @@ def compute_decay_coverage(
     #
     # Pass: for each recently-accessed note, follow its wikilink
     # targets to find decayed notes it links to.
+    #
+    # "Recently accessed" means the cue runner (or a human read via the
+    # cue-runner path) touched this note in the window, not that a
+    # grooming pass rewrote its frontmatter.
     struct_links_slugs: set[str] = set()
     for md in _iter_notes(vault_dir):
         text = _read_text(md)
         fm, body = split_frontmatter(text)
-        last_accessed = _parse_last_accessed(fm.get("last_accessed"))
-        if last_accessed is None or last_accessed < window_floor:
+        speaking_accessed_at = _parse_speaking_accessed(
+            fm.get("speaking_accessed_at")
+        )
+        if (
+            speaking_accessed_at is None
+            or speaking_accessed_at < window_floor
+        ):
             continue
         targets: list[str] = list(_extract_targets(body))
         for val in fm.values():

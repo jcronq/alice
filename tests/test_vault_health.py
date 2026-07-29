@@ -2780,6 +2780,7 @@ def test_decay_coverage_partial_access(tmp_path: Path) -> None:
         created: 2026-04-25
         access_count: 1
         last_accessed: 2026-05-08
+        speaking_accessed_at: 2026-05-08T12:00:00
         domain: fitness
         ---
         """,
@@ -2792,6 +2793,7 @@ def test_decay_coverage_partial_access(tmp_path: Path) -> None:
         created: 2026-04-25
         access_count: 2
         last_accessed: 2026-05-09
+        speaking_accessed_at: 2026-05-09T12:00:00
         domain: alice-architecture
         ---
         """,
@@ -2954,6 +2956,7 @@ def test_decay_coverage_window_days_parameter(tmp_path: Path) -> None:
         created: 2026-04-01
         access_count: 1
         last_accessed: 2026-05-09
+        speaking_accessed_at: 2026-05-09T12:00:00
         ---
         """,
     )
@@ -3034,6 +3037,7 @@ def test_decay_coverage_structural_recovers_via_inbound_link(
         created: 2026-04-01
         access_count: 1
         last_accessed: 2026-05-09
+        speaking_accessed_at: 2026-05-09T12:00:00
         domain: fitness
         ---
         Links to [[linked-only]].
@@ -3093,6 +3097,7 @@ def test_decay_coverage_structural_resolves_via_alias(tmp_path: Path) -> None:
         created: 2026-04-01
         access_count: 1
         last_accessed: 2026-05-09
+        speaking_accessed_at: 2026-05-09T12:00:00
         domain: fitness
         ---
         Refers to [[Migraine Trigger]] as an alias.
@@ -3136,6 +3141,7 @@ def test_decay_coverage_structural_per_domain_fields(tmp_path: Path) -> None:
         created: 2026-04-01
         access_count: 1
         last_accessed: 2026-05-09
+        speaking_accessed_at: 2026-05-09T12:00:00
         domain: fitness
         ---
         See [[f-linked]].
@@ -3314,6 +3320,7 @@ def test_decay_coverage_structural_split_mixed_pool(tmp_path: Path) -> None:
         created: 2026-03-01
         access_count: 3
         last_accessed: 2026-05-09
+        speaking_accessed_at: 2026-05-09T12:00:00
         domain: fitness
         ---
         See [[acc-linked]] and [[zero-linked]].
@@ -3327,6 +3334,7 @@ def test_decay_coverage_structural_split_mixed_pool(tmp_path: Path) -> None:
         created: 2026-03-01
         access_count: 2
         last_accessed: 2026-04-20
+        speaking_accessed_at: 2026-04-20T12:00:00
         domain: fitness
         ---
         Body.
@@ -3340,6 +3348,7 @@ def test_decay_coverage_structural_split_mixed_pool(tmp_path: Path) -> None:
         created: 2026-03-01
         access_count: 1
         last_accessed: 2026-04-10
+        speaking_accessed_at: 2026-04-10T12:00:00
         domain: fitness
         ---
         Body.
@@ -3413,6 +3422,7 @@ def test_decay_coverage_structural_combined_unchanged_backward_compat(
         created: 2026-04-01
         access_count: 1
         last_accessed: 2026-05-09
+        speaking_accessed_at: 2026-05-09T12:00:00
         domain: fitness
         ---
         Links to [[linked-only]].
@@ -3609,6 +3619,185 @@ def test_decay_coverage_excludes_feedback_folder(tmp_path: Path) -> None:
     )
     assert result["total_decayed_notes"] == 0
     assert result["by_domain"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Source-of-truth fix: ``speaking_accessed_at`` (cue-runner write) is the
+# behavioral signal, NOT ``last_accessed`` (bumped by grooming passes too).
+# Task-0600 / [[decay-coverage-source-fix-implementation-design]].
+# ---------------------------------------------------------------------------
+
+
+def test_decay_coverage_speaking_accessed_at_counts_as_accessed(
+    tmp_path: Path,
+) -> None:
+    """A note with ``speaking_accessed_at`` inside the window counts as
+    accessed even when ``last_accessed`` is absent — the cue-runner write
+    is the sole behavioral signal after the fix."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "cue-read.md",
+        """
+        ---
+        slug: cue-read
+        created: 2026-04-01
+        access_count: 1
+        speaking_accessed_at: 2026-05-09T14:38:13
+        domain: fitness
+        ---
+        Body.
+        """,
+    )
+    result = compute_decay_coverage(
+        vault, today=_TODAY, activation_date=_ACTIVATION
+    )
+    assert result["total_decayed_notes"] == 1
+    assert result["decayed_accessed_in_window"] == 1
+    assert result["decay_coverage_pct"] == 100.0
+
+
+def test_decay_coverage_only_last_accessed_does_not_count_as_accessed(
+    tmp_path: Path,
+) -> None:
+    """A note touched only by grooming (``last_accessed`` set,
+    ``speaking_accessed_at`` absent) must NOT be counted as accessed.
+    This is the whole point of the fix — grooming touches used to
+    inflate the metric by ~5.9x."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "groomed-only.md",
+        """
+        ---
+        slug: groomed-only
+        created: 2026-04-01
+        access_count: 0
+        last_accessed: 2026-05-09
+        domain: fitness
+        ---
+        Body.
+        """,
+    )
+    result = compute_decay_coverage(
+        vault, today=_TODAY, activation_date=_ACTIVATION
+    )
+    # Still in pool (access_count == 0).
+    assert result["total_decayed_notes"] == 1
+    # But NOT accessed — no cue-runner touch.
+    assert result["decayed_accessed_in_window"] == 0
+    assert result["decay_coverage_pct"] == 0.0
+
+
+def test_decay_coverage_speaking_accessed_at_wins_over_last_accessed(
+    tmp_path: Path,
+) -> None:
+    """When both timestamps are present, ``speaking_accessed_at`` is the
+    deciding signal for the accessed-in-window check. Two fixtures cover
+    both directions:
+
+    - ``sp-in-la-out``: ``speaking_accessed_at`` inside window,
+      ``last_accessed`` outside → counted as accessed.
+    - ``sp-out-la-in``: ``speaking_accessed_at`` outside window (but
+      post-activation, so still in pool), ``last_accessed`` inside window
+      → NOT counted as accessed.
+    """
+    # activation 2026-05-06, today 2026-05-10, window_days 3
+    # → window_floor = max(2026-05-07, 2026-05-06) = 2026-05-07
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "sp-in-la-out.md",
+        """
+        ---
+        slug: sp-in-la-out
+        created: 2026-04-01
+        access_count: 1
+        last_accessed: 2026-05-06
+        speaking_accessed_at: 2026-05-08T12:00:00
+        domain: fitness
+        ---
+        Body.
+        """,
+    )
+    _write(
+        vault / "research" / "sp-out-la-in.md",
+        """
+        ---
+        slug: sp-out-la-in
+        created: 2026-04-01
+        access_count: 1
+        last_accessed: 2026-05-09
+        speaking_accessed_at: 2026-05-06T12:00:00
+        domain: fitness
+        ---
+        Body.
+        """,
+    )
+    result = compute_decay_coverage(
+        vault, today=_TODAY, activation_date=_ACTIVATION, window_days=3
+    )
+    # Both in pool: access_count > 0 and speaking_accessed_at >= activation.
+    assert result["total_decayed_notes"] == 2
+    # Only the one with speaking_accessed_at inside window counts.
+    assert result["decayed_accessed_in_window"] == 1
+    assert result["decay_coverage_pct"] == 50.0
+
+
+def test_decay_coverage_missing_speaking_accessed_treated_as_not_accessed(
+    tmp_path: Path,
+) -> None:
+    """A note with no ``speaking_accessed_at`` field is never counted as
+    accessed, regardless of ``last_accessed``. Verifies that a bang-fresh
+    ``last_accessed`` (today) does not sneak the note into the accessed
+    bucket."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "no-cue-field.md",
+        """
+        ---
+        slug: no-cue-field
+        created: 2026-04-01
+        access_count: 0
+        last_accessed: 2026-05-10
+        domain: fitness
+        ---
+        Body.
+        """,
+    )
+    result = compute_decay_coverage(
+        vault, today=_TODAY, activation_date=_ACTIVATION
+    )
+    assert result["total_decayed_notes"] == 1
+    assert result["decayed_accessed_in_window"] == 0
+    assert result["decay_coverage_pct"] == 0.0
+
+
+def test_decay_coverage_malformed_speaking_accessed_no_crash(
+    tmp_path: Path,
+) -> None:
+    """A malformed ``speaking_accessed_at`` value must not crash the
+    function — the parser returns ``None`` and the note is treated as
+    not-accessed. Locks in the ``except (ValueError, TypeError)`` branch
+    of :func:`_parse_speaking_accessed`."""
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "garbage-ts.md",
+        """
+        ---
+        slug: garbage-ts
+        created: 2026-04-01
+        access_count: 0
+        speaking_accessed_at: not-a-timestamp
+        domain: fitness
+        ---
+        Body.
+        """,
+    )
+    # The important assertion is that this call returns without raising.
+    result = compute_decay_coverage(
+        vault, today=_TODAY, activation_date=_ACTIVATION
+    )
+    assert result["total_decayed_notes"] == 1
+    assert result["decayed_accessed_in_window"] == 0
+    assert result["decay_coverage_pct"] == 0.0
 
 
 # ---------------------------------------------------------------------------
