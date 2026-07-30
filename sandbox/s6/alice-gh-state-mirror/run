@@ -11,6 +11,10 @@
 # floor 60s — same shape as alice-gh-watcher / alice-gh-reconciler.
 set -e
 
+# Bind-mounted alice source must be on PYTHONPATH so python -m alice_forge.gh_state_mirror
+# resolves. Same pattern as alice-index-rebuild, alice-speaking, alice-viewer.
+export PYTHONPATH=/home/alice/alice/src
+
 LOCK=/state/worker/gh-state-mirror.lock
 CONFIG_JSON=/home/alice/alice-mind/config/alice.config.json
 DEFAULT_INTERVAL=900
