@@ -256,13 +256,23 @@ def test_second_run_emits_only_new_events(
         mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
     )
 
+    # After task-0603, check_failure is a telemetry event routed to
+    # events.jsonl (not inner/notes/). Only the trusted PR-conversation
+    # comment lands as a note.
     notes = sorted((mind_dir / "inner" / "notes").glob("*.md"))
-    assert len(notes) == 2, [n.name for n in notes]
-    bodies = [p.read_text() for p in notes]
-    joined = "\n".join(bodies)
-    assert "tag: github" in joined
-    assert "I have concerns" in joined
-    assert "lint" in joined and "failure" in joined
+    assert len(notes) == 1, [n.name for n in notes]
+    note_body = notes[0].read_text()
+    assert "tag: github" in note_body
+    assert "I have concerns" in note_body
+
+    events_path = mind_dir / "memory" / "events.jsonl"
+    assert events_path.is_file(), "check_failure must land in events.jsonl"
+    lines = [json.loads(line) for line in events_path.read_text().splitlines() if line]
+    assert len(lines) == 1
+    assert lines[0]["type"] == "github_check_failure"
+    assert lines[0]["kind"] == "check_failure"
+    assert lines[0]["repo"] == "acme/widgets"
+    assert "lint" in lines[0]["body"] and "failure" in lines[0]["body"]
 
 
 def test_state_transition_emits_pr_state_event(
@@ -291,11 +301,18 @@ def test_state_transition_emits_pr_state_event(
         mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
     )
 
+    # After task-0603, pr_state is telemetry — no note, one events.jsonl line.
     notes = list((mind_dir / "inner" / "notes").glob("*.md"))
-    assert len(notes) == 1
-    body = notes[0].read_text()
-    assert "open → merged" in body
-    assert "Refactor" in body
+    assert notes == [], [n.name for n in notes]
+    events_path = mind_dir / "memory" / "events.jsonl"
+    assert events_path.is_file()
+    lines = [json.loads(line) for line in events_path.read_text().splitlines() if line]
+    assert len(lines) == 1
+    assert lines[0]["type"] == "github_pr_state"
+    assert lines[0]["kind"] == "pr_state"
+    assert lines[0]["repo"] == "acme/widgets"
+    assert "open → merged" in lines[0]["body"]
+    assert "Refactor" in lines[0]["body"]
 
 
 def test_disabled_or_empty_repos_is_noop(
@@ -1068,3 +1085,299 @@ def test_labeler_failure_does_not_block_new_issue_note(
     notes = list((mind_dir / "inner" / "notes").glob("*.md"))
     assert len(notes) == 1
     assert "Has to land" in notes[0].read_text()
+
+
+# ---------------------------------------------------------------------------
+# Telemetry vs. conversation routing (task-0603)
+#
+# High-volume, low-conversation telemetry (new_pr, pr_state, check_failure,
+# issue_state) is written to memory/events.jsonl. Conversation events
+# (review, review_comment, issue_comment, new_issue, standalone_issue_comment)
+# stay on the inner/notes/ pipeline so thinking sees them.
+# ---------------------------------------------------------------------------
+
+
+def _events_lines(mind: pathlib.Path) -> list[dict]:
+    """Read the events.jsonl telemetry log as a list of dict records."""
+    events_path = mind / "memory" / "events.jsonl"
+    if not events_path.is_file():
+        return []
+    return [
+        json.loads(line)
+        for line in events_path.read_text().splitlines()
+        if line.strip()
+    ]
+
+
+def test_new_pr_writes_to_events_not_notes(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    """A brand-new PR (unseen → open, after priming) must land in
+    events.jsonl as ``type == "github_new_pr"`` with no note file."""
+    api = FakeAPI()
+    api.pulls = []
+    gh_watcher.run(
+        mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
+    )
+
+    api.pulls = [_make_pr(number=101, title="Fresh PR")]
+    api.reviews[101] = []
+    api.review_comments[101] = []
+    api.pr_conversation_comments[101] = []
+    api.check_runs["deadbeef"] = []
+    gh_watcher.run(
+        mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
+    )
+
+    notes = list((mind_dir / "inner" / "notes").glob("*.md"))
+    assert notes == [], (
+        f"new_pr must NOT write inner/notes/, got {[n.name for n in notes]}"
+    )
+    lines = _events_lines(mind_dir)
+    assert len(lines) == 1
+    row = lines[0]
+    assert row["type"] == "github_new_pr"
+    assert row["kind"] == "new_pr"
+    assert row["repo"] == "acme/widgets"
+    assert row["ts"], "ts must be present"
+    # Timestamp is a parseable ISO-8601 with tz offset.
+    import datetime as _dt
+    assert _dt.datetime.fromisoformat(row["ts"]).utcoffset() is not None
+    assert row["body"].strip(), "body must not be empty"
+    assert "Fresh PR" in row["body"]
+
+
+def test_pr_state_writes_to_events_not_notes(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    """PR open → merged transition lands in events.jsonl, not inner/notes/."""
+    api = FakeAPI()
+    api.pulls = [_make_pr(number=7, title="Refactor")]
+    api.reviews[7] = []
+    api.review_comments[7] = []
+    api.pr_conversation_comments[7] = []
+    api.check_runs["deadbeef"] = []
+    gh_watcher.run(
+        mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
+    )
+
+    api.pulls = [
+        _make_pr(
+            number=7,
+            title="Refactor",
+            state="closed",
+            merged_at="2026-04-29T15:00:00Z",
+        )
+    ]
+    gh_watcher.run(
+        mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
+    )
+
+    notes = list((mind_dir / "inner" / "notes").glob("*.md"))
+    assert notes == [], [n.name for n in notes]
+    lines = _events_lines(mind_dir)
+    assert len(lines) == 1
+    row = lines[0]
+    assert row["type"] == "github_pr_state"
+    assert row["kind"] == "pr_state"
+    assert row["repo"] == "acme/widgets"
+    assert row["body"].strip()
+    assert "open → merged" in row["body"]
+
+
+def test_check_failure_writes_to_events_not_notes(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    """A CI failure on a PR head lands in events.jsonl, not inner/notes/."""
+    api = FakeAPI()
+    api.pulls = [_make_pr(number=8, title="CI dance")]
+    api.reviews[8] = []
+    api.review_comments[8] = []
+    api.pr_conversation_comments[8] = []
+    api.check_runs["deadbeef"] = []
+    gh_watcher.run(
+        mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
+    )
+
+    api.check_runs["deadbeef"] = [
+        {
+            "id": 9999,
+            "name": "pytest",
+            "status": "completed",
+            "conclusion": "failure",
+            "completed_at": "2026-04-29T15:00:00Z",
+            "html_url": "https://example.com/run/9999",
+            "output": {"summary": "3 tests failed"},
+        }
+    ]
+    gh_watcher.run(
+        mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
+    )
+
+    notes = list((mind_dir / "inner" / "notes").glob("*.md"))
+    assert notes == [], [n.name for n in notes]
+    lines = _events_lines(mind_dir)
+    assert len(lines) == 1
+    row = lines[0]
+    assert row["type"] == "github_check_failure"
+    assert row["kind"] == "check_failure"
+    assert row["repo"] == "acme/widgets"
+    assert row["body"].strip()
+    assert "pytest" in row["body"] and "failure" in row["body"]
+
+
+def test_issue_state_writes_to_events_not_notes(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    """Issue open → closed transition lands in events.jsonl, not inner/notes/."""
+    api = FakeAPI()
+    api.issues = [_make_issue(number=55, title="Track something", user="jcronq")]
+    api.issue_thread_comments[55] = []
+    gh_watcher.run(
+        mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
+    )
+
+    api.issues = [
+        _make_issue(
+            number=55, title="Track something", user="jcronq", state="closed"
+        )
+    ]
+    api.issue_thread_comments[55] = []
+    gh_watcher.run(
+        mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
+    )
+
+    notes = list((mind_dir / "inner" / "notes").glob("*.md"))
+    assert notes == [], [n.name for n in notes]
+    lines = _events_lines(mind_dir)
+    assert len(lines) == 1
+    row = lines[0]
+    assert row["type"] == "github_issue_state"
+    assert row["kind"] == "issue_state"
+    assert row["repo"] == "acme/widgets"
+    assert row["body"].strip()
+    assert "open → closed" in row["body"]
+
+
+def test_new_issue_writes_to_notes_not_events(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    """Regression guard: a new issue from a trusted author is a
+    conversation event — it stays on the inner/notes/ pipeline. No
+    events.jsonl line is written."""
+    api = FakeAPI()
+    api.issues = []
+    gh_watcher.run(
+        mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
+    )
+
+    api.issues = [_make_issue(number=71, title="Real bug", user="jcronq")]
+    api.issue_thread_comments[71] = []
+    gh_watcher.run(
+        mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
+    )
+
+    notes = list((mind_dir / "inner" / "notes").glob("*.md"))
+    assert len(notes) == 1
+    assert "Real bug" in notes[0].read_text()
+    assert _events_lines(mind_dir) == [], (
+        "new_issue is conversation, must NOT touch events.jsonl"
+    )
+
+
+def test_issue_comment_writes_to_notes_not_events(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    """Regression guard: PR-conversation comments stay in inner/notes/.
+    No events.jsonl line."""
+    api = FakeAPI()
+    api.pulls = [_make_pr(number=42, title="Under discussion")]
+    api.reviews[42] = []
+    api.review_comments[42] = []
+    api.pr_conversation_comments[42] = []
+    api.check_runs["deadbeef"] = []
+    gh_watcher.run(
+        mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
+    )
+
+    api.pr_conversation_comments[42] = [
+        {
+            "id": 7777,
+            "user": {"login": "jcronq"},
+            "body": "one more thought",
+            "author_association": "OWNER",
+            "created_at": "2026-04-29T12:00:00Z",
+            "html_url": "https://example.com/c/7777",
+        }
+    ]
+    gh_watcher.run(
+        mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
+    )
+
+    notes = list((mind_dir / "inner" / "notes").glob("*.md"))
+    assert len(notes) == 1
+    assert "one more thought" in notes[0].read_text()
+    assert _events_lines(mind_dir) == [], (
+        "issue_comment (PR conversation) is conversation, must NOT touch events.jsonl"
+    )
+
+
+def test_write_event_json_line_shape(tmp_path: pathlib.Path) -> None:
+    """Direct unit coverage: ``write_event`` appends one well-formed JSON
+    line per call, creates missing parent dirs, and merges ``extra`` into
+    the top-level record without clobbering the required fields."""
+    events_path = tmp_path / "nested" / "memory" / "events.jsonl"
+    assert not events_path.parent.exists()
+
+    gh_watcher.write_event(
+        events_path,
+        kind="new_pr",
+        body="hello world",
+        extra={"repo": "jcronq/alice", "number": 42, "url": "https://x/y/pull/42"},
+    )
+    gh_watcher.write_event(
+        events_path,
+        kind="pr_state",
+        body="open → merged",
+        extra={"repo": "jcronq/alice", "number": 42},
+    )
+
+    text = events_path.read_text()
+    lines = [json.loads(entry) for entry in text.splitlines() if entry]
+    assert len(lines) == 2
+
+    first, second = lines
+    assert first["type"] == "github_new_pr"
+    assert first["kind"] == "new_pr"
+    assert first["repo"] == "jcronq/alice"
+    assert first["number"] == 42
+    assert first["url"] == "https://x/y/pull/42"
+    assert first["body"] == "hello world"
+    assert first["ts"]
+
+    assert second["type"] == "github_pr_state"
+    assert second["kind"] == "pr_state"
+    assert second["body"] == "open → merged"
+
+
+def test_write_event_missing_repo_defaults_to_empty(tmp_path: pathlib.Path) -> None:
+    """No ``repo`` key in extra must not crash — it degrades to empty string
+    so the record stays schema-consistent."""
+    events_path = tmp_path / "events.jsonl"
+    gh_watcher.write_event(
+        events_path, kind="check_failure", body="ruff broke", extra=None
+    )
+    lines = [
+        json.loads(entry) for entry in events_path.read_text().splitlines() if entry
+    ]
+    assert len(lines) == 1
+    assert lines[0]["repo"] == ""
+    assert lines[0]["kind"] == "check_failure"
+    assert lines[0]["type"] == "github_check_failure"
+
+
+def test_telemetry_kinds_constant_matches_spec() -> None:
+    """Guardrail against accidental reroute of conversation events."""
+    assert gh_watcher.TELEMETRY_KINDS == frozenset(
+        {"new_pr", "pr_state", "check_failure", "issue_state"}
+    )
