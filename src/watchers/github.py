@@ -949,6 +949,62 @@ def write_note(
     return path
 
 
+# Telemetry event kinds — high-volume, low-conversation signal (new PRs,
+# PR state transitions, CI failures, issue open/close). These bypass the
+# inner/notes/ → thinking pipeline and land directly in events.jsonl so
+# the inbox stays focused on true conversation events (reviews, comments,
+# new issues) that actually want thinking's attention. See task-0603.
+TELEMETRY_KINDS = frozenset(
+    {"new_pr", "pr_state", "check_failure", "issue_state"}
+)
+
+
+def write_event(
+    events_path: pathlib.Path,
+    *,
+    kind: str,
+    body: str,
+    extra: dict | None = None,
+) -> None:
+    """Append one JSON line to ``events.jsonl`` for a telemetry event.
+
+    Line shape:
+
+        {"ts": <iso8601 with tz>, "type": "github_<kind>", "repo": <repo>,
+         "kind": <kind>, "body": <as-emitted>, ...extra}
+
+    Failures are logged to stderr and swallowed — this mirrors
+    ``write_note``'s posture (a broken events.jsonl write must not crash
+    the whole poll pass, which would prevent the state file save and
+    force a re-poll on the next cadence).
+    """
+    extra = dict(extra or {})
+    # Repo comes off extra so callers only pass it once; empty-string
+    # fallback keeps the record schema-consistent even in malformed
+    # call sites rather than crashing on KeyError.
+    repo = str(extra.pop("repo", "") or "")
+    record: dict[str, Any] = {
+        # Same timestamp idiom as stage_b._now_iso_tz — local-time
+        # ISO-8601 with offset, matching the events.jsonl convention
+        # produced by ``event-log`` and the memory worker.
+        "ts": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "type": f"github_{kind}",
+        "repo": repo,
+        "kind": kind,
+        "body": body,
+        **extra,
+    }
+    try:
+        events_path.parent.mkdir(parents=True, exist_ok=True)
+        with events_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        print(
+            f"[gh-watcher] failed to append event {kind} to {events_path}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def _write_auth_error_note(
     notes_dir: pathlib.Path,
     state: dict[str, Any],
@@ -1009,9 +1065,15 @@ def run(
         log("[gh-watcher] disabled or no repos configured — exiting clean")
         return 0
     notes_dir = mind_dir / "inner" / "notes"
+    # Telemetry sink for new_pr / pr_state / check_failure / issue_state.
+    # These skip the inner/notes/ pipeline entirely — thinking doesn't
+    # need to read every closed PR or CI failure, but a structured log
+    # is still useful for auditing / "when did X last happen" queries.
+    events_path = mind_dir / "memory" / "events.jsonl"
     state = load_state(state_path)
     repos_state = state.setdefault("repos", {})
     notes_written = 0
+    events_written = 0
     saw_auth_error = False
 
     for repo in cfg.repos:
@@ -1037,12 +1099,32 @@ def run(
             continue
         for event in events:
             slug, body = render_note(event)
-            path = write_note(notes_dir, slug, body)
-            notes_written += 1
-            log(f"[gh-watcher] {repo}: wrote {path.name} ({event.kind})")
+            if event.kind in TELEMETRY_KINDS:
+                write_event(
+                    events_path,
+                    kind=event.kind,
+                    body=body,
+                    extra={
+                        "repo": event.repo,
+                        "number": event.number,
+                        "title": event.title,
+                        "url": event.url,
+                    },
+                )
+                events_written += 1
+                log(
+                    f"[gh-watcher] {repo}: appended events.jsonl entry ({event.kind})"
+                )
+            else:
+                path = write_note(notes_dir, slug, body)
+                notes_written += 1
+                log(f"[gh-watcher] {repo}: wrote {path.name} ({event.kind})")
 
     save_state(state_path, state)
-    log(f"[gh-watcher] done — {notes_written} note(s) written")
+    log(
+        f"[gh-watcher] done — {notes_written} note(s), "
+        f"{events_written} event(s) written"
+    )
     return 1 if saw_auth_error else 0
 
 
