@@ -1238,6 +1238,112 @@ def test_recovery_state_active_burst_computes_structural_debt_delta(
 
 
 # ---------------------------------------------------------------------------
+# Recovery state: output_rate_slope R² significance gate (task-0607)
+# Mirrors the threshold convention used by structural_debt_trend and
+# tier_1_trend — noisy fits (R² < 0.7) get clipped to 0.0 rather than
+# propagating a meaningless direction into recovery classification.
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_state_output_slope_gated_when_r2_below_threshold(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Noisy counts (R² < 0.7) clip slope to 0.0."""
+    from metrics.vault_health import (
+        _STRUCTURAL_DEBT_TREND_R2_THRESHOLD,
+        _linear_regression_r_squared,
+    )
+
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    events = tmp_path / "events.jsonl"  # doesn't exist
+
+    noisy_counts = [7, 2, 8, 1, 9, 3, 6, 2, 8, 4]
+    # Verify the premise: this sequence really is R² < 0.7.
+    x_vals = [float(i) for i in range(len(noisy_counts))]
+    r2 = _linear_regression_r_squared(x_vals, [float(c) for c in noisy_counts])
+    assert r2 < _STRUCTURAL_DEBT_TREND_R2_THRESHOLD, (
+        f"test premise violated: noisy_counts fit R²={r2} >= threshold"
+    )
+
+    def _fake_slope(*_a, **_kw):
+        return {"slope": -2.32, "days": len(noisy_counts), "counts": noisy_counts}
+
+    monkeypatch.setattr(
+        "metrics.vault_health.count_output_rate_slope", _fake_slope
+    )
+
+    we = datetime.now()
+    ws = we - timedelta(days=14)
+    result = compute_recovery_state(
+        vault, thoughts, window_start=ws, window_end=we, events_path=events
+    )
+    assert result["output_rate_slope"] == 0.0
+
+
+def test_recovery_state_output_slope_passes_when_r2_above_threshold(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Clean linear counts (R² ≥ 0.7) pass the slope through unchanged."""
+    from metrics.vault_health import (
+        _STRUCTURAL_DEBT_TREND_R2_THRESHOLD,
+        _linear_regression_r_squared,
+    )
+
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    events = tmp_path / "events.jsonl"  # doesn't exist
+
+    clean_counts = [10, 9, 8, 7, 6]  # perfectly linear → R² = 1.0
+    x_vals = [float(i) for i in range(len(clean_counts))]
+    r2 = _linear_regression_r_squared(x_vals, [float(c) for c in clean_counts])
+    assert r2 >= _STRUCTURAL_DEBT_TREND_R2_THRESHOLD, (
+        f"test premise violated: clean_counts fit R²={r2} < threshold"
+    )
+
+    def _fake_slope(*_a, **_kw):
+        return {"slope": -1.0, "days": len(clean_counts), "counts": clean_counts}
+
+    monkeypatch.setattr(
+        "metrics.vault_health.count_output_rate_slope", _fake_slope
+    )
+
+    we = datetime.now()
+    ws = we - timedelta(days=14)
+    result = compute_recovery_state(
+        vault, thoughts, window_start=ws, window_end=we, events_path=events
+    )
+    assert result["output_rate_slope"] == -1.0
+
+
+def test_recovery_state_output_slope_gate_skipped_when_fewer_than_three_counts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Fewer than 3 counts → gate does NOT fire; original slope preserved."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    events = tmp_path / "events.jsonl"  # doesn't exist
+
+    def _fake_slope(*_a, **_kw):
+        # Only 2 counts — R² is undefined; the guard must skip the gate.
+        return {"slope": -3.0, "days": 2, "counts": [5, 1]}
+
+    monkeypatch.setattr(
+        "metrics.vault_health.count_output_rate_slope", _fake_slope
+    )
+
+    we = datetime.now()
+    ws = we - timedelta(days=14)
+    result = compute_recovery_state(
+        vault, thoughts, window_start=ws, window_end=we, events_path=events
+    )
+    assert result["output_rate_slope"] == -3.0
+
+
+# ---------------------------------------------------------------------------
 # Observation-only trend fields: [[recovery-classification-improvement]]
 # Additive fields (tier_1_trend, tier_1_trend_significance,
 # structural_debt_trend) computed from the last N vault_health events
