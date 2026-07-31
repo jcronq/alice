@@ -40,7 +40,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from indexer.build_index import _meta_built_at_and_count
@@ -2168,6 +2168,80 @@ def _trend_over_last_events(
     return slope, r_squared
 
 
+def _trend_over_last_events_by_date(
+    events: list[dict[str, Any]],
+    field_extractor: Callable[[dict[str, Any]], float | None],
+    n_days: int = _TREND_LOOKBACK_EVENTS,
+) -> tuple[float | None, float | None]:
+    """Slope + R² over the last ``n_days`` daily means.
+
+    Groups vault_health events by date, computes the mean of the
+    extracted field per date, then computes OLS slope + R² over
+    the daily means. This smooths intra-day rapid-fire event
+    clusters (e.g. state-machine transitions or scan retries)
+    that would otherwise dominate an event-indexed regression
+    and yield noisy structural-debt trend signals.
+
+    Returns ``(slope, r_squared)``. Both are ``None`` if fewer
+    than 3 daily means are available. R² is ``0.0`` for the
+    zero-variance case (all daily means identical).
+
+    See ``[[research/2026-07-28-structural-debt-trend-daily-mean-aggregation]]``
+    for the design rationale.
+    """
+    # Step 1: group by date
+    daily: dict[str, list[float]] = {}
+    for evt in events:
+        if evt.get("type") != "vault_health":
+            continue
+        evt_date = evt.get("date")
+        if not evt_date:
+            continue
+        raw = field_extractor(evt)
+        if raw is None:
+            continue
+        try:
+            daily.setdefault(evt_date, []).append(float(raw))
+        except (TypeError, ValueError):
+            continue
+
+    # Step 2: compute daily means
+    means: list[tuple[str, float]] = []
+    for date in sorted(daily.keys()):
+        vals = daily[date]
+        means.append((date, sum(vals) / len(vals)))
+
+    # Step 3: take last n_days
+    means = means[-n_days:]
+
+    # Step 4: OLS slope + R² over daily means
+    if len(means) < 3:
+        return None, None
+
+    x = list(range(len(means)))  # 0, 1, 2, ...
+    y = [m[1] for m in means]
+
+    n = len(x)
+    sum_x = sum(x)
+    sum_y = sum(y)
+    sum_xy = sum(xi * yi for xi, yi in zip(x, y))
+    sum_x2 = sum(xi * xi for xi in x)
+
+    denom = n * sum_x2 - sum_x * sum_x
+    if denom == 0:
+        return None, None
+
+    slope = (n * sum_xy - sum_x * sum_y) / denom
+    intercept = (sum_y - slope * sum_x) / n
+
+    ss_res = sum((yi - slope * xi - intercept) ** 2 for xi, yi in zip(x, y))
+    ss_tot = sum((yi - sum_y / n) ** 2 for yi in y)
+
+    r_squared = 1.0 - ss_res / ss_tot if ss_tot != 0 else 0.0
+
+    return slope, r_squared
+
+
 def compute_recovery_state(
     vault_dir: Path,
     thoughts_dir: Path,
@@ -2263,7 +2337,7 @@ def compute_recovery_state(
             # trend from an artifact of 10-event window composition — see
             # [[research/2026-07-27-structural-debt-trend-actionability]] for
             # the 2026-07-26 spike (slope 6.27 at R²=0.57) that motivated it.
-            burst_debt_trend, burst_debt_r2 = _trend_over_last_events(
+            burst_debt_trend, burst_debt_r2 = _trend_over_last_events_by_date(
                 events, _extract_recovery_debt_delta
             )
             # Compute structural_debt_delta during burst using the same
@@ -2490,7 +2564,7 @@ def compute_recovery_state(
         tier1_trend, tier1_trend_sig = _trend_over_last_events(
             trend_events, _extract_recovery_tier1_ratio
         )
-        debt_trend, debt_r2 = _trend_over_last_events(
+        debt_trend, debt_r2 = _trend_over_last_events_by_date(
             trend_events, _extract_recovery_debt_delta
         )
 
