@@ -29,7 +29,9 @@ import pytest
 from metrics.vault_health import (
     ADR_SCHEMA,
     DEFAULT_DECAY_SCORE_THRESHOLD,
+    _check_decay_coverage_spike,
     _last_event_has_same_state,
+    _read_last_vault_health_event,
     _sleep_window_closed,
     build_vault_health_event,
     compute_all_links_degree,
@@ -5079,6 +5081,257 @@ def test_last_event_has_same_state_no_vault_health_events(tmp_path: Path) -> Non
         "recovery_state": {"structural_debt_delta": -1.5},
     }
     assert _last_event_has_same_state(events, new_event, "2026-07-29") is False
+
+
+# ---------------------------------------------------------------------------
+# _read_last_vault_health_event — shared last-event reader (task-0611).
+# ---------------------------------------------------------------------------
+
+
+def test_read_last_vault_health_event_missing_file(tmp_path: Path) -> None:
+    """Non-existent events path → None (no throw)."""
+    assert _read_last_vault_health_event(tmp_path / "nope.jsonl") is None
+
+
+def test_read_last_vault_health_event_returns_most_recent(tmp_path: Path) -> None:
+    """Returns the last vault_health event, ignoring other event types."""
+    events = tmp_path / "events.jsonl"
+    events.parent.mkdir(parents=True, exist_ok=True)
+    with events.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "vault_health", "date": "2026-07-29", "n": 1}) + "\n")
+        fh.write(json.dumps({"type": "meal", "date": "2026-07-30"}) + "\n")
+        fh.write(json.dumps({"type": "vault_health", "date": "2026-07-30", "n": 2}) + "\n")
+        fh.write(json.dumps({"type": "workout", "date": "2026-07-30"}) + "\n")
+    last = _read_last_vault_health_event(events)
+    assert last is not None
+    assert last["date"] == "2026-07-30"
+    assert last["n"] == 2
+
+
+def test_read_last_vault_health_event_skips_malformed_lines(tmp_path: Path) -> None:
+    """Non-JSON lines are silently skipped; the last valid one wins."""
+    events = tmp_path / "events.jsonl"
+    events.parent.mkdir(parents=True, exist_ok=True)
+    with events.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "vault_health", "date": "2026-07-29"}) + "\n")
+        fh.write("this is not json\n")
+        fh.write("\n")  # blank
+        fh.write(json.dumps({"type": "vault_health", "date": "2026-07-30"}) + "\n")
+    last = _read_last_vault_health_event(events)
+    assert last is not None
+    assert last["date"] == "2026-07-30"
+
+
+def test_read_last_vault_health_event_no_vault_health_records(tmp_path: Path) -> None:
+    """Events file exists but has no vault_health records → None."""
+    events = tmp_path / "events.jsonl"
+    events.parent.mkdir(parents=True, exist_ok=True)
+    with events.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"type": "meal", "date": "2026-07-30"}) + "\n")
+    assert _read_last_vault_health_event(events) is None
+
+
+# ---------------------------------------------------------------------------
+# _check_decay_coverage_spike — flags large decay_coverage_pct swings
+# (task-0611: cortex-memory/research/
+# 2026-07-29-decay-coverage-spike-warning-implementation.md).
+# ---------------------------------------------------------------------------
+
+
+def _make_dc_event(pct: float, struct: float = 55.0, date: str = "2026-07-31") -> dict:
+    """Build a minimal vault_health event with a decay_coverage sub-dict."""
+    return {
+        "type": "vault_health",
+        "date": date,
+        "decay_coverage": {
+            "decay_coverage_pct": pct,
+            "decay_coverage_structural_pct": struct,
+        },
+    }
+
+
+def test_check_decay_coverage_spike_above_threshold_returns_warning() -> None:
+    """Historical 2026-07-29 case: 4.51 → 17.93 (Δ=13.42) fires the warning."""
+    last = _make_dc_event(4.51)
+    new = _make_dc_event(17.93)
+    warning = _check_decay_coverage_spike(last, new)
+    assert warning is not None
+    assert warning["decay_coverage_pct_spike"] is True
+    assert warning["spike_direction"] == "up"
+    assert warning["old_pct"] == 4.51
+    assert warning["new_pct"] == 17.93
+    assert warning["delta_pct_points"] == 13.42
+    assert "note" in warning
+    assert "decay_coverage_structural_pct" in warning["note"]
+
+
+def test_check_decay_coverage_spike_below_threshold_returns_none() -> None:
+    """Δ=2.0 pt < 5.0 pt default threshold → no warning."""
+    last = _make_dc_event(10.0)
+    new = _make_dc_event(12.0)
+    assert _check_decay_coverage_spike(last, new) is None
+
+
+def test_check_decay_coverage_spike_negative_direction_fires() -> None:
+    """Spikes-down are also window-boundary artifacts and must warn."""
+    last = _make_dc_event(20.0)
+    new = _make_dc_event(3.0)
+    warning = _check_decay_coverage_spike(last, new)
+    assert warning is not None
+    assert warning["spike_direction"] == "down"
+    assert warning["delta_pct_points"] == 17.0
+
+
+def test_check_decay_coverage_spike_missing_last_event_returns_none() -> None:
+    """First-ever vault_health event has nothing to compare against."""
+    new = _make_dc_event(50.0)
+    assert _check_decay_coverage_spike(None, new) is None
+
+
+def test_check_decay_coverage_spike_missing_key_on_either_side_returns_none() -> None:
+    """Missing decay_coverage sub-dict or decay_coverage_pct field → no crash."""
+    last = _make_dc_event(4.51)
+    # New event missing decay_coverage entirely.
+    new_no_dc = {"type": "vault_health", "date": "2026-07-31"}
+    assert _check_decay_coverage_spike(last, new_no_dc) is None
+    # New event has decay_coverage but no decay_coverage_pct.
+    new_partial_dc = {
+        "type": "vault_health",
+        "date": "2026-07-31",
+        "decay_coverage": {"decay_coverage_structural_pct": 55.0},
+    }
+    assert _check_decay_coverage_spike(last, new_partial_dc) is None
+    # Last event missing decay_coverage.
+    last_no_dc = {"type": "vault_health", "date": "2026-07-31"}
+    new = _make_dc_event(17.93)
+    assert _check_decay_coverage_spike(last_no_dc, new) is None
+
+
+def test_check_decay_coverage_spike_custom_threshold_respected() -> None:
+    """Passing threshold_pct_points=15.0 suppresses the historical 13.42 spike."""
+    last = _make_dc_event(4.51)
+    new = _make_dc_event(17.93)
+    assert _check_decay_coverage_spike(last, new, threshold_pct_points=15.0) is None
+
+
+def test_check_decay_coverage_spike_end_to_end_via_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """main() attaches decay_coverage_warning to the written event when spiked.
+
+    Seeds events.jsonl with a low-dcp vault_health event, then runs
+    vault_health_main under conditions that produce a spiking event, and
+    reads back the newly written event to confirm the warning field is
+    present with the correct shape.
+    """
+    events = tmp_path / "events.jsonl"
+    events.parent.mkdir(parents=True, exist_ok=True)
+    # Seed the last vault_health event with a low decay_coverage_pct.
+    prior = {
+        "type": "vault_health",
+        "date": "2026-07-30",
+        "orphan_notes": 25,
+        "broken_wikilinks": 23,
+        "recovery_state": {"structural_debt_delta": -1.5},
+        "decay_coverage": {
+            "decay_coverage_pct": 4.51,
+            "decay_coverage_structural_pct": 55.0,
+        },
+    }
+    with events.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps(prior) + "\n")
+
+    # Build the new event we want main() to write.
+    new_event = {
+        "type": "vault_health",
+        "date": "2026-07-31",
+        "orphan_notes": 30,  # different state — dedup won't fire
+        "broken_wikilinks": 24,
+        "recovery_state": {"structural_debt_delta": -0.5},
+        "decay_coverage": {
+            "decay_coverage_pct": 17.93,
+            "decay_coverage_structural_pct": 55.0,
+        },
+    }
+
+    # Patch build_vault_health_event so main() emits our synthetic event.
+    def _fake_build(*args, **kwargs):  # noqa: ARG001
+        return dict(new_event)
+
+    monkeypatch.setattr(
+        "metrics.vault_health.build_vault_health_event", _fake_build,
+    )
+    # Neutralize the standalone birth_signal branch — its module may
+    # need a real vault; we only care about the vault_health write path.
+    import metrics.birth_signal as bs_mod
+
+    monkeypatch.setattr(
+        bs_mod, "birth_signal_event_exists_for_date",
+        lambda *a, **k: True,
+    )
+
+    vault = tmp_path / "cortex-memory"
+    vault.mkdir()
+    (vault / "research").mkdir()
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+
+    rc = vault_health_main([
+        "--vault", str(vault),
+        "--thoughts", str(thoughts),
+        "--events", str(events),
+        "--append",
+        "--check-existing",
+    ])
+    assert rc == 0
+
+    # Last event in the file should be the newly written one with warning.
+    written = None
+    with events.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            evt = json.loads(line)
+            if evt.get("type") == "vault_health" and evt.get("date") == "2026-07-31":
+                written = evt
+    assert written is not None, "New vault_health event was not written"
+    assert "decay_coverage_warning" in written
+    warn = written["decay_coverage_warning"]
+    assert warn["decay_coverage_pct_spike"] is True
+    assert warn["spike_direction"] == "up"
+    assert warn["old_pct"] == 4.51
+    assert warn["new_pct"] == 17.93
+    assert warn["delta_pct_points"] == 13.42
+
+
+def test_last_event_has_same_state_accepts_preread_last_event(
+    tmp_path: Path,
+) -> None:
+    """Regression: main() may thread a pre-read last_event kwarg to skip re-scan.
+
+    Ensures the signature change (added ``last_event`` kwarg) is
+    backwards-compatible AND that a supplied last_event short-circuits
+    the internal file read.
+    """
+    events = tmp_path / "events.jsonl"
+    # File does NOT exist — proves the pre-read kwarg wins over the
+    # internal file scan (which would have returned False on missing).
+    preread = {
+        "type": "vault_health",
+        "date": "2026-07-29",
+        "orphan_notes": 25,
+        "broken_wikilinks": 23,
+        "recovery_state": {"structural_debt_delta": -1.5},
+    }
+    new_event = {
+        "orphan_notes": 25,
+        "broken_wikilinks": 23,
+        "recovery_state": {"structural_debt_delta": -1.5},
+    }
+    assert _last_event_has_same_state(
+        events, new_event, "2026-07-29", last_event=preread,
+    ) is True
 
 
 # ---------------------------------------------------------------------------
