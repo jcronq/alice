@@ -21,6 +21,7 @@ import time
 from datetime import datetime, timedelta, timezone as _tz_module
 from pathlib import Path
 from textwrap import dedent
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -5078,3 +5079,228 @@ def test_last_event_has_same_state_no_vault_health_events(tmp_path: Path) -> Non
         "recovery_state": {"structural_debt_delta": -1.5},
     }
     assert _last_event_has_same_state(events, new_event, "2026-07-29") is False
+
+
+# ---------------------------------------------------------------------------
+# _trend_over_last_events_by_date — daily-mean aggregation for structural debt
+# See research/2026-07-28-structural-debt-trend-daily-mean-aggregation.md
+# ---------------------------------------------------------------------------
+
+
+def _make_vault_health_event(date: str, debt: float) -> dict[str, Any]:
+    return {
+        "type": "vault_health",
+        "date": date,
+        "structural_debt_delta": debt,
+    }
+
+
+def test_trend_over_last_events_by_date_smooths_intra_day_noise() -> None:
+    """5 prior days at 16 + 6 events same day [16, 16, 16, 16, 16, 48].
+
+    Daily means: [16, 16, 16, 16, 16, ~21.3]. Trend exists (one spike at
+    the end) but R² should be modest — not the near-perfect linear trend
+    the old event-indexed regression would produce from raw rapid-fire.
+    """
+    from metrics.vault_health import _trend_over_last_events_by_date
+
+    events = []
+    for i in range(5):
+        d = f"2026-07-{22 + i:02d}"
+        events.append(_make_vault_health_event(d, 16))
+    for _ in range(5):
+        events.append(_make_vault_health_event("2026-07-27", 16))
+    events.append(_make_vault_health_event("2026-07-27", 48))
+
+    slope, r2 = _trend_over_last_events_by_date(
+        events, lambda e: e.get("structural_debt_delta")
+    )
+    assert slope is not None
+    assert r2 is not None
+    assert r2 < 0.90
+
+
+def test_trend_over_last_events_by_date_detects_real_trend() -> None:
+    """Daily means [10, 12, ..., 28] → slope ≈ 2.0, R² ≈ 1.0."""
+    from metrics.vault_health import _trend_over_last_events_by_date
+
+    events = []
+    for i in range(10):
+        d = f"2026-07-{i + 1:02d}"
+        events.append(_make_vault_health_event(d, 10 + 2 * i))
+
+    slope, r2 = _trend_over_last_events_by_date(
+        events, lambda e: e.get("structural_debt_delta")
+    )
+    assert slope is not None
+    assert r2 is not None
+    assert abs(slope - 2.0) < 0.01
+    assert r2 > 0.99
+
+
+def test_trend_over_last_events_by_date_insufficient_days() -> None:
+    """2 distinct days → (None, None) — below the 3-point threshold."""
+    from metrics.vault_health import _trend_over_last_events_by_date
+
+    events = [
+        _make_vault_health_event("2026-07-27", 16),
+        _make_vault_health_event("2026-07-28", 20),
+    ]
+
+    slope, r2 = _trend_over_last_events_by_date(
+        events, lambda e: e.get("structural_debt_delta")
+    )
+    assert slope is None
+    assert r2 is None
+
+
+def test_trend_over_last_events_by_date_skips_non_vault_health_events() -> None:
+    """Non vault_health events must be filtered out before aggregation."""
+    from metrics.vault_health import _trend_over_last_events_by_date
+
+    events = [
+        _make_vault_health_event("2026-07-26", 10),
+        {"type": "meal", "date": "2026-07-27"},
+        _make_vault_health_event("2026-07-27", 12),
+        _make_vault_health_event("2026-07-28", 14),
+    ]
+
+    slope, r2 = _trend_over_last_events_by_date(
+        events, lambda e: e.get("structural_debt_delta")
+    )
+    assert slope is not None
+    assert abs(slope - 2.0) < 0.01
+
+
+def test_trend_over_last_events_by_date_null_field_values_skipped() -> None:
+    """Events with null/missing field don't break aggregation."""
+    from metrics.vault_health import _trend_over_last_events_by_date
+
+    events = [
+        _make_vault_health_event("2026-07-26", 10),
+        {"type": "vault_health", "date": "2026-07-27"},  # missing field
+        _make_vault_health_event("2026-07-27", 12),
+        _make_vault_health_event("2026-07-28", 14),
+    ]
+
+    slope, r2 = _trend_over_last_events_by_date(
+        events, lambda e: e.get("structural_debt_delta")
+    )
+    # 2026-07-27 mean = 12/1 = 12 (null skipped) → daily means [10, 12, 14]
+    assert slope is not None
+    assert abs(slope - 2.0) < 0.01
+
+
+def test_trend_over_last_events_by_date_zero_variance() -> None:
+    """All daily means identical → slope=0.0, R²=0.0 (not NaN)."""
+    from metrics.vault_health import _trend_over_last_events_by_date
+
+    events = [
+        _make_vault_health_event("2026-07-25", 16),
+        _make_vault_health_event("2026-07-26", 16),
+        _make_vault_health_event("2026-07-27", 16),
+        _make_vault_health_event("2026-07-28", 16),
+    ]
+
+    slope, r2 = _trend_over_last_events_by_date(
+        events, lambda e: e.get("structural_debt_delta")
+    )
+    assert slope is not None
+    assert slope == 0.0
+    assert r2 is not None
+    assert r2 == 0.0
+
+
+def test_trend_over_last_events_by_date_date_gaps() -> None:
+    """Date gaps don't affect slope — x-axis is index, not calendar."""
+    from metrics.vault_health import _trend_over_last_events_by_date
+
+    events = [
+        _make_vault_health_event("2026-07-25", 10),
+        _make_vault_health_event("2026-07-27", 12),  # gap: no 07-26
+        _make_vault_health_event("2026-07-28", 14),
+    ]
+
+    slope, r2 = _trend_over_last_events_by_date(
+        events, lambda e: e.get("structural_debt_delta")
+    )
+    assert slope is not None
+    assert abs(slope - 2.0) < 0.01
+    assert r2 is not None
+    assert abs(r2 - 1.0) < 0.01
+
+
+def test_trend_over_last_events_by_date_exceeds_n_days() -> None:
+    """Only the last n_days days are used; earlier data ignored."""
+    from metrics.vault_health import _trend_over_last_events_by_date
+
+    events = []
+    for i in range(15):
+        d = f"2026-07-{i + 1:02d}"
+        events.append(_make_vault_health_event(d, 10 + i))
+
+    # Default n_days = _TREND_LOOKBACK_EVENTS = 10 → last 10 values [15..24]
+    slope, r2 = _trend_over_last_events_by_date(
+        events, lambda e: e.get("structural_debt_delta")
+    )
+    assert slope is not None
+    assert abs(slope - 1.0) < 0.01
+    assert r2 is not None
+    assert abs(r2 - 1.0) < 0.01
+
+
+def test_compute_recovery_state_uses_daily_mean_trend(tmp_path: Path) -> None:
+    """End-to-end wiring: compute_recovery_state must consume the new
+    daily-mean function. 5 events on the same last day with mixed
+    deltas collapse to a single daily-mean data point, so the trend
+    reflects only the cross-day movement — not the intra-day
+    scan-clatter the event-indexed regression would amplify.
+    """
+    from metrics.vault_health import compute_recovery_state
+
+    vault_dir = tmp_path / "vault"
+    vault_dir.mkdir()
+    thoughts_dir = tmp_path / "thoughts"
+    thoughts_dir.mkdir()
+    events_path = tmp_path / "events.jsonl"
+
+    lines: list[dict[str, Any]] = []
+    # 4 prior days, one event each, structural_debt_delta = 0.0
+    for i in range(4):
+        d = f"2026-07-{22 + i:02d}"
+        lines.append(
+            {
+                "type": "vault_health",
+                "date": d,
+                "recovery_state": {"structural_debt_delta": 0.0},
+            }
+        )
+    # Last day: 5 events with varying deltas → daily mean = 6.0
+    for delta in [0.0, 5.0, 10.0, 5.0, 10.0]:
+        lines.append(
+            {
+                "type": "vault_health",
+                "date": "2026-07-26",
+                "recovery_state": {"structural_debt_delta": delta},
+            }
+        )
+    with events_path.open("w", encoding="utf-8") as fh:
+        for row in lines:
+            fh.write(json.dumps(row) + "\n")
+
+    we = datetime(2026, 7, 26, 12, 0, 0)
+    ws = we - timedelta(days=14)
+    rs = compute_recovery_state(
+        vault_dir,
+        thoughts_dir,
+        window_start=ws,
+        window_end=we,
+        events_path=events_path,
+    )
+
+    # Wiring check: fields present and populated
+    assert "structural_debt_trend" in rs
+    assert "structural_debt_trend_actionable" in rs
+    # Daily means [0, 0, 0, 0, 6] → OLS slope = 1.2
+    assert rs["structural_debt_trend"] is not None
+    assert abs(rs["structural_debt_trend"] - 1.2) < 0.01
