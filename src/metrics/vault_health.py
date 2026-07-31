@@ -2337,6 +2337,16 @@ def compute_recovery_state(
     output = count_output_rate_slope(vault_dir, window_start=ws, window_end=we)
     slope = output.get("slope", 0.0)
     slope_total_notes = sum(output.get("counts", []) or [])
+    # R² significance gate — mirrors the threshold convention used by
+    # structural_debt_trend and tier_1_trend. If the slope's fit is noisy
+    # (R² < 0.7), treat as zero rather than propagating a meaningless direction
+    # into recovery classification.
+    counts = output.get("counts", [])
+    if len(counts) >= 3:
+        x_vals = [float(i) for i in range(len(counts))]
+        slope_r2 = _linear_regression_r_squared(x_vals, [float(c) for c in counts])
+        if slope_r2 < _STRUCTURAL_DEBT_TREND_R2_THRESHOLD:
+            slope = 0.0
 
     # 3. Structural debt delta
     debt_delta = 0
