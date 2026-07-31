@@ -3199,8 +3199,49 @@ def _append_event(events_path: Path, event: dict[str, Any]) -> None:
         fh.write(line + "\n")
 
 
+def _read_last_vault_health_event(events_path: Path) -> dict[str, Any] | None:
+    """Return the most recent ``vault_health`` event dict, or ``None``.
+
+    Reads ``events.jsonl`` end-to-end and returns the last line whose
+    ``type`` is ``"vault_health"``. Malformed / non-JSON lines are
+    silently skipped. Missing file or ``OSError`` returns ``None``.
+
+    Shared by both:
+      - ``_last_event_has_same_state`` — for rapid-fire dedup.
+      - ``_check_decay_coverage_spike`` — for spike-warning attachment
+        (task-0611, ``cortex-memory/research/
+        2026-07-29-decay-coverage-spike-warning-implementation.md``).
+
+    Consolidating the read into one helper means ``main()`` can call it
+    once per cycle and thread the result into both consumers, avoiding
+    a second full-file scan.
+    """
+    if not events_path.exists():
+        return None
+    try:
+        with events_path.open("r", encoding="utf-8") as fh:
+            last = None
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if evt.get("type") == "vault_health":
+                    last = evt
+            return last
+    except OSError:
+        return None
+
+
 def _last_event_has_same_state(
-    events_path: Path, new_event: dict, today_str: str,
+    events_path: Path,
+    new_event: dict,
+    today_str: str,
+    *,
+    last_event: dict[str, Any] | None = None,
 ) -> bool:
     """True if the last vault_health event is same-day *and* identical state.
 
@@ -3224,40 +3265,97 @@ def _last_event_has_same_state(
       - broken_wikilinks      — link integrity count
       - structural_debt_delta — net debt change (inside recovery_state)
 
+    ``last_event`` is an optional pre-read record — supplied by callers
+    that already loaded the last vault_health event via
+    ``_read_last_vault_health_event`` — so this function can skip its own
+    file scan. When ``None``, the function reads the file itself
+    (backwards-compatible with existing callers and tests).
+
     See: 2026-07-28-intraday-rapid-fire-cluster-impact (29.8 % slope
     distortion from 11 same-state events across 6 clusters).
     """
-    if not events_path.exists():
+    if last_event is None:
+        last = _read_last_vault_health_event(events_path)
+    else:
+        last = last_event
+    if last is None:
         return False
+    # Same-day precondition: dedup applies only to today's cluster.
+    # A same-state match against a prior-day event is a fresh daily
+    # snapshot, not a duplicate — record it.
+    if last.get("date") != today_str:
+        return False
+    new_rs = new_event.get("recovery_state", {})
+    old_rs = last.get("recovery_state", {})
+    return (
+        last.get("orphan_notes") == new_event.get("orphan_notes")
+        and last.get("broken_wikilinks") == new_event.get("broken_wikilinks")
+        and old_rs.get("structural_debt_delta") == new_rs.get("structural_debt_delta")
+    )
+
+
+def _check_decay_coverage_spike(
+    last_event: dict[str, Any] | None,
+    new_event: dict[str, Any],
+    threshold_pct_points: float = 5.0,
+) -> dict[str, Any] | None:
+    """Return a warning dict if ``decay_coverage_pct`` spiked ≥ threshold.
+
+    ``decay_coverage_pct`` — the percentage of the decayed pool touched
+    within the 14-day access window — is emitted inside the
+    ``decay_coverage`` sub-dict of every ``vault_health`` event. It is
+    known to be noisy: a small window-position shift can cause a large
+    swing (e.g. 4.51 % → 17.93 % on 2026-07-29 from a 2 h 40 min window
+    boundary drift; see ``cortex-memory/research/
+    2026-07-29-decay-coverage-spike-analysis.md``).
+
+    When the absolute point-difference between the previous and new
+    events' ``decay_coverage_pct`` values crosses ``threshold_pct_points``
+    (default 5.0 — chosen to catch the 13.42 pt historical spike while
+    ignoring the ±1–2 pt day-to-day noise; empirically ~6.7 % of adjacent
+    event pairs trip this bar), return a warning dict so downstream
+    consumers (active-ideas task generator, dashboards) can treat the
+    metric as suspect. Otherwise return ``None``.
+
+    Returns ``None`` (never raises) when:
+      - ``last_event`` is ``None`` (first-ever vault_health event),
+      - either side lacks a ``decay_coverage.decay_coverage_pct`` field.
+
+    The warning does not suppress or otherwise alter the event; it is
+    attached as an additive ``decay_coverage_warning`` field by
+    ``main()``. See ``cortex-memory/research/
+    2026-07-29-decay-coverage-spike-warning-implementation.md`` for the
+    full design.
+    """
+    if last_event is None:
+        return None
+    new_dc = new_event.get("decay_coverage") or {}
+    old_dc = last_event.get("decay_coverage") or {}
+    new_pct = new_dc.get("decay_coverage_pct")
+    old_pct = old_dc.get("decay_coverage_pct")
+    if new_pct is None or old_pct is None:
+        return None
     try:
-        with events_path.open("r", encoding="utf-8") as fh:
-            last = None
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    evt = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if evt.get("type") == "vault_health":
-                    last = evt
-            if last is None:
-                return False
-        # Same-day precondition: dedup applies only to today's cluster.
-        # A same-state match against a prior-day event is a fresh daily
-        # snapshot, not a duplicate — record it.
-        if last.get("date") != today_str:
-            return False
-        new_rs = new_event.get("recovery_state", {})
-        old_rs = last.get("recovery_state", {})
-        return (
-            last.get("orphan_notes") == new_event.get("orphan_notes")
-            and last.get("broken_wikilinks") == new_event.get("broken_wikilinks")
-            and old_rs.get("structural_debt_delta") == new_rs.get("structural_debt_delta")
-        )
-    except OSError:
-        return False
+        delta = abs(float(new_pct) - float(old_pct))
+    except (TypeError, ValueError):
+        return None
+    if delta < threshold_pct_points:
+        return None
+    direction = "up" if new_pct > old_pct else "down"
+    structural_pct = new_dc.get("decay_coverage_structural_pct")
+    return {
+        "decay_coverage_pct_spike": True,
+        "spike_direction": direction,
+        "old_pct": old_pct,
+        "new_pct": new_pct,
+        "delta_pct_points": round(delta, 2),
+        "note": (
+            f"decay_coverage_pct changed {delta:.1f}pts "
+            f"({old_pct}% → {new_pct}%) — likely window-position artifact. "
+            f"Use decay_coverage_structural_pct ({structural_pct}%) "
+            f"as the primary health indicator."
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -4063,6 +4161,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
             if args.append:
+                # Read the last vault_health event once — shared by the
+                # same-state dedup guard AND the decay-coverage spike
+                # check (task-0611). One file scan per cycle.
+                last_event = _read_last_vault_health_event(args.events)
+
                 # State dedup: skip if the last event is same-day AND has
                 # identical core state.  Catches rapid-fire invocations
                 # where the vault hasn't changed between scans within a
@@ -4071,7 +4174,9 @@ def main(argv: list[str] | None = None) -> int:
                 # Same-day precondition inside the helper prevents a
                 # cross-day state match from silently skipping today's
                 # snapshot.
-                if _last_event_has_same_state(args.events, event, today_str):
+                if _last_event_has_same_state(
+                    args.events, event, today_str, last_event=last_event,
+                ):
                     sys.stderr.write(
                         f"vault_health: last event today has identical core state "
                         f"(orphans={event['orphan_notes']}, broken={event['broken_wikilinks']}, "
@@ -4079,6 +4184,25 @@ def main(argv: list[str] | None = None) -> int:
                         f"— skipping duplicate write\n"
                     )
                 else:
+                    # Attach a spike warning if decay_coverage_pct
+                    # shifted ≥5 pt between the previous and current
+                    # events. Warning is additive and does not suppress
+                    # the write. See cortex-memory/research/
+                    # 2026-07-29-decay-coverage-spike-warning-implementation.md
+                    spike = _check_decay_coverage_spike(last_event, event)
+                    if spike is not None:
+                        event["decay_coverage_warning"] = spike
+                        sys.stderr.write(
+                            f"vault_health: decay_coverage_pct spike detected "
+                            f"({spike['old_pct']}% → {spike['new_pct']}%, "
+                            f"Δ={spike['delta_pct_points']}pt, "
+                            f"direction={spike['spike_direction']}) — "
+                            f"see decay_coverage_warning field\n"
+                        )
+                        logger.warning(
+                            "vault_health: decay_coverage_pct spike: %s",
+                            spike["note"],
+                        )
                     _append_event(args.events, event)
 
                 # Standalone birth_signal event — per spec
