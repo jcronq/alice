@@ -84,6 +84,34 @@ def test_classify_default_is_bucket1():
 
 
 # ---------------------------------------------------------------------------
+# canonical-reference scaffolding (task-0613)
+#
+# Scaffolding-at-1.0 lands the tag → boost wiring while BUCKET2_BOOST stays at
+# 1.0 (identity), so no live retrieval behavior changes yet. These tests lock
+# the tag-set membership and the tag→boost path so a future BUCKET2_BOOST bump
+# (gated on the 72-query retrieval eval) doesn't silently skip canonical-
+# reference notes.
+
+
+def test_canonical_reference_tag_is_in_bucket2_tags():
+    assert "canonical-reference" in cue_runner._BUCKET2_TAGS
+
+
+def test_classify_canonical_reference_tagged_note_gets_bucket2_boost():
+    assert classify_note("research", ["canonical-reference"]) == BUCKET2_BOOST
+    assert classify_note("reference", ["canonical-reference"]) == BUCKET2_BOOST
+    # Mixed with an unrelated tag — the canonical-reference match is enough.
+    assert classify_note("research", ["random-tag", "canonical-reference"]) == BUCKET2_BOOST
+
+
+def test_classify_untagged_note_does_not_get_bucket2_boost():
+    # Regression guard for the tag-set lookup logic: notes without any
+    # BUCKET2 tag fall through to BUCKET1_BOOST, not BUCKET2_BOOST.
+    assert classify_note("research", ["random-tag"]) == BUCKET1_BOOST
+    assert classify_note("reference", ["some-other-tag"]) == BUCKET1_BOOST
+
+
+# ---------------------------------------------------------------------------
 # _tokenize_query
 
 

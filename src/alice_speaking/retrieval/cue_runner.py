@@ -162,6 +162,10 @@ FITNESS_RECENCY_COEFFICIENT = 0.4
 FITNESS_RECENCY_CAP = 100
 
 _STATE_TYPES = {"daily", "state-snapshot", "skill"}
+# Scaffolding for canonical-reference hub-note preservation (task-0613).
+# BUCKET2_BOOST intentionally stays at 1.0 = identity multiplication = no live
+# behavior change. Bump to 1.1 gated on 72-query retrieval eval (see design
+# note 2026-07-31-canonical-reference-tag-design.md).
 _BUCKET2_TAGS = {
     "cozyhem",
     "alice-architecture",
@@ -169,6 +173,7 @@ _BUCKET2_TAGS = {
     "strix-halo",
     "alice-thinking",
     "alice-speaking",
+    "canonical-reference",
 }
 
 # Over-fetch ceiling before boost + final cut. Brief §New module step 2.
