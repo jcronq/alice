@@ -231,6 +231,42 @@ def test_note_metrics_seeded_from_frontmatter_speaking_accessed_at(
     )
 
 
+def test_note_metrics_seeded_from_frontmatter_last_queried(
+    tmp_path: pathlib.Path,
+):
+    """``last_queried`` must round-trip from frontmatter into the seeded
+    ``note_metrics`` row on rebuild — same symmetry as ``access_count``
+    and ``speaking_accessed_at``. Without this, the DB column resets to
+    NULL on every rebuild, wiping every write the cue runner (PR #577 /
+    task-0538) makes on retrieval. Missing frontmatter → NULL. See
+    task-0622 / ``[[2026-08-03-last-queried-root-cause]]``."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "queried.md").write_text(
+        "---\ntitle: Queried\nlast_queried: 2026-08-03T12:00:00\n---\n\nBody.\n"
+    )
+    (vault / "unqueried.md").write_text(
+        "---\ntitle: Unqueried\n---\n\nBody.\n"
+    )
+
+    db_path = tmp_path / "index.db"
+    build(vault, db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = dict(conn.execute("SELECT slug, last_queried FROM note_metrics"))
+    finally:
+        conn.close()
+
+    assert rows["queried"] == "2026-08-03T12:00:00", (
+        f"expected frontmatter value to round-trip, got {rows.get('queried')!r}"
+    )
+    assert rows["unqueried"] is None, (
+        "missing frontmatter key must seed NULL, got "
+        f"{rows.get('unqueried')!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Regression: slug collisions on deep folders + meta-based staleness check.
 # Both bugs combined to silently drop 423 notes from FTS over 6 days in
