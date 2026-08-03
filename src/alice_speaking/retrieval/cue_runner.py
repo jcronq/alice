@@ -328,6 +328,15 @@ _LAST_ACCESSED_RE = re.compile(r"^last_accessed:\s*[^\n]*$", re.MULTILINE)
 _SPEAKING_ACCESSED_AT_RE = re.compile(
     r"^speaking_accessed_at:\s*[^\n]*$", re.MULTILINE
 )
+# `last_queried` was a schema ghost until task-0538: the column existed in
+# note_metrics but no writer touched it, so 5,971/5,971 rows carried the
+# literal string "None" from the indexer's NULL seed. The cue runner now
+# writes this column on every retrieval bump so recency-based analysis can
+# slice on it. Frontmatter mirror parallels `speaking_accessed_at` so an
+# index rebuild that reads frontmatter will not wipe recent bumps.
+_LAST_QUERIED_RE = re.compile(
+    r"^last_queried:\s*[^\n]*$", re.MULTILINE
+)
 # Captures the date value (YYYY-MM-DD prefix) from a `last_accessed:` line.
 # Tolerates trailing time / timezone (e.g. `2026-05-19 12:38 EDT`) — only the
 # leading ISO date is required for the 7-day window check.
@@ -613,6 +622,15 @@ async def _bump_access(
             )
         else:
             new_fm = new_fm.rstrip() + f"\nspeaking_accessed_at: {now_ts}"
+        # Mirror `last_queried` the same way (task-0538). Same `now_ts` so
+        # both columns share a timestamp per bump — a downstream analyst
+        # comparing the two doesn't see spurious sub-second skew.
+        if _LAST_QUERIED_RE.search(new_fm):
+            new_fm = _LAST_QUERIED_RE.sub(
+                f"last_queried: {now_ts}", new_fm, count=1
+            )
+        else:
+            new_fm = new_fm.rstrip() + f"\nlast_queried: {now_ts}"
         new_text = "---\n" + new_fm + "\n---\n" + text[fm_match.end() :]
         try:
             path.write_text(new_text, encoding="utf-8")
@@ -635,11 +653,12 @@ async def _bump_access(
             # (rare — the indexer seeds every slug — but defensive).
             conn.execute(
                 """
-                INSERT INTO note_metrics(slug, access_count, speaking_accessed_at)
-                VALUES(?, 1, datetime('now'))
+                INSERT INTO note_metrics(slug, access_count, speaking_accessed_at, last_queried)
+                VALUES(?, 1, datetime('now'), datetime('now'))
                 ON CONFLICT(slug) DO UPDATE SET
                     access_count = access_count + 1,
-                    speaking_accessed_at = datetime('now')
+                    speaking_accessed_at = datetime('now'),
+                    last_queried = datetime('now')
                 """,
                 (target_slug,),
             )

@@ -880,6 +880,139 @@ async def test_bump_access_updates_existing_speaking_accessed_at(
 
 
 # ---------------------------------------------------------------------------
+# last_queried writer (task-0538)
+#
+# The column existed in the schema but no code path wrote to it — the
+# indexer seeded NULL and the cue runner never touched it, leaving 5,971
+# rows with the literal "None" string. These tests cover the writer that
+# closes the schema-ghost: `_do_bump` mirrors last_queried into
+# frontmatter (parallel to speaking_accessed_at) and `_do_db_bump`
+# populates the DB column via INSERT ... ON CONFLICT.
+
+
+@pytest.mark.asyncio
+async def test_bump_access_appends_last_queried_to_frontmatter(
+    tmp_path: pathlib.Path,
+):
+    """Missing key -> append. The value must parse as an ISO datetime with
+    second precision, matching the speaking_accessed_at contract."""
+    note = tmp_path / "n.md"
+    note.write_text("---\ntitle: N\naccess_count: 0\n---\nbody\n")
+
+    await _bump_access(tmp_path, "n.md")
+
+    text = note.read_text()
+    import re
+
+    m = re.search(r"^last_queried:\s*(\S+)\s*$", text, re.MULTILINE)
+    assert m is not None, f"last_queried missing from frontmatter: {text!r}"
+    parsed = datetime.datetime.fromisoformat(m.group(1))
+    assert parsed.microsecond == 0, (
+        f"expected second-precision timestamp, got microsecond={parsed.microsecond}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_bump_access_updates_existing_last_queried(
+    tmp_path: pathlib.Path,
+):
+    """When last_queried is already present, the bump must replace it in
+    place (not append a duplicate line)."""
+    note = tmp_path / "n.md"
+    note.write_text(
+        "---\ntitle: N\naccess_count: 0\n"
+        "last_queried: 2020-01-01T00:00:00\n---\nbody\n"
+    )
+
+    await _bump_access(tmp_path, "n.md")
+
+    text = note.read_text()
+    lines = [ln for ln in text.splitlines() if ln.startswith("last_queried:")]
+    assert len(lines) == 1, f"expected 1 last_queried line, got {lines}"
+    assert "2020-01-01T00:00:00" not in lines[0]
+
+
+@pytest.mark.asyncio
+async def test_bump_access_last_queried_and_speaking_accessed_at_share_timestamp(
+    tmp_path: pathlib.Path,
+):
+    """Both frontmatter mirrors must use the same ``now_ts`` so downstream
+    consumers comparing the two columns don't see spurious sub-second
+    skew. Regression guard for the shared-variable refactor."""
+    note = tmp_path / "n.md"
+    note.write_text("---\ntitle: N\naccess_count: 0\n---\nbody\n")
+
+    await _bump_access(tmp_path, "n.md")
+
+    text = note.read_text()
+    import re
+
+    sa = re.search(r"^speaking_accessed_at:\s*(\S+)\s*$", text, re.MULTILINE)
+    lq = re.search(r"^last_queried:\s*(\S+)\s*$", text, re.MULTILINE)
+    assert sa is not None and lq is not None
+    assert sa.group(1) == lq.group(1), (
+        f"expected identical timestamps, got speaking_accessed_at={sa.group(1)!r} "
+        f"last_queried={lq.group(1)!r}"
+    )
+
+
+def _read_db_last_queried(db: pathlib.Path, slug: str) -> str | None:
+    conn = sqlite3.connect(str(db))
+    try:
+        row = conn.execute(
+            "SELECT last_queried FROM note_metrics WHERE slug = ?", (slug,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return None if row is None else row[0]
+
+
+@pytest.mark.asyncio
+async def test_bump_access_writes_last_queried_to_db_on_update(
+    tmp_path: pathlib.Path,
+):
+    """When the row already exists (indexer seeded NULL), the UPDATE
+    branch of the upsert must populate last_queried with a real
+    ``datetime('now')`` value -- replacing the seeded NULL."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    note = vault / "n.md"
+    note.write_text("---\ntitle: N\naccess_count: 0\n---\nbody\n")
+    db = tmp_path / "cortex-index.db"
+    _make_metrics_db(db, ["n"])
+    # Pre-condition: seeded row has NULL last_queried.
+    assert _read_db_last_queried(db, "n") is None
+
+    await _bump_access(vault, "n.md", db_path=db, slug="n")
+
+    lq = _read_db_last_queried(db, "n")
+    assert lq is not None and lq != "", f"last_queried not populated: {lq!r}"
+    # Value must be parseable as an ISO datetime (sqlite's datetime('now')
+    # emits `YYYY-MM-DD HH:MM:SS`).
+    datetime.datetime.strptime(lq, "%Y-%m-%d %H:%M:%S")
+
+
+@pytest.mark.asyncio
+async def test_bump_access_writes_last_queried_to_db_on_insert(
+    tmp_path: pathlib.Path,
+):
+    """When there's no seeded row (defensive branch), the INSERT must
+    include a populated last_queried value, not NULL."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    note = vault / "fresh.md"
+    note.write_text("---\ntitle: Fresh\naccess_count: 0\n---\nbody\n")
+    db = tmp_path / "cortex-index.db"
+    _make_metrics_db(db, [])  # empty table — INSERT branch
+
+    await _bump_access(vault, "fresh.md", db_path=db, slug="fresh")
+
+    lq = _read_db_last_queried(db, "fresh")
+    assert lq is not None and lq != "", f"last_queried not populated: {lq!r}"
+    datetime.datetime.strptime(lq, "%Y-%m-%d %H:%M:%S")
+
+
+# ---------------------------------------------------------------------------
 # Access-count recency boost (Phase 0 closure)
 #
 # The bump writer was already wired (#90/#99/#196), but build_cue_packet
