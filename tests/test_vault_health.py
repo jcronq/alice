@@ -5269,6 +5269,13 @@ def test_check_decay_coverage_spike_end_to_end_via_main(
         bs_mod, "birth_signal_event_exists_for_date",
         lambda *a, **k: True,
     )
+    # Force the sleep window to be closed so main() proceeds past the
+    # _sleep_window_closed() gate (which returns False before 07:00 EDT
+    # and silently skips the write — the root cause of the pre-fix bug).
+    monkeypatch.setattr(
+        "metrics.vault_health._local_now",
+        lambda: datetime(2026, 7, 31, 9, 0, tzinfo=ZoneInfo("America/New_York")),
+    )
 
     vault = tmp_path / "cortex-memory"
     vault.mkdir()
