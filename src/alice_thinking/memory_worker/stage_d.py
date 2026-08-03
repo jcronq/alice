@@ -90,6 +90,10 @@ from typing import Any, Callable, Iterable, Optional
 from indexer.yaml_lite import _strip_code, split_frontmatter
 
 from alice_thinking import vault_lock
+from alice_thinking._frontmatter import (
+    render_frontmatter as _fm_render_frontmatter,
+    render_kv as _fm_render_kv,
+)
 
 from . import journal as journal_mod
 
@@ -645,38 +649,36 @@ def _parse_synthesizer_blob(blob: dict[str, Any]) -> SynthesizerOutput:
 
 
 def _render_kv(key: str, val: Any) -> str:
-    if isinstance(val, list):
-        items = ", ".join(str(v) for v in val)
-        return f"{key}: [{items}]"
-    if isinstance(val, bool):
-        return f"{key}: {'true' if val else 'false'}"
-    return f"{key}: {val}"
+    """Legacy single-line renderer kept for callers outside the render pipeline.
+
+    Routes through :mod:`alice_thinking._frontmatter` for lint-safe
+    scalar quoting; see task-0617.
+    """
+    lines = _fm_render_kv(key, val)
+    return "\n".join(lines) if lines else ""
 
 
 def _render_frontmatter(fm: dict[str, Any]) -> str:
-    preferred = (
-        "title",
-        "source",
-        "note_a",
-        "note_b",
-        "tags",
-        "created",
-        "updated",
-        "last_accessed",
-        "access_count",
+    """Render Stage D synthesis frontmatter as lint-safe YAML.
+
+    Scalars containing an internal ``:`` are quoted, empty list items
+    filtered, closing ``---`` always preceded by a newline. See
+    :mod:`alice_thinking._frontmatter` and task-0617.
+    """
+    return _fm_render_frontmatter(
+        fm,
+        preferred_keys=(
+            "title",
+            "source",
+            "note_a",
+            "note_b",
+            "tags",
+            "created",
+            "updated",
+            "last_accessed",
+            "access_count",
+        ),
     )
-    out: list[str] = ["---"]
-    seen: set[str] = set()
-    for key in preferred:
-        if key in fm:
-            out.append(_render_kv(key, fm[key]))
-            seen.add(key)
-    for key, val in fm.items():
-        if key in seen:
-            continue
-        out.append(_render_kv(key, val))
-    out.append("---")
-    return "\n".join(out) + "\n"
 
 
 def _build_synthesis_note(

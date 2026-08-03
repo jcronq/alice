@@ -29,6 +29,10 @@ import shutil
 import time
 from typing import Any, Optional
 
+from alice_thinking._frontmatter import (
+    render_frontmatter as _fm_render_frontmatter,
+)
+
 from .scoring import score_candidates
 from .subroutines import (
     ModelCall,
@@ -325,15 +329,16 @@ def pick_grooming_target(state: WakeState) -> Optional[pathlib.Path]:
 
 
 def _serialize_frontmatter(fm: dict[str, str]) -> str:
+    """Render frontmatter with lint-safe YAML (task-0617 defense).
+
+    Values are routed through :func:`alice_thinking._frontmatter.quote_if_needed`
+    so a scalar containing an internal ``:`` (or that would otherwise
+    reparse as a nested mapping) is quoted; ``None`` values are dropped.
+    Always emits a newline before the closing ``---`` fence.
+    """
     if not fm:
         return ""
-    lines = ["---"]
-    for k, v in fm.items():
-        if v is None:
-            continue
-        lines.append(f"{k}: {v}")
-    lines.append("---\n")
-    return "\n".join(lines)
+    return _fm_render_frontmatter({k: v for k, v in fm.items() if v is not None})
 
 
 def _split_frontmatter(text: str) -> tuple[dict[str, str], str]:

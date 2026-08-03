@@ -70,6 +70,10 @@ from typing import Any, Optional
 from indexer.yaml_lite import _strip_code, split_frontmatter
 
 from alice_thinking import vault_lock
+from alice_thinking._frontmatter import (
+    render_frontmatter as _fm_render_frontmatter,
+    render_kv as _fm_render_kv,
+)
 
 from . import journal as journal_mod
 from . import correction_cascade as cascade_mod
@@ -737,30 +741,33 @@ def _frontmatter_render(fm: dict[str, Any]) -> str:
     the keys we care about most come first (title/tags/created/updated),
     then everything else in insertion order. We intentionally don't
     re-parse the original YAML — Stage C only writes flat keys.
+
+    Lint-safe: scalar values containing an internal ``:`` are quoted;
+    empty list items filtered; newline always emitted before closing
+    fence. See :mod:`alice_thinking._frontmatter` and task-0617.
     """
-    preferred = ["title", "tags", "created", "updated", "last_accessed", "access_count"]
-    out: list[str] = ["---"]
-    seen: set[str] = set()
-    for key in preferred:
-        if key in fm:
-            out.append(_render_kv(key, fm[key]))
-            seen.add(key)
-    for key, val in fm.items():
-        if key in seen:
-            continue
-        out.append(_render_kv(key, val))
-    out.append("---")
-    return "\n".join(out) + "\n"
+    return _fm_render_frontmatter(
+        fm,
+        preferred_keys=(
+            "title",
+            "tags",
+            "created",
+            "updated",
+            "last_accessed",
+            "access_count",
+        ),
+    )
 
 
 def _render_kv(key: str, val: Any) -> str:
-    if isinstance(val, list):
-        # Flow-style list for tag-like fields. Stringify each item.
-        items = ", ".join(str(v) for v in val)
-        return f"{key}: [{items}]"
-    if isinstance(val, bool):
-        return f"{key}: {'true' if val else 'false'}"
-    return f"{key}: {val}"
+    """Legacy single-line renderer kept for callers outside the render pipeline.
+
+    New code should use :func:`_frontmatter_render`. This shim preserves
+    the historical ``str`` return shape (single-line, unquoted scalars)
+    while routing through the lint-safe helpers.
+    """
+    lines = _fm_render_kv(key, val)
+    return "\n".join(lines) if lines else ""
 
 
 def atomize(

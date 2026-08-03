@@ -1137,11 +1137,19 @@ def _write_frontmatter_fields(text: str, *, updates: dict[str, str]) -> str:
     Pairs with :func:`_parse_frontmatter` — the writer doesn't preserve
     YAML quoting/anchors because the parser doesn't either. Sufficient
     for the small set of fields thinking owns on conflict notes.
+
+    Values containing an internal ``:`` are quoted via
+    :func:`alice_thinking._frontmatter.quote_if_needed` (task-0617)
+    so an unquoted colon can't produce YAML-invalid frontmatter.
     """
+    from alice_thinking._frontmatter import quote_if_needed as _fm_quote
+
+    def _fmt(k: str, v: str) -> str:
+        return f"{k}: {_fm_quote(v)}"
 
     m = _FRONTMATTER_RE.match(text)
     if not m:
-        header = ["---"] + [f"{k}: {v}" for k, v in updates.items()] + ["---", ""]
+        header = ["---"] + [_fmt(k, v) for k, v in updates.items()] + ["---", ""]
         return "\n".join(header) + text
 
     body = text[m.end():]
@@ -1155,13 +1163,13 @@ def _write_frontmatter_fields(text: str, *, updates: dict[str, str]) -> str:
         key, _, _ = stripped.partition(":")
         key = key.strip()
         if key in updates and key not in seen:
-            out_lines.append(f"{key}: {updates[key]}")
+            out_lines.append(_fmt(key, updates[key]))
             seen.add(key)
         else:
             out_lines.append(line)
     for k, v in updates.items():
         if k not in seen:
-            out_lines.append(f"{k}: {v}")
+            out_lines.append(_fmt(k, v))
     return "---\n" + "\n".join(out_lines) + "\n---\n" + body
 
 
