@@ -2848,6 +2848,13 @@ def test_decay_coverage_all_decayed_returns_zero(tmp_path: Path) -> None:
         "structural_recovery_for_accessed_notes": 100.0,
         # 3 zero-access members, none recovered → 0.0.
         "structural_recovery_for_zero_access_notes": 0.0,
+        # Raw pool + recovered counts disambiguate 0.0% recovery.
+        # All 3 notes have access_count=0 → zero-access pool of 3,
+        # accessed pool empty, nothing recovered on either side.
+        "accessed_pool_size": 0,
+        "zero_access_pool_size": 3,
+        "accessed_recovered": 0,
+        "zero_access_recovered": 0,
     }
 
 
@@ -3514,6 +3521,13 @@ def test_decay_coverage_structural_split_mixed_pool(tmp_path: Path) -> None:
     assert fitness["structural_coverage_pct"] == 60.0
     assert fitness["structural_recovery_for_accessed_notes"] == 66.67
     assert fitness["structural_recovery_for_zero_access_notes"] == 50.0
+    # Raw pool sizes + recovered counts: accessed pool = 3 (acc-direct,
+    # acc-linked, acc-orphan), 2 recovered → 66.67. Zero-access pool = 2
+    # (zero-linked, zero-orphan), 1 recovered → 50.0.
+    assert fitness["accessed_pool_size"] == 3
+    assert fitness["accessed_recovered"] == 2
+    assert fitness["zero_access_pool_size"] == 2
+    assert fitness["zero_access_recovered"] == 1
 
 
 def test_decay_coverage_structural_combined_unchanged_backward_compat(

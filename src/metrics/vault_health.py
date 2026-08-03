@@ -1525,6 +1525,15 @@ def compute_decay_coverage(
             "structural_recovery_for_zero_access_notes": (
                 d_struct_recovery_zero_access
             ),
+            # Raw pool sizes + recovered counts disambiguate 0.0% recovery:
+            # "zero recovered out of a real pool" (problem) vs "zero
+            # recovered out of an empty pool" (vacuous). Design:
+            # cortex-memory/research/
+            # 2026-08-03-decay-coverage-access-history-fields.md.
+            "accessed_pool_size": d_acc_pool,
+            "zero_access_pool_size": d_zero_pool,
+            "accessed_recovered": d_acc_recovered,
+            "zero_access_recovered": d_zero_recovered,
         }
 
     return {
