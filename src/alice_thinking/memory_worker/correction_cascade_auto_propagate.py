@@ -55,6 +55,7 @@ from zoneinfo import ZoneInfo
 from indexer.yaml_lite import split_frontmatter
 
 from alice_thinking import vault_lock
+from alice_thinking._frontmatter import render_frontmatter as _fm_render_frontmatter
 from alice_thinking.memory_worker.correction_cascade import (
     CascadeReport,
     _frontmatter_read,
@@ -194,19 +195,17 @@ def _already_references(
 
 
 def _write_updated_frontmatter(fm: dict, body: str) -> str:
-    """Render frontmatter + body back to text, bumping ``updated:``."""
+    """Render frontmatter + body back to text, bumping ``updated:``.
+
+    Uses :mod:`alice_thinking._frontmatter` so scalars with an internal
+    ``:`` are quoted, empty list items filtered, and the closing
+    ``---`` fence always follows a newline (lint-safe per task-0617).
+    Preserves this site's block-style list rendering
+    (``key:\\n  - item``) since correction-cascade notes use it.
+    """
     fm["updated"] = time.strftime("%Y-%m-%d %H:%M EDT")
-    out = "---\n"
-    for k, v in fm.items():
-        if isinstance(v, list):
-            out += f"{k}:\n"
-            for item in v:
-                out += f"  - {item}\n"
-        else:
-            out += f"{k}: {v}\n"
-    out += "---\n\n"
-    out += body
-    return out
+    rendered = _fm_render_frontmatter(fm, list_style="block")
+    return rendered + "\n" + body
 
 
 def _add_backlink(
