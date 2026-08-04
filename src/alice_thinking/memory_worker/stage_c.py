@@ -809,6 +809,22 @@ def atomize(
     for md, decay_boost in scored:
         if processed >= max_items:
             break
+        # Per-note experiment-anchor exemption. Notes flagged with
+        # ``experiment_anchor: true`` are protected from atomization so
+        # ongoing experiments keep stable anchor slugs and inbound
+        # wikilinks. See 2026-08-03 higher-dose-erosion-prevention
+        # protocol. String compare because ``split_frontmatter`` does
+        # not YAML-coerce booleans.
+        try:
+            _fm_anchor, _ = split_frontmatter(md.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if str(_fm_anchor.get("experiment_anchor") or "").lower() == "true":
+            logger.info(
+                "stage_c atomize-exempt-experiment-anchor: %s",
+                md.relative_to(vault),
+            )
+            continue
         threshold = (
             BLOATED_LINE_THRESHOLD * _DECAY_ATOMIZE_FRACTION
             if decay_boost > 0
