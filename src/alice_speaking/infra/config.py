@@ -273,6 +273,26 @@ def _load_env_file(path: pathlib.Path) -> dict[str, str]:
     return result
 
 
+def _deep_merge(defaults: dict[str, Any], user: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge ``user`` into ``defaults``. Where both sides
+    have a dict at the same key, recurse; otherwise ``user`` wins.
+
+    Prevents partial user config (e.g.
+    ``{"cue_runner": {"enabled": true}}``) from wiping the rest of the
+    defaults' sub-dict. Never mutates either input — always returns a
+    fresh dict — so subsequent loads in the same process aren't
+    contaminated by an earlier load's user overrides.
+    """
+    merged = dict(defaults)
+    for key, value in user.items():
+        base = merged.get(key)
+        if isinstance(value, dict) and isinstance(base, dict):
+            merged[key] = _deep_merge(base, value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def _parse_allowed_senders(raw: str) -> dict[str, str]:
     """Parse the legacy ``ALLOWED_SENDERS`` env var into a ``{number: name}``
     mapping. Used as the synth-fallback input for the address book when
@@ -335,7 +355,12 @@ def load() -> Config:
     if config_json.is_file():
         try:
             parsed = json.loads(config_json.read_text())
-            speaking.update(parsed.get("speaking") or {})
+            # Deep-merge so a user's partial sub-dict (e.g.
+            # ``{"cue_runner": {"enabled": true}}``) doesn't wipe the
+            # rest of the defaults' cue_runner keys. Recurses through
+            # nested sub-dicts too (cue_runner.reranker, .hebbian,
+            # .typed_edge; quiet_hours; rate_limit_policy).
+            speaking = _deep_merge(speaking, parsed.get("speaking") or {})
         except json.JSONDecodeError as exc:
             raise ValueError(f"{config_json} is not valid JSON: {exc}") from exc
 
