@@ -3581,6 +3581,20 @@ def _fragmentation_tags(fm: dict[str, Any]) -> set[str]:
     return tags - FRAGMENTATION_DOMAIN_TAGS
 
 
+#: Upper bound (inclusive) of the "designed" cluster-size range — the
+#: band the design was calibrated against (baseline max was 15). Clusters
+#: in [``min_cluster_size`` .. this] contribute to the ``alert`` /
+#: ``high_priority_alert`` signal.
+FRAGMENTATION_DESIGNED_MAX = 15
+
+#: Upper bound (inclusive) of the "moderate" band — over the designed
+#: max but not yet a mega-cluster. Reported for visibility but does NOT
+#: trigger the fragmentation alert (see docstring). Speaking's addition
+#: to close a spec gap in thinking's Option B, which addressed only the
+#: designed and mega ranges. See PR body "## Option B refactor".
+FRAGMENTATION_MODERATE_MAX = 100
+
+
 def count_fragmentation_clusters(
     vault_dir: Path,
     min_cluster_size: int = 3,
@@ -3610,21 +3624,54 @@ def count_fragmentation_clusters(
     (``dailies/``, ``archive/``, ``gh-state/``, etc.) are excluded from
     the scan for the same reason ``count_orphans`` skips them.
 
-    The output shape is:
+    **Size bucketing (Option B refactor):** Clusters are bucketed by
+    member count so the "real fragmentation" signal is separated from
+    connected-component topology artifacts. The first live-vault run of
+    the original metric produced a 176-node mega-cluster driven by
+    same-day cohorts chaining together through pairwise Jaccard edges —
+    not a fragmentation event, a topology anomaly. Buckets:
 
-    ``{"clusters_today", "clusters_total", "largest_cluster_size",
-    "alert", "high_priority_alert"}``
+    * **Sub-threshold** — sizes ``[min_cluster_size, 4]``. Included in
+      ``clusters_total`` but no dedicated field; low signal.
+    * **Designed range** — sizes ``[5, 15]``. Reported as
+      ``clusters_designed_range`` and drives the alert flags. Baseline
+      max was 15; this is the calibrated fragmentation range.
+    * **Moderate** — sizes ``[16, 100]``. Reported as
+      ``clusters_moderate`` for visibility; does NOT alert. Speaking's
+      addition to close a gap in thinking's Option B spec (which only
+      addressed designed + mega); see PR body.
+    * **Mega** — sizes ``> 100``. Reported as ``clusters_mega`` and
+      sets ``mega_cluster_anomaly: True`` — a separate signal to
+      thinking meaning "the algorithm chained a topology mess, not the
+      vault fragmenting."
+
+    Output shape::
+
+        {
+          "clusters_today": int,           # any-size clusters born today
+          "clusters_total": int,           # any-size clusters across all days
+          "clusters_designed_range": int,  # clusters with size in [5, 15]
+          "clusters_moderate": int,        # clusters with size in [16, 100]
+          "clusters_mega": int,            # clusters with size > 100
+          "largest_cluster_size": int,     # max across all buckets
+          "alert": bool,                   # any designed-range cluster reaches size >= 5
+          "high_priority_alert": bool,     # any designed-range cluster reaches size >= 10
+          "mega_cluster_anomaly": bool,    # clusters_mega > 0
+        }
 
     ``clusters_today`` counts only clusters whose creation day equals
-    ``today`` (naive local midnight; default ``datetime.now()``);
-    ``clusters_total`` counts all clusters across every day represented
-    in the vault. ``alert`` fires on any cluster of size >= 5,
-    ``high_priority_alert`` on any cluster of size >= 10 — thresholds
-    calibrated against 140 days of vault history in the baseline note.
+    ``today`` (naive local midnight; default ``datetime.now()``).
+    ``alert`` and ``high_priority_alert`` are size-in-designed-range
+    predicates: a single designed-range cluster of size 5 alerts, one of
+    size 10 also flags high priority. Mega clusters do NOT participate
+    in the alert flags — the ``mega_cluster_anomaly`` bool is the
+    channel for that signal. Sub-threshold and moderate clusters never
+    alert.
 
     Pure function: no side effects, filesystem-only inputs. Runs O(n²)
     per day where n = notes created that day (typical <= 50; the
-    worst-case bursts in the baseline peaked at 47 notes/day).
+    worst-case bursts in the baseline peaked at 187 notes/day, which
+    is what drove the 176-node mega-cluster).
     """
     if today is None:
         today_dt = datetime.now().replace(
@@ -3637,9 +3684,13 @@ def count_fragmentation_clusters(
     empty_result: dict[str, Any] = {
         "clusters_today": 0,
         "clusters_total": 0,
+        "clusters_designed_range": 0,
+        "clusters_moderate": 0,
+        "clusters_mega": 0,
         "largest_cluster_size": 0,
         "alert": False,
         "high_priority_alert": False,
+        "mega_cluster_anomaly": False,
     }
 
     if not vault_dir.exists():
@@ -3768,16 +3819,53 @@ def count_fragmentation_clusters(
             })
 
     largest = max((len(c["slugs"]) for c in valid_clusters), default=0)
-    alert = any(len(c["slugs"]) >= 5 for c in valid_clusters)
-    high_priority_alert = any(len(c["slugs"]) >= 10 for c in valid_clusters)
     clusters_today = sum(1 for c in valid_clusters if c["day"] == today_str)
+
+    # Size bucketing (Option B refactor — see docstring).
+    # Bounds recap:
+    #   designed_range: [5, FRAGMENTATION_DESIGNED_MAX (15)]
+    #   moderate:       [FRAGMENTATION_DESIGNED_MAX + 1 (16), FRAGMENTATION_MODERATE_MAX (100)]
+    #   mega:           > FRAGMENTATION_MODERATE_MAX (>= 101)
+    # Sub-threshold ([min_cluster_size, 4]) is included in clusters_total
+    # but has no dedicated field — derivable as
+    # ``clusters_total - designed - moderate - mega`` for debug.
+    designed_range = 0
+    moderate = 0
+    mega = 0
+    for cluster in valid_clusters:
+        size = len(cluster["slugs"])
+        if 5 <= size <= FRAGMENTATION_DESIGNED_MAX:
+            designed_range += 1
+        elif FRAGMENTATION_DESIGNED_MAX < size <= FRAGMENTATION_MODERATE_MAX:
+            moderate += 1
+        elif size > FRAGMENTATION_MODERATE_MAX:
+            mega += 1
+        # else: sub-threshold [min_cluster_size, 4] — counted only in total
+
+    # Alert semantics: fire on any designed-range cluster reaching the
+    # respective size threshold. Mega clusters never contribute — their
+    # signal is ``mega_cluster_anomaly``. Sub-threshold and moderate
+    # clusters never alert.
+    alert = any(
+        5 <= len(c["slugs"]) <= FRAGMENTATION_DESIGNED_MAX
+        for c in valid_clusters
+    )
+    high_priority_alert = any(
+        10 <= len(c["slugs"]) <= FRAGMENTATION_DESIGNED_MAX
+        for c in valid_clusters
+    )
+    mega_cluster_anomaly = mega > 0
 
     return {
         "clusters_today": clusters_today,
         "clusters_total": len(valid_clusters),
+        "clusters_designed_range": designed_range,
+        "clusters_moderate": moderate,
+        "clusters_mega": mega,
         "largest_cluster_size": largest,
         "alert": alert,
         "high_priority_alert": high_priority_alert,
+        "mega_cluster_anomaly": mega_cluster_anomaly,
     }
 
 
