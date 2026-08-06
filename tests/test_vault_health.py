@@ -5629,9 +5629,13 @@ def test_fragmentation_baseline_single_note(tmp_path: Path) -> None:
     assert result == {
         "clusters_today": 0,
         "clusters_total": 0,
+        "clusters_designed_range": 0,
+        "clusters_moderate": 0,
+        "clusters_mega": 0,
         "largest_cluster_size": 0,
         "alert": False,
         "high_priority_alert": False,
+        "mega_cluster_anomaly": False,
     }
 
 
@@ -5685,9 +5689,15 @@ def test_fragmentation_valid_cluster_of_three(tmp_path: Path) -> None:
     result = count_fragmentation_clusters(vault, today=today)
     assert result["clusters_today"] == 1
     assert result["clusters_total"] == 1
+    # Size 3 is sub-threshold (below designed range [5, 15]) — counted
+    # in clusters_total but no bucket, no alert.
+    assert result["clusters_designed_range"] == 0
+    assert result["clusters_moderate"] == 0
+    assert result["clusters_mega"] == 0
     assert result["largest_cluster_size"] == 3
     assert result["alert"] is False  # 3 < 5 → no alert
     assert result["high_priority_alert"] is False
+    assert result["mega_cluster_anomaly"] is False
 
 
 def test_fragmentation_alert_at_five(tmp_path: Path) -> None:
@@ -5710,9 +5720,14 @@ def test_fragmentation_alert_at_five(tmp_path: Path) -> None:
     result = count_fragmentation_clusters(vault, today=today)
     assert result["clusters_today"] == 1
     assert result["clusters_total"] == 1
+    # Size 5 lands in the designed range [5, 15] → drives alert.
+    assert result["clusters_designed_range"] == 1
+    assert result["clusters_moderate"] == 0
+    assert result["clusters_mega"] == 0
     assert result["largest_cluster_size"] == 5
     assert result["alert"] is True
     assert result["high_priority_alert"] is False
+    assert result["mega_cluster_anomaly"] is False
 
 
 def test_fragmentation_high_priority_alert_at_ten(tmp_path: Path) -> None:
@@ -5740,9 +5755,15 @@ def test_fragmentation_high_priority_alert_at_ten(tmp_path: Path) -> None:
     result = count_fragmentation_clusters(vault, today=today)
     assert result["clusters_today"] == 1
     assert result["clusters_total"] == 1
+    # Size 10 lands in the designed range and clears the high-priority
+    # size threshold (>= 10) inside that band.
+    assert result["clusters_designed_range"] == 1
+    assert result["clusters_moderate"] == 0
+    assert result["clusters_mega"] == 0
     assert result["largest_cluster_size"] == 10
     assert result["alert"] is True
     assert result["high_priority_alert"] is True
+    assert result["mega_cluster_anomaly"] is False
 
 
 def test_fragmentation_zero_wikilinks_rejected(tmp_path: Path) -> None:
@@ -5939,6 +5960,9 @@ def test_fragmentation_configurable_thresholds(tmp_path: Path) -> None:
     )
     assert result["clusters_today"] == 1
     assert result["largest_cluster_size"] == 3
+    # Size 3 is still sub-threshold — Jaccard override lets the edges
+    # form but the resulting cluster doesn't hit the alerting band.
+    assert result["clusters_designed_range"] == 0
 
 
 def test_fragmentation_returns_empty_for_missing_vault(tmp_path: Path) -> None:
@@ -5949,7 +5973,247 @@ def test_fragmentation_returns_empty_for_missing_vault(tmp_path: Path) -> None:
     assert result == {
         "clusters_today": 0,
         "clusters_total": 0,
+        "clusters_designed_range": 0,
+        "clusters_moderate": 0,
+        "clusters_mega": 0,
         "largest_cluster_size": 0,
         "alert": False,
         "high_priority_alert": False,
+        "mega_cluster_anomaly": False,
     }
+
+
+# ---------------------------------------------------------------------------
+# Option B refactor — bucketing tests. See PR body "## Option B refactor"
+# and the design surface at inner/surface/.handled/2026-08-06/
+# 2026-08-06-182726-fragmentation-metric-option-b.md.
+# ---------------------------------------------------------------------------
+
+
+def _fragmentation_cluster(
+    vault: Path,
+    slug_prefix: str,
+    size: int,
+    created: str,
+    tags: list[str],
+) -> list[str]:
+    """Write ``size`` notes forming a ring-linked, tag-sharing cluster.
+
+    Returns the list of slugs written. The ring wikilinks guarantee the
+    wikilink-overlap validation passes; the shared tag set guarantees
+    Jaccard-similarity edges form between every pair.
+    """
+    slugs = [f"{slug_prefix}-{i}" for i in range(size)]
+    for i, slug in enumerate(slugs):
+        _write(
+            vault / "research" / f"{slug}.md",
+            _fragmentation_note(
+                slug,
+                created,
+                tags,
+                wikilinks=[slugs[(i + 1) % len(slugs)]],
+            ),
+        )
+    return slugs
+
+
+def test_fragmentation_mega_cluster_in_isolation(tmp_path: Path) -> None:
+    """One same-day mega cluster of 150 notes → mega bucket, no alert.
+
+    Reproduces the shape of the 2026-08-06 baseline event (largest
+    cluster 176). Under Option B the mega-cluster count sets
+    ``mega_cluster_anomaly`` — a separate topology-anomaly signal —
+    without tripping the fragmentation ``alert`` / ``high_priority_alert``
+    flags, since a mega-cluster is diagnostic of connected-component
+    chaining, not real fragmentation.
+    """
+    from metrics.vault_health import count_fragmentation_clusters
+
+    vault = _make_vault(tmp_path)
+    _fragmentation_cluster(
+        vault,
+        slug_prefix="mega",
+        size=150,
+        created="2026-07-29",
+        tags=["decay-recovery", "cue-runner", "trigger-keyword"],
+    )
+    today = datetime(2026, 7, 29)  # noqa: DTZ001
+    result = count_fragmentation_clusters(vault, today=today)
+    assert result["clusters_today"] == 1
+    assert result["clusters_total"] == 1
+    assert result["clusters_designed_range"] == 0
+    assert result["clusters_moderate"] == 0
+    assert result["clusters_mega"] == 1
+    assert result["largest_cluster_size"] == 150
+    assert result["alert"] is False
+    assert result["high_priority_alert"] is False
+    assert result["mega_cluster_anomaly"] is True
+
+
+def test_fragmentation_mixed_buckets_designed_plus_mega(tmp_path: Path) -> None:
+    """A designed-range cluster and a mega cluster coexist.
+
+    Both signals fire independently: the designed-range cluster of size
+    5 drives ``alert=True``, the mega cluster drives
+    ``mega_cluster_anomaly=True``. Confirms the two channels don't mask
+    each other.
+    """
+    from metrics.vault_health import count_fragmentation_clusters
+
+    vault = _make_vault(tmp_path)
+    # Designed-range cluster of 5.
+    _fragmentation_cluster(
+        vault,
+        slug_prefix="designed",
+        size=5,
+        created="2026-07-29",
+        tags=["designed-a", "designed-b", "designed-c"],
+    )
+    # Mega cluster of 120 — disjoint tag set so it forms its own
+    # connected component instead of chaining into the designed cluster.
+    _fragmentation_cluster(
+        vault,
+        slug_prefix="mega",
+        size=120,
+        created="2026-07-29",
+        tags=["mega-a", "mega-b", "mega-c"],
+    )
+    today = datetime(2026, 7, 29)  # noqa: DTZ001
+    result = count_fragmentation_clusters(vault, today=today)
+    assert result["clusters_today"] == 2
+    assert result["clusters_total"] == 2
+    assert result["clusters_designed_range"] == 1
+    assert result["clusters_moderate"] == 0
+    assert result["clusters_mega"] == 1
+    assert result["largest_cluster_size"] == 120
+    assert result["alert"] is True
+    assert result["high_priority_alert"] is False  # designed cluster is size 5, not 10
+    assert result["mega_cluster_anomaly"] is True
+
+
+def test_fragmentation_moderate_band_report_only(tmp_path: Path) -> None:
+    """Three clusters of size 30 → moderate bucket only, no alerts.
+
+    The moderate band [16, 100] is report-only per Option B: over the
+    designed max but under the mega threshold. Speaking added this
+    bucket to close a gap in thinking's spec (which addressed only
+    designed and mega). Notably: even three moderate clusters together
+    do not trigger the fragmentation alert.
+    """
+    from metrics.vault_health import count_fragmentation_clusters
+
+    vault = _make_vault(tmp_path)
+    for cluster_idx in range(3):
+        _fragmentation_cluster(
+            vault,
+            slug_prefix=f"mod{cluster_idx}",
+            size=30,
+            # Different day per cluster so they form distinct
+            # connected components (same-day is a hard precondition).
+            created=f"2026-07-{27 + cluster_idx:02d}",
+            tags=[
+                f"moderate-{cluster_idx}-a",
+                f"moderate-{cluster_idx}-b",
+                f"moderate-{cluster_idx}-c",
+            ],
+        )
+    today = datetime(2026, 7, 29)  # noqa: DTZ001
+    result = count_fragmentation_clusters(vault, today=today)
+    assert result["clusters_total"] == 3
+    assert result["clusters_designed_range"] == 0
+    assert result["clusters_moderate"] == 3
+    assert result["clusters_mega"] == 0
+    assert result["largest_cluster_size"] == 30
+    assert result["alert"] is False
+    assert result["high_priority_alert"] is False
+    assert result["mega_cluster_anomaly"] is False
+
+
+def test_fragmentation_bucket_boundary_size_15(tmp_path: Path) -> None:
+    """Cluster of exactly 15 → designed range, not moderate."""
+    from metrics.vault_health import count_fragmentation_clusters
+
+    vault = _make_vault(tmp_path)
+    _fragmentation_cluster(
+        vault,
+        slug_prefix="boundary15",
+        size=15,
+        created="2026-07-29",
+        tags=["b15-a", "b15-b", "b15-c"],
+    )
+    today = datetime(2026, 7, 29)  # noqa: DTZ001
+    result = count_fragmentation_clusters(vault, today=today)
+    assert result["clusters_designed_range"] == 1
+    assert result["clusters_moderate"] == 0
+    assert result["clusters_mega"] == 0
+    assert result["largest_cluster_size"] == 15
+    assert result["alert"] is True
+    assert result["high_priority_alert"] is True  # size 15 >= 10
+
+
+def test_fragmentation_bucket_boundary_size_16(tmp_path: Path) -> None:
+    """Cluster of exactly 16 → moderate, not designed range."""
+    from metrics.vault_health import count_fragmentation_clusters
+
+    vault = _make_vault(tmp_path)
+    _fragmentation_cluster(
+        vault,
+        slug_prefix="boundary16",
+        size=16,
+        created="2026-07-29",
+        tags=["b16-a", "b16-b", "b16-c"],
+    )
+    today = datetime(2026, 7, 29)  # noqa: DTZ001
+    result = count_fragmentation_clusters(vault, today=today)
+    assert result["clusters_designed_range"] == 0
+    assert result["clusters_moderate"] == 1
+    assert result["clusters_mega"] == 0
+    assert result["largest_cluster_size"] == 16
+    # Size 16 is over the designed max — no alert.
+    assert result["alert"] is False
+    assert result["high_priority_alert"] is False
+    assert result["mega_cluster_anomaly"] is False
+
+
+def test_fragmentation_bucket_boundary_size_100(tmp_path: Path) -> None:
+    """Cluster of exactly 100 → moderate, not mega."""
+    from metrics.vault_health import count_fragmentation_clusters
+
+    vault = _make_vault(tmp_path)
+    _fragmentation_cluster(
+        vault,
+        slug_prefix="boundary100",
+        size=100,
+        created="2026-07-29",
+        tags=["b100-a", "b100-b", "b100-c"],
+    )
+    today = datetime(2026, 7, 29)  # noqa: DTZ001
+    result = count_fragmentation_clusters(vault, today=today)
+    assert result["clusters_designed_range"] == 0
+    assert result["clusters_moderate"] == 1
+    assert result["clusters_mega"] == 0
+    assert result["largest_cluster_size"] == 100
+    assert result["alert"] is False
+    assert result["mega_cluster_anomaly"] is False
+
+
+def test_fragmentation_bucket_boundary_size_101(tmp_path: Path) -> None:
+    """Cluster of exactly 101 → mega, not moderate."""
+    from metrics.vault_health import count_fragmentation_clusters
+
+    vault = _make_vault(tmp_path)
+    _fragmentation_cluster(
+        vault,
+        slug_prefix="boundary101",
+        size=101,
+        created="2026-07-29",
+        tags=["b101-a", "b101-b", "b101-c"],
+    )
+    today = datetime(2026, 7, 29)  # noqa: DTZ001
+    result = count_fragmentation_clusters(vault, today=today)
+    assert result["clusters_designed_range"] == 0
+    assert result["clusters_moderate"] == 0
+    assert result["clusters_mega"] == 1
+    assert result["largest_cluster_size"] == 101
+    assert result["alert"] is False
+    assert result["mega_cluster_anomaly"] is True
