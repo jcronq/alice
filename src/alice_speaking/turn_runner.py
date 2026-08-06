@@ -134,6 +134,25 @@ def _write_watchdog_sentinel(reason: str) -> None:
 BUILTIN_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch"]
 
 
+# Pre-turn hygiene visibility (Option A per thinking's 2026-07-22
+# pre-turn-branch-checkout design + Speaking's 2026-08-06 hold-and-route
+# hygiene recommendation). We log Speaking's own git state at the start
+# of every turn so drift (stash pile-up, branch that never lands,
+# untracked cruft) is observable. This is deliberately NON-destructive:
+# no reset, no branch switch, no stash — the destructive B-variant is
+# deferred pending Jason review after we've watched drift metrics land
+# for a few days.
+#
+# ``parents[2]`` resolves this module's file
+# (``src/alice_speaking/turn_runner.py``) to the alice-runtime repo
+# root. If Speaking is ever pip-installed elsewhere the resolution
+# still yields *some* path; the subprocess calls fail gracefully
+# (rule: never raise from _log_pre_turn_hygiene).
+REPO_PATH = pathlib.Path(__file__).resolve().parents[2]
+_HYGIENE_STASH_WARN_THRESHOLD = 20
+_HYGIENE_UNPUSHED_BRANCH_WARN_THRESHOLD = 5
+
+
 class TurnRunner:
     """Owns session identity + bootstrap preamble + the kernel call.
 
@@ -423,6 +442,139 @@ class TurnRunner:
         return handlers
 
     # ------------------------------------------------------------------
+    # Pre-turn hygiene (Option A — log-only)
+
+    def _log_pre_turn_hygiene(self) -> None:
+        """Emit a visibility-only snapshot of Speaking's runtime git state.
+
+        Reads four cheap git values (branch, stash count, untracked file
+        count, unpushed commits vs. origin/master) and logs them at INFO.
+        Fires a WARNING when the stash pile crosses
+        :data:`_HYGIENE_STASH_WARN_THRESHOLD` or the current non-master
+        branch has more than :data:`_HYGIENE_UNPUSHED_BRANCH_WARN_THRESHOLD`
+        commits ahead of origin/master.
+
+        Contract:
+
+        * MUST NOT mutate git state (no stash, no branch switch, no reset).
+        * MUST NOT raise — every subprocess failure is caught and logged
+          at DEBUG, the whole body is wrapped in a defensive ``try`` so
+          even bugs in this method cannot break :meth:`run_turn`.
+        * MUST NOT be slow — each git call has ``timeout=2``.
+
+        This is Option A per thinking's 2026-07-22 pre-turn-branch-checkout
+        design and Speaking's 2026-08-06 hold-and-route note. The
+        destructive Option B variant is deferred pending Jason review
+        after we observe drift metrics for a few days.
+        """
+        try:
+            def _git(args: list[str]) -> Optional[subprocess.CompletedProcess]:
+                try:
+                    return subprocess.run(
+                        ["git", *args],
+                        cwd=REPO_PATH,
+                        capture_output=True,
+                        text=True,
+                        timeout=2,
+                        check=False,
+                    )
+                except (
+                    subprocess.TimeoutExpired,
+                    FileNotFoundError,
+                    OSError,
+                ) as exc:
+                    log.debug(
+                        "pre_turn_hygiene: git %s failed (%s)",
+                        args[0] if args else "",
+                        type(exc).__name__,
+                    )
+                    return None
+
+            # Branch name — plain ``master`` on the primary branch,
+            # otherwise the feature branch label.
+            branch: Optional[str]
+            r = _git(["rev-parse", "--abbrev-ref", "HEAD"])
+            if r is not None and r.returncode == 0:
+                branch = r.stdout.strip() or None
+            else:
+                branch = None
+
+            # Stash count — every accumulated WIP entry adds to the pile.
+            stash_count: Optional[int]
+            r = _git(["stash", "list"])
+            if r is not None and r.returncode == 0:
+                stash_count = sum(
+                    1
+                    for line in r.stdout.splitlines()
+                    if line.startswith("stash@")
+                )
+            else:
+                stash_count = None
+
+            # Untracked file count — files git sees but nobody has
+            # staged / .gitignored yet.
+            untracked_count: Optional[int]
+            r = _git(["ls-files", "--others", "--exclude-standard"])
+            if r is not None and r.returncode == 0:
+                untracked_count = sum(
+                    1 for line in r.stdout.splitlines() if line.strip()
+                )
+            else:
+                untracked_count = None
+
+            # Unpushed commits vs origin/master. Non-zero exit here is
+            # the expected shape when the remote ref is missing (fresh
+            # clone, detached HEAD, etc.) — swallow to ``None``.
+            unpushed_commits: Optional[int]
+            r = _git(["rev-list", "--count", "origin/master..HEAD"])
+            if r is not None and r.returncode == 0:
+                try:
+                    unpushed_commits = int(r.stdout.strip())
+                except ValueError:
+                    unpushed_commits = None
+            else:
+                unpushed_commits = None
+
+            log.info(
+                "pre_turn_hygiene: branch=%s, stash=%s, untracked=%s, "
+                "unpushed=%s",
+                branch,
+                stash_count,
+                untracked_count,
+                unpushed_commits,
+            )
+
+            triggered: list[str] = []
+            if (
+                stash_count is not None
+                and stash_count > _HYGIENE_STASH_WARN_THRESHOLD
+            ):
+                triggered.append(
+                    f"stash={stash_count}>{_HYGIENE_STASH_WARN_THRESHOLD}"
+                )
+            if (
+                branch is not None
+                and branch != "master"
+                and unpushed_commits is not None
+                and unpushed_commits > _HYGIENE_UNPUSHED_BRANCH_WARN_THRESHOLD
+            ):
+                triggered.append(
+                    f"branch={branch} unpushed={unpushed_commits}>"
+                    f"{_HYGIENE_UNPUSHED_BRANCH_WARN_THRESHOLD}"
+                )
+            if triggered:
+                log.warning(
+                    "pre_turn_hygiene: threshold(s) exceeded — %s",
+                    "; ".join(triggered),
+                )
+        except Exception as exc:  # noqa: BLE001 — never block the turn loop
+            log.debug(
+                "pre_turn_hygiene: swallowed unexpected error (%s: %s)",
+                type(exc).__name__,
+                exc,
+            )
+
+    # ------------------------------------------------------------------
     # Run
 
     async def run_turn(
@@ -448,6 +600,9 @@ class TurnRunner:
         Returns the concatenated assistant text (useful for
         compaction turns which consume the summary).
         """
+        # Pre-turn hygiene snapshot (Option A, log-only). Non-destructive,
+        # subprocess failures swallowed. See :meth:`_log_pre_turn_hygiene`.
+        self._log_pre_turn_hygiene()
         # Cue runner: prepend a vault-context packet to the pending
         # preamble before ``compose_prompt`` consumes it. Silent turns
         # (bootstrap / compaction) skip the cue runner — there's no
