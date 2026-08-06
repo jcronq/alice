@@ -119,6 +119,25 @@ _ADR_ADHERENCE_THRESHOLD = 0.8
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 
 
+# Domain / meta tags excluded from the fragmentation clustering step.
+# Same pattern as ``FITNESS_TAGS`` in stage_d — a single source of truth
+# for "tags that identify a subsystem or note class rather than a topic".
+# Two notes sharing only ``alice-thinking`` or ``vault-health`` aren't
+# topically related; excluding these prevents structural noise from
+# driving Jaccard edges. See design note
+# ``[[2026-07-29-fragmentation-metric-design]]`` for the full rationale.
+FRAGMENTATION_DOMAIN_TAGS: frozenset[str] = frozenset({
+    # Alice subsystem tags
+    "alice-architecture", "alice-core", "alice-sleep", "alice-system-design",
+    "alice-thinking", "alice-viewer", "alice-infrastructure",
+    "alice-metrics", "alice-system",
+    # Vault structural tags
+    "vault-health", "metrics", "fragmentation",
+    # Generic meta / note-type tags
+    "research", "reference", "projects",
+})
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 
@@ -3533,6 +3552,235 @@ def _sleep_window_closed(scan_dt: datetime) -> bool:
     return eastern.hour >= 7
 
 
+# ---------------------------------------------------------------------------
+# Fragmentation clusters
+# Design: [[2026-07-29-fragmentation-metric-design]] +
+# [[2026-07-29-fragmentation-metric-baseline]]. The bloated-notes metric
+# was retired for its false-signal rate; fragmentation is the inverse
+# problem — many small overlapping notes born the same day that reduce
+# information density. Detection is same-day + Jaccard-tag clustering
+# with wikilink-overlap validation.
+# ---------------------------------------------------------------------------
+
+
+def _fragmentation_tags(fm: dict[str, Any]) -> set[str]:
+    """Return non-domain tags for a note, lowercased and stripped.
+
+    Mirrors ``_tags_of`` in stage_d (list-or-string tolerant) then
+    subtracts :data:`FRAGMENTATION_DOMAIN_TAGS`. Returns an empty set
+    if the note has no ``tags:``, tags that aren't a list/string, or a
+    tag set that reduces to zero after domain exclusion.
+    """
+    raw = fm.get("tags")
+    if isinstance(raw, list):
+        tags = {str(t).strip().lower() for t in raw if str(t).strip()}
+    elif isinstance(raw, str) and raw.strip():
+        tags = {raw.strip().lower()}
+    else:
+        return set()
+    return tags - FRAGMENTATION_DOMAIN_TAGS
+
+
+def count_fragmentation_clusters(
+    vault_dir: Path,
+    min_cluster_size: int = 3,
+    jaccard_threshold: float = 0.3,
+    today: datetime | None = None,
+) -> dict[str, Any]:
+    """Detect same-day fragmentation clusters across the vault.
+
+    A fragmentation cluster is a connected component of notes where:
+
+    1. Every member was written on the same calendar day (per the
+       ``created:`` frontmatter field).
+    2. Every pairwise edge between members has Jaccard tag similarity
+       ``>= jaccard_threshold`` on the non-domain tag sets. Connected-
+       component clustering allows the full-cluster tag intersection to
+       be empty as long as every edge meets the threshold — this is the
+       expected chain-through-shared-pairs shape observed in the
+       baseline analysis (see design note §"Empty common tags").
+    3. The component has at least one pair of members where one links
+       to the other via a wikilink. Components without any internal
+       wikilink are dropped as false positives (same tags, different
+       topics).
+
+    Notes with no parseable ``created:`` field or whose effective tag
+    set (after domain exclusion) is empty are silently skipped — they
+    can never participate in a valid cluster. Non-knowledge folders
+    (``dailies/``, ``archive/``, ``gh-state/``, etc.) are excluded from
+    the scan for the same reason ``count_orphans`` skips them.
+
+    The output shape is:
+
+    ``{"clusters_today", "clusters_total", "largest_cluster_size",
+    "alert", "high_priority_alert"}``
+
+    ``clusters_today`` counts only clusters whose creation day equals
+    ``today`` (naive local midnight; default ``datetime.now()``);
+    ``clusters_total`` counts all clusters across every day represented
+    in the vault. ``alert`` fires on any cluster of size >= 5,
+    ``high_priority_alert`` on any cluster of size >= 10 — thresholds
+    calibrated against 140 days of vault history in the baseline note.
+
+    Pure function: no side effects, filesystem-only inputs. Runs O(n²)
+    per day where n = notes created that day (typical <= 50; the
+    worst-case bursts in the baseline peaked at 47 notes/day).
+    """
+    if today is None:
+        today_dt = datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+    else:
+        today_dt = today.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_str = today_dt.strftime("%Y-%m-%d")
+
+    empty_result: dict[str, Any] = {
+        "clusters_today": 0,
+        "clusters_total": 0,
+        "largest_cluster_size": 0,
+        "alert": False,
+        "high_priority_alert": False,
+    }
+
+    if not vault_dir.exists():
+        return empty_result
+
+    # Build a resolution index so wikilink targets in a note's body can
+    # be canonicalized back to slug-or-stem identifiers we can compare
+    # against cluster members. Reuse the same helper the orphan /
+    # broken-link metrics use so we honor aliases and slug overrides.
+    by_slug, _slugs_to_aliases, alias_lower_to_slug = _build_resolution_index(vault_dir)
+
+    notes_by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    for md in _iter_notes(vault_dir):
+        rel_parts = md.relative_to(vault_dir).parts
+        # Fragmentation is a knowledge-note signal, not a dailies /
+        # gh-state / archive signal. Same exclusion set the orphan
+        # scan uses.
+        if rel_parts and rel_parts[0] in NON_KNOWLEDGE_FOLDERS:
+            continue
+        text = _read_text(md)
+        if not text:
+            continue
+        fm, body = split_frontmatter(text)
+        if not isinstance(fm, dict) or not fm:
+            continue
+        created = _parse_created_date(fm.get("created"))
+        if created is None:
+            continue
+        effective_tags = _fragmentation_tags(fm)
+        if not effective_tags:
+            continue
+        slug = _slug_from_fm(fm, md.stem).lower()
+        stem = md.stem.lower()
+
+        # Resolve outbound wikilink targets to a canonical stem-lower
+        # identifier so we can check membership against cluster members.
+        # Unresolvable targets fall back to the raw normalized target
+        # (still comparable against a member's stem if a link like
+        # ``[[some-slug]]`` happens to match the member's filename).
+        target_ids: set[str] = set()
+        for raw_target in _extract_targets(body):
+            lower = raw_target.lower()
+            resolved_path = by_slug.get(lower)
+            if resolved_path is None:
+                aliased = alias_lower_to_slug.get(lower)
+                if aliased:
+                    resolved_path = by_slug.get(aliased)
+            if resolved_path is not None:
+                target_ids.add(resolved_path.stem.lower())
+            else:
+                target_ids.add(lower)
+
+        day_key = created.strftime("%Y-%m-%d")
+        notes_by_day[day_key].append({
+            "slug": slug,
+            "stem": stem,
+            "tags": effective_tags,
+            "targets": target_ids,
+        })
+
+    valid_clusters: list[dict[str, Any]] = []
+
+    for day, notes in notes_by_day.items():
+        n = len(notes)
+        if n < min_cluster_size:
+            continue
+
+        # Adjacency list keyed by note-index within the day.
+        adj: dict[int, set[int]] = defaultdict(set)
+        for i in range(n):
+            for j in range(i + 1, n):
+                inter = notes[i]["tags"] & notes[j]["tags"]
+                union = notes[i]["tags"] | notes[j]["tags"]
+                jaccard = len(inter) / len(union) if union else 0.0
+                if jaccard >= jaccard_threshold:
+                    adj[i].add(j)
+                    adj[j].add(i)
+
+        # Connected-component clustering via iterative DFS.
+        visited: set[int] = set()
+        for start in range(n):
+            if start in visited:
+                continue
+            component: list[int] = []
+            stack = [start]
+            while stack:
+                cur = stack.pop()
+                if cur in visited:
+                    continue
+                visited.add(cur)
+                component.append(cur)
+                for neighbor in adj.get(cur, ()):
+                    if neighbor not in visited:
+                        stack.append(neighbor)
+            if len(component) < min_cluster_size:
+                continue
+
+            # Wikilink-overlap validation. Build the set of member
+            # identifiers (slug OR stem — either form can appear as a
+            # wikilink target) and check whether any member's outbound
+            # target set intersects some OTHER member's identifiers.
+            # A member linking only to itself doesn't count.
+            member_identifiers = set()
+            per_member_ids: list[set[str]] = []
+            for idx in component:
+                ids = {notes[idx]["slug"], notes[idx]["stem"]}
+                per_member_ids.append(ids)
+                member_identifiers |= ids
+
+            has_internal_link = False
+            for pos, idx in enumerate(component):
+                own_ids = per_member_ids[pos]
+                # Restrict to identifiers belonging to *other* members.
+                other_ids = member_identifiers - own_ids
+                if notes[idx]["targets"] & other_ids:
+                    has_internal_link = True
+                    break
+
+            if not has_internal_link:
+                continue
+
+            valid_clusters.append({
+                "day": day,
+                "slugs": sorted(notes[i]["slug"] for i in component),
+            })
+
+    largest = max((len(c["slugs"]) for c in valid_clusters), default=0)
+    alert = any(len(c["slugs"]) >= 5 for c in valid_clusters)
+    high_priority_alert = any(len(c["slugs"]) >= 10 for c in valid_clusters)
+    clusters_today = sum(1 for c in valid_clusters if c["day"] == today_str)
+
+    return {
+        "clusters_today": clusters_today,
+        "clusters_total": len(valid_clusters),
+        "largest_cluster_size": largest,
+        "alert": alert,
+        "high_priority_alert": high_priority_alert,
+    }
+
+
 def compute_stage_d_drought(
     events_path: Path | None,
     thoughts_dir: Path,
@@ -3800,6 +4048,20 @@ def build_vault_health_event(
         event["birth_signal"].pop("by_bucket", None)
     except Exception as exc:  # noqa: BLE001 — never block vault_health
         logger.warning("vault_health: birth_signal skipped (%s)", exc)
+
+    # Fragmentation — same-day tag-similarity clusters with wikilink
+    # overlap. Complementary to the retired bloated-notes metric:
+    # bloating measured one note too big, fragmentation measures many
+    # notes too small. Wrapped in try/except like birth_signal so a
+    # scanner failure never blocks the event write.
+    # Design: [[2026-07-29-fragmentation-metric-design]] +
+    # [[2026-07-29-fragmentation-metric-baseline]].
+    try:
+        event["fragmentation"] = count_fragmentation_clusters(
+            vault_dir, today=today_midnight,
+        )
+    except Exception as exc:  # noqa: BLE001 — never block vault_health
+        logger.warning("vault_health: fragmentation skipped (%s)", exc)
 
     # Drought flag — computed in-code with sleep_window_closed awareness,
     # replacing the prompt-level instruction that used to live in
@@ -4282,6 +4544,10 @@ def main(argv: list[str] | None = None) -> int:
     out["template_adherence"] = {
         "adr": _aggregate_adr_template_adherence(args.vault),
     }
+
+    # Fragmentation — same-day Jaccard-tag clusters with wikilink
+    # overlap. Design: [[2026-07-29-fragmentation-metric-design]].
+    out["fragmentation"] = count_fragmentation_clusters(args.vault)
 
     if args.thoughts and args.window_start and args.window_end:
         out["wake_type_distribution"] = count_wakes_by_stage(

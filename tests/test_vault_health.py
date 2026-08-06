@@ -5578,3 +5578,378 @@ def test_compute_recovery_state_uses_daily_mean_trend(tmp_path: Path) -> None:
     # Daily means [0, 0, 0, 0, 6] → OLS slope = 1.2
     assert rs["structural_debt_trend"] is not None
     assert abs(rs["structural_debt_trend"] - 1.2) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# Fragmentation clusters — same-day Jaccard-tag clusters with wikilink
+# overlap. Complementary to the retired bloated-notes metric.
+# Design: [[2026-07-29-fragmentation-metric-design]] +
+#         [[2026-07-29-fragmentation-metric-baseline]].
+# ---------------------------------------------------------------------------
+
+
+def _fragmentation_note(
+    slug: str,
+    created: str,
+    tags: list[str],
+    wikilinks: list[str] | None = None,
+    domain: str | None = None,
+) -> str:
+    """Compose a minimal note body with frontmatter for fragmentation tests.
+
+    Body contains one wikilink per entry in ``wikilinks`` so the
+    outbound-target extraction has real content to chew on.
+    """
+    fm_lines = ["---", f"slug: {slug}", f"created: {created}"]
+    if domain is not None:
+        fm_lines.append(f"domain: {domain}")
+    fm_lines.append("tags:")
+    for t in tags:
+        fm_lines.append(f"  - {t}")
+    fm_lines.append("---")
+    fm_lines.append("")
+    body_links = [f"see [[{target}]]" for target in (wikilinks or [])]
+    fm_lines.extend(body_links or ["placeholder body."])
+    return "\n".join(fm_lines) + "\n"
+
+
+def test_fragmentation_baseline_single_note(tmp_path: Path) -> None:
+    """One note on the day → no cluster, no alert."""
+    from metrics.vault_health import count_fragmentation_clusters
+
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "solo.md",
+        _fragmentation_note(
+            "solo", "2026-07-29", ["decay", "trigger-keywords", "cue-runner"]
+        ),
+    )
+    today = datetime(2026, 7, 29)  # noqa: DTZ001
+    result = count_fragmentation_clusters(vault, today=today)
+    assert result == {
+        "clusters_today": 0,
+        "clusters_total": 0,
+        "largest_cluster_size": 0,
+        "alert": False,
+        "high_priority_alert": False,
+    }
+
+
+def test_fragmentation_below_min_cluster_size(tmp_path: Path) -> None:
+    """Two notes with matching tags and a wikilink → no cluster (needs >= 3)."""
+    from metrics.vault_health import count_fragmentation_clusters
+
+    vault = _make_vault(tmp_path)
+    _write(
+        vault / "research" / "pair-a.md",
+        _fragmentation_note(
+            "pair-a", "2026-07-29",
+            ["decay", "trigger-keywords", "cue-runner"],
+            wikilinks=["pair-b"],
+        ),
+    )
+    _write(
+        vault / "research" / "pair-b.md",
+        _fragmentation_note(
+            "pair-b", "2026-07-29",
+            ["decay", "trigger-keywords", "cue-runner"],
+            wikilinks=["pair-a"],
+        ),
+    )
+    today = datetime(2026, 7, 29)  # noqa: DTZ001
+    result = count_fragmentation_clusters(vault, today=today)
+    assert result["clusters_today"] == 0
+    assert result["clusters_total"] == 0
+    assert result["largest_cluster_size"] == 0
+    assert result["alert"] is False
+
+
+def test_fragmentation_valid_cluster_of_three(tmp_path: Path) -> None:
+    """Three notes sharing tags with an internal wikilink → one cluster."""
+    from metrics.vault_health import count_fragmentation_clusters
+
+    vault = _make_vault(tmp_path)
+    slugs = ["trio-a", "trio-b", "trio-c"]
+    for slug in slugs:
+        _write(
+            vault / "research" / f"{slug}.md",
+            _fragmentation_note(
+                slug,
+                "2026-07-29",
+                ["decay", "trigger-keywords", "cue-runner"],
+                # Ring: every note links to the next member.
+                wikilinks=[slugs[(slugs.index(slug) + 1) % len(slugs)]],
+            ),
+        )
+    today = datetime(2026, 7, 29)  # noqa: DTZ001
+    result = count_fragmentation_clusters(vault, today=today)
+    assert result["clusters_today"] == 1
+    assert result["clusters_total"] == 1
+    assert result["largest_cluster_size"] == 3
+    assert result["alert"] is False  # 3 < 5 → no alert
+    assert result["high_priority_alert"] is False
+
+
+def test_fragmentation_alert_at_five(tmp_path: Path) -> None:
+    """Cluster of 5 → alert True, high_priority_alert False."""
+    from metrics.vault_health import count_fragmentation_clusters
+
+    vault = _make_vault(tmp_path)
+    slugs = [f"burst-{i}" for i in range(5)]
+    for i, slug in enumerate(slugs):
+        _write(
+            vault / "research" / f"{slug}.md",
+            _fragmentation_note(
+                slug,
+                "2026-07-29",
+                ["decay-recovery", "structural-debt", "trigger-audit"],
+                wikilinks=[slugs[(i + 1) % len(slugs)]],
+            ),
+        )
+    today = datetime(2026, 7, 29)  # noqa: DTZ001
+    result = count_fragmentation_clusters(vault, today=today)
+    assert result["clusters_today"] == 1
+    assert result["clusters_total"] == 1
+    assert result["largest_cluster_size"] == 5
+    assert result["alert"] is True
+    assert result["high_priority_alert"] is False
+
+
+def test_fragmentation_high_priority_alert_at_ten(tmp_path: Path) -> None:
+    """Cluster of 10 → both alert flags True."""
+    from metrics.vault_health import count_fragmentation_clusters
+
+    vault = _make_vault(tmp_path)
+    slugs = [f"mega-{i}" for i in range(10)]
+    for i, slug in enumerate(slugs):
+        _write(
+            vault / "research" / f"{slug}.md",
+            _fragmentation_note(
+                slug,
+                "2026-07-29",
+                [
+                    "decay-recovery",
+                    "trigger-keyword",
+                    "structural-linking",
+                    "cue-runner",
+                ],
+                wikilinks=[slugs[(i + 1) % len(slugs)]],
+            ),
+        )
+    today = datetime(2026, 7, 29)  # noqa: DTZ001
+    result = count_fragmentation_clusters(vault, today=today)
+    assert result["clusters_today"] == 1
+    assert result["clusters_total"] == 1
+    assert result["largest_cluster_size"] == 10
+    assert result["alert"] is True
+    assert result["high_priority_alert"] is True
+
+
+def test_fragmentation_zero_wikilinks_rejected(tmp_path: Path) -> None:
+    """3 same-day notes with identical tags but ZERO wikilinks → no cluster.
+
+    Locks in the false-positive filter (Step 4 of the design): same
+    tags without any internal wikilink means "different topics that
+    happen to share vocabulary", not a genuine cluster.
+    """
+    from metrics.vault_health import count_fragmentation_clusters
+
+    vault = _make_vault(tmp_path)
+    for slug in ("iso-a", "iso-b", "iso-c"):
+        _write(
+            vault / "research" / f"{slug}.md",
+            _fragmentation_note(
+                slug,
+                "2026-07-29",
+                ["shared-tag-1", "shared-tag-2", "shared-tag-3"],
+                # No wikilinks between the notes.
+                wikilinks=[],
+            ),
+        )
+    today = datetime(2026, 7, 29)  # noqa: DTZ001
+    result = count_fragmentation_clusters(vault, today=today)
+    assert result["clusters_today"] == 0
+    assert result["clusters_total"] == 0
+    assert result["largest_cluster_size"] == 0
+    assert result["alert"] is False
+
+
+def test_fragmentation_domain_tags_excluded(tmp_path: Path) -> None:
+    """3 same-day notes sharing ONLY a domain tag → no cluster.
+
+    Each note has a unique non-domain tag alongside a common domain
+    tag (``alice-thinking``). Jaccard on effective tags is 0 → no
+    edges → no cluster.
+    """
+    from metrics.vault_health import count_fragmentation_clusters
+
+    vault = _make_vault(tmp_path)
+    triples = [
+        ("dom-a", ["alice-thinking", "topic-alpha"]),
+        ("dom-b", ["alice-thinking", "topic-beta"]),
+        ("dom-c", ["alice-thinking", "topic-gamma"]),
+    ]
+    slugs = [t[0] for t in triples]
+    for i, (slug, tags) in enumerate(triples):
+        _write(
+            vault / "research" / f"{slug}.md",
+            _fragmentation_note(
+                slug,
+                "2026-07-29",
+                tags,
+                wikilinks=[slugs[(i + 1) % len(slugs)]],
+            ),
+        )
+    today = datetime(2026, 7, 29)  # noqa: DTZ001
+    result = count_fragmentation_clusters(vault, today=today)
+    assert result["clusters_today"] == 0
+    assert result["clusters_total"] == 0
+    assert result["largest_cluster_size"] == 0
+    assert result["alert"] is False
+
+
+def test_fragmentation_clusters_today_vs_total(tmp_path: Path) -> None:
+    """Distinguish clusters_today from clusters_total.
+
+    Two same-day clusters on different days: one today, one older.
+    clusters_today counts only today's; clusters_total counts both.
+    """
+    from metrics.vault_health import count_fragmentation_clusters
+
+    vault = _make_vault(tmp_path)
+    # Today's cluster.
+    today_slugs = ["today-1", "today-2", "today-3"]
+    for i, slug in enumerate(today_slugs):
+        _write(
+            vault / "research" / f"{slug}.md",
+            _fragmentation_note(
+                slug,
+                "2026-07-29",
+                ["theme-today-a", "theme-today-b", "theme-today-c"],
+                wikilinks=[today_slugs[(i + 1) % len(today_slugs)]],
+            ),
+        )
+    # Older cluster on a different day.
+    old_slugs = ["old-1", "old-2", "old-3"]
+    for i, slug in enumerate(old_slugs):
+        _write(
+            vault / "research" / f"{slug}.md",
+            _fragmentation_note(
+                slug,
+                "2026-06-16",
+                ["theme-old-a", "theme-old-b", "theme-old-c"],
+                wikilinks=[old_slugs[(i + 1) % len(old_slugs)]],
+            ),
+        )
+    today = datetime(2026, 7, 29)  # noqa: DTZ001
+    result = count_fragmentation_clusters(vault, today=today)
+    assert result["clusters_today"] == 1
+    assert result["clusters_total"] == 2
+    assert result["largest_cluster_size"] == 3
+    assert result["alert"] is False
+
+
+def test_fragmentation_dailies_excluded(tmp_path: Path) -> None:
+    """Notes in ``dailies/`` never enter the fragmentation scan.
+
+    Same non-knowledge-folder exclusion the orphan metric uses —
+    dailies are date-stamped activity logs, not topical notes.
+    """
+    from metrics.vault_health import count_fragmentation_clusters
+
+    vault = _make_vault(tmp_path)
+    dailies_slugs = ["daily-1", "daily-2", "daily-3"]
+    for i, slug in enumerate(dailies_slugs):
+        _write(
+            vault / "dailies" / f"{slug}.md",
+            _fragmentation_note(
+                slug,
+                "2026-07-29",
+                ["diary-theme-a", "diary-theme-b", "diary-theme-c"],
+                wikilinks=[dailies_slugs[(i + 1) % len(dailies_slugs)]],
+            ),
+        )
+    today = datetime(2026, 7, 29)  # noqa: DTZ001
+    result = count_fragmentation_clusters(vault, today=today)
+    assert result["clusters_today"] == 0
+    assert result["clusters_total"] == 0
+
+
+def test_fragmentation_jaccard_boundary_below_threshold(tmp_path: Path) -> None:
+    """Below-threshold Jaccard produces no edges even with wikilinks.
+
+    Three notes with tag sets whose pairwise Jaccard is 1/7 ≈ 0.14 —
+    below the 0.3 default. Even with internal wikilinks, no edges
+    form and no cluster is reported.
+    """
+    from metrics.vault_health import count_fragmentation_clusters
+
+    vault = _make_vault(tmp_path)
+    tag_sets = [
+        ["shared", "unique-a1", "unique-a2", "unique-a3"],
+        ["shared", "unique-b1", "unique-b2", "unique-b3"],
+        ["shared", "unique-c1", "unique-c2", "unique-c3"],
+    ]
+    slugs = ["low-jac-a", "low-jac-b", "low-jac-c"]
+    for i, (slug, tags) in enumerate(zip(slugs, tag_sets)):
+        _write(
+            vault / "research" / f"{slug}.md",
+            _fragmentation_note(
+                slug,
+                "2026-07-29",
+                tags,
+                wikilinks=[slugs[(i + 1) % len(slugs)]],
+            ),
+        )
+    today = datetime(2026, 7, 29)  # noqa: DTZ001
+    result = count_fragmentation_clusters(vault, today=today)
+    # Pairwise Jaccard: |{shared}| / |7 tags| ≈ 0.143 < 0.3 → no edges.
+    assert result["clusters_today"] == 0
+    assert result["clusters_total"] == 0
+
+
+def test_fragmentation_configurable_thresholds(tmp_path: Path) -> None:
+    """Overriding jaccard_threshold and min_cluster_size changes behavior.
+
+    Same 3-note fixture as the "below threshold" test. Lowering the
+    Jaccard threshold to 0.1 lets edges form and a cluster surface.
+    """
+    from metrics.vault_health import count_fragmentation_clusters
+
+    vault = _make_vault(tmp_path)
+    tag_sets = [
+        ["shared", "unique-a1", "unique-a2", "unique-a3"],
+        ["shared", "unique-b1", "unique-b2", "unique-b3"],
+        ["shared", "unique-c1", "unique-c2", "unique-c3"],
+    ]
+    slugs = ["cfg-a", "cfg-b", "cfg-c"]
+    for i, (slug, tags) in enumerate(zip(slugs, tag_sets)):
+        _write(
+            vault / "research" / f"{slug}.md",
+            _fragmentation_note(
+                slug,
+                "2026-07-29",
+                tags,
+                wikilinks=[slugs[(i + 1) % len(slugs)]],
+            ),
+        )
+    today = datetime(2026, 7, 29)  # noqa: DTZ001
+    result = count_fragmentation_clusters(
+        vault, jaccard_threshold=0.1, today=today,
+    )
+    assert result["clusters_today"] == 1
+    assert result["largest_cluster_size"] == 3
+
+
+def test_fragmentation_returns_empty_for_missing_vault(tmp_path: Path) -> None:
+    """A vault_dir that doesn't exist yields a well-formed empty result."""
+    from metrics.vault_health import count_fragmentation_clusters
+
+    result = count_fragmentation_clusters(tmp_path / "does-not-exist")
+    assert result == {
+        "clusters_today": 0,
+        "clusters_total": 0,
+        "largest_cluster_size": 0,
+        "alert": False,
+        "high_priority_alert": False,
+    }
