@@ -5766,6 +5766,58 @@ def test_fragmentation_high_priority_alert_at_ten(tmp_path: Path) -> None:
     assert result["mega_cluster_anomaly"] is False
 
 
+def test_fragmentation_alert_ignores_historical_clusters(tmp_path: Path) -> None:
+    """Today has no designed-range cluster, but a historical one exists.
+
+    The alert flags must NOT fire for clusters from prior days.
+    Regression test for the bug where valid_clusters (all-time) drove
+    alerts instead of today's subset.
+    """
+    from metrics.vault_health import count_fragmentation_clusters
+
+    vault = _make_vault(tmp_path)
+    today = datetime(2026, 8, 7)  # noqa: DTZ001
+    today_str = today.strftime("%Y-%m-%d")
+    hist_str = "2026-04-28"  # burst day — mega cluster from prior cycle
+
+    # Today: 3 notes (sub-threshold, no alert)
+    today_slugs = [f"today-a", f"today-b", f"today-c"]
+    for i, slug in enumerate(today_slugs):
+        _write(
+            vault / "research" / f"{slug}.md",
+            _fragmentation_note(
+                slug,
+                today_str,
+                ["decay-recovery", "structural-debt"],
+                wikilinks=[today_slugs[(i + 1) % len(today_slugs)]],
+            ),
+        )
+
+    # Historical: 12-note cluster from April 28 (designed-range, size ≥ 10)
+    hist_slugs = [f"burst-hist-{i}" for i in range(12)]
+    for i, slug in enumerate(hist_slugs):
+        _write(
+            vault / "research" / f"{slug}.md",
+            _fragmentation_note(
+                slug,
+                hist_str,
+                ["decay-recovery", "structural-debt", "trigger-keyword"],
+                wikilinks=[hist_slugs[(i + 1) % len(hist_slugs)]],
+            ),
+        )
+
+    result = count_fragmentation_clusters(vault, today=today)
+    # Today has 1 cluster (size 3, sub-threshold)
+    assert result["clusters_today"] == 1
+    # Total includes today's + historical
+    assert result["clusters_total"] == 2
+    # Today's cluster is sub-threshold (size 3 < 5)
+    assert result["clusters_designed_range"] == 0
+    # The alert flags must NOT fire — historical clusters are invisible
+    assert result["alert"] is False
+    assert result["high_priority_alert"] is False
+
+
 def test_fragmentation_zero_wikilinks_rejected(tmp_path: Path) -> None:
     """3 same-day notes with identical tags but ZERO wikilinks → no cluster.
 
@@ -6103,22 +6155,22 @@ def test_fragmentation_moderate_band_report_only(tmp_path: Path) -> None:
     from metrics.vault_health import count_fragmentation_clusters
 
     vault = _make_vault(tmp_path)
+    today = datetime(2026, 7, 29)  # noqa: DTZ001
+    today_str = today.strftime("%Y-%m-%d")
     for cluster_idx in range(3):
         _fragmentation_cluster(
             vault,
             slug_prefix=f"mod{cluster_idx}",
             size=30,
-            # Different day per cluster so they form distinct
-            # connected components (same-day is a hard precondition).
-            created=f"2026-07-{27 + cluster_idx:02d}",
+            created=today_str,
             tags=[
                 f"moderate-{cluster_idx}-a",
                 f"moderate-{cluster_idx}-b",
                 f"moderate-{cluster_idx}-c",
             ],
         )
-    today = datetime(2026, 7, 29)  # noqa: DTZ001
     result = count_fragmentation_clusters(vault, today=today)
+    assert result["clusters_today"] == 3
     assert result["clusters_total"] == 3
     assert result["clusters_designed_range"] == 0
     assert result["clusters_moderate"] == 3
