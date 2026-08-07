@@ -3818,21 +3818,26 @@ def count_fragmentation_clusters(
                 "slugs": sorted(notes[i]["slug"] for i in component),
             })
 
-    largest = max((len(c["slugs"]) for c in valid_clusters), default=0)
-    clusters_today = sum(1 for c in valid_clusters if c["day"] == today_str)
+    # Restrict to today's clusters for alerting and bucketing.
+    # Historical clusters are visible via ``clusters_total`` but must
+    # not drive alerts or bucket counts.
+    today_valid_clusters = [
+        c for c in valid_clusters if c["day"] == today_str
+    ]
+    largest = max((len(c["slugs"]) for c in today_valid_clusters), default=0)
+    clusters_today = len(today_valid_clusters)
 
-    # Size bucketing (Option B refactor — see docstring).
-    # Bounds recap:
+    # Size bucketing (Option B refactor — see docstring). Bounds:
     #   designed_range: [5, FRAGMENTATION_DESIGNED_MAX (15)]
     #   moderate:       [FRAGMENTATION_DESIGNED_MAX + 1 (16), FRAGMENTATION_MODERATE_MAX (100)]
     #   mega:           > FRAGMENTATION_MODERATE_MAX (>= 101)
-    # Sub-threshold ([min_cluster_size, 4]) is included in clusters_total
+    # Sub-threshold ([min_cluster_size, 4]) is included in clusters_today
     # but has no dedicated field — derivable as
-    # ``clusters_total - designed - moderate - mega`` for debug.
+    # ``clusters_today - designed - moderate - mega`` for debug.
     designed_range = 0
     moderate = 0
     mega = 0
-    for cluster in valid_clusters:
+    for cluster in today_valid_clusters:
         size = len(cluster["slugs"])
         if 5 <= size <= FRAGMENTATION_DESIGNED_MAX:
             designed_range += 1
@@ -3843,16 +3848,14 @@ def count_fragmentation_clusters(
         # else: sub-threshold [min_cluster_size, 4] — counted only in total
 
     # Alert semantics: fire on any designed-range cluster reaching the
-    # respective size threshold. Mega clusters never contribute — their
-    # signal is ``mega_cluster_anomaly``. Sub-threshold and moderate
-    # clusters never alert.
+    # respective size threshold, restricted to today's clusters.
     alert = any(
         5 <= len(c["slugs"]) <= FRAGMENTATION_DESIGNED_MAX
-        for c in valid_clusters
+        for c in today_valid_clusters
     )
     high_priority_alert = any(
         10 <= len(c["slugs"]) <= FRAGMENTATION_DESIGNED_MAX
-        for c in valid_clusters
+        for c in today_valid_clusters
     )
     mega_cluster_anomaly = mega > 0
 
