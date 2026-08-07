@@ -5781,7 +5781,7 @@ def test_fragmentation_alert_ignores_historical_clusters(tmp_path: Path) -> None
     hist_str = "2026-04-28"  # burst day — mega cluster from prior cycle
 
     # Today: 3 notes (sub-threshold, no alert)
-    today_slugs = [f"today-a", f"today-b", f"today-c"]
+    today_slugs = ["today-a", "today-b", "today-c"]
     for i, slug in enumerate(today_slugs):
         _write(
             vault / "research" / f"{slug}.md",
