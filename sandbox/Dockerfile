@@ -98,7 +98,8 @@ RUN python3 -m venv /opt/alice-venv \
         'jinja2>=3.1' \
         'fastapi>=0.115' \
         'uvicorn[standard]>=0.30' \
-        'sse-starlette>=2.0'
+        'sse-starlette>=2.0' \
+        'scipy>=1.11'
 
 # s6-overlay for process supervision. Arch-branched because the upstream
 # tarball is per-arch; ADD can't expand a shell var mid-URL, so we curl.
