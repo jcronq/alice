@@ -925,8 +925,9 @@ def compute_decay_score(
     * ``folder_resistance`` — folder-based stability (lookup, default 0.15).
     * ``trigger_proxy = 0.5`` if body contains any of {decay, recovery,
       metrics, health, score}; ``0.0`` otherwise.
-    * ``age_factor = exp(-ln(2) * age_days / 7)`` — half-life 7 days
-      against ``fm['created']`` (today if unparseable).
+    * ``age_factor = 1 - exp(-ln(2) * age_days / 7)`` — grows 0→1 with
+      age, half-life 7 days against ``fm['created']`` (max value 1.0
+      when unparseable, on the assumption undated notes are old).
     * ``access_term = access_weight[folder] * log(1+access_count) /
       log(1+860)`` — folder-weighted access protection.
 
@@ -968,14 +969,24 @@ def compute_decay_score(
     trigger_proxy = 0.5 if any(kw in body_lower for kw in _TRIGGER_KEYWORDS) else 0.0
 
     # ── Age factor ──────────────────────────────────────────────
+    # A "decay" score should grow with age — old unaccessed notes are more
+    # decayed than fresh ones. Original formula `exp(-ln(2) * age / tau)`
+    # decays 1→0 with age, inverting the intended semantic when multiplied
+    # INTO the score. Fix (2026-08-11 per thinking's inversion analysis):
+    # use `1 - exp(...)` so age_factor grows 0→1 with age. Half-life
+    # constant unchanged.
+    #
+    # No-created-date fallback flips from 1.0 → 1.0 (previously "just-
+    # created = no penalty" is now "undated = assume old = max decay
+    # eligibility"). Consistent with the semantic fix; no separate change.
     created_dt = _parse_created_date(fm.get("created"))
     if created_dt is None:
-        # No created date → can't age. Treat as just-created (no penalty).
+        # No created date → assume old (max age_factor).
         age_factor = 1.0
     else:
         created_date = created_dt.date() if isinstance(created_dt, datetime) else created_dt
         age_days = max(0, (today_date - created_date).days)
-        age_factor = math.exp(-math.log(2) * age_days / _AGE_TAU)
+        age_factor = 1.0 - math.exp(-math.log(2) * age_days / _AGE_TAU)
 
     # ── Access term ─────────────────────────────────────────────
     access_weight = _ACCESS_WEIGHT.get(folder, _DEFAULT_ACCESS_WEIGHT)
