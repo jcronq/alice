@@ -42,7 +42,7 @@ _LOG = logging.getLogger(__name__)
 
 DEFAULT_ALICE_ENV = pathlib.Path.home() / ".config" / "alice" / "alice.env"
 
-AuthMode = Literal["subscription", "api", "bedrock", "none", "pi"]
+AuthMode = Literal["subscription", "api", "bedrock", "none", "pi", "hermes"]
 
 _API_VARS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 _BEDROCK_VARS = ("CLAUDE_CODE_USE_BEDROCK", "AWS_REGION", "AWS_PROFILE")
@@ -275,6 +275,18 @@ def ensure_auth_env(
         # Clear the Anthropic-specific env vars so a stale subscription
         # token / API key doesn't accidentally re-enter when Anthropic
         # backends run later in the same process.
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        for key in _API_VARS:
+            os.environ.pop(key, None)
+        for key in _BEDROCK_VARS:
+            os.environ.pop(key, None)
+    elif auth.mode == "hermes":
+        # HermesKernel reads HERMES_API_KEY directly at request time
+        # (see kernels.hermes.kernel._resolve_api_key). Nothing to
+        # write here — just clear the Anthropic-specific env vars so a
+        # stale subscription token or API key doesn't accidentally
+        # re-enter when Anthropic backends run later in the same
+        # process. Mirrors the pi-mode branch above.
         os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
         for key in _API_VARS:
             os.environ.pop(key, None)

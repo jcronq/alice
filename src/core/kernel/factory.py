@@ -39,6 +39,7 @@ __all__ = ["make_kernel"]
 _SIBLING_KERNELS: dict[str, str] = {
     "anthropic": "kernels.anthropic.kernel:AnthropicKernel",
     "pi": "kernels.pi.kernel:PiKernel",
+    "hermes": "kernels.hermes.kernel:HermesKernel",
 }
 
 

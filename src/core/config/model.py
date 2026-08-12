@@ -63,9 +63,11 @@ __all__ = [
 
 MODEL_FILENAME = "model.yml"
 HEMISPHERES: tuple[str, ...] = ("speaking", "thinking", "viewer")
-BackendName = Literal["subscription", "api", "bedrock", "pi"]
+BackendName = Literal["subscription", "api", "bedrock", "pi", "hermes"]
 HarnessName = Literal["claude-code", "pi-mono"]
-_VALID_BACKENDS: frozenset[str] = frozenset({"subscription", "api", "bedrock", "pi"})
+_VALID_BACKENDS: frozenset[str] = frozenset(
+    {"subscription", "api", "bedrock", "pi", "hermes"}
+)
 _VALID_HARNESSES: frozenset[str] = frozenset({"claude-code", "pi-mono"})
 _VALID_STAGES: frozenset[str] = frozenset({"active", "sleep_b", "sleep_c", "sleep_d"})
 _HARNESS_ALIASES: dict[str, HarnessName] = {
