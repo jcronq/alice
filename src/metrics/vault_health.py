@@ -3860,6 +3860,14 @@ def count_fragmentation_clusters(
 
     # Alert semantics: fire on any designed-range cluster reaching the
     # respective size threshold, restricted to today's clusters.
+    #
+    # `alert_type` clarifies what the alert is actually detecting: same-day
+    # tag-overlap clusters (a burst of related note creation), not true
+    # vault-graph fragmentation (disconnected components across the whole
+    # graph). Consumers that see `alert_type == "burst"` should treat the
+    # alert as a burst detector — the clusters typically merge within hours
+    # as more notes are added. Downstream from note 2026-08-13 meta-pattern
+    # analysis (thinking): "structural artifact misread as behavioral signal".
     alert = any(
         5 <= len(c["slugs"]) <= FRAGMENTATION_DESIGNED_MAX
         for c in today_valid_clusters
@@ -3869,6 +3877,7 @@ def count_fragmentation_clusters(
         for c in today_valid_clusters
     )
     mega_cluster_anomaly = mega > 0
+    alert_type = "burst" if (alert or high_priority_alert) else None
 
     return {
         "clusters_today": clusters_today,
@@ -3878,6 +3887,7 @@ def count_fragmentation_clusters(
         "clusters_mega": mega,
         "largest_cluster_size": largest,
         "alert": alert,
+        "alert_type": alert_type,
         "high_priority_alert": high_priority_alert,
         "mega_cluster_anomaly": mega_cluster_anomaly,
     }
