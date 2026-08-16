@@ -17,14 +17,17 @@
 model_list:
   # Stage B/D consolidation + viewer lobe labels. Backend is the LAN
   # Qwen runtime served by pi-mono at 10.20.30.177:8033.
+  # Swapped 2026-08-16 from Qwen3.6-35B-A3B (MoE) to Qwen3.8-27B (dense).
+  # 25-30x throughput hit (~5-6 tok/s vs ~150 tok/s) traded for quality.
+  # Rollback: /home/cronqj/wrappers/llama-server.sh.bak-pre-3.8 on aimax1.
   - model_name: qwen-local
     litellm_params:
-      model: openai/qwen3-32b
+      model: openai/qwen3.8-27b
       api_base: http://10.20.30.177:8033/v1
       api_key: dummy
       # Imputed "what this would cost behind a hosted API" — the backend
       # is local/$0, but pricing it lets the dashboard track equivalent
-      # spend. Qwen 35B-A3B reference: $0.15 in / $1.00 out per 1M tokens.
+      # spend. Qwen3.8-27B reference: $0.15 in / $1.00 out per 1M tokens.
       input_cost_per_token: 0.00000015
       output_cost_per_token: 0.000001
 
