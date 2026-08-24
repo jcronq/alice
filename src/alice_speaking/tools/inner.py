@@ -42,7 +42,12 @@ def _derive_title(content: str) -> str:
     for line in content.splitlines():
         cleaned = line.strip().lstrip("#*-").strip()
         if cleaned:
-            return cleaned[:80]
+            if len(cleaned) <= 80:
+                return cleaned
+            cut = cleaned[:80]
+            if " " in cut:
+                cut = cut[: cut.rfind(" ")]
+            return cut.rstrip(" ,;:.") + "…"
     return "untitled"
 
 
@@ -104,7 +109,7 @@ def build(cfg: Config, *, personae: Personae | None = None) -> list[SdkMcpTool[A
         created = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
         # frontmatter required for surface_dedup / gh-watcher metadata extraction
         header = "---\n"
-        header += f"title: {_derive_title(content)}\n"
+        header += f'title: "{_derive_title(content).replace(chr(34), chr(39))}"\n'
         if tag:
             header += f"tag: {tag}\n"
         header += f"created: {created}\n"
