@@ -435,6 +435,44 @@ def test_handler_routes_doorbell_pressed_to_emergency_recipient() -> None:
     assert "cozyhem_doorbell_voiced" in kinds
 
 
+def test_handler_routes_real_wire_format_doorbell_colon_pressed() -> None:
+    """The dispatcher must handle the actual cozyhem-engine wire format.
+
+    cozyhem-engine's UniFi Protect bridge broadcasts ``doorbell:pressed``
+    (colon) with a payload of ``{camera_id, camera_name, event_id, details,
+    timestamp}`` — no ``entity_id`` field. See ``cozyhem/main.py:237``.
+    Regression coverage for the 2026-08-26 kind-mismatch fix.
+    """
+    recipient = ChannelRef(
+        transport="signal", address="+15551234567", durable=True
+    )
+    ctx = _HandlerCtx(recipient=recipient)
+    event = CozyHemEvent(
+        kind="doorbell:pressed",
+        entity_id="",
+        payload={
+            "camera_id": "cam-abc",
+            "camera_name": "Front Door",
+            "event_id": "evt-1",
+            "details": {},
+            "timestamp": "2026-08-27T00:00:00Z",
+        },
+        received_at=123.0,
+    )
+
+    asyncio.run(handle_cozyhem_event(ctx, event))
+
+    assert len(ctx.dispatched) == 1
+    sent = ctx.dispatched[0]
+    assert sent["channel"] == recipient
+    assert "Doorbell pressed" in sent["text"]
+    assert "Front Door" in sent["text"]  # camera_name preferred over blank entity_id
+    assert sent["bypass_quiet"] is True
+    kinds = [k for k, _ in ctx.events.emitted]
+    assert "cozyhem_event" in kinds
+    assert "cozyhem_doorbell_voiced" in kinds
+
+
 def test_handler_drops_unknown_kinds() -> None:
     recipient = ChannelRef(
         transport="signal", address="+15551234567", durable=True

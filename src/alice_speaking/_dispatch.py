@@ -1119,7 +1119,10 @@ async def handle_cozyhem_event(ctx: DaemonContext, event: "CozyHemEvent") -> Non
         received_at=event.received_at,
     )
 
-    if event.kind == "doorbell_pressed":
+    # Accept both wire formats: cozyhem-engine broadcasts "doorbell:pressed"
+    # (main.py:237); the legacy underscore form is kept for any producer that
+    # still emits it and for existing test fixtures.
+    if event.kind in ("doorbell:pressed", "doorbell_pressed"):
         await _handle_doorbell_pressed(ctx, event)
         return
 
@@ -1152,10 +1155,15 @@ async def _handle_doorbell_pressed(
         )
         return
 
-    text = "Doorbell pressed."
-    entity_id = event.entity_id or ""
-    if entity_id:
-        text = f"Doorbell pressed ({entity_id})."
+    # Prefer camera_name (present in cozyhem-engine's doorbell:pressed
+    # payload) over entity_id (which the real wire format doesn't carry).
+    camera_name = ""
+    if isinstance(event.payload, dict):
+        raw = event.payload.get("camera_name")
+        if isinstance(raw, str):
+            camera_name = raw.strip()
+    label = camera_name or (event.entity_id or "")
+    text = f"Doorbell pressed ({label})." if label else "Doorbell pressed."
     try:
         await ctx._dispatch_outbound(
             recipient,
