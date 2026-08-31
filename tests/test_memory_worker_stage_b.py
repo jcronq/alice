@@ -387,6 +387,310 @@ def test_feedback_self_routes_to_feedback_folder(vault: pathlib.Path) -> None:
     assert "Signal replies stay 1-3 sentences." in text
 
 
+# ---------- target route ----------
+
+
+def _seed_target_page(
+    vault: pathlib.Path,
+    folder: str,
+    slug: str,
+    *,
+    title: str | None = None,
+    updated: str = "2026-04-01",
+    body: str = "Original page body.",
+) -> pathlib.Path:
+    """Drop a well-formed existing vault page for the target route to
+    merge into."""
+    target_dir = vault / "cortex-memory" / folder
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{slug}.md"
+    title = title or slug
+    target.write_text(
+        (
+            "---\n"
+            f"title: {title}\n"
+            f"tags: [{folder.rstrip('s')}]\n"
+            "created: 2026-04-01\n"
+            f"updated: {updated}\n"
+            "last_accessed: 2026-04-01\n"
+            "access_count: 0\n"
+            "---\n"
+            "\n"
+            f"# {title}\n"
+            "\n"
+            f"{body}\n"
+        ),
+        encoding="utf-8",
+    )
+    return target
+
+
+def test_target_frontmatter_resolves_and_merges(vault: pathlib.Path) -> None:
+    """``target:`` frontmatter + existing target → dated Update section
+    appended, ``updated:`` bumped, note consumed with ``became:``
+    trailer pointing at the target."""
+    target = _seed_target_page(
+        vault, "reference", "cozyhem-deployment", title="CozyHem Deployment"
+    )
+    _drop_note(
+        vault,
+        "2026-08-28-020141-correction.md",
+        (
+            "---\n"
+            "tag: correction\n"
+            "target: cortex-memory/reference/cozyhem-deployment.md\n"
+            "---\n"
+            "\n"
+            "Hot-reload is NOT universal in CozyHem. "
+            "Only automations/light/*.yaml hot-reloads on the ~5s cycle.\n"
+        ),
+    )
+    report = stage_b.run(vault)
+    assert report.routed_target == 1
+    assert report.routed_concept == 0
+    assert report.unclassified == 0
+
+    text = target.read_text(encoding="utf-8")
+    today = datetime.date.today().isoformat()
+    # Dated update section appended, filename provenance recorded.
+    assert (
+        f"## Update {today} (from 2026-08-28-020141-correction.md)" in text
+    )
+    assert "Hot-reload is NOT universal" in text
+    # Original content preserved.
+    assert "Original page body." in text
+    # updated: bumped to today.
+    assert f"updated: {today}" in text
+    assert "updated: 2026-04-01" not in text
+
+    # Note consumed (not moved to .failed/), trailer appended.
+    consumed = _consumed_path(vault, "2026-08-28-020141-correction.md")
+    assert consumed.is_file()
+    consumed_text = consumed.read_text(encoding="utf-8")
+    assert "became: [[cozyhem-deployment]] (update appended)" in consumed_text
+    assert "processed_at:" in consumed_text
+    assert "route: memory-worker stage_b target" in consumed_text
+
+
+def test_target_body_line_fallback_resolves_and_merges(
+    vault: pathlib.Path,
+) -> None:
+    """A ``Target: <path>`` line in the first ~10 body lines is the
+    fallback channel when frontmatter has no ``target:`` field."""
+    target = _seed_target_page(vault, "reference", "cozyhem-deployment")
+    _drop_note(
+        vault,
+        "2026-08-28-013210-correction.md",
+        (
+            "---\n"
+            "tag: correction\n"
+            "---\n"
+            "\n"
+            "Third re-file of the CozyHem hot-reload correction.\n"
+            "\n"
+            "Target vault page (verified exists): "
+            "cortex-memory/reference/cozyhem-deployment.md\n"
+            "\n"
+            "Body of the correction follows here.\n"
+        ),
+    )
+    report = stage_b.run(vault)
+    assert report.routed_target == 1
+
+    text = target.read_text(encoding="utf-8")
+    today = datetime.date.today().isoformat()
+    assert f"## Update {today}" in text
+    assert "Third re-file of the CozyHem hot-reload correction." in text
+
+
+def test_target_unresolvable_falls_through_to_unclassified(
+    vault: pathlib.Path,
+) -> None:
+    """``target:`` names a page that doesn't exist → route returns
+    None → note falls through to unclassified. Safe failure: the
+    memory worker does not synthesize a new page for a
+    mis-declared target."""
+    _drop_note(
+        vault,
+        "2026-08-28-nowhere.md",
+        (
+            "---\n"
+            "tag: correction\n"
+            "target: cortex-memory/reference/does-not-exist.md\n"
+            "---\n"
+            "\n"
+            "This correction points at a nonexistent page.\n"
+        ),
+    )
+    report = stage_b.run(vault)
+    assert report.routed_target == 0
+    assert report.unclassified == 1
+
+    # Note moved to .failed/, surface written for thinking.
+    assert _failed_path(vault, "2026-08-28-nowhere.md").exists()
+    surfaces = list((vault / "inner" / "surface").glob("*-stage-b-unclassified-*.md"))
+    assert len(surfaces) == 1
+
+
+def test_target_frontmatter_wins_over_body_line(vault: pathlib.Path) -> None:
+    """When both frontmatter ``target:`` and body ``Target:`` are
+    present and disagree, frontmatter wins (primary channel)."""
+    fm_target = _seed_target_page(
+        vault, "reference", "cozyhem-deployment", title="CozyHem Deployment"
+    )
+    body_target = _seed_target_page(
+        vault, "reference", "other-page", title="Other Page"
+    )
+    _drop_note(
+        vault,
+        "2026-08-30-mixed.md",
+        (
+            "---\n"
+            "tag: correction\n"
+            "target: cortex-memory/reference/cozyhem-deployment.md\n"
+            "---\n"
+            "\n"
+            "Target: cortex-memory/reference/other-page.md\n"
+            "\n"
+            "Content that must land on cozyhem-deployment, not other-page.\n"
+        ),
+    )
+    report = stage_b.run(vault)
+    assert report.routed_target == 1
+
+    fm_text = fm_target.read_text(encoding="utf-8")
+    assert "Content that must land on cozyhem-deployment" in fm_text
+
+    # Body-target page was NOT touched.
+    body_text = body_target.read_text(encoding="utf-8")
+    assert "Content that must land on cozyhem-deployment" not in body_text
+    assert "## Update" not in body_text
+
+
+def test_target_correction_tag_with_target_merges(vault: pathlib.Path) -> None:
+    """``tag: correction`` — previously a silently-unclassified tag —
+    routes cleanly through the target rule when a resolvable target
+    is declared. This is the primary incident-fix case."""
+    target = _seed_target_page(vault, "reference", "cozyhem-deployment")
+    _drop_note(
+        vault,
+        "2026-08-28-011337-correction.md",
+        (
+            "---\n"
+            "tag: correction\n"
+            "target: cortex-memory/reference/cozyhem-deployment.md\n"
+            "---\n"
+            "\n"
+            "First-round correction body.\n"
+        ),
+    )
+    report = stage_b.run(vault)
+    assert report.routed_target == 1
+    assert report.unclassified == 0
+
+    text = target.read_text(encoding="utf-8")
+    assert "First-round correction body." in text
+
+
+def test_target_for_memory_worker_tag_no_target_is_unclassified(
+    vault: pathlib.Path,
+) -> None:
+    """``tag: for-memory-worker`` without any target declaration →
+    unclassified (safe failure — the tag alone doesn't authorize a
+    write; the design keeps ``target absent`` as a thinking judgment
+    call). Documents the deterministic outcome for the tag."""
+    _drop_note(
+        vault,
+        "2026-08-28-012511-for-memory-worker.md",
+        (
+            "---\n"
+            "tag: for-memory-worker\n"
+            "---\n"
+            "\n"
+            "Some vague instructions for the memory worker with no target.\n"
+        ),
+    )
+    report = stage_b.run(vault)
+    assert report.routed_target == 0
+    assert report.unclassified == 1
+    assert _failed_path(
+        vault, "2026-08-28-012511-for-memory-worker.md"
+    ).exists()
+
+
+def test_target_reference_tag_merges_instead_of_creating_duplicate(
+    vault: pathlib.Path,
+) -> None:
+    """``tag: reference`` + resolvable target → merges into the target
+    instead of creating a new timestamped ``reference/<filename>.md``.
+    Verifies the target route runs BEFORE the concept route in the
+    classification chain (design's key ordering decision)."""
+    target = _seed_target_page(vault, "reference", "cozyhem-deployment")
+    _drop_note(
+        vault,
+        "2026-08-30-091500-reference.md",
+        (
+            "---\n"
+            "tag: reference\n"
+            "target: cortex-memory/reference/cozyhem-deployment.md\n"
+            "---\n"
+            "\n"
+            "Additional deployment reference content.\n"
+        ),
+    )
+    report = stage_b.run(vault)
+    assert report.routed_target == 1
+    assert report.routed_concept == 0
+
+    # Merged into the target — original page carries the update.
+    text = target.read_text(encoding="utf-8")
+    assert "Additional deployment reference content." in text
+    # No duplicate atomic note was created under reference/.
+    duplicate = vault / "cortex-memory" / "reference" / "2026-08-30-091500-reference.md"
+    assert not duplicate.exists()
+
+
+def test_target_write_acquires_vault_lock_exclusive(
+    vault: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The target writer serializes access to the destination via
+    :func:`vault_lock.acquire` in ``EXCLUSIVE`` mode, matching every
+    other vault-mutating writer in ``alice_thinking`` (CLAUDE.md
+    concurrency contract). Spy on the acquire call to prove the mode
+    and target path."""
+    target = _seed_target_page(vault, "reference", "cozyhem-deployment")
+    from alice_thinking import vault_lock
+
+    calls: list[tuple[pathlib.Path, vault_lock.LockMode]] = []
+    real_acquire = vault_lock.acquire
+
+    def spy_acquire(path, *, mode=vault_lock.LockMode.EXCLUSIVE, **kw):
+        calls.append((path, mode))
+        return real_acquire(path, mode=mode, **kw)
+
+    monkeypatch.setattr(stage_b.vault_lock, "acquire", spy_acquire)
+
+    _drop_note(
+        vault,
+        "2026-08-30-locked.md",
+        (
+            "---\n"
+            "tag: correction\n"
+            "target: cortex-memory/reference/cozyhem-deployment.md\n"
+            "---\n"
+            "\n"
+            "Correction body.\n"
+        ),
+    )
+    report = stage_b.run(vault)
+    assert report.routed_target == 1
+
+    assert len(calls) == 1
+    locked_path, locked_mode = calls[0]
+    assert locked_path == target
+    assert locked_mode is vault_lock.LockMode.EXCLUSIVE
+
+
 # ---------- conflict-candidate route ----------
 
 

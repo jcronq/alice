@@ -26,13 +26,20 @@ Routing chain (first match wins)
    has a deterministic marker (``ate ``, ``workout:``, etc.) —
    write a JSON line to ``events.jsonl`` AND append a one-liner to
    today's daily.
-3. **New concept** — `tag` in :data:`CONCEPT_TAGS` — write or
+3. **Target update** — frontmatter ``target:`` (or a ``Target:``
+   line in the first ~10 body lines) that resolves to an existing
+   vault page — append a dated ``## Update`` section, bump
+   ``updated:``. Tag-agnostic; runs before concept so tagged notes
+   with a resolvable target merge instead of creating duplicate
+   atomic notes. See :data:`TARGET_TAGS` for the vocabulary that
+   most commonly rides this route.
+4. **New concept** — `tag` in :data:`CONCEPT_TAGS` — write or
    merge an atomic vault note in the matching folder.
-4. **Conflict candidate** — `tag == "conflict-candidate"` —
+5. **Conflict candidate** — `tag == "conflict-candidate"` —
    write to ``cortex-memory/conflicts/``.
-5. **Noise** — `tag == "noise"` or `route == "noise"` — append a
+6. **Noise** — `tag == "noise"` or `route == "noise"` — append a
    one-liner to today's daily.
-6. **Unclassified** — no rule matched — write a
+7. **Unclassified** — no rule matched — write a
    ``conflict-candidate`` surface to ``inner/surface/`` AND move
    the note to ``.failed/`` so the surface doesn't re-emit on the
    next tick.
@@ -60,6 +67,7 @@ import pathlib
 import re
 from typing import Any, Callable, Optional
 
+from alice_thinking import vault_lock
 from indexer.yaml_lite import split_frontmatter
 
 
@@ -100,6 +108,18 @@ CONCEPT_TAGS = frozenset(
 #: sensor data live here.
 NOISE_TAGS = frozenset({"noise", "low-signal", "sensor"})
 
+#: Frontmatter ``tag`` values that most commonly ride the target
+#: route — Speaking uses these when correcting or extending an
+#: existing vault page. Kept as a documented vocabulary so future
+#: readers don't have to grep the incident that motivated the route
+#: (2026-08-27 seven-bounce, see
+#: ``research/2026-08-31-memory-worker-router-target-route-design.md``).
+#:
+#: NOTE: The target route itself is tag-agnostic — any note with a
+#: resolvable target merges regardless of tag. This set is
+#: informational; membership does not affect routing.
+TARGET_TAGS = frozenset({"correction", "for-memory-worker"})
+
 #: Folder for each concept tag. ``person`` is special — the vault
 #: convention is plural ``people/``.
 _CONCEPT_FOLDER = {
@@ -131,6 +151,17 @@ _EVENT_BODY_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
 #: start of the first non-empty body line.
 _ACTIVITY_BODY_RE = re.compile(r"^\s*\d{1,2}:\d{2}\b")
 
+#: Body pattern used by :func:`_route_target` when the note lacks a
+#: frontmatter ``target:`` field. Matches ``Target: <path-or-slug>``
+#: anywhere on the line; the router only inspects the first ~10
+#: non-empty body lines to bound scan cost and keep the fallback
+#: predictable (Speaking's convention places the marker near the
+#: top of the note body).
+_TARGET_BODY_RE = re.compile(r"^\s*Target(?:\s+vault\s+page)?[^:]*:\s*(.+?)\s*$", re.IGNORECASE)
+
+#: How many non-empty body lines to scan for a ``Target:`` fallback.
+_TARGET_BODY_SCAN_LINES = 10
+
 
 # ---------- routing data model ----------
 
@@ -155,6 +186,7 @@ class DrainReport:
     scanned: int = 0
     routed_activity: int = 0
     routed_event: int = 0
+    routed_target: int = 0
     routed_concept: int = 0
     routed_conflict: int = 0
     routed_noise: int = 0
@@ -268,6 +300,142 @@ def _route_event(fm: dict[str, Any], body: str) -> Optional[Route]:
     return None
 
 
+def _extract_target(fm: dict[str, Any], body: str) -> Optional[str]:
+    """Return the declared target string (frontmatter preferred, body fallback).
+
+    Primary channel: frontmatter ``target:`` field. Fallback: a
+    ``Target: <path-or-slug>`` line in the first
+    :data:`_TARGET_BODY_SCAN_LINES` non-empty body lines. Both channels
+    return the raw declared string — normalization and existence check
+    are :func:`_resolve_target`'s job.
+    """
+    raw = fm.get("target")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    scanned = 0
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        scanned += 1
+        if scanned > _TARGET_BODY_SCAN_LINES:
+            break
+        m = _TARGET_BODY_RE.match(stripped)
+        if m:
+            candidate = m.group(1).strip()
+            if candidate:
+                return candidate
+    return None
+
+
+def _resolve_target(vault: pathlib.Path, target_str: str) -> Optional[pathlib.Path]:
+    """Resolve a declared target to an existing vault file.
+
+    Resolution order (per
+    ``research/2026-08-31-memory-worker-router-target-route-design.md``):
+
+    1. Normalize: strip a leading ``cortex-memory/`` prefix and trailing
+       ``.md`` for uniform handling.
+    2. If the normalized string contains a folder segment, treat it as
+       an exact vault-relative path — try ``vault/cortex-memory/<path>.md``.
+    3. Otherwise, treat it as a bare slug — search
+       ``cortex-memory/**/<slug>.md`` for the first match. If the
+       cortex-index DB exists at ``inner/state/cortex-index.db``, prefer
+       the O(1) DB lookup (already a stage B dependency via predicate
+       extraction — no new dependency added).
+
+    Returns the absolute path on success, ``None`` if the target does
+    not resolve to an existing file. A non-resolving target is the safe
+    failure mode — the caller falls through to unclassified so thinking
+    (not the deterministic worker) makes the "create-or-not" call.
+    """
+    normalized = (target_str or "").strip()
+    if not normalized:
+        return None
+    if normalized.startswith("cortex-memory/"):
+        normalized = normalized[len("cortex-memory/"):]
+    normalized = normalized.rstrip("/")
+    if not normalized:
+        return None
+    # Path-style target: contains a folder segment.
+    if "/" in normalized:
+        base = vault / "cortex-memory" / normalized
+        candidates = [base]
+        if not normalized.endswith(".md"):
+            candidates.append(base.with_suffix(base.suffix + ".md"))
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    return candidate
+            except OSError:
+                continue
+        return None
+    # Slug-style target: search the vault for a matching filename.
+    slug = normalized[:-3] if normalized.endswith(".md") else normalized
+    # Prefer cortex-index.db when present — O(1) lookup vs an rglob.
+    db_path = vault / "inner" / "state" / "cortex-index.db"
+    if db_path.is_file():
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                row = conn.execute(
+                    "SELECT path FROM notes WHERE slug = ? LIMIT 1", (slug,)
+                ).fetchone()
+            finally:
+                conn.close()
+            if row and row[0]:
+                candidate = vault / "cortex-memory" / row[0]
+                if candidate.is_file():
+                    return candidate
+        except Exception as exc:  # noqa: BLE001 — DB is best-effort
+            logger.debug(
+                "memory-worker stage_b: cortex-index slug lookup failed for %s: %s",
+                slug,
+                exc,
+            )
+    # Fallback: walk the vault. Cheap for a few-thousand-note vault.
+    vault_root = vault / "cortex-memory"
+    if not vault_root.is_dir():
+        return None
+    try:
+        for md in vault_root.rglob(f"{slug}.md"):
+            if md.is_file():
+                return md
+    except OSError:
+        return None
+    return None
+
+
+def _route_target(
+    fm: dict[str, Any], body: str, vault: pathlib.Path
+) -> Optional[Route]:
+    """Target update → merge dated section into an existing vault page.
+
+    Trigger: a frontmatter ``target:`` field (primary) or a ``Target:``
+    body line (fallback) that resolves to an existing vault file. The
+    rule is tag-agnostic — a note tagged ``correction``,
+    ``for-memory-worker``, or even ``reference`` merges into its target
+    if one is declared, so we don't create a duplicate atomic note.
+
+    An unresolvable target returns ``None``, which lets the classifier
+    fall through to the next rule (concept, ..., unclassified). Safe
+    failure: silently missing targets surface for thinking to decide
+    rather than being materialized as new pages.
+    """
+    target_str = _extract_target(fm, body)
+    if not target_str:
+        return None
+    resolved = _resolve_target(vault, target_str)
+    if resolved is None:
+        return None
+    return Route(
+        "target",
+        {"target_path": resolved, "target_declared": target_str},
+    )
+
+
 def _route_concept(fm: dict[str, Any], body: str, filename: str) -> Optional[Route]:
     """New concept → atomic vault note (or merge).
 
@@ -332,12 +500,23 @@ def _route_noise(fm: dict[str, Any], _body: str) -> Optional[Route]:
     return None
 
 
-def _classify(fm: dict[str, Any], body: str, filename: str) -> Optional[Route]:
+def _classify(
+    fm: dict[str, Any], body: str, filename: str, vault: pathlib.Path
+) -> Optional[Route]:
     """Run the routing chain. First match wins; ``None`` means
-    unclassified (handled by the caller)."""
+    unclassified (handled by the caller).
+
+    The ``vault`` argument threads through so :func:`_route_target`
+    can resolve declared targets against the live vault (exact-path
+    check + optional ``cortex-index.db`` slug lookup). The target
+    route is inserted BEFORE concept so a tagged note carrying a
+    resolvable target merges into the existing page instead of
+    creating a duplicate atomic note.
+    """
     for fn in (
         lambda: _route_activity(fm, body),
         lambda: _route_event(fm, body),
+        lambda: _route_target(fm, body, vault),
         lambda: _route_concept(fm, body, filename),
         lambda: _route_conflict(fm, body, filename),
         lambda: _route_noise(fm, body),
@@ -771,6 +950,127 @@ def _write_concept(
     target.write_text(header, encoding="utf-8")
 
 
+def _bump_updated_field(raw: str, new_value: str) -> str:
+    """Return ``raw`` with the frontmatter ``updated:`` field set to
+    ``new_value``.
+
+    Operates line-by-line on the raw text so we preserve the field
+    order and formatting choices of the target note. Behavior:
+
+    * No frontmatter fence → return ``raw`` unchanged (the caller's
+      merge writer still appends the update section; targets without
+      frontmatter are rare and don't warrant synthesizing one).
+    * ``updated:`` present → replace its value with ``new_value``.
+    * ``updated:`` absent → insert ``updated: <value>`` immediately
+      before the closing fence so it lands in the natural bookkeeping
+      block.
+
+    Not a full YAML editor — anchors, block-scalars, and nested maps
+    are not handled. Vault frontmatter uses flat scalars + flow lists,
+    which this covers.
+    """
+    lines = raw.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return raw
+    end_idx = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end_idx = i
+            break
+    if end_idx is None:
+        return raw
+    for i in range(1, end_idx):
+        if re.match(r"^updated\s*:", lines[i]):
+            lines[i] = f"updated: {new_value}"
+            return "\n".join(lines)
+    # No updated: field — insert before closing fence.
+    lines.insert(end_idx, f"updated: {new_value}")
+    return "\n".join(lines)
+
+
+def _atomic_write_text(path: pathlib.Path, content: str) -> None:
+    """Write ``content`` to ``path`` via ``<path>.tmp`` + :func:`os.replace`.
+
+    Matches the tmp+replace pattern used elsewhere in ``alice_thinking``
+    (see :mod:`alice_thinking.backoff` and
+    :mod:`alice_thinking.workflow.projection`). Guarantees a reader can
+    never observe a partial write — the caller either sees the old file
+    or the new file, never a torn one.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _write_target(
+    vault: pathlib.Path,
+    fm: dict[str, Any],
+    body: str,
+    filename: str,
+    target_path: pathlib.Path,
+) -> str:
+    """Append a dated update section to an existing vault page.
+
+    Under an EXCLUSIVE :mod:`alice_thinking.vault_lock` hold on
+    ``target_path``:
+
+    1. Read the target's current content.
+    2. Bump the frontmatter ``updated:`` field to today's date.
+    3. Append a ``## Update YYYY-MM-DD (from <filename>)`` section,
+       followed by the inbox note's body verbatim.
+    4. Atomic write via tmp+replace.
+
+    The append is intentional — the memory worker is mechanical, not
+    semantic. Consolidation is thinking's job downstream. Returns the
+    target slug so the caller can write a ``became:`` trailer on the
+    consumed inbox note.
+    """
+    target_slug = target_path.stem
+    today = _today().isoformat()
+    with vault_lock.acquire(target_path, mode=vault_lock.LockMode.EXCLUSIVE):
+        try:
+            raw = target_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(
+                f"stage_b _write_target: failed to read target {target_path}: {exc}"
+            ) from exc
+        bumped = _bump_updated_field(raw, today)
+        if bumped and not bumped.endswith("\n"):
+            bumped += "\n"
+        section = (
+            f"\n## Update {today} (from {filename})\n\n"
+            f"{body.strip()}\n"
+        )
+        _atomic_write_text(target_path, bumped + section)
+    return target_slug
+
+
+def _append_became_trailer(note: pathlib.Path, target_slug: str) -> None:
+    """Append a ``became:`` trailer to ``note`` in place.
+
+    Mirrors thinking's consume convention: a trailing YAML-like block
+    separated by ``---`` records what the note produced or updated. The
+    trailer lands in the inbox file *before* :func:`_consume` moves it
+    to ``.consumed/``, so the archived copy carries its own provenance.
+    """
+    trailer = (
+        f"\n---\n"
+        f"processed_at: {_now_iso_tz()}\n"
+        f"became: [[{target_slug}]] (update appended)\n"
+        f"route: memory-worker stage_b target\n"
+    )
+    try:
+        existing = note.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(
+            f"stage_b _append_became_trailer: failed to read {note}: {exc}"
+        ) from exc
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    note.write_text(existing + trailer, encoding="utf-8")
+
+
 def _write_conflict(
     vault: pathlib.Path, fm: dict[str, Any], body: str, slug: str
 ) -> None:
@@ -974,7 +1274,7 @@ def _process_one(
         report.malformed += 1
         return
 
-    route = _classify(fm, body, note.name)
+    route = _classify(fm, body, note.name, vault)
     if route is None:
         # Unclassified — surface for thinking, move note to .failed/.
         try:
@@ -994,6 +1294,7 @@ def _process_one(
         return
 
     # Dispatch. A writer raising leaves the note in the inbox.
+    target_slug_for_trailer: Optional[str] = None
     try:
         if route.kind == "activity":
             _write_activity(vault, fm, body, note.name)
@@ -1001,6 +1302,11 @@ def _process_one(
         elif route.kind == "event":
             _write_event(vault, fm, body, note.name, route.payload["event_type"])
             report.routed_event += 1
+        elif route.kind == "target":
+            target_slug_for_trailer = _write_target(
+                vault, fm, body, note.name, route.payload["target_path"]
+            )
+            report.routed_target += 1
         elif route.kind == "concept":
             _write_concept(
                 vault,
@@ -1029,6 +1335,24 @@ def _process_one(
         )
         report.errors += 1
         return
+
+    # Target route writes a ``became:`` trailer into the inbox note
+    # before consume so the archived copy in ``.consumed/`` carries its
+    # own provenance (mirrors thinking's convention when it drains
+    # ``.failed/`` by hand). Trailer failure is soft — we log and
+    # proceed to consume, since the durable target write already
+    # succeeded and blocking consume would re-process the note next
+    # tick and double-append.
+    if target_slug_for_trailer is not None:
+        try:
+            _append_became_trailer(note, target_slug_for_trailer)
+        except (OSError, RuntimeError) as exc:
+            logger.warning(
+                "memory-worker stage_b: became-trailer append failed for %s: %s "
+                "— proceeding to consume anyway",
+                note,
+                exc,
+            )
 
     # Vault write succeeded — atomic-rename to .consumed/. If the
     # rename fails the writer's output is durable but the note will
