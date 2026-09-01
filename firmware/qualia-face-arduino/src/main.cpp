@@ -35,6 +35,13 @@ constexpr char WIFI_PASSWORD[] = "JPfarm1959";
 constexpr uint16_t HTTP_PORT = 8080;
 constexpr uint32_t TICK_MS = 50;
 constexpr int SCALE = 10;
+// Empirical nudge to compensate for the round display's cutout being
+// slightly off-center from the 480x480 logical panel — the bare
+// `(W - face_w_scaled) / 2` centering renders ~few-percent up-and-left
+// of the visible round center. Positive values shift the face right /
+// down. Adjust if a new panel batch shows different mounting tolerance.
+constexpr int CENTER_OFFSET_X = 10;
+constexpr int CENTER_OFFSET_Y = 20;
 
 round21::Panel panel;
 face::Animator animator;
@@ -106,8 +113,8 @@ void blitScaledToFramebuffer() {
     const int H = panel.height();
     const int face_w_scaled = FACE_TILE_W * SCALE;
     const int face_h_scaled = FACE_TILE_H * SCALE;
-    const int origin_x = (W - face_w_scaled) / 2;
-    const int origin_y = (H - face_h_scaled) / 2;
+    const int origin_x = (W - face_w_scaled) / 2 + CENTER_OFFSET_X;
+    const int origin_y = (H - face_h_scaled) / 2 + CENTER_OFFSET_Y;
 
     for (int sy = 0; sy < FACE_TILE_H; sy++) {
         for (int sx = 0; sx < FACE_TILE_W; sx++) {
