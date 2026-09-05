@@ -521,7 +521,11 @@ def _delta_decisions(
         values = [ev.value_num for ev in group if ev.value_num is not None]
         first = min(group, key=lambda ev: ev.observed_at)
         last = max(group, key=lambda ev: ev.observed_at)
-        delta = max(values) - min(values)
+        # Round the observed delta before comparison so floating-point
+        # noise (e.g. 0.25 - 0.20 == 0.04999999999999998) doesn't push
+        # an intended-threshold value below the cut. Sensors report at
+        # ~2 decimals of precision; 6 is a safe headroom.
+        delta = round(max(values) - min(values), 6)
         room = next(
             (ev.room for ev in group if ev.room), None
         )
