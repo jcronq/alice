@@ -43,6 +43,7 @@ from . import (
     stage_b,
     stage_c,
     stage_d,
+    thalamus,
 )
 
 
@@ -205,6 +206,17 @@ def main() -> int:
     # vault root), not on ``--state-dir``.
     drain = stage_b.run(mind, journal_path=journal_path)
 
+    # Phase 2b: Thalamus intake drain. Same 30-min cadence as the
+    # inner/notes drain above. Applies the coalescing / aggregation
+    # rules from the thalamus relay design to
+    # ``inner/thalamus/intake/`` and produces filtered/dropped
+    # decisions in the sibling directories. No-op when the thalamus
+    # directory tree is absent (deployments that haven't rolled out
+    # the Phase 1 scaffold yet). See
+    # ``research/2026-06-02-thalamus-relay-layer.md`` §2.4 and
+    # ``research/2026-08-07-agent-home-automation-integration-architecture.md`` §2.2.
+    thalamus_report = thalamus.run(mind)
+
     # Phase 3: Stage C vault grooming. UNION trigger over structural
     # debt + decay + orphan + broken-link signals; incremental cap
     # per category keeps wake budget bounded.
@@ -237,6 +249,7 @@ def main() -> int:
         ),
         **report.to_dict(),
         **{f"stage_b_{k}": v for k, v in drain.to_dict().items()},
+        **{f"thalamus_{k}": v for k, v in thalamus_report.to_dict().items()},
         **{f"stage_c_{k}": v for k, v in groom.to_dict().items()},
         stage_c_ran=bool(groom.ran),
         **{f"stage_d_{k}": v for k, v in synth.to_dict().items()},
