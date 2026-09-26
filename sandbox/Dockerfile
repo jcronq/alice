@@ -26,7 +26,10 @@ FROM debian:trixie-slim AS base
 
 ARG USER_ID=1000
 ARG GROUP_ID=1000
-ARG SIGNAL_CLI_VERSION=0.14.1
+# 0.14.5 is the floor: 0.14.1–0.14.4.1 drop ALL incoming sealed-sender
+# messages with `getServerGuid(...) must not be null` after Signal's
+# 2026-06-11 server change (upstream signal-cli #2059). Do not downgrade.
+ARG SIGNAL_CLI_VERSION=0.14.5
 ARG S6_OVERLAY_VERSION=3.2.2.0
 ARG TARGETARCH
 
