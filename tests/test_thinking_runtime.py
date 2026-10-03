@@ -59,6 +59,28 @@ def test_runner_returns_prompt_and_spec(tmp_path) -> None:
     assert spec.append_system_prompt == "You are Eve."
 
 
+def test_runner_prompt_includes_hard_stop_deadline_when_bounded(
+    tmp_path,
+) -> None:
+    """P3 of the 2026-10-02 wake-death-loop fix: when a non-zero
+    max_seconds budget is configured, the composed prompt must carry
+    an explicit hard-stop deadline so the model can pace itself inside
+    the budget. Zero budget → no deadline block (preserves prior shape).
+    """
+    runner = PhaseRunner(config=PhaseConfig(max_seconds=2400))
+    prompt, _ = runner.run(Phase.ACTIVE, _ctx(tmp_path))
+    assert "Wake start (UTC):" in prompt
+    assert "Hard-stop (UTC):" in prompt
+    assert "max_wake_seconds=2400" in prompt
+    assert "Pace yourself" in prompt
+
+    # Zero budget → no deadline block (back-compat with unbounded wakes).
+    runner_unbounded = PhaseRunner()
+    prompt_u, _ = runner_unbounded.run(Phase.ACTIVE, _ctx(tmp_path))
+    assert "Hard-stop (UTC):" not in prompt_u
+    assert "Wake start (UTC):" not in prompt_u
+
+
 def test_runner_quick_uses_quick_template(tmp_path) -> None:
     runner = PhaseRunner()
     prompt, _ = runner.run(Phase.ACTIVE, _ctx(tmp_path, quick=True))

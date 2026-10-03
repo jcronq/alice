@@ -419,6 +419,99 @@ async def test_pi_kernel_silent_suppresses_drop_event(fake_pi_env) -> None:
     assert cap.events == []
 
 
+@pytest.mark.asyncio
+async def test_pi_kernel_timeout_fires_closeout_turn(
+    monkeypatch, tmp_path
+) -> None:
+    """Wake death-loop fix (2026-10-02): when the main turn trips the
+    max_seconds budget, PiKernel must fire ONE close-out turn with its
+    own short budget before returning error=timeout. The close-out gives
+    the model a chance to persist Step-5 state + an active-thread
+    handoff. Without it, 39+ consecutive wakes died silently."""
+    from kernels.pi import kernel as _pi_kernel
+
+    # Patch the main _drive to hang (triggers TimeoutError inside the
+    # asyncio.timeout block). Record close-out invocation so we assert
+    # it fired exactly once after the timeout.
+    calls: list[dict] = []
+
+    import asyncio as _asyncio
+
+    async def fake_drive(self, argv, spec, translator, handlers):
+        calls.append({"prompt_argv": argv, "max_seconds": spec.max_seconds})
+        if len(calls) == 1:
+            # First call is the main wake — hang so the outer
+            # asyncio.timeout fires.
+            await _asyncio.sleep(10)
+        # Second call is the close-out — return promptly to simulate
+        # the model writing state and exiting.
+        return
+
+    monkeypatch.setattr(_pi_kernel.PiKernel, "_drive", fake_drive)
+    # Short-circuit the models_staging + unsupported-fields probes.
+    monkeypatch.setattr(
+        _pi_kernel, "ensure_pi_models_json", lambda emit=None: None
+    )
+
+    cap = CapturingEmitter()
+    kernel = PiKernel(cap, correlation_id="t-closeout")
+    result = await kernel.run(
+        "main prompt",
+        KernelSpec(model="gpt-5.3-codex", max_seconds=1),
+    )
+
+    # One main call + one close-out call.
+    assert len(calls) == 2
+    # Close-out budget is bounded (~120s per module constant).
+    assert calls[1]["max_seconds"] == _pi_kernel._CLOSEOUT_MAX_SECONDS
+    # Prompt argv for the close-out carries the handoff instructions.
+    joined = " ".join(str(x) for x in calls[1]["prompt_argv"])
+    assert "close-out" in joined
+    assert "active-thread.md" in joined
+    # Timeout + closeout_ok events both surfaced; result still signals
+    # the main-wake timeout so the caller can log + propagate.
+    event_names = [e["event"] for e in cap.events]
+    assert "timeout" in event_names
+    assert "closeout_ok" in event_names
+    assert result.error == "timeout"
+    assert result.is_error is True
+
+
+@pytest.mark.asyncio
+async def test_pi_kernel_closeout_timeout_still_returns_timeout_result(
+    monkeypatch, tmp_path
+) -> None:
+    """If the close-out turn ALSO times out, PiKernel must still return
+    error=timeout cleanly — a wedged close-out can't leak into the
+    outer error path."""
+    from kernels.pi import kernel as _pi_kernel
+    import asyncio as _asyncio
+
+    async def hanging_drive(self, argv, spec, translator, handlers):
+        # Both main AND close-out hang.
+        await _asyncio.sleep(10)
+
+    monkeypatch.setattr(_pi_kernel.PiKernel, "_drive", hanging_drive)
+    monkeypatch.setattr(
+        _pi_kernel, "ensure_pi_models_json", lambda emit=None: None
+    )
+    # Shorten the close-out budget to keep the test fast.
+    monkeypatch.setattr(_pi_kernel, "_CLOSEOUT_MAX_SECONDS", 1)
+
+    cap = CapturingEmitter()
+    kernel = PiKernel(cap)
+    result = await kernel.run(
+        "main prompt",
+        KernelSpec(model="gpt-5.3-codex", max_seconds=1),
+    )
+
+    assert result.error == "timeout"
+    assert result.is_error is True
+    event_names = [e["event"] for e in cap.events]
+    assert "timeout" in event_names
+    assert "closeout_timeout" in event_names
+
+
 def test_pi_kernel_argv_drops_tools_without_pi_equivalent() -> None:
     """WebFetch and WebSearch have no pi built-in; they drop
     silently. If the operator's allowlist is ALL drops, --tools is

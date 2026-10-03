@@ -31,6 +31,7 @@ own context.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace as _dc_replace
 from importlib import resources
 from typing import Any, Optional
 
@@ -49,6 +50,51 @@ from .translator import PiEventTranslator
 
 
 __all__ = ["PiKernel"]
+
+
+# Close-out budget — when the main wake trips its max_seconds, fire ONE
+# more turn with this budget so the model can persist state before the
+# process exits (Step-5 summary, active-thread.md handoff, daily note
+# line). Keeping it short (~2 min) bounds damage if the close-out itself
+# hangs; the outer s6 WAKE_TIMEOUT=3600s remains the ultimate backstop.
+_CLOSEOUT_MAX_SECONDS = 120
+
+
+# Prompt sent to the close-out turn. Deliberately prescriptive — the
+# model has very little budget here and shouldn't reason about what to
+# do, only execute. See wake death-loop fix (2026-10-02):
+# 39+ consecutive wakes were hard-killed at the outer 60-min timeout
+# with no state persisted; this converts the hard kill into a graceful
+# handoff.
+_CLOSEOUT_PROMPT = """\
+Your main wake just hit the hard-stop budget and was killed mid-work. \
+You have a tight ~120-second close-out budget. Do exactly these steps, \
+nothing else:
+
+1. Append a brief "Step 5 — close (interrupted)" summary line to the \
+wake file you wrote in Step 1 at \
+`~/alice-mind/inner/thoughts/<today-UTC>/*-wake.md` (today's UTC date, \
+newest file). Note that the hard-stop fired and what you had just \
+finished.
+
+2. Write or update `~/alice-mind/inner/state/active-thread.md` with \
+the exact remaining next step so the next wake picks up cleanly. \
+Use this format:
+
+   ---
+   topic: <one-line topic you were working on>
+   last_action: <what you had just completed>
+   next_step: <concrete next action>
+   created: <ISO8601 UTC timestamp>
+   ---
+
+3. Append a single-line entry to today's daily note at \
+`~/alice-mind/cortex-memory/dailies/<today-UTC>.md` noting the \
+interrupted wake and the handoff.
+
+Then stop. Do not start new work. Do not drain the inbox. Do not groom \
+the vault. This is a graceful handoff — persist state and exit.
+"""
 
 
 def _thinking_to_pi_arg(level: Optional[ThinkingLevel]) -> str:
@@ -207,9 +253,48 @@ class PiKernel:
                 await self._drive(argv, spec, translator, handlers)
         except asyncio.TimeoutError:
             self._emit("timeout", max_seconds=spec.max_seconds)
+            # Convert the hard kill into a graceful handoff: fire ONE
+            # short turn so the model can persist Step-5 + active-thread
+            # state before the process exits. The main translator's
+            # partial state is preserved — the close-out writes files
+            # only, no kernel-result contamination.
+            await self._run_closeout(spec)
             return translator.to_kernel_result(error="timeout", is_error=True)
 
         return translator.to_kernel_result()
+
+    async def _run_closeout(self, spec: KernelSpec) -> None:
+        """Fire a short close-out turn after the main wake times out.
+
+        Uses a fresh translator (silent — we don't need the output) so
+        the main wake's partial state survives untouched for the caller.
+        Any failure here (second timeout, pi subprocess exits non-zero,
+        unexpected event-stream error) is swallowed and logged — the
+        caller still gets ``error="timeout"`` and the outer s6
+        ``WAKE_TIMEOUT`` is the ultimate backstop.
+        """
+        closeout_spec = _dc_replace(spec, max_seconds=_CLOSEOUT_MAX_SECONDS)
+        closeout_argv = self._build_argv(_CLOSEOUT_PROMPT, closeout_spec)
+        # Silent translator — close-out output isn't surfaced to handlers
+        # or the final KernelResult; it exists only to drive the pi
+        # subprocess side effects (file writes) to completion.
+        closeout_translator = PiEventTranslator(
+            (lambda *a, **k: None), short_cap=self._cap
+        )
+        try:
+            async with asyncio.timeout(_CLOSEOUT_MAX_SECONDS):
+                await self._drive(
+                    closeout_argv, closeout_spec, closeout_translator, []
+                )
+            self._emit("closeout_ok", max_seconds=_CLOSEOUT_MAX_SECONDS)
+        except asyncio.TimeoutError:
+            self._emit("closeout_timeout", max_seconds=_CLOSEOUT_MAX_SECONDS)
+        except Exception as exc:  # noqa: BLE001
+            self._emit(
+                "closeout_exception",
+                type=type(exc).__name__,
+                message=str(exc),
+            )
 
     async def _drive(
         self,

@@ -219,7 +219,12 @@ class PhaseRunner:
             return load_prompt("thinking.quick")
         if ctx.inline_prompt:
             return ctx.inline_prompt
-        header = wake_timestamp_header(ctx.now)
+        # Thread the resolved max_seconds into the timestamp header so
+        # the prompt carries the hard-stop deadline. See the 2026-10-02
+        # wake-death-loop fix (P3) in :func:`wake_timestamp_header`.
+        header = wake_timestamp_header(
+            ctx.now, max_seconds=self._resolve_max_seconds(ctx)
+        )
         return self.loader.compose(
             phase, timestamp_header=header, injected_content=injected_content
         )

@@ -17,7 +17,7 @@ The active-mode prompt is built from two pieces:
 from __future__ import annotations
 
 import pathlib
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -25,17 +25,39 @@ from zoneinfo import ZoneInfo
 WAKE_TZ = ZoneInfo("America/New_York")
 
 
-def wake_timestamp_header(now: Optional[datetime] = None) -> str:
-    """Return a single-line wake-time header for the prompt.
+def wake_timestamp_header(
+    now: Optional[datetime] = None,
+    *,
+    max_seconds: int = 0,
+) -> str:
+    """Return the wake-time header for the prompt.
 
-    Format: ``Current local time: 2026-04-26 14:32 EDT (Sunday)``.
-    DST is handled by zoneinfo; the abbreviation isn't hardcoded.
+    The first line is the local time (``Current local time: 2026-04-26
+    14:32 EDT (Sunday)``). When ``max_seconds > 0``, three deadline
+    lines are appended so the model can pace itself inside the budget:
+    wake-start UTC, hard-stop UTC, and a short pacing directive. This
+    is the P3 half of the 2026-10-02 wake-death-loop fix — a 39-wake
+    streak was hard-killed at the outer 60-min timeout with no state
+    persisted, in large part because the model had no visible deadline
+    inside the prompt.
     """
     moment = (now or datetime.now(WAKE_TZ)).astimezone(WAKE_TZ)
-    return (
+    local_line = (
         "Current local time: "
         f"{moment.strftime('%Y-%m-%d %H:%M %Z')} ({moment.strftime('%A')})"
     )
+    if max_seconds <= 0:
+        return local_line
+    start_utc = moment.astimezone(timezone.utc)
+    stop_utc = start_utc + timedelta(seconds=max_seconds)
+    deadline_lines = [
+        f"Wake start (UTC): {start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}",
+        f"Hard-stop (UTC): {stop_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+        f" (max_wake_seconds={max_seconds})",
+        "Pace yourself. Finish any in-flight write before the hard-stop"
+        " or your work is lost.",
+    ]
+    return "\n".join([local_line, *deadline_lines])
 
 
 def build_wake_prompt(
