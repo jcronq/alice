@@ -73,6 +73,15 @@ class KernelSpec:
     ``thinking`` is a normalized effort level; AnthropicKernel maps
     it to ``ThinkingConfig`` and PiKernel maps it to its
     ``--thinking`` flag.
+
+    ``permission_mode`` is the SDK's permission gate (``default`` /
+    ``acceptEdits`` / ``plan`` / ``bypassPermissions`` / ``dontAsk`` /
+    ``auto``). ``None`` keeps the SDK default. Set
+    ``"bypassPermissions"`` for sandboxed daemons that need the agent
+    to Write/Edit outside the configured ``cwd`` + ``add_dirs`` surface
+    without the harness blocking on a human-permission prompt it can
+    never answer. Anthropic-specific; PiKernel ignores it and emits
+    a ``pi_spec_field_dropped`` event when populated.
     """
 
     model: str
@@ -91,6 +100,9 @@ class KernelSpec:
     # tasks instead of blocking the parent turn. Anthropic-specific;
     # PiKernel ignores (and emits a ``pi_spec_field_dropped`` event).
     hooks: Optional[dict] = None
+    # SDK permission gate — see class docstring. Anthropic-specific;
+    # PiKernel ignores (and emits a ``pi_spec_field_dropped`` event).
+    permission_mode: Optional[str] = None
 
 
 @dataclass

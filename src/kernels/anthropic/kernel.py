@@ -375,6 +375,8 @@ class AnthropicKernel:
             }
         if spec.hooks is not None:
             kwargs["hooks"] = spec.hooks
+        if spec.permission_mode is not None:
+            kwargs["permission_mode"] = spec.permission_mode
         return ClaudeAgentOptions(**kwargs)
 
 

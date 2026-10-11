@@ -141,7 +141,11 @@ _PI_TOOL_NAME_MAP: dict[str, Optional[str]] = {
 # pi backend is exactly the trap that hid the ``run_experiment``
 # MCP-tool wiring bug from us for days. New Anthropic-only fields
 # added to :class:`KernelSpec` should be appended here.
-_PI_UNSUPPORTED_SPEC_FIELDS: tuple[str, ...] = ("mcp_servers", "hooks")
+_PI_UNSUPPORTED_SPEC_FIELDS: tuple[str, ...] = (
+    "mcp_servers",
+    "hooks",
+    "permission_mode",
+)
 
 
 def _summarize_dropped_value(value: Any) -> str:

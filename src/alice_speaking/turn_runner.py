@@ -357,6 +357,15 @@ class TurnRunner:
             thinking="medium",
             append_system_prompt=self._system_prompt,
             hooks=self._hooks,
+            # Speaking runs headless in the s6-supervised ``alice-speaking``
+            # service with no human on the harness to answer a permission
+            # prompt. ``bypassPermissions`` lets Write/Edit reach paths
+            # outside ``cwd`` + ``add_dirs`` (e.g. new skill files under
+            # ``/state/worker/alice-skills/speaking/.claude/skills/``) that
+            # the SDK's default mode would block on. Thinking's parallel
+            # path (``alice_thinking/experiments/runner.py``) uses the pi
+            # ``--permission-mode dontAsk`` equivalent for the same reason.
+            permission_mode="bypassPermissions",
         )
 
     def _build_handlers(self, *, silent: bool) -> list:
