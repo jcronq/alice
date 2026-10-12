@@ -7,7 +7,7 @@ Sleep mode (23:00–06:59 local), Stage B. The harness selected this phase deter
 After draining notes (Step 2), run the existing groom-the-vault behavior. Invoke the **cortex-memory** skill at `.claude/skills/cortex-memory/SKILL.md` and pick **one** op:
 
 - Open dangling links in `cortex-memory/unresolved.md` → `ops/document`
-- Concept or research notes larger than 250 lines, or tl;drs with "and" → `ops/atomize` (never atomize dailies)
+- Notes flagged in today's `stage_c_candidates` from the `vault_health` event (the field applies archive/ exclusion + the coherence filter per [[2026-06-22-bloated-note-coherence-filter]]; raw line count is NOT the signal), or tl;drs with "and" → `ops/atomize` (never atomize dailies)
 - Orphan notes (zero incoming wikilinks) → `ops/link`
 - Broken wikilinks, stale tl;drs, drifted frontmatter → `ops/groom`
 - Recurring theme across recent dailies / consumed notes → `ops/promote`

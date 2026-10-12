@@ -71,7 +71,7 @@ python3 -m metrics.vault_health \
   --append --check-existing
 ```
 
-The remaining fields (`research_notes_last_night`, surfaces, `stage_c_candidates`, etc.) still come from the bash recipes below — only the four metrics that drifted moved into the module.
+The remaining fields (`research_notes_last_night`, surfaces, etc.) still come from the bash recipes below. `stage_c_candidates` is ALSO module-computed by `count_stage_c_candidates()` (gated with archive/ exclusion + the ARS coherence filter per [[2026-06-22-bloated-note-coherence-filter]]: >300 lines AND >25 H2 AND structural_inbound ≤ 2 AND age > 7d) — do not re-implement it in bash.
 
 Fields:
 
@@ -102,16 +102,7 @@ Fields:
 }
 ```
 
-`stage_c_candidates` measures Stage C workload — `bloated_notes` are vault `.md` files >250 lines (atomization candidates, excluding `dailies/`, `index.md`, `README.md`, `unresolved.md`); `stale_dailies` are dailies older than 90 days (archive-eligible). Compute via:
-
-```bash
-bloated=$(find ~/alice-mind/cortex-memory -name "*.md" \
-  ! -path "*/dailies/*" ! -name "index.md" ! -name "README.md" ! -name "unresolved.md" \
-  -exec wc -l {} \; | awk '$1 > 250 {count++} END {print count+0}')
-cutoff=$(date -d '90 days ago' '+%Y-%m-%d')
-stale=$(find ~/alice-mind/cortex-memory/dailies -name "*.md" | while read f; do
-  d=$(basename "$f" .md); [[ "$d" < "$cutoff" ]] && echo "$d"; done | wc -l)
-```
+`stage_c_candidates` measures Stage C workload — `bloated_notes` are atomization candidates (archive/ excluded, coherence filter applied per [[2026-06-22-bloated-note-coherence-filter]]); `stale_dailies` are dailies older than 90 days (archive-eligible). Both are module-computed by `count_stage_c_candidates()` in `metrics.vault_health` with the index DB. **Do not re-derive `bloated_notes` with a line-count recipe** — the 2026-10-12 06:25 UTC wake counted 160 phantom candidates by doing exactly that, while the module reported 0. Raw line count is NOT the atomization signal; many 300+ line notes are coherent specs.
 
 If `total` stays elevated or rises across consecutive days, Stage C is falling behind (debt accumulation — see [[2026-04-28-stage-c-debt-metric-design]]).
 
