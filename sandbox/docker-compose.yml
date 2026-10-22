@@ -49,6 +49,12 @@ services:
       # signal-cli is in the same container; no inter-service hop.
       SIGNAL_API: "http://localhost:8080"
       SIGNAL_LOG_FILE: "/state/daemon/signal-daemon.log"
+      # "1" → signal-outbound-proxy owns :8080 and logs every external
+      # JSON-RPC `send` (HA rest_command, notify CLI, scripts) to
+      # /state/worker/signal-outbound.jsonl; signal-cli moves to
+      # 127.0.0.1:18080. Speaking sees those sends on its next inbound
+      # Signal turn. "0" → legacy (signal-cli on :8080 directly).
+      SIGNAL_OUTBOUND_PROXY: "${SIGNAL_OUTBOUND_PROXY:-0}"
       STATE_DIR: "/state/worker"
       TZ: "${ALICE_TZ:-America/New_York}"
       PATH: "/home/alice/alice-tools/bin:/home/alice/.local/bin:/usr/local/bin:/usr/bin:/bin"

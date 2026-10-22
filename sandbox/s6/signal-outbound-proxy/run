@@ -1,0 +1,30 @@
+#!/command/with-contenv bash
+# Outbound-capture proxy in front of signal-cli (alice_speaking.infra.signal_outbound_proxy).
+#
+# Every non-Speaking sender (apartment HA rest_command, `notify` CLI,
+# scripts) POSTs JSON-RPC `send` to :8080. signal-cli records nothing
+# for its own clients' sends, so this proxy owns :8080, forwards to
+# signal-cli on 127.0.0.1:18080, and appends each `send` to
+# /state/worker/signal-outbound.jsonl. Speaking reads that file on its
+# next inbound Signal turn — it is never woken by it.
+#
+# Gated by SIGNAL_OUTBOUND_PROXY=1 (alice.env or compose env). The same
+# flag makes signal-daemon bind loopback:18080 instead of 0.0.0.0:8080,
+# so the two services flip together. Unset → idle, legacy topology.
+set -e
+set -a
+# shellcheck disable=SC1091
+[ -f /home/alice/.config/alice/alice.env ] && source /home/alice/.config/alice/alice.env
+set +a
+
+if [ "${SIGNAL_OUTBOUND_PROXY:-0}" != "1" ] || [ -z "${SIGNAL_ACCOUNT:-}" ]; then
+    exec sleep infinity
+fi
+
+export PYTHONPATH=/home/alice/alice/src
+export PYTHONUNBUFFERED=1
+export SIGNAL_PROXY_LISTEN="${SIGNAL_PROXY_LISTEN:-0.0.0.0:8080}"
+export SIGNAL_PROXY_UPSTREAM="${SIGNAL_PROXY_UPSTREAM:-http://127.0.0.1:18080}"
+
+exec s6-setuidgid alice /opt/alice-venv/bin/python -m alice_speaking.infra.signal_outbound_proxy \
+    >> /state/daemon/signal-outbound-proxy.log 2>&1

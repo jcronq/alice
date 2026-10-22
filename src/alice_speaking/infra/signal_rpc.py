@@ -138,7 +138,10 @@ class SignalRPC:
             await self._rpc(
                 "send",
                 params,
-                request_id=f"send-{i}",
+                # ``speaking-`` prefix lets the outbound-capture proxy
+                # (signal_outbound_proxy) tell Speaking's own sends from
+                # automations/scripts sharing the account.
+                request_id=f"speaking-send-{i}",
             )
 
     async def send_typing(self, recipient: str) -> None:

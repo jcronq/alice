@@ -28,7 +28,15 @@ if [ -z "${SIGNAL_ACCOUNT:-}" ]; then
 fi
 rm -f /state/daemon/signal-disabled
 
-# Bind 0.0.0.0:8080 so the worker container can reach via Docker network.
+# Default: bind 0.0.0.0:8080 directly (published to the host).
+# SIGNAL_OUTBOUND_PROXY=1: bind loopback:18080 and let the
+# signal-outbound-proxy service own :8080 so every external `send` is
+# captured to /state/worker/signal-outbound.jsonl.
+if [ "${SIGNAL_OUTBOUND_PROXY:-0}" = "1" ]; then
+    HTTP_BIND="${SIGNAL_CLI_HTTP_BIND:-127.0.0.1:18080}"
+else
+    HTTP_BIND="${SIGNAL_CLI_HTTP_BIND:-0.0.0.0:8080}"
+fi
 exec s6-setuidgid alice bash -c \
-    'exec signal-cli -a "$1" -o json daemon --http 0.0.0.0:8080 >> "$2" 2>&1' \
-    -- "$SIGNAL_ACCOUNT" "$LOG_FILE"
+    'exec signal-cli -a "$1" -o json daemon --http "$3" >> "$2" 2>&1' \
+    -- "$SIGNAL_ACCOUNT" "$LOG_FILE" "$HTTP_BIND"

@@ -191,6 +191,7 @@ COPY sandbox/s6/alice-thinker-watchdog/ /etc/s6-overlay/s6-rc.d/alice-thinker-wa
 COPY sandbox/s6/alice-viewer/           /etc/s6-overlay/s6-rc.d/alice-viewer/
 COPY sandbox/s6/init-state-perms/       /etc/s6-overlay/s6-rc.d/init-state-perms/
 COPY sandbox/s6/signal-daemon/          /etc/s6-overlay/s6-rc.d/signal-daemon/
+COPY sandbox/s6/signal-outbound-proxy/  /etc/s6-overlay/s6-rc.d/signal-outbound-proxy/
 
 # User bundle — copy the dir itself for `type`, then enumerate the
 # non-cozylobe `contents.d/` entries explicitly. Listing only services whose
@@ -213,6 +214,7 @@ COPY sandbox/s6/user/contents.d/alice-thinker-watchdog          /etc/s6-overlay/
 COPY sandbox/s6/user/contents.d/alice-viewer                    /etc/s6-overlay/s6-rc.d/user/contents.d/alice-viewer
 COPY sandbox/s6/user/contents.d/init-state-perms                /etc/s6-overlay/s6-rc.d/user/contents.d/init-state-perms
 COPY sandbox/s6/user/contents.d/signal-daemon                   /etc/s6-overlay/s6-rc.d/user/contents.d/signal-daemon
+COPY sandbox/s6/user/contents.d/signal-outbound-proxy           /etc/s6-overlay/s6-rc.d/user/contents.d/signal-outbound-proxy
 
 # ---------- Plugin loader ----------
 # `INSTALL_PLUGINS=false` skips this block, producing a plugin-free
