@@ -207,7 +207,7 @@ def test_render_filters_and_formats(tmp_path):
     )
     block = so.render_awareness_block(JASON, path=p, now=now)
     lines = block.splitlines()
-    assert lines[0].startswith("[Outbound from Alice's Signal number NOT sent by you")
+    assert lines[0].startswith("[Outbound from your Signal number NOT sent by you")
     assert len(lines) == 3
     assert (
         '(50m ago) via apartment-home-assistant: "Apartment door has been open for 5 minutes."'
