@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Optional
 
 from core.sdk_compat import _short
 
+from . import signal_outbound
 from .domain.turn_log import new_turn
 from .pipeline.quiet_hours import is_quiet_hours
 from .transports import ChannelRef, DaemonContext, OutboundMessage
@@ -103,6 +104,42 @@ def _touch_inbound(ctx: DaemonContext, transport: str, address: str) -> None:
 
 # ---------------------------------------------------------------------------
 # Signal turn — no auto-capture; Alice replies via send_message.
+
+
+def _with_outbound_awareness(
+    ctx: DaemonContext, prompt: str, recipient: str, turn_id: str
+) -> str:
+    """Prepend recent non-Speaking sends to ``recipient`` (HA alerts,
+    ``notify`` CLI, scripts) so a reply like "is it open now?" has a
+    referent. Read-only, best-effort: never raises, never wakes — it
+    only runs inside a turn an inbound message already started.
+    Config: ``speaking.outbound_awareness`` {enabled, window_hours,
+    max_entries, max_chars}.
+    """
+    try:
+        cfg = (ctx.cfg.speaking or {}).get("outbound_awareness", {}) or {}
+        if not cfg.get("enabled", True):
+            return prompt
+        block = signal_outbound.render_awareness_block(
+            recipient,
+            window_hours=float(cfg.get("window_hours", signal_outbound.DEFAULT_WINDOW_HOURS)),
+            max_entries=int(cfg.get("max_entries", signal_outbound.DEFAULT_MAX_ENTRIES)),
+            max_chars=int(cfg.get("max_chars", signal_outbound.DEFAULT_MAX_CHARS)),
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("outbound awareness block failed")
+        return prompt
+    if not block:
+        return prompt
+    with contextlib.suppress(Exception):
+        ctx.events.emit(
+            "outbound_awareness_injected",
+            turn_id=turn_id,
+            recipient=recipient,
+            lines=block.count("\n"),
+            chars=len(block),
+        )
+    return f"{block}\n\n{prompt}"
 
 
 async def handle_signal(ctx: DaemonContext, batch: list["SignalEvent"]) -> None:
@@ -195,6 +232,7 @@ async def handle_signal(ctx: DaemonContext, batch: list["SignalEvent"]) -> None:
         prompt = ctx.signal_transport.build_prompt(
             sender_name=sender_name, stamp=stamp, batch=batch
         )
+        prompt = _with_outbound_awareness(ctx, prompt, source, turn_id)
         await ctx._run_turn(prompt, turn_id=turn_id, outbound_recipient=source)
         if ctx._turn_did_send:
             terminal_state = "replied"
