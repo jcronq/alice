@@ -2526,8 +2526,10 @@ def compute_recovery_state(
         return "red"
 
     def _slope_color(s: float, total_notes: int) -> str:
-        # Positive slope = recovering (output declining from burst)
-        # Negative slope = deteriorating (output accelerating)
+        # Positive slope = output accelerating (burst) — large values are red.
+        # Negative slope = output declining (recovery) — green per the bands
+        # below, which only flag upward bursts. Matches the sign convention
+        # documented on ``count_output_rate_slope``.
         # Fewer than 3 notes total in the window → yellow (cautious unknown):
         # OLS over a series of zeros gives a small slope that the green band
         # would swallow, masking a genuine "no data" state.
