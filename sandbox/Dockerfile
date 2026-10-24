@@ -26,7 +26,7 @@ FROM debian:trixie-slim AS base
 
 ARG USER_ID=1000
 ARG GROUP_ID=1000
-ARG SIGNAL_CLI_VERSION=0.14.1
+ARG SIGNAL_CLI_VERSION=0.14.5
 ARG S6_OVERLAY_VERSION=3.2.2.0
 ARG TARGETARCH
 
@@ -53,7 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # signal-cli — arch-branched, folded from sandbox/daemon/Dockerfile:21-36.
 # amd64 uses the GraalVM native build (no JVM in the image). arm64 has no
 # native build upstream, so install OpenJDK 25 from trixie main and use the
-# JRE-based tarball. (signal-cli 0.14.1 targets JavaVersion.VERSION_25; lower
+# JRE-based tarball. (signal-cli 0.14.x targets JavaVersion.VERSION_25; lower
 # JDKs hit UnsupportedClassVersionError at load.)
 RUN apt-get update \
     && case "${TARGETARCH}" in \
