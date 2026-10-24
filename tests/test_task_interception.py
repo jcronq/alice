@@ -60,6 +60,12 @@ def _make_hook(*, raise_dispatch: bool = False):
 
     class _StubDaemon:
         _dispatch_subagent = staticmethod(stub_dispatch)
+        # These tests exercise Task interception on a full-trust turn.
+        # The hook now consults the limited-trust gate first, which
+        # no-ops for any non-"gmail" turn kind — carry the real method
+        # and a non-gmail kind so that path is modelled faithfully.
+        _current_turn_kind = "signal"
+        _gmail_trust_deny = SpeakingDaemon._gmail_trust_deny
 
     stub = _StubDaemon()
     bound = SpeakingDaemon._pretooluse_hook.__get__(stub, _StubDaemon)

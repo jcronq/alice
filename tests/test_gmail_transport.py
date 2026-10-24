@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from email.message import EmailMessage
+from types import SimpleNamespace
+from typing import Union
 
 import pytest
 
@@ -9,10 +11,27 @@ from alice_speaking.transports.base import EMAIL_CAPS, ChannelRef, OutboundMessa
 from alice_speaking.transports.gmail import (
     GmailAddress,
     GmailTransport,
+    _domains_aligned,
+    _evaluate_sender_auth,
+    _parse_authentication_results,
     decode_address,
     encode_address,
 )
+from alice_speaking.domain.principals import (
+    AddressBook,
+    PrincipalChannel,
+    PrincipalRecord,
+)
 from alice_speaking.infra import config as config_module
+
+
+# A DMARC-pass verdict as Gmail would stamp it for a genuine gmail.com sender.
+GOOD_AUTH = (
+    "mx.google.com; dkim=pass header.i=@example.com header.s=sel header.b=AbC; "
+    "spf=pass (google.com: domain of jason@example.com designates 1.2.3.4) "
+    "smtp.mailfrom=jason@example.com; dmarc=pass (p=REJECT sp=REJECT dis=NONE) "
+    "header.from=example.com"
+)
 
 
 def _raw_message(
@@ -22,6 +41,7 @@ def _raw_message(
     references: str = "",
     in_reply_to: str = "",
     body: str = "Hello Alice",
+    auth_results: Union[str, list[str], None] = None,
 ) -> bytes:
     msg = EmailMessage()
     msg["From"] = "Jason <JASON@example.com>"
@@ -33,8 +53,49 @@ def _raw_message(
         msg["References"] = references
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
+    if auth_results is not None:
+        values = [auth_results] if isinstance(auth_results, str) else auth_results
+        for value in values:
+            msg["Authentication-Results"] = value
     msg.set_content(body)
     return msg.as_bytes()
+
+
+def _fake_imap_factory():
+    """IMAP client that no-ops login/select/store so ``_mark_seen`` works
+    in tests without touching the network."""
+
+    class FakeIMAP:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def login(self, *args):
+            return ("OK", [b""])
+
+        def select(self, mailbox):
+            return ("OK", [b"1"])
+
+        def uid(self, *args):
+            return ("OK", [b""])
+
+        def logout(self):
+            return ("BYE", [b""])
+
+    return FakeIMAP
+
+
+def _jason_book() -> AddressBook:
+    return AddressBook(
+        [
+            PrincipalRecord(
+                id="jason",
+                display_name="Jason",
+                channels=[
+                    PrincipalChannel(transport="gmail", address="jason@example.com")
+                ],
+            )
+        ]
+    )
 
 
 def test_construction_requires_credentials():
@@ -67,6 +128,28 @@ def test_config_loads_gmail_settings(tmp_path, monkeypatch):
     assert cfg.gmail_address == "alice@example.com"
     assert cfg.gmail_app_password == "abcdefghijklmnop"
     assert cfg.gmail_poll_seconds == 12.5
+    # Sender verification is fail-closed by default.
+    assert cfg.gmail_require_verified is True
+    assert cfg.gmail_trusted_authserv_id == "mx.google.com"
+
+
+def test_config_verification_can_be_disabled(tmp_path, monkeypatch):
+    env_file = tmp_path / "alice.env"
+    env_file.write_text(
+        "\n".join(
+            (
+                f"ALICE_MIND_DIR={tmp_path}",
+                "GMAIL_ADDRESS=alice@example.com",
+                "GMAIL_APP_PASSWORD=secret",
+                "GMAIL_REQUIRE_VERIFIED=0",
+                "GMAIL_TRUSTED_AUTHSERV_ID=mx.internal.test",
+            )
+        )
+    )
+    monkeypatch.setenv("ALICE_CONFIG", str(env_file))
+    cfg = config_module.load()
+    assert cfg.gmail_require_verified is False
+    assert cfg.gmail_trusted_authserv_id == "mx.internal.test"
 
 
 def test_address_codec_supports_plain_recipient_and_thread_context():
@@ -173,3 +256,128 @@ def test_send_sets_reply_headers_and_attaches_files(tmp_path):
     assert message["References"] == "<root@example.com> <latest@example.com>"
     assert "Status: done" in message.get_body(preferencelist=("plain",)).get_content()
     assert list(message.iter_attachments())[0].get_filename() == "note.txt"
+
+
+# ---------------------------------------------------------------------------
+# Sender authentication (Recommendation 1: fail-closed From verification).
+
+
+def test_domains_aligned():
+    assert _domains_aligned("example.com", "example.com")
+    assert _domains_aligned("mail.example.com", "example.com")  # relaxed subdomain
+    assert _domains_aligned("example.com.", "example.com")  # trailing dot
+    assert not _domains_aligned("evil.com", "example.com")
+    assert not _domains_aligned("", "example.com")
+    assert not _domains_aligned("example.com", "")
+
+
+def test_parse_authentication_results_selects_trusted_authserv_id():
+    # A forged verdict claiming pass sits alongside Gmail's real fail verdict.
+    forged = "attacker.example; dkim=pass; spf=pass; dmarc=pass"
+    real = "mx.google.com; dkim=fail; spf=softfail; dmarc=fail"
+    parsed = _parse_authentication_results([forged, real], "mx.google.com")
+    assert parsed["dkim"] == "fail"
+    assert parsed["dmarc"] == "fail"
+
+
+def test_parse_authentication_results_missing_trusted_header():
+    forged = "attacker.example; dkim=pass; dmarc=pass"
+    assert _parse_authentication_results([forged], "mx.google.com") == {}
+
+
+def test_evaluate_sender_auth_rules():
+    assert _evaluate_sender_auth({}, "example.com")[0] is False
+    # dmarc=pass is sufficient on its own.
+    assert _evaluate_sender_auth({"dmarc": "pass"}, "example.com")[0] is True
+    # dkim=pass with an aligned signing domain passes even without dmarc.
+    ok, _ = _evaluate_sender_auth(
+        {"dkim": "pass", "dmarc": "none", "dkim_domain": "example.com"},
+        "example.com",
+    )
+    assert ok is True
+    # dkim=pass but signed by a different domain does NOT authenticate From.
+    bad, _ = _evaluate_sender_auth(
+        {"dkim": "pass", "dmarc": "none", "dkim_domain": "evil.com"},
+        "example.com",
+    )
+    assert bad is False
+    # spf alone is never sufficient (it authenticates the envelope, not From).
+    spf_only, _ = _evaluate_sender_auth(
+        {"spf": "pass", "dkim": "none", "dmarc": "none"}, "example.com"
+    )
+    assert spf_only is False
+
+
+def test_parse_message_marks_verified_sender():
+    transport = GmailTransport(address="alice@example.com", app_password="x")
+    inbound = transport._parse_message(
+        _raw_message(message_id="<a@example.com>", auth_results=GOOD_AUTH), "1"
+    )
+    assert inbound is not None
+    assert inbound.metadata["sender_verified"] is True
+    assert inbound.metadata["sender_auth"]["dmarc"] == "pass"
+
+
+def test_parse_message_marks_unverified_when_no_auth_header():
+    transport = GmailTransport(address="alice@example.com", app_password="x")
+    inbound = transport._parse_message(_raw_message(message_id="<a@example.com>"), "1")
+    assert inbound is not None
+    assert inbound.metadata["sender_verified"] is False
+
+
+def test_parse_message_rejects_forged_authserv_id():
+    transport = GmailTransport(address="alice@example.com", app_password="x")
+    forged = "evil.relay; dkim=pass header.d=example.com; dmarc=pass"
+    inbound = transport._parse_message(
+        _raw_message(message_id="<a@example.com>", auth_results=forged), "1"
+    )
+    assert inbound is not None
+    assert inbound.metadata["sender_verified"] is False
+
+
+def test_accept_message_gate_enforces_verification():
+    transport = GmailTransport(
+        address="alice@example.com",
+        app_password="x",
+        imap_factory=_fake_imap_factory(),
+    )
+    ctx = SimpleNamespace(address_book=_jason_book(), _queue=asyncio.Queue())
+
+    verified = transport._parse_message(
+        _raw_message(message_id="<good@example.com>", auth_results=GOOD_AUTH), "1"
+    )
+    spoofed = transport._parse_message(
+        _raw_message(message_id="<spoof@example.com>"), "2"
+    )
+    assert verified.metadata["sender_verified"] is True
+    assert spoofed.metadata["sender_verified"] is False
+
+    async def go():
+        await transport._accept_message(ctx, b"1", verified)
+        after_verified = ctx._queue.qsize()
+        await transport._accept_message(ctx, b"2", spoofed)
+        after_spoof = ctx._queue.qsize()
+        return after_verified, after_spoof
+
+    after_verified, after_spoof = asyncio.run(go())
+    assert after_verified == 1  # verified message ran
+    assert after_spoof == 1  # spoof was dropped, queue unchanged
+
+
+def test_accept_message_gate_can_be_disabled():
+    transport = GmailTransport(
+        address="alice@example.com",
+        app_password="x",
+        require_verified_sender=False,
+        imap_factory=_fake_imap_factory(),
+    )
+    ctx = SimpleNamespace(address_book=_jason_book(), _queue=asyncio.Queue())
+    spoofed = transport._parse_message(
+        _raw_message(message_id="<spoof@example.com>"), "1"
+    )
+
+    async def go():
+        await transport._accept_message(ctx, b"1", spoofed)
+        return ctx._queue.qsize()
+
+    assert asyncio.run(go()) == 1  # unverified allowed when gate is off
