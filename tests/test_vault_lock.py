@@ -188,6 +188,46 @@ def test_exclusive_lock_blocks_across_processes(
             proc.join(timeout=2.0)
 
 
+def test_acquire_on_non_vault_path_works(tmp_path: pathlib.Path) -> None:
+    """The lock guard is path-agnostic — it works on any target, not just
+    ``cortex-memory/*.md``.
+
+    Regression test for the 2026-08-06 extension: autopush and worker
+    subagents share ``vault_lock`` for coordinating writes to
+    ``tools/*.py`` (design note: ``cortex-memory/research/
+    2026-08-06-concurrent-write-safety-patterns.md``). The sidecar
+    convention — ``.<name>.lock`` next to the target — is the whole
+    contract; there is no allowed-prefix check to trip over.
+    """
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir()
+    target = tools_dir / "convergence_detector.py"
+    target.write_text("# fake tool\n", encoding="utf-8")
+
+    holder_acquired = threading.Event()
+    holder_release = threading.Event()
+
+    def hold_lock() -> None:
+        with acquire(target, mode=LockMode.EXCLUSIVE):
+            holder_acquired.set()
+            holder_release.wait(timeout=5.0)
+
+    t = threading.Thread(target=hold_lock)
+    t.start()
+    try:
+        assert holder_acquired.wait(timeout=5.0)
+        # Sidecar landed in the right spot with the tools/-style name.
+        sidecar = tools_dir / ".convergence_detector.py.lock"
+        assert sidecar.is_file()
+        # And the lock is real: a second acquirer must fail while held.
+        with pytest.raises(VaultLockTimeout):
+            with acquire(target, mode=LockMode.EXCLUSIVE, timeout=0.0):
+                pass
+    finally:
+        holder_release.set()
+        t.join(timeout=5.0)
+
+
 def test_thread_contention_resolves(tmp_path: pathlib.Path) -> None:
     """Two threads each opening their own fd serialize on flock.
 

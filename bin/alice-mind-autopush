@@ -31,9 +31,69 @@ git pull --rebase --autostash 2>&1 || {
     exit 1
 }
 
+# Acquire per-file locks on dirty tools/*.py files before staging.
+# Rationale: worker subagents editing tools/*.py acquire an exclusive
+# fcntl.flock on a sidecar .<name>.lock via alice_thinking.vault_lock;
+# autopush must respect the same locks or we get silent overwrites when
+# a worker's read-edit-write window straddles an autopush cycle.
+#
+# Non-blocking (flock -n): if a worker holds the lock, skip that file
+# for THIS cycle only — the next autopush run (~15 min later) will pick
+# it up. Never wait; autopush stalling on a hung worker is worse than
+# a one-cycle deferral.
+#
+# Design: cortex-memory/research/2026-08-06-concurrent-write-safety-patterns.md
+LOCK_FDS=()
+SKIPPED_LOCKED=()
+# Release any locks we acquire on any exit path. Bash closes FDs on
+# process exit anyway (which releases the flock), but the trap makes
+# the intent explicit and covers the rare case where a caller sources
+# this script instead of executing it.
+release_locks() {
+    for fd in "${LOCK_FDS[@]}"; do
+        exec {fd}<&- 2>/dev/null || true
+    done
+}
+trap release_locks EXIT
+# git status --porcelain output: "XY path". awk splits on whitespace;
+# $1 matches ??/M/A (untracked/modified/added on either side). $NF is
+# the path. Filenames with spaces would break this, but tools/*.py is a
+# controlled namespace where none have spaces.
+DIRTY_TOOLS=$(git status --porcelain -- 'tools/*.py' 2>/dev/null \
+    | awk '$1 ~ /^[MA?]/ {print $NF}' || true)
+for f in $DIRTY_TOOLS; do
+    LOCKFILE="$REPO/$(dirname "$f")/.$(basename "$f").lock"
+    # Sidecar may not exist yet if no worker has ever locked this file.
+    # Touch is safe — vault_lock does the same via O_CREAT.
+    touch "$LOCKFILE" 2>/dev/null || continue
+    # Open the sidecar RW and try a non-blocking exclusive flock. FD is
+    # held for the rest of the script (implicit close on exit releases
+    # the lock).
+    exec {fd}<>"$LOCKFILE"
+    if flock -n -x "$fd"; then
+        LOCK_FDS+=("$fd")
+    else
+        exec {fd}<&-
+        SKIPPED_LOCKED+=("$f")
+    fi
+done
+
+if [[ ${#SKIPPED_LOCKED[@]} -gt 0 ]]; then
+    echo "auto-push: skipped locked file(s) for this cycle: ${SKIPPED_LOCKED[*]}" >&2
+fi
+
 git add -A
 
-# Staging may have produced no change (e.g. all paths are gitignored).
+# Unstage any files a worker held locked when we started iterating; git
+# add -A above staged them unconditionally. Doing the reset after the
+# add (rather than trying to pre-empt it) is simpler than curating a
+# staging list, and is a no-op when the loop is empty.
+for f in "${SKIPPED_LOCKED[@]}"; do
+    git reset HEAD -- "$f" >/dev/null 2>&1 || true
+done
+
+# Staging may have produced no change (e.g. all paths are gitignored,
+# or the only dirty files were skipped-locked and got reset out).
 if git diff --cached --quiet; then
     exit 0
 fi
