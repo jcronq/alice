@@ -56,14 +56,30 @@ from alice_thinking.memory_worker.stage_d import _is_fitness_domain
 
 logger = logging.getLogger(__name__)
 
-# Low-wake-count detector (issue #323 fix 3). Total of Stage B + C + D
-# wakes in the morning window. The May-22 sleep cycle produced 3 wakes
-# in 8 hours; a healthy 8h sleep should produce 15–19. Anything under 8
-# is a strong signal that the backoff ladder ran away or the supervisor
-# stalled. When this fires the morning vault-health event tags
-# ``low_wake_count: true`` and an insight-tier surface is written to
-# ``<vault>/inner/surface/<YYYY-MM-DD-HHMMSS>-low-wake-count.md``.
+# Low-wake-count metric (issue #323 fix 3). Total of Stage B + C + D
+# wakes in the morning window, recorded as ``total_sleep_wakes`` and
+# tagged ``low_wake_count: true`` when under the threshold so the metric
+# history continues. It NO LONGER triggers a surface: the "healthy 8h
+# sleep = 15–19 wakes" premise came from the retired day/night thinking
+# architecture. Thinking is now single-mode (5-min cadence, 24/7) and
+# B/C/D are memory-worker phases whose run count scales with inbox
+# volume, so a quiet night legitimately yields 2–4 (false alarms fired
+# 2026-10-24 and 2026-10-26 while both services were healthy).
 WAKE_COUNT_THRESHOLD = 8
+
+# Wake-stall detector (replaces the low-wake-count surface). Fires an
+# insight surface only on real liveness failures, once the morning
+# window has closed:
+#   * the memory-worker heartbeat file is older than
+#     ``MEMORY_WORKER_STALE_SECONDS``, or
+#   * thinking produced zero wakes in the morning window
+#     (``total_wakes_last_night == 0``).
+# A missing heartbeat file is treated as "unknown" (not stale) so dev /
+# CI environments without /state/worker don't fire spuriously.
+# Path mirrors ``alice_thinking.memory_worker.wake.MEMORY_WORKER_LIVENESS_PATH``
+# (not imported: that module pulls in every stage module).
+MEMORY_WORKER_LIVENESS_PATH = Path("/state/worker/memory-worker-alive")
+MEMORY_WORKER_STALE_SECONDS = 2 * 3600
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -4038,6 +4054,7 @@ def build_vault_health_event(
     surface_dir: Path | None = None,
     now: datetime | None = None,
     index_db_path: Path | None = None,
+    memory_worker_liveness_path: Path | None = None,
 ) -> dict[str, Any]:
     """Assemble the complete vault_health event dict.
 
@@ -4242,11 +4259,10 @@ def build_vault_health_event(
         )
         event["parse_quality"] = "suspect"
 
-    # Low-wake-count detector (issue #323 fix 3). Sum Stage B+C+D wakes
-    # from the morning window; if under WAKE_COUNT_THRESHOLD, tag the
-    # event AND write an insight-tier surface so Speaking notices on
-    # the next morning surface scan. Background: May-22 sleep cycle
-    # had 3 wakes in 8 hours; healthy is 15–19.
+    # Low-wake-count metric (issue #323 fix 3). Sum Stage B+C+D wakes
+    # from the morning window and tag the event when under
+    # WAKE_COUNT_THRESHOLD. Metric only — see the module-level comment
+    # for why this no longer writes a surface.
     dist = event["wake_type_distribution"]
     # Single-mode guard: null values mean no wake carried a stage
     # frontmatter (Phase 5+ active thinking). Skip the check.
@@ -4259,22 +4275,42 @@ def build_vault_health_event(
             + int(dist.get("stage_d", 0))
         )
     event["total_sleep_wakes"] = total_sleep_wakes
-    # Same partial-window concern as the drought flag — a low count
-    # before 07:00 Eastern is expected because not all sleep-phase wakes
-    # have written their note yet. Only fire the low-wake surface once
-    # the window has closed.
+    # Same partial-window concern as the drought flag — only tag once
+    # the 23:00→07:00 window has closed.
     if window_closed and total_sleep_wakes is not None and total_sleep_wakes < WAKE_COUNT_THRESHOLD:
         event["low_wake_count"] = True
+
+    # Wake-stall detector: surface only on a real liveness failure.
+    hb_path = (
+        memory_worker_liveness_path
+        if memory_worker_liveness_path is not None
+        else MEMORY_WORKER_LIVENESS_PATH
+    )
+    try:
+        hb_age = max(0.0, now.timestamp() - hb_path.stat().st_mtime)
+    except OSError:
+        hb_age = None
+    event["memory_worker_heartbeat_age_s"] = (
+        None if hb_age is None else int(hb_age)
+    )
+    reasons: list[str] = []
+    if hb_age is not None and hb_age > MEMORY_WORKER_STALE_SECONDS:
+        reasons.append("memory_worker_heartbeat_stale")
+    if event["total_wakes_last_night"] == 0:
+        reasons.append("no_thinking_wakes")
+    if window_closed and reasons:
+        event["wake_stall"] = reasons
         try:
-            _write_low_wake_count_surface(
+            _write_wake_stall_surface(
                 surface_dir=surface_dir,
                 now=now,
-                total_sleep_wakes=total_sleep_wakes,
-                distribution=dist,
+                reasons=reasons,
+                heartbeat_age_s=event["memory_worker_heartbeat_age_s"],
+                heartbeat_path=hb_path,
             )
         except OSError as exc:
             logger.warning(
-                "vault_health: failed to write low-wake-count surface to %s: %s",
+                "vault_health: failed to write wake-stall surface to %s: %s",
                 surface_dir,
                 exc,
             )
@@ -4282,57 +4318,46 @@ def build_vault_health_event(
     return event
 
 
-def _write_low_wake_count_surface(
+def _write_wake_stall_surface(
     *,
     surface_dir: Path,
     now: datetime,
-    total_sleep_wakes: int,
-    distribution: dict[str, int],
+    reasons: list[str],
+    heartbeat_age_s: int | None,
+    heartbeat_path: Path,
 ) -> Path:
-    """Drop an insight-tier surface flagging low overnight wake count.
+    """Drop an insight-tier surface flagging a thinking / memory-worker stall.
 
-    Insight-tier (not flash) — the symptom is structural, not urgent;
-    Speaking's morning surface sweep will pick it up alongside the rest
-    of the vault_health-driven nudges.
-
-    Filename: ``<YYYY-MM-DD-HHMMSS>-low-wake-count.md`` (matches the
-    surface naming convention used by ``design_pipeline.write_surface``
-    and the rest of the inner/surface ecosystem).
+    Filename: ``<YYYY-MM-DD-HHMMSS>-wake-stall.md``.
     """
     surface_dir.mkdir(parents=True, exist_ok=True)
     stamp = now.strftime("%Y-%m-%d-%H%M%S")
-    path = surface_dir / f"{stamp}-low-wake-count.md"
+    path = surface_dir / f"{stamp}-wake-stall.md"
 
+    bullets = []
+    if "memory_worker_heartbeat_stale" in reasons:
+        bullets.append(
+            f"- Memory-worker heartbeat `{heartbeat_path}` is "
+            f"{heartbeat_age_s}s old (threshold "
+            f"{MEMORY_WORKER_STALE_SECONDS}s)."
+        )
+    if "no_thinking_wakes" in reasons:
+        bullets.append(
+            "- Thinking wrote no wakes in the 23:00→07:00 morning window."
+        )
     body = (
-        f"Stage B + C + D wakes during the morning window summed to "
-        f"`{total_sleep_wakes}`, below the threshold of "
-        f"`{WAKE_COUNT_THRESHOLD}`. A healthy 8h sleep cycle produces "
-        f"15–19 wakes; persistently low counts indicate the wake-cadence "
-        f"backoff ladder ran away or the s6 supervisor stalled.\n\n"
-        f"Per-stage distribution: "
-        f"B={int(distribution.get('stage_b', 0))}, "
-        f"C={int(distribution.get('stage_c', 0))}, "
-        f"D={int(distribution.get('stage_d', 0))}.\n\n"
-        f"**Suggested next step**: check the backoff history in "
-        f"`memory/events.jsonl` (filter for `type: wake_start` / "
-        f"`type: vault_health`) and the supervisor logs under "
-        f"`/state/worker/`. If the ladder spent the night pegged at "
-        f"`MAX_INTERVAL_SECONDS` despite Stage B/D writes, the "
-        f"`did_work` signal probably isn't being emitted — see "
-        f"issue #323 fix 0.\n"
+        "Liveness check failed after the overnight window:\n\n"
+        + "\n".join(bullets)
+        + "\n\n**Suggested next step**: check the s6 service status and "
+        "logs for the stalled service(s) under `/state/worker/`.\n"
     )
-
     lines = [
         "---",
         "priority: insight",
-        (
-            "context: Wake count fell below threshold, indicating "
-            "possible backoff runaway or scheduler issue"
-        ),
+        "context: Thinking or memory-worker liveness check failed overnight",
         "reply_expected: false",
-        "type: low-wake-count",
-        f"total_sleep_wakes: {total_sleep_wakes}",
-        f"threshold: {WAKE_COUNT_THRESHOLD}",
+        "type: wake-stall",
+        f"reasons: {','.join(reasons)}",
         "---",
         "",
         body,

@@ -15,6 +15,7 @@ Bug map:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import time
@@ -4051,7 +4052,7 @@ def test_continuous_flag_does_not_change_baseline_output(
 
 
 # ---------------------------------------------------------------------------
-# Issue #323 — low-wake-count surface
+# Issue #323 — low-wake-count metric + wake-stall surface
 # ---------------------------------------------------------------------------
 
 
@@ -4083,10 +4084,23 @@ def _seed_wakes_for_morning_window(
             _write_wake(tday, f"05{seq:02d}00-wake.md", stage)
 
 
-def test_low_wake_count_tagged_when_under_threshold(tmp_path: Path) -> None:
-    """Issue #323 fix 3: when stage_b + stage_c + stage_d < threshold,
-    the event MUST tag ``low_wake_count: True`` and write an
-    insight-tier surface file under ``surface_dir``."""
+def _fresh_heartbeat(tmp_path: Path, now: datetime, age_s: int = 60) -> Path:
+    hb = tmp_path / "memory-worker-alive"
+    hb.touch()
+    mtime = now.timestamp() - age_s
+    os.utime(hb, (mtime, mtime))
+    return hb
+
+
+def _all_surfaces(surface: Path) -> list[Path]:
+    return sorted(surface.glob("*.md"))
+
+
+def test_low_wake_count_tagged_but_no_surface(tmp_path: Path) -> None:
+    """Issue #323 fix 3, revised: B+C+D < threshold still tags
+    ``low_wake_count: True`` (metric history) but MUST NOT write a
+    surface — a quiet night legitimately yields 2–4 memory-worker
+    phase runs under single-mode thinking."""
     from metrics.vault_health import WAKE_COUNT_THRESHOLD
 
     vault = _make_vault(tmp_path)
@@ -4096,15 +4110,8 @@ def test_low_wake_count_tagged_when_under_threshold(tmp_path: Path) -> None:
     surface.mkdir()
     events = tmp_path / "events.jsonl"
 
-    # Freeze the clock past 07:00 EDT so the sleep-window gate added in
-    # #466 evaluates closed and the low_wake_count flag actually fires.
-    # Without this, the test depends on wall-clock time and fails when
-    # run before 07:00 EDT (see PR #462 for the same fix on adjacent tests).
+    # Past 07:00 Eastern so the sleep-window gate (#466) is closed.
     fake_now = datetime(2026, 6, 6, 8, 0, tzinfo=ZoneInfo("America/New_York"))
-
-    # 3 total wakes — well under the threshold of 8 (matches the
-    # May-22 sleep cycle that motivated the fix). Pass the frozen clock
-    # so the helper seeds files into the same window the event reader uses.
     _seed_wakes_for_morning_window(thoughts, b=1, c=1, d=1, now=fake_now)
     event = build_vault_health_event(
         vault_dir=vault,
@@ -4112,32 +4119,19 @@ def test_low_wake_count_tagged_when_under_threshold(tmp_path: Path) -> None:
         events_path=events,
         surface_dir=surface,
         now=fake_now,
+        memory_worker_liveness_path=_fresh_heartbeat(tmp_path, fake_now),
     )
 
-    assert event["wake_type_distribution"]["stage_b"] + \
-        event["wake_type_distribution"]["stage_c"] + \
-        event["wake_type_distribution"]["stage_d"] < WAKE_COUNT_THRESHOLD
+    assert event["total_sleep_wakes"] == 3 < WAKE_COUNT_THRESHOLD
     assert event.get("low_wake_count") is True
-    assert event.get("total_sleep_wakes") == 3
-
-    # Surface file dropped with the expected naming + frontmatter.
-    written = list(surface.glob("*-low-wake-count.md"))
-    assert len(written) == 1, written
-    body = written[0].read_text(encoding="utf-8")
-    assert body.startswith("---\n")
-    assert "priority: insight" in body
-    assert "reply_expected: false" in body
-    assert "Wake count fell below threshold" in body
-    assert "total_sleep_wakes: 3" in body
-    assert f"threshold: {WAKE_COUNT_THRESHOLD}" in body
-    assert "check the backoff history" in body
+    assert event.get("wake_stall") is None
+    assert _all_surfaces(surface) == []
 
 
 def test_low_wake_count_not_tagged_when_at_or_above_threshold(
     tmp_path: Path,
 ) -> None:
-    """Healthy 8h sleep produces 15–19 wakes. Anything ≥ threshold
-    must NOT tag the event and must NOT write a surface file."""
+    """At or above threshold: no tag, no surface."""
     vault = _make_vault(tmp_path)
     thoughts = tmp_path / "thoughts"
     thoughts.mkdir()
@@ -4145,13 +4139,7 @@ def test_low_wake_count_not_tagged_when_at_or_above_threshold(
     surface.mkdir()
     events = tmp_path / "events.jsonl"
 
-    # 16 total wakes — the floor MIN_WAKE_PERIOD guarantees.
-    # Pass now=fake_now so _seed_wakes_for_morning_window uses the same
-    # date as _local_now() inside build_vault_health_event. Without this,
-    # datetime.now() (UTC) and _local_now() (EDT) desync during the
-    # 04:00–07:59 UTC window, writing wakes to the wrong directory.
-    from metrics.vault_health import _local_now
-    fake_now = _local_now()
+    fake_now = datetime(2026, 6, 6, 8, 0, tzinfo=ZoneInfo("America/New_York"))
     _seed_wakes_for_morning_window(thoughts, b=8, c=4, d=4, now=fake_now)
 
     event = build_vault_health_event(
@@ -4160,16 +4148,17 @@ def test_low_wake_count_not_tagged_when_at_or_above_threshold(
         events_path=events,
         surface_dir=surface,
         now=fake_now,
+        memory_worker_liveness_path=_fresh_heartbeat(tmp_path, fake_now),
     )
 
     assert event.get("low_wake_count") is None or event["low_wake_count"] is False
     assert event["total_sleep_wakes"] == 16
-    assert list(surface.glob("*-low-wake-count.md")) == []
+    assert _all_surfaces(surface) == []
 
 
-def test_low_wake_count_handles_zero_wakes(tmp_path: Path) -> None:
-    """Edge case: no thoughts at all (e.g. supervisor never ran).
-    Must still tag and surface — zero is below threshold."""
+def test_wake_stall_surface_when_no_thinking_wakes(tmp_path: Path) -> None:
+    """Zero thinking wakes in the morning window is a real stall: tag
+    ``wake_stall`` and write a wake-stall surface."""
     vault = _make_vault(tmp_path)
     thoughts = tmp_path / "thoughts"
     thoughts.mkdir()
@@ -4177,9 +4166,6 @@ def test_low_wake_count_handles_zero_wakes(tmp_path: Path) -> None:
     surface.mkdir()
     events = tmp_path / "events.jsonl"
 
-    # Freeze the clock past 07:00 EDT — same rationale as above: the
-    # sleep-window gate from #466 only sets low_wake_count after the
-    # window closes, so wall-clock-dependent tests are flaky before 07:00.
     fake_now = datetime(2026, 6, 6, 8, 0, tzinfo=ZoneInfo("America/New_York"))
     event = build_vault_health_event(
         vault_dir=vault,
@@ -4187,11 +4173,81 @@ def test_low_wake_count_handles_zero_wakes(tmp_path: Path) -> None:
         events_path=events,
         surface_dir=surface,
         now=fake_now,
+        memory_worker_liveness_path=_fresh_heartbeat(tmp_path, fake_now),
     )
 
-    assert event["total_sleep_wakes"] == 0
+    assert event["total_wakes_last_night"] == 0
     assert event.get("low_wake_count") is True
-    assert len(list(surface.glob("*-low-wake-count.md"))) == 1
+    assert event["wake_stall"] == ["no_thinking_wakes"]
+    written = list(surface.glob("*-wake-stall.md"))
+    assert len(written) == 1, written
+    body = written[0].read_text(encoding="utf-8")
+    assert body.startswith("---\n")
+    assert "priority: insight" in body
+    assert "type: wake-stall" in body
+    assert "reasons: no_thinking_wakes" in body
+    assert not list(surface.glob("*low-wake-count*"))
+
+
+def test_wake_stall_surface_when_memory_worker_heartbeat_stale(
+    tmp_path: Path,
+) -> None:
+    """Heartbeat older than 2h fires the stall surface even when
+    thinking woke normally."""
+    from metrics.vault_health import MEMORY_WORKER_STALE_SECONDS
+
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    fake_now = datetime(2026, 6, 6, 8, 0, tzinfo=ZoneInfo("America/New_York"))
+    _seed_wakes_for_morning_window(thoughts, b=1, c=0, d=0, now=fake_now)
+    hb = _fresh_heartbeat(
+        tmp_path, fake_now, age_s=MEMORY_WORKER_STALE_SECONDS + 600
+    )
+    event = build_vault_health_event(
+        vault_dir=vault,
+        thoughts_dir=thoughts,
+        events_path=events,
+        surface_dir=surface,
+        now=fake_now,
+        memory_worker_liveness_path=hb,
+    )
+
+    assert event["wake_stall"] == ["memory_worker_heartbeat_stale"]
+    assert event["memory_worker_heartbeat_age_s"] >= MEMORY_WORKER_STALE_SECONDS
+    written = list(surface.glob("*-wake-stall.md"))
+    assert len(written) == 1, written
+    assert "memory-worker-alive" in written[0].read_text(encoding="utf-8")
+
+
+def test_wake_stall_missing_heartbeat_is_not_stale(tmp_path: Path) -> None:
+    """A missing heartbeat file (dev/CI, no /state/worker) is unknown,
+    not stale — no surface when thinking woke."""
+    vault = _make_vault(tmp_path)
+    thoughts = tmp_path / "thoughts"
+    thoughts.mkdir()
+    surface = tmp_path / "surface"
+    surface.mkdir()
+    events = tmp_path / "events.jsonl"
+
+    fake_now = datetime(2026, 6, 6, 8, 0, tzinfo=ZoneInfo("America/New_York"))
+    _seed_wakes_for_morning_window(thoughts, b=1, c=0, d=0, now=fake_now)
+    event = build_vault_health_event(
+        vault_dir=vault,
+        thoughts_dir=thoughts,
+        events_path=events,
+        surface_dir=surface,
+        now=fake_now,
+        memory_worker_liveness_path=tmp_path / "does-not-exist",
+    )
+
+    assert event["memory_worker_heartbeat_age_s"] is None
+    assert event.get("wake_stall") is None
+    assert _all_surfaces(surface) == []
 
 
 # ---------------------------------------------------------------------------
@@ -4374,10 +4430,11 @@ def test_build_event_flags_window_open_at_0014(tmp_path: Path) -> None:
     # Distribution is still computed for diagnostics, but its stage_d=0
     # value is partial-window and must not drive a drought flag.
     assert "wake_type_distribution" in event
-    # low_wake_count surface MUST NOT fire on partial data even though
-    # total_sleep_wakes would otherwise be below the threshold.
+    # Neither the low_wake_count tag nor the wake-stall surface may
+    # fire on partial data.
     assert event.get("low_wake_count") is not True
-    assert not list(surface.glob("*low-wake-count*"))
+    assert event.get("wake_stall") is None
+    assert not list(surface.glob("*wake-stall*"))
 
 
 def test_build_event_flags_window_closed_at_0730(tmp_path: Path) -> None:
