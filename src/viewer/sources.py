@@ -74,8 +74,10 @@ def _read_jsonl(path: pathlib.Path) -> Iterator[dict[str, Any]]:
 
 # Per-process incremental cache for append-only JSONL files.
 # Each entry remembers how many bytes we've already parsed so a follow-up
-# read only decodes the tail. Rotation (size shrinks) → reparse from
-# scratch.
+# read only decodes the tail. Rotation → reparse from scratch: a rename
+# rotation (new inode) or a copytruncate (size shrinks) both reset the
+# cache, so a stale offset is never applied to a different file. See
+# sandbox/logrotate/alice-logs.conf.
 #
 # Retention is BOUNDED to a trailing byte window of each file
 # (``ALICE_VIEWER_JSONL_WINDOW_BYTES``, default 64 MiB). thinking.log is
@@ -110,6 +112,9 @@ class _JsonlCacheEntry:
     # ``events`` and monotonically increasing. Used to evict events that
     # fall out of the trailing window.
     starts: list[int] = field(default_factory=list)
+    # Inode of the file the offsets refer to; a change means the path was
+    # rotated out from under us (rename + recreate).
+    ino: int = 0
 
 
 _jsonl_caches: dict[str, _JsonlCacheEntry] = {}
@@ -209,16 +214,18 @@ def _cached_jsonl(
             _jsonl_caches.pop(key, None)
         return []
     try:
-        size = path.stat().st_size
+        st = path.stat()
     except OSError:
         return cached.events if cached is not None else []
+    size, ino = st.st_size, st.st_ino
 
     window = _jsonl_window_bytes()
-    if cached is None or size < cached.size:
+    if cached is None or size < cached.size or ino != cached.ino:
         cached = _JsonlCacheEntry(
             size=_window_start_offset(path, size, window),
             events=[],
             state=initial_state_factory(),
+            ino=ino,
         )
         _jsonl_caches[key] = cached
 

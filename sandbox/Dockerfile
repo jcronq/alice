@@ -40,7 +40,7 @@ ENV NODE_MAJOR=24
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg git openssh-client jq less xz-utils \
         ripgrep fd-find tini procps util-linux python3 python3-venv python3-pip \
-        inotify-tools \
+        inotify-tools logrotate \
     && install -d /etc/apt/keyrings \
     && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
     && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" > /etc/apt/sources.list.d/nodesource.list \
@@ -170,7 +170,7 @@ WORKDIR /home/alice/alice-mind
 # `--target cozylobe` stage is retired — see the header docstring.
 FROM base AS main
 
-# Per-stage s6 copy: 15 native alice-* service dirs plus init-state-perms and signal-daemon.
+# Per-stage s6 copy: 16 native alice-* service dirs plus init-state-perms and signal-daemon.
 # Plugin service dirs (e.g. alice-cozylobe, alice-cozylobe-reload-watcher)
 # are NOT copied here — they ship inside their plugin wheels and land
 # in /etc/s6-overlay/s6-rc.d/ via install-plugins.sh.
@@ -181,6 +181,7 @@ COPY sandbox/s6/alice-gh-reconciler/    /etc/s6-overlay/s6-rc.d/alice-gh-reconci
 COPY sandbox/s6/alice-gh-state-mirror/  /etc/s6-overlay/s6-rc.d/alice-gh-state-mirror/
 COPY sandbox/s6/alice-gh-watcher/       /etc/s6-overlay/s6-rc.d/alice-gh-watcher/
 COPY sandbox/s6/alice-index-rebuild/    /etc/s6-overlay/s6-rc.d/alice-index-rebuild/
+COPY sandbox/s6/alice-logrotate/        /etc/s6-overlay/s6-rc.d/alice-logrotate/
 COPY sandbox/s6/alice-memory-worker/    /etc/s6-overlay/s6-rc.d/alice-memory-worker/
 COPY sandbox/s6/alice-reload-watcher/   /etc/s6-overlay/s6-rc.d/alice-reload-watcher/
 COPY sandbox/s6/alice-repo-autopull/    /etc/s6-overlay/s6-rc.d/alice-repo-autopull/
@@ -192,6 +193,9 @@ COPY sandbox/s6/alice-viewer/           /etc/s6-overlay/s6-rc.d/alice-viewer/
 COPY sandbox/s6/init-state-perms/       /etc/s6-overlay/s6-rc.d/init-state-perms/
 COPY sandbox/s6/signal-daemon/          /etc/s6-overlay/s6-rc.d/signal-daemon/
 COPY sandbox/s6/signal-outbound-proxy/  /etc/s6-overlay/s6-rc.d/signal-outbound-proxy/
+# Log rotation policy for alice-logrotate. Forced to 0644 in the chmod
+# sweep below: logrotate ignores configs writable by group/other.
+COPY sandbox/logrotate/alice-logs.conf /etc/alice/logrotate.conf
 
 # User bundle — copy the dir itself for `type`, then enumerate the
 # non-cozylobe `contents.d/` entries explicitly. Listing only services whose
@@ -204,6 +208,7 @@ COPY sandbox/s6/user/contents.d/alice-gh-reconciler             /etc/s6-overlay/
 COPY sandbox/s6/user/contents.d/alice-gh-state-mirror           /etc/s6-overlay/s6-rc.d/user/contents.d/alice-gh-state-mirror
 COPY sandbox/s6/user/contents.d/alice-gh-watcher                /etc/s6-overlay/s6-rc.d/user/contents.d/alice-gh-watcher
 COPY sandbox/s6/user/contents.d/alice-index-rebuild             /etc/s6-overlay/s6-rc.d/user/contents.d/alice-index-rebuild
+COPY sandbox/s6/user/contents.d/alice-logrotate                 /etc/s6-overlay/s6-rc.d/user/contents.d/alice-logrotate
 COPY sandbox/s6/user/contents.d/alice-memory-worker             /etc/s6-overlay/s6-rc.d/user/contents.d/alice-memory-worker
 COPY sandbox/s6/user/contents.d/alice-reload-watcher            /etc/s6-overlay/s6-rc.d/user/contents.d/alice-reload-watcher
 COPY sandbox/s6/user/contents.d/alice-repo-autopull             /etc/s6-overlay/s6-rc.d/user/contents.d/alice-repo-autopull
@@ -242,7 +247,8 @@ RUN chmod +x /usr/local/bin/install-plugins.sh \
 # above) and plugin services (installed by install-plugins.sh). The cp
 # -a in the install script preserves wheel-built exec bits, but this
 # sweep is belt-and-suspenders for plugins built without them.
-RUN find /etc/s6-overlay/s6-rc.d \( -name 'run' -o -name 'up' -o -name 'finish' \) | xargs -r chmod +x
+RUN find /etc/s6-overlay/s6-rc.d \( -name 'run' -o -name 'up' -o -name 'finish' \) | xargs -r chmod +x \
+    && chmod 0644 /etc/alice/logrotate.conf
 
 # Viewer port published from the same container now; speaking + signal-cli
 # stay on localhost (no inter-container DNS hop).

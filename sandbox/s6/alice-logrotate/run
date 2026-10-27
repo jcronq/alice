@@ -1,0 +1,50 @@
+#!/command/with-contenv bash
+# alice-logrotate — size-based rotation of Alice's runtime logs.
+#
+# thinking.log reached 11 GB unrotated (Apr→Oct 2026, ~60 MB/day) and
+# speaking.log / speaking-stderr.log were past 500 MB. This loop runs
+# logrotate against sandbox/logrotate/alice-logs.conf (baked to
+# /etc/alice/logrotate.conf) every CADENCE seconds; the config rotates at
+# 256 MiB and keeps 5 gzipped generations. See the config header for why
+# event logs rotate by rename and stderr logs by copytruncate.
+#
+# Runs as root (logrotate refuses group-writable parent dirs like
+# /state/worker unless it can `su`); the config's `su alice alice`
+# drops to the files' owner for every file operation.
+#
+# Shape mirrors alice-index-rebuild: SIGTERM trap, staggered startup,
+# backgrounded sleep under `wait` so shutdown is prompt between cycles.
+set -e
+
+CONF=${ALICE_LOGROTATE_CONF:-/etc/alice/logrotate.conf}
+STATE=${ALICE_LOGROTATE_STATE:-/state/worker/logrotate.status}
+CADENCE=${ALICE_LOGROTATE_CADENCE:-900}
+
+STOPPING=
+on_signal() {
+    STOPPING=1
+}
+trap on_signal TERM INT
+
+# /usr/sbin is not on the container PATH, so resolve explicitly.
+LOGROTATE=$(command -v logrotate || echo /usr/sbin/logrotate)
+if [ ! -x "$LOGROTATE" ] || [ ! -r "$CONF" ]; then
+    # Image predates the logrotate layer — idle instead of crash-looping.
+    echo "[alice-logrotate] logrotate or $CONF missing; idling" >&2
+    exec sleep infinity
+fi
+
+sleep 60 &
+wait $! 2>/dev/null || true
+
+while true; do
+    [ -n "$STOPPING" ] && break
+
+    # Foreground so an in-flight copytruncate/gzip finishes before exit.
+    "$LOGROTATE" -s "$STATE" "$CONF" || echo "[alice-logrotate] logrotate exited $?" >&2
+
+    [ -n "$STOPPING" ] && break
+
+    sleep "$CADENCE" &
+    wait $! 2>/dev/null || true
+done
