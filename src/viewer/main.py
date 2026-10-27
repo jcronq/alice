@@ -1981,13 +1981,10 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         speaking_path = p.speaking_log
 
         # Start from current end-of-file so we only ship new events.
+        # Cursor is (inode, offset) so log rotation is detected.
         offsets = {
-            thinking_path: thinking_path.stat().st_size
-            if thinking_path.is_file()
-            else 0,
-            speaking_path: speaking_path.stat().st_size
-            if speaking_path.is_file()
-            else 0,
+            thinking_path: _eof_cursor(thinking_path),
+            speaking_path: _eof_cursor(speaking_path),
         }
 
         async def gen():
@@ -1998,9 +1995,8 @@ def create_app(paths: Paths | None = None) -> FastAPI:
                     (thinking_path, "thinking"),
                     (speaking_path, "speaking"),
                 ):
-                    new_lines = _read_since(path, offsets[path])
+                    new_lines, offsets[path] = _read_since(path, offsets[path])
                     if new_lines:
-                        offsets[path] = path.stat().st_size
                         for raw in new_lines:
                             try:
                                 rec = json.loads(raw)
@@ -2019,26 +2015,48 @@ def create_app(paths: Paths | None = None) -> FastAPI:
 # Helpers
 
 
-def _read_since(path: pathlib.Path, offset: int) -> list[str]:
-    if not path.is_file():
-        return []
+def _eof_cursor(path: pathlib.Path) -> tuple[int, int]:
+    """``(inode, size)`` of ``path`` — a cursor positioned at end-of-file."""
     try:
-        size = path.stat().st_size
+        st = path.stat()
     except OSError:
-        return []
-    if size <= offset:
-        # File was truncated (e.g. rotated) — reset from 0.
-        if size < offset:
-            offset = 0
-        else:
-            return []
+        return (0, 0)
+    return (st.st_ino, st.st_size)
+
+
+def _read_since(
+    path: pathlib.Path, cursor: tuple[int, int]
+) -> tuple[list[str], tuple[int, int]]:
+    """Complete lines appended since ``cursor`` (an ``(inode, offset)``
+    pair), plus the advanced cursor.
+
+    Rotation-safe: a new inode (rename rotation) or a size below the
+    offset (copytruncate) restarts from the top of the current file. Only
+    whole lines are consumed — a trailing partial line (writer mid-write)
+    stays unread so it is returned intact on the next poll instead of
+    being split into two undecodable halves.
+    """
+    ino, offset = cursor
     try:
-        with path.open("r", errors="replace") as f:
+        st = path.stat()
+    except OSError:
+        return [], cursor
+    if st.st_ino != ino or st.st_size < offset:
+        ino, offset = st.st_ino, 0
+    if st.st_size == offset:
+        return [], (ino, offset)
+    try:
+        with path.open("rb") as f:
             f.seek(offset)
             data = f.read()
     except OSError:
-        return []
-    return [line for line in data.splitlines() if line.strip()]
+        return [], (ino, offset)
+    end = data.rfind(b"\n")
+    if end < 0:
+        return [], (ino, offset)
+    complete = data[: end + 1].decode("utf-8", errors="replace")
+    lines = [line for line in complete.splitlines() if line.strip()]
+    return lines, (ino, offset + end + 1)
 
 
 def _localtime(ts: float) -> str:
