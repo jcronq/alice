@@ -232,7 +232,9 @@ services:
     environment:
       PYTHONPATH: /app
       PYTHONDONTWRITEBYTECODE: "1"
-      TZ: "${ALICE_TZ:-America/New_York}"
+      # POSIX rule, not a zone name: the alpine image ships no tzdata, and musl
+      # silently falls back to UTC on names it can't resolve.
+      TZ: "${ALICE_STATUS_TZ:-EST5EDT,M3.2.0,M11.1.0}"
       STATUS_DIR: /srv/status
       SURFACE_DIR: /srv/surface
       UPLOAD_DIR: /srv/uploads
