@@ -2015,6 +2015,10 @@ def create_app(paths: Paths | None = None) -> FastAPI:
 # Helpers
 
 
+# Max bytes /stream replays from a file it finds rotated under it.
+_STREAM_ROTATION_REPLAY_BYTES = 1024 * 1024
+
+
 def _eof_cursor(path: pathlib.Path) -> tuple[int, int]:
     """``(inode, size)`` of ``path`` — a cursor positioned at end-of-file."""
     try:
@@ -2031,7 +2035,9 @@ def _read_since(
     pair), plus the advanced cursor.
 
     Rotation-safe: a new inode (rename rotation) or a size below the
-    offset (copytruncate) restarts from the top of the current file. Only
+    offset (copytruncate) restarts in the current file — from the top, or
+    from the last ``_STREAM_ROTATION_REPLAY_BYTES`` if it is already big
+    (e.g. a trimmed log), so a live client isn't flooded. Only
     whole lines are consumed — a trailing partial line (writer mid-write)
     stays unread so it is returned intact on the next poll instead of
     being split into two undecodable halves.
@@ -2042,7 +2048,10 @@ def _read_since(
     except OSError:
         return [], cursor
     if st.st_ino != ino or st.st_size < offset:
-        ino, offset = st.st_ino, 0
+        ino = st.st_ino
+        offset = sources._window_start_offset(
+            path, st.st_size, _STREAM_ROTATION_REPLAY_BYTES
+        )
     if st.st_size == offset:
         return [], (ino, offset)
     try:

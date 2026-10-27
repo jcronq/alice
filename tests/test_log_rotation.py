@@ -222,3 +222,16 @@ def test_policy_rotates_for_real(tmp_path):
     assert (state / "worker" / "speaking-stderr.log.1.gz").exists()
     # Held fd keeps writing into the live (truncated) file, at offset 0.
     assert stderr.read_bytes() == _line(999)
+
+
+def test_read_since_bounds_replay_into_large_rotated_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(viewer_main, "_STREAM_ROTATION_REPLAY_BYTES", 1000)
+    log = tmp_path / "thinking.log"
+    _append(log, 0, 3)
+    cur = viewer_main._eof_cursor(log)
+    log.rename(tmp_path / "thinking.log.1")
+    _append(log, 0, 500)  # ~40 KB, far past the replay bound
+    lines, cur = viewer_main._read_since(log, cur)
+    ids = _decoded(lines)
+    assert 0 < len(ids) < 20
+    assert ids == list(range(ids[0], 500))  # whole lines, ending at the tail
