@@ -16,6 +16,7 @@ single uvicorn worker).
 
 from __future__ import annotations
 
+import bisect
 import datetime as _dt
 import json
 import math
@@ -75,11 +76,40 @@ def _read_jsonl(path: pathlib.Path) -> Iterator[dict[str, Any]]:
 # Each entry remembers how many bytes we've already parsed so a follow-up
 # read only decodes the tail. Rotation (size shrinks) → reparse from
 # scratch.
+#
+# Retention is BOUNDED to a trailing byte window of each file
+# (``ALICE_VIEWER_JSONL_WINDOW_BYTES``, default 64 MiB). thinking.log is
+# never rotated and reached 11 GB; the old cache decoded the entire file
+# into ``UnifiedEvent`` objects (each holding the full record dict) and
+# kept every one forever, so the viewer child grew to 30+ GB, swapped the
+# host, and blocked the event loop for hours on cold start. Now a cold
+# start seeks to ``size - window`` and the oldest events are evicted as
+# the file grows, so retained memory tracks the window, not file size.
+_DEFAULT_JSONL_WINDOW_BYTES = 64 * 1024 * 1024
+_JSONL_READ_CHUNK_BYTES = 4 * 1024 * 1024
+
+
+def _jsonl_window_bytes() -> int:
+    raw = os.environ.get("ALICE_VIEWER_JSONL_WINDOW_BYTES")
+    if raw:
+        try:
+            val = int(raw)
+        except ValueError:
+            return _DEFAULT_JSONL_WINDOW_BYTES
+        if val > 0:
+            return val
+    return _DEFAULT_JSONL_WINDOW_BYTES
+
+
 @dataclass
 class _JsonlCacheEntry:
     size: int
     events: list[UnifiedEvent]
     state: Any
+    # File offset where each retained event's line starts; parallel to
+    # ``events`` and monotonically increasing. Used to evict events that
+    # fall out of the trailing window.
+    starts: list[int] = field(default_factory=list)
 
 
 _jsonl_caches: dict[str, _JsonlCacheEntry] = {}
@@ -92,35 +122,72 @@ def _iter_jsonl_tail(
     after ``start_offset``. ``record`` is None for blank/malformed lines so
     callers can still advance the offset cursor past them.
 
+    Reads in fixed-size chunks so a large tail never materializes as one
+    giant bytes buffer.
+
     A trailing partial line (writer mid-flush) is left unread; the caller
     keeps the previous offset so the next call picks it up cleanly.
     """
     try:
-        with path.open("rb") as f:
-            f.seek(start_offset)
-            data = f.read()
+        f = path.open("rb")
     except OSError:
         return
-    if not data:
-        return
-    pos = 0
-    while pos < len(data):
-        nl = data.find(b"\n", pos)
-        if nl < 0:
-            return  # partial trailing line — leave for next call
-        line_bytes = data[pos:nl]
-        new_offset = start_offset + nl + 1
-        pos = nl + 1
-        line = line_bytes.strip()
-        if not line:
-            yield None, new_offset
-            continue
+    with f:
         try:
-            rec = json.loads(line.decode("utf-8", errors="replace"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            yield None, new_offset
-            continue
-        yield rec, new_offset
+            f.seek(start_offset)
+        except OSError:
+            return
+        base = start_offset  # file offset of buf[0]
+        buf = b""
+        while True:
+            try:
+                chunk = f.read(_JSONL_READ_CHUNK_BYTES)
+            except OSError:
+                return
+            if not chunk:
+                return  # anything left in buf is a partial trailing line
+            buf = buf + chunk if buf else chunk
+            pos = 0
+            while True:
+                nl = buf.find(b"\n", pos)
+                if nl < 0:
+                    break
+                line = buf[pos:nl].strip()
+                new_offset = base + nl + 1
+                pos = nl + 1
+                if not line:
+                    yield None, new_offset
+                    continue
+                try:
+                    rec = json.loads(line.decode("utf-8", errors="replace"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    yield None, new_offset
+                    continue
+                yield rec, new_offset
+            buf = buf[pos:]
+            base += pos
+
+
+def _window_start_offset(path: pathlib.Path, size: int, window: int) -> int:
+    """First line boundary at or after ``size - window`` (0 if the whole
+    file fits). Skips the partial line the cut lands in."""
+    if size <= window:
+        return 0
+    cut = size - window
+    try:
+        with path.open("rb") as f:
+            f.seek(cut - 1)
+            pos = cut - 1
+            while True:
+                chunk = f.read(64 * 1024)
+                if not chunk:
+                    return size
+                nl = chunk.find(b"\n")
+                if nl >= 0:
+                    return pos + nl + 1
+                pos += len(chunk)
+    except OSError:
+        return 0
 
 
 def _cached_jsonl(
@@ -130,9 +197,10 @@ def _cached_jsonl(
 ) -> list[UnifiedEvent]:
     """Tail-parse cache. ``parse_record`` is ``(rec, state) -> (event_or_None, new_state)``.
 
-    Returns the cached list directly — callers (``load_all``) consume via
-    ``list.extend`` which copies references rather than mutating, so it's
-    safe to share. Don't mutate the returned list.
+    Only events from the trailing ``_jsonl_window_bytes()`` of the file are
+    retained. Returns the cached list directly — callers (``load_all``)
+    consume via ``list.extend`` which copies references rather than
+    mutating, so it's safe to share. Don't mutate the returned list.
     """
     key = str(path)
     cached = _jsonl_caches.get(key)
@@ -145,8 +213,13 @@ def _cached_jsonl(
     except OSError:
         return cached.events if cached is not None else []
 
+    window = _jsonl_window_bytes()
     if cached is None or size < cached.size:
-        cached = _JsonlCacheEntry(size=0, events=[], state=initial_state_factory())
+        cached = _JsonlCacheEntry(
+            size=_window_start_offset(path, size, window),
+            events=[],
+            state=initial_state_factory(),
+        )
         _jsonl_caches[key] = cached
 
     if size == cached.size:
@@ -154,15 +227,26 @@ def _cached_jsonl(
 
     state = cached.state
     new_offset = cached.size
+    line_start = cached.size
     for rec, off in _iter_jsonl_tail(path, cached.size):
+        this_start, line_start = line_start, off
         new_offset = off
         if rec is None:
             continue
         event, state = parse_record(rec, state)
         if event is not None:
             cached.events.append(event)
+            cached.starts.append(this_start)
     cached.state = state
     cached.size = new_offset
+
+    # Evict events whose line starts before the trailing window. Rebind
+    # (not in-place delete) so lists already handed to callers stay intact.
+    floor = cached.size - window
+    if cached.starts and cached.starts[0] < floor:
+        cut = bisect.bisect_left(cached.starts, floor)
+        cached.events = cached.events[cut:]
+        cached.starts = cached.starts[cut:]
     return cached.events
 
 
