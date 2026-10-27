@@ -26,7 +26,9 @@ on_signal() {
 }
 trap on_signal TERM INT
 
-if ! command -v logrotate >/dev/null 2>&1 || [ ! -r "$CONF" ]; then
+# /usr/sbin is not on the container PATH, so resolve explicitly.
+LOGROTATE=$(command -v logrotate || echo /usr/sbin/logrotate)
+if [ ! -x "$LOGROTATE" ] || [ ! -r "$CONF" ]; then
     # Image predates the logrotate layer — idle instead of crash-looping.
     echo "[alice-logrotate] logrotate or $CONF missing; idling" >&2
     exec sleep infinity
@@ -39,7 +41,7 @@ while true; do
     [ -n "$STOPPING" ] && break
 
     # Foreground so an in-flight copytruncate/gzip finishes before exit.
-    logrotate -s "$STATE" "$CONF" || echo "[alice-logrotate] logrotate exited $?" >&2
+    "$LOGROTATE" -s "$STATE" "$CONF" || echo "[alice-logrotate] logrotate exited $?" >&2
 
     [ -n "$STOPPING" ] && break
 
