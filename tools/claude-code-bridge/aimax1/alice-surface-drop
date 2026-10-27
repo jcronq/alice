@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""Forced-command receiver: reads a surface markdown doc on stdin, drops it into Alice's surface inbox.
+
+Used by Claude Code hooks on Bazzite (authorized_keys command=). Ignores SSH_ORIGINAL_COMMAND.
+"""
+import os, re, sys, time
+
+
+def alice_mind():
+    """$ALICE_MIND, else ALICE_MIND= from ~/.config/alice/alice.env, else ~/alice-mind."""
+    if os.environ.get("ALICE_MIND"):
+        return os.environ["ALICE_MIND"]
+    try:
+        for line in open(os.path.expanduser("~/.config/alice/alice.env")):
+            if line.startswith("ALICE_MIND="):
+                return line.split("=", 1)[1].strip().strip("'\"")
+    except OSError:
+        pass
+    return os.path.expanduser("~/alice-mind")
+
+
+SURFACE_DIR = os.path.join(alice_mind(), "inner", "surface")
+MAX_BYTES = 64 * 1024
+
+data = sys.stdin.buffer.read(MAX_BYTES + 1)
+if not data.strip() or len(data) > MAX_BYTES:
+    sys.exit("rejected: empty or oversized")
+text = data.decode("utf-8", "replace")
+if not text.startswith("---\n"):
+    sys.exit("rejected: missing frontmatter")
+m = re.search(r"^detail:\s*([A-Za-z0-9._-]{1,60})\s*$", text, re.M)
+slug = m.group(1) if m else "claude-code"
+name = time.strftime("%Y-%m-%dT%H-%M-%S") + f"-cc-{slug}.md"
+tmp = os.path.join(SURFACE_DIR, f".tmp-{os.getpid()}")
+with open(tmp, "w") as f:
+    f.write(text)
+os.chmod(tmp, 0o664)
+os.rename(tmp, os.path.join(SURFACE_DIR, name))
+print(name)

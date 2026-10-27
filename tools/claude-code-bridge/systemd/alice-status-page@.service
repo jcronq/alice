@@ -1,0 +1,8 @@
+# Template: publish one status page to Alice's status site.
+# Instance name = generator script in ~/bin, e.g. alice-status-page@mud-wave-status
+[Unit]
+Description=Publish %i to Alice status site
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I %h/bin/%i.py

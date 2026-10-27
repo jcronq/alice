@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# status-reply THREAD_ID "text" — post Alice's reply into a status-page item
+# thread (the status site's per-item chat; see docs/designs/status-site.md).
+#
+# Threads root: $STATUS_DIR, else $ALICE_MIND/inner/status, else
+# ~/alice-mind/inner/status. The Python implementation lives in
+# src/status_site/cli.py; alice-tools/bin/status-reply execs this wrapper so
+# Speaking's PATH entry keeps working.
+
+set -u
+
+ALICE_SRC="${ALICE_SRC:-/home/alice/alice/src}"
+if [ ! -d "$ALICE_SRC/status_site" ]; then
+    ALICE_SRC="$(cd "$(dirname "$(readlink -f "$0")")/../src" && pwd)"
+fi
+PY="$(command -v python3)" || { echo "[status-reply] no python3 available" >&2; exit 2; }
+
+if [ -n "${PYTHONPATH-}" ]; then
+    export PYTHONPATH="$ALICE_SRC:$PYTHONPATH"
+else
+    export PYTHONPATH="$ALICE_SRC"
+fi
+
+exec "$PY" -m status_site.cli "$@"
