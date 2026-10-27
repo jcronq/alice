@@ -211,6 +211,58 @@ services:
       litellm:
         condition: service_healthy
 
+  # Status site — Jason's status/todo page with per-item threads that route
+  # to Speaking as `type: status-reply` surfaces (docs/designs/status-site.md).
+  # Its own tiny container so it can be deployed/restarted without touching
+  # `alice` (Speaking). Stdlib-only, so a stock python image runs the repo
+  # package straight from the bind-mounted checkout; the autopull keeps it
+  # current, `docker compose up -d --no-deps --force-recreate status-site` picks
+  # up code changes. Content (pages, threads, uploads) and the shared key stay
+  # in the mind dir. LAN-only: no auth on reads, shared key on writes.
+  #
+  # Deploy just this service (never recreates `alice`):
+  #   cd sandbox && ALICE_ROOT=.. . ../bin/_alice-env.sh && docker compose up -d --no-deps status-site
+  status-site:
+    image: python:3.12-alpine
+    container_name: alice-status
+    restart: unless-stopped
+    user: "${USER_ID:-1000}:${GROUP_ID:-1000}"
+    command: ["python3", "-u", "-m", "status_site"]
+    working_dir: /app
+    environment:
+      PYTHONPATH: /app
+      PYTHONDONTWRITEBYTECODE: "1"
+      # POSIX rule, not a zone name: the alpine image ships no tzdata, and musl
+      # silently falls back to UTC on names it can't resolve.
+      TZ: "${ALICE_STATUS_TZ:-EST5EDT,M3.2.0,M11.1.0}"
+      STATUS_DIR: /srv/status
+      SURFACE_DIR: /srv/surface
+      UPLOAD_DIR: /srv/uploads
+      KEY_FILE: /srv/config/key
+      PORT: "8095"
+      # Where Speaking (inside `alice`) sees UPLOAD_DIR; surfaces list these paths.
+      UPLOAD_DIR_ALIAS: /home/alice/alice-mind/inner/status-uploads
+      PUBLIC_URL: "${ALICE_STATUS_PUBLIC_URL:-http://10.20.30.177:8095}"
+    ports:
+      - "8095:8095"
+    volumes:
+      - ${ALICE_REPO:-${HOME}/alice}/src/status_site:/app/status_site:ro
+      - ${ALICE_MIND:-${HOME}/alice-mind}/inner/status:/srv/status
+      - ${ALICE_MIND:-${HOME}/alice-mind}/inner/surface:/srv/surface
+      - ${ALICE_MIND:-${HOME}/alice-mind}/inner/status-uploads:/srv/uploads
+      # Holds only `key` (the shared reply key; never committed).
+      - ${ALICE_MIND:-${HOME}/alice-mind}/inner/status-server:/srv/config:ro
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8095/api/threads', timeout=3).status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
   # LiteLLM proxy — single OpenAI-compatible endpoint for all local
   # model traffic. Call sites use LITELLM_BASE_URL (set on the alice
   # service above) plus a configured virtual model name which the proxy

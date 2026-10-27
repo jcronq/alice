@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Alice — status</title>
+<style>
+:root{--bg:#fbfaf7;--fg:#1f2328;--muted:#6b7280;--card:#fff;--line:#e5e2db;--accent:#2f6f5e;--warn:#b45309}
+@media (prefers-color-scheme:dark){:root{--bg:#15171a;--fg:#e6e6e6;--muted:#9aa0a6;--card:#1d2024;--line:#2c3036;--accent:#6cc4a8;--warn:#f0a35e}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}
+header{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--line);padding:.6rem 1rem;display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;z-index:2}
+header b{font-size:1.05rem}header nav{display:flex;gap:.4rem;flex-wrap:wrap}
+header a{color:var(--muted);text-decoration:none;padding:.15rem .55rem;border:1px solid var(--line);border-radius:999px;font-size:.85rem}
+header a.on{color:var(--bg);background:var(--accent);border-color:var(--accent)}
+#age{margin-left:auto;color:var(--muted);font-size:.8rem}
+main{max-width:860px;margin:0 auto;padding:1rem 1rem 4rem}
+h1{font-size:1.5rem;margin:.6rem 0}h2{font-size:1.15rem;margin:1.6rem 0 .5rem;padding-bottom:.25rem;border-bottom:1px solid var(--line)}h3{font-size:1rem}
+ul{padding-left:1.2rem}li{margin:.2rem 0}
+li:has(> input[type=checkbox]){list-style:none;margin-left:-1.2rem;padding:.45rem .7rem;background:var(--card);border:1px solid var(--line);border-radius:8px;margin-bottom:.35rem}
+li:has(> input:checked){color:var(--muted)}
+input[type=checkbox]{transform:scale(1.15);margin-right:.5rem;accent-color:var(--accent)}
+em{color:var(--muted);font-style:normal;font-size:.92em}
+code{background:var(--card);border:1px solid var(--line);border-radius:4px;padding:0 .3rem;font-size:.88em}
+table{border-collapse:collapse;width:100%;font-size:.92rem}th,td{border-bottom:1px solid var(--line);padding:.35rem .5rem;text-align:left}
+blockquote{margin:.6rem 0;padding:.4rem .8rem;border-left:3px solid var(--warn);background:var(--card);border-radius:0 6px 6px 0}
+progress{width:100%;height:10px;accent-color:var(--accent)}
+a{color:var(--accent)}
+.reply{margin-top:.45rem;display:none}.reply.open{display:block}
+.reply textarea{width:100%;min-height:4.2rem;font:inherit;padding:.45rem;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+.reply .row{display:flex;gap:.5rem;margin-top:.35rem;align-items:center}
+button{font:inherit;font-size:.85rem;padding:.3rem .8rem;border-radius:6px;border:1px solid var(--accent);background:var(--accent);color:var(--bg);cursor:pointer}
+button.ghost{background:transparent;color:var(--accent)}
+.rbtn{float:right;margin-left:.5rem}.sent{color:var(--accent);font-size:.85rem}
+.thread{margin-top:.5rem;display:flex;flex-direction:column;gap:.35rem}
+.msg{max-width:88%;padding:.4rem .65rem;border-radius:10px;font-size:.92rem;white-space:pre-wrap;line-height:1.4}
+.msg.jason{align-self:flex-end;background:var(--accent);color:var(--bg);border-bottom-right-radius:3px}
+.msg.alice{align-self:flex-start;background:var(--bg);border:1px solid var(--line);border-bottom-left-radius:3px}
+.msg small{display:block;opacity:.65;font-size:.72rem;margin-top:.15rem}
+.typing{align-self:flex-start;color:var(--muted);font-size:.82rem;font-style:italic}
+.attach{font-size:.85rem;color:var(--accent);cursor:pointer;border:1px solid var(--accent);border-radius:6px;padding:.3rem .7rem}
+.conv{display:none;margin-top:.5rem;border:1px solid var(--line);border-radius:8px;background:var(--bg)}
+.conv.open{display:block}
+.conv .thread{max-height:320px;overflow-y:auto;padding:.5rem;margin:0;overscroll-behavior:contain}
+.conv .reply{display:block;margin:0;padding:.5rem;border-top:1px solid var(--line)}
+.ctog{float:right;margin-left:.5rem;font-size:.8rem;padding:.2rem .6rem;border-radius:999px;border:1px solid var(--line);background:var(--card);color:var(--muted);cursor:pointer}
+.ctog.unread{border-color:var(--accent);color:var(--accent);font-weight:600}
+.ctog.on{background:var(--accent);color:var(--bg);border-color:var(--accent)}
+</style></head><body>
+<header><b>Alice</b><nav id="nav"></nav><span id="age"></span></header>
+<main id="doc">Loading…</main>
+<script src="marked.min.js"></script>
+<script>
+const q=new URLSearchParams(location.search);const page=(q.get('p')||'index').replace(/[^a-z0-9_-]/gi,'');
+
+const KEY=(()=>{const k=q.get('k');if(k){localStorage.setItem('alice-key',k);history.replaceState(null,'',location.pathname+(page!=='index'?'?p='+page:''))}return localStorage.getItem('alice-key')||''})();
+let replyOpen=false,THREADS={};
+const slug=t=>t.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,60);
+const esc=t=>t.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+function fmt(at){const d=new Date(at);return isNaN(d)?'':d.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'})}
+const seen=JSON.parse(localStorage.getItem('alice-seen')||'{}'),openSet=new Set(JSON.parse(localStorage.getItem('alice-open')||'[]'));
+const saveUI=()=>{localStorage.setItem('alice-seen',JSON.stringify(seen));localStorage.setItem('alice-open',JSON.stringify([...openSet]))};
+function renderThread(li){
+  const tid=li.dataset.tid,conv=li.querySelector(':scope > .conv'),t=conv.querySelector('.thread'),tog=li.querySelector(':scope > .ctog');
+  const msgs=THREADS[tid]||[],open=conv.classList.contains('open');
+  const atBottom=t.scrollHeight-t.scrollTop-t.clientHeight<40;
+  t.innerHTML=msgs.length?msgs.map(m=>`<div class="msg ${m.from==='jason'?'jason':'alice'}">${esc(m.text||'')}${(m.files||[]).map(n=>`<div>📎 ${esc(n)}</div>`).join('')}<small>${m.from==='jason'?'You':'Alice'} · ${fmt(m.at)}</small></div>`).join('')+
+    (msgs[msgs.length-1].from==='jason'?'<div class="typing">Alice is on it…</div>':''):'<div class="typing">No messages yet.</div>';
+  t.style.display='flex';t.style.flexDirection='column';t.style.gap='.35rem';
+  if(open){seen[tid]=msgs.length;saveUI();if(atBottom||t.dataset.first!=='1'){t.scrollTop=t.scrollHeight;t.dataset.first='1'}}
+  const unread=msgs.length-(seen[tid]||0);
+  tog.textContent=open?'Hide':(msgs.length?`💬 ${msgs.length}${unread>0?` · ${unread} new`:''}`:'💬 Reply');
+  tog.classList.toggle('unread',!open&&unread>0);tog.classList.toggle('on',open);
+}
+function addReplies(){
+  let waiting=false;
+  document.querySelectorAll('#doc > *').forEach(el=>{
+    if(/^H[12]$/.test(el.tagName)) waiting=/waiting on you/i.test(el.textContent);
+    if(el.tagName!=='UL')return;
+    el.querySelectorAll(':scope > li').forEach(li=>{
+      const st=li.querySelector('strong'); if(!st||li.dataset.tid)return;
+      const tid=slug(st.textContent); li.dataset.tid=tid; const itemText=li.textContent.replace(/\s+/g,' ').trim().slice(0,400);
+      const has=(THREADS[tid]||[]).length>0;
+      if(!waiting&&!has&&!li.querySelector('input:not(:checked)'))return;
+      const tog=document.createElement('button');tog.className='ctog';
+      const conv=document.createElement('div');conv.className='conv';
+      conv.innerHTML='<div class="thread"></div><div class="reply"><textarea placeholder="Message Alice about this…"></textarea><div class="row"><button>Send</button><label class="attach">📎 Attach<input type="file" multiple hidden></label><span class="sent"></span></div></div>';
+      if(openSet.has(tid))conv.classList.add('open');
+      tog.onclick=()=>{const o=conv.classList.toggle('open');o?openSet.add(tid):openSet.delete(tid);saveUI();renderThread(li);if(o)conv.querySelector('textarea').focus({preventScroll:true})};
+      const ta=conv.querySelector('textarea'),sm=conv.querySelector('.sent'),send=conv.querySelector('.row button'),fi=conv.querySelector('input[type=file]');
+      fi.onchange=()=>{sm.textContent=fi.files.length?[...fi.files].map(f=>f.name).join(', '):'';replyOpen=true};
+      ta.addEventListener('input',()=>{replyOpen=!!ta.value});
+      send.onclick=async()=>{
+        if(!ta.value.trim()&&!fi.files.length)return;
+        if(!KEY){sm.textContent='No key: open the link Alice sent once.';return}
+        send.disabled=true;sm.textContent='Sending…';
+        try{const files=await Promise.all([...fi.files].map(f=>new Promise((ok,no)=>{const rd=new FileReader();rd.onload=()=>ok({name:f.name,data:rd.result.split(',')[1]});rd.onerror=no;rd.readAsDataURL(f)})));
+          const r=await fetch('api/reply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:KEY,item:itemText,thread:tid,text:ta.value,files,page})});
+          const j=await r.json();
+          if(r.ok){sm.textContent='';ta.value='';fi.value='';replyOpen=false;await pollThreads();const t=conv.querySelector('.thread');t.scrollTop=t.scrollHeight}else sm.textContent='Error: '+(j.error||r.status)}
+        catch(e){sm.textContent='Error: '+e.message}
+        send.disabled=false};
+      li.insertBefore(tog,li.firstChild.nextSibling);li.appendChild(conv);renderThread(li);
+    });
+  });
+}
+async function pollThreads(){
+  try{const r=await fetch('api/threads?'+Date.now());if(!r.ok)return;THREADS=await r.json();
+    document.querySelectorAll('#doc li[data-tid]').forEach(li=>{if(li.querySelector(':scope > .conv'))renderThread(li)});}catch(e){}
+}
+setInterval(pollThreads,5000);
+async function load(){
+  if(replyOpen)return;
+  try{
+    const [r,pr]=await Promise.all([fetch(page+'.md?'+Date.now()),fetch('pages.json?'+Date.now()).catch(()=>null)]);
+    if(!r.ok)throw new Error(r.status);
+    const lm=r.headers.get('last-modified');
+    document.getElementById('doc').innerHTML=marked.parse(await r.text(),{gfm:true});
+    document.querySelectorAll('#doc input[type=checkbox]').forEach(c=>c.disabled=true);
+    await pollThreads();addReplies();
+    if(lm){const m=Math.round((Date.now()-new Date(lm))/60000);document.getElementById('age').textContent='updated '+(m<1?'just now':m<60?m+' min ago':Math.round(m/60)+' h ago')}
+    if(pr&&pr.ok){const pages=await pr.json();document.getElementById('nav').innerHTML=pages.map(p=>`<a href="?p=${p.slug}" class="${p.slug===page?'on':''}">${p.title}</a>`).join('')}
+    document.title='Alice — '+(document.querySelector('#doc h1')?.textContent||page);
+  }catch(e){document.getElementById('doc').textContent='Could not load '+page+'.md ('+e.message+')'}
+}
+let PAGE_VER=null;
+async function checkVersion(){try{const r=await fetch('index.html',{method:'HEAD',cache:'no-store'});const v=r.headers.get('last-modified');if(PAGE_VER&&v&&v!==PAGE_VER&&!replyOpen)location.reload();PAGE_VER=PAGE_VER||v}catch(e){}}
+load();checkVersion();setInterval(load,60000);setInterval(checkVersion,30000);
+</script></body></html>

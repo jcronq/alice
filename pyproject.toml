@@ -102,6 +102,11 @@ alice-host-claude-request = "alice_speaking.tools.host_claude:main"
 # scripts/sm-thinking-perissue.py shim is a thin file-path wrapper around
 # the same module for repo-root invocations.
 alice-sm-thinking-perissue = "alice_thinking.cli.perissue:main"
+# Status site (docs/designs/status-site.md): the server runs as the
+# alice-status compose service; status-reply is how Speaking answers an item
+# thread. bin/status-reply is the repo-checkout wrapper for the same CLI.
+alice-status-site = "status_site.server:main"
+status-reply = "status_site.cli:main"
 # cozylobe-cortex-onboard and cozylobe-cortex-lint entry points moved
 # to the standalone alice-cozylobe repo (see dependencies above).
 
@@ -122,6 +127,7 @@ build-backend = "hatchling.build"
 #   alice_speaking  — Signal daemon (composes kernel with producers/handlers/outbox)
 #   alice_thinking  — one-shot wake (python -m alice_thinking)
 #   (alice_cozylobe + cozylobe_cortex now live in jcronq/alice-cozylobe)
+#   status_site — Jason's status/todo page + per-item threads (stdlib-only)
 #   viewer    — FastAPI observability UI (serves /state logs)
 #   watchers  — one-shot pollers feeding inner/notes/ (github, …)
 [tool.hatch.build.targets.wheel]
@@ -136,6 +142,7 @@ packages = [
     "src/alice_forge",
     "src/alice_speaking",
     "src/alice_thinking",
+    "src/status_site",
     "src/viewer",
     "src/watchers",
 ]
@@ -152,6 +159,7 @@ packages = [
 "src/kernels/pi/extensions" = "kernels/pi/extensions"
 "src/alice_thinking/prompts" = "alice_thinking/prompts"
 "src/alice_thinking/workflows/stage_b/prompts" = "alice_thinking/workflows/stage_b/prompts"
+"src/status_site/static" = "status_site/static"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

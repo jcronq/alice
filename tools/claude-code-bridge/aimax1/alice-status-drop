@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""Forced-command receiver: writes stdin (markdown) to Alice's status site as <name>.md.
+
+Name comes from SSH_ORIGINAL_COMMAND, restricted to [a-z0-9-]{1,40} and not 'index'.
+Add the page to pages.json once so it shows up in the nav.
+"""
+import os, re, sys
+
+
+def alice_mind():
+    """$ALICE_MIND, else ALICE_MIND= from ~/.config/alice/alice.env, else ~/alice-mind."""
+    if os.environ.get("ALICE_MIND"):
+        return os.environ["ALICE_MIND"]
+    try:
+        for line in open(os.path.expanduser("~/.config/alice/alice.env")):
+            if line.startswith("ALICE_MIND="):
+                return line.split("=", 1)[1].strip().strip("'\"")
+    except OSError:
+        pass
+    return os.path.expanduser("~/alice-mind")
+
+
+DIR = os.path.join(alice_mind(), "inner", "status")
+name = (os.environ.get("SSH_ORIGINAL_COMMAND") or "").strip()
+if not re.fullmatch(r"[a-z0-9-]{1,40}", name) or name == "index":
+    sys.exit("rejected: bad page name")
+data = sys.stdin.buffer.read(256 * 1024 + 1)
+if not data.strip() or len(data) > 256 * 1024:
+    sys.exit("rejected: empty or oversized")
+tmp = os.path.join(DIR, f".{name}.tmp")
+with open(tmp, "wb") as f:
+    f.write(data)
+os.chmod(tmp, 0o644)
+os.rename(tmp, os.path.join(DIR, name + ".md"))
