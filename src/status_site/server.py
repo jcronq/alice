@@ -303,7 +303,7 @@ def handle_reply(cfg: Config, d: dict) -> dict:
 
 class Handler(BaseHTTPRequestHandler):
     cfg: Config  # set by make_server
-    server_version = "AliceStatus/1.0"
+    server_version = "StatusSite/1.0"
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002 (stdlib signature)
         # Never log query strings: Jason's link carries ?k=<key>.
