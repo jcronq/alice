@@ -5,6 +5,7 @@ Stdlib-only (runs on a bare ``python:3.12-alpine`` image). Routes:
     GET  /, /index.html, /marked.min.js   packaged frontend (status_site/static/)
     GET  /<page>.md, /pages.json, images  content, read from STATUS_DIR (top level only)
     GET  /api/threads                     {thread_id: [message, ...]} for every thread
+    POST /api/page-visibility             dismiss/restore a nav tab (shared-key auth)
     POST /api/reply                       Jason's reply to an item (shared-key auth):
                                           appends to the item's thread, stores attachments
                                           privately under UPLOAD_DIR, and drops a
@@ -301,6 +302,40 @@ def handle_reply(cfg: Config, d: dict) -> dict:
 # ---------------------------------------------------------------- HTTP
 
 
+def handle_page_visibility(cfg: Config, d: dict) -> dict:
+    """Dismiss or restore a nav tab: sets/clears "hidden" on its pages.json entry."""
+    if not isinstance(d, dict):
+        raise ReplyError(400, "bad json")
+    if not hmac.compare_digest(str(d.get("key", "")).encode(), cfg.key.encode()):
+        raise ReplyError(403, "bad key")
+    slug = re.sub(r"[^a-z0-9-]", "", str(d.get("slug", "")).lower())[:40]
+    action = str(d.get("action", "dismiss"))
+    if not slug or slug == "index":
+        raise ReplyError(400, "that tab can't be dismissed")
+    if action not in ("dismiss", "restore"):
+        raise ReplyError(400, "bad action")
+    path = cfg.status_dir / "pages.json"
+    with cfg.lock:
+        try:
+            pages = json.loads(path.read_text())
+        except (OSError, ValueError):
+            raise ReplyError(500, "pages.json unreadable") from None
+        hit = False
+        for p in pages:
+            if isinstance(p, dict) and p.get("slug") == slug:
+                hit = True
+                if action == "dismiss":
+                    p["hidden"] = True
+                else:
+                    p.pop("hidden", None)
+        if not hit:
+            raise ReplyError(404, "no such tab")
+        tmp = path.with_name(".pages.json.tmp")
+        tmp.write_text(json.dumps(pages, indent=1) + "\n")
+        os.replace(tmp, path)
+    return {"ok": True, "slug": slug, "hidden": action == "dismiss"}
+
+
 class Handler(BaseHTTPRequestHandler):
     cfg: Config  # set by make_server
     server_version = "StatusSite/1.0"
@@ -373,7 +408,8 @@ class Handler(BaseHTTPRequestHandler):
         self._get(head=True)
 
     def do_POST(self) -> None:
-        if urlsplit(self.path).path != "/api/reply":
+        route = urlsplit(self.path).path
+        if route not in ("/api/reply", "/api/page-visibility"):
             return self._json(404, {"error": "not found"})
         try:
             n = int(self.headers.get("Content-Length", "0"))
@@ -389,7 +425,8 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self._json(400, {"error": "bad json"})
         try:
-            return self._json(200, handle_reply(self.cfg, d))
+            fn = handle_reply if route == "/api/reply" else handle_page_visibility
+            return self._json(200, fn(self.cfg, d))
         except ReplyError as e:
             return self._json(e.code, {"error": e.msg})
 
