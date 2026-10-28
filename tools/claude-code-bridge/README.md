@@ -18,12 +18,13 @@ forwarding, and only from the dev host's IP.
 ```
 dev-host/alice-cc-hook.py     ─ssh alice_surface─▶  aimax1:~/bin/alice-surface-drop ─▶ mind/inner/surface/<ts>-cc-<detail>.md
 dev-host/<generator>.py       ─ssh alice_status <page>─▶ aimax1:~/bin/alice-status-drop ─▶ mind/inner/status/<page>.md
+dev-host/<generator>.py       ─ssh alice_status extra/<slug>─▶ alice-status-drop ─▶ mind/inner/status/item-extra/<slug>.jsonl
 ```
 
 | File | Lives on | Purpose |
 |------|----------|---------|
 | `aimax1/alice-surface-drop` | aimax1 `~/bin/` | Forced command. stdin (≤64 KB, must start with frontmatter) → surface file. Ignores `SSH_ORIGINAL_COMMAND`. |
-| `aimax1/alice-status-drop` | aimax1 `~/bin/` | Forced command. stdin (≤256 KB) → `<page>.md`; page name from `SSH_ORIGINAL_COMMAND`, `[a-z0-9-]{1,40}`, never `index`. |
+| `aimax1/alice-status-drop` | aimax1 `~/bin/` | Forced command. stdin (≤256 KB) → `<page>.md`; page name from `SSH_ORIGINAL_COMMAND`, `[a-z0-9-]{1,40}`, never `index`. Command `extra/<slug>` instead writes JSON Lines (≤64 KB, ≤500 objects) to `item-extra/<slug>.jsonl`, shown in that item's "what happened" timeline. |
 | `dev-host/alice-cc-hook.py` | dev host `~/bin/` | Stop hook + `--progress` / `--watch` modes. |
 | `dev-host/mud-wave-status.py` | dev host `~/bin/` | Example status generator (modern-mud wave-A build). |
 | `systemd/alice-status-page@.{service,timer}` | dev host `~/.config/systemd/user/` | Runs a generator every 3 min. |

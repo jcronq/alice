@@ -7,6 +7,10 @@ Stdlib-only (runs on a bare ``python:3.12-alpine`` image). Routes:
     GET  /api/threads                     {thread_id: [message, ...]} for every thread
     GET  /api/pages                       slugs of all markdown pages (for item detail links)
     GET  /api/note?slug=<s>               leaf-item write-up from STATUS_DIR/notes/<s>.md (item modal)
+    GET  /api/history?slug=<s>            {events, thread, extra} for one item (item modal timeline):
+                                          events from item-history/<s>.jsonl (written by the
+                                          tracker thread, see history.py), thread from
+                                          threads/<s>.jsonl, extra from item-extra/<s>.jsonl
     POST /api/page-visibility             dismiss/restore/open a nav tab (shared-key auth)
     POST /api/reply                       Jason's reply to an item (shared-key auth):
                                           appends to the item's thread, stores attachments
@@ -14,7 +18,7 @@ Stdlib-only (runs on a bare ``python:3.12-alpine`` image). Routes:
                                           ``type: status-reply`` surface into SURFACE_DIR
                                           so Speaking gets a turn.
 
-Anything else is a 404: dotfiles (``.replies.jsonl``), ``threads/``, the key and
+Anything else is a 404: dotfiles (``.replies.jsonl``, ``.item-state.json``), ``threads/``, the key and
 the uploads are never served. See docs/designs/status-site.md.
 """
 
@@ -34,6 +38,8 @@ from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
+
+from status_site.history import Tracker, read_history
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC_FILES = {"index.html", "marked.min.js"}
@@ -427,6 +433,12 @@ class Handler(BaseHTTPRequestHandler):
             if note is None:
                 return self._json(404, {"error": "no note"}, head=head)
             return self._json(200, note, head=head)
+        if path == "/api/history":
+            q = parse_qs(urlsplit(self.path).query)
+            hist = read_history(self.cfg.status_dir, (q.get("slug") or [""])[0])
+            if hist is None:
+                return self._json(400, {"error": "bad slug"}, head=head)
+            return self._json(200, hist, head=head)
         if path == "/api/pages":
             return self._json(200, list_pages(self.cfg), head=head)
         if path == "/api/threads":
@@ -489,6 +501,10 @@ def make_server(cfg: Config) -> ThreadingHTTPServer:
 def main() -> None:
     cfg = Config.from_env()
     srv = make_server(cfg)
+    if os.environ.get("ITEM_HISTORY", "1") != "0":
+        Tracker(cfg.status_dir, cfg.lock).start(
+            float(os.environ.get("ITEM_HISTORY_INTERVAL", "10"))
+        )
     print(f"status_site: serving {cfg.status_dir} on {cfg.host}:{cfg.port}", flush=True)
     srv.serve_forever()
 
