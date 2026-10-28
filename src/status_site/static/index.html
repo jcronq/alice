@@ -44,6 +44,11 @@ li[data-tid]{position:relative;padding-right:5.8rem!important;display:flow-root}
 .ctog{position:absolute;right:.5rem;top:.35rem;font-size:.8rem;padding:.2rem .6rem;border-radius:999px;border:1px solid var(--line);background:var(--card);color:var(--muted);cursor:pointer}
 .ctog.unread{border-color:var(--accent);color:var(--accent);font-weight:600}
 .ctog.on{background:var(--accent);color:var(--bg);border-color:var(--accent)}
+.tab{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;overflow:hidden}
+.tab a{border:0!important;border-radius:0!important}
+.tab.on{background:var(--accent);border-color:var(--accent)}.tab.on a{color:var(--bg)!important;background:transparent!important}
+.tab .x{border:0;background:transparent;color:var(--muted);padding:0 .45rem 0 0;font-size:.95rem;cursor:pointer}.tab.on .x{color:var(--bg)}
+.tab.hid{opacity:.55}.more{border:0!important;font-size:.8rem}
 </style></head><body>
 <header><b>Alice</b><nav id="nav"></nav><span id="age"></span></header>
 <main id="doc">Loading…</main>
@@ -106,6 +111,18 @@ async function pollThreads(){
     document.querySelectorAll('#doc li[data-tid]').forEach(li=>{if(li.querySelector(':scope > .conv'))renderThread(li)});}catch(e){}
 }
 setInterval(pollThreads,5000);
+let SHOW_HIDDEN=false;
+function renderNav(pages){
+  const vis=pages.filter(p=>!p.hidden||p.slug===page),hid=pages.filter(p=>p.hidden&&p.slug!==page);
+  const tab=p=>`<span class="tab ${p.slug===page?'on':''}${p.hidden?' hid':''}"><a href="?p=${p.slug}">${esc(p.title)}</a>${p.slug!=='index'&&KEY?`<button class="x" data-s="${p.slug}" data-a="${p.hidden?'restore':'dismiss'}" title="${p.hidden?'Restore':'Dismiss'} tab">${p.hidden?'↺':'×'}</button>`:''}</span>`;
+  let html=vis.map(tab).join('');
+  if(hid.length)html+=SHOW_HIDDEN?hid.map(tab).join('')+'<a class="more" href="#" data-t="1">hide dismissed</a>':`<a class="more" href="#" data-t="1">+${hid.length} dismissed</a>`;
+  const nav=document.getElementById('nav');nav.innerHTML=html;
+  nav.querySelectorAll('.x').forEach(b=>b.onclick=async e=>{e.preventDefault();
+    const r=await fetch('api/page-visibility',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:KEY,slug:b.dataset.s,action:b.dataset.a})});
+    if(r.ok){if(b.dataset.a==='dismiss'&&b.dataset.s===page)location.href='?p=index';else load()}});
+  nav.querySelectorAll('[data-t]').forEach(a=>a.onclick=e=>{e.preventDefault();SHOW_HIDDEN=!SHOW_HIDDEN;renderNav(pages)});
+}
 async function load(){
   if(replyOpen)return;
   try{
@@ -116,7 +133,7 @@ async function load(){
     document.querySelectorAll('#doc input[type=checkbox]').forEach(c=>c.disabled=true);
     await pollThreads();addReplies();
     if(lm){const m=Math.round((Date.now()-new Date(lm))/60000);document.getElementById('age').textContent='updated '+(m<1?'just now':m<60?m+' min ago':Math.round(m/60)+' h ago')}
-    if(pr&&pr.ok){const pages=await pr.json();document.getElementById('nav').innerHTML=pages.map(p=>`<a href="?p=${p.slug}" class="${p.slug===page?'on':''}">${p.title}</a>`).join('')}
+    if(pr&&pr.ok){renderNav(await pr.json())}
     document.title='Alice — '+(document.querySelector('#doc h1')?.textContent||page);
   }catch(e){document.getElementById('doc').textContent='Could not load '+page+'.md ('+e.message+')'}
 }
