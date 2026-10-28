@@ -5,7 +5,8 @@ Stdlib-only (runs on a bare ``python:3.12-alpine`` image). Routes:
     GET  /, /index.html, /marked.min.js   packaged frontend (status_site/static/)
     GET  /<page>.md, /pages.json, images  content, read from STATUS_DIR (top level only)
     GET  /api/threads                     {thread_id: [message, ...]} for every thread
-    POST /api/page-visibility             dismiss/restore a nav tab (shared-key auth)
+    GET  /api/pages                       slugs of all markdown pages (for item detail links)
+    POST /api/page-visibility             dismiss/restore/open a nav tab (shared-key auth)
     POST /api/reply                       Jason's reply to an item (shared-key auth):
                                           appends to the item's thread, stores attachments
                                           privately under UPLOAD_DIR, and drops a
@@ -302,6 +303,13 @@ def handle_reply(cfg: Config, d: dict) -> dict:
 # ---------------------------------------------------------------- HTTP
 
 
+def list_pages(cfg: Config) -> list[str]:
+    """Slugs of every top-level markdown page (detail pages included)."""
+    return sorted(
+        p.stem for p in cfg.status_dir.glob("*.md") if not p.name.startswith(".")
+    )
+
+
 def handle_page_visibility(cfg: Config, d: dict) -> dict:
     """Dismiss or restore a nav tab: sets/clears "hidden" on its pages.json entry."""
     if not isinstance(d, dict):
@@ -312,7 +320,7 @@ def handle_page_visibility(cfg: Config, d: dict) -> dict:
     action = str(d.get("action", "dismiss"))
     if not slug or slug == "index":
         raise ReplyError(400, "that tab can't be dismissed")
-    if action not in ("dismiss", "restore"):
+    if action not in ("dismiss", "restore", "open"):
         raise ReplyError(400, "bad action")
     path = cfg.status_dir / "pages.json"
     with cfg.lock:
@@ -328,12 +336,27 @@ def handle_page_visibility(cfg: Config, d: dict) -> dict:
                     p["hidden"] = True
                 else:
                     p.pop("hidden", None)
+        if not hit and action == "open":
+            md = cfg.status_dir / f"{slug}.md"
+            if not md.is_file():
+                raise ReplyError(404, "no such page")
+            title = slug.replace("-", " ").capitalize()
+            for line in md.read_text().splitlines():
+                if line.startswith("# "):
+                    title = line[2:].strip()[:60]
+                    break
+            pages.append({"slug": slug, "title": title})
+            hit = True
+        elif hit and action == "open":
+            for p in pages:
+                if isinstance(p, dict) and p.get("slug") == slug:
+                    p.pop("hidden", None)
         if not hit:
             raise ReplyError(404, "no such tab")
         tmp = path.with_name(".pages.json.tmp")
         tmp.write_text(json.dumps(pages, indent=1) + "\n")
         os.replace(tmp, path)
-    return {"ok": True, "slug": slug, "hidden": action == "dismiss"}
+    return {"ok": True, "slug": slug, "hidden": action == "dismiss", "pages": pages}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -382,6 +405,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _get(self, head: bool) -> None:
         path = urlsplit(self.path).path
+        if path == "/api/pages":
+            return self._json(200, list_pages(self.cfg), head=head)
         if path == "/api/threads":
             return self._json(200, read_threads(self.cfg), head=head)
         p = self._resolve(path)

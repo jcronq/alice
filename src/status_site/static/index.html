@@ -49,6 +49,7 @@ li[data-tid]{position:relative;padding-right:5.8rem!important;display:flow-root}
 .tab.on{background:var(--accent);border-color:var(--accent)}.tab.on a{color:var(--bg)!important;background:transparent!important}
 .tab .x{border:0;background:transparent;color:var(--muted);padding:0 .45rem 0 0;font-size:.95rem;cursor:pointer}.tab.on .x{color:var(--bg)}
 .tab.hid{opacity:.55}.more{border:0!important;font-size:.8rem}
+a.detail{color:inherit;text-decoration:none;border-bottom:1px dashed var(--accent)}a.detail:after{content:' ›';color:var(--accent)}
 </style></head><body>
 <header><b>Alice</b><nav id="nav"></nav><span id="age"></span></header>
 <main id="doc">Loading…</main>
@@ -106,6 +107,22 @@ function addReplies(){
     });
   });
 }
+let AVAIL=new Set();
+function linkDetails(){
+  document.querySelectorAll('#doc li').forEach(li=>{
+    const st=li.querySelector('strong');if(!st||st.closest('a'))return;
+    const s=slug(st.textContent.replace(/[:.]+$/,''));if(!AVAIL.has(s)||s===page)return;
+    const a=document.createElement('a');a.href='?p='+s;a.className='detail';a.title='Open details';st.replaceWith(a);a.appendChild(st);
+  });
+}
+async function ensureTab(pages){
+  const me=pages.find(p=>p.slug===page);
+  if(KEY&&page!=='index'&&(!me||me.hidden)){
+    try{const r=await fetch('api/page-visibility',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:KEY,slug:page,action:'open'})});
+      if(r.ok){const j=await r.json();if(j.pages)return j.pages}}catch(e){}
+  }
+  return pages;
+}
 async function pollThreads(){
   try{const r=await fetch('api/threads?'+Date.now());if(!r.ok)return;THREADS=await r.json();
     document.querySelectorAll('#doc li[data-tid]').forEach(li=>{if(li.querySelector(':scope > .conv'))renderThread(li)});}catch(e){}
@@ -133,7 +150,9 @@ async function load(){
     document.querySelectorAll('#doc input[type=checkbox]').forEach(c=>c.disabled=true);
     await pollThreads();addReplies();
     if(lm){const m=Math.round((Date.now()-new Date(lm))/60000);document.getElementById('age').textContent='updated '+(m<1?'just now':m<60?m+' min ago':Math.round(m/60)+' h ago')}
-    if(pr&&pr.ok){renderNav(await pr.json())}
+    try{const ar=await fetch('api/pages?'+Date.now());if(ar.ok)AVAIL=new Set(await ar.json())}catch(e){}
+    linkDetails();
+    if(pr&&pr.ok){renderNav(await ensureTab(await pr.json()))}
     document.title='Alice — '+(document.querySelector('#doc h1')?.textContent||page);
   }catch(e){document.getElementById('doc').textContent='Could not load '+page+'.md ('+e.message+')'}
 }
