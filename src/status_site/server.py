@@ -6,6 +6,7 @@ Stdlib-only (runs on a bare ``python:3.12-alpine`` image). Routes:
     GET  /<page>.md, /pages.json, images  content, read from STATUS_DIR (top level only)
     GET  /api/threads                     {thread_id: [message, ...]} for every thread
     GET  /api/pages                       slugs of all markdown pages (for item detail links)
+    GET  /api/note?slug=<s>               leaf-item write-up from STATUS_DIR/notes/<s>.md (item modal)
     POST /api/page-visibility             dismiss/restore/open a nav tab (shared-key auth)
     POST /api/reply                       Jason's reply to an item (shared-key auth):
                                           appends to the item's thread, stores attachments
@@ -32,7 +33,7 @@ from dataclasses import dataclass, field
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC_FILES = {"index.html", "marked.min.js"}
@@ -303,6 +304,21 @@ def handle_reply(cfg: Config, d: dict) -> dict:
 # ---------------------------------------------------------------- HTTP
 
 
+def read_note(cfg: Config, slug: str) -> dict | None:
+    """Leaf-item write-up: STATUS_DIR/notes/<slug>.md, rendered in the item modal."""
+    slug = re.sub(r"[^a-z0-9-]", "", str(slug).lower())[:60]
+    if not slug:
+        return None
+    p = cfg.status_dir / "notes" / f"{slug}.md"
+    if not p.is_file():
+        return None
+    return {
+        "slug": slug,
+        "markdown": p.read_text()[:200_000],
+        "updated": p.stat().st_mtime,
+    }
+
+
 def list_pages(cfg: Config) -> list[str]:
     """Slugs of every top-level markdown page (detail pages included)."""
     return sorted(
@@ -405,6 +421,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _get(self, head: bool) -> None:
         path = urlsplit(self.path).path
+        if path == "/api/note":
+            q = parse_qs(urlsplit(self.path).query)
+            note = read_note(self.cfg, (q.get("slug") or [""])[0])
+            if note is None:
+                return self._json(404, {"error": "no note"}, head=head)
+            return self._json(200, note, head=head)
         if path == "/api/pages":
             return self._json(200, list_pages(self.cfg), head=head)
         if path == "/api/threads":
