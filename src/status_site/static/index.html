@@ -75,10 +75,9 @@ function addReplies(){
     if(/^H[12]$/.test(el.tagName)) waiting=/waiting on you/i.test(el.textContent);
     if(el.tagName!=='UL')return;
     el.querySelectorAll(':scope > li').forEach(li=>{
-      const st=li.querySelector('strong'); if(!st||li.dataset.tid)return;
-      const tid=slug(st.textContent); li.dataset.tid=tid; const itemText=li.textContent.replace(/\s+/g,' ').trim().slice(0,400);
+      if(li.dataset.tid)return; const st=li.querySelector('strong'); const label=(st?st.textContent:li.textContent.split(/[—:]/)[0]).trim(); if(!label)return;
+      const tid=slug(label); li.dataset.tid=tid; const itemText=li.textContent.replace(/\s+/g,' ').trim().slice(0,400);
       const has=(THREADS[tid]||[]).length>0;
-      if(!waiting&&!has&&!li.querySelector('input:not(:checked)'))return;
       const tog=document.createElement('button');tog.className='ctog';
       const conv=document.createElement('div');conv.className='conv';
       conv.innerHTML='<div class="thread"></div><div class="reply"><textarea placeholder="Message Alice about this…"></textarea><div class="row"><button>Send</button><label class="attach">📎 Attach<input type="file" multiple hidden></label><span class="sent"></span></div></div>';
