@@ -50,8 +50,16 @@ li[data-tid]{position:relative;padding-right:5.8rem!important;display:flow-root}
 .tab .x{border:0;background:transparent;color:var(--muted);padding:0 .45rem 0 0;font-size:.95rem;cursor:pointer}.tab.on .x{color:var(--bg)}
 .tab.hid{opacity:.55}.more{border:0!important;font-size:.8rem}
 a.detail{color:inherit;text-decoration:none;border-bottom:1px dashed var(--accent)}a.detail:after{content:' ›';color:var(--accent)}
+#modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10;align-items:flex-start;justify-content:center;padding:6vh 1rem}
+#modal.open{display:flex}
+#modal .mc{background:var(--card);border:1px solid var(--line);border-radius:12px;max-width:720px;width:100%;max-height:84vh;display:flex;flex-direction:column}
+#modal .mh{display:flex;align-items:center;gap:.5rem;padding:.7rem 1rem;border-bottom:1px solid var(--line)}#modal .mt{flex:1}
+#modal .mx{border:0;background:transparent;color:var(--muted);font-size:1.4rem;cursor:pointer}
+#modal .mb{padding:.4rem 1rem 1rem;overflow-y:auto}
+strong.leaf{cursor:pointer;text-decoration:underline dotted var(--muted);text-underline-offset:3px}
 </style></head><body>
 <header><b>Alice</b><nav id="nav"></nav><span id="age"></span></header>
+<div id="modal" onclick="if(event.target===this)closeModal()"><div class="mc"><div class="mh"><b class="mt"></b><button class="mx" onclick="closeModal()">×</button></div><div class="mb"></div></div></div>
 <main id="doc">Loading…</main>
 <script src="marked.min.js"></script>
 <script>
@@ -115,6 +123,23 @@ function linkDetails(){
     const a=document.createElement('a');a.href='?p='+s;a.className='detail';a.title='Open details';st.replaceWith(a);a.appendChild(st);
   });
 }
+function openModal(title,itemHtml,tid){
+  const m=document.getElementById('modal');m.querySelector('.mt').textContent=title;
+  const body=m.querySelector('.mb');body.innerHTML='<div class="typing">Loading…</div>';m.classList.add('open');
+  fetch('api/note?slug='+encodeURIComponent(tid)).then(r=>r.ok?r.json():null).then(n=>{
+    body.innerHTML=(n?marked.parse(n.markdown,{gfm:true}):`<p class="mi">${itemHtml}</p><p class="typing">No write-up yet. Ask in the item's 💬 thread and I'll add one.</p>`)+
+      (n?`<p class="typing">Updated ${new Date(n.updated*1000).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}</p>`:'');
+  }).catch(()=>{body.innerHTML='<p class="typing">Could not load.</p>'});
+}
+function closeModal(){document.getElementById('modal').classList.remove('open')}
+function linkLeaves(){
+  document.querySelectorAll('#doc li').forEach(li=>{
+    const st=li.querySelector('strong');if(!st||st.closest('a')||st.dataset.leaf)return;
+    st.dataset.leaf='1';st.classList.add('leaf');st.title='What happened';
+    st.onclick=e=>{e.preventDefault();e.stopPropagation();const c=li.cloneNode(true);c.querySelectorAll('.ctog,.conv,input').forEach(x=>x.remove());
+      openModal(st.textContent.replace(/[:.]+$/,''),c.innerHTML,slug(st.textContent.replace(/[:.]+$/,'')))};
+  });
+}
 async function ensureTab(pages){
   const me=pages.find(p=>p.slug===page);
   if(KEY&&page!=='index'&&(!me||me.hidden)){
@@ -151,12 +176,13 @@ async function load(){
     await pollThreads();addReplies();
     if(lm){const m=Math.round((Date.now()-new Date(lm))/60000);document.getElementById('age').textContent='updated '+(m<1?'just now':m<60?m+' min ago':Math.round(m/60)+' h ago')}
     try{const ar=await fetch('api/pages?'+Date.now());if(ar.ok)AVAIL=new Set(await ar.json())}catch(e){}
-    linkDetails();
+    linkDetails();linkLeaves();
     if(pr&&pr.ok){renderNav(await ensureTab(await pr.json()))}
     document.title='Alice — '+(document.querySelector('#doc h1')?.textContent||page);
   }catch(e){document.getElementById('doc').textContent='Could not load '+page+'.md ('+e.message+')'}
 }
 let PAGE_VER=null;
 async function checkVersion(){try{const r=await fetch('index.html',{method:'HEAD',cache:'no-store'});const v=r.headers.get('last-modified');if(PAGE_VER&&v&&v!==PAGE_VER&&!replyOpen)location.reload();PAGE_VER=PAGE_VER||v}catch(e){}}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal()});
 load();checkVersion();setInterval(load,60000);setInterval(checkVersion,30000);
 </script></body></html>
