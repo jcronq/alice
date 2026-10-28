@@ -56,6 +56,17 @@ a.detail{color:inherit;text-decoration:none;border-bottom:1px dashed var(--accen
 #modal .mh{display:flex;align-items:center;gap:.5rem;padding:.7rem 1rem;border-bottom:1px solid var(--line)}#modal .mt{flex:1}
 #modal .mx{border:0;background:transparent;color:var(--muted);font-size:1.4rem;cursor:pointer}
 #modal .mb{padding:.4rem 1rem 1rem;overflow-y:auto}
+#modal .mi{margin:.5rem 0 .7rem;color:var(--muted);font-size:.92rem}
+#modal details.note{margin:.2rem 0 .8rem;border:1px solid var(--line);border-radius:8px;padding:.35rem .7rem;background:var(--bg)}
+#modal details.note summary{cursor:pointer;color:var(--muted);font-size:.88rem}
+#modal ol.tl{list-style:none;margin:0;padding:0 0 0 .2rem;border-left:2px solid var(--line)}
+#modal ol.tl li{position:relative;margin:0;padding:.3rem 0 .3rem .9rem;font-size:.92rem;line-height:1.4;white-space:pre-wrap;word-break:break-word}
+#modal ol.tl li:before{content:'';position:absolute;left:-6px;top:.72rem;width:10px;height:10px;border-radius:50%;background:var(--card);border:2px solid var(--line)}
+#modal ol.tl li.ev-checked:before,#modal ol.tl li.ev-commit:before{background:var(--accent);border-color:var(--accent)}
+#modal ol.tl li.ev-jason:before{border-color:var(--accent)}
+#modal ol.tl time{display:block;color:var(--muted);font-size:.75rem}
+#modal ol.tl del{color:var(--muted)}#modal ol.tl ins{text-decoration:none;color:var(--accent)}
+#modal ol.tl code{font-size:.82em}
 strong.leaf{cursor:pointer;text-decoration:underline dotted var(--muted);text-underline-offset:3px}
 </style></head><body>
 <header><b>Alice</b><nav id="nav"></nav><span id="age"></span></header>
@@ -123,13 +134,50 @@ function linkDetails(){
     const a=document.createElement('a');a.href='?p='+s;a.className='detail';a.title='Open details';st.replaceWith(a);a.appendChild(st);
   });
 }
+let PAGES=[];
+const plain=t=>String(t??'').replace(/[*_`~]+/g,'').replace(/\s+/g,' ').trim();
+const clip=(t,n)=>t.length>n?t.slice(0,n-1)+'…':t;
+const pageTitle=p=>(PAGES.find(x=>x.slug===p)||{}).title||p;
+const where=(p,section)=>String(section?section+(p&&p!==page?' ('+pageTitle(p)+')':''):pageTitle(p||''));
+function ts(at){const s=String(at||'').replace(/([+-]\d\d)(\d\d)$/,'$1:$2');const d=new Date(s);return isNaN(d)?null:d}
+function when(d){return d?d.toLocaleString([],{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}):''}
+function wordDiff(a,b){
+  const A=plain(a).split(' '),B=plain(b).split(' ');let i=0;while(i<A.length&&i<B.length&&A[i]===B[i])i++;
+  let j=0;while(j<A.length-i&&j<B.length-i&&A[A.length-1-j]===B[B.length-1-j])j++;
+  const o=A.slice(i,A.length-j).join(' '),n=B.slice(i,B.length-j).join(' ');
+  return (i?'… ':'')+(o?`<del>${esc(clip(o,160))}</del>`:'')+(o&&n?' → ':'')+(n?`<ins>${esc(clip(n,160))}</ins>`:(o?' (removed)':''))+(j?' …':'')||'(formatting only)';
+}
+function timeline(h){
+  const rows=[];
+  for(const e of h.events||[]){let t='',c='ev';
+    if(e.type==='appeared')t=e.seeded?`Already in ${esc(where(e.page,e.section))} when tracking started`+(e.checked?' (checked)':''):`Added to ${esc(where(e.page,e.section))}`+(e.checked?' (checked)':'');
+    else if(e.type==='checked'){t='Checked off';c='ev-checked'}
+    else if(e.type==='unchecked')t='Unchecked';
+    else if(e.type==='text_changed')t='Text changed: '+wordDiff(e.old,e.new);
+    else if(e.type==='moved')t=`Moved to ${esc(where(e.to?.page,e.to?.section))}`+(e.from?` from ${esc(where(e.from.page,e.from.section))}`:'');
+    else if(e.type==='removed')t=`Removed from ${esc(where(e.page,e.section))}`;
+    else t=esc(e.type||'event');
+    rows.push({d:ts(e.at),t,c})}
+  for(const m of h.thread||[]){const me=m.from==='jason';
+    rows.push({d:ts(m.at),c:me?'ev-jason':'ev',t:`${me?'You':'Alice'}: ${esc(clip(m.text||'',600))}`+((m.files||[]).length?` 📎 ${esc(m.files.join(', '))}`:'')})}
+  for(const x of h.extra||[]){
+    const t=x.sha?`${x.merge?'Merged':'Commit'} <code>${esc(String(x.sha).slice(0,10))}</code>: ${esc(clip(x.subject||'',200))}`:esc(clip(x.text||x.subject||JSON.stringify(x),300));
+    rows.push({d:ts(x.at),t,c:x.sha?'ev-commit':'ev'})}
+  rows.forEach((r,i)=>r.i=i);
+  rows.sort((a,b)=>((a.d?a.d.getTime():0)-(b.d?b.d.getTime():0))||a.i-b.i);
+  return rows.length?'<ol class="tl">'+rows.map(r=>`<li class="${r.c}"><time>${when(r.d)}</time>${r.t}</li>`).join('')+'</ol>':'<p class="typing">No history recorded yet. Changes to this item show up here automatically.</p>';
+}
 function openModal(title,itemHtml,tid){
   const m=document.getElementById('modal');m.querySelector('.mt').textContent=title;
-  const body=m.querySelector('.mb');body.innerHTML='<div class="typing">Loading…</div>';m.classList.add('open');
-  fetch('api/note?slug='+encodeURIComponent(tid)).then(r=>r.ok?r.json():null).then(n=>{
-    body.innerHTML=(n?marked.parse(n.markdown,{gfm:true}):`<p class="mi">${itemHtml}</p><p class="typing">No write-up yet. Ask in the item's 💬 thread and I'll add one.</p>`)+
-      (n?`<p class="typing">Updated ${new Date(n.updated*1000).toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}</p>`:'');
-  }).catch(()=>{body.innerHTML='<p class="typing">Could not load.</p>'});
+  const body=m.querySelector('.mb');body.innerHTML='<div class="typing">Loading…</div>';m.classList.add('open');m.dataset.tid=tid;
+  const get=u=>fetch(u).then(r=>r.ok?r.json():null).catch(()=>null);
+  Promise.all([get('api/history?slug='+encodeURIComponent(tid)),get('api/note?slug='+encodeURIComponent(tid))]).then(([h,n])=>{
+    if(m.dataset.tid!==tid)return;
+    if(!h&&!n){body.innerHTML='<p class="typing">Could not load.</p>';return}
+    body.innerHTML=`<div class="mi">${itemHtml}</div>`+
+      (n?`<details class="note"><summary>Alice's note (written summary) · updated ${when(new Date(n.updated*1000))}</summary>${marked.parse(n.markdown,{gfm:true})}</details>`:'')+
+      timeline(h||{});
+  });
 }
 function closeModal(){document.getElementById('modal').classList.remove('open')}
 function linkLeaves(){
@@ -177,7 +225,7 @@ async function load(){
     if(lm){const m=Math.round((Date.now()-new Date(lm))/60000);document.getElementById('age').textContent='updated '+(m<1?'just now':m<60?m+' min ago':Math.round(m/60)+' h ago')}
     try{const ar=await fetch('api/pages?'+Date.now());if(ar.ok)AVAIL=new Set(await ar.json())}catch(e){}
     linkDetails();linkLeaves();
-    if(pr&&pr.ok){renderNav(await ensureTab(await pr.json()))}
+    if(pr&&pr.ok){PAGES=await ensureTab(await pr.json());renderNav(PAGES)}
     document.title='Alice — '+(document.querySelector('#doc h1')?.textContent||page);
   }catch(e){document.getElementById('doc').textContent='Could not load '+page+'.md ('+e.message+')'}
 }

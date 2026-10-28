@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
-"""Forced-command receiver: writes stdin (markdown) to Alice's status site as <name>.md.
+"""Forced-command receiver for Alice's status site. Reads stdin; never runs a shell.
 
-Name comes from SSH_ORIGINAL_COMMAND, restricted to [a-z0-9-]{1,40} and not 'index'.
-Add the page to pages.json once so it shows up in the nav.
+SSH_ORIGINAL_COMMAND selects what is written:
+
+    <name>          markdown page -> STATUS_DIR/<name>.md
+                    name is [a-z0-9-]{1,40} and not 'index'. Add it to pages.json once
+                    so it shows up in the nav.
+    extra/<slug>    machine-generated facts for one item's "what happened" timeline
+                    (e.g. git commits) -> STATUS_DIR/item-extra/<slug>.jsonl, replaced
+                    whole. slug is [a-z0-9][a-z0-9-]{0,59}; stdin must be JSON Lines,
+                    one object per line, at most 64 KB and 500 lines.
 """
-import os, re, sys
+import json, os, re, sys
+
+PAGE_MAX = 256 * 1024
+EXTRA_MAX = 64 * 1024
+EXTRA_LINES = 500
 
 
 def alice_mind():
@@ -20,15 +31,48 @@ def alice_mind():
     return os.path.expanduser("~/alice-mind")
 
 
-DIR = os.path.join(alice_mind(), "inner", "status")
-name = (os.environ.get("SSH_ORIGINAL_COMMAND") or "").strip()
-if not re.fullmatch(r"[a-z0-9-]{1,40}", name) or name == "index":
-    sys.exit("rejected: bad page name")
-data = sys.stdin.buffer.read(256 * 1024 + 1)
-if not data.strip() or len(data) > 256 * 1024:
-    sys.exit("rejected: empty or oversized")
-tmp = os.path.join(DIR, f".{name}.tmp")
-with open(tmp, "wb") as f:
-    f.write(data)
-os.chmod(tmp, 0o644)
-os.rename(tmp, os.path.join(DIR, name + ".md"))
+def write_atomic(dest_dir, name, data):
+    tmp = os.path.join(dest_dir, f".{name}.tmp")
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.chmod(tmp, 0o644)
+    os.rename(tmp, os.path.join(dest_dir, name))
+
+
+def main():
+    status = os.path.join(alice_mind(), "inner", "status")
+    cmd = (os.environ.get("SSH_ORIGINAL_COMMAND") or "").strip()
+    if cmd.startswith("extra/"):
+        slug = cmd[len("extra/"):]
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,59}", slug):
+            sys.exit("rejected: bad item slug")
+        data = sys.stdin.buffer.read(EXTRA_MAX + 1)
+        if len(data) > EXTRA_MAX:
+            sys.exit("rejected: oversized")
+        lines = [l for l in data.decode("utf-8", "strict").splitlines() if l.strip()]
+        if len(lines) > EXTRA_LINES:
+            sys.exit("rejected: too many lines")
+        for l in lines:
+            try:
+                ok = isinstance(json.loads(l), dict)
+            except ValueError:
+                ok = False
+            if not ok:
+                sys.exit("rejected: each line must be a JSON object")
+        d = os.path.join(status, "item-extra")
+        os.makedirs(d, exist_ok=True)
+        write_atomic(d, slug + ".jsonl", ("\n".join(lines) + "\n" if lines else "").encode())
+        return
+    if not re.fullmatch(r"[a-z0-9-]{1,40}", cmd) or cmd == "index":
+        sys.exit("rejected: bad page name")
+    data = sys.stdin.buffer.read(PAGE_MAX + 1)
+    if not data.strip() or len(data) > PAGE_MAX:
+        sys.exit("rejected: empty or oversized")
+    write_atomic(status, cmd + ".md", data)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except UnicodeDecodeError:
+        sys.exit("rejected: not UTF-8")
