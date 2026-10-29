@@ -8,8 +8,11 @@ Prerequisites: install a compatible Hermes Agent release in the runtime containe
 and expose the `hermes` executable on PATH (or set `ALICE_HERMES_BIN`). The
 adapter uses `hermes chat --query-file - --oneshot --format stream-json`, available
 in NousResearch/hermes-agent at commit e298669b44ce (checked 2026-10-29).
-No bundled Hermes binary or API credentials are provided here. Verify the CLI
-and inference endpoint from inside the same container before switching config.
+The CLI needs its gateway running; validate gateway startup and a full one-shot
+turn before switching config. At that commit, the Python 3.14 package has an
+upstream dependency conflict (`browser-harness==0.1.13` pins Pillow 12.3.0,
+while Hermes pins Pillow 13.0.0); resolve upstream rather than deploying a
+locally modified dependency set. No binary or credentials are bundled here.
 
 To compare thinking on the same model as pi-mono, keep the existing
 `thinking.model: litellm/qwen-local` and `thinking.backend: pi`, set
@@ -17,7 +20,9 @@ To compare thinking on the same model as pi-mono, keep the existing
 `backends.pi.base_url: http://alice-litellm:4000/v1` in
 `~/alice-mind/config/model.yml`. Revert harness to `pi-mono` to switch back.
 The Hermes adapter sends model `qwen-local` to that endpoint. An absent endpoint
-is an error, never an implicit call to an external default provider.
+is an error, never an implicit call to an external default provider. For the
+configured LiteLLM URL, it forwards `LITELLM_MASTER_KEY` as the scoped OpenAI
+credential; the Hermes gateway must be launched with the same environment.
 
 Only thinking is supported. Speaking requires a Signal send_message tool bridge
 that Hermes Agent does not have; selecting it fails closed rather than silently

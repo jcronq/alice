@@ -55,14 +55,21 @@ class HermesAgentKernel:
         argv = [os.environ.get("ALICE_HERMES_BIN", "hermes"), "chat", "--query-file", "-",
                 "--oneshot", "--format", "stream-json", "--ignore-user-config",
                 "--ignore-rules", "--provider", "custom", "--base-url", self.base_url,
-                "--model", model, "--toolsets", "development"]
-        if spec.max_seconds > 0:
-            argv += ["--run-budget", str(spec.max_seconds)]
+                "--model", model]
+        # The gateway transport rejects --run-budget; enforce the wall-clock
+        # budget below with asyncio.timeout instead.
         if spec.resume:
             argv += ["--resume", spec.resume]
         cwd = str(spec.cwd) if spec.cwd else None
+        env = os.environ.copy()
+        # LiteLLM requires its master key. Hermes resolves OPENAI_API_KEY for
+        # custom OpenAI-compatible endpoints; do not place secrets in argv.
+        if (self.base_url.rstrip("/") == env.get("LITELLM_BASE_URL", "").rstrip("/")
+                and env.get("LITELLM_MASTER_KEY")):
+            env["OPENAI_BASE_URL"] = self.base_url
+            env["OPENAI_API_KEY"] = env["LITELLM_MASTER_KEY"]
         try:
-            proc = await asyncio.create_subprocess_exec(*argv, cwd=cwd,
+            proc = await asyncio.create_subprocess_exec(*argv, cwd=cwd, env=env,
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE, limit=10 * 1024 * 1024)
         except FileNotFoundError as exc:

@@ -68,6 +68,7 @@ def test_stream_json_subprocess(monkeypatch, tmp_path):
         "assert a[:4] == ['chat','--query-file','-','--oneshot']\n"
         "assert a[a.index('--model')+1] == 'qwen-local'\n"
         "assert a[a.index('--base-url')+1] == 'http://localhost/v1'\n"
+        "assert '--run-budget' not in a and '--toolsets' not in a\n"
         "assert 'instructions' in sys.stdin.read()\n"
         "for e in ({'type':'system','session_id':'s1'},"
         "{'type':'tool_use','name':'terminal','input':{'command':'pwd'},'tool_call_id':'t1'},"
@@ -87,3 +88,24 @@ def test_stream_json_subprocess(monkeypatch, tmp_path):
     assert result.usage.input_tokens == 10
     assert handler.calls == [("use", "terminal", "t1"), ("result", "t1", False), ("summary", "s1")]
     assert any(e == "result" for e, _ in events.items)
+
+
+def test_litellm_key_is_scoped_to_matching_endpoint(monkeypatch, tmp_path):
+    stub = tmp_path / "hermes"
+    stub.write_text("#!" + sys.executable + "\n"
+        "import json,os\n"
+        "print(json.dumps({'type':'result','text':json.dumps({"
+        "'key':os.getenv('OPENAI_API_KEY'), 'url':os.getenv('OPENAI_BASE_URL')}),"
+        "'exit_code':0}),flush=True)\n")
+    stub.chmod(0o755)
+    monkeypatch.setenv("ALICE_HERMES_BIN", str(stub))
+    monkeypatch.setenv("LITELLM_BASE_URL", "http://localhost/v1")
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "test-key")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    matching = HermesAgentKernel(Events(), base_url="http://localhost/v1")
+    result = asyncio.run(matching.run("ping", KernelSpec(model="qwen-local")))
+    assert result.text == '{"key": "test-key", "url": "http://localhost/v1"}'
+    other = HermesAgentKernel(Events(), base_url="http://other/v1")
+    result = asyncio.run(other.run("ping", KernelSpec(model="qwen-local")))
+    assert result.text == '{"key": null, "url": null}'
