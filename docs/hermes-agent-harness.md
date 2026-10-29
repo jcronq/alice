@@ -9,10 +9,17 @@ and expose the `hermes` executable on PATH (or set `ALICE_HERMES_BIN`). The
 adapter uses `hermes chat --query-file - --oneshot --format stream-json`, available
 in NousResearch/hermes-agent at commit e298669b44ce (checked 2026-10-29).
 The CLI needs its gateway running; validate gateway startup and a full one-shot
-turn before switching config. At that commit, the Python 3.14 package has an
-upstream dependency conflict (`browser-harness==0.1.13` pins Pillow 12.3.0,
-while Hermes pins Pillow 13.0.0); resolve upstream rather than deploying a
-locally modified dependency set. No binary or credentials are bundled here.
+turn before switching config. Install from the pinned upstream checkout with
+`./setup-hermes.sh --runtime-only`, not `pip install` or `uv tool install`: the
+upstream lockfile intentionally overrides the browser-harness Pillow pin and
+the regular wheel build is unsupported. On Debian trixie, install `libatomic1`
+before setup (the pinned Node binary requires it). The resulting launcher is
+`<checkout>/.hermes/bin/hermes`; set `ALICE_HERMES_BIN` to that path. Start the
+gateway with the same `HERMES_HOME`, `OPENAI_BASE_URL`, and `OPENAI_API_KEY`
+that the adapter uses; use a dedicated, persistent `HERMES_HOME` to avoid
+stale sessions or locks from other test runs. Verified with the upstream pinned
+installer and a successful Qwen one-shot on 2026-10-29. No binary or credentials
+are bundled here.
 
 To compare thinking on the same model as pi-mono, keep the existing
 `thinking.model: litellm/qwen-local` and `thinking.backend: pi`, set
