@@ -39,7 +39,8 @@ __all__ = ["make_kernel"]
 _SIBLING_KERNELS: dict[str, str] = {
     "anthropic": "kernels.anthropic.kernel:AnthropicKernel",
     "pi": "kernels.pi.kernel:PiKernel",
-    "hermes": "kernels.hermes.kernel:HermesKernel",
+    "hermes": "kernels.hermes.kernel:HermesKernel",  # legacy model-only HTTP shim
+    "hermes-agent": "kernels.hermes_agent.kernel:HermesAgentKernel",
 }
 
 
@@ -69,16 +70,16 @@ def make_kernel(
       time.
     """
     harness = getattr(backend, "harness", "")
-    name = "pi" if harness == "pi-mono" else getattr(backend, "backend", "subscription")
+    name = ("hermes-agent" if harness == "hermes-agent" else
+            "pi" if harness == "pi-mono" else
+            getattr(backend, "backend", "subscription"))
     # Anthropic-SDK backends share one impl.
     if name in {"subscription", "api", "bedrock"}:
         name = "anthropic"
     sibling = _SIBLING_KERNELS.get(name, _SIBLING_KERNELS["anthropic"])
     module_path, attr = sibling.split(":", 1)
     kernel_cls = getattr(importlib.import_module(module_path), attr)
-    return kernel_cls(
-        emitter,
-        correlation_id=correlation_id,
-        silent=silent,
-        short_cap=short_cap,
-    )
+    kwargs = dict(correlation_id=correlation_id, silent=silent, short_cap=short_cap)
+    if name == "hermes-agent":
+        kwargs["base_url"] = getattr(backend, "base_url", "")
+    return kernel_cls(emitter, **kwargs)

@@ -64,11 +64,11 @@ __all__ = [
 MODEL_FILENAME = "model.yml"
 HEMISPHERES: tuple[str, ...] = ("speaking", "thinking", "viewer")
 BackendName = Literal["subscription", "api", "bedrock", "pi", "hermes"]
-HarnessName = Literal["claude-code", "pi-mono"]
+HarnessName = Literal["claude-code", "pi-mono", "hermes-agent"]
 _VALID_BACKENDS: frozenset[str] = frozenset(
     {"subscription", "api", "bedrock", "pi", "hermes"}
 )
-_VALID_HARNESSES: frozenset[str] = frozenset({"claude-code", "pi-mono"})
+_VALID_HARNESSES: frozenset[str] = frozenset({"claude-code", "pi-mono", "hermes-agent"})
 _VALID_STAGES: frozenset[str] = frozenset({"active", "sleep_b", "sleep_c", "sleep_d"})
 _HARNESS_ALIASES: dict[str, HarnessName] = {
     "claude-code": "claude-code",
@@ -78,6 +78,7 @@ _HARNESS_ALIASES: dict[str, HarnessName] = {
     "pi": "pi-mono",
     "pi-mono": "pi-mono",
     "pi-coding-agent": "pi-mono",
+    "hermes-agent": "hermes-agent",
 }
 
 
@@ -261,7 +262,7 @@ def _hemisphere_spec(
     )
     backend_raw = _coerce_str(data.get("backend"), f"{name}.backend")
     if not backend_raw:
-        backend_raw = "pi" if harness == "pi-mono" else "subscription"
+        backend_raw = "pi" if harness in {"pi-mono", "hermes-agent"} else "subscription"
     if backend_raw not in _VALID_BACKENDS:
         raise ModelConfigError(
             f"{name}.backend = {backend_raw!r}; "
@@ -270,13 +271,13 @@ def _hemisphere_spec(
     backend: BackendName = backend_raw  # type: ignore[assignment]
     if harness is None:
         harness = "pi-mono" if backend == "pi" else "claude-code"
-    if harness == "pi-mono" and backend != "pi":
+    if harness in {"pi-mono", "hermes-agent"} and backend != "pi":
         raise ModelConfigError(
-            f"{name}.harness = 'pi-mono' requires {name}.backend = 'pi'"
+            f"{name}.harness = {harness!r} requires {name}.backend = 'pi'"
         )
     if harness == "claude-code" and backend == "pi":
         raise ModelConfigError(
-            f"{name}.backend = 'pi' requires {name}.harness = 'pi-mono'"
+            f"{name}.backend = 'pi' requires {name}.harness = 'pi-mono' or 'hermes-agent'"
         )
 
     defaults = backends.get(backend, BackendDefaults())
@@ -322,13 +323,13 @@ def _stage_spec(
     backend: BackendName = backend_raw or base.backend  # type: ignore[assignment]
     harness: HarnessName = harness_override or base.harness
 
-    if harness == "pi-mono" and backend != "pi":
+    if harness in {"pi-mono", "hermes-agent"} and backend != "pi":
         raise ModelConfigError(
-            f"{field_prefix}.harness = 'pi-mono' requires {field_prefix}.backend = 'pi'"
+            f"{field_prefix}.harness = {harness!r} requires {field_prefix}.backend = 'pi'"
         )
     if harness == "claude-code" and backend == "pi":
         raise ModelConfigError(
-            f"{field_prefix}.backend = 'pi' requires {field_prefix}.harness = 'pi-mono'"
+            f"{field_prefix}.backend = 'pi' requires {field_prefix}.harness = 'pi-mono' or 'hermes-agent'"
         )
 
     model_raw = _coerce_str(data.get("model"), f"{field_prefix}.model")

@@ -1,8 +1,9 @@
 # model.yml — pick the agent harness + LLM model each hemisphere runs on.
 #
-# Two harnesses are supported:
-#   claude-code — Claude Code / claude-agent-sdk.
-#   pi-mono     — pi-coding-agent (ChatGPT/Codex subscription routing).
+# Selectable harnesses:
+#   claude-code  — Claude Code / claude-agent-sdk.
+#   pi-mono      — pi-coding-agent (ChatGPT/Codex subscription routing).
+#   hermes-agent — NousResearch Hermes Agent CLI (requires an installed binary).
 #
 # Claude Code supports these Anthropic auth backends:
 #   subscription — Anthropic Max OAuth (CLAUDE_CODE_OAUTH_TOKEN).
@@ -11,6 +12,8 @@
 #   bedrock      — AWS Bedrock (CLAUDE_CODE_USE_BEDROCK=1 + AWS creds).
 # pi-mono uses:
 #   pi           — pi-coding-agent with ~/.pi/agent/auth.json.
+# Hermes Agent with backend pi uses an explicit OpenAI-compatible base_url
+# and its own CLI, not pi's auth or the legacy Hermes model HTTP shim.
 #
 # When this file is absent, every hemisphere falls back to
 # subscription with the model named in alice.config.json. That's the
@@ -41,6 +44,8 @@ backends:
   bedrock:
     # region: us-east-1
     # profile: alice-prod
+  pi:
+    # base_url: http://alice-litellm:4000/v1  # required for Hermes Agent
 
 # ------------------------------------------------------------------
 # Examples (uncomment + adapt to use):
@@ -77,3 +82,14 @@ backends:
 #   harness: pi-mono
 #   backend: pi
 #   model: gpt-5.3-codex
+#
+# # Compare thinking on the same local model with Hermes Agent:
+# # Requires `hermes` on PATH (or ALICE_HERMES_BIN). Only thinking is
+# # supported: Hermes has no Alice Signal outbox tool bridge yet.
+# thinking:
+#   harness: hermes-agent
+#   backend: pi
+#   model: litellm/qwen-local
+# backends:
+#   pi:
+#     base_url: http://alice-litellm:4000/v1
