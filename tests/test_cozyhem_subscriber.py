@@ -379,6 +379,10 @@ class _StubAddressBook:
     def emergency_recipient(self) -> Optional[ChannelRef]:
         return self._recipient
 
+    def preferred_channel(self, principal_id: str, transport: str) -> Optional[ChannelRef]:
+        assert (principal_id, transport) == ("jason", "signal")
+        return self._recipient
+
 
 class _HandlerCtx:
     def __init__(self, recipient: Optional[ChannelRef] = None) -> None:
@@ -471,6 +475,36 @@ def test_handler_routes_real_wire_format_doorbell_colon_pressed() -> None:
     kinds = [k for k, _ in ctx.events.emitted]
     assert "cozyhem_event" in kinds
     assert "cozyhem_doorbell_voiced" in kinds
+
+
+def test_roomba_bin_full_notifies_only_on_false_to_true_edge() -> None:
+    recipient = ChannelRef(transport="signal", address="+15551234567", durable=True)
+    ctx = _HandlerCtx(recipient=recipient)
+    for old, new in ((None, True), (False, False), (True, True), (False, True), (True, False), (False, True)):
+        event = CozyHemEvent(
+            kind="roomba:state", entity_id="",
+            payload={"name": "roomy_zoomy", "changed": ["bin_full"],
+                     "old_state": None if old is None else {"bin_full": old},
+                     "state": {"bin_full": new}},
+            received_at=123.0,
+        )
+        asyncio.run(handle_cozyhem_event(ctx, event))
+    assert [sent["text"] for sent in ctx.dispatched] == [
+        "Roomy Zoomy's bin is full. Please empty it.",
+        "Roomy Zoomy's bin is full. Please empty it.",
+    ]
+    assert all(sent["channel"] == recipient for sent in ctx.dispatched)
+    assert all(sent["bypass_quiet"] is False for sent in ctx.dispatched)
+
+
+def test_roomba_bin_full_ignores_malformed_events_and_missing_recipient() -> None:
+    ctx = _HandlerCtx()
+    for payload in ({}, {"old_state": {"bin_full": False}, "state": {"bin_full": True}, "changed": []},
+                    {"old_state": {"bin_full": False}, "state": {"bin_full": True}, "changed": ["bin_full"]}):
+        asyncio.run(handle_cozyhem_event(ctx, CozyHemEvent(
+            kind="roomba:state", entity_id="", payload=payload, received_at=123.0,
+        )))
+    assert ctx.dispatched == []
 
 
 def test_handler_drops_unknown_kinds() -> None:

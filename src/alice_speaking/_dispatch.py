@@ -1163,6 +1163,9 @@ async def handle_cozyhem_event(ctx: DaemonContext, event: "CozyHemEvent") -> Non
     if event.kind in ("doorbell:pressed", "doorbell_pressed"):
         await _handle_doorbell_pressed(ctx, event)
         return
+    if event.kind == "roomba:state":
+        await _handle_roomba_bin_full(ctx, event)
+        return
 
     log.info(
         "cozyhem: dropping unknown event kind=%r (entity_id=%s)",
@@ -1223,6 +1226,33 @@ async def _handle_doorbell_pressed(
         entity_id=event.entity_id,
         recipient=recipient.address,
     )
+
+
+async def _handle_roomba_bin_full(ctx: DaemonContext, event: "CozyHemEvent") -> None:
+    """Notify Jason once per false-to-true bin transition, not on startup baselines."""
+    payload = event.payload
+    if not isinstance(payload, dict):
+        return
+    old = payload.get("old_state")
+    new = payload.get("state")
+    changed = payload.get("changed")
+    if (not isinstance(old, dict) or not isinstance(new, dict)
+            or not isinstance(changed, list) or "bin_full" not in changed
+            or old.get("bin_full") is not False or new.get("bin_full") is not True):
+        return
+    recipient = ctx.address_book.preferred_channel("jason", transport="signal")
+    if recipient is None:
+        log.warning("cozyhem roomba bin full: no Signal channel for Jason")
+        return
+    name = payload.get("name")
+    label = name.replace("_", " ").title() if isinstance(name, str) and name else "The vacuum"
+    try:
+        await ctx._dispatch_outbound(recipient, f"{label}'s bin is full. Please empty it.", None)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("cozyhem roomba bin full: send failed")
+        ctx.events.emit("cozyhem_roomba_bin_full_send_error", error=f"{type(exc).__name__}: {exc}")
+        return
+    ctx.events.emit("cozyhem_roomba_bin_full_voiced", entity_id=f"vacuum.{name}")
 
 
 # ---------------------------------------------------------------------------
