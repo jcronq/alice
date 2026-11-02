@@ -7,7 +7,9 @@
 @media (prefers-color-scheme:dark){:root{--bg:#15171a;--fg:#e6e6e6;--muted:#9aa0a6;--card:#1d2024;--line:#2c3036;--accent:#6cc4a8;--warn:#f0a35e}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}
 header{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--line);padding:.6rem 1rem;display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;z-index:2}
-header b{font-size:1.05rem}header nav{display:flex;gap:.4rem;flex-wrap:wrap}
+header b{font-size:1.05rem}header nav{display:flex;flex-direction:column;gap:.25rem}
+.navrow{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center}
+.navrow.dyn{padding-top:.15rem;border-top:1px dashed var(--line)}
 header a{color:var(--muted);text-decoration:none;padding:.15rem .55rem;border:1px solid var(--line);border-radius:999px;font-size:.85rem}
 header a.on{color:var(--bg);background:var(--accent);border-color:var(--accent)}
 #age{margin-left:auto;color:var(--muted);font-size:.8rem}
@@ -210,7 +212,7 @@ async function pollThreads(){
 }
 setInterval(pollThreads,5000);
 let SHOW_HIDDEN=false;
-const PINNED=new Set(['index','chat']);
+const PINNED=new Set(['index','chat','bugs']);
 function withChatTab(pages){
   // Inject the Chat tab (not in pages.json; always visible, not dismissible).
   if(pages.some(p=>p.slug==='chat'))return pages;
@@ -220,8 +222,10 @@ function renderNav(pages){
   pages=withChatTab(pages);
   const vis=pages.filter(p=>!p.hidden||p.slug===page),hid=pages.filter(p=>p.hidden&&p.slug!==page);
   const tab=p=>`<span class="tab ${p.slug===page?'on':''}${p.hidden?' hid':''}"><a href="?p=${p.slug}">${esc(p.title)}</a>${!PINNED.has(p.slug)&&KEY?`<button class="x" data-s="${p.slug}" data-a="${p.hidden?'restore':'dismiss'}" title="${p.hidden?'Restore':'Dismiss'} tab">${p.hidden?'↺':'×'}</button>`:''}</span>`;
-  let html=vis.map(tab).join('');
-  if(hid.length)html+=SHOW_HIDDEN?hid.map(tab).join('')+'<a class="more" href="#" data-t="1">hide dismissed</a>':`<a class="more" href="#" data-t="1">+${hid.length} dismissed</a>`;
+  const perm=vis.filter(p=>PINNED.has(p.slug)),dyn=vis.filter(p=>!PINNED.has(p.slug));
+  let dynhtml=dyn.map(tab).join('');
+  if(hid.length)dynhtml+=SHOW_HIDDEN?hid.map(tab).join('')+'<a class="more" href="#" data-t="1">hide dismissed</a>':`<a class="more" href="#" data-t="1">+${hid.length} dismissed</a>`;
+  const html=`<div class="navrow perm">${perm.map(tab).join('')}</div>`+(dynhtml?`<div class="navrow dyn">${dynhtml}</div>`:'');
   const nav=document.getElementById('nav');nav.innerHTML=html;
   nav.querySelectorAll('.x').forEach(b=>b.onclick=async e=>{e.preventDefault();
     const r=await fetch('api/page-visibility',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:KEY,slug:b.dataset.s,action:b.dataset.a})});
