@@ -39,6 +39,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -409,6 +410,157 @@ def handle_reply(cfg: Config, d: dict) -> dict:
     return {"ok": True, "thread": tid}
 
 
+# ---------------------------------------------------------------- bugs render
+#
+# ``/bugs.md`` is rendered on-the-fly from every ``bug-<N>.md`` detail file in
+# STATUS_DIR. The server owns the Open / Fixed / Won't fix buckets — Jason
+# updates a bug's state by editing the detail file's frontmatter ``status:``
+# field, nothing else. See the matching intercept in ``Handler._get``.
+
+BUG_FILE_RE = re.compile(r"^bug-(\d+)\.md$")
+BUG_STATUSES = ("open", "fixed", "wontfix")
+# Heading-prefix stripper for the title fallback: ``# bug-N — real title``
+# becomes ``real title`` so the rendered line isn't ``bug-N — bug-N — ...``.
+BUG_HEADING_PREFIX_RE = re.compile(r"^bug-\d+\s*[-–—]\s*", re.I)
+
+
+def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
+    """Parse the leading ``---\\n...\\n---\\n`` block.
+
+    Returns (frontmatter_dict, body). If no frontmatter is present, returns
+    an empty dict and the original text. Values are read as plain strings;
+    matching surrounding single or double quotes are stripped. Lines without
+    a colon or starting with ``#`` are ignored.
+    """
+    if not text.startswith("---\n"):
+        return {}, text
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        return {}, text
+    front = text[4:end]
+    body = text[end + len("\n---\n") :]
+    data: dict[str, str] = {}
+    for line in front.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if ":" not in stripped:
+            continue
+        key, _, value = stripped.partition(":")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        data[key] = value
+    return data, body
+
+
+def _bug_summary_fallback(reported_at: str) -> str:
+    """Fallback summary line built from ``reported_at`` when missing."""
+    if not reported_at:
+        return ""
+    try:
+        dt = datetime.fromisoformat(reported_at.replace("Z", "+00:00"))
+    except ValueError:
+        return f"reported {reported_at}"
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+    return f"reported {dt.strftime('%Y-%m-%d %H:%M UTC')}"
+
+
+def _bug_title_from_heading(body: str, report_id: int) -> str:
+    """Extract the first ``# `` heading from a bug detail body.
+
+    Strips a leading ``bug-<N> —`` (or ``-``, ``–``) prefix so the rendered
+    index line doesn't double up on the bug number.
+    """
+    for raw in body.splitlines():
+        line = raw.strip()
+        if line.startswith("# "):
+            title = line[2:].strip()
+            title = BUG_HEADING_PREFIX_RE.sub("", title, count=1)
+            if title:
+                return title
+            break
+    return f"bug-{report_id}"
+
+
+def collect_bugs(status_dir: Path) -> tuple[dict[str, list[dict]], float]:
+    """Scan ``bug-<N>.md`` files, bucket by status.
+
+    Returns ``(buckets, max_mtime)``. ``buckets`` keys are ``open`` /
+    ``fixed`` / ``wontfix`` (every key always present, possibly empty).
+    Each bucket is a list of ``{"report_id": int, "title": str, "summary":
+    str}`` dicts ordered newest-first by ``report_id``. ``max_mtime`` is
+    the newest mtime among contributing files, or ``0.0`` if there are none.
+    """
+    buckets: dict[str, list[dict]] = {s: [] for s in BUG_STATUSES}
+    max_mtime = 0.0
+    if not status_dir.is_dir():
+        return buckets, max_mtime
+    for p in sorted(status_dir.glob("bug-*.md")):
+        m = BUG_FILE_RE.fullmatch(p.name)
+        if not m:
+            continue
+        try:
+            text = p.read_text(errors="replace")
+            st = p.stat()
+        except OSError:
+            continue
+        if st.st_mtime > max_mtime:
+            max_mtime = st.st_mtime
+        fm, body = parse_frontmatter(text)
+        try:
+            report_id = int(fm.get("report_id") or m.group(1))
+        except (TypeError, ValueError):
+            report_id = int(m.group(1))
+        status = (fm.get("status") or "").strip().lower()
+        if status not in buckets:
+            status = "open"
+        title = (fm.get("title") or "").strip()
+        if not title:
+            title = _bug_title_from_heading(body, report_id)
+        summary = (fm.get("summary") or "").strip()
+        if not summary:
+            summary = _bug_summary_fallback(fm.get("reported_at", ""))
+        buckets[status].append(
+            {"report_id": report_id, "title": title, "summary": summary}
+        )
+    for key in buckets:
+        buckets[key].sort(key=lambda b: b["report_id"], reverse=True)
+    return buckets, max_mtime
+
+
+def render_bugs_md(status_dir: Path) -> tuple[str, float]:
+    """Build the full ``/bugs.md`` body + newest contributing-file mtime."""
+    buckets, max_mtime = collect_bugs(status_dir)
+    parts = [
+        "# In-game bug reports\n",
+        "Every /bug report that reaches me from the game. Click one for the "
+        "full state at the moment of reporting — location, flags, inventory, "
+        "last 20 messages.\n",
+    ]
+    sections = (
+        ("Open", "open", "[ ]"),
+        ("Fixed", "fixed", "[x]"),
+        ("Won't fix", "wontfix", "[x]"),
+    )
+    for heading, key, box in sections:
+        parts.append(f"## {heading}\n")
+        items = buckets[key]
+        if not items:
+            parts.append("*(none yet)*\n")
+            continue
+        lines = []
+        for b in items:
+            line = f"- {box} **bug-{b['report_id']} — {b['title']}**"
+            if b["summary"]:
+                line += f": *{b['summary']}*"
+            lines.append(line)
+        parts.append("\n".join(lines) + "\n")
+    return "\n".join(parts), max_mtime
+
+
 # ---------------------------------------------------------------- HTTP
 
 
@@ -548,6 +700,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/chat":
             return self._json(
                 200, {"messages": read_chat(self.cfg)}, head=head
+            )
+        if path == "/bugs.md":
+            body, mtime = render_bugs_md(self.cfg.status_dir)
+            return self._send(
+                200,
+                body.encode("utf-8"),
+                "text/markdown; charset=utf-8",
+                mtime=mtime if mtime > 0 else None,
+                head=head,
             )
         p = self._resolve(path)
         if p is None:
