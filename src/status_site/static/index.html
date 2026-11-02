@@ -260,7 +260,7 @@ function mountChat(){
     send.disabled=false;
   };
   send.onclick=submit;
-  ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();submit()}});
+  ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();submit()}});
 }
 async function load(){
   if(replyOpen&&page!=='chat')return;
