@@ -11,15 +11,20 @@ Stdlib-only (runs on a bare ``python:3.12-alpine`` image). Routes:
                                           events from item-history/<s>.jsonl (written by the
                                           tracker thread, see history.py), thread from
                                           threads/<s>.jsonl, extra from item-extra/<s>.jsonl
+    GET  /api/chat                        {messages: [...]} — general chat log, no item context
     POST /api/page-visibility             dismiss/restore/open a nav tab (shared-key auth)
     POST /api/reply                       Jason's reply to an item (shared-key auth):
                                           appends to the item's thread, stores attachments
                                           privately under UPLOAD_DIR, and drops a
                                           ``type: status-reply`` surface into SURFACE_DIR
                                           so Speaking gets a turn.
+    POST /api/chat                        Jason's reply on the general Chat tab (shared-key auth):
+                                          appends to ``.chat.jsonl`` and drops a
+                                          ``type: status-chat`` surface into SURFACE_DIR
+                                          (no thread/item context — just the message).
 
-Anything else is a 404: dotfiles (``.replies.jsonl``, ``.item-state.json``), ``threads/``, the key and
-the uploads are never served. See docs/designs/status-site.md.
+Anything else is a 404: dotfiles (``.replies.jsonl``, ``.item-state.json``, ``.chat.jsonl``),
+``threads/``, the key and the uploads are never served. See docs/designs/status-site.md.
 """
 
 from __future__ import annotations
@@ -57,6 +62,10 @@ CONTENT_TYPES = {
 MAX_FILES = 5
 MAX_TEXT = 8000
 MAX_ITEM = 500
+# How many chat messages /api/chat returns, newest-at-end.
+MAX_CHAT_HISTORY = 500
+# How many tail lines to splice into the Speaking surface for context.
+CHAT_SURFACE_TAIL = 5
 
 SPEAKING_FOOTER = (
     "For Speaking: this came from Jason via the status site ({url}, key-authenticated). "
@@ -64,6 +73,14 @@ SPEAKING_FOOTER = (
     'not on Signal: run `status-reply {tid} "<your answer>"` (alice-tools/bin), which appends '
     "to the item's thread and shows up on his screen within seconds. Then update "
     "inner/status/index.md (move or check off the item). Use send_message only if it's "
+    "urgent or needs him away from the page."
+)
+
+CHAT_SPEAKING_FOOTER = (
+    "For Speaking: this came from Jason via the status site's Chat tab ({url}?p=chat, "
+    "key-authenticated). No thread or item context — just a message. REPLY ON THE CHAT, "
+    'not on Signal: run `status-chat "<your answer>"` (alice-tools/bin), which appends to '
+    "the chat log and shows up on his screen within seconds. Use send_message only if it's "
     "urgent or needs him away from the page."
 )
 
@@ -122,6 +139,12 @@ class Config:
         return self.status_dir / ".replies.jsonl"
 
     @property
+    def chat_log(self) -> Path:
+        # Dot-prefixed so the static-file handler won't serve it (same guard as
+        # ``.replies.jsonl``); the ``/api/chat`` endpoint is the only way out.
+        return self.status_dir / ".chat.jsonl"
+
+    @property
     def max_body(self) -> int:
         # base64 inflates by 4/3; leave headroom for the JSON envelope + text.
         return self.max_upload * 4 // 3 + 50_000
@@ -166,6 +189,85 @@ def append_thread(cfg: Config, tid: str, message: dict) -> None:
     cfg.threads_dir.mkdir(parents=True, exist_ok=True)
     with open(cfg.threads_dir / f"{tid}.jsonl", "a") as f:
         f.write(json.dumps(message) + "\n")
+
+
+def read_chat(cfg: Config, limit: int = MAX_CHAT_HISTORY) -> list[dict]:
+    """General chat log (``.chat.jsonl``), newest-at-end, trimmed to ``limit``."""
+    p = cfg.chat_log
+    if not p.is_file():
+        return []
+    msgs: list[dict] = []
+    for line in p.read_text(errors="replace").splitlines():
+        try:
+            msgs.append(json.loads(line))
+        except ValueError:
+            pass
+    return msgs[-limit:] if limit else msgs
+
+
+def append_chat(cfg: Config, message: dict) -> None:
+    """Append one message to the general chat log."""
+    cfg.status_dir.mkdir(parents=True, exist_ok=True)
+    with open(cfg.chat_log, "a") as f:
+        f.write(json.dumps(message) + "\n")
+
+
+def render_chat_surface(cfg: Config, *, text: str, prior: list[dict]) -> str:
+    """Build the ``type: status-chat`` surface document (no thread/item fields)."""
+    tail = "\n".join(f"  {m.get('from')}: {m.get('text')}" for m in prior)
+    return f"""---
+priority: action
+type: status-chat
+reply_expected: true
+created: {time.strftime("%Y-%m-%d")}
+source: status-site
+page: chat
+---
+
+# Jason sent a message on the Chat tab
+
+His new message:
+{text}
+
+Recent chat (for context, last {CHAT_SURFACE_TAIL} lines before this message):
+{tail or "  (none: this is the first message)"}
+
+---
+{CHAT_SPEAKING_FOOTER.format(url=cfg.public_url)}
+"""
+
+
+def handle_chat(cfg: Config, d: dict) -> dict:
+    """Validate + persist one chat message. Raises ReplyError on client errors.
+
+    Mirrors ``handle_reply`` but with no thread, item, or attachments: the Chat
+    tab is a single running log Jason uses when there's no todo item to anchor
+    the conversation to.
+    """
+    if not isinstance(d, dict):
+        raise ReplyError(400, "bad json")
+    if not hmac.compare_digest(str(d.get("key", "")).encode(), cfg.key.encode()):
+        raise ReplyError(403, "bad key")
+    text = str(d.get("text", "")).strip()[:MAX_TEXT]
+    if not text:
+        raise ReplyError(400, "empty message")
+
+    with cfg.lock:
+        prior = read_chat(cfg)[-CHAT_SURFACE_TAIL:]
+        append_chat(cfg, {"from": "jason", "at": now_iso(), "text": text})
+
+        doc = render_chat_surface(cfg, text=text, prior=prior)
+        cfg.surface_dir.mkdir(parents=True, exist_ok=True)
+        fname = f"{time.strftime('%Y-%m-%dT%H-%M-%S')}-status-chat.md"
+        tmp = cfg.surface_dir / f".tmp-chat-{os.getpid()}-{time.time_ns()}"
+        tmp.write_text(doc)
+        dest = cfg.surface_dir / fname
+        n = 1
+        while dest.exists():
+            n += 1
+            dest = cfg.surface_dir / fname.replace(".md", f"-{n}.md")
+        os.rename(tmp, dest)
+    return {"ok": True}
 
 
 def render_surface(
@@ -443,6 +545,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, list_pages(self.cfg), head=head)
         if path == "/api/threads":
             return self._json(200, read_threads(self.cfg), head=head)
+        if path == "/api/chat":
+            return self._json(
+                200, {"messages": read_chat(self.cfg)}, head=head
+            )
         p = self._resolve(path)
         if p is None:
             return self._json(404, {"error": "not found"}, head=head)
@@ -468,7 +574,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         route = urlsplit(self.path).path
-        if route not in ("/api/reply", "/api/page-visibility"):
+        handlers = {
+            "/api/reply": handle_reply,
+            "/api/page-visibility": handle_page_visibility,
+            "/api/chat": handle_chat,
+        }
+        fn = handlers.get(route)
+        if fn is None:
             return self._json(404, {"error": "not found"})
         try:
             n = int(self.headers.get("Content-Length", "0"))
@@ -484,7 +596,6 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self._json(400, {"error": "bad json"})
         try:
-            fn = handle_reply if route == "/api/reply" else handle_page_visibility
             return self._json(200, fn(self.cfg, d))
         except ReplyError as e:
             return self._json(e.code, {"error": e.msg})

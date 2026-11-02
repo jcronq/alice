@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# status-chat "text" — post Alice's reply into the status site's general Chat
+# tab (no item or thread context; see docs/designs/status-site.md).
+#
+# Chat log: $STATUS_DIR/.chat.jsonl, else $ALICE_MIND/inner/status/.chat.jsonl,
+# else ~/alice-mind/inner/status/.chat.jsonl. The Python implementation lives
+# in src/status_site/cli.py; alice-tools/bin/status-chat execs this wrapper so
+# Speaking's PATH entry keeps working.
+
+set -u
+
+ALICE_SRC="${ALICE_SRC:-/home/alice/alice/src}"
+if [ ! -d "$ALICE_SRC/status_site" ]; then
+    ALICE_SRC="$(cd "$(dirname "$(readlink -f "$0")")/../src" && pwd)"
+fi
+PY="$(command -v python3)" || { echo "[status-chat] no python3 available" >&2; exit 2; }
+
+if [ -n "${PYTHONPATH-}" ]; then
+    export PYTHONPATH="$ALICE_SRC:$PYTHONPATH"
+else
+    export PYTHONPATH="$ALICE_SRC"
+fi
+
+exec "$PY" -c 'import sys; from status_site.cli import main_chat; sys.exit(main_chat())' "$@"

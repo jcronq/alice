@@ -1,8 +1,13 @@
-"""status-reply THREAD_ID "text" — post Alice's reply into a status-page item thread.
+"""status-reply / status-chat — post Alice's reply into a status-site thread.
 
-Threads live in $STATUS_DIR/threads/<id>.jsonl (default ~/alice-mind/inner/status)
-and render under the matching item on the status site. THREAD_ID is the item's
+``status-reply THREAD_ID "text"`` appends to a per-item thread at
+``$STATUS_DIR/threads/<id>.jsonl`` (default ``~/alice-mind/inner/status``) and
+renders under the matching item on the status site. THREAD_ID is the item's
 slug (the lowercased bold title), the same id the status-reply surface names.
+
+``status-chat "text"`` appends to the general chat log at
+``$STATUS_DIR/.chat.jsonl`` and renders on the status site's Chat tab, which
+has no item or thread context.
 """
 
 from __future__ import annotations
@@ -24,9 +29,10 @@ def status_dir() -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """status-reply THREAD_ID "text" — post Alice's reply into an item thread."""
     args = sys.argv[1:] if argv is None else argv
     if len(args) != 2 or not args[1].strip():
-        print(__doc__, file=sys.stderr)
+        print(main.__doc__, file=sys.stderr)
         return 2
     tid = thread_id(args[0], "")
     if tid == "general" and not args[0].strip():
@@ -40,6 +46,23 @@ def main(argv: list[str] | None = None) -> int:
             + "\n"
         )
     print(f"posted to thread {tid}")
+    return 0
+
+
+def main_chat(argv: list[str] | None = None) -> int:
+    """status-chat "text" — post Alice's reply into the general Chat tab log."""
+    args = sys.argv[1:] if argv is None else argv
+    if len(args) != 1 or not args[0].strip():
+        print(main_chat.__doc__, file=sys.stderr)
+        return 2
+    d = status_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / ".chat.jsonl", "a") as f:
+        f.write(
+            json.dumps({"from": "alice", "at": now_iso(), "text": args[0].strip()})
+            + "\n"
+        )
+    print("posted to chat")
     return 0
 
 

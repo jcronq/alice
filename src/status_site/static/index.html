@@ -68,6 +68,13 @@ a.detail{color:inherit;text-decoration:none;border-bottom:1px dashed var(--accen
 #modal ol.tl del{color:var(--muted)}#modal ol.tl ins{text-decoration:none;color:var(--accent)}
 #modal ol.tl code{font-size:.82em}
 strong.leaf{cursor:pointer;text-decoration:underline dotted var(--muted);text-underline-offset:3px}
+#chatpage{display:flex;flex-direction:column;height:calc(100vh - 7rem);min-height:28rem}
+#chatpage h1{margin:0 0 .4rem}
+#chatpage .intro{color:var(--muted);font-size:.9rem;margin:0 0 .6rem}
+#chatpage .thread{flex:1;overflow-y:auto;overscroll-behavior:contain;padding:.6rem;border:1px solid var(--line);border-radius:8px;background:var(--card);display:flex;flex-direction:column;gap:.35rem}
+#chatpage .reply{display:block;margin-top:.6rem;padding:0}
+#chatpage textarea{width:100%;min-height:3.4rem;font:inherit;padding:.5rem;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+#chatpage .row{display:flex;gap:.5rem;margin-top:.35rem;align-items:center}
 </style></head><body>
 <header><b>Alice</b><nav id="nav"></nav><span id="age"></span></header>
 <div id="modal" onclick="if(event.target===this)closeModal()"><div class="mc"><div class="mh"><b class="mt"></b><button class="mx" onclick="closeModal()">×</button></div><div class="mb"></div></div></div>
@@ -202,9 +209,16 @@ async function pollThreads(){
 }
 setInterval(pollThreads,5000);
 let SHOW_HIDDEN=false;
+const PINNED=new Set(['index','chat']);
+function withChatTab(pages){
+  // Inject the Chat tab (not in pages.json; always visible, not dismissible).
+  if(pages.some(p=>p.slug==='chat'))return pages;
+  return [...pages,{slug:'chat',title:'Chat'}];
+}
 function renderNav(pages){
+  pages=withChatTab(pages);
   const vis=pages.filter(p=>!p.hidden||p.slug===page),hid=pages.filter(p=>p.hidden&&p.slug!==page);
-  const tab=p=>`<span class="tab ${p.slug===page?'on':''}${p.hidden?' hid':''}"><a href="?p=${p.slug}">${esc(p.title)}</a>${p.slug!=='index'&&KEY?`<button class="x" data-s="${p.slug}" data-a="${p.hidden?'restore':'dismiss'}" title="${p.hidden?'Restore':'Dismiss'} tab">${p.hidden?'↺':'×'}</button>`:''}</span>`;
+  const tab=p=>`<span class="tab ${p.slug===page?'on':''}${p.hidden?' hid':''}"><a href="?p=${p.slug}">${esc(p.title)}</a>${!PINNED.has(p.slug)&&KEY?`<button class="x" data-s="${p.slug}" data-a="${p.hidden?'restore':'dismiss'}" title="${p.hidden?'Restore':'Dismiss'} tab">${p.hidden?'↺':'×'}</button>`:''}</span>`;
   let html=vis.map(tab).join('');
   if(hid.length)html+=SHOW_HIDDEN?hid.map(tab).join('')+'<a class="more" href="#" data-t="1">hide dismissed</a>':`<a class="more" href="#" data-t="1">+${hid.length} dismissed</a>`;
   const nav=document.getElementById('nav');nav.innerHTML=html;
@@ -213,8 +227,55 @@ function renderNav(pages){
     if(r.ok){if(b.dataset.a==='dismiss'&&b.dataset.s===page)location.href='?p=index';else load()}});
   nav.querySelectorAll('[data-t]').forEach(a=>a.onclick=e=>{e.preventDefault();SHOW_HIDDEN=!SHOW_HIDDEN;renderNav(pages)});
 }
+let CHAT=[],chatMounted=false;
+function renderChatThread(force){
+  const t=document.querySelector('#chatpage .thread');if(!t)return;
+  const atBottom=t.scrollHeight-t.scrollTop-t.clientHeight<60;
+  const last=CHAT[CHAT.length-1];
+  t.innerHTML=CHAT.length?CHAT.map(m=>`<div class="msg ${m.from==='jason'?'jason':'alice'}">${esc(m.text||'')}<small>${m.from==='jason'?'You':'Alice'} · ${fmt(m.at)}</small></div>`).join('')+
+    (last&&last.from==='jason'?'<div class="typing">Alice is on it…</div>':''):'<div class="typing">No messages yet. Say hi.</div>';
+  if(force||atBottom)t.scrollTop=t.scrollHeight;
+  seen.chat=CHAT.length;saveUI();
+}
+async function pollChat(force){
+  if(page!=='chat')return;
+  try{const r=await fetch('api/chat?'+Date.now());if(!r.ok)return;const j=await r.json();CHAT=j.messages||[];renderChatThread(force)}catch(e){}
+}
+function mountChat(){
+  chatMounted=true;replyOpen=false;
+  const doc=document.getElementById('doc');
+  doc.innerHTML=`<div id="chatpage"><h1>Chat</h1><p class="intro">General line to Alice — no todo item attached. She'll reply right here.</p><div class="thread"><div class="typing">Loading…</div></div><div class="reply"><textarea placeholder="Message Alice…"></textarea><div class="row"><button>Send</button><span class="sent"></span></div></div></div>`;
+  const ta=doc.querySelector('textarea'),sm=doc.querySelector('.sent'),send=doc.querySelector('.row button');
+  ta.addEventListener('input',()=>{replyOpen=!!ta.value});
+  const submit=async()=>{
+    if(!ta.value.trim())return;
+    if(!KEY){sm.textContent='No key: open the link Alice sent once.';return}
+    send.disabled=true;sm.textContent='Sending…';
+    try{
+      const r=await fetch('api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:KEY,text:ta.value})});
+      const j=await r.json();
+      if(r.ok){sm.textContent='';ta.value='';replyOpen=false;await pollChat(true)}
+      else sm.textContent='Error: '+(j.error||r.status);
+    }catch(e){sm.textContent='Error: '+e.message}
+    send.disabled=false;
+  };
+  send.onclick=submit;
+  ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();submit()}});
+}
 async function load(){
-  if(replyOpen)return;
+  if(replyOpen&&page!=='chat')return;
+  if(page==='chat'){
+    try{
+      const pr=await fetch('pages.json?'+Date.now()).catch(()=>null);
+      if(!chatMounted)mountChat();
+      await pollChat(true);
+      document.getElementById('age').textContent='';
+      try{const ar=await fetch('api/pages?'+Date.now());if(ar.ok)AVAIL=new Set(await ar.json())}catch(e){}
+      if(pr&&pr.ok){PAGES=await pr.json();renderNav(PAGES)}
+      document.title='Alice — Chat';
+    }catch(e){document.getElementById('doc').textContent='Could not load Chat ('+e.message+')'}
+    return;
+  }
   try{
     const [r,pr]=await Promise.all([fetch(page+'.md?'+Date.now()),fetch('pages.json?'+Date.now()).catch(()=>null)]);
     if(!r.ok)throw new Error(r.status);
@@ -229,6 +290,7 @@ async function load(){
     document.title='Alice — '+(document.querySelector('#doc h1')?.textContent||page);
   }catch(e){document.getElementById('doc').textContent='Could not load '+page+'.md ('+e.message+')'}
 }
+setInterval(()=>pollChat(false),5000);
 let PAGE_VER=null;
 async function checkVersion(){try{const r=await fetch('index.html',{method:'HEAD',cache:'no-store'});const v=r.headers.get('last-modified');if(PAGE_VER&&v&&v!==PAGE_VER&&!replyOpen)location.reload();PAGE_VER=PAGE_VER||v}catch(e){}}
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal()});
