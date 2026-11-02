@@ -917,3 +917,157 @@ def test_scan_skips_dotfiles_and_subdirs(vault: pathlib.Path) -> None:
     report = stage_b.run(vault)
     assert report.scanned == 1
     assert report.routed_activity == 1
+
+
+# ---------- sm-skip route ----------
+#
+# SM dispatcher hint notes (``kind: sm-*``) are a cue for thinking's
+# wake-drain lane, NOT the memory worker. The sm-skip rule is
+# first-position in the classifier chain: match on ``kind:`` string,
+# return a no-op route whose dispatch leaves the note in
+# ``inner/notes/`` untouched. Design:
+# ``research/2026-08-31-memory-worker-sm-kind-skip-rule.md``.
+
+
+def test_route_sm_skip_matches_sm_needs_study_kind() -> None:
+    """``kind: sm-needs-study`` triggers the skip rule."""
+    route = stage_b._route_sm_skip({"kind": "sm-needs-study"}, "any body")
+    assert route is not None
+    assert route.kind == "sm-skip"
+    assert route.payload == {}
+
+
+def test_route_sm_skip_matches_any_sm_prefix() -> None:
+    """Any ``kind: sm-<anything>`` string matches — the rule covers
+    future SM hint kinds the dispatcher may introduce."""
+    for kind_value in ("sm-foo", "sm-bar-baz", "sm-", "sm-x"):
+        route = stage_b._route_sm_skip({"kind": kind_value}, "")
+        assert route is not None, f"expected match for kind={kind_value!r}"
+        assert route.kind == "sm-skip"
+
+
+def test_route_sm_skip_rejects_missing_kind() -> None:
+    """No ``kind:`` field → ``None`` (fall-through)."""
+    assert stage_b._route_sm_skip({}, "body") is None
+    assert stage_b._route_sm_skip({"tag": "activity"}, "body") is None
+
+
+def test_route_sm_skip_rejects_non_string_kind() -> None:
+    """A non-string ``kind:`` value (list, int, None) → ``None``.
+    Mirrors the other routers' isinstance-string guard; keeps the
+    rule from crashing on malformed frontmatter."""
+    for bad in ([None], 42, {"nested": "sm-foo"}, None, True):
+        assert stage_b._route_sm_skip({"kind": bad}, "") is None
+
+
+def test_route_sm_skip_rejects_non_sm_kind() -> None:
+    """``kind:`` present but not starting with ``sm-`` → ``None``.
+    This guarantees the rule doesn't steal non-SM dispatcher kinds."""
+    for value in ("needs-study", "note", "SM-needs-study", " sm-needs-study", ""):
+        assert stage_b._route_sm_skip({"kind": value}, "") is None
+
+
+def test_sm_hint_note_remains_in_inbox(vault: pathlib.Path) -> None:
+    """End-to-end: an SM hint note in ``inner/notes/`` is NOT
+    consumed, NOT failed, no surface written, no daily appended.
+    The DrainReport counter advances; nothing else does."""
+    today = datetime.date.today().isoformat()
+    _drop_note(
+        vault,
+        "sm-needs-study-issue912.md",
+        (
+            "---\n"
+            "kind: sm-needs-study\n"
+            "issue: 912\n"
+            "title: Example study hint\n"
+            "labels: [art:code, sm:needs_study]\n"
+            "source: alice-sm-dispatcher\n"
+            "---\n"
+            "\n"
+            "# Issue #912: Example study hint\n"
+            "\n"
+            "design this\n"
+        ),
+    )
+
+    report = stage_b.run(vault)
+
+    # Counters.
+    assert report.scanned == 1
+    assert report.skipped_sm == 1
+    assert report.unclassified == 0
+    assert report.routed_activity == 0
+    assert report.routed_event == 0
+    assert report.routed_target == 0
+    assert report.routed_concept == 0
+    assert report.routed_conflict == 0
+    assert report.routed_noise == 0
+    assert report.malformed == 0
+    assert report.errors == 0
+
+    # Note still in inbox — not moved to .consumed/ or .failed/.
+    assert (vault / "inner" / "notes" / "sm-needs-study-issue912.md").is_file()
+    assert not _consumed_path(vault, "sm-needs-study-issue912.md").exists()
+    assert not _failed_path(vault, "sm-needs-study-issue912.md").exists()
+
+    # No surface written.
+    surface_dir = vault / "inner" / "surface"
+    if surface_dir.exists():
+        assert list(surface_dir.glob("*.md")) == []
+
+    # No daily appended / created.
+    daily = vault / "cortex-memory" / "dailies" / f"{today}.md"
+    assert not daily.exists()
+
+    # No events.jsonl append.
+    events_jsonl = vault / "memory" / "events.jsonl"
+    if events_jsonl.exists():
+        assert events_jsonl.read_text(encoding="utf-8") == ""
+
+
+def test_sm_skip_wins_over_routable_tag(vault: pathlib.Path) -> None:
+    """Precedence: a note that carries BOTH ``kind: sm-needs-study``
+    AND a routable tag (e.g. ``tag: for-thinking``) still routes to
+    ``sm-skip``. First-position in the classifier chain is the
+    structural guarantee against the race documented in the design."""
+    _drop_note(
+        vault,
+        "sm-needs-study-with-for-thinking.md",
+        (
+            "---\n"
+            "kind: sm-needs-study\n"
+            "tag: for-thinking\n"
+            "issue: 913\n"
+            "title: Both-fields study hint\n"
+            "---\n"
+            "\n"
+            "# Issue #913: Both-fields study hint\n"
+            "\n"
+            "design this too\n"
+        ),
+    )
+
+    report = stage_b.run(vault)
+
+    assert report.skipped_sm == 1
+    assert report.routed_concept == 0
+    assert report.unclassified == 0
+
+    # Note still in inbox.
+    assert (vault / "inner" / "notes" / "sm-needs-study-with-for-thinking.md").is_file()
+    assert not _consumed_path(vault, "sm-needs-study-with-for-thinking.md").exists()
+    assert not _failed_path(vault, "sm-needs-study-with-for-thinking.md").exists()
+
+    # No for-thinking atomic note was created either.
+    research_dir = vault / "cortex-memory" / "research"
+    if research_dir.exists():
+        assert list(research_dir.glob("*.md")) == []
+
+
+def test_drain_report_skipped_sm_in_dict() -> None:
+    """``DrainReport.to_dict()`` includes the ``skipped_sm`` counter
+    so the heartbeat event emits it."""
+    report = stage_b.DrainReport()
+    d = report.to_dict()
+    assert "skipped_sm" in d
+    assert d["skipped_sm"] == 0
