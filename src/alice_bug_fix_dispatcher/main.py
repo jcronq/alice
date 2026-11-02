@@ -45,13 +45,21 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
-import os
 import pathlib
 import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Mapping
+
+from alice_pricing import (
+    actual_cost_from_tokens,
+    estimate_cost,
+    estimate_tokens,
+    format_usd,
+    read_worker_tokens,
+)
+from alice_pricing.rates import is_free
 
 from . import frontmatter as _fm
 
@@ -68,6 +76,18 @@ DEFAULT_WORKER_PROMPT_TEMPLATE = pathlib.Path(
 )
 DEFAULT_STALL_HOURS = 2
 DEFAULT_REPO = "jcronq/modern-mud"
+# The dispatcher spawns ``claude -p`` without passing ``--model``; the
+# user's current Claude Code setup picks the active model at launch
+# time, which today is Opus 4.7. Keep the dispatcher-side default
+# aligned so the estimate column reflects reality. Overridable via
+# ``bug_fix_dispatcher.worker_model`` in alice.config.json.
+DEFAULT_WORKER_MODEL = "claude-opus-4-7"
+# Output budget sized for a code-fix PR; mirrors the pricing module.
+DEFAULT_EXPECTED_OUTPUT_TOKENS = 8_000
+# How long the scratch dir must sit idle before we attempt to read
+# actuals on a worker whose result.json is empty or malformed. 5
+# minutes matches the spec; keeps us from pricing a mid-flight log.
+ACTUALS_SETTLE_SECONDS = 300
 
 
 BUG_FILE_RE = re.compile(r"^bug-(\d+)\.md$")
@@ -86,6 +106,12 @@ class DispatcherConfig:
     worker_prompt_template: pathlib.Path = DEFAULT_WORKER_PROMPT_TEMPLATE
     stall_hours: int = DEFAULT_STALL_HOURS
     repo: str = DEFAULT_REPO
+    # Pricing knobs. ``worker_model`` + ``expected_output_tokens`` feed
+    # the pre-flight ``estimate_usd`` write. Overridable in
+    # ``alice.config.json`` under ``bug_fix_dispatcher.*`` so Jason can
+    # swap models without a redeploy.
+    worker_model: str = DEFAULT_WORKER_MODEL
+    expected_output_tokens: int = DEFAULT_EXPECTED_OUTPUT_TOKENS
 
 
 @dataclass
@@ -128,6 +154,34 @@ def _read_config_pause_flag(config_json: pathlib.Path) -> bool:
     if not isinstance(section, dict):
         return False
     return bool(section.get("wave_a_signoff_pending"))
+
+
+def _read_config_pricing(cfg: "DispatcherConfig") -> tuple[str, int]:
+    """Return ``(worker_model, expected_output_tokens)`` from alice.config.json.
+
+    Falls back to the dataclass defaults when the file is missing /
+    malformed / lacks the keys. Reading at tick time (not instance
+    construction) means Jason can edit the config file and get a new
+    rate without restarting the dispatcher service.
+    """
+    worker_model = cfg.worker_model
+    expected_out = cfg.expected_output_tokens
+    if not cfg.config_json.is_file():
+        return worker_model, expected_out
+    try:
+        data = json.loads(cfg.config_json.read_text())
+    except (OSError, ValueError):
+        return worker_model, expected_out
+    section = data.get("bug_fix_dispatcher") if isinstance(data, dict) else None
+    if not isinstance(section, dict):
+        return worker_model, expected_out
+    override_model = section.get("worker_model")
+    if isinstance(override_model, str) and override_model:
+        worker_model = override_model
+    override_out = section.get("expected_output_tokens")
+    if isinstance(override_out, int) and override_out > 0:
+        expected_out = override_out
+    return worker_model, expected_out
 
 
 def _journal(journal_path: pathlib.Path, line: str) -> None:
@@ -273,17 +327,41 @@ def _dispatch_worker(
     scratch_dir.mkdir(parents=True, exist_ok=True)
     (scratch_dir / "prompt.md").write_text(prompt)
 
+    # Pre-flight pricing. Compute even on free models — the frontmatter
+    # column reads cleaner when the field is always present (``$0.00``
+    # for local inference), and ``is_free`` keeps us from writing a
+    # meaningless ``estimate_usd: 0`` next to a huge Hermes prompt
+    # without context.
+    worker_model, expected_out = _read_config_pricing(cfg)
+    prompt_tokens = estimate_tokens(prompt)
+    try:
+        estimate_usd = estimate_cost(worker_model, prompt_tokens, expected_out)
+    except KeyError as exc:
+        # Unknown model — don't invent a price. Log, write null.
+        log(
+            f"[bug-fix-dispatcher] bug-{report_id}: pricing skipped — "
+            f"unknown worker model {worker_model!r}: {exc}"
+        )
+        estimate_usd = None
+
     spawner = spawn or _spawn_claude_detached
     pid = spawner(report_id, scratch_dir, prompt)
     if pid is None:
         log(f"[bug-fix-dispatcher] bug-{report_id}: worker spawn failed")
         return False, {}
 
-    patch = {
+    patch: dict[str, object | None] = {
         "status": "in-progress",
         "dispatched_at": now_iso(),
         "worker_task_id": f"pid:{pid}",
+        "worker_model": worker_model,
+        "estimate_prompt_tokens": prompt_tokens,
+        "estimate_output_tokens": expected_out,
     }
+    if estimate_usd is not None:
+        # Four decimal places gives sub-cent resolution for Haiku-grade
+        # fixes without exploding digit count for Opus.
+        patch["estimate_usd"] = f"{estimate_usd:.4f}"
     try:
         _fm.update(bug_path, patch)
     except OSError as exc:
@@ -292,9 +370,13 @@ def _dispatch_worker(
             f"spawn (pid {pid}): {exc}"
         )
         return False, {}
+    estimate_label = (
+        format_usd(estimate_usd) if estimate_usd is not None else "unknown"
+    )
     log(
         f"[bug-fix-dispatcher] bug-{report_id}: dispatched worker pid={pid} "
-        f"scratch={scratch_dir}"
+        f"scratch={scratch_dir} model={worker_model} "
+        f"estimate_usd={estimate_label}"
     )
     return True, patch
 
@@ -348,6 +430,100 @@ def _spawn_claude_detached(
     return proc.pid
 
 
+def _compute_actuals_patch(
+    *,
+    report_id: int,
+    scratch_dir: pathlib.Path,
+    fields: Mapping[str, str],
+    cfg: DispatcherConfig,
+    log: Callable[[str], None],
+) -> dict[str, object | None]:
+    """Build the frontmatter patch carrying ``actual_usd`` + sidecars.
+
+    Returns a dict with (always):
+        * ``actual_usd``: formatted dollars, or ``None`` on unparseable
+        * ``actual_tokens``: ``"input=X output=Y"`` audit string, or ``None``
+        * ``cost_attribution_note``: human-readable explanation when
+          ``actual_usd`` is ``None``, or ``None`` to clear a stale note
+
+    The returned patch is deliberately idempotent: calling twice with
+    the same scratch dir writes the same values.
+    """
+    patch: dict[str, object | None] = {}
+    tokens = read_worker_tokens(scratch_dir)
+    if tokens is None:
+        patch["actual_usd"] = None
+        patch["actual_tokens"] = None
+        patch["cost_attribution_note"] = (
+            f"worker scratch ({scratch_dir}) had no parseable token "
+            "counts in result.json or stderr.log"
+        )
+        log(
+            f"[bug-fix-dispatcher] bug-{report_id}: actuals unreadable in "
+            f"{scratch_dir} — writing actual_usd=null"
+        )
+        return patch
+
+    # If the worker's own envelope reports a model, trust it; else
+    # fall back to the model we recorded at dispatch time (``worker_model``
+    # in the frontmatter) and finally the config default.
+    model = tokens.get("model") or fields.get("worker_model") or cfg.worker_model
+    if is_free(model):
+        patch["actual_usd"] = f"{0:.4f}"
+        patch["actual_tokens"] = (
+            f"input={tokens['input_tokens']} output={tokens['output_tokens']}"
+        )
+        patch["cost_attribution_note"] = None
+        log(
+            f"[bug-fix-dispatcher] bug-{report_id}: local model ({model}) — "
+            f"actual_usd=$0.00 input={tokens['input_tokens']} "
+            f"output={tokens['output_tokens']}"
+        )
+        return patch
+
+    try:
+        actual_usd = actual_cost_from_tokens(
+            model,
+            tokens["input_tokens"],
+            tokens["output_tokens"],
+            tokens.get("cache_read_tokens", 0),
+            tokens.get("cache_write_tokens", 0),
+        )
+    except KeyError:
+        patch["actual_usd"] = None
+        patch["actual_tokens"] = (
+            f"input={tokens['input_tokens']} output={tokens['output_tokens']}"
+        )
+        patch["cost_attribution_note"] = (
+            f"worker reported unknown model {model!r}; add it to "
+            "alice_pricing.rates.RATES to price retroactively"
+        )
+        log(
+            f"[bug-fix-dispatcher] bug-{report_id}: unknown model {model!r} — "
+            f"writing actual_usd=null"
+        )
+        return patch
+
+    patch["actual_usd"] = f"{actual_usd:.4f}"
+    patch["actual_tokens"] = (
+        f"input={tokens['input_tokens']} output={tokens['output_tokens']}"
+    )
+    cache_read = tokens.get("cache_read_tokens", 0)
+    cache_write = tokens.get("cache_write_tokens", 0)
+    if cache_read or cache_write:
+        patch["actual_tokens"] = (
+            f"input={tokens['input_tokens']} output={tokens['output_tokens']} "
+            f"cache_read={cache_read} cache_write={cache_write}"
+        )
+    # Clear any stale attribution note from a prior tick.
+    patch["cost_attribution_note"] = None
+    log(
+        f"[bug-fix-dispatcher] bug-{report_id}: actual_usd={format_usd(actual_usd)} "
+        f"({model}, input={tokens['input_tokens']} output={tokens['output_tokens']})"
+    )
+    return patch
+
+
 def _adopt_worker_result(
     *,
     report_id: int,
@@ -366,15 +542,30 @@ def _adopt_worker_result(
     * ``stalled`` is True when the dispatched_at is older than the
       stall TTL and no result/pr_url has materialised. The caller
       transitions the bug to ``dispatch-failed``.
+
+    Side effect: when the worker is finished (PR URL extracted OR
+    scratch dir hasn't been touched for ``ACTUALS_SETTLE_SECONDS``),
+    we also compute ``actual_usd`` and merge it into the frontmatter
+    patch — one write per state transition, no silent drops.
     """
     scratch_dir = cfg.worker_scratch_root / f"bug-{report_id}"
     result_path = scratch_dir / "result.json"
     pr_url = _extract_pr_url_from_result(result_path)
     if pr_url:
-        patch = {
+        patch: dict[str, object | None] = {
             "pr_url": pr_url,
             "last_check_at": now_iso(),
         }
+        # Fold actuals into the same write — if the worker emitted a
+        # PR URL, its result envelope should carry a ``usage`` block.
+        actuals_patch = _compute_actuals_patch(
+            report_id=report_id,
+            scratch_dir=scratch_dir,
+            fields=fields,
+            cfg=cfg,
+            log=log,
+        )
+        patch.update(actuals_patch)
         try:
             _fm.update(bug_path, patch)
         except OSError as exc:
@@ -386,7 +577,26 @@ def _adopt_worker_result(
         log(f"[bug-fix-dispatcher] bug-{report_id}: adopted pr_url={pr_url}")
         return True, False
 
-    # No pr_url yet — check stall.
+    # No pr_url yet — decide whether the worker has settled. If the
+    # scratch dir hasn't been touched in ACTUALS_SETTLE_SECONDS,
+    # assume the run finished without emitting a tidy PR URL (crashed,
+    # produced a stderr-only report, hit the token limit) and price
+    # the actuals anyway so the bug line gets a real dollar figure.
+    settled = _scratch_dir_settled(scratch_dir, ACTUALS_SETTLE_SECONDS)
+    actuals_already_recorded = "actual_usd" in fields
+    if settled and not actuals_already_recorded:
+        actuals_patch = _compute_actuals_patch(
+            report_id=report_id,
+            scratch_dir=scratch_dir,
+            fields=fields,
+            cfg=cfg,
+            log=log,
+        )
+        try:
+            _fm.update(bug_path, actuals_patch)
+        except OSError:
+            pass  # best-effort; stall sweep still fires below
+
     dispatched = _parse_iso(fields.get("dispatched_at", ""))
     if dispatched is None:
         return False, False
@@ -395,6 +605,29 @@ def _adopt_worker_result(
     if age >= _dt.timedelta(hours=cfg.stall_hours):
         return False, True
     return False, False
+
+
+def _scratch_dir_settled(scratch_dir: pathlib.Path, settle_seconds: int) -> bool:
+    """True when the newest file in ``scratch_dir`` is older than ``settle_seconds``.
+
+    Used as the "worker is done, safe to read tokens" signal when the
+    worker didn't produce a PR URL. We check the ``stderr.log`` and
+    ``result.json`` mtimes; if either is still being written, we hold
+    off so a mid-flight price doesn't get recorded as final.
+    """
+    newest = 0.0
+    for name in ("result.json", "stderr.log"):
+        p = scratch_dir / name
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        if st.st_mtime > newest:
+            newest = st.st_mtime
+    if newest == 0.0:
+        return False
+    age = _dt.datetime.now(_dt.timezone.utc).timestamp() - newest
+    return age >= settle_seconds
 
 
 def _extract_pr_url_from_result(result_path: pathlib.Path) -> str:
@@ -680,14 +913,49 @@ def tick(
             )
             report.skipped.append((report_id, f"ioerror:{exc.__class__.__name__}"))
 
+    # P&L roll-up — sum estimate_usd / actual_usd across *all* bugs
+    # (not just this tick's) so the log line is a running total Jason
+    # can grep for across restarts.
+    totals = _sum_pricing_totals(cfg.status_dir)
     _log(
         f"[bug-fix-dispatcher] done — scanned={report.scanned} "
         f"dispatched={len(report.dispatched)} "
         f"adopted_pr_url={len(report.adopted_pr_url)} "
         f"fixed={len(report.fixed)} reopened={len(report.reopened)} "
-        f"stalled={len(report.stalled)} skipped={len(report.skipped)}"
+        f"stalled={len(report.stalled)} skipped={len(report.skipped)} "
+        f"total_estimate_usd={format_usd(totals['estimate'])} "
+        f"total_actual_usd={format_usd(totals['actual'])}"
     )
     return report
+
+
+def _sum_pricing_totals(status_dir: pathlib.Path) -> dict[str, float]:
+    """Scan ``bug-*.md`` frontmatter and sum ``estimate_usd`` / ``actual_usd``.
+
+    Missing / unparseable fields are skipped silently (``$0.00`` for
+    the pile that hasn't been priced yet). Returns
+    ``{"estimate": float, "actual": float}``.
+    """
+    totals = {"estimate": 0.0, "actual": 0.0}
+    if not status_dir.is_dir():
+        return totals
+    for p in sorted(status_dir.glob("bug-*.md")):
+        if not BUG_FILE_RE.fullmatch(p.name):
+            continue
+        try:
+            text = p.read_text()
+        except OSError:
+            continue
+        fields, _body, _raw = _fm.parse(text)
+        for key, bucket in (("estimate_usd", "estimate"), ("actual_usd", "actual")):
+            raw = fields.get(key, "").strip()
+            if not raw:
+                continue
+            try:
+                totals[bucket] += float(raw)
+            except ValueError:
+                continue
+    return totals
 
 
 def _body_from(bug_path: pathlib.Path) -> str:
@@ -743,6 +1011,17 @@ def main(argv: Iterable[str] | None = None) -> int:
         default=DEFAULT_REPO,
         help="the modern-mud GitHub slug (reserved for future PR comment paths)",
     )
+    parser.add_argument(
+        "--worker-model",
+        default=DEFAULT_WORKER_MODEL,
+        help="model id priced at dispatch (alice.config.json overrides this)",
+    )
+    parser.add_argument(
+        "--expected-output-tokens",
+        type=int,
+        default=DEFAULT_EXPECTED_OUTPUT_TOKENS,
+        help="output budget used for pre-flight estimate_usd (default 8K)",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     cfg = DispatcherConfig(
@@ -753,6 +1032,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         worker_prompt_template=pathlib.Path(args.worker_prompt_template),
         stall_hours=args.stall_hours,
         repo=args.repo,
+        worker_model=args.worker_model,
+        expected_output_tokens=args.expected_output_tokens,
     )
 
     def _stderr(line: str) -> None:

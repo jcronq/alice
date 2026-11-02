@@ -528,17 +528,92 @@ def collect_bugs(status_dir: Path) -> tuple[dict[str, list[dict]], float]:
         if not summary:
             summary = _bug_summary_fallback(fm.get("reported_at", ""))
         pr_url = (fm.get("pr_url") or "").strip()
+        # Pricing fields (written by alice_bug_fix_dispatcher). Values
+        # are string floats like ``0.4231``; absence means "not priced
+        # yet", and ``_format_pricing_segment`` renders nothing for
+        # those bugs so the Bugs page reads clean before the first
+        # dispatched tick.
+        estimate_usd = (fm.get("estimate_usd") or "").strip()
+        actual_usd = (fm.get("actual_usd") or "").strip()
         buckets[status].append(
             {
                 "report_id": report_id,
                 "title": title,
                 "summary": summary,
                 "pr_url": pr_url,
+                "estimate_usd": estimate_usd,
+                "actual_usd": actual_usd,
             }
         )
     for key in buckets:
         buckets[key].sort(key=lambda b: b["report_id"], reverse=True)
     return buckets, max_mtime
+
+
+def _format_usd_local(dollars: float) -> str:
+    """Status-site-local USD formatter.
+
+    Mirrors ``alice_pricing.format_usd`` without taking a dep on the
+    pricing package — ``status_site`` is stdlib-only by design (see
+    the module docstring). Keep in sync.
+    """
+    if dollars == 0:
+        return "$0.00"
+    if dollars < 0:
+        return "-" + _format_usd_local(-dollars)
+    if dollars < 0.01:
+        return f"${dollars:.4g}"
+    return f"${dollars:.2f}"
+
+
+def _format_pricing_segment(estimate_usd: str, actual_usd: str) -> str:
+    """Build the ``$X est / $Y actual`` tail for a bug's summary line.
+
+    * both present  → ``$X est / $Y actual``
+    * only estimate → ``$X est``
+    * only actual   → ``$Y actual``
+    * neither       → ``""`` (caller omits the segment entirely)
+
+    Values that don't parse as floats, or that are the sentinel
+    strings ``null`` / ``none``, are treated as absent — a malformed
+    frontmatter row shouldn't crash the render.
+    """
+
+    def _render(raw: str) -> str:
+        s = (raw or "").strip()
+        if not s or s.lower() in ("null", "none"):
+            return ""
+        try:
+            dollars = float(s)
+        except ValueError:
+            return ""
+        return _format_usd_local(dollars)
+
+    est = _render(estimate_usd)
+    act = _render(actual_usd)
+    if est and act:
+        return f"{est} est / {act} actual"
+    if est:
+        return f"{est} est"
+    if act:
+        return f"{act} actual"
+    return ""
+
+
+def _sum_pricing(buckets: dict[str, list[dict]]) -> dict[str, float]:
+    """Return ``{"estimate": total, "actual": total}`` across every bug."""
+    totals = {"estimate": 0.0, "actual": 0.0}
+    for items in buckets.values():
+        for b in items:
+            for key, bucket in (("estimate_usd", "estimate"), ("actual_usd", "actual")):
+                raw = (b.get(key) or "").strip()
+                if not raw or raw.lower() in ("null", "none"):
+                    continue
+                try:
+                    totals[bucket] += float(raw)
+                except ValueError:
+                    continue
+    return totals
 
 
 def render_bugs_md(status_dir: Path) -> tuple[str, float]:
@@ -569,16 +644,37 @@ def render_bugs_md(status_dir: Path) -> tuple[str, float]:
         lines = []
         for b in items:
             line = f"- {box} **{prefix}bug-{b['report_id']} — {b['title']}**"
+            # Build the italic summary tail: summary → [draft PR] →
+            # pricing segment, joined by ``" — "``. We stitch into one
+            # single italic block (``*...*``) so Jason sees one line
+            # of context per bug, not a wall of separate italics.
+            summary_bits: list[str] = []
             if b["summary"]:
-                summary = b["summary"]
-                pr_url = b.get("pr_url", "")
-                if key == "in-progress" and pr_url:
-                    summary = f"{summary} — [draft PR]({pr_url})"
-                line += f": *{summary}*"
-            elif key == "in-progress" and b.get("pr_url"):
-                line += f": *[draft PR]({b['pr_url']})*"
+                summary_bits.append(b["summary"])
+            pr_url = b.get("pr_url", "")
+            if key == "in-progress" and pr_url:
+                summary_bits.append(f"[draft PR]({pr_url})")
+            pricing_segment = _format_pricing_segment(
+                b.get("estimate_usd", ""), b.get("actual_usd", "")
+            )
+            if pricing_segment:
+                summary_bits.append(pricing_segment)
+            if summary_bits:
+                line += ": *" + " — ".join(summary_bits) + "*"
             lines.append(line)
         parts.append("\n".join(lines) + "\n")
+
+    # Pipeline P&L — appended at the end of the page body as a single
+    # bolded line. Omitted entirely when nothing has been priced yet
+    # so an all-empty bug list stays as clean as it was before.
+    totals = _sum_pricing(buckets)
+    if totals["estimate"] > 0 or totals["actual"] > 0:
+        delta = totals["actual"] - totals["estimate"]
+        parts.append(
+            f"**Pipeline P&L (session):** total_estimate: {_format_usd_local(totals['estimate'])}, "
+            f"total_actual: {_format_usd_local(totals['actual'])}, "
+            f"delta: {_format_usd_local(delta)}\n"
+        )
     return "\n".join(parts), max_mtime
 
 
