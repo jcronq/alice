@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Optional
 from core.sdk_compat import _short
 
 from . import signal_outbound
+from . import worker_report as worker_report_module
 from .domain.turn_log import new_turn
 from .pipeline.quiet_hours import is_quiet_hours
 from .transports import ChannelRef, DaemonContext, OutboundMessage
@@ -1082,6 +1083,56 @@ async def handle_background_task_complete(
 
     framing = "failed" if event.is_error else "completed"
     body = (event.result_text or "").strip() or "(sub-agent returned no text)"
+
+    # Parse the trailing REQUIRED-REPORT JSON block (self-directed-
+    # agents item 1). Successful parse → no pending-verify. A missing
+    # or malformed block drops a note so Speaking's NEXT turn can
+    # triage even if this turn is quiet. Non-code tasks that omit
+    # commit_sha + full_suite_after are allowed via the ``kind``
+    # discriminator — the schema itself gates enforcement.
+    report = worker_report_module.parse_worker_report(event.result_text or "")
+    report_issues: list[str] = []
+    if report is None:
+        if not event.is_error:
+            report_issues.append(
+                "No trailing JSON report block found — the worker "
+                "did not emit the REQUIRED-REPORT contract."
+            )
+    else:
+        report_issues = worker_report_module.validate_worker_report(report)
+    if report_issues and not event.is_error:
+        log.warning(
+            "background_task %s returned without a valid report: %s",
+            event.handle,
+            "; ".join(report_issues),
+        )
+        mind_dir = getattr(getattr(ctx, "cfg", None), "mind_dir", None)
+        note_path = worker_report_module.write_pending_verify_note(
+            mind_dir,
+            handle=event.handle,
+            description=event.description,
+            reasons=report_issues,
+            result_excerpt=event.result_text or "",
+        )
+        ctx.events.emit(
+            "background_task_pending_verify",
+            handle=event.handle,
+            description=event.description,
+            reason_count=len(report_issues),
+            note_path=(str(note_path) if note_path else None),
+        )
+
+    report_section = ""
+    if report_issues and not event.is_error:
+        bullets = "\n".join(f"- {issue}" for issue in report_issues)
+        report_section = (
+            "\n\nREPORT CHECK FAILED — the sub-agent did not emit a "
+            "complete REQUIRED-REPORT block. Issues:\n"
+            f"{bullets}\n\nTriage the dispatched work before telling "
+            f"{event.principal_name} it's done. A pending-verify "
+            "note has been dropped in inner/notes/."
+        )
+
     prompt = (
         f"Background task `{event.handle}` ({event.description!r}) "
         f"{framing}. You dispatched it earlier on behalf of "
@@ -1091,6 +1142,7 @@ async def handle_background_task_complete(
         f"{event.principal_name}. Use send_message(recipient='self') "
         f"to reply on the originating channel — it's restored for "
         f"this turn."
+        f"{report_section}"
     )
 
     error: Optional[str] = None

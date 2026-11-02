@@ -57,6 +57,7 @@ from . import _dispatch as _dispatch_module
 from . import auto_fix as auto_fix_module
 from . import factory as factory_module
 from . import tools as tools_module
+from . import worker_report as worker_report_module
 from .domain import principals as principals_module
 from .domain import session_state
 from .domain.principals import AddressBook
@@ -1481,6 +1482,15 @@ class SpeakingDaemon:
             instructions, handle, title=description
         )
 
+        # Prepend the structured-report preamble so the sub-agent
+        # knows exactly what shape it owes back (self-directed-agents
+        # test-to-completion contract, items 1 + 2 + 4). The wrap is
+        # idempotent so a caller that already added it (tests,
+        # replayed instructions) doesn't double it.
+        wrapped_instructions = worker_report_module.wrap_instructions(
+            instructions
+        )
+
         async def _run_subagent() -> None:
             result_text = ""
             is_error = False
@@ -1511,7 +1521,7 @@ class SpeakingDaemon:
                     append_system_prompt=None,
                 )
                 result = await sub_kernel.run(
-                    instructions, sub_spec, handlers=[]
+                    wrapped_instructions, sub_spec, handlers=[]
                 )
                 result_text = (result.text or "").strip()
                 is_error = bool(result.is_error or result.error)
