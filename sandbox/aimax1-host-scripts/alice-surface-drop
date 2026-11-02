@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Forced-command receiver on aimax1 host: reads a surface markdown doc on
+stdin, drops it into Alice's surface inbox. For ``type: game-bug-report``
+surfaces it additionally writes a stable ``bug-<report_id>.md`` detail file
+into the mind's ``inner/status/`` directory so the status site's Bugs tab
+(``/bugs.md``, rendered on-the-fly by ``src/status_site/server.py``) picks
+it up on the next request.
+
+Used by Claude Code hooks on Bazzite (authorized_keys ``command=``).
+Ignores ``SSH_ORIGINAL_COMMAND``.
+
+**Deploys to** ``/home/cronqj/bin/alice-surface-drop`` on aimax1 host (NOT
+inside any container). Keep this file minimal and safe — it is the ingress
+for every surface Alice sees.
+
+Flags:
+    --dry-run         Parse + render but write nothing; print target paths.
+"""
+import os, re, sys, time
+
+SURFACE_DIR = "/home/cronqj/dev/alice/mind/inner/surface"
+STATUS_DIR = "/home/cronqj/dev/alice/mind/inner/status"
+MAX_BYTES = 64 * 1024
+
+DRY_RUN = "--dry-run" in sys.argv[1:]
+
+data = sys.stdin.buffer.read(MAX_BYTES + 1)
+if not data.strip() or len(data) > MAX_BYTES:
+    sys.exit("rejected: empty or oversized")
+text = data.decode("utf-8", "replace")
+if not text.startswith("---\n"):
+    sys.exit("rejected: missing frontmatter")
+
+
+def frontmatter_block(doc):
+    """Return (frontmatter_text, body_text). Expects a leading ``---\\n``
+    header. If the closing ``---\\n`` is missing the whole doc is treated as
+    frontmatter and the body is empty — same behavior as the surface loop."""
+    end = doc.find("\n---\n", 4)
+    if end < 0:
+        return doc[4:], ""
+    return doc[4:end], doc[end + len("\n---\n"):]
+
+
+def fm_get(front, key):
+    """Pull one simple scalar from a YAML-ish frontmatter block. Strips
+    matching surrounding quotes. Returns None if absent."""
+    pattern = re.compile(r"^" + re.escape(key) + r"\s*:\s*(.*?)\s*$", re.M)
+    m = pattern.search(front)
+    if not m:
+        return None
+    value = m.group(1)
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1]
+    return value
+
+
+front, body = frontmatter_block(text)
+
+m = re.search(r"^detail:\s*([A-Za-z0-9._-]{1,60})\s*$", front, re.M)
+slug = m.group(1) if m else "claude-code"
+name = time.strftime("%Y-%m-%dT%H-%M-%S") + f"-cc-{slug}.md"
+dest = os.path.join(SURFACE_DIR, name)
+
+if DRY_RUN:
+    print(f"would write surface: {dest}")
+else:
+    tmp = os.path.join(SURFACE_DIR, f".tmp-{os.getpid()}")
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o664)
+    os.rename(tmp, dest)
+    print(name)
+
+# ---- game-bug-report dual-write: materialize bug-<N>.md so /bugs.md picks
+# ---- it up. If the detail already exists Jason may have hand-edited the
+# ---- status; preserve his edits and skip.
+surface_type = fm_get(front, "type")
+if surface_type == "game-bug-report":
+    report_id = fm_get(front, "report_id")
+    raw_title = fm_get(front, "title") or ""
+    reported_at = fm_get(front, "reported_at") or time.strftime(
+        "%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()
+    )
+    # Strip the ``MUD staging bug #N: `` prefix the forwarder prepends.
+    short_title = re.sub(
+        r"^MUD staging bug #\d+\s*:\s*", "", raw_title, count=1
+    ).strip()
+    if not short_title:
+        short_title = f"bug-{report_id or '?'}"
+
+    try:
+        rid = int(report_id)
+    except (TypeError, ValueError):
+        sys.stderr.write(
+            "alice-surface-drop: game-bug-report missing/bad report_id, "
+            "skipping bug-*.md dual-write\n"
+        )
+        sys.exit(0)
+
+    detail_path = os.path.join(STATUS_DIR, f"bug-{rid}.md")
+    if os.path.exists(detail_path):
+        sys.stderr.write(
+            f"alice-surface-drop: {detail_path} already exists; "
+            "preserving existing content (status edits are sticky)\n"
+        )
+        sys.exit(0)
+
+    # YAML scalar escaping: wrap in double quotes if title has a colon or
+    # ``#`` so the status_site frontmatter parser doesn't split it early.
+    needs_quote = any(c in short_title for c in ':#"\n') or short_title.startswith(
+        ("- ", "? ")
+    )
+    if needs_quote:
+        yaml_title = '"' + short_title.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    else:
+        yaml_title = short_title
+
+    detail = (
+        "---\n"
+        f"report_id: {rid}\n"
+        f"title: {yaml_title}\n"
+        "status: open\n"
+        f"reported_at: {reported_at}\n"
+        "---\n"
+        + body.lstrip("\n")
+    )
+    if not detail.endswith("\n"):
+        detail += "\n"
+
+    if DRY_RUN:
+        print(f"would write detail: {detail_path}")
+    else:
+        tmp_detail = os.path.join(STATUS_DIR, f".tmp-bug-{os.getpid()}-{time.time_ns()}")
+        with open(tmp_detail, "w") as f:
+            f.write(detail)
+        os.chmod(tmp_detail, 0o664)
+        os.rename(tmp_detail, detail_path)
+        sys.stderr.write(f"alice-surface-drop: wrote {detail_path}\n")
