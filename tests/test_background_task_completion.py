@@ -187,3 +187,98 @@ def test_handler_with_no_channel_falls_through_safely() -> None:
     assert ctx.run_turn_calls[0]["outbound_recipient"] is None
     # Channel stays None during the turn (nothing to restore).
     assert ctx.channel_at_run_turn is None
+
+
+# ---------------------------------------------------------------------------
+# REQUIRED-REPORT parse + pending-verify path (self-directed-agents item 1)
+
+
+class _CfgWithMindDir:
+    def __init__(self, mind_dir) -> None:
+        self.mind_dir = mind_dir
+
+
+def _ok_report_json() -> str:
+    return (
+        '{"kind":"code","branch":"feat/x",'
+        '"commit_sha":"0123456789abcdef0123456789abcdef01234567",'
+        '"pr_url":"https://github.com/jcronq/alice/pull/999",'
+        '"baseline_suite":{"passed":10,"failed":0,"errors":0,"skipped":0},'
+        '"full_suite_after":{"passed":11,"failed":0,"errors":0,"skipped":0},'
+        '"live_verified":"n/a","amendments_addressed":[],'
+        '"unresolved":[],"lessons":[]}'
+    )
+
+
+def test_well_formed_report_does_not_emit_pending_verify(tmp_path) -> None:
+    ctx = _StubCtx()
+    ctx.cfg = _CfgWithMindDir(tmp_path)
+    event = _make_event(
+        result_text=f"Summary.\n\n```json\n{_ok_report_json()}\n```",
+    )
+
+    asyncio.run(handle_background_task_complete(ctx, event))
+
+    kinds = [k for k, _ in ctx.events.emitted]
+    assert "background_task_pending_verify" not in kinds
+    assert "REPORT CHECK FAILED" not in ctx.run_turn_calls[0]["prompt"]
+    assert not (tmp_path / "inner" / "notes").exists()
+
+
+def test_missing_report_writes_pending_verify_note(tmp_path) -> None:
+    ctx = _StubCtx()
+    ctx.cfg = _CfgWithMindDir(tmp_path)
+    event = _make_event(
+        result_text="all done, no fences anywhere here",
+    )
+
+    asyncio.run(handle_background_task_complete(ctx, event))
+
+    kinds = [k for k, _ in ctx.events.emitted]
+    assert "background_task_pending_verify" in kinds
+    notes_dir = tmp_path / "inner" / "notes"
+    assert notes_dir.is_dir()
+    notes = list(notes_dir.glob("*.md"))
+    assert len(notes) == 1
+    assert "pending-verify" in notes[0].read_text()
+    # Delivery prompt tells Alice to triage.
+    assert "REPORT CHECK FAILED" in ctx.run_turn_calls[0]["prompt"]
+
+
+def test_invalid_report_writes_pending_verify_note(tmp_path) -> None:
+    ctx = _StubCtx()
+    ctx.cfg = _CfgWithMindDir(tmp_path)
+    # Code kind without commit_sha → should trip validation.
+    bad = (
+        '{"kind":"code","branch":"feat/x",'
+        '"full_suite_after":{"passed":1,"failed":0,"errors":0,"skipped":0}}'
+    )
+    event = _make_event(
+        result_text=f"Here you go.\n\n```json\n{bad}\n```",
+    )
+
+    asyncio.run(handle_background_task_complete(ctx, event))
+
+    kinds = [k for k, _ in ctx.events.emitted]
+    assert "background_task_pending_verify" in kinds
+    notes = list((tmp_path / "inner" / "notes").glob("*.md"))
+    assert len(notes) == 1
+    assert "commit_sha" in notes[0].read_text()
+
+
+def test_error_event_skips_pending_verify(tmp_path) -> None:
+    # If the sub-agent itself crashed, we don't double-penalise by
+    # also dropping a pending-verify — the error framing in the
+    # delivery prompt is enough signal for Alice.
+    ctx = _StubCtx()
+    ctx.cfg = _CfgWithMindDir(tmp_path)
+    event = _make_event(
+        is_error=True,
+        result_text="Sub-agent crashed: ValueError: boom",
+    )
+
+    asyncio.run(handle_background_task_complete(ctx, event))
+
+    kinds = [k for k, _ in ctx.events.emitted]
+    assert "background_task_pending_verify" not in kinds
+    assert not (tmp_path / "inner" / "notes").exists()

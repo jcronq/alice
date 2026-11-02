@@ -130,6 +130,49 @@ _SPEAKING_RULES = (
 # ---------------------------------------------------------------------------
 
 
+# Shared discipline rules applied to every build-flavored worker
+# (code-worker + config-worker). Lifted from Jason's self-directed-
+# agents test-to-completion kit — PROJECT_PROFILE handshake, baseline
+# counts, reproduce-before-fix. Research-writer deliberately opts out:
+# it writes vault notes, not code.
+_WORKER_DISCIPLINE_RULES = (
+    BehavioralRule(
+        id="read-project-profile-first",
+        injection=(
+            "Before starting, read ``PROJECT_PROFILE.md`` at the top "
+            "of the repo you're working in. It tells you how to run "
+            "tests, where the daemon lives, how to deploy, and which "
+            "invariants are non-negotiable. If the file doesn't exist, "
+            "write a one-sentence note at the end of your SM transition "
+            "comment flagging the gap and proceed with best judgement."
+        ),
+    ),
+    BehavioralRule(
+        id="baseline-before-change",
+        injection=(
+            "Before changing code, run the test suite and record the "
+            "pass / fail / errors / skipped counts. Cite them in the "
+            "PR body (``baseline_suite``). The acceptance gate is "
+            "zero failures and zero errors on the FINAL suite run. "
+            "Tactical carve-out: diffs under 30 LOC of code or 15 LOC "
+            "of config may skip the baseline capture, but the final "
+            "suite still has to be green."
+        ),
+    ),
+    BehavioralRule(
+        id="reproduce-before-fix",
+        injection=(
+            "If you're fixing a live-site finding (a bug observed in "
+            "prod / smoke / a dispatched turn in the logs), reproduce "
+            "it first with a failing test or captured log line. Cite "
+            "that artifact in your PR body before writing the fix. "
+            "A red test turning green is evidence; \"I ran it and "
+            "it worked\" is not."
+        ),
+    ),
+)
+
+
 # code-worker rules — v1 claude-cli worker behavioral surface.
 # Post-Phase 4 of #194 (#321), these rules are the SOLE source for
 # the worker prompt body; :func:`compose_spawn_prompt` reads them via
@@ -138,7 +181,7 @@ _SPEAKING_RULES = (
 # which has since been deleted. (At sm:selected, ``art:code`` now
 # routes to the per-issue designer/builder lanes — these rules apply
 # wherever the v1 worker pool is still the spawn lane.)
-_CODE_WORKER_RULES = (
+_CODE_WORKER_RULES = _WORKER_DISCIPLINE_RULES + (
     BehavioralRule(
         id="open-pr-closes-issue",
         injection=(
@@ -332,7 +375,7 @@ _COZYLOBE_RULES = (
 # stay under 15 LOC with no schema change, otherwise the work belongs
 # in art:code (with a design pass) rather than the constrained
 # config-worker lane.
-_CONFIG_WORKER_RULES = (
+_CONFIG_WORKER_RULES = _WORKER_DISCIPLINE_RULES + (
     BehavioralRule(
         id="config-files-only",
         injection=(

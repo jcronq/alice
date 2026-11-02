@@ -10,6 +10,15 @@ Example issue body that the worker reads.
 
 Your task: implement the change described above. Read the relevant code first, write a focused diff, run tests, and open a PR.
 
+## Constraint: read-project-profile-first
+Before starting, read ``PROJECT_PROFILE.md`` at the top of the repo you're working in. It tells you how to run tests, where the daemon lives, how to deploy, and which invariants are non-negotiable. If the file doesn't exist, write a one-sentence note at the end of your SM transition comment flagging the gap and proceed with best judgement.
+
+## Constraint: baseline-before-change
+Before changing code, run the test suite and record the pass / fail / errors / skipped counts. Cite them in the PR body (``baseline_suite``). The acceptance gate is zero failures and zero errors on the FINAL suite run. Tactical carve-out: diffs under 30 LOC of code or 15 LOC of config may skip the baseline capture, but the final suite still has to be green.
+
+## Constraint: reproduce-before-fix
+If you're fixing a live-site finding (a bug observed in prod / smoke / a dispatched turn in the logs), reproduce it first with a failing test or captured log line. Cite that artifact in your PR body before writing the fix. A red test turning green is evidence; "I ran it and it worked" is not.
+
 ## Constraint: config-files-only
 Edit and Write only the config files explicitly named in the issue. Do not touch source code, tests, or documentation in the same change. If the fix requires broader edits, stop and escalate the issue back to ``sm:draft`` for re-triage as ``art:code``.
 
