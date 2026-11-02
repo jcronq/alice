@@ -124,6 +124,7 @@ build-backend = "hatchling.build"
 #   prompts   — Jinja2 templates the runtime renders into model prompts
 #   skills    — registry over .claude/skills/ markdown (plan 07)
 #   alice_forge     — State Machine dispatcher for alice_forge (poll → trust-filter → comment)
+#   alice_bug_fix_dispatcher — Modern-MUD /bug auto-remediation dispatcher (standalone s6 service)
 #   alice_speaking  — Signal daemon (composes kernel with producers/handlers/outbox)
 #   alice_thinking  — one-shot wake (python -m alice_thinking)
 #   (alice_cozylobe + cozylobe_cortex now live in jcronq/alice-cozylobe)
@@ -139,6 +140,7 @@ packages = [
     "src/kernels",
     "src/prompts",
     "src/skills",
+    "src/alice_bug_fix_dispatcher",
     "src/alice_forge",
     "src/alice_speaking",
     "src/alice_thinking",

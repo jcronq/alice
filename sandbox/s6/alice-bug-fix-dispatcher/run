@@ -1,0 +1,84 @@
+#!/command/with-contenv bash
+# alice-bug-fix-dispatcher — timer loop that drives the Modern-MUD
+# bug-fix dispatcher: scans ~/alice-mind/inner/status/bug-*.md for
+# open / in-progress reports and routes each through its state
+# transition (spawn worker / adopt PR URL / poll PR state / stall
+# sweep). Dedup is implicit via the ``dispatched_at`` idempotency
+# field on each bug's frontmatter — the dispatcher is safe to
+# re-fire at any cadence.
+#
+# Singleton via `flock -n` so a slow tick can't double-fire.
+#
+# Cadence is read from ~/alice-mind/config/alice.config.json
+# ``bug_fix_dispatcher.cadence_seconds`` on each cycle (live
+# reconfig, no restart needed). Default: 30s, floor 15s.
+#
+# Pause gate: when
+# /home/alice/alice-mind/inner/status/.bug-fix-dispatcher-paused
+# exists OR ``bug_fix_dispatcher.wave_a_signoff_pending`` is true in
+# the config, each tick logs a single ``paused`` line and returns —
+# no scan, no worker spawn. The Python tick enforces the gate; the
+# supervisor-level script keeps running so a resume (sentinel
+# delete) picks up on the next tick without an s6-rc restart.
+set -e
+
+LOCK=/state/worker/bug-fix-dispatcher.lock
+CONFIG_JSON=/home/alice/alice-mind/config/alice.config.json
+DEFAULT_CADENCE=30
+MIN_CADENCE=15
+
+mkdir -p "$(dirname "$LOCK")"
+touch "$LOCK"
+chown alice:alice "$LOCK" || true
+
+# Graceful shutdown: trap SIGTERM so an in-flight tick finishes
+# naturally rather than being SIGKILLed at the s6 gracetime cliff.
+# Sleeps run in the background under `wait` so the trap fires
+# immediately during quiet periods.
+STOPPING=
+on_signal() {
+    STOPPING=1
+}
+trap on_signal TERM INT
+
+# Stagger startup so the dispatcher and other 30-s services don't
+# all wake in lockstep. 60s offset: lands after the index-rebuild
+# init burst and before the memory worker's 90s warmup, so there's
+# always a quiescent window on cold start.
+sleep 60 &
+wait $! 2>/dev/null || true
+
+while true; do
+    [ -n "$STOPPING" ] && break
+
+    cadence="$DEFAULT_CADENCE"
+    if [ -f "$CONFIG_JSON" ] && command -v jq >/dev/null 2>&1; then
+        v=$(jq -r '.bug_fix_dispatcher.cadence_seconds // empty' "$CONFIG_JSON" 2>/dev/null || true)
+        case "$v" in
+            ''|*[!0-9]*) ;;
+            *) cadence="$v" ;;
+        esac
+    fi
+    if [ "$cadence" -lt "$MIN_CADENCE" ]; then
+        cadence=$MIN_CADENCE
+    fi
+
+    start_ts=$(date +%s)
+    # redirfd (execline) opens fd 2 after the privilege drop so the
+    # log file is owned by alice; shell `2>>` would open it as the
+    # supervising root shell.
+    flock -n "$LOCK" s6-setuidgid alice redirfd -a 2 /state/worker/bug-fix-dispatcher-stderr.log \
+        /usr/local/bin/alice-bug-fix-dispatcher || true
+    end_ts=$(date +%s)
+    elapsed=$(( end_ts - start_ts ))
+    remainder=$(( cadence - elapsed ))
+
+    [ -n "$STOPPING" ] && break
+
+    if [ "$remainder" -gt 0 ]; then
+        sleep "$remainder" &
+        wait $! 2>/dev/null || true
+    fi
+
+    [ -n "$STOPPING" ] && break
+done
