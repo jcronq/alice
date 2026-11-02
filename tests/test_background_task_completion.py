@@ -266,6 +266,54 @@ def test_invalid_report_writes_pending_verify_note(tmp_path) -> None:
     assert "commit_sha" in notes[0].read_text()
 
 
+def test_valid_report_but_done_claim_without_evidence_in_prose(tmp_path) -> None:
+    """Secondary prose-level check (self-directed-agents item 3):
+    even when the structured report is well-formed, a worker whose
+    prose claims completion without naming a commit / PR / tests
+    still trips a pending-verify. Catches the "I say done, structured
+    report shows null" edge where the two tiers would otherwise
+    disagree."""
+    ctx = _StubCtx()
+    ctx.cfg = _CfgWithMindDir(tmp_path)
+    # Research kind so the structured check passes; prose claims done
+    # with no commit / PR / test counts.
+    research = (
+        '{"kind":"research",'
+        '"live_verified":"cortex-memory/research/foo.md"}'
+    )
+    body = (
+        "Done! I looked into this and here's what I found.\n\n"
+        f"```json\n{research}\n```"
+    )
+    event = _make_event(result_text=body)
+
+    asyncio.run(handle_background_task_complete(ctx, event))
+
+    kinds = [k for k, _ in ctx.events.emitted]
+    assert "background_task_pending_verify" in kinds
+    notes = list((tmp_path / "inner" / "notes").glob("*.md"))
+    assert len(notes) == 1
+    text = notes[0].read_text()
+    assert "prose-level evidence check" in text
+
+
+def test_valid_report_with_evidence_in_prose_passes(tmp_path) -> None:
+    """The counter-example: valid structured report AND prose names
+    the commit / PR / tests. No pending-verify."""
+    ctx = _StubCtx()
+    ctx.cfg = _CfgWithMindDir(tmp_path)
+    body = (
+        "Done — merged in PR #42 with 123 tests passing.\n\n"
+        f"```json\n{_ok_report_json()}\n```"
+    )
+    event = _make_event(result_text=body)
+
+    asyncio.run(handle_background_task_complete(ctx, event))
+
+    kinds = [k for k, _ in ctx.events.emitted]
+    assert "background_task_pending_verify" not in kinds
+
+
 def test_error_event_skips_pending_verify(tmp_path) -> None:
     # If the sub-agent itself crashed, we don't double-penalise by
     # also dropping a pending-verify — the error framing in the
