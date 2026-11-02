@@ -193,6 +193,10 @@ class DrainReport:
     unclassified: int = 0
     malformed: int = 0
     errors: int = 0
+    #: SM dispatcher hint notes (``kind: sm-*``) left in the inbox
+    #: for thinking's wake-drain lane. See :func:`_route_sm_skip`
+    #: and ``research/2026-08-31-memory-worker-sm-kind-skip-rule.md``.
+    skipped_sm: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return dataclasses.asdict(self)
@@ -256,6 +260,35 @@ def _first_body_line(body: str) -> str:
 
 
 # ---------- routing rules (first match wins) ----------
+
+
+def _route_sm_skip(fm: dict[str, Any], _body: str) -> Optional[Route]:
+    """SM dispatcher hint notes → leave in inbox for thinking.
+
+    Trigger: frontmatter ``kind:`` is a string starting with ``sm-``
+    (covers ``sm-needs-study`` today and future ``sm-*`` hint kinds
+    the SM dispatcher may introduce).
+
+    Behavior: return a :class:`Route` whose dispatch branch is a true
+    no-op — the writer does NOT consume the note, does NOT write to
+    the vault / dailies / ``events.jsonl``, and does NOT emit a
+    surface. The note stays in ``inner/notes/`` for thinking's
+    wake-drain lane, which is the intended consumer.
+
+    Rationale: the dispatcher's hint notes (produced by
+    ``alice_forge/dispatcher/rendering.py::render_study_hint_note_body``)
+    carry a ``kind:`` field but no routable ``tag``/``tags``/``route``/
+    ``target``, so without this rule they fall through to the
+    unclassified branch which surfaces + ``.failed/``-moves them,
+    silently breaking the SM study lane. ``kind:`` is a
+    dispatcher-owned field with no other observed producer, so
+    first-position placement is safe. See
+    ``research/2026-08-31-memory-worker-sm-kind-skip-rule.md``.
+    """
+    kind = fm.get("kind")
+    if isinstance(kind, str) and kind.startswith("sm-"):
+        return Route("sm-skip", {})
+    return None
 
 
 def _route_activity(fm: dict[str, Any], body: str) -> Optional[Route]:
@@ -512,8 +545,15 @@ def _classify(
     route is inserted BEFORE concept so a tagged note carrying a
     resolvable target merges into the existing page instead of
     creating a duplicate atomic note.
+
+    :func:`_route_sm_skip` runs FIRST so SM-dispatcher hint notes
+    (``kind: sm-*``) are left in the inbox for thinking even if they
+    also happen to carry a routable tag — first-position placement
+    is the structural guarantee against the race documented in
+    ``research/2026-08-31-memory-worker-sm-kind-skip-rule.md``.
     """
     for fn in (
+        lambda: _route_sm_skip(fm, body),
         lambda: _route_activity(fm, body),
         lambda: _route_event(fm, body),
         lambda: _route_target(fm, body, vault),
@@ -1291,6 +1331,19 @@ def _process_one(
         report.unclassified += 1
         if on_route is not None:
             on_route(Route("unclassified", {}))
+        return
+
+    # SM-dispatcher hint notes (kind: sm-*) are a cue for thinking's
+    # wake-drain lane — the memory worker intentionally does nothing
+    # here: no vault write, no surface, no daily line, and crucially
+    # NO call to _consume() so the note stays in inner/notes/ for
+    # thinking. Only the DrainReport counter advances so the skip is
+    # observable via the heartbeat. See
+    # research/2026-08-31-memory-worker-sm-kind-skip-rule.md.
+    if route.kind == "sm-skip":
+        report.skipped_sm += 1
+        if on_route is not None:
+            on_route(route)
         return
 
     # Dispatch. A writer raising leaves the note in the inbox.
