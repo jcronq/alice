@@ -119,6 +119,7 @@ function addReplies(){
       const ta=conv.querySelector('textarea'),sm=conv.querySelector('.sent'),send=conv.querySelector('.row button'),fi=conv.querySelector('input[type=file]');
       fi.onchange=()=>{sm.textContent=fi.files.length?[...fi.files].map(f=>f.name).join(', '):'';replyOpen=true};
       ta.addEventListener('input',()=>{replyOpen=!!ta.value});
+      ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();send.click()}});
       send.onclick=async()=>{
         if(!ta.value.trim()&&!fi.files.length)return;
         if(!KEY){sm.textContent='No key: open the link Alice sent once.';return}
