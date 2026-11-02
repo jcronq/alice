@@ -1100,6 +1100,26 @@ async def handle_background_task_complete(
             )
     else:
         report_issues = worker_report_module.validate_worker_report(report)
+    # Secondary prose-level check (self-directed-agents item 3): the
+    # worker claimed completion (done | merged | fixed | complete)
+    # but didn't cite a commit SHA, PR number, structured report
+    # field, or passing-test count. Fires in addition to the
+    # structured check so a worker that emits a valid-shape report
+    # with no evidence terms in its prose still gets flagged — rare
+    # but worth the second net. Deliberately added as a SEPARATE
+    # issue entry so the pending-verify note tells the triager
+    # exactly which tier caught it.
+    if (
+        not event.is_error
+        and worker_report_module.looks_like_done_without_evidence(
+            event.result_text or ""
+        )
+    ):
+        report_issues.append(
+            "Final text claims completion (done / merged / fixed / "
+            "complete) without citing a commit SHA, PR number, or "
+            "passing-test counts — prose-level evidence check failed."
+        )
     if report_issues and not event.is_error:
         log.warning(
             "background_task %s returned without a valid report: %s",
