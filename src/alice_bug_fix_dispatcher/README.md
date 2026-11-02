@@ -32,6 +32,19 @@ The frontmatter fields the dispatcher reads/writes:
 | `fix_pr`                    | when PR merges               | the final PR URL.                                |
 | `last_dispatch_failed_at`   | PR closed-unmerged OR stall  | UTC ISO.                                         |
 | `last_failed_pr`            | PR closed-unmerged           | the URL of the attempt that didn't land.         |
+| `worker_model`              | on worker spawn              | model id priced at dispatch; e.g. `claude-opus-4-7`. |
+| `estimate_prompt_tokens`    | on worker spawn              | tokens in the rendered worker prompt (4-chars-per-token heuristic). |
+| `estimate_output_tokens`    | on worker spawn              | output budget used for `estimate_usd`.           |
+| `estimate_usd`              | on worker spawn              | pre-flight dollar estimate, four decimals.       |
+| `actual_usd`                | on PR adoption OR settle TTL | measured cost from the worker's `usage` block, or absent (null) when unparseable. |
+| `actual_tokens`             | on PR adoption OR settle TTL | audit string: `input=X output=Y [cache_read=Z cache_write=W]`. |
+| `cost_attribution_note`     | when `actual_usd` is absent  | human-readable reason the actuals couldn't be computed. |
+
+Pricing is driven by `alice_pricing` (same repo). The dispatcher's
+default model is `claude-opus-4-7`; override in `alice.config.json`
+under `bug_fix_dispatcher.worker_model` (and
+`.expected_output_tokens` for the output budget feeding the
+estimate). Rate source + methodology: `src/alice_pricing/README.md`.
 
 Writes are atomic (`tempfile` + `os.replace`) and unknown fields are
 preserved — Jason can hand-edit a bug file (adding a `summary`, a
