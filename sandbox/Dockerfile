@@ -174,7 +174,8 @@ FROM base AS main
 # Plugin service dirs (e.g. alice-cozylobe, alice-cozylobe-reload-watcher)
 # are NOT copied here — they ship inside their plugin wheels and land
 # in /etc/s6-overlay/s6-rc.d/ via install-plugins.sh.
-COPY sandbox/s6/alice-autopush/         /etc/s6-overlay/s6-rc.d/alice-autopush/
+COPY sandbox/s6/alice-autopush/            /etc/s6-overlay/s6-rc.d/alice-autopush/
+COPY sandbox/s6/alice-bug-fix-dispatcher/  /etc/s6-overlay/s6-rc.d/alice-bug-fix-dispatcher/
 COPY sandbox/s6/alice-embedder/         /etc/s6-overlay/s6-rc.d/alice-embedder/
 COPY sandbox/s6/alice-face-caption/     /etc/s6-overlay/s6-rc.d/alice-face-caption/
 COPY sandbox/s6/alice-gh-reconciler/    /etc/s6-overlay/s6-rc.d/alice-gh-reconciler/
@@ -202,6 +203,7 @@ COPY sandbox/logrotate/alice-logs.conf /etc/alice/logrotate.conf
 # dirs we copied above keeps s6 from failing on a missing-bundle reference.
 COPY sandbox/s6/user/type                                       /etc/s6-overlay/s6-rc.d/user/type
 COPY sandbox/s6/user/contents.d/alice-autopush                  /etc/s6-overlay/s6-rc.d/user/contents.d/alice-autopush
+COPY sandbox/s6/user/contents.d/alice-bug-fix-dispatcher        /etc/s6-overlay/s6-rc.d/user/contents.d/alice-bug-fix-dispatcher
 COPY sandbox/s6/user/contents.d/alice-embedder                  /etc/s6-overlay/s6-rc.d/user/contents.d/alice-embedder
 COPY sandbox/s6/user/contents.d/alice-face-caption              /etc/s6-overlay/s6-rc.d/user/contents.d/alice-face-caption
 COPY sandbox/s6/user/contents.d/alice-gh-reconciler             /etc/s6-overlay/s6-rc.d/user/contents.d/alice-gh-reconciler

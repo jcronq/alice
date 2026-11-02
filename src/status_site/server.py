@@ -418,7 +418,11 @@ def handle_reply(cfg: Config, d: dict) -> dict:
 # field, nothing else. See the matching intercept in ``Handler._get``.
 
 BUG_FILE_RE = re.compile(r"^bug-(\d+)\.md$")
-BUG_STATUSES = ("open", "fixed", "wontfix")
+# Buckets rendered on ``/bugs.md``. ``in-progress`` lands between
+# Open and Fixed so Jason can see dispatcher activity at a glance;
+# ``dispatch-failed`` goes after Won't fix with a visual warning so
+# it stands out as "needs triage, dispatcher gave up".
+BUG_STATUSES = ("open", "in-progress", "fixed", "wontfix", "dispatch-failed")
 # Heading-prefix stripper for the title fallback: ``# bug-N — real title``
 # becomes ``real title`` so the rendered line isn't ``bug-N — bug-N — ...``.
 BUG_HEADING_PREFIX_RE = re.compile(r"^bug-\d+\s*[-–—]\s*", re.I)
@@ -523,8 +527,14 @@ def collect_bugs(status_dir: Path) -> tuple[dict[str, list[dict]], float]:
         summary = (fm.get("summary") or "").strip()
         if not summary:
             summary = _bug_summary_fallback(fm.get("reported_at", ""))
+        pr_url = (fm.get("pr_url") or "").strip()
         buckets[status].append(
-            {"report_id": report_id, "title": title, "summary": summary}
+            {
+                "report_id": report_id,
+                "title": title,
+                "summary": summary,
+                "pr_url": pr_url,
+            }
         )
     for key in buckets:
         buckets[key].sort(key=lambda b: b["report_id"], reverse=True)
@@ -540,12 +550,17 @@ def render_bugs_md(status_dir: Path) -> tuple[str, float]:
         "full state at the moment of reporting — location, flags, inventory, "
         "last 20 messages.\n",
     ]
+    # Section order: Open → In progress → Fixed → Won't fix →
+    # Dispatch failed (needs triage). ``prefix`` is prepended to the
+    # bug title so Dispatch-failed items are visually distinct (⚠).
     sections = (
-        ("Open", "open", "[ ]"),
-        ("Fixed", "fixed", "[x]"),
-        ("Won't fix", "wontfix", "[x]"),
+        ("Open", "open", "[ ]", ""),
+        ("In progress", "in-progress", "[ ]", ""),
+        ("Fixed", "fixed", "[x]", ""),
+        ("Won't fix", "wontfix", "[x]", ""),
+        ("Dispatch failed (needs triage)", "dispatch-failed", "[ ]", "⚠ "),
     )
-    for heading, key, box in sections:
+    for heading, key, box, prefix in sections:
         parts.append(f"## {heading}\n")
         items = buckets[key]
         if not items:
@@ -553,9 +568,15 @@ def render_bugs_md(status_dir: Path) -> tuple[str, float]:
             continue
         lines = []
         for b in items:
-            line = f"- {box} **bug-{b['report_id']} — {b['title']}**"
+            line = f"- {box} **{prefix}bug-{b['report_id']} — {b['title']}**"
             if b["summary"]:
-                line += f": *{b['summary']}*"
+                summary = b["summary"]
+                pr_url = b.get("pr_url", "")
+                if key == "in-progress" and pr_url:
+                    summary = f"{summary} — [draft PR]({pr_url})"
+                line += f": *{summary}*"
+            elif key == "in-progress" and b.get("pr_url"):
+                line += f": *[draft PR]({b['pr_url']})*"
             lines.append(line)
         parts.append("\n".join(lines) + "\n")
     return "\n".join(parts), max_mtime

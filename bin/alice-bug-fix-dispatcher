@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# alice-bug-fix-dispatcher — one tick of the Modern-MUD bug-fix dispatcher.
+#
+# Thin shim over `python -m alice_bug_fix_dispatcher`, modeled on
+# `alice-sm-dispatcher`. The Python entry point owns the pause gate,
+# frontmatter mutation, worker spawn, and PR polling. Phase 1 ships
+# paused — the sentinel at
+# /home/alice/alice-mind/inner/status/.bug-fix-dispatcher-paused is
+# created by the deploy; Jason deletes it to resume once Wave A is
+# signed off.
+#
+# Usage:
+#   alice-bug-fix-dispatcher             # one full tick
+#   alice-bug-fix-dispatcher --help      # see arg list
+#
+# Singleton enforcement is external — the alice-bug-fix-dispatcher
+# s6 service wraps each invocation in
+# `flock -n /state/worker/bug-fix-dispatcher.lock` so two firings
+# can't collide on the bug frontmatter writes.
+set -u
+
+VENV_PY="/opt/alice-venv/bin/python"
+# Monorepo root is bind-mounted at /home/alice/alice; src/ holds all
+# sibling packages (core, alice_speaking, alice_thinking,
+# alice_bug_fix_dispatcher, viewer, …).
+ALICE_SRC="${ALICE_SRC:-/home/alice/alice/src}"
+
+# Outer timeout. The tick itself is cheap (frontmatter parse +
+# detached Popen + at most a few `gh pr view` calls per in-progress
+# bug); 300s is far more than any realistic tick but caps a wedged
+# `gh` subprocess so the supervisor's flock doesn't get held
+# forever.
+WAKE_TIMEOUT="${WAKE_TIMEOUT:-300}"
+WAKE_KILL_GRACE="${WAKE_KILL_GRACE:-30}"
+
+if [ ! -x "$VENV_PY" ]; then
+    echo "[alice-bug-fix-dispatcher] venv python missing at $VENV_PY" >&2
+    exit 1
+fi
+
+export PYTHONPATH="$ALICE_SRC"
+export PYTHONUNBUFFERED=1
+exec timeout --kill-after="$WAKE_KILL_GRACE" "$WAKE_TIMEOUT" \
+    "$VENV_PY" -m alice_bug_fix_dispatcher "$@"
