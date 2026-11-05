@@ -183,7 +183,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "mcp__alice__send_message": {
         "description": (
-            "Send a message to the user or another configured Alice principal. "
+            "Send a message to the user or another configured principal. "
             "Returning text alone does not deliver it."
         ),
         "parameters": {
@@ -237,7 +237,7 @@ def alice_tools_to_openai(allowed: list[str]) -> list[dict[str, Any]]:
             # the model can still invoke it. Downstream tool-executor
             # sees the request and either dispatches or rejects.
             schema = {
-                "description": f"Alice tool {name!r}.",
+                "description": f"Tool {name!r}.",
                 "parameters": {"type": "object", "properties": {}},
             }
         out.append(
