@@ -30,6 +30,8 @@ from alice_bug_fix_dispatcher.main import (
     _extract_captured_state,
     _extract_pr_url_from_result,
     _extract_report_text,
+    _pr_is_green,
+    _rebuild_waiting_block,
     _render_prompt,
     _scan_bugs,
     tick,
@@ -101,6 +103,7 @@ def _make_cfg(tmp_path: pathlib.Path, *, template: str | None = None) -> Dispatc
         worker_scratch_root=tmp_path / "scratch",
         worker_prompt_template=template_path,
         stall_hours=2,
+        index_path=tmp_path / "index.md",
     )
 
 
@@ -520,3 +523,183 @@ def test_open_with_stale_dispatched_at_is_skipped(tmp_path):
     reparsed, _body, _raw = fm.parse(p.read_text())
     assert reparsed["status"] == "open"
     assert reparsed["dispatched_at"]
+
+
+# ---------------------------------------------------------------- ready-for-review
+
+
+PR_URL = "https://github.com/jcronq/modern-mud/pull/42"
+GREEN = [
+    {"conclusion": "SUCCESS", "status": "COMPLETED"},
+    {"state": "SUCCESS"},
+]
+INDEX_MD = """# Status
+
+## Running now
+
+- [ ] something
+
+## Waiting on you
+
+- [ ] **PFL: confirm the payout.**
+
+## Later
+
+- [ ] other
+"""
+
+
+def _rfr_setup(tmp_path, *, reporter_in_body="cronqj", extra=None, status="in-progress"):
+    cfg = _make_cfg(tmp_path)
+    cfg.index_path.write_text(INDEX_MD)
+    body = BUG_BODY.format(n=7, title="cake box").replace(
+        "## Who / where\n", f"## Who / where\n\n- Account: {reporter_in_body}\n", 1
+    )
+    front = {
+        "dispatched_at": "2026-11-02T17:00:00+00:00",
+        "worker_task_id": "pid:1",
+        "pr_url": PR_URL,
+    }
+    front.update(extra or {})
+    p = write_bug(
+        cfg.status_dir, 7, status=status, title="cake box", extra_front=front, body=body
+    )
+    return cfg, p
+
+
+def _view(**kw):
+    data = {
+        "state": "OPEN",
+        "isDraft": True,
+        "statusCheckRollup": GREEN,
+        "reviewDecision": "",
+    }
+    data.update(kw)
+    return lambda url: data
+
+
+def test_pr_is_green():
+    assert _pr_is_green({"statusCheckRollup": GREEN})
+    assert not _pr_is_green({"statusCheckRollup": []})
+    assert not _pr_is_green({})
+    assert not _pr_is_green({"statusCheckRollup": GREEN + [{"conclusion": "FAILURE"}]})
+    assert not _pr_is_green({"statusCheckRollup": [{"status": "IN_PROGRESS", "conclusion": ""}]})
+
+
+def test_green_draft_trusted_flips_ready_and_lists_waiting_line(tmp_path):
+    cfg, p = _rfr_setup(tmp_path)
+    ready_calls: list[str] = []
+    rep = tick(cfg, gh_pr_view=_view(), gh_pr_ready=ready_calls.append)
+    assert ready_calls == [PR_URL]
+    assert rep.ready == [7]
+    reparsed, _b, _r = fm.parse(p.read_text())
+    assert reparsed["status"] == "ready-for-review"
+    index = cfg.index_path.read_text()
+    assert "- [ ] Review PR #42 (bug-7: cake box)" in index
+    waiting = index.index("## Waiting on you")
+    assert waiting < index.index("Review PR #42") < index.index("## Later")
+
+
+def test_trusted_reporter_from_frontmatter_field(tmp_path):
+    cfg, p = _rfr_setup(tmp_path, reporter_in_body="stranger", extra={"reporter": "CronQJ"})
+    calls: list[str] = []
+    tick(cfg, gh_pr_view=_view(), gh_pr_ready=calls.append)
+    assert calls == [PR_URL]
+
+
+def test_trusted_reporters_overridable_in_config(tmp_path):
+    cfg, p = _rfr_setup(tmp_path, reporter_in_body="friend")
+    cfg.config_json.write_text('{"bug_fix_dispatcher": {"trusted_reporters": ["friend"]}}')
+    calls: list[str] = []
+    tick(cfg, gh_pr_view=_view(), gh_pr_ready=calls.append)
+    assert calls == [PR_URL]
+
+
+@pytest.mark.parametrize(
+    "view_kw, reporter",
+    [
+        ({"statusCheckRollup": [{"conclusion": "SUCCESS"}, {"status": "IN_PROGRESS"}]}, "cronqj"),
+        ({"statusCheckRollup": [{"conclusion": "FAILURE"}]}, "cronqj"),
+        ({"statusCheckRollup": []}, "cronqj"),
+        ({"reviewDecision": "CHANGES_REQUESTED"}, "cronqj"),
+        ({}, "stranger"),
+        ({"isDraft": False}, "cronqj"),
+    ],
+)
+def test_no_flip_when_not_eligible(tmp_path, view_kw, reporter):
+    cfg, p = _rfr_setup(tmp_path, reporter_in_body=reporter)
+    calls: list[str] = []
+    rep = tick(cfg, gh_pr_view=_view(**view_kw), gh_pr_ready=calls.append)
+    assert calls == []
+    assert rep.ready == []
+    reparsed, _b, _r = fm.parse(p.read_text())
+    assert reparsed["status"] == "in-progress"
+    assert cfg.index_path.read_text() == INDEX_MD
+
+
+def test_gh_pr_ready_failure_leaves_status(tmp_path):
+    cfg, p = _rfr_setup(tmp_path)
+
+    def boom(url):
+        raise RuntimeError("gh down")
+
+    rep = tick(cfg, gh_pr_view=_view(), gh_pr_ready=boom)
+    assert rep.ready == []
+    reparsed, _b, _r = fm.parse(p.read_text())
+    assert reparsed["status"] == "in-progress"
+
+
+def test_ready_for_review_not_reflipped_and_merge_routes_to_fixed(tmp_path):
+    cfg, p = _rfr_setup(tmp_path)
+    tick(cfg, gh_pr_view=_view(), gh_pr_ready=lambda u: None)
+    # Hand-edit a line into the Waiting section next to the managed block.
+    index = cfg.index_path.read_text().replace(
+        "- [ ] **PFL: confirm the payout.**",
+        "- [ ] **PFL: confirm the payout.**\n- [ ] hand-added line",
+    )
+    cfg.index_path.write_text(index)
+
+    # Still draft again + green: must not re-flip an already ready-for-review bug.
+    calls: list[str] = []
+    rep = tick(cfg, gh_pr_view=_view(), gh_pr_ready=calls.append)
+    assert calls == [] and rep.ready == []
+    assert "Review PR #42" in cfg.index_path.read_text()
+
+    rep = tick(cfg, gh_pr_view=lambda u: {"state": "MERGED", "mergeCommit": {"oid": "abc"}})
+    assert rep.fixed == [7]
+    reparsed, _b, _r = fm.parse(p.read_text())
+    assert reparsed["status"] == "fixed"
+    final = cfg.index_path.read_text()
+    assert "Review PR" not in final
+    assert "bug-review" not in final
+    assert "- [ ] hand-added line" in final
+    assert "- [ ] **PFL: confirm the payout.**" in final
+    assert "## Later" in final
+
+
+def test_rebuild_waiting_block_idempotent(tmp_path):
+    cfg, _p = _rfr_setup(tmp_path, status="ready-for-review")
+    assert _rebuild_waiting_block(cfg.status_dir, cfg.index_path) is True
+    once = cfg.index_path.read_text()
+    assert once.count("<!-- bug-review -->") == 1
+    assert _rebuild_waiting_block(cfg.status_dir, cfg.index_path) is False
+    assert cfg.index_path.read_text() == once
+    tick(cfg, gh_pr_view=lambda u: {"state": "OPEN"})
+    assert cfg.index_path.read_text() == once
+
+
+def test_rebuild_waiting_block_noop_without_ready_bugs_or_index(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    assert _rebuild_waiting_block(cfg.status_dir, cfg.index_path) is False  # no index
+    cfg.index_path.write_text(INDEX_MD)
+    assert _rebuild_waiting_block(cfg.status_dir, cfg.index_path) is False
+    assert cfg.index_path.read_text() == INDEX_MD
+
+
+def test_rebuild_waiting_block_creates_section_when_missing(tmp_path):
+    cfg, _p = _rfr_setup(tmp_path, status="ready-for-review")
+    cfg.index_path.write_text("# Status\n\n- [ ] x\n")
+    assert _rebuild_waiting_block(cfg.status_dir, cfg.index_path) is True
+    text = cfg.index_path.read_text()
+    assert "## Waiting on you" in text and "Review PR #42" in text
+    assert text.startswith("# Status\n\n- [ ] x\n")

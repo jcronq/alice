@@ -22,7 +22,14 @@ One tick:
    * ``in-progress`` and a ``pr_url``         → poll the PR. Merged
                                                  → ``fixed``; closed
                                                  unmerged → revert
-                                                 to ``open``.
+                                                 to ``open``; green
+                                                 draft from a trusted
+                                                 reporter → ``gh pr
+                                                 ready`` +
+                                                 ``ready-for-review``.
+   * ``ready-for-review`` and a ``pr_url``    → keep polling so a merge
+                                                 still routes to
+                                                 ``fixed``.
    * anything else                            → no-op.
 4. Journal every transition to
    ``inner/state/bug-fix-dispatcher.log``.
@@ -34,10 +41,15 @@ tick can retry; if a worker is dispatched but never produces a PR
 within the stall TTL, the bug lands in ``dispatch-failed`` and
 needs a human triage.
 
-The dispatcher never calls GitHub itself for anything except the
-PR-state poll (``gh pr view``) — all mutation goes through the
-spawned worker, so the ``--draft`` invariant lives in exactly one
-place: the worker prompt template.
+The dispatcher only calls GitHub for the PR-state poll (``gh pr
+view``) and, for trusted reporters, the draft → ready flip
+(``gh pr ready``) once CI is green. Everything else goes through the
+spawned worker, so the ``--draft`` invariant at PR creation lives in
+the worker prompt template.
+
+At the end of each tick the ``<!-- bug-review -->`` block under
+``## Waiting on you`` in ``index.md`` is rebuilt: one
+``Review PR #N`` line per ``ready-for-review`` bug.
 """
 
 from __future__ import annotations
@@ -76,6 +88,16 @@ DEFAULT_WORKER_PROMPT_TEMPLATE = pathlib.Path(
 )
 DEFAULT_STALL_HOURS = 2
 DEFAULT_REPO = "jcronq/modern-mud"
+DEFAULT_INDEX_PATH = pathlib.Path("/home/alice/alice-mind/inner/status/index.md")
+DEFAULT_TRUSTED_REPORTERS: tuple[str, ...] = ("cronqj",)
+WAITING_HEADING_RE = re.compile(r"^##\s+Waiting on you\s*$", re.M | re.I)
+BUG_REVIEW_START = "<!-- bug-review -->"
+BUG_REVIEW_END = "<!-- /bug-review -->"
+BUG_REVIEW_BLOCK_RE = re.compile(
+    r"(?:\n\n)?" + re.escape(BUG_REVIEW_START) + r".*?" + re.escape(BUG_REVIEW_END),
+    re.S,
+)
+ACCOUNT_RE = re.compile(r"^[\s>*_-]*Account\**:\**\s*@?(\S+)", re.M | re.I)
 # The dispatcher spawns ``claude -p`` without passing ``--model``; the
 # user's current Claude Code setup picks the active model at launch
 # time, which today is Opus 4.7. Keep the dispatcher-side default
@@ -112,6 +134,12 @@ class DispatcherConfig:
     # swap models without a redeploy.
     worker_model: str = DEFAULT_WORKER_MODEL
     expected_output_tokens: int = DEFAULT_EXPECTED_OUTPUT_TOKENS
+    # Auto ready-for-review. ``index_path`` is the status-site index whose
+    # ``## Waiting on you`` section gets the dispatcher-owned block;
+    # ``trusted_reporters`` gates the draft → ready flip. Both overridable
+    # under ``bug_fix_dispatcher.*`` in alice.config.json.
+    index_path: pathlib.Path = DEFAULT_INDEX_PATH
+    trusted_reporters: tuple[str, ...] = DEFAULT_TRUSTED_REPORTERS
 
 
 @dataclass
@@ -122,6 +150,7 @@ class TickReport:
     adopted_pr_url: list[int] = field(default_factory=list)
     fixed: list[int] = field(default_factory=list)
     reopened: list[int] = field(default_factory=list)
+    ready: list[int] = field(default_factory=list)
     stalled: list[int] = field(default_factory=list)
     skipped: list[tuple[int, str]] = field(default_factory=list)
 
@@ -182,6 +211,125 @@ def _read_config_pricing(cfg: "DispatcherConfig") -> tuple[str, int]:
     if isinstance(override_out, int) and override_out > 0:
         expected_out = override_out
     return worker_model, expected_out
+
+
+def _read_config_trusted_reporters(cfg: "DispatcherConfig") -> tuple[str, ...]:
+    """``bug_fix_dispatcher.trusted_reporters`` (list of strings) or the cfg default."""
+    if not cfg.config_json.is_file():
+        return cfg.trusted_reporters
+    try:
+        data = json.loads(cfg.config_json.read_text())
+    except (OSError, ValueError):
+        return cfg.trusted_reporters
+    section = data.get("bug_fix_dispatcher") if isinstance(data, dict) else None
+    override = section.get("trusted_reporters") if isinstance(section, dict) else None
+    if isinstance(override, list) and all(isinstance(r, str) for r in override):
+        return tuple(override)
+    return cfg.trusted_reporters
+
+
+def _reporter_trusted(
+    fields: Mapping[str, str], body: str, cfg: "DispatcherConfig"
+) -> bool:
+    """True when the bug's reporter is on the trusted list.
+
+    Reads the ``reporter`` frontmatter field, falling back to the
+    ``Account: <x>`` line in the body. Comparison is case-insensitive.
+    """
+    reporter = (fields.get("reporter") or "").strip()
+    if not reporter:
+        m = ACCOUNT_RE.search(body)
+        reporter = m.group(1) if m else ""
+    reporter = reporter.lstrip("@").lower()
+    if not reporter:
+        return False
+    trusted = {r.lstrip("@").lower() for r in _read_config_trusted_reporters(cfg)}
+    return reporter in trusted
+
+
+def _pr_is_green(data: Mapping[str, object]) -> bool:
+    """True when ``statusCheckRollup`` is non-empty and every context is SUCCESS.
+
+    Handles both CheckRun (``conclusion``) and StatusContext (``state``)
+    shapes. An empty rollup (no CI) is not green.
+    """
+    rollup = data.get("statusCheckRollup")
+    if not isinstance(rollup, list) or not rollup:
+        return False
+    for ctx in rollup:
+        if not isinstance(ctx, dict):
+            return False
+        verdict = ctx.get("conclusion") or ctx.get("state") or ""
+        if str(verdict).upper() != "SUCCESS":
+            return False
+    return True
+
+
+def _mark_pr_ready(
+    pr_url: str,
+    *,
+    gh_pr_ready: Callable[[str], None] | None = None,
+) -> bool:
+    """Run ``gh pr ready <url>``. Returns True on success."""
+    if gh_pr_ready is not None:
+        try:
+            gh_pr_ready(pr_url)
+        except Exception:  # noqa: BLE001 — test fakes shouldn't blow up the tick
+            return False
+        return True
+    try:
+        subprocess.run(
+            ["gh", "pr", "ready", pr_url],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+    return True
+
+
+def _rebuild_waiting_block(status_dir: pathlib.Path, index_path: pathlib.Path) -> bool:
+    """Rewrite the ``<!-- bug-review -->`` block in ``index.md``'s Waiting section.
+
+    One ``[ ] Review PR #N (bug-N: <title>)`` line per ``ready-for-review``
+    bug. Content outside the markers is never touched. Returns True when
+    the file changed; idempotent across ticks.
+    """
+    if not index_path.is_file():
+        return False
+    try:
+        text = index_path.read_text()
+    except OSError:
+        return False
+
+    lines = []
+    for report_id, _path, fields in _scan_bugs(status_dir):
+        if (fields.get("status") or "").strip().lower() != "ready-for-review":
+            continue
+        m = re.search(r"/pull/(\d+)", fields.get("pr_url", ""))
+        pr_label = f"PR #{m.group(1)}" if m else "PR"
+        title = fields.get("title", f"bug-{report_id}")
+        lines.append(f"- [ ] Review {pr_label} (bug-{report_id}: {title})")
+
+    block = "\n".join([BUG_REVIEW_START, *lines, BUG_REVIEW_END]) if lines else ""
+    if BUG_REVIEW_BLOCK_RE.search(text):
+        new = BUG_REVIEW_BLOCK_RE.sub(
+            lambda _m: ("\n\n" + block) if block else "", text, count=1
+        )
+    elif not block:
+        return False
+    else:
+        heading = WAITING_HEADING_RE.search(text)
+        if heading:
+            new = text[: heading.end()] + "\n\n" + block + text[heading.end() :]
+        else:
+            new = text.rstrip("\n") + "\n\n## Waiting on you\n\n" + block + "\n"
+    if new == text:
+        return False
+    _fm.atomic_write(index_path, new)
+    return True
 
 
 def _journal(journal_path: pathlib.Path, line: str) -> None:
@@ -696,7 +844,7 @@ def _poll_pr(
     *,
     gh_pr_view: Callable[[str], dict] | None = None,
 ) -> dict:
-    """Call ``gh pr view --json state,mergedAt,mergeCommit`` for a PR URL.
+    """Call ``gh pr view --json state,mergedAt,mergeCommit,...`` for a PR URL.
 
     Returns the parsed dict, or ``{}`` on failure.
     """
@@ -713,7 +861,7 @@ def _poll_pr(
                 "view",
                 pr_url,
                 "--json",
-                "state,mergedAt,mergeCommit,url",
+                "state,mergedAt,mergeCommit,url,isDraft,statusCheckRollup,reviewDecision",
             ],
             check=True,
             capture_output=True,
@@ -737,10 +885,12 @@ def _check_pr_state(
     log: Callable[[str], None],
     now_iso: Callable[[], str] = _now_utc_iso,
     gh_pr_view: Callable[[str], dict] | None = None,
+    gh_pr_ready: Callable[[str], None] | None = None,
+    body: str = "",
 ) -> str:
     """Poll the PR and apply any resulting transition.
 
-    Returns one of ``"fixed"``, ``"reopened"``, ``""`` (no change).
+    Returns one of ``"fixed"``, ``"reopened"``, ``"ready"``, ``""`` (no change).
     """
     pr_url = fields.get("pr_url", "").strip()
     if not pr_url:
@@ -785,6 +935,26 @@ def _check_pr_state(
             f"status=open (retry)"
         )
         return "reopened"
+    status = (fields.get("status") or "").strip().lower()
+    if (
+        status == "in-progress"
+        and state == "OPEN"
+        and data.get("isDraft")
+        and _pr_is_green(data)
+        and (data.get("reviewDecision") or "").upper() != "CHANGES_REQUESTED"
+        and _reporter_trusted(fields, body, cfg)
+    ):
+        if _mark_pr_ready(pr_url, gh_pr_ready=gh_pr_ready):
+            _fm.update(
+                bug_path,
+                {"status": "ready-for-review", "last_check_at": now_iso()},
+            )
+            log(
+                f"[bug-fix-dispatcher] bug-{report_id}: draft PR green ({pr_url}) → "
+                f"gh pr ready, status=ready-for-review"
+            )
+            return "ready"
+        log(f"[bug-fix-dispatcher] bug-{report_id}: gh pr ready failed for {pr_url}")
     # OPEN / DRAFT / unknown: just update last_check_at.
     _fm.update(bug_path, {"last_check_at": now_iso()})
     return ""
@@ -800,6 +970,7 @@ def tick(
     now_iso: Callable[[], str] = _now_utc_iso,
     spawn: Callable[[int, pathlib.Path, str], int | None] | None = None,
     gh_pr_view: Callable[[str], dict] | None = None,
+    gh_pr_ready: Callable[[str], None] | None = None,
 ) -> TickReport:
     """Run one scan + act pass.
 
@@ -865,9 +1036,11 @@ def tick(
                     f"dispatched_at to re-dispatch)"
                 )
                 report.skipped.append((report_id, "stale-dispatched_at"))
-            elif status == "in-progress":
+            elif status in ("in-progress", "ready-for-review"):
                 pr_url = fields.get("pr_url", "").strip()
-                if pr_url:
+                if status == "ready-for-review" and not pr_url:
+                    report.skipped.append((report_id, "status=ready-for-review"))
+                elif pr_url:
                     outcome = _check_pr_state(
                         report_id=report_id,
                         bug_path=bug_path,
@@ -876,11 +1049,15 @@ def tick(
                         log=_log,
                         now_iso=now_iso,
                         gh_pr_view=gh_pr_view,
+                        gh_pr_ready=gh_pr_ready,
+                        body=_body_from(bug_path),
                     )
                     if outcome == "fixed":
                         report.fixed.append(report_id)
                     elif outcome == "reopened":
                         report.reopened.append(report_id)
+                    elif outcome == "ready":
+                        report.ready.append(report_id)
                 else:
                     adopted, stalled = _adopt_worker_result(
                         report_id=report_id,
@@ -913,6 +1090,12 @@ def tick(
             )
             report.skipped.append((report_id, f"ioerror:{exc.__class__.__name__}"))
 
+    try:
+        if _rebuild_waiting_block(cfg.status_dir, cfg.index_path):
+            _log(f"[bug-fix-dispatcher] rebuilt bug-review block in {cfg.index_path}")
+    except OSError as exc:
+        _log(f"[bug-fix-dispatcher] failed to rebuild bug-review block: {exc}")
+
     # P&L roll-up — sum estimate_usd / actual_usd across *all* bugs
     # (not just this tick's) so the log line is a running total Jason
     # can grep for across restarts.
@@ -922,6 +1105,7 @@ def tick(
         f"dispatched={len(report.dispatched)} "
         f"adopted_pr_url={len(report.adopted_pr_url)} "
         f"fixed={len(report.fixed)} reopened={len(report.reopened)} "
+        f"ready={len(report.ready)} "
         f"stalled={len(report.stalled)} skipped={len(report.skipped)} "
         f"total_estimate_usd={format_usd(totals['estimate'])} "
         f"total_actual_usd={format_usd(totals['actual'])}"
