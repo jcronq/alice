@@ -402,6 +402,41 @@ def _scan_bugs(status_dir: pathlib.Path) -> list[tuple[int, pathlib.Path, dict[s
     return out
 
 
+def _parse_depends_on(value: str) -> list[str]:
+    """``depends_on: [a, b]`` / ``a, b`` frontmatter value -> deduped slugs."""
+    out: list[str] = []
+    for raw in (value or "").strip().strip("[]").split(","):
+        slug = re.sub(r"[^a-z0-9-]", "", raw.strip().strip("'\"").lower())[:60].strip("-")
+        if slug and slug not in out:
+            out.append(slug)
+    return out
+
+
+def _unresolved_deps(
+    depends_on: list[str],
+    status_dir: pathlib.Path,
+    bugs: list[tuple[int, pathlib.Path, dict[str, str]]],
+) -> list[str]:
+    """Deps not yet satisfied. ``bug-<N>`` resolves via that bug's status
+    (fixed / wontfix); any other slug via ``.item-state.json`` (checked).
+    Unknown slugs are unresolved so a typo blocks rather than passes."""
+    bug_status = {
+        f"bug-{rid}": (f.get("status") or "").strip().lower() for rid, _p, f in bugs
+    }
+    try:
+        state = json.loads((status_dir / ".item-state.json").read_text()).get("items", {})
+    except (OSError, ValueError, AttributeError):
+        state = {}
+    out = []
+    for dep in depends_on:
+        if dep in bug_status:
+            if bug_status[dep] not in ("fixed", "wontfix"):
+                out.append(dep)
+        elif (state.get(dep) or {}).get("checked") is not True:
+            out.append(dep)
+    return out
+
+
 def _render_prompt(
     template_text: str,
     *,
@@ -1086,6 +1121,18 @@ def tick(
         status = (fields.get("status") or "").strip().lower()
         try:
             if status == "open" and not fields.get("dispatched_at"):
+                blockers = _unresolved_deps(
+                    _parse_depends_on(fields.get("depends_on", "")),
+                    cfg.status_dir,
+                    bugs,
+                )
+                if blockers:
+                    _log(
+                        f"[bug-fix-dispatcher] bug-{report_id}: blocked by "
+                        f"{', '.join(blockers)} — not dispatching"
+                    )
+                    report.skipped.append((report_id, "blocked"))
+                    continue
                 ok, _patch = _dispatch_worker(
                     report_id=report_id,
                     bug_path=bug_path,

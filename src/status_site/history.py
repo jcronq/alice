@@ -24,7 +24,7 @@ import json
 import os
 import re
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -38,6 +38,8 @@ _HEAD_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 # First bold span, optionally wrapped in a link ``[**x**](url)`` or strikethrough ``~~**x**~~``.
 _BOLD_RE = re.compile(r"(?P<pre>\[|~~)?\*\*(?P<t>[^*]+?)\*\*(?P<post>\]\([^)]*\)|~~)?")
+# ``<!--deps: slug-a, slug-b-->`` on a bullet: items this one waits on. Hidden by marked.js.
+_DEPS_RE = re.compile(r"<!--\s*deps:(.*?)-->", re.S)
 
 
 def slugify(text: str, limit: int = 60) -> str:
@@ -67,6 +69,24 @@ class Item:
     checked: bool | None
     page: str
     section: str
+    depends_on: list[str] = field(default_factory=list)
+
+
+def _extract_deps(text: str) -> tuple[str, list[str]]:
+    """Strip every ``<!--deps: ...-->`` marker; return (text, deduped safe slugs)."""
+    deps: list[str] = []
+    for m in _DEPS_RE.finditer(text):
+        for raw in m.group(1).split(","):
+            s = safe_slug(raw.strip())
+            if s and s not in deps:
+                deps.append(s)
+    return _DEPS_RE.sub(" ", text), deps
+
+
+def unresolved_deps(depends_on: list[str], items: dict[str, dict]) -> list[str]:
+    """Deps that are not a checked item in ``items`` (state-file shape). Unknown slugs
+    count as unresolved so a typo blocks rather than silently passing."""
+    return [d for d in depends_on if (items.get(d) or {}).get("checked") is not True]
 
 
 def _clean(s: str) -> str:
@@ -115,14 +135,21 @@ def parse_page(markdown: str, page: str) -> list[Item]:
         if m:
             while stack and stack[-1][0] >= indent:
                 stack.pop()
-            box, body = m.group(4), m.group(5)
+            box = m.group(4)
+            body, deps = _extract_deps(m.group(5))
             checked = None if box is None else box.lower() == "x"
             idx = -1
             split = _split_title(body)
             if split and title_slug(split[0]):
                 items.append(
                     Item(
-                        title_slug(split[0]), split[0], split[1], checked, page, section
+                        title_slug(split[0]),
+                        split[0],
+                        split[1],
+                        checked,
+                        page,
+                        section,
+                        deps,
                     )
                 )
                 idx = len(items) - 1
@@ -137,7 +164,9 @@ def parse_page(markdown: str, page: str) -> list[Item]:
         if owner is None:
             stack = []  # unindented paragraph after a blank line ends the list
         elif owner >= 0:
-            items[owner].text = _clean(items[owner].text + " " + line.strip())
+            extra, more = _extract_deps(line.strip())
+            items[owner].text = _clean(items[owner].text + " " + extra)
+            items[owner].depends_on += [d for d in more if d not in items[owner].depends_on]
         blank = False
     return items
 
