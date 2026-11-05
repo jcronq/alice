@@ -188,6 +188,7 @@ COPY sandbox/s6/alice-reload-watcher/   /etc/s6-overlay/s6-rc.d/alice-reload-wat
 COPY sandbox/s6/alice-repo-autopull/    /etc/s6-overlay/s6-rc.d/alice-repo-autopull/
 COPY sandbox/s6/alice-sm-dispatcher/    /etc/s6-overlay/s6-rc.d/alice-sm-dispatcher/
 COPY sandbox/s6/alice-speaking/         /etc/s6-overlay/s6-rc.d/alice-speaking/
+COPY sandbox/s6/alice-thinking-queue/ /etc/s6-overlay/s6-rc.d/alice-thinking-queue/
 COPY sandbox/s6/alice-thinker/          /etc/s6-overlay/s6-rc.d/alice-thinker/
 COPY sandbox/s6/alice-thinker-watchdog/ /etc/s6-overlay/s6-rc.d/alice-thinker-watchdog/
 COPY sandbox/s6/alice-viewer/           /etc/s6-overlay/s6-rc.d/alice-viewer/
@@ -216,6 +217,7 @@ COPY sandbox/s6/user/contents.d/alice-reload-watcher            /etc/s6-overlay/
 COPY sandbox/s6/user/contents.d/alice-repo-autopull             /etc/s6-overlay/s6-rc.d/user/contents.d/alice-repo-autopull
 COPY sandbox/s6/user/contents.d/alice-sm-dispatcher             /etc/s6-overlay/s6-rc.d/user/contents.d/alice-sm-dispatcher
 COPY sandbox/s6/user/contents.d/alice-speaking                  /etc/s6-overlay/s6-rc.d/user/contents.d/alice-speaking
+COPY sandbox/s6/user/contents.d/alice-thinking-queue /etc/s6-overlay/s6-rc.d/user/contents.d/alice-thinking-queue
 COPY sandbox/s6/user/contents.d/alice-thinker                   /etc/s6-overlay/s6-rc.d/user/contents.d/alice-thinker
 COPY sandbox/s6/user/contents.d/alice-thinker-watchdog          /etc/s6-overlay/s6-rc.d/user/contents.d/alice-thinker-watchdog
 COPY sandbox/s6/user/contents.d/alice-viewer                    /etc/s6-overlay/s6-rc.d/user/contents.d/alice-viewer

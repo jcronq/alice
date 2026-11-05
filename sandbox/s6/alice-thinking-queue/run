@@ -1,0 +1,28 @@
+#!/command/with-contenv bash
+# alice-thinking-queue — every 60s, cache the SM design-phase GitHub queue to
+# inner/status/.thinking-queue.json for the status site's Overview page.
+# Singleton via `flock -n` so a slow poll can't double-fire.
+set -e
+
+export PYTHONPATH=/home/alice/alice/src
+
+LOCK=/state/worker/thinking-queue.lock
+INTERVAL=60
+
+mkdir -p "$(dirname "$LOCK")"
+touch "$LOCK"
+chown alice:alice "$LOCK" || true
+
+# Stagger startup away from the other GitHub pollers.
+sleep 45
+
+while true; do
+    start_ts=$(date +%s)
+    flock -n "$LOCK" s6-setuidgid alice redirfd -a 2 /state/worker/thinking-queue-stderr.log \
+        /opt/alice-venv/bin/python -m alice_forge.thinking_queue_poller || true
+    elapsed=$(( $(date +%s) - start_ts ))
+    remainder=$(( INTERVAL - elapsed ))
+    if [ "$remainder" -gt 0 ]; then
+        sleep "$remainder"
+    fi
+done
