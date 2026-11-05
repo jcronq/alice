@@ -805,6 +805,181 @@ def test_is_self_filed_helper() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Own-activity + [SM] protocol-comment suppression (issue #615)
+# ---------------------------------------------------------------------------
+
+
+def _comment(cid: int, *, user: str, body: str, assoc: str = "OWNER") -> dict:
+    return {
+        "id": cid,
+        "user": {"login": user},
+        "body": body,
+        "author_association": assoc,
+        "created_at": "2026-04-29T13:00:00Z",
+        "html_url": f"https://example.com/c/{cid}",
+    }
+
+
+def _notes(mind_dir: pathlib.Path) -> list[pathlib.Path]:
+    return list((mind_dir / "inner" / "notes").glob("*.md"))
+
+
+def _prime(mind_dir: pathlib.Path, state_path: pathlib.Path, api: FakeAPI) -> None:
+    gh_watcher.run(
+        mind_dir=mind_dir, state_path=state_path, api=api, log=lambda _: None
+    )
+
+
+def test_own_authored_issue_tracked_but_silent(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    api = FakeAPI()
+    _prime(mind_dir, state_path, api)
+
+    api.issues = [_make_issue(number=615, user="alice", author_association="OWNER")]
+    api.issue_thread_comments[615] = []
+    _prime(mind_dir, state_path, api)
+
+    assert _notes(mind_dir) == []
+    state = json.loads(state_path.read_text())
+    assert state["repos"]["acme/widgets"]["issue_state"]["615"] == "open"
+
+    # Closing it is also silent.
+    api.issues = [
+        _make_issue(
+            number=615, user="alice", state="closed", author_association="OWNER"
+        )
+    ]
+    _prime(mind_dir, state_path, api)
+    assert _notes(mind_dir) == []
+
+
+def test_own_authored_comments_suppressed_but_marked_seen(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    api = FakeAPI()
+    api.pulls = [_make_pr(number=5, user="jcronq")]
+    api.issues = [_make_issue(number=12, user="jcronq")]
+    api.pr_conversation_comments[5] = []
+    api.issue_thread_comments[12] = []
+    _prime(mind_dir, state_path, api)
+
+    api.pr_conversation_comments[5] = [
+        _comment(9001, user="alice", body="pushed a fix")
+    ]
+    api.issue_thread_comments[12] = [
+        _comment(9002, user="Alice", body="working on it")
+    ]
+    _prime(mind_dir, state_path, api)
+
+    assert _notes(mind_dir) == []
+    repo_state = json.loads(state_path.read_text())["repos"]["acme/widgets"]
+    assert 9001 in repo_state["seen_issue_comment_ids"]
+    assert 9002 in repo_state["seen_standalone_issue_comment_ids"]
+
+
+def test_sm_protocol_comment_suppressed_regardless_of_author(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    api = FakeAPI()
+    api.pulls = [_make_pr(number=5, user="jcronq")]
+    api.issues = [_make_issue(number=12, user="jcronq")]
+    api.pr_conversation_comments[5] = []
+    api.issue_thread_comments[12] = []
+    _prime(mind_dir, state_path, api)
+
+    api.pr_conversation_comments[5] = [
+        _comment(9101, user="jcronq", body="[SM] transition from=draft to=design")
+    ]
+    api.issue_thread_comments[12] = [
+        _comment(9102, user="drapw", body="  [sm] dispatcher-hello", assoc="MEMBER")
+    ]
+    _prime(mind_dir, state_path, api)
+
+    assert _notes(mind_dir) == []
+    repo_state = json.loads(state_path.read_text())["repos"]["acme/widgets"]
+    assert 9101 in repo_state["seen_issue_comment_ids"]
+    assert 9102 in repo_state["seen_standalone_issue_comment_ids"]
+
+
+def test_non_own_non_sm_activity_still_emitted(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    """Regression guard: owner / contributor issues and comments still fire,
+    including a body that merely mentions [SM] mid-text."""
+    api = FakeAPI()
+    api.pulls = [_make_pr(number=5, user="jcronq")]
+    api.issues = [_make_issue(number=12, user="jcronq")]
+    api.pr_conversation_comments[5] = []
+    api.issue_thread_comments[12] = []
+    _prime(mind_dir, state_path, api)
+
+    api.issues.append(
+        _make_issue(number=13, user="jcronq", author_association="OWNER")
+    )
+    api.issue_thread_comments[13] = []
+    api.pr_conversation_comments[5] = [
+        _comment(9201, user="jcronq", body="looks good, see [SM] above")
+    ]
+    api.issue_thread_comments[12] = [
+        _comment(9202, user="contrib", body="idea", assoc="COLLABORATOR")
+    ]
+    _prime(mind_dir, state_path, api)
+
+    assert len(_notes(mind_dir)) == 3
+
+
+def test_own_login_override_honored(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    (mind_dir / "config" / "alice.config.json").write_text(
+        json.dumps(
+            {
+                "github_watcher": {
+                    "enabled": True,
+                    "repos": ["acme/widgets"],
+                    "own_login": "alice-bot",
+                }
+            }
+        )
+    )
+    assert gh_watcher.load_config(mind_dir).own_login == "alice-bot"
+
+    api = FakeAPI()
+    api.issues = [_make_issue(number=12, user="jcronq")]
+    api.issue_thread_comments[12] = []
+    _prime(mind_dir, state_path, api)
+
+    api.issue_thread_comments[12] = [
+        _comment(9301, user="alice-bot", body="mine"),
+        _comment(9302, user="alice", body="not mine under this config"),
+    ]
+    _prime(mind_dir, state_path, api)
+
+    notes = _notes(mind_dir)
+    assert len(notes) == 1
+    assert "not mine under this config" in notes[0].read_text()
+
+
+def test_own_login_defaults_to_alice(mind_dir: pathlib.Path) -> None:
+    assert gh_watcher.load_config(mind_dir).own_login == "alice"
+    assert gh_watcher.WatcherConfig().own_login == "alice"
+
+
+def test_own_activity_and_sm_helpers() -> None:
+    assert gh_watcher._is_own_activity("alice", "alice")
+    assert gh_watcher._is_own_activity("Alice", "alice")
+    assert not gh_watcher._is_own_activity("jcronq", "alice")
+    assert not gh_watcher._is_own_activity(None, "alice")
+
+    assert gh_watcher._is_sm_protocol_comment("[SM] design-ready")
+    assert gh_watcher._is_sm_protocol_comment("\n  [sm] hello")
+    assert not gh_watcher._is_sm_protocol_comment("see [SM] later")
+    assert not gh_watcher._is_sm_protocol_comment(None)
+    assert not gh_watcher._is_sm_protocol_comment(42)
+
+
+# ---------------------------------------------------------------------------
 # sm:draft auto-labeling on new_issue intake
 #
 # The SM v2 dispatcher's GitHub query filters by ``label:sm:draft,...`` —
