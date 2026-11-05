@@ -70,6 +70,8 @@ a.detail{color:inherit;text-decoration:none;border-bottom:1px dashed var(--accen
 #modal ol.tl del{color:var(--muted)}#modal ol.tl ins{text-decoration:none;color:var(--accent)}
 #modal ol.tl code{font-size:.82em}
 strong.leaf{cursor:pointer;text-decoration:underline dotted var(--muted);text-underline-offset:3px}
+li.dragging{opacity:.4}
+.dh{cursor:grab;color:var(--muted);user-select:none;margin-right:.35rem;font-size:.9rem}
 #chatpage{display:flex;flex-direction:column;height:calc(100vh - 7rem);min-height:28rem}
 #chatpage h1{margin:0 0 .4rem}
 #chatpage .intro{color:var(--muted);font-size:.9rem;margin:0 0 .6rem}
@@ -104,14 +106,68 @@ function renderThread(li){
   tog.textContent=open?'Hide':(msgs.length?`💬 ${msgs.length}${unread>0?` · ${unread} new`:''}`:'💬 Reply');
   tog.classList.toggle('unread',!open&&unread>0);tog.classList.toggle('on',open);
 }
+const liTid=li=>{const st=li.querySelector('strong'); const label=(st?st.textContent:li.textContent.split(/[—:]/)[0]).trim(); return label?slug(label):''};
+function waitingLists(){
+  const out=[];let waiting=false;
+  document.querySelectorAll('#doc > *').forEach(el=>{
+    if(/^H[12]$/.test(el.tagName)) waiting=/waiting on you/i.test(el.textContent);
+    else if(waiting&&el.tagName==='UL')out.push(el);
+  });
+  return out;
+}
+// <merge-order>
+// Known slugs take the slots known items occupy, in saved sequence; unknown items keep their slot.
+function mergeWaitingOrder(natural,saved){
+  const rank=new Map();saved.forEach((t,i)=>{if(!rank.has(t))rank.set(t,i)});
+  const known=natural.filter(t=>rank.has(t)).sort((a,b)=>rank.get(a)-rank.get(b));
+  let k=0;return natural.map(t=>rank.has(t)?known[k++]:t);
+}
+// </merge-order>
+let WAITING_ORDER=[];
+function applyWaitingOrder(){
+  if(!WAITING_ORDER.length)return;
+  waitingLists().forEach(ul=>{
+    const lis=[...ul.querySelectorAll(':scope > li')],tids=lis.map(liTid);
+    if(tids.some(t=>!t)||new Set(tids).size!==tids.length)return;
+    const byTid=new Map(lis.map((li,i)=>[tids[i],li]));
+    const merged=mergeWaitingOrder(tids,WAITING_ORDER);
+    merged.forEach(t=>ul.appendChild(byTid.get(t)));
+  });
+}
+async function saveWaitingOrder(ul){
+  const order=[...ul.querySelectorAll(':scope > li')].map(li=>li.dataset.tid||liTid(li)).filter(Boolean);
+  try{const r=await fetch('api/waiting-order',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:KEY,order})});
+    if(r.ok)WAITING_ORDER=order}catch(e){}
+}
+function makeDraggable(){
+  if(!KEY)return;
+  waitingLists().forEach(ul=>{
+    let drag=null;
+    ul.querySelectorAll(':scope > li').forEach(li=>{
+      if(li.querySelector(':scope > .dh'))return;
+      const h=document.createElement('span');h.className='dh';h.textContent='⠿';h.title='Drag to reorder';
+      h.onmousedown=()=>{li.draggable=true};
+      h.onmouseup=()=>{li.draggable=false};
+      li.insertBefore(h,li.firstChild);
+      li.addEventListener('dragstart',e=>{drag=li;li.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',li.dataset.tid||'')});
+      li.addEventListener('dragover',e=>{
+        if(!drag||drag===li||drag.parentNode!==ul)return;
+        e.preventDefault();const r=li.getBoundingClientRect();
+        ul.insertBefore(drag,e.clientY<r.top+r.height/2?li:li.nextSibling);
+      });
+      li.addEventListener('drop',e=>{if(drag)e.preventDefault()});
+      li.addEventListener('dragend',()=>{li.draggable=false;li.classList.remove('dragging');if(drag===li){drag=null;saveWaitingOrder(ul)}});
+    });
+  });
+}
 function addReplies(){
   let waiting=false;
   document.querySelectorAll('#doc > *').forEach(el=>{
     if(/^H[12]$/.test(el.tagName)) waiting=/waiting on you/i.test(el.textContent);
     if(el.tagName!=='UL')return;
     el.querySelectorAll(':scope > li').forEach(li=>{
-      if(li.dataset.tid)return; const st=li.querySelector('strong'); const label=(st?st.textContent:li.textContent.split(/[—:]/)[0]).trim(); if(!label)return;
-      const tid=slug(label); li.dataset.tid=tid; const itemText=li.textContent.replace(/\s+/g,' ').trim().slice(0,400);
+      if(li.dataset.tid)return; const tid=liTid(li); if(!tid)return;
+       li.dataset.tid=tid; const itemText=li.textContent.replace(/\s+/g,' ').trim().slice(0,400);
       const has=(THREADS[tid]||[]).length>0;
       const tog=document.createElement('button');tog.className='ctog';
       const conv=document.createElement('div');conv.className='conv';
@@ -194,7 +250,7 @@ function linkLeaves(){
   document.querySelectorAll('#doc li').forEach(li=>{
     const st=li.querySelector('strong');if(!st||st.closest('a')||st.dataset.leaf)return;
     st.dataset.leaf='1';st.classList.add('leaf');st.title='What happened';
-    st.onclick=e=>{e.preventDefault();e.stopPropagation();const c=li.cloneNode(true);c.querySelectorAll('.ctog,.conv,input').forEach(x=>x.remove());
+    st.onclick=e=>{e.preventDefault();e.stopPropagation();const c=li.cloneNode(true);c.querySelectorAll('.ctog,.conv,.dh,input').forEach(x=>x.remove());
       openModal(st.textContent.replace(/[:.]+$/,''),c.innerHTML,slug(st.textContent.replace(/[:.]+$/,'')))};
   });
 }
@@ -282,12 +338,14 @@ async function load(){
     return;
   }
   try{
-    const [r,pr]=await Promise.all([fetch(page+'.md?'+Date.now()),fetch('pages.json?'+Date.now()).catch(()=>null)]);
+    const [r,pr,wo]=await Promise.all([fetch(page+'.md?'+Date.now()),fetch('pages.json?'+Date.now()).catch(()=>null),fetch('api/waiting-order?'+Date.now()).catch(()=>null)]);
+    if(wo&&wo.ok){try{WAITING_ORDER=(await wo.json()).order||[]}catch(e){}}
     if(!r.ok)throw new Error(r.status);
     const lm=r.headers.get('last-modified');
     document.getElementById('doc').innerHTML=marked.parse(await r.text(),{gfm:true});
     document.querySelectorAll('#doc input[type=checkbox]').forEach(c=>c.disabled=true);
-    await pollThreads();addReplies();
+    applyWaitingOrder();
+    await pollThreads();addReplies();makeDraggable();
     if(lm){const m=Math.round((Date.now()-new Date(lm))/60000);document.getElementById('age').textContent='updated '+(m<1?'just now':m<60?m+' min ago':Math.round(m/60)+' h ago')}
     try{const ar=await fetch('api/pages?'+Date.now());if(ar.ok)AVAIL=new Set(await ar.json())}catch(e){}
     linkDetails();linkLeaves();
