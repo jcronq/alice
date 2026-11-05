@@ -100,7 +100,6 @@ _FULL_TOOL_ALLOWLIST: tuple[str, ...] = (
     "Glob",
     "WebFetch",
     "WebSearch",
-    "mcp__alice__send_message",
     "mcp__alice__run_experiment",
 )
 

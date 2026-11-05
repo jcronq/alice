@@ -157,9 +157,10 @@ _FULL_SET = {
     "Glob",
     "WebFetch",
     "WebSearch",
-    "mcp__alice__send_message",
-    # Added 2026-05-11 — thinking-side async experiment dispatch tool.
-    # The MCP server is composed in wake.py and threaded onto KernelSpec.
+    # mcp__alice__send_message removed 2026-11-05: speaking owns the outbox
+    # per CLAUDE.md hemisphere rule; keeping it in the thinking allowlist
+    # crashed the hermes-agent kernel (kernel.py:43 refuses to run when
+    # send_message is present). See jcronq/alice#617.
     "mcp__alice__run_experiment",
 }
 
