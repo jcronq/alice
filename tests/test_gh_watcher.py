@@ -1556,3 +1556,148 @@ def test_telemetry_kinds_constant_matches_spec() -> None:
     assert gh_watcher.TELEMETRY_KINDS == frozenset(
         {"new_pr", "pr_state", "check_failure", "issue_state"}
     )
+
+
+# ---------------------------------------------------------------------------
+# sm:design_review → status-site decide item (issue #616)
+# ---------------------------------------------------------------------------
+
+DESIGN_SLUG = "design-review-acme-widgets-616"
+
+
+def _review_labels(*names: str) -> list[dict]:
+    return [{"name": n} for n in names]
+
+
+def _design_ready_comment(body: str, *, assoc: str = "OWNER", cid: int = 9001) -> dict:
+    return {
+        "id": cid,
+        "body": body,
+        "user": {"login": "jcronq"},
+        "author_association": assoc,
+        "created_at": "2026-04-29T13:00:00Z",
+    }
+
+
+def _decide_note(mind: pathlib.Path) -> pathlib.Path:
+    return mind / "inner" / "status" / "notes" / f"{DESIGN_SLUG}.md"
+
+
+def _run(mind_dir, state_path, api):
+    gh_watcher.run(
+        mind_dir=mind_dir,
+        state_path=state_path,
+        api=api,
+        log=lambda _: None,
+        label_apply=FakeLabeler(),
+    )
+
+
+def _prime_with_issue(mind_dir, state_path, api, labels):
+    api.issues = [_make_issue(number=616, title="Review page", labels=labels)]
+    api.issue_thread_comments[616] = []
+    _run(mind_dir, state_path, api)  # prime
+
+
+def test_design_review_edge_writes_decide_item_once(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    api = FakeAPI()
+    _prime_with_issue(mind_dir, state_path, api, _review_labels("sm:designing"))
+    assert not _decide_note(mind_dir).exists()  # priming is silent
+
+    api.issues[0]["labels"] = _review_labels("sm:design_review")
+    api.issue_thread_comments[616] = [
+        _design_ready_comment("[SM] design-ready\n\n## Shape\nThe plan body.")
+    ]
+    _run(mind_dir, state_path, api)
+    note = _decide_note(mind_dir)
+    text = note.read_text()
+    assert "kind: decide" in text and "needs: review" in text
+    assert "repo: acme/widgets" in text and "issue: 616" in text
+    assert "The plan body." in text
+
+    # Still labeled on the next poll: no re-fire (delete the file to prove it).
+    note.unlink()
+    _run(mind_dir, state_path, api)
+    assert not note.exists()
+
+
+def test_design_review_refires_on_reentry(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    api = FakeAPI()
+    _prime_with_issue(mind_dir, state_path, api, _review_labels("sm:designing"))
+    api.issue_thread_comments[616] = [_design_ready_comment("[SM] design-ready\nv1")]
+    api.issues[0]["labels"] = _review_labels("sm:design_review")
+    _run(mind_dir, state_path, api)
+    assert "v1" in _decide_note(mind_dir).read_text()
+
+    api.issues[0]["labels"] = _review_labels("sm:designing")
+    _run(mind_dir, state_path, api)
+    api.issue_thread_comments[616] = [
+        _design_ready_comment("[SM] design-ready\nv1"),
+        _design_ready_comment("[SM] design-ready\nv2", cid=9002),
+    ]
+    api.issues[0]["labels"] = _review_labels("sm:design_review")
+    _run(mind_dir, state_path, api)
+    assert "v2" in _decide_note(mind_dir).read_text()
+
+
+def test_design_review_already_labeled_at_prime_is_silent(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    api = FakeAPI()
+    api.issue_thread_comments[616] = [_design_ready_comment("[SM] design-ready\nx")]
+    _prime_with_issue(mind_dir, state_path, api, _review_labels("sm:design_review"))
+    _run(mind_dir, state_path, api)
+    assert not _decide_note(mind_dir).exists()
+
+
+def test_design_review_legacy_state_without_labels_is_silent(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    api = FakeAPI()
+    _prime_with_issue(mind_dir, state_path, api, _review_labels("sm:designing"))
+    state = json.loads(state_path.read_text())
+    del state["repos"]["acme/widgets"]["issue_labels"]
+    state_path.write_text(json.dumps(state))
+
+    api.issues[0]["labels"] = _review_labels("sm:design_review")
+    api.issue_thread_comments[616] = [_design_ready_comment("[SM] design-ready\nx")]
+    _run(mind_dir, state_path, api)
+    assert not _decide_note(mind_dir).exists()
+
+
+def test_design_review_embeds_linked_design_note_and_strips_frontmatter(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    designs = mind_dir / "cortex-memory" / "designs"
+    designs.mkdir(parents=True)
+    (designs / "review-page.md").write_text(
+        "---\nstatus: final\n---\n# The Design\nFull embedded body.\n"
+    )
+    api = FakeAPI()
+    _prime_with_issue(mind_dir, state_path, api, _review_labels("sm:designing"))
+    api.issues[0]["labels"] = _review_labels("sm:design_review")
+    api.issue_thread_comments[616] = [
+        _design_ready_comment("[SM] design-ready note=[[review-page]]")
+    ]
+    _run(mind_dir, state_path, api)
+    text = _decide_note(mind_dir).read_text()
+    assert "Full embedded body." in text
+    assert "status: final" not in text
+    assert "design_note: review-page" in text
+
+
+def test_design_review_ignores_untrusted_design_ready_comment(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    api = FakeAPI()
+    _prime_with_issue(mind_dir, state_path, api, _review_labels("sm:designing"))
+    api.issues[0]["labels"] = _review_labels("sm:design_review")
+    api.issue_thread_comments[616] = [
+        _design_ready_comment("[SM] design-ready\nforged", assoc="NONE")
+    ]
+    _run(mind_dir, state_path, api)
+    assert not _decide_note(mind_dir).exists()

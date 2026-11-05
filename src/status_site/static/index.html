@@ -91,6 +91,16 @@ li.dragging{opacity:.4}
 .pv .chip img{height:3.2rem;max-width:6rem;object-fit:cover;border-radius:4px}
 .pv .chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pv .chip b{cursor:pointer;color:var(--muted);font-weight:normal;padding:0 .15rem}
+.rvbtn{display:inline-block;margin:.25rem 0 0 .5rem;font-size:.85rem;font-weight:600;padding:.2rem .7rem;border-radius:999px;background:var(--accent);color:var(--bg)!important;text-decoration:none!important;border:1px solid var(--accent)}
+#reviewpage .meta{color:var(--muted);font-size:.9rem;margin:0 0 .8rem}
+#reviewpage .plan{padding:.2rem 1rem;border:1px solid var(--line);border-radius:8px;background:var(--card)}
+#reviewpage .actions{display:grid;gap:.8rem;margin-top:1rem}
+#reviewpage .act{border:1px solid var(--line);border-radius:8px;padding:.6rem .8rem;background:var(--card)}
+#reviewpage .act h3{margin:0 0 .35rem}
+#reviewpage .act textarea{width:100%;min-height:3.4rem;font:inherit;padding:.45rem;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+#reviewpage .act .row{display:flex;gap:.5rem;margin-top:.35rem;align-items:center}
+#reviewpage .act.approve h3{color:var(--accent)}#reviewpage .act.reject h3{color:var(--warn)}
+#reviewpage button.reject{background:var(--warn);border-color:var(--warn)}
 </style></head><body>
 <header><b>Alice</b><nav id="nav"></nav><span id="age"></span></header>
 <div id="modal" onclick="if(event.target===this)closeModal()"><div class="mc"><div class="mh"><b class="mt"></b><button class="mx" onclick="closeModal()">×</button></div><div class="mb"></div></div></div>
@@ -227,6 +237,7 @@ function addReplies(){
         catch(e){sm.textContent='Error: '+e.message}
         send.disabled=false};
       li.insertBefore(tog,li.firstChild.nextSibling);li.appendChild(conv);renderThread(li);
+      if(waiting&&REVIEWS.has(tid)){const a=document.createElement('a');a.className='rvbtn';a.href='?p=review-'+tid;a.textContent='Review plan →';li.insertBefore(a,conv)}
     });
   });
 }
@@ -243,7 +254,7 @@ function collapseDone(){
   d.addEventListener('toggle',()=>localStorage.setItem('alice-done-open',d.open?'1':'0'));
   h.replaceWith(d);
 }
-let AVAIL=new Set();
+let AVAIL=new Set(),REVIEWS=new Set();
 const depsOf=li=>{const out=[];
   for(const n of [...li.childNodes,...[...li.querySelectorAll(':scope > p')].flatMap(p=>[...p.childNodes])])
     if(n.nodeType===8){const m=/^\s*deps:([\s\S]*)$/.exec(n.nodeValue);if(m)for(const d of m[1].split(',')){const s=d.trim().toLowerCase().replace(/[^a-z0-9-]/g,'').slice(0,60).replace(/^-+|-+$/g,'');if(s&&!out.includes(s))out.push(s)}}
@@ -425,8 +436,42 @@ function markStaleSections(){
     }
   });
 }
+let reviewMounted=false;
+async function mountReview(){
+  reviewMounted=true;replyOpen=false;
+  const doc=document.getElementById('doc'),rslug=page.slice('review-'.length);
+  const r=await fetch('api/review?slug='+encodeURIComponent(rslug)+'&'+Date.now()).catch(()=>null);
+  if(!r||!r.ok){doc.innerHTML='<p class="typing">No such review item.</p><p><a href="?p=index">← Back to status</a></p>';return}
+  const v=await r.json();
+  const act=(k,label,hint,cls)=>`<div class="act ${k}"><h3>${label}</h3><textarea data-a="${k}" placeholder="${hint}"></textarea><div class="row"><button class="${cls||''}" data-a="${k}">${label}</button><span class="sent"></span></div></div>`;
+  doc.innerHTML=`<div id="reviewpage"><p><a href="?p=index">← Back to status</a></p><h1>${esc(v.title)}</h1><p class="meta">${v.url?`<a href="${esc(v.url)}">${esc((v.repo||'')+(v.issue?'#'+v.issue:'')||'source')}</a> · `:''}updated ${when(new Date(v.updated*1000))}</p><div class="plan">${marked.parse(v.markdown||'',{gfm:true})}</div><div class="actions">`+
+    act('approve','Approve','Optional notes for Alice…')+act('modify','Modify','What should change? (required)')+act('reject','Reject','Why? (optional)','reject')+'</div></div>';
+  doc.querySelectorAll('textarea').forEach(t=>t.addEventListener('input',()=>{replyOpen=[...doc.querySelectorAll('textarea')].some(x=>x.value)}));
+  doc.querySelectorAll('.act button').forEach(b=>b.onclick=async()=>{
+    const box=b.closest('.act'),ta=box.querySelector('textarea'),sm=box.querySelector('.sent'),a=b.dataset.a;
+    if(!KEY){sm.textContent='No key: open the link Alice sent once.';return}
+    if(a==='modify'&&!ta.value.trim()){sm.textContent='Say what to change first.';return}
+    if(a==='reject'&&!confirm('Reject this plan?'))return;
+    doc.querySelectorAll('.act button').forEach(x=>x.disabled=true);sm.textContent='Sending…';
+    try{const rr=await fetch('api/review-action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:KEY,slug:rslug,action:a,notes:ta.value})});
+      const j=await rr.json();
+      if(rr.ok){replyOpen=false;doc.querySelector('.actions').innerHTML=`<p class="sent">Sent: ${esc(a)}. Alice is on it. <a href="?p=index">Back to status</a></p>`;return}
+      sm.textContent='Error: '+(j.error||rr.status)}
+    catch(e){sm.textContent='Error: '+e.message}
+    doc.querySelectorAll('.act button').forEach(x=>x.disabled=false)});
+}
 async function load(){
   if(replyOpen&&page!=='chat')return;
+  if(page.startsWith('review-')){
+    try{
+      if(!reviewMounted)await mountReview();
+      document.getElementById('age').textContent='';
+      const pr=await fetch('pages.json?'+Date.now()).catch(()=>null);
+      if(pr&&pr.ok){PAGES=await pr.json();renderNav(PAGES)}
+      document.title='Alice — Review';
+    }catch(e){document.getElementById('doc').textContent='Could not load review ('+e.message+')'}
+    return;
+  }
   if(page==='chat'){
     try{
       const pr=await fetch('pages.json?'+Date.now()).catch(()=>null);
@@ -448,6 +493,7 @@ async function load(){
     document.querySelectorAll('#doc input[type=checkbox]').forEach(c=>c.disabled=true);
     markStaleSections();
     applyWaitingOrder();
+    try{const rv=await fetch('api/reviews?'+Date.now());REVIEWS=new Set(rv.ok?await rv.json():[])}catch(e){}
     await pollThreads();addReplies();makeDraggable();
     if(lm){const m=Math.round((Date.now()-new Date(lm))/60000);document.getElementById('age').textContent='updated '+(m<1?'just now':m<60?m+' min ago':Math.round(m/60)+' h ago')}
     try{const ar=await fetch('api/pages?'+Date.now());if(ar.ok)AVAIL=new Set(await ar.json())}catch(e){}
