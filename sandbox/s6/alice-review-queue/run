@@ -1,0 +1,65 @@
+#!/command/with-contenv bash
+# alice-review-queue — timer loop that runs the review_queue_renderer
+# script, which rewrites the ## Ready for Review section of the
+# status-site Overview from live GitHub state (open issues labelled
+# sm:design_review, open PRs that are non-draft + REVIEW_REQUIRED).
+#
+# Singleton via `flock -n` so a slow poll can't double-fire.
+#
+# Cadence is read from alice.config.json
+# `review_queue_renderer.poll_interval_seconds` on each cycle (live
+# reconfig, no restart needed). Default: 300s (5 min), floor 60s —
+# same shape as alice-gh-state-mirror / alice-gh-reconciler.
+#
+# Design: cortex-memory/designs/2026-11-05-issue622-ready-for-review-overview.md
+# Issue:  #622.
+set -e
+
+# Bind-mounted alice source must be on PYTHONPATH so
+# `python -m alice_forge.review_queue_renderer` resolves. Same pattern
+# as alice-gh-state-mirror.
+export PYTHONPATH=/home/alice/alice/src
+
+LOCK=/state/worker/review-queue.lock
+CONFIG_JSON=/home/alice/alice-mind/config/alice.config.json
+DEFAULT_INTERVAL=300
+
+mkdir -p "$(dirname "$LOCK")"
+touch "$LOCK"
+chown alice:alice "$LOCK" || true
+
+# Stagger startup so the renderer, mirror, reconciler, dispatcher,
+# and gh-watcher don't all wake up in lockstep when the worker boots.
+# 90s lands between gh-state-mirror (75s) and the longer-interval
+# services; matches the slot described in the design.
+sleep 90
+
+while true; do
+    interval="$DEFAULT_INTERVAL"
+    if [ -f "$CONFIG_JSON" ] && command -v jq >/dev/null 2>&1; then
+        v=$(jq -r '.review_queue_renderer.poll_interval_seconds // empty' "$CONFIG_JSON" 2>/dev/null || true)
+        case "$v" in
+            ''|*[!0-9]*) ;;
+            *) interval="$v" ;;
+        esac
+    fi
+    if [ "$interval" -lt 60 ]; then
+        # Polling faster than once a minute would burn rate limit and
+        # GitHub's secondary-rate-limit thresholds — same reasoning as
+        # alice-gh-state-mirror.
+        interval=60
+    fi
+
+    start_ts=$(date +%s)
+    # redirfd (execline) opens fd 2 after the privilege drop so the log
+    # file is owned by alice; shell `2>>` would open it as the
+    # supervising root shell.
+    flock -n "$LOCK" s6-setuidgid alice redirfd -a 2 /state/worker/review-queue-stderr.log \
+        /opt/alice-venv/bin/python -m alice_forge.review_queue_renderer || true
+    end_ts=$(date +%s)
+    elapsed=$(( end_ts - start_ts ))
+    remainder=$(( interval - elapsed ))
+    if [ "$remainder" -gt 0 ]; then
+        sleep "$remainder"
+    fi
+done
