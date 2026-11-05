@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# waiting-ask "text" | --resolve ID | --list — manage structured asks on the
+# status-site Waiting-on-you section (see docs/designs/status-site.md).
+#
+# Asks log: $STATUS_DIR/asks.jsonl, else $ALICE_MIND/inner/status/asks.jsonl,
+# else ~/alice-mind/inner/status/asks.jsonl. The Python implementation lives
+# in src/status_site/cli.py (main_waiting_ask); alice-tools/bin/waiting-ask
+# execs this wrapper so Speaking's PATH entry keeps working.
+
+set -u
+
+ALICE_SRC="${ALICE_SRC:-/home/alice/alice/src}"
+if [ ! -d "$ALICE_SRC/status_site" ]; then
+    ALICE_SRC="$(cd "$(dirname "$(readlink -f "$0")")/../src" && pwd)"
+fi
+PY="$(command -v python3)" || { echo "[waiting-ask] no python3 available" >&2; exit 2; }
+
+if [ -n "${PYTHONPATH-}" ]; then
+    export PYTHONPATH="$ALICE_SRC:$PYTHONPATH"
+else
+    export PYTHONPATH="$ALICE_SRC"
+fi
+
+exec "$PY" -c 'import sys; from status_site.cli import main_waiting_ask; sys.exit(main_waiting_ask())' "$@"

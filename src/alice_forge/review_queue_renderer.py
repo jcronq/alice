@@ -259,12 +259,46 @@ def _render_pr_line(item: PRItem) -> str:
     )
 
 
+def _default_description(agent_name: str) -> str:
+    """Italic intro line for the section. Takes the agent name as an
+    argument so the literal isn't baked into the module (which would
+    trip ``tests/test_no_hardcoded_personae_literals.py``); the name
+    is loaded from ``mind/personae.yml`` by the caller."""
+    return (
+        f"*Items that passed through {agent_name}'s pipeline and need "
+        "your sign-off. Live - updated every 5 min.*"
+    )
+
+
+def _load_agent_name() -> str:
+    """Resolve the agent's name from ``mind/personae.yml``. Falls back
+    to the placeholder persona on any error so the one-shot CLI
+    rendering still produces a reasonable description line."""
+    try:
+        from core.config.personae import load as _load, placeholder
+    except ImportError:
+        return "the agent"
+    mind_env = os.environ.get("ALICE_MIND") or os.path.expanduser("~/alice-mind")
+    try:
+        return _load(Path(mind_env)).agent.name
+    except Exception:  # noqa: BLE001
+        try:
+            return placeholder().agent.name
+        except Exception:  # noqa: BLE001
+            return "the agent"
+
+
 def render_section(
     design_items: Sequence[DesignItem],
     pr_items: Sequence[PRItem],
     code_items: Sequence[object] | None = None,
+    *,
+    agent_name: str | None = None,
 ) -> str:
     """Return the full ``## Ready for Review`` section markdown body.
+
+    ``agent_name`` is substituted into the intro line. Defaults to the
+    live personae value; tests pass a literal to keep output stable.
 
     The block ends with a trailing newline so :func:`replace_section`
     can splice it in without touching surrounding structure.
@@ -272,13 +306,13 @@ def render_section(
     # Code review is placeholder-only until sm:reviewing is wired up.
     _ = code_items  # reserved for future use; signature pinned
 
+    if agent_name is None:
+        agent_name = _load_agent_name()
+
     lines: list[str] = []
     lines.append("## Ready for Review")
     lines.append("")
-    lines.append(
-        "*Items that passed through Alice's pipeline and need your "
-        "sign-off. Live — updated every 5 min.*"
-    )
+    lines.append(_default_description(agent_name))
     lines.append("")
 
     lines.append("### Design review")

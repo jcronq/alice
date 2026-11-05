@@ -51,6 +51,17 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from status_site.history import Tracker, read_history
+from status_site.sources import (
+    done_today as _done_today,
+    known_issues as _known_issues,
+    review_queue as _review_queue,
+    running_now as _running_now,
+    waiting_on_you as _waiting_on_you,
+)
+from status_site.sources.common import (
+    asks_path as _asks_path,
+    read_asks as _read_asks,
+)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC_FILES = {"index.html", "marked.min.js"}
@@ -143,6 +154,12 @@ class Config:
     public_url: str = "http://10.20.30.177:8095"
     max_upload: int = 25 * 1024 * 1024
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # Set at boot by ``main()`` after ``make_server``. Holds the
+    # background TTL-cache + pollers for the expensive overview
+    # sources; the ``/index.md`` handler reads through this when
+    # present and renders a "nothing yet" state when not (tests spin
+    # up the server without background threads).
+    pollers: "OverviewPollers | None" = field(default=None, repr=False)
 
     @property
     def threads_dir(self) -> Path:
@@ -1047,18 +1064,332 @@ def _splice_sections(body: str, sections: Iterable[SpliceSection]) -> str:
 ALICE_QUEUE_START = "<!-- alice-queue:start -->"
 ALICE_QUEUE_END = "<!-- alice-queue:end -->"
 
+RUNNING_NOW_START = "<!-- running-now:start -->"
+RUNNING_NOW_END = "<!-- running-now:end -->"
+
+READY_FOR_REVIEW_START = "<!-- ready-for-review:start -->"
+READY_FOR_REVIEW_END = "<!-- ready-for-review:end -->"
+
+WAITING_ON_YOU_START = "<!-- waiting-on-you:start -->"
+WAITING_ON_YOU_END = "<!-- waiting-on-you:end -->"
+
+DONE_TODAY_START = "<!-- done-today:start -->"
+DONE_TODAY_END = "<!-- done-today:end -->"
+
+KNOWN_ISSUES_START = "<!-- known-issues:start -->"
+KNOWN_ISSUES_END = "<!-- known-issues:end -->"
+
+
+def _agent_name() -> str:
+    """Resolve the agent's name from ``mind/personae.yml``.
+
+    Kept out of module scope + a no-literal implementation on purpose:
+    ``tests/test_no_hardcoded_personae_literals.py`` forbids the
+    string ``"Alice"`` appearing as a literal in ``src/`` outside its
+    small allowlist. Reading the name from the config lets the heading
+    ("Alice's queue") stay live without hardcoding it here.
+
+    Fall back to the placeholder personae on any failure (missing
+    file, YAML/import error, malformed data) so the fallback-append
+    path still produces a reasonable heading when the mind isn't yet
+    bootstrapped.
+    """
+    try:
+        from core.config.personae import load as _load, placeholder
+    except ImportError:
+        return "the agent"
+    mind = Path(os.environ.get("ALICE_MIND", os.path.expanduser("~/alice-mind")))
+    try:
+        return _load(mind).agent.name
+    except Exception:  # noqa: BLE001  — any failure → placeholder
+        try:
+            return placeholder().agent.name
+        except Exception:  # noqa: BLE001
+            return "the agent"
+
 
 def _alice_queue_fallback(rendered: str) -> str:
     """Appended-section shape when the index.md markers are missing.
 
     Includes the heading + markers so the fallback is a complete
     self-contained section (the deploy stays readable while the mind
-    repo edit catches up).
+    repo edit catches up). The heading text is derived from
+    :func:`_agent_name` — see that function's docstring for why.
     """
+    heading = f"\n## {_agent_name()}'s queue\n"
     return (
-        "\n## Alice's queue\n"
+        f"{heading}"
         f"{ALICE_QUEUE_START}\n{rendered}\n{ALICE_QUEUE_END}\n"
     )
+
+
+def _running_now_fallback(rendered: str) -> str:
+    return (
+        "\n## Running now\n"
+        f"{RUNNING_NOW_START}\n{rendered}\n{RUNNING_NOW_END}\n"
+    )
+
+
+def _ready_for_review_fallback(rendered: str) -> str:
+    return (
+        "\n## Ready for Review\n"
+        f"{READY_FOR_REVIEW_START}\n{rendered}\n{READY_FOR_REVIEW_END}\n"
+    )
+
+
+def _waiting_on_you_fallback(rendered: str) -> str:
+    return (
+        "\n## Waiting on you\n"
+        f"{WAITING_ON_YOU_START}\n{rendered}\n{WAITING_ON_YOU_END}\n"
+    )
+
+
+def _done_today_fallback(rendered: str) -> str:
+    return (
+        "\n## Done today\n"
+        f"{DONE_TODAY_START}\n{rendered}\n{DONE_TODAY_END}\n"
+    )
+
+
+def _known_issues_fallback(rendered: str) -> str:
+    return (
+        "\n## Known issues I'm on\n"
+        f"{KNOWN_ISSUES_START}\n{rendered}\n{KNOWN_ISSUES_END}\n"
+    )
+
+
+# ───────────────────────── Overview TTL cache ───────────────────────
+#
+# Expensive sources (``gh pr/issue list``, ``ps aux``, worktree scans)
+# get their own background poll thread; the cache dict is read inline
+# by the ``/index.md`` handler so the response never waits on the
+# network. Cheap sources (hand-edit file reads, local-file globs) are
+# fetched inline and skip the cache.
+
+# Default poll intervals (seconds). Pollers for the gh-backed sources
+# share the ``review_queue_renderer.poll_interval_seconds`` key (added
+# by #622); the running-now source polls faster because it just reads
+# local state.
+DEFAULT_REVIEW_POLL_SECONDS = 300
+DEFAULT_RUNNING_NOW_POLL_SECONDS = 15
+DEFAULT_DONE_TODAY_POLL_SECONDS = 300
+
+
+@dataclass
+class _CachedValue:
+    value: object
+    fetched_at: float
+
+
+class OverviewPollers:
+    """Background threads that keep expensive section renders fresh.
+
+    One thread per expensive source. Each thread calls its fetch
+    function on ``interval`` cadence and stores the result in a dict
+    protected by ``cfg.lock`` (shared with the item-history tracker
+    so writers don't race against each other).
+
+    The server's ``/index.md`` handler reads the cache without
+    blocking. The first ``interval`` seconds after boot the cache is
+    empty — renderers degrade to their "nothing yet" string so the
+    page is still serveable.
+    """
+
+    def __init__(
+        self,
+        cfg: "Config",
+        *,
+        review_poll: float = DEFAULT_REVIEW_POLL_SECONDS,
+        running_now_poll: float = DEFAULT_RUNNING_NOW_POLL_SECONDS,
+        done_today_poll: float = DEFAULT_DONE_TODAY_POLL_SECONDS,
+        stop: threading.Event | None = None,
+    ):
+        self.cfg = cfg
+        self._cache: dict[str, _CachedValue] = {}
+        self._review_poll = review_poll
+        self._running_now_poll = running_now_poll
+        self._done_today_poll = done_today_poll
+        self.stop = stop or threading.Event()
+        self._threads: list[threading.Thread] = []
+
+    # ── cache accessors ─────────────────────────────────────────
+    def get(self, key: str) -> object | None:
+        with self.cfg.lock:
+            entry = self._cache.get(key)
+        return entry.value if entry else None
+
+    def _set(self, key: str, value: object) -> None:
+        with self.cfg.lock:
+            self._cache[key] = _CachedValue(value=value, fetched_at=time.time())
+
+    # ── background loops ────────────────────────────────────────
+    def _loop_running_now(self) -> None:
+        repo_dir = _running_now.repo_dir_from_env()
+        tasks_dir = (
+            Path(os.environ.get("ALICE_MIND", os.path.expanduser("~/alice-mind")))
+            / "inner"
+            / "tasks"
+        )
+        while not self.stop.is_set():
+            try:
+                worktrees = _running_now.parse_worktrees(
+                    _running_now.read_worktree_output(repo_dir)
+                )
+                ps_output = _running_now.read_ps_output()
+                logs = _running_now.read_build_logs()
+                task_records = _running_now.collect_task_records(tasks_dir)
+                rows = _running_now.build_running_tasks(
+                    worktrees, ps_output, logs, task_records
+                )
+                # Newest first by elapsed-start proxy: shortest-elapsed
+                # first is more intuitive ("just started" above
+                # "running for 2h"). Kept stable for the renderer.
+                rows.sort(key=lambda r: r.elapsed)
+                self._set("running_now", rows)
+            except Exception as e:  # noqa: BLE001
+                print(f"status_site: running_now poll failed: {e!r}", flush=True)
+            self.stop.wait(self._running_now_poll)
+
+    def _loop_review_queue(self) -> None:
+        while not self.stop.is_set():
+            try:
+                design, prs, d_failed, p_failed = _review_queue.fetch()
+                self._set(
+                    "review_queue",
+                    {
+                        "design": design,
+                        "pr": prs,
+                        "design_failed": d_failed,
+                        "pr_failed": p_failed,
+                    },
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"status_site: review_queue poll failed: {e!r}", flush=True)
+            self.stop.wait(self._review_poll)
+
+    def _loop_done_today(self) -> None:
+        while not self.stop.is_set():
+            try:
+                repos = _done_today.repos_pr_from_config()
+                today = _done_today.today_local()
+                prs, failed = _done_today.fetch_merged_prs(repos, today=today)
+                self._set(
+                    "done_today",
+                    {"prs": prs, "today": today, "failed": failed},
+                )
+                # Day-roll: cheap no-op when sentinel matches today.
+                try:
+                    _done_today.roll_day(
+                        self.cfg.status_dir,
+                        today=today,
+                        load_prs=lambda d, repos=repos: _done_today.fetch_merged_prs(
+                            repos, today=d
+                        )[0],
+                        load_asks=lambda d: _done_today.resolved_today(
+                            _read_asks(_asks_path(self.cfg.status_dir)), d
+                        ),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    print(f"status_site: done_today roll failed: {e!r}", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"status_site: done_today poll failed: {e!r}", flush=True)
+            self.stop.wait(self._done_today_poll)
+
+    def start(self) -> None:
+        for name, target in (
+            ("running-now-poll", self._loop_running_now),
+            ("review-queue-poll", self._loop_review_queue),
+            ("done-today-poll", self._loop_done_today),
+        ):
+            t = threading.Thread(target=target, name=name, daemon=True)
+            t.start()
+            self._threads.append(t)
+
+
+def overview_splice_sections(
+    cfg: "Config",
+    *,
+    items: list[dict],
+    now: float,
+) -> list[tuple]:
+    """Build the ``_splice_sections`` list for ``GET /index.md``.
+
+    Order mirrors the Overview as it appears on the page:
+    Running now → Ready for Review → Waiting on you → Alice's queue →
+    Done today → Known issues I'm on. Each tuple carries sentinel
+    markers, a renderer closure, and a fallback builder so the
+    append-case keeps the page serveable while the mind repo catches
+    up on the marker-insertion pass.
+    """
+    pollers = cfg.pollers
+    # Running now — read cache; empty list is the "nothing yet" state.
+    def _render_running_now() -> str:
+        rows = (pollers.get("running_now") if pollers else None) or []
+        return _running_now.render(rows)
+
+    def _render_ready_for_review() -> str:
+        cached = (pollers.get("review_queue") if pollers else None) or {}
+        return _review_queue.render(
+            cached.get("design", []),
+            cached.get("pr", []),
+            design_failed=cached.get("design_failed", []),
+            pr_failed=cached.get("pr_failed", []),
+        )
+
+    def _render_waiting_on_you() -> str:
+        return _waiting_on_you.render(
+            cfg.status_dir / "waiting-on-you.md",
+            asks_path=_asks_path(cfg.status_dir),
+        )
+
+    def _render_done_today() -> str:
+        cached = (pollers.get("done_today") if pollers else None) or {}
+        today = cached.get("today") or _done_today.today_local()
+        asks = _read_asks(_asks_path(cfg.status_dir))
+        resolved = _done_today.resolved_today(asks, today)
+        return _done_today.render(cached.get("prs", []), resolved)
+
+    def _render_known_issues() -> str:
+        return _known_issues.render(cfg.status_dir / "known-issues.md")
+
+    return [
+        (
+            RUNNING_NOW_START,
+            RUNNING_NOW_END,
+            _render_running_now,
+            _running_now_fallback,
+        ),
+        (
+            READY_FOR_REVIEW_START,
+            READY_FOR_REVIEW_END,
+            _render_ready_for_review,
+            _ready_for_review_fallback,
+        ),
+        (
+            WAITING_ON_YOU_START,
+            WAITING_ON_YOU_END,
+            _render_waiting_on_you,
+            _waiting_on_you_fallback,
+        ),
+        (
+            ALICE_QUEUE_START,
+            ALICE_QUEUE_END,
+            lambda: render_alice_queue(items, now=now),
+            _alice_queue_fallback,
+        ),
+        (
+            DONE_TODAY_START,
+            DONE_TODAY_END,
+            _render_done_today,
+            _done_today_fallback,
+        ),
+        (
+            KNOWN_ISSUES_START,
+            KNOWN_ISSUES_END,
+            _render_known_issues,
+            _known_issues_fallback,
+        ),
+    ]
 
 
 def surfaces_api_payload(
@@ -1298,17 +1629,10 @@ class Handler(BaseHTTPRequestHandler):
                     (float(it["mtime"]) for it in items), default=0.0
                 )
                 now = time.time()
-                rendered = _splice_sections(
-                    source,
-                    [
-                        (
-                            ALICE_QUEUE_START,
-                            ALICE_QUEUE_END,
-                            lambda: render_alice_queue(items, now=now),
-                            _alice_queue_fallback,
-                        ),
-                    ],
+                sections = overview_splice_sections(
+                    self.cfg, items=items, now=now
                 )
+                rendered = _splice_sections(source, sections)
                 mtime = max(file_mtime, newest)
                 return self._send(
                     200,
@@ -1385,6 +1709,29 @@ def main() -> None:
         Tracker(cfg.status_dir, cfg.lock).start(
             float(os.environ.get("ITEM_HISTORY_INTERVAL", "10"))
         )
+    if os.environ.get("OVERVIEW_POLLERS", "1") != "0":
+        pollers = OverviewPollers(
+            cfg,
+            review_poll=float(
+                os.environ.get(
+                    "REVIEW_POLL_SECONDS", str(DEFAULT_REVIEW_POLL_SECONDS)
+                )
+            ),
+            running_now_poll=float(
+                os.environ.get(
+                    "RUNNING_NOW_POLL_SECONDS",
+                    str(DEFAULT_RUNNING_NOW_POLL_SECONDS),
+                )
+            ),
+            done_today_poll=float(
+                os.environ.get(
+                    "DONE_TODAY_POLL_SECONDS",
+                    str(DEFAULT_DONE_TODAY_POLL_SECONDS),
+                )
+            ),
+        )
+        cfg.pollers = pollers
+        pollers.start()
     print(f"status_site: serving {cfg.status_dir} on {cfg.host}:{cfg.port}", flush=True)
     srv.serve_forever()
 

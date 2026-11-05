@@ -15,6 +15,9 @@ header a.on{color:var(--bg);background:var(--accent);border-color:var(--accent)}
 #age{margin-left:auto;color:var(--muted);font-size:.8rem}
 main{max-width:860px;margin:0 auto;padding:1rem 1rem 4rem}
 h1{font-size:1.5rem;margin:.6rem 0}h2{font-size:1.15rem;margin:1.6rem 0 .5rem;padding-bottom:.25rem;border-bottom:1px solid var(--line)}h3{font-size:1rem}
+h2.stale{color:#c0392b;border-bottom-color:#c0392b}
+@media (prefers-color-scheme:dark){h2.stale{color:#f5766a;border-bottom-color:#f5766a}}
+em.stale-footer{display:block;font-size:.78em;opacity:.65;margin-top:.1rem}
 ul{padding-left:1.2rem}li{margin:.2rem 0}
 li:has(> input[type=checkbox]){list-style:none;margin-left:-1.2rem;padding:.45rem .7rem;background:var(--card);border:1px solid var(--line);border-radius:8px;margin-bottom:.35rem}
 li:has(> input:checked){color:var(--muted)}
@@ -356,6 +359,37 @@ function mountChat(){
   send.onclick=submit;
   ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();submit()}});
 }
+// Staleness tint: every spliced section renderer ends its body with an
+// italic ``*last_rendered: <iso> · source: <name>*`` line. Find those,
+// parse the timestamp, and add a .stale class to the h2 above when
+// the delta exceeds STALE_MS.
+const STALE_MS=30*1000;
+function markStaleSections(){
+  const doc=document.getElementById('doc');
+  if(!doc)return;
+  const now=Date.now();
+  // The parser renders the italic line as a trailing <em> inside the
+  // <p> that immediately precedes the next <h2> (or EOF). Walk every
+  // <em> and keep the ones whose text starts with "last_rendered:".
+  doc.querySelectorAll('em').forEach(em=>{
+    const txt=(em.textContent||'').trim();
+    if(!/^last_rendered:/.test(txt))return;
+    em.classList.add('stale-footer');
+    const m=txt.match(/^last_rendered:\s*(\S+)/);
+    if(!m)return;
+    const t=Date.parse(m[1]);
+    if(!isFinite(t))return;
+    if(now-t<=STALE_MS)return;
+    // Walk back to the nearest preceding <h2>.
+    let n=em;
+    while(n&&n.previousElementSibling==null&&n.parentElement)n=n.parentElement;
+    while(n){
+      n=n.previousElementSibling||(n.parentElement&&n.parentElement.previousElementSibling);
+      if(!n)break;
+      if(n.tagName==='H2'){n.classList.add('stale');break}
+    }
+  });
+}
 async function load(){
   if(replyOpen&&page!=='chat')return;
   if(page==='chat'){
@@ -377,6 +411,7 @@ async function load(){
     const lm=r.headers.get('last-modified');
     document.getElementById('doc').innerHTML=marked.parse(await r.text(),{gfm:true});
     document.querySelectorAll('#doc input[type=checkbox]').forEach(c=>c.disabled=true);
+    markStaleSections();
     applyWaitingOrder();
     await pollThreads();addReplies();makeDraggable();
     if(lm){const m=Math.round((Date.now()-new Date(lm))/60000);document.getElementById('age').textContent='updated '+(m<1?'just now':m<60?m+' min ago':Math.round(m/60)+' h ago')}
