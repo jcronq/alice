@@ -19,7 +19,8 @@ Stdlib-only (runs on a bare ``python:3.12-alpine`` image). Routes:
                                           ``type: status-reply`` surface into SURFACE_DIR
                                           so Speaking gets a turn.
     POST /api/chat                        Jason's reply on the general Chat tab (shared-key auth):
-                                          appends to ``.chat.jsonl`` and drops a
+                                          appends to ``.chat.jsonl`` (attachments stored under
+                                          ``UPLOAD_DIR/chat/<date>/``, same rules as /api/reply) and drops a
                                           ``type: status-chat`` surface into SURFACE_DIR
                                           (no thread/item context — just the message).
 
@@ -61,6 +62,14 @@ CONTENT_TYPES = {
 }
 
 MAX_FILES = 5
+MAX_PER_FILE = 10 * 1024 * 1024
+MIME_ALLOWLIST = (
+    "image/*",
+    "text/*",
+    "application/pdf",
+    "application/json",
+    "application/zip",
+)
 MAX_TEXT = 8000
 MAX_ITEM = 500
 # How many chat messages /api/chat returns, newest-at-end.
@@ -213,9 +222,73 @@ def append_chat(cfg: Config, message: dict) -> None:
         f.write(json.dumps(message) + "\n")
 
 
-def render_chat_surface(cfg: Config, *, text: str, prior: list[dict]) -> str:
+class ReplyError(Exception):
+    def __init__(self, code: int, msg: str):
+        super().__init__(msg)
+        self.code = code
+        self.msg = msg
+
+
+def mime_allowed(name: str) -> bool:
+    mime = mimetypes.guess_type(name)[0]
+    if not mime:
+        return False
+    return any(
+        mime == pat or (pat.endswith("/*") and mime.startswith(pat[:-1]))
+        for pat in MIME_ALLOWLIST
+    )
+
+
+def ingest_attachments(cfg: Config, raw_files: object, subdir: str) -> list[dict]:
+    """Decode, validate and store base64 attachments under ``UPLOAD_DIR/<subdir>``.
+
+    Every file is validated before any is written. Returns
+    ``[{name, path, bytes}]`` where ``path`` is the Speaking-visible alias.
+    Callers hold ``cfg.lock``. Raises ReplyError on client errors.
+    """
+    if raw_files is None:
+        raw_files = []
+    if not isinstance(raw_files, list):
+        raise ReplyError(400, "bad attachment")
+    if len(raw_files) > MAX_FILES:
+        raise ReplyError(413, f"at most {MAX_FILES} attachments")
+    cap = min(MAX_PER_FILE, cfg.max_upload)
+    blobs = []
+    for a in raw_files:
+        if not isinstance(a, dict):
+            raise ReplyError(400, "bad attachment")
+        name = safe_filename(a.get("name"))
+        try:
+            blob = base64.b64decode(str(a.get("data", "")), validate=True)
+        except (ValueError, binascii.Error):
+            raise ReplyError(400, "bad attachment") from None
+        if len(blob) > cap:
+            raise ReplyError(413, f"{name} over {cap // (1024 * 1024)} MB")
+        if not mime_allowed(name):
+            raise ReplyError(415, f"{name}: file type not allowed")
+        blobs.append((name, blob))
+
+    files = []
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for i, (name, blob) in enumerate(blobs):
+        ddir = cfg.upload_dir / subdir
+        ddir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path = ddir / f"{stamp}-{i}-{name}"
+        with open(path, "xb") as f:
+            f.write(blob)
+        alias = os.path.join(
+            cfg.upload_dir_alias, os.path.relpath(path, cfg.upload_dir)
+        )
+        files.append({"name": name, "path": alias, "bytes": len(blob)})
+    return files
+
+
+def render_chat_surface(
+    cfg: Config, *, text: str, prior: list[dict], files: list[dict] | None = None
+) -> str:
     """Build the ``type: status-chat`` surface document (no thread/item fields)."""
     tail = "\n".join(f"  {m.get('from')}: {m.get('text')}" for m in prior)
+    attached = "\n".join(f"  {x['path']} ({x['bytes']} bytes)" for x in files or [])
     return f"""---
 priority: action
 type: status-chat
@@ -228,7 +301,10 @@ page: chat
 # Jason sent a message on the Chat tab
 
 His new message:
-{text}
+{text or "(no text: attachment only)"}
+
+Attachments (Read them; stored privately, not served):
+{attached or "  none"}
 
 Recent chat (for context, last {CHAT_SURFACE_TAIL} lines before this message):
 {tail or "  (none: this is the first message)"}
@@ -241,7 +317,7 @@ Recent chat (for context, last {CHAT_SURFACE_TAIL} lines before this message):
 def handle_chat(cfg: Config, d: dict) -> dict:
     """Validate + persist one chat message. Raises ReplyError on client errors.
 
-    Mirrors ``handle_reply`` but with no thread, item, or attachments: the Chat
+    Mirrors ``handle_reply`` but with no thread or item: the Chat
     tab is a single running log Jason uses when there's no todo item to anchor
     the conversation to.
     """
@@ -250,14 +326,24 @@ def handle_chat(cfg: Config, d: dict) -> dict:
     if not hmac.compare_digest(str(d.get("key", "")).encode(), cfg.key.encode()):
         raise ReplyError(403, "bad key")
     text = str(d.get("text", "")).strip()[:MAX_TEXT]
-    if not text:
+    raw_files = d.get("files") or []
+    if not text and not raw_files:
         raise ReplyError(400, "empty message")
 
     with cfg.lock:
+        files = ingest_attachments(cfg, raw_files, f"chat/{time.strftime('%Y-%m-%d')}")
         prior = read_chat(cfg)[-CHAT_SURFACE_TAIL:]
-        append_chat(cfg, {"from": "jason", "at": now_iso(), "text": text})
+        append_chat(
+            cfg,
+            {
+                "from": "jason",
+                "at": now_iso(),
+                "text": text,
+                "files": [x["name"] for x in files],
+            },
+        )
 
-        doc = render_chat_surface(cfg, text=text, prior=prior)
+        doc = render_chat_surface(cfg, text=text, prior=prior, files=files)
         cfg.surface_dir.mkdir(parents=True, exist_ok=True)
         fname = f"{time.strftime('%Y-%m-%dT%H-%M-%S')}-status-chat.md"
         tmp = cfg.surface_dir / f".tmp-chat-{os.getpid()}-{time.time_ns()}"
@@ -314,13 +400,6 @@ Attachments (Read them; stored privately, not served):
 """
 
 
-class ReplyError(Exception):
-    def __init__(self, code: int, msg: str):
-        super().__init__(msg)
-        self.code = code
-        self.msg = msg
-
-
 def handle_reply(cfg: Config, d: dict) -> dict:
     """Validate + persist one reply. Raises ReplyError on client errors."""
     if not isinstance(d, dict):
@@ -335,38 +414,11 @@ def handle_reply(cfg: Config, d: dict) -> dict:
     )
 
     raw_files = d.get("files") or []
-    if not isinstance(raw_files, list):
-        raise ReplyError(400, "bad attachment")
-    if len(raw_files) > MAX_FILES:
-        raise ReplyError(413, f"at most {MAX_FILES} attachments")
-    blobs = []
-    for a in raw_files:
-        if not isinstance(a, dict):
-            raise ReplyError(400, "bad attachment")
-        name = safe_filename(a.get("name"))
-        try:
-            blob = base64.b64decode(str(a.get("data", "")), validate=True)
-        except (ValueError, binascii.Error):
-            raise ReplyError(400, "bad attachment") from None
-        if len(blob) > cfg.max_upload:
-            raise ReplyError(413, f"{name} over {cfg.max_upload // (1024 * 1024)} MB")
-        blobs.append((name, blob))
-    if not text and not blobs:
+    if not text and not raw_files:
         raise ReplyError(400, "empty reply")
 
     with cfg.lock:
-        files = []
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        for i, (name, blob) in enumerate(blobs):
-            ddir = cfg.upload_dir / tid
-            ddir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            path = ddir / f"{stamp}-{i}-{name}"
-            with open(path, "xb") as f:
-                f.write(blob)
-            alias = os.path.join(
-                cfg.upload_dir_alias, os.path.relpath(path, cfg.upload_dir)
-            )
-            files.append({"name": name, "path": alias, "bytes": len(blob)})
+        files = ingest_attachments(cfg, raw_files, tid)
 
         prior = read_threads(cfg).get(tid, [])[-12:]
         append_thread(
