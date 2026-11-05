@@ -43,7 +43,7 @@ Content (mind dir, never committed; host `…/mind/inner/`, container `/srv/*`):
 |------|-----|------|
 | `inner/status/` | `STATUS_DIR` | `index.md` and other `<page>.md`, `pages.json` (nav: `[{"slug","title"}]`), `threads/<id>.jsonl`, `.replies.jsonl` (audit log of Jason's replies) |
 | `inner/status-uploads/<thread>/` | `UPLOAD_DIR` | Attachments, `YYYYmmdd-HHMMSS-<n>-<name>`, dir mode 0700 |
-| `inner/surface/` | `SURFACE_DIR` | Where `status-reply` surfaces land |
+| `inner/surface/` | `SURFACE_DIR` | Where `status-reply` / `status-chat` surfaces land. Also scanned at request time for the **Alice's queue** section on `/index.md` — flat `*.md` files are the "pending my attention" list; resolved surfaces move to `.handled/<date>/` and drop out naturally. The server splices the rendered list into `index.md` between `<!-- alice-queue:start -->` / `<!-- alice-queue:end -->` sentinels; if the markers aren't present the section is appended to the served body (nothing is written to disk). |
 | `inner/status-server/key` | `KEY_FILE` | Shared reply key (single line) |
 
 Other env: `PORT` (8095), `HOST` (0.0.0.0), `UPLOAD_DIR_ALIAS` (the upload dir as
@@ -61,8 +61,10 @@ versions), the server uses the text before the first `:` of `item`, then
 | Route | Auth | Notes |
 |-------|------|-------|
 | `GET /`, `/index.html`, `/marked.min.js` | none | Packaged static assets |
+| `GET /index.md` | none | Live render: the on-disk `index.md` with the **Alice's queue** section spliced in (flat `inner/surface/*.md` surfaces as labels / ages / links, cap 10, `+N more` link into `/api/surfaces`). `Last-Modified = max(index.md mtime, newest surface mtime)`. |
 | `GET /<name>.(md\|json\|png\|jpg\|jpeg\|gif\|webp\|txt)` | none | Top-level files in `STATUS_DIR` only. The name must match `[A-Za-z0-9][A-Za-z0-9_-]*` before the extension |
 | `GET /api/threads` | none | `{thread_id: [message, …]}` |
+| `GET /api/surfaces` | none | `{"count": N, "surfaces": [{slug, type, source, created, age_seconds, link?}, …]}` — full unresolved-surface list oldest-first, no cap, no bodies, no attachment paths. Backs the "full list" link that the Alice's queue section shows on overflow. |
 | `POST /api/reply` | key | JSON `{key, item, thread?, text, page, files?: [{name, data(base64)}]}` → `{ok, thread}` |
 
 Everything else returns 404. The server never serves dotfiles, `threads/`,

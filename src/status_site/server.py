@@ -42,6 +42,7 @@ import os
 import re
 import threading
 import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import formatdate
@@ -751,6 +752,343 @@ def render_bugs_md(status_dir: Path) -> tuple[str, float]:
     return "\n".join(parts), max_mtime
 
 
+# ---------------------------------------------------------------- Alice's queue
+#
+# Live render of unresolved surfaces in ``inner/surface/*.md``. Scanned at
+# request time from the bind-mounted directory; splices into ``index.md``
+# between sentinel markers so Overview shows what's pending my attention. See
+# docs/designs/status-site.md and the design note under
+# ``cortex-memory/designs/2026-11-05-issue621-alice-queue-live-render.md``.
+
+# Cap of lines rendered in the Overview section. Overflow collapses into
+# a single "+N more" line linking the full JSON list. Env override (rarely
+# useful, but keeps the knob accessible) via ``ALICE_QUEUE_MAX``.
+QUEUE_CAP = 10
+
+# Surface filename prefix: ``YYYY-mm-ddTHH-MM-SS-<slug>.md``. Writers
+# (handle_chat / handle_reply / gh-watcher) all agree on this shape.
+SURFACE_NAME_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-(.+)\.md$"
+)
+
+# Markdown metacharacters escaped in user-derived slugs before they land
+# in the rendered body. Covers the set that can actually damage the
+# render (bold/italic/links/code); whitespace is intentionally untouched.
+_MD_META_RE = re.compile(r"([\\*_\[\]()`])")
+
+# Parses ``github-<owner>-<repo>-issue<N>`` out of a filename slug or
+# ``detail:`` field (stage-b-unclassified gh-watcher notes). Owner/repo
+# charset matches GitHub's; the full match is anchored on word boundaries
+# so it won't eat trailing suffixes.
+GITHUB_ISSUE_RE = re.compile(
+    r"github-([A-Za-z0-9._-]+?)-([A-Za-z0-9._-]+?)-issue(\d+)"
+)
+
+
+def _queue_cap() -> int:
+    """QUEUE_CAP, overridable at request time via ``ALICE_QUEUE_MAX``."""
+    raw = os.environ.get("ALICE_QUEUE_MAX", "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    return QUEUE_CAP
+
+
+def _md_escape(text: str) -> str:
+    """Backslash-escape markdown metacharacters in ``text``.
+
+    Applied to user-derived slugs (reply item slugs, stage-b note names)
+    before they are rendered inline so ``*`` / ``[`` / etc. can't break
+    the surrounding bold/link syntax.
+    """
+    return _MD_META_RE.sub(r"\\\1", text)
+
+
+def format_age(seconds: float) -> str:
+    """Human age: ``45s`` / ``12m`` / ``3h 4m`` / ``2d 5h``.
+
+    Omits the zero sub-unit on the ``h`` / ``d`` forms so a clean 3-hour
+    item reads ``3h`` instead of ``3h 0m``. Negative inputs (clock skew)
+    are clamped to zero.
+    """
+    s = int(max(0.0, seconds))
+    if s < 60:
+        return f"{s}s"
+    m, _ = divmod(s, 60)
+    if m < 60:
+        return f"{m}m"
+    h, rem_m = divmod(m, 60)
+    if h < 24:
+        return f"{h}h {rem_m}m" if rem_m else f"{h}h"
+    d, rem_h = divmod(h, 24)
+    return f"{d}d {rem_h}h" if rem_h else f"{d}d"
+
+
+def scan_surfaces(surface_dir: Path) -> list[dict]:
+    """Scan flat ``*.md`` surfaces under ``surface_dir`` (oldest first).
+
+    Resolved surfaces live under ``.handled/<date>/`` and are naturally
+    excluded by the flat glob; in-flight ``.tmp-*`` writers and
+    ``.gitkeep`` are dotfiles the glob also skips.
+
+    Returns a list of dicts with: ``slug`` (filename stem minus timestamp
+    prefix), ``type`` / ``source`` / ``page`` / ``thread`` / ``detail``
+    (from frontmatter, empty string when absent), ``created`` (ISO local,
+    second precision), ``created_epoch`` (float; used for sort + age
+    math), ``path`` (Path), ``mtime`` (float).
+
+    Per-file errors (unreadable file, parse failure) are skipped silently
+    so one bad surface can't 500 the whole scan.
+    """
+    out: list[dict] = []
+    if not surface_dir.is_dir():
+        return out
+    for p in surface_dir.glob("*.md"):
+        # Belt-and-suspenders dotfile skip: ``Path.glob`` matched hidden
+        # names on Python 3.14 even for patterns that start with ``*``,
+        # so ``.tmp-reply-….md`` writers in flight would otherwise sneak
+        # in. ``.handled/`` is still excluded by ``glob`` because it's a
+        # directory, not a file match.
+        if p.name.startswith("."):
+            continue
+        try:
+            st = p.stat()
+            text = p.read_text(errors="replace")
+        except OSError:
+            continue
+        m = SURFACE_NAME_RE.match(p.name)
+        if m:
+            try:
+                dt = datetime.strptime(m.group(1), "%Y-%m-%dT%H-%M-%S")
+            except ValueError:
+                dt = datetime.fromtimestamp(st.st_mtime)
+            slug = m.group(2)
+        else:
+            dt = datetime.fromtimestamp(st.st_mtime)
+            slug = p.stem
+        try:
+            fm, _ = parse_frontmatter(text)
+        except Exception:
+            fm = {}
+        out.append(
+            {
+                "slug": slug,
+                "type": (fm.get("type") or "").strip(),
+                "source": (fm.get("source") or "").strip(),
+                "page": (fm.get("page") or "").strip(),
+                "thread": (fm.get("thread") or "").strip(),
+                "detail": (fm.get("detail") or "").strip(),
+                "created": dt.isoformat(timespec="seconds"),
+                "created_epoch": dt.timestamp(),
+                "path": p,
+                "mtime": st.st_mtime,
+            }
+        )
+    out.sort(key=lambda it: it["created_epoch"])
+    return out
+
+
+def _surface_link_url(item: dict) -> str:
+    """Bare URL for the surface's source, or ``""`` when nothing fits.
+
+    Precedence: ``status-reply`` + non-empty ``page`` → page query;
+    ``status-chat`` → chat query; otherwise look for a
+    ``github-<owner>-<repo>-issue<N>`` marker in the filename slug or
+    ``detail:`` field.
+    """
+    t = item.get("type", "")
+    if t == "status-reply":
+        page = item.get("page", "")
+        if page:
+            return f"?p={page}"
+    elif t == "status-chat":
+        return "?p=chat"
+    for src in (item.get("slug", ""), item.get("detail", "")):
+        if not src:
+            continue
+        m = GITHUB_ISSUE_RE.search(src)
+        if m:
+            owner, repo, n = m.group(1), m.group(2), m.group(3)
+            return f"https://github.com/{owner}/{repo}/issues/{n}"
+    return ""
+
+
+def _surface_link_md(item: dict) -> str:
+    """Markdown link for the surface, or ``""`` when there is none."""
+    t = item.get("type", "")
+    if t == "status-reply":
+        page = item.get("page", "")
+        if page:
+            return f"[{page}](?p={page})"
+    elif t == "status-chat":
+        return "[open chat](?p=chat)"
+    for src in (item.get("slug", ""), item.get("detail", "")):
+        if not src:
+            continue
+        m = GITHUB_ISSUE_RE.search(src)
+        if m:
+            owner, repo, n = m.group(1), m.group(2), m.group(3)
+            return f"[issue #{n}](https://github.com/{owner}/{repo}/issues/{n})"
+    return ""
+
+
+def _surface_label(item: dict) -> str:
+    """Section label: ``chat`` / ``reply: <slug>`` / ``<type>``.
+
+    Slugs are markdown-escaped before being spliced into the bold span.
+    """
+    t = item.get("type") or "unknown"
+    if t == "status-chat":
+        return "chat"
+    if t == "status-reply":
+        detail = item.get("detail", "")
+        slug = detail
+        if slug.startswith("status-reply-"):
+            slug = slug[len("status-reply-") :]
+        if not slug:
+            slug = item.get("slug", "")
+        return f"reply: {_md_escape(slug)}"
+    return _md_escape(t)
+
+
+def render_alice_queue(
+    items: list[dict],
+    *,
+    now: float | None = None,
+    cap: int | None = None,
+) -> str:
+    """Render the Alice's queue region body (no heading).
+
+    Returns the italic description + bulleted list — or the one-line
+    empty state when there are no items. The caller handles the
+    surrounding ``## Alice's queue`` heading and the sentinel markers.
+    """
+    if cap is None:
+        cap = _queue_cap()
+    if now is None:
+        now = time.time()
+    if not items:
+        return "*(queue clear)*"
+    description = (
+        "*What's pending my attention. Live from `inner/surface/` — "
+        "cleared when I handle it.*"
+    )
+    lines: list[str] = []
+    shown = items[:cap]
+    for it in shown:
+        age = format_age(now - float(it["created_epoch"]))
+        label = _surface_label(it)
+        link = _surface_link_md(it)
+        line = f"- {age} — **{label}**"
+        if link:
+            line += f" {link}"
+        lines.append(line)
+    overflow = len(items) - len(shown)
+    if overflow > 0:
+        lines.append(f"- +{overflow} more — [full list](/api/surfaces)")
+    return description + "\n\n" + "\n".join(lines)
+
+
+SpliceSection = tuple  # (start_marker, end_marker, renderer, fallback_builder?)
+
+
+def _splice_sections(body: str, sections: Iterable[SpliceSection]) -> str:
+    """Splice rendered regions into ``body`` between sentinel markers.
+
+    Each section is a tuple of ``(start_marker, end_marker, renderer)``
+    with an optional fourth element ``fallback_builder(rendered: str) ->
+    str`` used when the markers aren't present in the body (append-case
+    composition so the deploy doesn't break before the one-time marker
+    insertion lands in the mind repo).
+
+    When both markers are present in the body, the text strictly between
+    the marker lines (exclusive of the marker lines themselves) is
+    replaced with ``renderer()``. The markers stay intact so the splice
+    is idempotent across calls. If the markers are missing and a
+    ``fallback_builder`` is given, its output is appended to the body;
+    without a fallback, the renderer is skipped.
+
+    Shape is iterable-of-tuples (not a single tuple) specifically so
+    #613's Thinking queue can plug in a second entry without touching
+    this helper.
+    """
+    out = body
+    for section in sections:
+        start = section[0]
+        end = section[1]
+        renderer = section[2]
+        fallback_builder: Callable[[str], str] | None = (
+            section[3] if len(section) > 3 else None
+        )
+        s = out.find(start)
+        e = out.find(end)
+        rendered = renderer()
+        if s != -1 and e != -1 and e > s:
+            # Keep the marker lines themselves; replace between them.
+            start_eol = out.find("\n", s)
+            if start_eol == -1:
+                # Marker is the last thing in the body — unusual, but
+                # degrade gracefully by inserting after the marker text.
+                start_eol = s + len(start) - 1
+            end_bol = out.rfind("\n", 0, e) + 1
+            out = out[: start_eol + 1] + rendered + "\n" + out[end_bol:]
+        elif fallback_builder is not None:
+            tail = fallback_builder(rendered)
+            out = out.rstrip("\n") + "\n" + tail.lstrip("\n")
+            if not out.endswith("\n"):
+                out += "\n"
+    return out
+
+
+ALICE_QUEUE_START = "<!-- alice-queue:start -->"
+ALICE_QUEUE_END = "<!-- alice-queue:end -->"
+
+
+def _alice_queue_fallback(rendered: str) -> str:
+    """Appended-section shape when the index.md markers are missing.
+
+    Includes the heading + markers so the fallback is a complete
+    self-contained section (the deploy stays readable while the mind
+    repo edit catches up).
+    """
+    return (
+        "\n## Alice's queue\n"
+        f"{ALICE_QUEUE_START}\n{rendered}\n{ALICE_QUEUE_END}\n"
+    )
+
+
+def surfaces_api_payload(
+    items: list[dict], *, now: float | None = None
+) -> dict:
+    """Shape for ``GET /api/surfaces``.
+
+    Full list, oldest first, no cap. ``link`` omitted when there is
+    none. No bodies, no attachment paths — the queue is a labels-only
+    view (same security model as the rendered section, which is served
+    unauthenticated on the LAN).
+    """
+    if now is None:
+        now = time.time()
+    out = []
+    for it in items:
+        entry: dict = {
+            "slug": it["slug"],
+            "type": it["type"],
+            "source": it["source"],
+            "created": it["created"],
+            "age_seconds": now - float(it["created_epoch"]),
+        }
+        link = _surface_link_url(it)
+        if link:
+            entry["link"] = link
+        out.append(entry)
+    return {"count": len(out), "surfaces": out}
+
+
 # ---------------------------------------------------------------- HTTP
 
 
@@ -942,6 +1280,43 @@ class Handler(BaseHTTPRequestHandler):
                 mtime=mtime if mtime > 0 else None,
                 head=head,
             )
+        if path == "/api/surfaces":
+            items = scan_surfaces(self.cfg.surface_dir)
+            return self._json(
+                200, surfaces_api_payload(items, now=time.time()), head=head
+            )
+        if path == "/index.md":
+            index_path = self.cfg.status_dir / "index.md"
+            if index_path.is_file():
+                try:
+                    source = index_path.read_text(errors="replace")
+                    file_mtime = index_path.stat().st_mtime
+                except OSError:
+                    return self._json(404, {"error": "not found"}, head=head)
+                items = scan_surfaces(self.cfg.surface_dir)
+                newest = max(
+                    (float(it["mtime"]) for it in items), default=0.0
+                )
+                now = time.time()
+                rendered = _splice_sections(
+                    source,
+                    [
+                        (
+                            ALICE_QUEUE_START,
+                            ALICE_QUEUE_END,
+                            lambda: render_alice_queue(items, now=now),
+                            _alice_queue_fallback,
+                        ),
+                    ],
+                )
+                mtime = max(file_mtime, newest)
+                return self._send(
+                    200,
+                    rendered.encode("utf-8"),
+                    "text/markdown; charset=utf-8",
+                    mtime=mtime if mtime > 0 else None,
+                    head=head,
+                )
         p = self._resolve(path)
         if p is None:
             return self._json(404, {"error": "not found"}, head=head)
