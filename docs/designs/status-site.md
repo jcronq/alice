@@ -32,16 +32,27 @@ Code (repo, read-only in the container):
 
 ```
 src/status_site/
-  server.py        ThreadingHTTPServer, routes, reply handling
-  cli.py           status-reply CLI (bin/status-reply wraps it; `status-reply` entry point)
-  static/          index.html (the app) + vendored marked.min.js (v12)
+  server.py                   ThreadingHTTPServer, routes, reply handling,
+                              overview-splice site + background TTL pollers
+  cli.py                      status-reply / status-chat / waiting-ask CLIs
+                              (bin/* wrappers point here)
+  sources/                    per-section renderers (pure functions, cached
+                              upstream when the source is expensive):
+    common.py                 staleness footer + asks.jsonl reader
+    running_now.py            git worktree + ps + build-log tail
+    review_queue.py           in-process adapter around
+                              alice_forge.review_queue_renderer
+    waiting_on_you.py         hand-zone + structured asks hybrid
+    done_today.py             gh merged-PR search + resolved-asks + day roll
+    known_issues.py           hand-zone pass-through
+  static/                     index.html (app) + vendored marked.min.js (v12)
 ```
 
 Content (mind dir, never committed; host `…/mind/inner/`, container `/srv/*`):
 
 | Path | Env | What |
 |------|-----|------|
-| `inner/status/` | `STATUS_DIR` | `index.md` and other `<page>.md`, `pages.json` (nav: `[{"slug","title"}]`), `threads/<id>.jsonl`, `.replies.jsonl` (audit log of Jason's replies) |
+| `inner/status/` | `STATUS_DIR` | `index.md` (splice container; sections rendered from ground truth — see below) and other `<page>.md`, `pages.json` (nav: `[{"slug","title"}]`), `threads/<id>.jsonl`, `.replies.jsonl` (audit log), `asks.jsonl` (structured waiting-on-you asks, one record per line), `waiting-on-you.md` + `known-issues.md` (hand-edit zones spliced into the Overview), `done-archive.md` (day-roll archive) |
 | `inner/status-uploads/<thread>/` | `UPLOAD_DIR` | Attachments, `YYYYmmdd-HHMMSS-<n>-<name>`, dir mode 0700 |
 | `inner/surface/` | `SURFACE_DIR` | Where `status-reply` / `status-chat` surfaces land. Also scanned at request time for the **Alice's queue** section on `/index.md` — flat `*.md` files are the "pending my attention" list; resolved surfaces move to `.handled/<date>/` and drop out naturally. The server splices the rendered list into `index.md` between `<!-- alice-queue:start -->` / `<!-- alice-queue:end -->` sentinels; if the markers aren't present the section is appended to the served body (nothing is written to disk). |
 | `inner/status-server/key` | `KEY_FILE` | Shared reply key (single line) |
@@ -61,7 +72,7 @@ versions), the server uses the text before the first `:` of `item`, then
 | Route | Auth | Notes |
 |-------|------|-------|
 | `GET /`, `/index.html`, `/marked.min.js` | none | Packaged static assets |
-| `GET /index.md` | none | Live render: the on-disk `index.md` with the **Alice's queue** section spliced in (flat `inner/surface/*.md` surfaces as labels / ages / links, cap 10, `+N more` link into `/api/surfaces`). `Last-Modified = max(index.md mtime, newest surface mtime)`. |
+| `GET /index.md` | none | Live render: the on-disk `index.md` is a splice container — six sections are spliced in between sentinel marker comments on every request. Five are auto-rendered from ground truth (**Running now**, **Ready for Review**, **Waiting on you**'s structured-ask sub-list, **Alice's queue**, **Done today**) and two are hand-edit zones (`waiting-on-you.md`'s prose, `known-issues.md`). Expensive sources (`gh pr/issue list`, `git worktree`, `ps aux`) are kept warm in a background TTL cache so the request path never blocks on the network. `Last-Modified = max(index.md mtime, newest surface mtime)`. See the section-source table below. |
 | `GET /<name>.(md\|json\|png\|jpg\|jpeg\|gif\|webp\|txt)` | none | Top-level files in `STATUS_DIR` only. The name must match `[A-Za-z0-9][A-Za-z0-9_-]*` before the extension |
 | `GET /api/threads` | none | `{thread_id: [message, …]}` |
 | `GET /api/surfaces` | none | `{"count": N, "surfaces": [{slug, type, source, created, age_seconds, link?}, …]}` — full unresolved-surface list oldest-first, no cap, no bodies, no attachment paths. Backs the "full list" link that the Alice's queue section shows on overflow. |
@@ -69,6 +80,78 @@ versions), the server uses the text before the first `:` of `item`, then
 
 Everything else returns 404. The server never serves dotfiles, `threads/`,
 uploads, the key, or anything outside `STATUS_DIR`.
+
+## Overview splice sections
+
+`GET /index.md` runs every section renderer in `src/status_site/sources/`
+and splices each one between a pair of HTML-comment sentinels in the
+served response. The on-disk `index.md` is a container — Alice edits
+only the headings + sentinel pairs there; the content between them is
+replaced on every request. Missing-sentinel sections fall through to
+an append path so the deploy stays readable until the mind repo lands
+the marker pairs. See
+`cortex-memory/designs/2026-11-05-issue638-overview-auto-render.md` for
+the decision log.
+
+| Section | Markers | Source | Cache |
+|---------|---------|--------|-------|
+| Running now | `<!-- running-now:{start,end} -->` | `git worktree list --porcelain` ∪ `ps aux` grep ∪ `/tmp/alice-build-*/build-*.log` tails ∪ `inner/tasks/*.md` | 15s background poll (`RUNNING_NOW_POLL_SECONDS`) |
+| Ready for Review | `<!-- ready-for-review:{start,end} -->` | `gh issue list --label sm:design_review` + `gh pr list --json ...reviewDecision`. Repos from `alice.config.json.review_queue_renderer.repos_pr` / `repos_design_review` | 5min background poll (`REVIEW_POLL_SECONDS`) |
+| Waiting on you | `<!-- waiting-on-you:{start,end} -->` | Hand-zone: `inner/status/waiting-on-you.md` verbatim. Structured: `inner/status/asks.jsonl` unresolved records rendered oldest-first as `- [ ] <text>` | Inline (cheap file reads) |
+| Alice's queue | `<!-- alice-queue:{start,end} -->` | `inner/surface/*.md` scan (same as pre-#638) | Inline |
+| Done today | `<!-- done-today:{start,end} -->` | `gh pr list --search "is:merged merged:>=<today>"` across watched repos + `asks.jsonl` records with `resolved_at` on today-local | 5min background poll (`DONE_TODAY_POLL_SECONDS`) |
+| Known issues I'm on | `<!-- known-issues:{start,end} -->` | `inner/status/known-issues.md` verbatim | Inline |
+
+Hand-edit zones DO NOT carry a staleness footer. Every other
+renderer's output ends with::
+
+    *last_rendered: <iso-local> · source: <name>*
+
+The frontend (`static/index.html`) scans every page `<em>` for that
+shape and adds a `.stale` class to the preceding `<h2>` when the
+delta exceeds 30 s, red-tinting the heading. Hand zones are not
+polled so they never go stale.
+
+### `asks.jsonl`
+
+One JSON object per line, append-only (plus the atomic rewrite on
+resolve). Shape:
+
+```json
+{"id":"abcd1234","text":"decide SM v2 cutover","created":"2026-11-05T12:34:56-04:00","resolved":false}
+```
+
+Fields:
+
+- `id` — short uuid4 prefix (8 hex chars), printed by the
+  `waiting-ask` CLI on append.
+- `text` — the ask verbatim.
+- `created` / `resolved_at` — ISO8601 with offset. `resolved_at`
+  appears only on resolved records.
+- `resolved` — boolean. Resolved records drop off Waiting-on-you
+  and (when `resolved_at` lands on today's local date) appear under
+  Done today's "Asks resolved today" sub-list.
+
+### `waiting-ask` CLI
+
+Entry point `src/status_site/cli.py:main_waiting_ask`, wrapper
+`bin/waiting-ask`. Three modes:
+
+- `waiting-ask "<text>"` — append a new pending ask, print its id.
+- `waiting-ask --resolve <id>` — mark an ask resolved. Idempotent on
+  already-resolved; exits 1 when the id doesn't exist.
+- `waiting-ask --list` — print unresolved asks, oldest first.
+
+Writes land in `$STATUS_DIR/asks.jsonl` (`$ALICE_MIND/inner/status/`
+by default).
+
+### Day-roll archive
+
+The Done-today background poller also calls `roll_day()` on every
+tick. Semantics: once per local-day boundary the previous day's
+rendered content is appended to `$STATUS_DIR/done-archive.md`, with a
+sentinel file (`.done-archive-last-roll`) guarding against
+double-append on restart.
 
 ## Security model
 
