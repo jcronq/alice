@@ -190,12 +190,13 @@ def test_render_pricing_segment_appended_after_pr_url(tmp_path):
         estimate_usd="0.50",
     )
     out, _ = render_bugs_md(status)
-    ip_section = out.split("## In progress", 1)[1].split("## Fixed", 1)[0]
-    assert "[draft PR](https://github.com/jcronq/modern-mud/pull/42)" in ip_section
-    assert "$0.50 est" in ip_section
+    # in-progress + pr_url now renders under Waiting on review.
+    section = out.split("## Waiting on review", 1)[1].split("## In progress", 1)[0]
+    assert "[draft PR](https://github.com/jcronq/modern-mud/pull/42)" in section
+    assert "$0.50 est" in section
     # PR URL comes before the pricing segment in the italic tail.
-    pr_pos = ip_section.index("[draft PR]")
-    price_pos = ip_section.index("$0.50 est")
+    pr_pos = section.index("[draft PR]")
+    price_pos = section.index("$0.50 est")
     assert pr_pos < price_pos
 
 
