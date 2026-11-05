@@ -289,6 +289,71 @@ _DESIGNER_RULES = _THINKING_RULES + (
 )
 
 
+# designer-cli rules — issue #620 cutover. The per-issue design phase
+# for ``(sm:selected, art:code)`` runs as a one-shot ``claude --print``
+# subagent on Sonnet (via the v1 worker lane's :func:`spawn_agent`)
+# instead of the long-lived thinking-agent. The rules below are the
+# design-phase contract: read + inspect, produce a design doc + vault
+# note, post the ``[SM] design-ready`` audit comment, and crucially
+# STOP without opening a branch or PR. The build phase is a separate
+# worker spawned later from ``(sm:designed, art:code)``.
+_DESIGNER_CLI_RULES = (
+    BehavioralRule(
+        id="read-project-profile-first",
+        injection=(
+            "Before starting, read ``PROJECT_PROFILE.md`` at the top "
+            "of the repo you're working in. It tells you how to run "
+            "tests, where the daemon lives, how to deploy, and which "
+            "invariants are non-negotiable."
+        ),
+    ),
+    BehavioralRule(
+        id="design-only-no-code-changes",
+        injection=(
+            "You are a DESIGN agent, not a build agent. Read the "
+            "issue, inspect the referenced code with Read / Grep / "
+            "Glob, and produce a concise design doc (shape, scope, "
+            "implementation surface, test plan). Do NOT open a PR. "
+            "Do NOT create a branch. Do NOT edit source files. If "
+            "the design calls for code changes, describe them — the "
+            "build phase is a separate worker that reads your design "
+            "note and implements it."
+        ),
+    ),
+    BehavioralRule(
+        id="write-design-note-under-vault",
+        injection=(
+            "Write the design note to "
+            "``~/alice-mind/cortex-memory/designs/<date>-issue<N>-"
+            "<slug>.md`` with YAML frontmatter. Keep it concise — "
+            "the build phase reads this verbatim to drive "
+            "implementation."
+        ),
+    ),
+    BehavioralRule(
+        id="design-ready-exit-comment",
+        injection=(
+            "When the design note is committed, post one audit "
+            "comment on the issue using ``gh issue comment``: "
+            "``[SM] design-ready note=[[<slug>]]`` (where <slug> is "
+            "the filename without the ``.md`` suffix). That comment "
+            "advances the issue from ``sm:designing`` to "
+            "``sm:design_review``; nothing else you emit transitions "
+            "the state machine. Exit immediately after posting."
+        ),
+    ),
+    BehavioralRule(
+        id="no-direct-signal",
+        injection=(
+            "Do not send Signal messages. Do not shell out to "
+            "``signal-cli``, ``notify``, ``curl`` to the signal RPC. "
+            "If something needs to reach Jason, leave it in the "
+            "design note for Speaking to decide."
+        ),
+    ),
+)
+
+
 # watcher rules — read + send_message only; observations and durable
 # findings route through ``~/alice-mind/inner/notes/`` so thinking
 # can process them on her next wake. Per the user's "notes-not-direct-
@@ -525,6 +590,28 @@ def _designer_template() -> KernelSpec:
     return _thinking_template()
 
 
+def _designer_cli_template() -> KernelSpec:
+    """Issue #620 — one-shot ``claude --print`` design subagent. Read
+    + Grep + Glob + Bash (for ``gh``) + WebFetch (for prior-art
+    lookups). Explicitly NOT Edit/Write at the kernel layer — the
+    build phase is a separate worker, so the design agent must
+    produce a design note via Bash heredoc / ``gh issue comment``
+    rather than touching source. No Signal MCP — design agents never
+    talk to Jason directly."""
+    return KernelSpec(
+        model=_DEFAULT_MODEL,
+        allowed_tools=[
+            "Read",
+            "Grep",
+            "Glob",
+            "Bash",
+            "WebFetch",
+        ],
+        max_seconds=0,
+        thinking=None,
+    )
+
+
 def _watcher_template() -> KernelSpec:
     """Watcher — read-side + ``send_message`` outbound. Matches the
     GitHub watcher and cortex-memory cue runner shape: scan, write a
@@ -682,6 +769,27 @@ def _designer_spec() -> AgentSpec:
     )
 
 
+def _designer_cli_spec() -> AgentSpec:
+    """Issue #620 — the Sonnet claude-cli design subagent that replaces
+    the thinking-agent on ``(sm:selected, art:code)``. The dispatcher's
+    v1 worker-pool spawn machinery (:func:`alice_forge.dispatcher.spawn.spawn_agent`)
+    launches this spec; the ``model`` override on the SPAWN_MAP row pins
+    it to Sonnet, and the ``exec_only`` tool policy keeps it to Read +
+    Grep + Glob + Bash + WebFetch (no Edit, no Write, no Signal). The
+    behavioral rules frame the task as design-only and contract the
+    ``[SM] design-ready`` audit-comment exit."""
+    return AgentSpec(
+        name="designer-cli",
+        persona="designer-cli",
+        kernel_spec=_designer_cli_template(),
+        runtime="claude-cli",
+        scope="on-demand",
+        lifecycle="per-issue",
+        tool_policy=policies.exec_only,
+        behavioral_constraints=_DESIGNER_CLI_RULES,
+    )
+
+
 def _watcher_spec() -> AgentSpec:
     return AgentSpec(
         name="watcher",
@@ -749,6 +857,7 @@ def register_builtins(registry=default_registry) -> None:
         _research_writer_spec(),
         _reviewer_spec(),
         _designer_spec(),
+        _designer_cli_spec(),
         _watcher_spec(),
         _config_worker_spec(),
         _cozylobe_spec(),

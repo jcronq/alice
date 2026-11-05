@@ -19,12 +19,14 @@ SPAWN_MAP row. They serve two purposes:
    ``tests/fixtures/spawn_prompts/`` sees the exact text the live
    workers receive at spawn time.
 
-The reviewer row (``(sm:reviewing, art:code)``) and the SDK lanes
-(``(sm:selected, art:code)``, ``(sm:designed, art:code)``) do not go
-through :func:`compose_spawn_prompt` so they are not covered here —
-the reviewer dispatches via :func:`core.agent_library.run_agent` and
-the SDK lanes use their own composers (:func:`compose_thinking_spawn_prompt`
-/ :func:`compose_speaking_spawn_prompt`).
+The reviewer row (``(sm:reviewing, art:code)``) and the remaining
+SDK lane (``(sm:designed, art:code)``) do not go through
+:func:`compose_spawn_prompt` so they are not covered here — the
+reviewer dispatches via :func:`core.agent_library.run_agent` and the
+speaking-build SDK lane uses its own composer
+(:func:`compose_speaking_spawn_prompt`). Issue #620 moved
+``(sm:selected, art:code)`` out of the thinking SDK lane and into the
+v1 worker pool with a design task-framing, so it IS covered.
 
 Regenerating goldens
 ====================
@@ -85,6 +87,7 @@ CANONICAL_ISSUE: dict = {
 # renders. The reviewer / thinking / speaking lanes use other
 # composers (see module docstring).
 WORKER_ROWS: list[tuple[tuple[str, str], str]] = [
+    (("sm:selected", "art:code"), "sm_selected__art_code.txt"),
     (("sm:selected", "art:config_change"), "sm_selected__art_config_change.txt"),
     (("sm:selected", "art:research_note"), "sm_selected__art_research_note.txt"),
     (("sm:selected", "art:experiment"), "sm_selected__art_experiment.txt"),

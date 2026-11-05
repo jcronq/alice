@@ -1379,11 +1379,12 @@ def test_phase2_spawn_fires_on_code_artifact_with_no_prior_spawn(
     """sm:selected + art:config_change + no [SM] spawn-started → fires
     Popen, posts spawn-started, writes pidfile and prompt.txt.
 
-    Issue #186 cutover: ``(sm:selected, art:code)`` now routes to the
-    thinking-agent lane (covered separately by
-    ``test_phase2_selected_art_code_routes_to_thinking_lane``); the v1
-    code-worker pool fires on ``art:config_change`` and the research
-    artifact rows.
+    Issue #186 cutover + issue #620 re-cutover: ``(sm:selected,
+    art:code)`` routes to the v1 worker pool with the designer-cli
+    agent spec (covered separately by
+    ``test_phase2_selected_art_code_routes_to_worker_lane_with_designer_cli``);
+    the v1 code-worker pool also fires on ``art:config_change`` and
+    the research artifact rows.
     """
     spawn_dir = tmp_path / "spawns"
     spawn_dir.mkdir()
@@ -1477,6 +1478,174 @@ def test_phase2_spawn_fires_on_code_artifact_with_no_prior_spawn(
     assert "Issue: #200" in prompt
     assert "Closes #<issue_number>" in prompt
     assert "Never pass ``--no-verify``" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Issue #620 — designer-cli model argv plumbing + design task framing
+# ---------------------------------------------------------------------------
+
+
+def test_phase2_spawn_agent_argv_contains_model_override_for_designer_cli(
+    state_path,
+    tmp_path,
+) -> None:
+    """Issue #620 — when the SPAWN_MAP row carries a non-empty ``model``
+    field, :func:`spawn_agent` must append ``--model <name>`` to the
+    ``claude --print`` argv. Pins the model-plumbing contract so a
+    future SPAWN_MAP edit that drops the field surfaces here (the
+    production row for ``(sm:selected, art:code)`` pins
+    ``claude-sonnet-5`` via this field)."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    popens: list[FakePopen] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    def spawn(issue, art_label, repo):
+        return sm.spawn_agent(
+            issue,
+            art_label,
+            repo,
+            spawn_dir=spawn_dir,
+            claude_bin="/usr/bin/claude",
+            post_comment=recorder,
+            popen=popen,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+
+    issues = [_make_issue(620, art_labels=("art:code",))]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        post_comment=recorder,
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        has_live_spawn=lambda _n: False,
+        count_running=lambda: 0,
+        spawn=spawn,
+        has_live_thinking_spawn=lambda _n: False,
+        count_running_thinking=lambda: 0,
+        spawn_thinking=_no_call,
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 1
+    assert popens, "expected Popen to be called"
+    cmd = popens[0].args
+    assert cmd[0].endswith("claude")
+    assert "--print" in cmd
+    # --model is threaded through from the SPAWN_MAP row's ``model``
+    # field — the production row pins claude-sonnet-5.
+    assert "--model" in cmd
+    model_idx = cmd.index("--model")
+    assert cmd[model_idx + 1] == "claude-sonnet-5"
+
+
+def test_spawn_agent_argv_omits_model_flag_when_row_has_no_model(
+    state_path,
+    tmp_path,
+) -> None:
+    """Issue #620 — rows without a ``model`` field (every v1 worker row
+    except the post-#620 designer-cli one) must NOT get ``--model`` in
+    their argv. Catches a regression where the plumbing accidentally
+    always adds the flag."""
+    spawn_dir = tmp_path / "spawns"
+    spawn_dir.mkdir()
+    recorder = Recorder()
+    popens: list[FakePopen] = []
+
+    def popen(*args, **kwargs):
+        p = FakePopen(*args, **kwargs)
+        popens.append(p)
+        return p
+
+    def spawn(issue, art_label, repo):
+        return sm.spawn_agent(
+            issue,
+            art_label,
+            repo,
+            spawn_dir=spawn_dir,
+            claude_bin="/usr/bin/claude",
+            post_comment=recorder,
+            popen=popen,
+            now_iso=_frozen_now,
+            log=lambda _m: None,
+        )
+
+    issues = [
+        _make_issue(
+            621, sm_labels=("sm:selected",), art_labels=("art:config_change",)
+        )
+    ]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        list_issues=lambda _r: issues,
+        list_stale_closed=lambda _r: [],
+        post_comment=recorder,
+        edit_labels=LabelRecorder(),
+        close_issue=CloseRecorder(),
+        find_linked_pr=_no_pr,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        count_running=lambda: 0,
+        spawn=spawn,
+        proactive_reap=lambda: (0, 0),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert report.spawned == 1
+    cmd = popens[0].args
+    assert "--model" not in cmd
+
+
+def test_compose_spawn_prompt_renders_designer_cli_design_framing() -> None:
+    """Issue #620 — :func:`compose_spawn_prompt` for the designer-cli
+    row renders the design task-framing (contains ``design-ready``,
+    writes the vault note, exits without opening a PR). Pins the
+    structural invariant: the design agent must NEVER be told to open
+    a PR, even transitively via the generic worker trailer."""
+    row = sm.SPAWN_MAP[("sm:selected", "art:code")]
+    issue = {
+        "number": 620,
+        "title": "sm-dispatcher: route art:code design phase to Sonnet subagent",
+        "body": "Design the cutover.",
+        "labels": [{"name": "art:code"}],
+        "author": {"login": "jcronq"},
+    }
+    rendered = sm.compose_spawn_prompt(issue, row)
+    # Design-ready contract.
+    assert "design-ready" in rendered
+    assert "cortex-memory/designs/" in rendered
+    # Must carry an explicit "do NOT open a PR" instruction (any
+    # "open a PR" string that survives in the prompt has to be the
+    # negated form). Pins the design-agent contract.
+    assert "Do NOT open a PR" in rendered
+    # The build-phase ``pr_url`` emission never appears in a design
+    # prompt — that's the build worker's output contract, not the
+    # designer's.
+    assert "pr_url" not in rendered
+    # Design-only role framing.
+    assert "designer-cli" in rendered
+    # Safety: no "self-merge" wording on a design agent.
+    assert "Self-merge" not in rendered
 
 
 def test_phase2_spawn_fires_on_research_note_with_writer_template(
@@ -9427,21 +9596,22 @@ def test_deps_blocked_dep_dry_run_does_not_post(state_path) -> None:
 # artifact rows.
 
 
-def test_spawn_map_selected_art_code_row_targets_thinking_persona() -> None:
-    """The (sm:selected, art:code) row carries persona=thinking after the
-    cutover. The thinking-agent composes its own prompt in
-    :func:`compose_thinking_spawn_prompt`, not :func:`compose_spawn_prompt`.
-
-    Post-Phase 4 of #194 (#321) the v1 worker-prompt inline fields
-    (``system_prompt_role`` / ``instruction_trailer``) are gone from
-    every row — see
-    :func:`test_spawn_map_legacy_inline_fields_removed_post_phase4` in
-    ``test_agent_library_phase3_call_sites`` for the global assertion."""
+def test_spawn_map_selected_art_code_row_targets_designer_cli_worker() -> None:
+    """Issue #620 — the (sm:selected, art:code) row now targets the v1
+    worker pool (persona=worker) with a model override pinning the
+    one-shot ``claude --print`` subagent to Sonnet and an agent_spec
+    pointer at the registered ``designer-cli`` AgentSpec. The pre-#620
+    thinking SDK lane (persona=thinking, phase=per_issue_design) is
+    gone from this row."""
     row = sm.SPAWN_MAP[("sm:selected", "art:code")]
-    assert row["persona"] == "thinking"
-    assert row["runtime"] == "claude-agent-sdk:opus"
-    assert row["phase"] == "per_issue_design"
-    # No worker-prompt fields on the thinking row.
+    assert row["persona"] == "worker"
+    assert row["runtime"] == "claude-cli"
+    assert row["agent_spec"] == "designer-cli"
+    assert row["model"] == "claude-sonnet-5"
+    # No thinking-lane phase marker — the design phase is a one-shot
+    # worker-pool spawn now, not a long-lived PhaseRunner pass.
+    assert "phase" not in row
+    # No worker-prompt legacy inline fields.
     assert "system_prompt_role" not in row
     assert "instruction_trailer" not in row
 
@@ -9493,17 +9663,21 @@ def _track_spawn(records):
     return call
 
 
-def test_phase2_selected_art_code_routes_to_thinking_lane(
+def test_phase2_selected_art_code_routes_to_worker_lane_with_designer_cli(
     state_path,
 ) -> None:
-    """sm:selected + art:code → spawn_thinking fires, spawn (v1 worker)
-    does NOT. The audit-comment counters / spawn_records bookkeeping
-    is identical to the worker path so existing telemetry stays valid."""
-    thinking_calls: list = []
+    """Issue #620 — sm:selected + art:code now routes to the v1 worker
+    lane (``spawn``) with ``agent_spec=designer-cli``; the thinking SDK
+    lane (``spawn_thinking``) must NOT fire. The spawn-dispatch-art-code
+    transition (selected → designing) still fires after a successful
+    design-lane spawn so the agent's ``[SM] design-ready`` lands at
+    sm:designing."""
+    worker_calls: list = []
+    label_rec = LabelRecorder()
 
-    def spawn_worker(*_a, **_kw):  # pragma: no cover — must not fire
+    def spawn_thinking_unused(*_a, **_kw):  # pragma: no cover — must not fire
         raise AssertionError(
-            "v1 worker spawn fired for (sm:selected, art:code) after cutover"
+            "thinking SDK lane fired for (sm:selected, art:code) post-#620"
         )
 
     def spawn_speaking_unused(*_a, **_kw):  # pragma: no cover — must not fire
@@ -9516,19 +9690,19 @@ def test_phase2_selected_art_code_routes_to_thinking_lane(
         list_issues=lambda _r: issues,
         list_stale_closed=lambda _r: [],
         post_comment=Recorder(),
-        edit_labels=LabelRecorder(),
+        edit_labels=label_rec,
         close_issue=CloseRecorder(),
         find_linked_pr=_no_pr,
         pr_merge_status=_no_call,
         master_ci_status=_no_call,
-        # v1 worker lane is wired but must not fire for art:code.
+        # v1 worker lane wired — this is the lane that should fire now.
         has_live_spawn=lambda _n: False,
         count_running=lambda: 0,
-        spawn=spawn_worker,
-        # Thinking lane wired; this is the lane that should fire.
+        spawn=_track_spawn(worker_calls),
+        # Thinking lane wired but must NOT fire for art:code post-#620.
         has_live_thinking_spawn=lambda _n: False,
         count_running_thinking=lambda: 0,
-        spawn_thinking=_track_spawn(thinking_calls),
+        spawn_thinking=spawn_thinking_unused,
         # Speaking lane wired but only fires at sm:designed; assert it
         # stays untouched at sm:selected.
         has_live_speaking_spawn=lambda _n: False,
@@ -9541,8 +9715,17 @@ def test_phase2_selected_art_code_routes_to_thinking_lane(
 
     assert exit_code == 0
     assert report.spawned == 1
-    assert thinking_calls == [(700, "art:code", "spawn-700-stub")]
+    assert worker_calls == [(700, "art:code", "spawn-700-stub")]
     assert report.spawn_records == [(700, "art:code", "spawn-700-stub")]
+    # spawn-dispatch-art-code EventTransition still fires: a successful
+    # design-lane spawn (whether the pre-#620 thinking agent or the
+    # post-#620 designer-cli worker) swaps selected → designing so the
+    # agent's eventual ``[SM] design-ready`` is picked up by the
+    # DESIGNING handler.
+    assert (700, "sm:selected", "sm:designing") in report.transitions
+    edit = label_rec.calls[-1]
+    assert edit["add"] == ["sm:designing"]
+    assert edit["remove"] == ["sm:selected"]
 
 
 def test_phase2_selected_art_config_change_still_routes_to_v1_worker(
@@ -9585,15 +9768,13 @@ def test_phase2_selected_art_config_change_still_routes_to_v1_worker(
     assert worker_calls == [(701, "art:config_change", "spawn-701-stub")]
 
 
-def test_phase2_selected_art_code_mid_flight_v1_does_not_double_spawn(
+def test_phase2_selected_art_code_live_worker_spawn_does_not_double_spawn(
     state_path, tmp_path
 ) -> None:
-    """Migration risk (from #186): an issue with a live v1 worker spawn
-    dir already running when the cutover lands. The thinking-lane
-    ``has_live_spawn`` check sees no thinking spawn, but production
-    wiring also checks the v1 spawn dir for dedup. We assert the
-    dispatcher does NOT spawn a thinking-agent on top of a live v1
-    worker — both lane helpers consulted, neither fires twice."""
+    """Issue #620 — post-cutover, the designer-cli lane IS the v1
+    worker lane for (sm:selected, art:code), so a live worker spawn
+    dir is the normal dedup signal: the dispatcher must NOT fire a
+    second subagent on top of a live one."""
     import os as _os
 
     v1_spawn_dir = tmp_path / "spawns"
@@ -9602,16 +9783,14 @@ def test_phase2_selected_art_code_mid_flight_v1_does_not_double_spawn(
     live_v1.mkdir()
     (live_v1 / "pidfile").write_text(str(_os.getpid()))
 
-    thinking_calls: list = []
+    worker_calls: list = []
 
-    def spawn_worker_unused(*_a, **_kw):  # pragma: no cover — must not fire
-        raise AssertionError("v1 worker spawn called during migration")
+    def spawn_thinking_unused(*_a, **_kw):  # pragma: no cover — must not fire
+        raise AssertionError(
+            "thinking SDK lane fired for live-v1 dedup check post-#620"
+        )
 
     issues = [_make_issue(702, art_labels=("art:code",))]
-    # ``has_live_thinking_spawn`` reports the v1 spawn dir as a live
-    # spawn for #702 too — the production deploy treats a mid-flight
-    # v1 worker as a dedup signal so the cutover doesn't double-fire
-    # an agent on the same issue.
     exit_code, report = sm.run(
         repo="jcronq/alice",
         state_path=state_path,
@@ -9625,12 +9804,10 @@ def test_phase2_selected_art_code_mid_flight_v1_does_not_double_spawn(
         master_ci_status=_no_call,
         has_live_spawn=lambda n: sm.has_live_spawn_for_issue(n, v1_spawn_dir),
         count_running=lambda: 1,
-        spawn=spawn_worker_unused,
-        has_live_thinking_spawn=lambda n: sm.has_live_spawn_for_issue(
-            n, v1_spawn_dir
-        ),
+        spawn=_track_spawn(worker_calls),
+        has_live_thinking_spawn=lambda _n: False,
         count_running_thinking=lambda: 0,
-        spawn_thinking=_track_spawn(thinking_calls),
+        spawn_thinking=spawn_thinking_unused,
         proactive_reap=lambda: (0, 0),
         now_iso=_frozen_now,
         log=lambda _m: None,
@@ -9638,18 +9815,18 @@ def test_phase2_selected_art_code_mid_flight_v1_does_not_double_spawn(
 
     assert exit_code == 0
     assert report.spawned == 0
-    assert thinking_calls == []
+    assert worker_calls == []
     # Live v1 spawn dir was not reaped (it's still alive).
     assert live_v1.exists()
 
 
-def test_phase2_selected_art_code_thinking_concurrency_cap_skips(
+def test_phase2_selected_art_code_worker_concurrency_cap_skips(
     state_path,
 ) -> None:
-    """Thinking lane has its own concurrency cap. With the cap reached,
-    spawn_thinking must not fire even though the v1 worker pool may be
-    idle."""
-    thinking_calls: list = []
+    """Issue #620 — the designer-cli lane shares the v1 worker pool's
+    concurrency cap. With the worker cap reached, ``spawn`` must not
+    fire for art:code."""
+    worker_calls: list = []
 
     issues = [_make_issue(703, art_labels=("art:code",))]
     exit_code, report = sm.run(
@@ -9664,12 +9841,12 @@ def test_phase2_selected_art_code_thinking_concurrency_cap_skips(
         pr_merge_status=_no_call,
         master_ci_status=_no_call,
         has_live_spawn=lambda _n: False,
-        count_running=lambda: 0,
-        spawn=_no_call,
+        count_running=lambda: 5,
+        spawn=_track_spawn(worker_calls),
+        max_concurrent_spawns=2,
         has_live_thinking_spawn=lambda _n: False,
-        count_running_thinking=lambda: 5,
-        spawn_thinking=_track_spawn(thinking_calls),
-        max_concurrent_thinking_spawns=2,
+        count_running_thinking=lambda: 0,
+        spawn_thinking=_no_call,
         proactive_reap=lambda: (0, 0),
         now_iso=_frozen_now,
         log=lambda _m: None,
@@ -9677,15 +9854,16 @@ def test_phase2_selected_art_code_thinking_concurrency_cap_skips(
 
     assert exit_code == 0
     assert report.spawned == 0
-    assert thinking_calls == []
+    assert worker_calls == []
 
 
-def test_phase2_selected_art_code_dry_run_uses_thinking_prompt_preview(
+def test_phase2_selected_art_code_dry_run_uses_designer_prompt_preview(
     state_path,
 ) -> None:
-    """Dry-run for the thinking lane previews the thinking-agent prompt,
-    not the v1 worker prompt."""
-    thinking_calls: list = []
+    """Issue #620 — dry-run on (sm:selected, art:code) previews the
+    designer-cli worker-pool prompt (design framing, no PR wording)
+    rather than the pre-#620 thinking SDK lane prompt."""
+    worker_calls: list = []
     logged: list[str] = []
 
     issues = [_make_issue(704, art_labels=("art:code",))]
@@ -9702,10 +9880,10 @@ def test_phase2_selected_art_code_dry_run_uses_thinking_prompt_preview(
         master_ci_status=_no_call,
         has_live_spawn=lambda _n: False,
         count_running=lambda: 0,
-        spawn=_no_call,
+        spawn=_track_spawn(worker_calls),
         has_live_thinking_spawn=lambda _n: False,
         count_running_thinking=lambda: 0,
-        spawn_thinking=_track_spawn(thinking_calls),
+        spawn_thinking=_no_call,
         proactive_reap=lambda: (0, 0),
         dry_run=True,
         now_iso=_frozen_now,
@@ -9715,15 +9893,22 @@ def test_phase2_selected_art_code_dry_run_uses_thinking_prompt_preview(
     assert exit_code == 0
     assert report.spawned == 1
     # spawn callable not invoked in dry-run.
-    assert thinking_calls == []
+    assert worker_calls == []
     assert any(
-        "DRY-RUN would spawn thinking on #704" in m for m in logged
+        "DRY-RUN would spawn designer-cli on #704" in m for m in logged
     ), logged
-    # Prompt preview is the thinking-agent template, not the worker one.
+    # Prompt preview is the designer-cli worker-pool template — role
+    # label is "designer-cli agent" and the design framing wording
+    # replaces the generic "implement the change" worker wording. The
+    # preview is truncated to the first 240 chars so we only assert the
+    # bits that reliably fall in that window.
     preview = [m for m in logged if "prompt preview" in m]
     assert preview
-    assert "thinking-agent" in preview[0]
-    assert "per_issue_design" in preview[0]
+    assert "designer-cli" in preview[0]
+    assert "design doc" in preview[0]
+    # The generic worker framing ("implement the change") must never
+    # appear in a design-agent prompt.
+    assert "implement the change" not in preview[0]
 
 
 def test_phase2_designed_art_code_routes_to_speaking_and_transitions(
@@ -10202,26 +10387,28 @@ def test_designed_untrusted_design_ready_falls_back_to_none(
 # the issue to sm:blocked rather than looping.
 
 
-def test_selected_thinking_spawn_silent_completion_transitions_to_blocked(
+def test_selected_designer_cli_silent_completion_transitions_to_blocked(
     state_path,
 ) -> None:
-    """A prior ``[SM] thinking-spawn-started`` audit comment from a
-    trusted author with no follow-up ``[SM] design-ready`` and no live
-    spawn dir means the shim exited silently. The dispatcher must
-    transition the issue to sm:blocked and NOT re-spawn (issue #202)."""
+    """Issue #620 — a prior ``[SM] spawn-started`` audit from a trusted
+    author with no follow-up ``[SM] design-ready`` and no live spawn
+    dir means the one-shot designer-cli worker exited silently. The
+    silent-failure guard (originally #202 for the thinking lane) must
+    still fire for the designer-cli lane so the dispatcher doesn't
+    loop."""
     recorder = Recorder()
     label_rec = LabelRecorder()
 
     issues = [_make_issue(800, art_labels=("art:code",))]
     comments = [
         _audit_comment(
-            "[SM] thinking-spawn-started task=#800 artifact=art:code "
-            "phase=per_issue_design runtime=claude-agent-sdk:opus "
-            "spawn_id=spawn-800-1778600000 ts=2026-05-13T15:21:00+00:00"
+            "[SM] spawn-started task=#800 artifact=art:code "
+            "runtime=claude-cli spawn_id=spawn-800-1778600000 "
+            "ts=2026-05-13T15:21:00+00:00"
         ),
     ]
 
-    def spawn_thinking_unused(*_a, **_kw):  # pragma: no cover — must not fire
+    def spawn_worker_unused(*_a, **_kw):  # pragma: no cover — must not fire
         raise AssertionError(
             "silent-spawn-failure guard let the dispatcher re-spawn (loop)"
         )
@@ -10241,10 +10428,10 @@ def test_selected_thinking_spawn_silent_completion_transitions_to_blocked(
         master_ci_status=_no_call,
         has_live_spawn=lambda _n: False,
         count_running=lambda: 0,
-        spawn=_no_call,
+        spawn=spawn_worker_unused,
         has_live_thinking_spawn=lambda _n: False,
         count_running_thinking=lambda: 0,
-        spawn_thinking=spawn_thinking_unused,
+        spawn_thinking=_no_call,
         proactive_reap=lambda: (0, 0),
         now_iso=_frozen_now,
         log=lambda _m: None,
@@ -10266,38 +10453,32 @@ def test_selected_thinking_spawn_silent_completion_transitions_to_blocked(
     ), bodies
 
 
-def test_selected_thinking_spawn_with_design_ready_transitions_to_design_review(
+def test_selected_designer_cli_with_design_ready_transitions_to_design_review(
     state_path,
 ) -> None:
-    """If a prior ``[SM] design-ready`` follows the thinking-spawn-started
-    audit, the dispatcher must transition ``sm:selected → sm:design_review``
-    and NOT re-spawn another design-phase agent.
-
-    Pre-#295 behaviour was: silent-spawn guard skipped, no forward
-    transition, dispatcher re-spawned the design phase on every poll.
-    That produced the 228-respawn loop on issue #295. The recovery
-    transition closes the loop by adopting the design-ready as the
-    terminal signal for the (orphaned) DESIGNING phase, exactly as the
-    DESIGNING handler would have if the ``spawn-dispatch-art-code``
-    EventTransition had ever been wired.
-    """
-    thinking_calls: list = []
+    """Issue #620 — if a prior ``[SM] design-ready`` from the
+    designer-cli follows a ``[SM] spawn-started`` audit, the dispatcher
+    must transition ``sm:selected → sm:design_review`` and NOT re-spawn
+    another design-phase agent. Same orphan-recovery guarantee as
+    #295's thinking-lane path, now parameterised to also recognise the
+    v1 worker lane's ``[SM] spawn-started`` prefix."""
+    worker_calls: list = []
     recorder = Recorder()
     label_rec = LabelRecorder()
 
     issues = [_make_issue(801, art_labels=("art:code",))]
     comments = [
         _audit_comment(
-            "[SM] thinking-spawn-started task=#801 artifact=art:code "
-            "phase=per_issue_design runtime=claude-agent-sdk:opus "
-            "spawn_id=spawn-801-1778600000 ts=2026-05-13T15:21:00+00:00"
+            "[SM] spawn-started task=#801 artifact=art:code "
+            "runtime=claude-cli spawn_id=spawn-801-1778600000 "
+            "ts=2026-05-13T15:21:00+00:00"
         ),
         _audit_comment(
             "[SM] design-ready note=[[2026-05-13-issue801-foo]] author=alice"
         ),
     ]
 
-    def spawn_thinking_unused(*_a, **_kw):  # pragma: no cover — must not fire
+    def spawn_worker_unused(*_a, **_kw):  # pragma: no cover — must not fire
         raise AssertionError(
             "orphan-design-ready recovery did not transition; "
             "dispatcher re-spawned the design phase (loop)"
@@ -10318,10 +10499,10 @@ def test_selected_thinking_spawn_with_design_ready_transitions_to_design_review(
         master_ci_status=_no_call,
         has_live_spawn=lambda _n: False,
         count_running=lambda: 0,
-        spawn=_no_call,
+        spawn=spawn_worker_unused,
         has_live_thinking_spawn=lambda _n: False,
         count_running_thinking=lambda: 0,
-        spawn_thinking=spawn_thinking_unused,
+        spawn_thinking=_no_call,
         proactive_reap=lambda: (0, 0),
         now_iso=_frozen_now,
         log=lambda _m: None,
@@ -10329,7 +10510,7 @@ def test_selected_thinking_spawn_with_design_ready_transitions_to_design_review(
 
     assert exit_code == 0
     assert report.spawned == 0
-    assert thinking_calls == []
+    assert worker_calls == []
     assert report.transitioned == 1
     assert (801, "sm:selected", "sm:design_review") in report.transitions
     edit = label_rec.calls[-1]
@@ -10344,13 +10525,16 @@ def test_selected_thinking_spawn_with_design_ready_transitions_to_design_review(
     ), bodies
 
 
-def test_selected_thinking_spawn_first_pass_no_prior_audit_spawns(
+def test_selected_designer_cli_first_pass_no_prior_audit_spawns(
     state_path,
 ) -> None:
-    """No prior ``[SM] thinking-spawn-started`` audit means this is a
-    first-pass spawn — the silent-failure guard must NOT short-circuit
-    and the normal spawn path must fire (issue #202)."""
-    thinking_calls: list = []
+    """Issue #620 — no prior ``[SM] spawn-started`` audit means this is
+    a first-pass designer-cli spawn. The silent-failure guard must NOT
+    short-circuit and the normal spawn path must fire; the
+    spawn-dispatch-art-code transition must still swap
+    sm:selected → sm:designing so the agent's ``[SM] design-ready``
+    lands at the state that knows how to advance it."""
+    worker_calls: list = []
     recorder = Recorder()
     label_rec = LabelRecorder()
 
@@ -10371,10 +10555,10 @@ def test_selected_thinking_spawn_first_pass_no_prior_audit_spawns(
         master_ci_status=_no_call,
         has_live_spawn=lambda _n: False,
         count_running=lambda: 0,
-        spawn=_no_call,
+        spawn=_track_spawn(worker_calls),
         has_live_thinking_spawn=lambda _n: False,
         count_running_thinking=lambda: 0,
-        spawn_thinking=_track_spawn(thinking_calls),
+        spawn_thinking=_no_call,
         proactive_reap=lambda: (0, 0),
         now_iso=_frozen_now,
         log=lambda _m: None,
@@ -10382,13 +10566,13 @@ def test_selected_thinking_spawn_first_pass_no_prior_audit_spawns(
 
     assert exit_code == 0
     assert report.spawned == 1
-    assert thinking_calls == [(802, "art:code", "spawn-802-stub")]
+    assert worker_calls == [(802, "art:code", "spawn-802-stub")]
     blocked_transitions = [
         t for t in report.transitions if t[2] == "sm:blocked"
     ]
     assert blocked_transitions == []
     # spawn-dispatch-art-code EventTransition: after a successful
-    # first-pass thinking spawn the dispatcher swaps
+    # first-pass designer-cli spawn the dispatcher swaps
     # sm:selected → sm:designing so design-ready lands at the
     # state that knows how to advance it.
     assert (802, "sm:selected", "sm:designing") in report.transitions
@@ -10397,23 +10581,23 @@ def test_selected_thinking_spawn_first_pass_no_prior_audit_spawns(
     assert edit["remove"] == ["sm:selected"]
 
 
-def test_selected_thinking_spawn_silent_completion_untrusted_audit_ignored(
+def test_selected_designer_cli_silent_completion_untrusted_audit_ignored(
     state_path,
 ) -> None:
-    """A forged ``[SM] thinking-spawn-started`` from an untrusted author
-    must NOT trip the silent-failure guard — otherwise an outside
+    """Issue #620 — a forged ``[SM] spawn-started`` from an untrusted
+    author must NOT trip the silent-failure guard. Otherwise an outside
     commenter could force any sm:selected issue into sm:blocked just by
-    pasting the audit prefix (issue #202)."""
-    thinking_calls: list = []
+    pasting the audit prefix."""
+    worker_calls: list = []
     recorder = Recorder()
     label_rec = LabelRecorder()
 
     issues = [_make_issue(803, art_labels=("art:code",))]
     comments = [
         _audit_comment(
-            "[SM] thinking-spawn-started task=#803 artifact=art:code "
-            "phase=per_issue_design runtime=claude-agent-sdk:opus "
-            "spawn_id=spawn-803-forged ts=2026-05-13T15:21:00+00:00",
+            "[SM] spawn-started task=#803 artifact=art:code "
+            "runtime=claude-cli spawn_id=spawn-803-forged "
+            "ts=2026-05-13T15:21:00+00:00",
             author="random-drive-by",
         ),
     ]
@@ -10433,10 +10617,10 @@ def test_selected_thinking_spawn_silent_completion_untrusted_audit_ignored(
         master_ci_status=_no_call,
         has_live_spawn=lambda _n: False,
         count_running=lambda: 0,
-        spawn=_no_call,
+        spawn=_track_spawn(worker_calls),
         has_live_thinking_spawn=lambda _n: False,
         count_running_thinking=lambda: 0,
-        spawn_thinking=_track_spawn(thinking_calls),
+        spawn_thinking=_no_call,
         proactive_reap=lambda: (0, 0),
         now_iso=_frozen_now,
         log=lambda _m: None,
@@ -10446,7 +10630,7 @@ def test_selected_thinking_spawn_silent_completion_untrusted_audit_ignored(
     # Forged audit ignored → normal first-pass spawn fires +
     # spawn-dispatch-art-code transition fires.
     assert report.spawned == 1
-    assert thinking_calls == [(803, "art:code", "spawn-803-stub")]
+    assert worker_calls == [(803, "art:code", "spawn-803-stub")]
     blocked_transitions = [
         t for t in report.transitions if t[2] == "sm:blocked"
     ]
@@ -10454,15 +10638,15 @@ def test_selected_thinking_spawn_silent_completion_untrusted_audit_ignored(
     assert (803, "sm:selected", "sm:designing") in report.transitions
 
 
-def test_thinking_spawn_dispatch_transitions_to_designing(state_path) -> None:
-    """Successful thinking-agent spawn for (sm:selected, art:code) must
-    atomically swap sm:selected → sm:designing (the
-    ``spawn-dispatch-art-code`` EventTransition declared in
-    ``sm/transitions.py``). Without this, design-ready arrives at
-    sm:selected and the dispatcher re-spawns the design phase every
-    poll — the 228-respawn loop observed on #295.
-    """
-    thinking_calls: list = []
+def test_designer_cli_spawn_dispatch_transitions_to_designing(state_path) -> None:
+    """Issue #620 — a successful designer-cli spawn for
+    (sm:selected, art:code) must atomically swap sm:selected →
+    sm:designing (the ``spawn-dispatch-art-code`` EventTransition).
+    Without this, design-ready arrives at sm:selected and the
+    dispatcher re-spawns the design phase every poll — the 228-respawn
+    loop observed on #295 (originally on the thinking lane; post-#620
+    the same invariant applies to the designer-cli worker lane)."""
+    worker_calls: list = []
     recorder = Recorder()
     label_rec = LabelRecorder()
 
@@ -10483,10 +10667,10 @@ def test_thinking_spawn_dispatch_transitions_to_designing(state_path) -> None:
         master_ci_status=_no_call,
         has_live_spawn=lambda _n: False,
         count_running=lambda: 0,
-        spawn=_no_call,
+        spawn=_track_spawn(worker_calls),
         has_live_thinking_spawn=lambda _n: False,
         count_running_thinking=lambda: 0,
-        spawn_thinking=_track_spawn(thinking_calls),
+        spawn_thinking=_no_call,
         proactive_reap=lambda: (0, 0),
         now_iso=_frozen_now,
         log=lambda _m: None,
@@ -10494,7 +10678,7 @@ def test_thinking_spawn_dispatch_transitions_to_designing(state_path) -> None:
 
     assert exit_code == 0
     assert report.spawned == 1
-    assert thinking_calls == [(900, "art:code", "spawn-900-stub")]
+    assert worker_calls == [(900, "art:code", "spawn-900-stub")]
     assert report.transitioned == 1
     assert (900, "sm:selected", "sm:designing") in report.transitions
     edit = label_rec.calls[-1]

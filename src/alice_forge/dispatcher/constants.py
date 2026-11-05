@@ -285,16 +285,25 @@ DESIGN_REVIEWER_RUNTIME_LABEL = os.environ.get(
 )
 
 _DEFAULT_SPAWN_MAP: dict[tuple[str, str], dict[str, str]] = {
-    # SM v2 design lane. The per-issue thinking-agent reads the issue,
+    # SM v2 design lane (post-#620 cutover). The per-issue design phase
+    # runs as a one-shot ``claude --print --model claude-sonnet-5``
+    # subagent out of the v1 worker lane (``spawn_agent``) instead of
+    # the long-lived thinking-agent. The subagent reads the issue,
     # produces a design note at
     # ``~/alice-mind/cortex-memory/designs/<date>-issue<N>-<slug>.md``,
-    # and posts ``[SM] design-ready note=[[<wikilink>]]`` to advance the
-    # issue to ``sm:design_review``.
+    # and posts ``[SM] design-ready note=[[<wikilink>]]`` to advance
+    # the issue to ``sm:design_review``.
+    #
+    # The ``model`` field is threaded through :func:`spawn_agent` into
+    # the ``claude --model <name>`` argv so the subagent runs on
+    # Sonnet rather than the account default; ``agent_spec`` points
+    # :func:`compose_spawn_prompt` at the ``designer-cli`` AgentSpec
+    # whose behavioral rules frame the task as "design only, no PR".
     ("sm:selected", "art:code"): {
-        "persona": "thinking",
-        "runtime": THINKING_RUNTIME_LABEL,
-        "phase": "per_issue_design",
-        "agent_spec": "designer",
+        "persona": "worker",
+        "runtime": "claude-cli",
+        "agent_spec": "designer-cli",
+        "model": "claude-sonnet-5",
     },
     ("sm:selected", "art:config_change"): {
         "persona": "worker",
@@ -350,7 +359,14 @@ def _coerce_spawn_row(row: Any) -> tuple[tuple[str, str], dict[str, str]] | None
     if not isinstance(art_label, str) or not art_label.strip():
         return None
     payload: dict[str, str] = {}
-    for key in ("persona", "runtime", "phase", "agent_spec", "system_prompt_module"):
+    for key in (
+        "persona",
+        "runtime",
+        "phase",
+        "agent_spec",
+        "system_prompt_module",
+        "model",
+    ):
         value = row.get(key)
         if isinstance(value, str) and value.strip():
             payload[key] = value.strip()
@@ -377,10 +393,10 @@ def load_spawn_map(
               {
                 "sm_state": "sm:selected",
                 "art_label": "art:code",
-                "persona": "thinking",
-                "runtime": "claude-agent-sdk",
-                "phase": "per_issue_design",
-                "agent_spec": "designer"
+                "persona": "worker",
+                "runtime": "claude-cli",
+                "agent_spec": "designer-cli",
+                "model": "claude-sonnet-5"
               }
             ]
           }

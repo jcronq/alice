@@ -313,10 +313,24 @@ def _process_selected(
         return
 
     persona = spawn_config.get("persona", "worker")
+    agent_spec_name = spawn_config.get("agent_spec", "")
+
+    # Issue #620 — the design-lane is a row attribute, not a persona
+    # attribute: the pre-#620 thinking lane used ``persona=thinking``,
+    # the post-#620 claude-cli designer uses ``persona=worker`` +
+    # ``agent_spec=designer-cli``. Both need the same state-machine
+    # plumbing at sm:selected (flip to sm:designing after spawn,
+    # recover orphan design-ready comments), so lump them together as
+    # "is this the design lane" here and preserve the original persona
+    # for lane-selection below.
+    is_design_lane = persona == "thinking" or agent_spec_name == "designer-cli"
 
     # Persona selects the spawn lane (sub-issue 7 / #186). The thinking
     # lane uses its own dedup + concurrency helpers so a long-running
     # design loop can't starve the v1 worker pool (and vice versa).
+    # The post-#620 designer-cli lane shares the v1 worker lane's
+    # helpers — a one-shot Sonnet design subagent fits the same
+    # concurrency / dedup envelope as the config-worker.
     if persona == "thinking":
         lane_spawn = spawn_thinking
         lane_has_live = has_live_thinking_spawn
@@ -328,7 +342,7 @@ def _process_selected(
         lane_has_live = has_live_spawn
         lane_count_running = count_running
         lane_cap = max_concurrent_spawns
-        lane_label = "worker"
+        lane_label = "worker" if not is_design_lane else "designer-cli"
 
     # Caller passes the lane's helpers as None to disable spawning
     # entirely (tests that only care about hello/T1 paths take this
@@ -363,9 +377,9 @@ def _process_selected(
         )
         return
 
-    # Issue #202 — silent thinking-spawn guard. The thinking lane has
+    # Issue #202 — silent design-spawn guard. The design lane has
     # no equivalent of the worker lane's "open a PR" terminal signal at
-    # sm:selected; instead, the thinking-agent is expected to post
+    # sm:selected; instead, the design agent is expected to post
     # ``[SM] design-ready`` once the design note is written. If a prior
     # spawn already fired (audit comment present) but no design-ready
     # ever followed AND no live spawn dir remains, the shim completed
@@ -373,9 +387,19 @@ def _process_selected(
     # observed failure mode on #194: ~1125 respawns over 22h). Block
     # the issue rather than re-spawning; an operator (or sub-issue 3
     # shim replacement) can unblock once the underlying entrypoint is
-    # wired up. Scoped to ``persona == "thinking"`` so the v1 worker
-    # retry semantics above stay untouched.
-    if persona == "thinking":
+    # wired up. Scoped to the design lane so the v1 worker retry
+    # semantics above stay untouched for non-design worker rows.
+    #
+    # Issue #620 — the audit prefix depends on the lane: the pre-#620
+    # thinking-agent posted ``[SM] thinking-spawn-started``; the new
+    # claude-cli designer uses the v1 worker lane's
+    # ``[SM] spawn-started``. Check both so pre-cutover and post-cutover
+    # issues dedup correctly.
+    if is_design_lane:
+        design_spawn_prefix = (
+            THINKING_SPAWN_STARTED_PREFIX if persona == "thinking"
+            else SPAWN_STARTED_PREFIX
+        )
         saw_thinking_spawn_started = False
         saw_design_ready = False
         design_ready_note: str | None = None
@@ -388,7 +412,7 @@ def _process_selected(
             login = _comment_author_login(c)
             if not isinstance(login, str) or login not in trusted_authors:
                 continue
-            if body.startswith(THINKING_SPAWN_STARTED_PREFIX):
+            if body.startswith(design_spawn_prefix):
                 saw_thinking_spawn_started = True
             elif body.startswith("[SM] design-ready"):
                 # Matches both the agent-emitted ``[SM] design-ready``
@@ -517,6 +541,10 @@ def _process_selected(
         if persona == "thinking":
             preview = compose_thinking_spawn_prompt(issue)[:240]
         else:
+            # Covers both the v1 worker-pool rows and the post-#620
+            # designer-cli lane (which goes through
+            # :func:`compose_spawn_prompt` with a design task-framing
+            # branch keyed off the registered AgentSpec persona).
             preview = compose_spawn_prompt(issue, spawn_config)[:240]
         log(
             f"[sm-dispatcher] DRY-RUN would spawn {lane_label} on "
@@ -545,19 +573,25 @@ def _process_selected(
 
     # Issue #295 — spawn-dispatch-art-code EventTransition. The v3
     # transition table (sm/transitions.py, SELECTED row) declares this
-    # implicit transition: dispatching the thinking-agent swaps
+    # implicit transition: dispatching the design agent swaps
     # sm:selected → sm:designing so the agent's eventual
     # ``[SM] design-ready`` lands at sm:designing, where the DESIGNING
     # handler advances it to sm:design_review. Without this swap the
     # design-ready arrives at sm:selected — orphaned — and the
     # dispatcher re-spawns the design phase every poll (228-respawn
-    # loop on #295). Scoped to ``persona == "thinking"`` because the
-    # other art lanes (config_change / experiment / research_note) go
-    # selected → reviewing via PR-open and don't pass through
-    # designing.
-    if persona == "thinking":
+    # loop on #295).
+    #
+    # Issue #620 — scoped to the design lane (``persona=thinking``
+    # pre-cutover; ``persona=worker`` + ``agent_spec=designer-cli``
+    # post-cutover). The other art lanes (config_change / experiment /
+    # research_note) go selected → reviewing via PR-open and don't
+    # pass through designing.
+    if is_design_lane:
+        agent_label = (
+            "thinking-agent" if persona == "thinking" else "designer-cli"
+        )
         reason = (
-            f"spawn-dispatch-art-code: thinking-agent dispatched "
+            f"spawn-dispatch-art-code: {agent_label} dispatched "
             f"(spawn_id={spawn_id})"
         )
         transition_body = render_transition_comment(
