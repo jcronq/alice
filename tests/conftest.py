@@ -15,6 +15,18 @@ from alice_speaking.domain.principals import (
 
 
 @pytest.fixture(autouse=True)
+def _isolate_status_dir(tmp_path_factory, monkeypatch):
+    """Point ``status-reply`` thread writes at a tmp dir for every test.
+
+    Code paths that post to a status-site thread (e.g. the bug-fix
+    dispatcher's default poster) would otherwise append to the real
+    ``~/alice-mind/inner/status/threads``.
+    """
+    monkeypatch.setenv("STATUS_DIR", str(tmp_path_factory.mktemp("status-dir-isolation")))
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_pi_models_staging(tmp_path_factory, monkeypatch):
     """Redirect kernels.pi.models_staging at tmp paths for every test.
 

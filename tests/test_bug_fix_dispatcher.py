@@ -34,8 +34,10 @@ from alice_bug_fix_dispatcher.main import (
     _rebuild_waiting_block,
     _render_prompt,
     _scan_bugs,
+    _post_transition,
     tick,
 )
+from status_site.history import title_slug as site_title_slug
 
 
 # ---------------------------------------------------------------- helpers
@@ -703,3 +705,172 @@ def test_rebuild_waiting_block_creates_section_when_missing(tmp_path):
     text = cfg.index_path.read_text()
     assert "## Waiting on you" in text and "Review PR #42" in text
     assert text.startswith("# Status\n\n- [ ] x\n")
+# ---------------------------------------------------------------- thread posts
+
+
+class ReplyCollector:
+    """Fake ``post_reply`` that records ``(slug, msg)`` pairs."""
+
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, str]] = []
+
+    def __call__(self, slug: str, msg: str) -> None:
+        self.posts.append((slug, msg))
+
+
+def test_dispatch_posts_worker_spawned(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    write_bug(cfg.status_dir, 3, status="open", title="cake-box swap")
+    posts = ReplyCollector()
+    tick(cfg, spawn=lambda *a: 4242, post_reply=posts)
+    assert posts.posts == [("bug-3-cake-box-swap", "worker-spawned pid:4242")]
+
+
+def test_spawn_failure_posts_worker_crash(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    write_bug(cfg.status_dir, 3, status="open", title="cake-box swap")
+    posts = ReplyCollector()
+    tick(cfg, spawn=lambda *a: None, post_reply=posts)
+    assert posts.posts == [("bug-3-cake-box-swap", "worker crash: spawn failed")]
+
+
+def test_adopting_pr_url_posts_pr_opened(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    write_bug(
+        cfg.status_dir,
+        7,
+        status="in-progress",
+        title="door sticks",
+        extra_front={"dispatched_at": "2026-11-02T17:00:00+00:00", "worker_task_id": "pid:1"},
+    )
+    scratch = cfg.worker_scratch_root / "bug-7"
+    scratch.mkdir(parents=True)
+    url = "https://github.com/jcronq/modern-mud/pull/42"
+    (scratch / "result.json").write_text(f'{{"pr_url": "{url}"}}')
+    posts = ReplyCollector()
+    tick(cfg, post_reply=posts)
+    assert posts.posts == [("bug-7-door-sticks", f"PR {url} opened, CI pending")]
+
+
+def test_merge_posts_merged_sha(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    write_bug(
+        cfg.status_dir,
+        7,
+        status="in-progress",
+        title="door sticks",
+        extra_front={
+            "dispatched_at": "2026-11-02T17:00:00+00:00",
+            "pr_url": "https://github.com/jcronq/modern-mud/pull/42",
+        },
+    )
+    posts = ReplyCollector()
+    tick(
+        cfg,
+        gh_pr_view=lambda u: {"state": "MERGED", "mergeCommit": {"oid": "deadbeef0001"}},
+        post_reply=posts,
+    )
+    assert posts.posts == [
+        ("bug-7-door-sticks", "merged deadbeef0001, bug flipped to fixed")
+    ]
+
+
+def test_stall_posts_flagging(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    stale = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=3)).replace(microsecond=0).isoformat()
+    write_bug(
+        cfg.status_dir,
+        9,
+        status="in-progress",
+        title="door sticks",
+        extra_front={"dispatched_at": stale, "worker_task_id": "pid:1"},
+    )
+    posts = ReplyCollector()
+    tick(cfg, post_reply=posts)
+    assert posts.posts == [("bug-9-door-sticks", "worker no PR after 2h, flagging")]
+
+
+def test_settled_crash_posts_once(tmp_path):
+    import os
+
+    cfg = _make_cfg(tmp_path)
+    fresh = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=30)).replace(microsecond=0).isoformat()
+    write_bug(
+        cfg.status_dir,
+        9,
+        status="in-progress",
+        title="door sticks",
+        extra_front={"dispatched_at": fresh, "worker_task_id": "pid:1"},
+    )
+    scratch = cfg.worker_scratch_root / "bug-9"
+    scratch.mkdir(parents=True)
+    err = scratch / "stderr.log"
+    err.write_text("boom")
+    old = _dt.datetime.now().timestamp() - 3600
+    os.utime(err, (old, old))
+    posts = ReplyCollector()
+    tick(cfg, post_reply=posts)
+    tick(cfg, post_reply=posts)
+    assert posts.posts == [("bug-9-door-sticks", "worker crash: exited without a PR")]
+
+
+def test_poll_only_ticks_do_not_post(tmp_path):
+    """Open PR → only ``last_check_at`` moves; no thread chatter."""
+    cfg = _make_cfg(tmp_path)
+    write_bug(
+        cfg.status_dir,
+        7,
+        status="in-progress",
+        extra_front={
+            "dispatched_at": "2026-11-02T17:00:00+00:00",
+            "pr_url": "https://github.com/jcronq/modern-mud/pull/42",
+        },
+    )
+    posts = ReplyCollector()
+    for _ in range(3):
+        tick(cfg, gh_pr_view=lambda u: {"state": "OPEN"}, post_reply=posts)
+    assert posts.posts == []
+
+
+def test_poster_exception_does_not_abort_tick(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    p = write_bug(cfg.status_dir, 3, status="open")
+
+    def boom(slug: str, msg: str) -> None:
+        raise RuntimeError("thread store down")
+
+    rep = tick(cfg, spawn=lambda *a: 4242, post_reply=boom)
+    assert rep.dispatched == [3]
+    reparsed, _body, _raw = fm.parse(p.read_text())
+    assert reparsed["status"] == "in-progress"
+
+
+def test_slug_matches_site_for_punctuated_title(tmp_path):
+    title = "Cake-box: won't swap (empty tin) — Michael!"
+    posts = ReplyCollector()
+    _post_transition(12, title, "hi", post_reply=posts)
+    assert posts.posts == [(site_title_slug(f"bug-12 — {title}"), "hi")]
+    assert posts.posts[0][0] == "bug-12-cake-box-won-t-swap-empty-tin-michael"
+
+
+def test_slug_falls_back_to_heading_when_frontmatter_title_missing(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    p = cfg.status_dir / "bug-5.md"
+    p.write_text(
+        "---\nreport_id: 5\nstatus: open\n---\n\n"
+        + BUG_BODY.format(n=5, title="heading only title")
+    )
+    posts = ReplyCollector()
+    tick(cfg, spawn=lambda *a: 1, post_reply=posts)
+    assert posts.posts == [("bug-5-heading-only-title", "worker-spawned pid:1")]
+
+
+def test_default_poster_writes_thread_file(tmp_path, monkeypatch):
+    """No injected poster → ``status-reply`` CLI appends to ``threads/<slug>.jsonl``."""
+    status = tmp_path / "sd"
+    monkeypatch.setenv("STATUS_DIR", str(status))
+    cfg = _make_cfg(tmp_path)
+    write_bug(cfg.status_dir, 3, status="open", title="cake-box swap")
+    tick(cfg, spawn=lambda *a: 4242)
+    thread = status / "threads" / "bug-3-cake-box-swap.jsonl"
+    assert "worker-spawned pid:4242" in thread.read_text()
