@@ -12,7 +12,9 @@ Stdlib-only (runs on a bare ``python:3.12-alpine`` image). Routes:
                                           tracker thread, see history.py), thread from
                                           threads/<s>.jsonl, extra from item-extra/<s>.jsonl
     GET  /api/chat                        {messages: [...]} — general chat log, no item context
+    GET  /api/waiting-order               {order: [slug, ...]} saved drag order of "Waiting on you"
     POST /api/page-visibility             dismiss/restore/open a nav tab (shared-key auth)
+    POST /api/waiting-order               save the "Waiting on you" drag order (shared-key auth)
     POST /api/reply                       Jason's reply to an item (shared-key auth):
                                           appends to the item's thread, stores attachments
                                           privately under UPLOAD_DIR, and drops a
@@ -23,7 +25,8 @@ Stdlib-only (runs on a bare ``python:3.12-alpine`` image). Routes:
                                           ``type: status-chat`` surface into SURFACE_DIR
                                           (no thread/item context — just the message).
 
-Anything else is a 404: dotfiles (``.replies.jsonl``, ``.item-state.json``, ``.chat.jsonl``),
+Anything else is a 404: dotfiles (``.replies.jsonl``, ``.item-state.json``, ``.chat.jsonl``,
+``.waiting-order.json``),
 ``threads/``, the key and the uploads are never served. See docs/designs/status-site.md.
 """
 
@@ -144,6 +147,11 @@ class Config:
         # Dot-prefixed so the static-file handler won't serve it (same guard as
         # ``.replies.jsonl``); the ``/api/chat`` endpoint is the only way out.
         return self.status_dir / ".chat.jsonl"
+
+    @property
+    def waiting_order(self) -> Path:
+        # Dot-prefixed: kept out of the static handler; /api/waiting-order is the only way out.
+        return self.status_dir / ".waiting-order.json"
 
     @property
     def max_body(self) -> int:
@@ -765,6 +773,44 @@ def handle_page_visibility(cfg: Config, d: dict) -> dict:
     return {"ok": True, "slug": slug, "hidden": action == "dismiss", "pages": pages}
 
 
+WAITING_ORDER_MAX = 500
+WAITING_SLUG_RE = re.compile(r"[a-z0-9-]{1,60}")
+
+
+def read_waiting_order(cfg: Config) -> list[str]:
+    try:
+        data = json.loads(cfg.waiting_order.read_text())
+    except (OSError, ValueError):
+        return []
+    order = data.get("order") if isinstance(data, dict) else None
+    if not isinstance(order, list):
+        return []
+    return [s for s in order if isinstance(s, str) and WAITING_SLUG_RE.fullmatch(s)]
+
+
+def handle_waiting_order(cfg: Config, d: dict) -> dict:
+    """Persist the drag-sorted slug sequence for the "Waiting on you" list."""
+    if not isinstance(d, dict):
+        raise ReplyError(400, "bad json")
+    if not hmac.compare_digest(str(d.get("key", "")).encode(), cfg.key.encode()):
+        raise ReplyError(403, "bad key")
+    order = d.get("order")
+    if not isinstance(order, list) or len(order) > WAITING_ORDER_MAX:
+        raise ReplyError(400, "bad order")
+    clean: list[str] = []
+    for s in order:
+        if not isinstance(s, str) or not WAITING_SLUG_RE.fullmatch(s):
+            raise ReplyError(400, "bad slug in order")
+        if s not in clean:
+            clean.append(s)
+    path = cfg.waiting_order
+    with cfg.lock:
+        tmp = path.with_name(".waiting-order.json.tmp")
+        tmp.write_text(json.dumps({"order": clean}) + "\n")
+        os.replace(tmp, path)
+    return {"ok": True, "order": clean}
+
+
 class Handler(BaseHTTPRequestHandler):
     cfg: Config  # set by make_server
     server_version = "StatusSite/1.0"
@@ -827,6 +873,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, list_pages(self.cfg), head=head)
         if path == "/api/threads":
             return self._json(200, read_threads(self.cfg), head=head)
+        if path == "/api/waiting-order":
+            return self._json(
+                200, {"order": read_waiting_order(self.cfg)}, head=head
+            )
         if path == "/api/chat":
             return self._json(
                 200, {"messages": read_chat(self.cfg)}, head=head
@@ -869,6 +919,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/reply": handle_reply,
             "/api/page-visibility": handle_page_visibility,
             "/api/chat": handle_chat,
+            "/api/waiting-order": handle_waiting_order,
         }
         fn = handlers.get(route)
         if fn is None:
