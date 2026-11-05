@@ -79,6 +79,11 @@ li.dragging{opacity:.4}
 #chatpage .reply{display:block;margin-top:.6rem;padding:0}
 #chatpage textarea{width:100%;min-height:3.4rem;font:inherit;padding:.5rem;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
 #chatpage .row{display:flex;gap:.5rem;margin-top:.35rem;align-items:center}
+.pv{display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.35rem}.pv:empty{display:none}
+.pv .chip{position:relative;display:inline-flex;align-items:center;gap:.3rem;border:1px solid var(--line);border-radius:6px;background:var(--card);padding:.2rem .5rem;font-size:.8rem;max-width:14rem}
+.pv .chip img{height:3.2rem;max-width:6rem;object-fit:cover;border-radius:4px}
+.pv .chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pv .chip b{cursor:pointer;color:var(--muted);font-weight:normal;padding:0 .15rem}
 </style></head><body>
 <header><b>Alice</b><nav id="nav"></nav><span id="age"></span></header>
 <div id="modal" onclick="if(event.target===this)closeModal()"><div class="mc"><div class="mh"><b class="mt"></b><button class="mx" onclick="closeModal()">×</button></div><div class="mb"></div></div></div>
@@ -94,6 +99,32 @@ const esc=t=>t.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 function fmt(at){const d=new Date(at);return isNaN(d)?'':d.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'})}
 const seen=JSON.parse(localStorage.getItem('alice-seen')||'{}'),openSet=new Set(JSON.parse(localStorage.getItem('alice-open')||'[]'));
 const saveUI=()=>{localStorage.setItem('alice-seen',JSON.stringify(seen));localStorage.setItem('alice-open',JSON.stringify([...openSet]))};
+const MAX_FILES=5,MAX_PER_FILE=10*1024*1024,OK_TYPE=/^(image\/|text\/|application\/(pdf|json|zip)$)/;
+const toB64=f=>new Promise((ok,no)=>{const rd=new FileReader();rd.onload=()=>ok({name:f.name,data:rd.result.split(',')[1]});rd.onerror=no;rd.readAsDataURL(f)});
+function attachState(ta,fi,pv,sm){
+  const pending=[];
+  const draw=()=>{
+    pv.innerHTML='';
+    pending.forEach((f,i)=>{
+      const c=document.createElement('div');c.className='chip';
+      if(f.type.startsWith('image/')){const im=document.createElement('img');im.src=URL.createObjectURL(f);im.onload=()=>URL.revokeObjectURL(im.src);c.appendChild(im)}
+      const n=document.createElement('span');n.textContent=f.name;n.title=f.name;c.appendChild(n);
+      const x=document.createElement('b');x.textContent='×';x.title='Remove';x.onclick=()=>{pending.splice(i,1);draw()};c.appendChild(x);
+      pv.appendChild(c)});
+    if(pending.length)replyOpen=true;
+  };
+  const add=list=>{
+    for(const f of list){
+      if(pending.length>=MAX_FILES){sm.textContent='At most '+MAX_FILES+' attachments.';break}
+      if(!OK_TYPE.test(f.type)){sm.textContent=f.name+': file type not allowed.';continue}
+      if(f.size>MAX_PER_FILE){sm.textContent=f.name+': over 10 MB.';continue}
+      const named=f.name&&f.name!=='image.png'?f:new File([f],'paste-'+Date.now()+'-'+pending.length+'.'+(f.type.split('/')[1]||'png').replace(/[^a-z0-9]/gi,''),{type:f.type});
+      pending.push(named)}
+    draw()};
+  ta.addEventListener('paste',e=>{const fs=[...(e.clipboardData?.files||[])];if(fs.length){e.preventDefault();add(fs)}});
+  if(fi)fi.onchange=()=>{add([...fi.files]);fi.value=''};
+  return {pending,encode:()=>Promise.all(pending.map(toB64)),clear:()=>{pending.length=0;draw()}};
+}
 function renderThread(li){
   const tid=li.dataset.tid,conv=li.querySelector(':scope > .conv'),t=conv.querySelector('.thread'),tog=li.querySelector(':scope > .ctog');
   const msgs=THREADS[tid]||[],open=conv.classList.contains('open');
@@ -171,21 +202,21 @@ function addReplies(){
       const has=(THREADS[tid]||[]).length>0;
       const tog=document.createElement('button');tog.className='ctog';
       const conv=document.createElement('div');conv.className='conv';
-      conv.innerHTML='<div class="thread"></div><div class="reply"><textarea placeholder="Message Alice about this…"></textarea><div class="row"><button>Send</button><label class="attach">📎 Attach<input type="file" multiple hidden></label><span class="sent"></span></div></div>';
+      conv.innerHTML='<div class="thread"></div><div class="reply"><textarea placeholder="Message Alice about this…"></textarea><div class="row"><button>Send</button><label class="attach">📎 Attach<input type="file" multiple hidden></label><span class="sent"></span></div><div class="pv"></div></div>';
       if(openSet.has(tid))conv.classList.add('open');
       tog.onclick=()=>{const o=conv.classList.toggle('open');o?openSet.add(tid):openSet.delete(tid);saveUI();renderThread(li);if(o)conv.querySelector('textarea').focus({preventScroll:true})};
       const ta=conv.querySelector('textarea'),sm=conv.querySelector('.sent'),send=conv.querySelector('.row button'),fi=conv.querySelector('input[type=file]');
-      fi.onchange=()=>{sm.textContent=fi.files.length?[...fi.files].map(f=>f.name).join(', '):'';replyOpen=true};
+      const att=attachState(ta,fi,conv.querySelector('.pv'),sm);
       ta.addEventListener('input',()=>{replyOpen=!!ta.value});
       ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();send.click()}});
       send.onclick=async()=>{
-        if(!ta.value.trim()&&!fi.files.length)return;
+        if(!ta.value.trim()&&!att.pending.length)return;
         if(!KEY){sm.textContent='No key: open the link Alice sent once.';return}
         send.disabled=true;sm.textContent='Sending…';
-        try{const files=await Promise.all([...fi.files].map(f=>new Promise((ok,no)=>{const rd=new FileReader();rd.onload=()=>ok({name:f.name,data:rd.result.split(',')[1]});rd.onerror=no;rd.readAsDataURL(f)})));
+        try{const files=await att.encode();
           const r=await fetch('api/reply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:KEY,item:itemText,thread:tid,text:ta.value,files,page})});
           const j=await r.json();
-          if(r.ok){sm.textContent='';ta.value='';fi.value='';replyOpen=false;await pollThreads();const t=conv.querySelector('.thread');t.scrollTop=t.scrollHeight}else sm.textContent='Error: '+(j.error||r.status)}
+          if(r.ok){sm.textContent='';ta.value='';att.clear();replyOpen=false;await pollThreads();const t=conv.querySelector('.thread');t.scrollTop=t.scrollHeight}else sm.textContent='Error: '+(j.error||r.status)}
         catch(e){sm.textContent='Error: '+e.message}
         send.disabled=false};
       li.insertBefore(tog,li.firstChild.nextSibling);li.appendChild(conv);renderThread(li);
@@ -293,7 +324,7 @@ function renderChatThread(force){
   const t=document.querySelector('#chatpage .thread');if(!t)return;
   const atBottom=t.scrollHeight-t.scrollTop-t.clientHeight<60;
   const last=CHAT[CHAT.length-1];
-  t.innerHTML=CHAT.length?CHAT.map(m=>`<div class="msg ${m.from==='jason'?'jason':'alice'}">${esc(m.text||'')}<small>${m.from==='jason'?'You':'Alice'} · ${fmt(m.at)}</small></div>`).join('')+
+  t.innerHTML=CHAT.length?CHAT.map(m=>`<div class="msg ${m.from==='jason'?'jason':'alice'}">${esc(m.text||'')}${(m.files||[]).map(n=>`<div>📎 ${esc(n)}</div>`).join('')}<small>${m.from==='jason'?'You':'Alice'} · ${fmt(m.at)}</small></div>`).join('')+
     (last&&last.from==='jason'?'<div class="typing">Alice is on it…</div>':''):'<div class="typing">No messages yet. Say hi.</div>';
   if(force||atBottom)t.scrollTop=t.scrollHeight;
   seen.chat=CHAT.length;saveUI();
@@ -305,17 +336,19 @@ async function pollChat(force){
 function mountChat(){
   chatMounted=true;replyOpen=false;
   const doc=document.getElementById('doc');
-  doc.innerHTML=`<div id="chatpage"><h1>Chat</h1><p class="intro">General line to Alice — no todo item attached. She'll reply right here.</p><div class="thread"><div class="typing">Loading…</div></div><div class="reply"><textarea placeholder="Message Alice…"></textarea><div class="row"><button>Send</button><span class="sent"></span></div></div></div>`;
-  const ta=doc.querySelector('textarea'),sm=doc.querySelector('.sent'),send=doc.querySelector('.row button');
+  doc.innerHTML=`<div id="chatpage"><h1>Chat</h1><p class="intro">General line to Alice — no todo item attached. She'll reply right here.</p><div class="thread"><div class="typing">Loading…</div></div><div class="reply"><textarea placeholder="Message Alice…"></textarea><div class="row"><button>Send</button><label class="attach">📎 Attach<input type="file" multiple hidden></label><span class="sent"></span></div><div class="pv"></div></div></div>`;
+  const ta=doc.querySelector('textarea'),sm=doc.querySelector('.sent'),send=doc.querySelector('.row button'),fi=doc.querySelector('input[type=file]');
+  const att=attachState(ta,fi,doc.querySelector('.pv'),sm);
   ta.addEventListener('input',()=>{replyOpen=!!ta.value});
   const submit=async()=>{
-    if(!ta.value.trim())return;
+    if(!ta.value.trim()&&!att.pending.length)return;
     if(!KEY){sm.textContent='No key: open the link Alice sent once.';return}
     send.disabled=true;sm.textContent='Sending…';
     try{
-      const r=await fetch('api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:KEY,text:ta.value})});
+      const files=await att.encode();
+      const r=await fetch('api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:KEY,text:ta.value,files})});
       const j=await r.json();
-      if(r.ok){sm.textContent='';ta.value='';replyOpen=false;await pollChat(true)}
+      if(r.ok){sm.textContent='';ta.value='';att.clear();replyOpen=false;await pollChat(true)}
       else sm.textContent='Error: '+(j.error||r.status);
     }catch(e){sm.textContent='Error: '+e.message}
     send.disabled=false;
