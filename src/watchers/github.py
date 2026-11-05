@@ -87,6 +87,30 @@ def _is_self_filed(issue: dict[str, Any]) -> bool:
     return SELF_FILED_MARKER in body
 
 
+# Prefix the SM v2 dispatcher puts on its lifecycle comments (hello /
+# transition). They carry no new information for thinking, so the watcher
+# suppresses them regardless of author (issue #615).
+SM_COMMENT_PREFIX = "[SM]"
+
+
+def _is_own_activity(author_login: str | None, own_login: str) -> bool:
+    """True iff ``author_login`` is Alice's own GitHub identity (case-insensitive)."""
+    if not author_login or not own_login:
+        return False
+    return author_login.strip().lower() == own_login.strip().lower()
+
+
+def _is_sm_protocol_comment(body: str | None) -> bool:
+    """True iff the comment body begins with the ``[SM]`` protocol prefix."""
+    if not isinstance(body, str):
+        return False
+    return body.lstrip().upper().startswith(SM_COMMENT_PREFIX)
+
+
+def _login(obj: dict[str, Any]) -> str | None:
+    return (obj.get("user") or {}).get("login")
+
+
 # Label the SM v2 dispatcher uses as the lifecycle entry point. The
 # dispatcher's GitHub query (``src/alice_forge/dispatcher/gh.py``) filters
 # by ``label:sm:draft,sm:needs_study,...`` — an unlabeled trusted-author
@@ -235,6 +259,7 @@ class WatcherConfig:
     trusted_associations: frozenset[str] = field(
         default_factory=lambda: frozenset(DEFAULT_TRUSTED_ASSOCIATIONS)
     )
+    own_login: str = "alice"
 
 
 def load_config(mind_dir: pathlib.Path) -> WatcherConfig:
@@ -264,11 +289,16 @@ def load_config(mind_dir: pathlib.Path) -> WatcherConfig:
         trust = frozenset(str(s).strip().upper() for s in raw_trust if str(s).strip())
     else:
         trust = frozenset(DEFAULT_TRUSTED_ASSOCIATIONS)
+    raw_own = block.get("own_login")
+    own_login = (
+        raw_own.strip() if isinstance(raw_own, str) and raw_own.strip() else "alice"
+    )
     return WatcherConfig(
         enabled=enabled,
         repos=repos,
         poll_interval_seconds=interval,
         trusted_associations=trust,
+        own_login=own_login,
     )
 
 
@@ -412,6 +442,7 @@ def poll_repo(
     repo_state: dict[str, Any],
     *,
     trusted: frozenset[str] = frozenset(DEFAULT_TRUSTED_ASSOCIATIONS),
+    own_login: str = "alice",
     api: Callable[[str], Any] = gh_api,
     label_apply: Callable[[str, int, list[str]], bool] = _apply_sm_draft_label,
 ) -> list[Event]:
@@ -567,6 +598,10 @@ def poll_repo(
                 continue
             if not is_trusted_association(c.get("author_association"), trusted):
                 continue
+            if _is_own_activity(_login(c), own_login) or _is_sm_protocol_comment(
+                c.get("body")
+            ):
+                continue
             events.append(
                 Event(
                     kind="issue_comment",
@@ -657,8 +692,11 @@ def poll_repo(
         # noise. State is still tracked so a later genuine state
         # transition (if it ever matters) isn't lost.
         self_filed = _is_self_filed(issue)
+        own_authored = _is_own_activity(_login(issue), own_login)
         if not first_run and issues_primed and author_trusted and not self_filed:
-            if prev_state and prev_state != new_state:
+            if own_authored:
+                pass
+            elif prev_state and prev_state != new_state:
                 events.append(
                     Event(
                         kind="issue_state",
@@ -732,6 +770,10 @@ def poll_repo(
             if first_run or not issues_primed:
                 continue
             if not is_trusted_association(c.get("author_association"), trusted):
+                continue
+            if _is_own_activity(_login(c), own_login) or _is_sm_protocol_comment(
+                c.get("body")
+            ):
                 continue
             events.append(
                 Event(
@@ -1083,6 +1125,7 @@ def run(
                 repo,
                 repo_state,
                 trusted=cfg.trusted_associations,
+                own_login=cfg.own_login,
                 api=api,
                 label_apply=label_apply,
             )
