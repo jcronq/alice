@@ -98,8 +98,8 @@ def test_no_bug_files_all_sections_empty(tmp_path):
     status = tmp_path / "status"
     status.mkdir()
     out, mtime = render_bugs_md(status)
-    # Five sections now: Open / In progress / Fixed / Won't fix / Dispatch failed.
-    assert out.count("*(none yet)*") == 5
+    # Six sections now: Open / Waiting on review / In progress / Fixed / Won't fix / Dispatch failed.
+    assert out.count("*(none yet)*") == 6
     assert mtime == 0.0
 
 
@@ -271,7 +271,7 @@ def test_http_bugs_md_empty_state(site):
     cfg, port = site
     status, body, _ = _get(port, "/bugs.md")
     assert status == 200
-    assert body.decode("utf-8").count("*(none yet)*") == 5
+    assert body.decode("utf-8").count("*(none yet)*") == 6
 
 
 def test_http_head_bugs_md(site):
@@ -332,9 +332,15 @@ def test_in_progress_bucket_renders_pr_url_link(tmp_path):
         "---\n\n# bug-2 — give-cakes\n"
     )
     out, _ = render_bugs_md(status)
+    # Bugs with status=in-progress AND a pr_url now get promoted to the
+    # dedicated Waiting on review section so Jason can spot review-ready
+    # work without scanning the still-cooking workers.
+    wor_section = out.split("## Waiting on review", 1)[1].split("## In progress", 1)[0]
+    assert "[draft PR](https://github.com/jcronq/modern-mud/pull/42)" in wor_section
+    assert "worker working" in wor_section
+    # And the item does NOT also appear under In progress.
     ip_section = out.split("## In progress", 1)[1].split("## Fixed", 1)[0]
-    assert "[draft PR](https://github.com/jcronq/modern-mud/pull/42)" in ip_section
-    assert "worker working" in ip_section
+    assert "bug-2" not in ip_section
 
 
 def test_in_progress_without_pr_url_renders_plain_summary(tmp_path):
@@ -371,20 +377,20 @@ def test_dispatch_failed_bucket_empty_placeholder(tmp_path):
     assert "*(none yet)*" in df_section
 
 
-def test_render_all_five_sections_present_even_when_empty(tmp_path):
+def test_render_all_six_sections_present_even_when_empty(tmp_path):
     status = tmp_path / "status"
     status.mkdir()
     out, _ = render_bugs_md(status)
     for heading in (
         "## Open",
+        "## Waiting on review",
         "## In progress",
         "## Fixed",
         "## Won't fix",
         "## Dispatch failed (needs triage)",
     ):
         assert heading in out
-    # Five empty-state placeholders now (not three).
-    assert out.count("*(none yet)*") == 5
+    assert out.count("*(none yet)*") == 6
 
 
 def test_parse_frontmatter_no_block():

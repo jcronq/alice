@@ -422,7 +422,7 @@ BUG_FILE_RE = re.compile(r"^bug-(\d+)\.md$")
 # Open and Fixed so Jason can see dispatcher activity at a glance;
 # ``dispatch-failed`` goes after Won't fix with a visual warning so
 # it stands out as "needs triage, dispatcher gave up".
-BUG_STATUSES = ("open", "in-progress", "fixed", "wontfix", "dispatch-failed")
+BUG_STATUSES = ("open", "waiting-on-review", "in-progress", "fixed", "wontfix", "dispatch-failed")
 # Heading-prefix stripper for the title fallback: ``# bug-N — real title``
 # becomes ``real title`` so the rendered line isn't ``bug-N — bug-N — ...``.
 BUG_HEADING_PREFIX_RE = re.compile(r"^bug-\d+\s*[-–—]\s*", re.I)
@@ -545,6 +545,18 @@ def collect_bugs(status_dir: Path) -> tuple[dict[str, list[dict]], float]:
                 "actual_usd": actual_usd,
             }
         )
+    # Promote in-progress bugs that already have a draft PR into the
+    # dedicated ``waiting-on-review`` bucket. Jason wanted bug-reviews
+    # to live on the Bugs pane itself (not the Overview's Ready for
+    # Review section): a draft PR is the hand-off from worker back to
+    # him, so it deserves its own heading above the still-cooking
+    # workers.
+    ready = []
+    cooking = []
+    for b in buckets["in-progress"]:
+        (ready if b.get("pr_url") else cooking).append(b)
+    buckets["waiting-on-review"] = ready
+    buckets["in-progress"] = cooking
     for key in buckets:
         buckets[key].sort(key=lambda b: b["report_id"], reverse=True)
     return buckets, max_mtime
@@ -630,6 +642,7 @@ def render_bugs_md(status_dir: Path) -> tuple[str, float]:
     # bug title so Dispatch-failed items are visually distinct (⚠).
     sections = (
         ("Open", "open", "[ ]", ""),
+        ("Waiting on review", "waiting-on-review", "[ ]", ""),
         ("In progress", "in-progress", "[ ]", ""),
         ("Fixed", "fixed", "[x]", ""),
         ("Won't fix", "wontfix", "[x]", ""),
@@ -652,7 +665,7 @@ def render_bugs_md(status_dir: Path) -> tuple[str, float]:
             if b["summary"]:
                 summary_bits.append(b["summary"])
             pr_url = b.get("pr_url", "")
-            if key == "in-progress" and pr_url:
+            if key in ("in-progress", "waiting-on-review") and pr_url:
                 summary_bits.append(f"[draft PR]({pr_url})")
             pricing_segment = _format_pricing_segment(
                 b.get("estimate_usd", ""), b.get("actual_usd", "")
