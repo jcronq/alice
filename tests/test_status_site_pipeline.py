@@ -264,7 +264,10 @@ def test_review_slug_for_is_stable_and_safe():
 def test_ensure_review_notes_writes_frontmatter_and_body(tmp_path):
     out = P.ensure_review_notes([_dr_row(704)], tmp_path)
     assert out["written"] == ["ghi-jcronq-alice-704"]
-    p = tmp_path / "review-ghi-jcronq-alice-704.md"
+    # The file stem == the slug — read_review looks up ``<slug>.md``
+    # under ``notes/`` with no additional prefix.
+    p = tmp_path / "ghi-jcronq-alice-704.md"
+    assert p.exists()
     text = p.read_text()
     for line in (
         "kind: decide",
@@ -281,7 +284,7 @@ def test_ensure_review_notes_writes_frontmatter_and_body(tmp_path):
 def test_ensure_review_notes_empty_body_renders_placeholder(tmp_path):
     P.ensure_review_notes([_dr_row(704, body="")], tmp_path)
     assert "_(no description)_" in (
-        tmp_path / "review-ghi-jcronq-alice-704.md"
+        tmp_path / "ghi-jcronq-alice-704.md"
     ).read_text()
 
 
@@ -289,7 +292,7 @@ def test_ensure_review_notes_is_idempotent_on_unchanged_updated_at(tmp_path):
     row = _dr_row(704)
     first = P.ensure_review_notes([row], tmp_path)
     assert first["written"] == ["ghi-jcronq-alice-704"]
-    p = tmp_path / "review-ghi-jcronq-alice-704.md"
+    p = tmp_path / "ghi-jcronq-alice-704.md"
     mtime_before = p.stat().st_mtime_ns
     second = P.ensure_review_notes([row], tmp_path)
     assert second["written"] == []
@@ -302,7 +305,7 @@ def test_ensure_review_notes_rewrites_when_updated_at_changes(tmp_path):
         [_dr_row(704, updated_at="2026-11-06T22:00:00Z", body="new body")], tmp_path
     )
     assert out["written"] == ["ghi-jcronq-alice-704"]
-    text = (tmp_path / "review-ghi-jcronq-alice-704.md").read_text()
+    text = (tmp_path / "ghi-jcronq-alice-704.md").read_text()
     assert "updated: 2026-11-06T22:00:00Z" in text
     assert "new body" in text
 
@@ -316,8 +319,8 @@ def test_ensure_review_notes_skips_rows_not_matching_filter(tmp_path):
     ]
     out = P.ensure_review_notes(rows, tmp_path)
     assert out["written"] == ["ghi-jcronq-alice-4"]
-    assert list(tmp_path.glob("review-ghi-*.md")) == [
-        tmp_path / "review-ghi-jcronq-alice-4.md"
+    assert list(tmp_path.glob("ghi-*.md")) == [
+        tmp_path / "ghi-jcronq-alice-4.md"
     ]
 
 
@@ -325,15 +328,15 @@ def test_ensure_review_notes_sweeps_stale_notes(tmp_path):
     # Seed two notes: one that matches a current row, one that does
     # not. The sweep should drop the orphan.
     P.ensure_review_notes([_dr_row(704), _dr_row(999)], tmp_path)
-    assert {p.name for p in tmp_path.glob("review-ghi-*.md")} == {
-        "review-ghi-jcronq-alice-704.md",
-        "review-ghi-jcronq-alice-999.md",
+    assert {p.name for p in tmp_path.glob("ghi-*.md")} == {
+        "ghi-jcronq-alice-704.md",
+        "ghi-jcronq-alice-999.md",
     }
     out = P.ensure_review_notes([_dr_row(704)], tmp_path)
     # #999 moved off sm:design_review (or closed) → note gone.
     assert out["deleted"] == ["ghi-jcronq-alice-999"]
-    assert list(tmp_path.glob("review-ghi-*.md")) == [
-        tmp_path / "review-ghi-jcronq-alice-704.md"
+    assert list(tmp_path.glob("ghi-*.md")) == [
+        tmp_path / "ghi-jcronq-alice-704.md"
     ]
 
 

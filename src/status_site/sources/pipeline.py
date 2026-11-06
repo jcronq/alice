@@ -471,7 +471,11 @@ def ensure_review_notes(
             continue
         slug = review_slug_for(repo, number)
         live_slugs.add(slug)
-        path = notes_dir / f"review-{slug}.md"
+        # File stem == slug. ``read_review`` opens ``notes/<slug>.md``
+        # (no "review-" filename prefix); the ``ghi-`` prefix inside
+        # the slug is the namespace that keeps us from colliding with
+        # existing hand-written notes.
+        path = notes_dir / f"{slug}.md"
         desired_updated = str(row.get("updated_at") or "")
         try:
             existing = path.read_text(errors="replace") if path.exists() else ""
@@ -492,9 +496,8 @@ def ensure_review_notes(
 
     # Sweep stale notes that match our ownership prefix.
     try:
-        for p in notes_dir.glob(f"review-{REVIEW_NOTE_PREFIX}*.md"):
-            # Strip the literal "review-" prefix to recover the slug.
-            slug = p.stem[len("review-") :]
+        for p in notes_dir.glob(f"{REVIEW_NOTE_PREFIX}*.md"):
+            slug = p.stem
             if slug in live_slugs:
                 continue
             try:

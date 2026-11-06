@@ -1923,7 +1923,9 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         )
         # Issue #719: tag design-review rows whose GH issue has a
         # synthesised review note so the frontend can link the title
-        # to ``?p=review-<slug>`` instead of straight to GitHub.
+        # to ``?p=review-<slug>`` instead of straight to GitHub. The
+        # review note file's stem == the slug (``read_review`` opens
+        # ``notes/<slug>.md`` directly).
         notes_dir = cfg.status_dir / "notes"
         if notes_dir.is_dir():
             existing_slugs = {p.stem for p in notes_dir.glob("*.md")}
@@ -1933,7 +1935,7 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
                 if not repo or not number:
                     continue
                 slug = _pipeline.review_slug_for(repo, number)
-                if f"review-{slug}" in existing_slugs:
+                if slug in existing_slugs:
                     row["review_slug"] = slug
         ask_rows = _ask_rows()
         your_todo_md = _waiting_on_you.read_hand_zone(
