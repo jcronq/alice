@@ -221,3 +221,78 @@ def test_is_chat_surface_only_for_status_chat_type():
     assert not _is_chat_surface(reply)
     assert not _is_chat_surface(body_mention)
     assert not _is_chat_surface("no frontmatter")
+
+
+# ─── handle_surface wiring (#688) ───────────────────────────────────
+
+
+class _StubRunner:
+    """Borrows the real begin/end methods without TurnRunner's heavy ctor."""
+
+    def __init__(self, status_dir):
+        from alice_speaking.turn_runner import TurnRunner
+
+        self._chat_status_dir = status_dir
+        self.chat_status = None
+        self.begin_chat_status = TurnRunner.begin_chat_status.__get__(self)
+        self.end_chat_status = TurnRunner.end_chat_status.__get__(self)
+
+
+def _surface_ctx(status_dir, seen, fail=False):
+    from types import SimpleNamespace
+
+    class _Events:
+        def emit(self, *a, **k):
+            pass
+
+    async def run_turn(prompt, turn_id, outbound_recipient):
+        seen.append((turn_id, bool(ctx.turn_runner.chat_status)))
+        if fail:
+            raise RuntimeError("boom")
+
+    ctx = SimpleNamespace(
+        events=_Events(),
+        _current_turn_kind=None,
+        turn_runner=_StubRunner(status_dir),
+        _run_turn=run_turn,
+        _surface_watcher=SimpleNamespace(archive_unresolved=lambda p: None),
+    )
+    return ctx
+
+
+def _drop_surface(tmp_path, kind):
+    p = tmp_path / f"{kind}.md"
+    p.write_text(f"---\ntype: {kind}\n---\n\nhello\n")
+    return p
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_handle_surface_brackets_chat_turn_with_status_rows(tmp_path, fail):
+    from types import SimpleNamespace
+
+    from alice_speaking._dispatch import handle_surface
+
+    seen: list = []
+    ctx = _surface_ctx(tmp_path / "status", seen, fail=fail)
+    asyncio.run(handle_surface(ctx, SimpleNamespace(path=_drop_surface(tmp_path, "status-chat"))))
+
+    (turn_id, writer_live), = seen
+    assert writer_live, "writer must be active while the turn runs"
+    assert ctx.turn_runner.chat_status is None, "writer cleared after the turn"
+    rows = _rows(tmp_path / "status")
+    assert [r["kind"] for r in rows] == ["turn_start", "turn_end"]
+    assert {r["turn_id"] for r in rows} == {turn_id}
+    assert bool(rows[-1].get("error")) is fail
+
+
+def test_handle_surface_skips_status_for_non_chat_surface(tmp_path):
+    from types import SimpleNamespace
+
+    from alice_speaking._dispatch import handle_surface
+
+    seen: list = []
+    ctx = _surface_ctx(tmp_path / "status", seen)
+    asyncio.run(handle_surface(ctx, SimpleNamespace(path=_drop_surface(tmp_path, "note"))))
+
+    assert seen and seen[0][1] is False
+    assert not cs.status_path(tmp_path / "status").exists()
