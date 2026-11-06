@@ -1,0 +1,7 @@
+node_modules/
+.vite/
+# dist/ is checked in deliberately — the status_site container is
+# Python-only; shipping the built bundle avoids running ``npm``
+# inside CI or on the aimax1 host. See the slice-1 PR description
+# for #639 and the follow-up to add a build step.
+!dist/

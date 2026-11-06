@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Alice · status</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --fg: #1a1a1a;
+        --fg-muted: #555;
+        --bg: #fafaf7;
+        --bg-card: #ffffff;
+        --border: #e4e4df;
+        --accent: #7f3f00;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --fg: #e8e6e0;
+          --fg-muted: #9a988f;
+          --bg: #1c1c1a;
+          --bg-card: #26262a;
+          --border: #35353a;
+          --accent: #e8b073;
+        }
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          Helvetica, Arial, sans-serif;
+        line-height: 1.5;
+      }
+      main {
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 24px 16px 64px;
+      }
+      header.app-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 12px;
+        margin-bottom: 24px;
+      }
+      header.app-header h1 {
+        margin: 0;
+        font-family: Georgia, "Times New Roman", serif;
+        font-weight: 400;
+        font-size: 28px;
+      }
+      header.app-header .conn {
+        font-size: 12px;
+        color: var(--fg-muted);
+      }
+      header.app-header .conn[data-state="open"]::before {
+        content: "●";
+        color: #4caf50;
+        margin-right: 4px;
+      }
+      header.app-header .conn[data-state="connecting"]::before,
+      header.app-header .conn[data-state="retrying"]::before {
+        content: "●";
+        color: #ff9800;
+        margin-right: 4px;
+      }
+      header.app-header .conn[data-state="closed"]::before {
+        content: "●";
+        color: #d32f2f;
+        margin-right: 4px;
+      }
+      section.rendered-section {
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 16px 20px;
+        margin-bottom: 16px;
+      }
+      section.rendered-section.empty {
+        opacity: 0.5;
+      }
+      section.rendered-section h1,
+      section.rendered-section h2 {
+        font-family: Georgia, "Times New Roman", serif;
+        font-weight: 400;
+        margin-top: 0;
+      }
+      section.rendered-section h2 {
+        font-size: 20px;
+        margin-bottom: 8px;
+      }
+      section.rendered-section a {
+        color: var(--accent);
+      }
+      section.rendered-section code,
+      section.rendered-section pre {
+        background: rgba(0, 0, 0, 0.05);
+        padding: 2px 4px;
+        border-radius: 4px;
+        font-size: 13px;
+      }
+      @media (prefers-color-scheme: dark) {
+        section.rendered-section code,
+        section.rendered-section pre {
+          background: rgba(255, 255, 255, 0.08);
+        }
+      }
+      section.rendered-section pre {
+        padding: 10px 12px;
+        overflow-x: auto;
+      }
+      footer.fallback-link {
+        text-align: center;
+        font-size: 12px;
+        color: var(--fg-muted);
+        margin-top: 32px;
+      }
+      footer.fallback-link a {
+        color: var(--fg-muted);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -50,6 +50,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from status_site.events import (
+    DEFAULT_HEARTBEAT_MS,
+    EventBroker,
+    HEARTBEAT_FRAME,
+    SectionPoller,
+    format_frame,
+    heartbeat_ms_from_env,
+    snapshot_payload,
+)
 from status_site.history import Tracker, read_history
 from status_site.sources import (
     done_today as _done_today,
@@ -65,6 +74,12 @@ from status_site.sources.common import (
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC_FILES = {"index.html", "marked.min.js"}
+# React shell (slice-1 of #639) ships as a pre-built Vite bundle under
+# ``static/react-app/dist/``. Served at ``/app/`` with SPA-style fallback
+# to ``index.html`` for anything that isn't a hashed asset. The legacy
+# ``index.html`` (markdown fallback) stays at ``/``.
+REACT_DIST_DIR = STATIC_DIR / "react-app" / "dist"
+import queue as _queue  # noqa: E402 — late because it is only used by SSE
 
 # Content files served from STATUS_DIR: flat names only (no '/', no leading dot).
 CONTENT_NAME_RE = re.compile(
@@ -160,6 +175,12 @@ class Config:
     # present and renders a "nothing yet" state when not (tests spin
     # up the server without background threads).
     pollers: "OverviewPollers | None" = field(default=None, repr=False)
+    # Set at boot (or by a test fixture) when the SSE event stream is
+    # enabled. ``None`` means ``/api/events`` is disabled; the markdown
+    # fallback (``/index.md``) still works.
+    events_broker: "EventBroker | None" = field(default=None, repr=False)
+    section_poller: "SectionPoller | None" = field(default=None, repr=False)
+    heartbeat_ms: int = DEFAULT_HEARTBEAT_MS
 
     @property
     def threads_dir(self) -> Path:
@@ -1576,8 +1597,116 @@ class Handler(BaseHTTPRequestHandler):
                 return p
         return None
 
+    # ───── SSE: slice-1 of #639 ────────────────────────────────
+    #
+    # One long-lived GET endpoint carries all app state to the browser.
+    # Snapshot-first, then diff frames whenever a section's rendered
+    # markdown changes. See ``status_site/events.py`` for the broker +
+    # poller; this method only drives one connection.
+
+    def _sse_headers(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        # No ``Content-Length``: the response is open-ended. ``no-store``
+        # is already implied by ``no-cache, no-transform`` for the SSE
+        # contract (the dedicated header is the one the browser reads).
+        self.end_headers()
+        # Flush the header block so the client's ``onopen`` fires
+        # immediately rather than waiting on the first data frame.
+        self.wfile.flush()
+
+    def _handle_events(self, head: bool) -> None:
+        broker = self.cfg.events_broker
+        if broker is None:
+            return self._json(503, {"error": "events disabled"}, head=head)
+        self._sse_headers()
+        if head:
+            return
+        heartbeat_ms = self.cfg.heartbeat_ms or DEFAULT_HEARTBEAT_MS
+        try:
+            # Initial snapshot.
+            try:
+                self.wfile.write(format_frame(snapshot_payload(broker)))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+            q = broker.subscribe()
+            heartbeat_s = max(0.05, heartbeat_ms / 1000.0)
+            try:
+                while True:
+                    try:
+                        msg = q.get(timeout=heartbeat_s)
+                    except _queue.Empty:
+                        try:
+                            self.wfile.write(HEARTBEAT_FRAME)
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            return
+                        continue
+                    try:
+                        self.wfile.write(format_frame(msg))
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        return
+            finally:
+                broker.unsubscribe(q)
+        finally:
+            # Idempotent — but a half-closed socket should not keep the
+            # worker thread around.
+            self.close_connection = True
+
+    def _resolve_react(self, path: str) -> Path | None:
+        """Resolve a path under ``/app/`` to a built React asset.
+
+        SPA fallback: anything that isn't a concrete file on disk
+        returns the bundle's ``index.html`` so client-side routing
+        works. Dotfile + path-escape attempts return ``None``.
+        """
+        if not REACT_DIST_DIR.is_dir():
+            return None
+        # ``/app`` → index.html; ``/app/`` → index.html.
+        rel = unquote(path)[len("/app") :].lstrip("/")
+        if not rel:
+            return REACT_DIST_DIR / "index.html"
+        # Deny dotfiles + parent traversal before resolve().
+        parts = rel.split("/")
+        if any(p in ("", ".", "..") or p.startswith(".") for p in parts):
+            return None
+        candidate = (REACT_DIST_DIR / rel).resolve()
+        try:
+            candidate.relative_to(REACT_DIST_DIR.resolve())
+        except ValueError:
+            return None
+        if candidate.is_file():
+            return candidate
+        # SPA fallback.
+        return REACT_DIST_DIR / "index.html"
+
     def _get(self, head: bool) -> None:
         path = urlsplit(self.path).path
+        if path == "/api/events":
+            return self._handle_events(head=head)
+        if path == "/app" or path.startswith("/app/"):
+            react = self._resolve_react(path)
+            if react is None or not react.is_file():
+                return self._json(404, {"error": "react shell not built"}, head=head)
+            try:
+                body = react.read_bytes()
+                mtime = react.stat().st_mtime
+            except OSError:
+                return self._json(404, {"error": "not found"}, head=head)
+            ctype = (
+                CONTENT_TYPES.get(react.suffix)
+                or mimetypes.guess_type(react.name)[0]
+                or "application/octet-stream"
+            )
+            if react.suffix in (".html", ".js", ".css", ".mjs"):
+                if "charset" not in ctype:
+                    ctype += "; charset=utf-8"
+            return self._send(200, body, ctype, mtime=mtime, head=head)
         if path == "/api/note":
             q = parse_qs(urlsplit(self.path).query)
             note = read_note(self.cfg, (q.get("slug") or [""])[0])
@@ -1732,6 +1861,13 @@ def main() -> None:
         )
         cfg.pollers = pollers
         pollers.start()
+    if os.environ.get("AGENT_UI_EVENTS", "1") != "0":
+        cfg.heartbeat_ms = heartbeat_ms_from_env()
+        broker = EventBroker()
+        poller = SectionPoller(cfg, broker)
+        cfg.events_broker = broker
+        cfg.section_poller = poller
+        poller.start()
     print(f"status_site: serving {cfg.status_dir} on {cfg.host}:{cfg.port}", flush=True)
     srv.serve_forever()
 
