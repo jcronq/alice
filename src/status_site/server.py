@@ -331,17 +331,19 @@ def read_chat(cfg: Config, limit: int = MAX_CHAT_HISTORY) -> list[dict]:
         except ValueError:
             pass
     msgs = msgs[-limit:] if limit else msgs
-    upload_root = cfg.upload_dir / "chat"
+    # Extract the <date>/<filename> suffix from each attachment's path
+    # so the client can build /chat-upload/<date>/<filename>. The stored
+    # path may be any absolute host prefix (alias) ending in
+    # ``.../chat/<date>/<filename>``; we don't care about the prefix.
+    chat_suffix = re.compile(r"/chat/(\d{4}-\d{2}-\d{2}/[^/]+)$")
     for m in msgs:
         for att in m.get("attachments") or []:
             raw = att.get("path") or ""
             if not raw:
                 continue
-            try:
-                rel = Path(raw).resolve().relative_to(upload_root.resolve())
-                att["url"] = "/chat-upload/" + rel.as_posix()
-            except (ValueError, OSError):
-                continue
+            match = chat_suffix.search(raw)
+            if match:
+                att["url"] = "/chat-upload/" + match.group(1)
     return msgs
 
 
