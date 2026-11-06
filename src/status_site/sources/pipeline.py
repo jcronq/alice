@@ -45,18 +45,20 @@ PIPELINE_STATES: tuple[str, ...] = (
     "designed",
     "building",
     "reviewing",
+    "blocked",
 )
 _STATE_RANK = {s: i for i, s in enumerate(PIPELINE_STATES)}
 
 #: An issue carrying any of these is out of the active pipeline even if
-#: a stale intermediate label is still attached.
+#: a stale intermediate label is still attached. ``sm:blocked`` is
+#: deliberately NOT excluded — Jason wants blocked work visible so
+#: dispatcher failures (bug #342) don't vanish from the queue.
 EXCLUDED_LABELS: frozenset[str] = frozenset(
     {
         "sm:draft",
         "sm:done",
         "sm:closed",
         "sm:rejected",
-        "sm:blocked",
     }
 )
 
