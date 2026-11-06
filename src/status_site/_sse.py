@@ -31,7 +31,7 @@ import json
 import queue
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 
@@ -88,7 +88,11 @@ class SectionBroadcaster:
 
     def __init__(
         self,
-        renderers: dict[str, Callable[[], str]],
+        # ``Mapping`` (not ``dict``) so a renderer that returns ``dict``
+        # — the slice-2 typed-payload shape — isn't rejected by dict
+        # invariance against the legacy ``dict | str`` return. See
+        # ``_safe_render`` for the str→dict backward-compat coercion.
+        renderers: "Mapping[str, Callable[[], dict | str]]",
         *,
         tick_seconds: float = DEFAULT_TICK_SECONDS,
         stop: threading.Event | None = None,
@@ -103,7 +107,11 @@ class SectionBroadcaster:
         # ``OverviewPollers.get``); nesting the two would deadlock since
         # ``threading.Lock`` is non-reentrant.
         self._lock = threading.Lock()
-        self._rendered: dict[str, str] = {}
+        # Payloads are dicts after slice-2 — renderers return a typed
+        # ``{"markdown": ..., "rows": ...}`` shape so widgets can render
+        # without re-parsing markdown. Dict ``==`` in Python is deep, so
+        # the change-detection compare still works as before.
+        self._rendered: dict[str, dict] = {}
         self._subs: "set[_Subscriber]" = set()
         self._thread: threading.Thread | None = None
 
@@ -134,11 +142,11 @@ class SectionBroadcaster:
         the very next tick won't re-emit everything as a delta.
         """
         sections: dict[str, dict] = {}
-        rendered_now: dict[str, str] = {}
+        rendered_now: dict[str, dict] = {}
         for name, fn in self._renderers.items():
-            md = _safe_render(fn)
-            sections[name] = {"markdown": md}
-            rendered_now[name] = md
+            payload = _safe_render(fn)
+            sections[name] = payload
+            rendered_now[name] = payload
         with self._lock:
             self._rendered.update(rendered_now)
         return {"type": "snapshot", "ts": _now_iso(), "sections": sections}
@@ -152,18 +160,18 @@ class SectionBroadcaster:
         """
         events: list[dict] = []
         for name, fn in self._renderers.items():
-            md = _safe_render(fn)
+            payload = _safe_render(fn)
             with self._lock:
                 prev = self._rendered.get(name)
-                if prev == md:
+                if prev == payload:
                     continue
-                self._rendered[name] = md
+                self._rendered[name] = payload
             events.append(
                 {
                     "type": "section.update",
                     "name": name,
                     "ts": _now_iso(),
-                    "data": {"markdown": md},
+                    "data": payload,
                 }
             )
         for ev in events:
@@ -282,12 +290,30 @@ def check_key(cfg_key: str, query_k: str) -> bool:
     return hmac.compare_digest(query_k.encode(), cfg_key.encode())
 
 
-def _safe_render(fn: Callable[[], str]) -> str:
+def _safe_render(fn: "Callable[[], dict | str]") -> dict:
+    """Run one renderer and coerce the result into a typed payload dict.
+
+    Slice-2 switched section renderers to return ``{"markdown": ...,
+    "rows": [...]}``-style dicts so widgets can render without
+    re-parsing markdown. For backward compatibility we accept plain
+    strings and wrap them as ``{"markdown": <str>}``; falsy returns
+    (``None`` / ``{}``) become an empty-dict payload. A renderer that
+    raises never kills the broadcast — we substitute an italic
+    "render failed" marker and attach the repr for debugging.
+    """
     try:
         out = fn()
     except Exception as e:  # noqa: BLE001 — never kill the broadcast on one bad source
-        return f"*(render failed: {e!r})*"
-    return out if isinstance(out, str) else str(out)
+        return {"markdown": f"*(render failed: {e!r})*", "error": repr(e)}
+    if out is None:
+        return {}
+    if isinstance(out, dict):
+        return out
+    if isinstance(out, str):
+        return {"markdown": out}
+    # Anything else: coerce to a markdown string so the widget layer
+    # still has *something* to show.
+    return {"markdown": str(out)}
 
 
 def _write(wfile, data: bytes) -> bool:

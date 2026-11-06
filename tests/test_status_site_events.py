@@ -326,6 +326,113 @@ def test_encode_event_shape():
     assert "\nid:" not in text
 
 
+# ─── typed section payloads (slice-2, #649) ─────────────────────────
+
+
+def test_section_payload_is_typed_dict(site):
+    """Each section's payload dict carries the keys slice-2's widgets
+    rely on: markdown for the legacy fallback + typed fields (rows,
+    hand_zone_md, prs, asks_resolved) so the client never has to
+    re-parse markdown.
+    """
+    cfg, port = site
+    conn, resp = _open_sse(port, KEY)
+    try:
+        snap = _read_frames_until(
+            resp, lambda e: isinstance(e, dict) and e.get("type") == "snapshot"
+        )
+        sections = snap["sections"]
+        assert {"markdown", "rows"} <= set(sections["running_now"].keys())
+        assert {"markdown", "hand_zone_md", "rows"} <= set(
+            sections["waiting_on_you"].keys()
+        )
+        assert {"markdown", "rows"} <= set(sections["alice_queue"].keys())
+        assert {"markdown", "prs", "asks_resolved"} <= set(
+            sections["done_today"].keys()
+        )
+        # Unchanged sections keep the markdown-only shape (and MUST
+        # retain the ``markdown`` key for the legacy Section fallback).
+        assert "markdown" in sections["ready_for_review"]
+        assert "markdown" in sections["known_issues"]
+    finally:
+        conn.close()
+
+
+def test_waiting_on_you_rows_carry_urgency(site):
+    """asks.jsonl drives the typed rows. An explicit urgency=NOW ask
+    bubbles above an untagged ask (which defaults to UNSET)."""
+    cfg, port = site
+    # Use timestamps relative to ``datetime.now`` so the urgency
+    # classifier's age-bump doesn't flip the untagged ask to TODAY
+    # on a slow CI run.
+    from datetime import datetime, timedelta, timezone
+
+    now_utc = datetime.now(timezone.utc)
+    now_ask_iso = (now_utc - timedelta(minutes=10)).isoformat()
+    plain_ask_iso = (now_utc - timedelta(minutes=5)).isoformat()
+    asks = cfg.status_dir / "asks.jsonl"
+    asks.write_text(
+        json.dumps(
+            {
+                "id": "ask-now",
+                "text": "ship the thing",
+                "urgency": "NOW",
+                "created": now_ask_iso,
+                "resolved": False,
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "id": "ask-plain",
+                # Keyword-free prose so the classifier falls through to
+                # the age bump (and, on a fresh ask, UNSET).
+                "text": "untagged request wording",
+                "created": plain_ask_iso,
+                "resolved": False,
+            }
+        )
+        + "\n"
+    )
+    conn, resp = _open_sse(port, KEY)
+    try:
+        ev = _read_frames_until(
+            resp,
+            lambda e: isinstance(e, dict)
+            and e.get("type") in ("snapshot", "section.update")
+            and (
+                (
+                    e.get("type") == "snapshot"
+                    and "ship the thing"
+                    in (
+                        e["sections"].get("waiting_on_you", {}).get("markdown", "")
+                    )
+                )
+                or (
+                    e.get("type") == "section.update"
+                    and e.get("name") == "waiting_on_you"
+                    and "ship the thing" in (e["data"].get("markdown", ""))
+                )
+            ),
+            timeout=4.0,
+        )
+        if ev["type"] == "snapshot":
+            payload = ev["sections"]["waiting_on_you"]
+        else:
+            payload = ev["data"]
+        rows = payload.get("rows") or []
+        by_id = {r["id"]: r for r in rows}
+        assert by_id["ask-now"]["urgency"] == "NOW"
+        # Untagged, fresh asks default to UNSET (the classifier's
+        # loud "please classify me" fallback).
+        assert by_id["ask-plain"]["urgency"] == "UNSET"
+        # NOW floats above UNSET in the row order.
+        ids = [r["id"] for r in rows]
+        assert ids.index("ask-now") < ids.index("ask-plain")
+    finally:
+        conn.close()
+
+
 # ─── broadcaster unit ───────────────────────────────────────────────
 
 

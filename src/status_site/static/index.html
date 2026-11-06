@@ -4,52 +4,91 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Alice — status</title>
 <!--
-  Reactive status-site shell (#639, slice-1).
+  Reactive status-site shell (#639, slice-2).
 
-  Reads one long-lived SSE stream from /api/events and renders each
-  Overview section as markdown (reusing the legacy marked.js). The
-  very first SSE frame is a full snapshot; subsequent `section.update`
-  frames patch one section's state. Lists are replaced whole — never
-  patched — so the client never has to reconcile a gap.
+  SSE-driven React shell. The first SSE frame is a full snapshot;
+  subsequent `section.update` frames patch one section's state. Each
+  section payload is a typed dict (``{markdown, rows, ...}``) so the
+  widget components render without re-parsing markdown; a markdown
+  fallback is still shipped for sections slice-2 doesn't widgetise yet
+  (ready_for_review, known_issues), and for the ``/index.md`` legacy
+  path that kicks in when SSE dies.
 
-  No build toolchain: React + ReactDOM come over an importmap from
-  esm.sh. Non-Overview pages (?p=chat, ?p=bugs, …) are handled by the
-  legacy shell at /legacy.html; the shell redirects there on mount
-  for anything but ?p=index, so nav tabs + modal + reply flow + chat
-  keep working through slice-1. Slices 2–6 will port those into the
-  reactive tree.
+  Non-Overview pages (?p=chat, ?p=bugs, …) continue to run through the
+  legacy shell at /legacy.html; the shell redirects there on mount for
+  anything but ?p=index so nav tabs + modal + reply flow + chat keep
+  working. Slices 3–6 fold more of that into the reactive tree.
 -->
+<link rel="stylesheet" href="design-tokens.css">
 <style>
-:root{
-  --bg:#fbfaf7;--fg:#1f2328;--muted:#6b7280;--card:#fff;
-  --line:#e5e2db;--accent:#2f6f5e;--warn:#b45309;--bad:#b23a3a;
+/* Shell-specific styles — tokens live in design-tokens.css. */
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font: var(--dash-font-size-body)/1.55 var(--font-sans);
 }
-@media (prefers-color-scheme:dark){:root{
-  --bg:#15171a;--fg:#e6e6e6;--muted:#9aa0a6;--card:#1d2024;
-  --line:#2c3036;--accent:#6cc4a8;--warn:#f0a35e;--bad:#f5766a;
-}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}
-header{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--line);padding:.6rem 1rem;display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;z-index:2}
-header b{font-size:1.05rem}
-header a{color:var(--muted);text-decoration:none;padding:.15rem .55rem;border:1px solid var(--line);border-radius:999px;font-size:.85rem}
-header a:hover{color:var(--accent);border-color:var(--accent)}
-.spacer{flex:1}
-.sse-status{font-size:.78rem;color:var(--muted);padding:.1rem .5rem;border:1px solid var(--line);border-radius:999px}
-.sse-status.live{color:var(--accent);border-color:var(--accent)}
-.sse-status.fallback{color:var(--warn);border-color:var(--warn)}
-.sse-status.off{color:var(--bad);border-color:var(--bad)}
-main{max-width:860px;margin:0 auto;padding:1rem 1rem 4rem}
-h1{font-size:1.5rem;margin:.6rem 0}
-h2{font-size:1.15rem;margin:1.6rem 0 .5rem;padding-bottom:.25rem;border-bottom:1px solid var(--line)}
-h3{font-size:1rem}
-em.stale-footer{display:block;font-size:.78em;opacity:.65;margin-top:.1rem}
-ul{padding-left:1.2rem}li{margin:.2rem 0}
-code{background:var(--card);border:1px solid var(--line);border-radius:4px;padding:0 .3rem;font-size:.88em}
-a{color:var(--accent)}
-.sec-body del{color:var(--muted)}
-.notice{margin:1rem 0;padding:.5rem .8rem;border:1px solid var(--warn);border-radius:6px;background:var(--card);color:var(--warn)}
-.notice.err{border-color:var(--bad);color:var(--bad)}
+header {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--color-bg);
+  border-bottom: 1px solid var(--color-border-line);
+  padding: .6rem 1rem;
+  display: flex; gap: .6rem; align-items: center; flex-wrap: wrap;
+}
+header b { font-size: 1.05rem; }
+header a, header button.hdr {
+  color: var(--color-fg-muted);
+  background: transparent;
+  text-decoration: none;
+  padding: .15rem .55rem;
+  border: 1px solid var(--color-border-line);
+  border-radius: 999px;
+  font-size: .85rem;
+  cursor: pointer;
+}
+header a:hover, header button.hdr:hover {
+  color: var(--color-ok); border-color: var(--color-ok);
+}
+.spacer { flex: 1; }
+.sse-status {
+  font-size: .78rem; color: var(--color-fg-muted);
+  padding: .1rem .5rem; border: 1px solid var(--color-border-line);
+  border-radius: 999px;
+}
+.sse-status.live { color: var(--color-ok); border-color: var(--color-ok); }
+.sse-status.fallback { color: var(--color-warn); border-color: var(--color-warn); }
+.sse-status.off { color: var(--color-bad); border-color: var(--color-bad); }
+main { max-width: 900px; margin: 0 auto; padding: 1rem 1rem 4rem; }
+h1 { font-size: 1.5rem; margin: .6rem 0; }
+h2.sec-heading {
+  font-size: 1.15rem; margin: 1.6rem 0 .5rem;
+  padding-bottom: .25rem;
+  border-bottom: 1px solid var(--color-border-line);
+}
+.sec { margin: 1rem 0; }
+.sec-body del { color: var(--color-fg-muted); }
+.sec-body a { color: var(--color-ok); }
+.sec-body ul { padding-left: 1.2rem; }
+.sec-body li { margin: .2rem 0; }
+.sec-body code {
+  background: var(--color-panel);
+  border: 1px solid var(--color-border-line);
+  border-radius: 4px; padding: 0 .3rem; font-size: .88em;
+}
+.notice {
+  margin: 1rem 0; padding: .5rem .8rem;
+  border: 1px solid var(--color-warn); border-radius: 6px;
+  background: var(--color-panel); color: var(--color-warn);
+}
+.notice.err { border-color: var(--color-bad); color: var(--color-bad); }
+.fx-big { display: inline-flex; align-items: baseline; gap: .3rem; }
+.fx-big .n {
+  font-size: var(--dash-font-size-title);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.fx-big .of { color: var(--color-fg-muted); font-size: var(--dash-font-size-caption); }
 </style>
 </head><body>
 <div id="root">Loading Alice…</div>
@@ -63,8 +102,9 @@ a{color:var(--accent)}
 }
 </script>
 <script type="module">
-import React, {useEffect, useReducer, useRef} from "react";
+import React, {useEffect, useReducer, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
+const h = React.createElement;
 
 // ── 0. key + legacy redirect ──────────────────────────────────────
 // Key handling mirrors legacy.html: ?k=<key> → localStorage → bare URL.
@@ -77,13 +117,36 @@ if (kParam) {
 }
 const KEY = localStorage.getItem("alice-key") || "";
 // Non-Overview pages continue to work through the legacy shell. The
-// reactive widget library (slice-2+) will fold these into the tree.
+// reactive widget library (slice-3+) will fold these into the tree.
 const PAGE = (new URLSearchParams(location.search).get("p") || "index");
 if (PAGE !== "index") {
   location.replace("legacy.html" + location.search + location.hash);
 }
 
-// ── 1. section catalogue ──────────────────────────────────────────
+// ── 1. theme toggle ───────────────────────────────────────────────
+// ?theme=dark|light → localStorage → <html data-theme>. Default is
+// "match system" (no data-theme attribute; the CSS media query owns
+// it). Explicit override via ?theme sticks until Jason clears it.
+const themeParam = new URL(location.href).searchParams.get("theme");
+if (themeParam === "dark" || themeParam === "light") {
+  localStorage.setItem("alice-theme", themeParam);
+  const u = new URL(location.href);
+  u.searchParams.delete("theme");
+  history.replaceState(null, "", u.pathname + (u.search ? "?" + u.search : "") + u.hash);
+} else if (themeParam === "system") {
+  localStorage.removeItem("alice-theme");
+}
+function applyTheme() {
+  const t = localStorage.getItem("alice-theme");
+  if (t === "dark" || t === "light") {
+    document.documentElement.setAttribute("data-theme", t);
+  } else {
+    document.documentElement.removeAttribute("data-theme");
+  }
+}
+applyTheme();
+
+// ── 2. section catalogue ──────────────────────────────────────────
 const SECTION_ORDER = [
   "running_now",
   "ready_for_review",
@@ -100,11 +163,16 @@ const SECTION_LABELS = {
   done_today: "Done today",
   known_issues: "Known issues I'm on",
 };
+// Which sections render via a typed widget (slice-2). Everything else
+// falls back to the markdown-only Section component.
+const WIDGET_SECTIONS = new Set([
+  "running_now",
+  "waiting_on_you",
+  "alice_queue",
+  "done_today",
+]);
 
-// ── 2. SSE parser ─────────────────────────────────────────────────
-// Incremental, spec-compliant: CR/LF/CRLF, strips leading BOM,
-// ignores ``:`` comment lines (so heartbeats never reach handlers),
-// supports multi-line ``data:`` fields.
+// ── 3. SSE parser ─────────────────────────────────────────────────
 function makeSseParser(onMessage) {
   let buf = "";
   let bomStripped = false;
@@ -120,35 +188,42 @@ function makeSseParser(onMessage) {
       buf = buf.slice(idx + 2);
       const dataLines = [];
       for (const line of raw.split("\n")) {
-        if (line.startsWith(":")) continue;      // comment / heartbeat
-        if (!line.startsWith("data:")) continue; // ignore event:, id:, etc.
+        if (line.startsWith(":")) continue;
+        if (!line.startsWith("data:")) continue;
         dataLines.push(line.slice(5).replace(/^ /, ""));
       }
       if (!dataLines.length) continue;
-      try {
-        onMessage(JSON.parse(dataLines.join("\n")));
-      } catch (e) {
-        // Malformed JSON frame — drop silently; the server's next
-        // snapshot (on reconnect) will put us back in sync.
-      }
+      try { onMessage(JSON.parse(dataLines.join("\n"))); }
+      catch (e) { /* malformed frame — the next snapshot resyncs us */ }
     }
   };
 }
 
-// ── 3. reducer ────────────────────────────────────────────────────
-// snapshot replaces every section; section.update replaces one.
-// __status is our local wire-type for connection state (not an SSE event).
-const INITIAL = {sections: {}, connected: false, fallback: false, error: null};
-
+// ── 4. reducer ────────────────────────────────────────────────────
+// snapshot replaces every section + stamps its ts; section.update
+// replaces one. ts is used by freshness tiles to tint by age.
+const INITIAL = {
+  sections: {}, ts: {},
+  connected: false, fallback: false, error: null,
+};
 function reducer(state, event) {
   switch (event.type) {
-    case "snapshot":
-      return {...state, sections: event.sections || {}, connected: true, fallback: false, error: null};
+    case "snapshot": {
+      const next = {};
+      for (const k of Object.keys(event.sections || {})) next[k] = event.ts;
+      return {
+        ...state,
+        sections: event.sections || {},
+        ts: {...state.ts, ...next},
+        connected: true, fallback: false, error: null,
+      };
+    }
     case "section.update":
       if (!event.name) return state;
       return {
         ...state,
         sections: {...state.sections, [event.name]: event.data || {}},
+        ts: {...state.ts, [event.name]: event.ts},
       };
     case "__status":
       return {
@@ -167,10 +242,9 @@ function reducer(state, event) {
   }
 }
 
-// ── 4. event-stream hook ──────────────────────────────────────────
+// ── 5. event-stream hook ──────────────────────────────────────────
 const MAX_RECONNECT_ATTEMPTS = 5;
 const BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 10000];
-
 function useEventStream(dispatch) {
   const abortRef = useRef(null);
   useEffect(() => {
@@ -196,8 +270,7 @@ function useEventStream(dispatch) {
         abortRef.current = ac;
         try {
           const r = await fetch("/api/events?k=" + encodeURIComponent(KEY), {
-            headers: {Accept: "text/event-stream"},
-            signal: ac.signal,
+            headers: {Accept: "text/event-stream"}, signal: ac.signal,
           });
           if (!r.ok) throw new Error("HTTP " + r.status);
           dispatch({type: "__status", connected: true, fallback: false});
@@ -216,9 +289,6 @@ function useEventStream(dispatch) {
         dispatch({type: "__status", connected: false, fallback: false});
         attempts++;
         if (attempts >= MAX_RECONNECT_ATTEMPTS) {
-          // Degrade to the splice-rendered /index.md so the page stays
-          // serviceable. Keep trying in the background every 30s; the
-          // moment SSE comes back we flip out of fallback via snapshot.
           await fallbackPoll();
           await new Promise(res => setTimeout(res, 30000));
           attempts = MAX_RECONNECT_ATTEMPTS;
@@ -236,30 +306,335 @@ function useEventStream(dispatch) {
   }, [dispatch]);
 }
 
-// ── 5. UI ─────────────────────────────────────────────────────────
+// ── 6. helpers: markdown, freshness, ages ─────────────────────────
 function renderMarkdown(md) {
   if (!md) return "";
-  try {
-    return window.marked.parse(md, {gfm: true, breaks: false});
-  } catch (e) {
-    return "<pre>" + (md || "").replace(/[&<>]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"}[c])) + "</pre>";
+  try { return window.marked.parse(md, {gfm: true, breaks: false}); }
+  catch (e) {
+    return "<pre>" + (md || "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])) + "</pre>";
   }
 }
+function parseTs(iso) {
+  if (!iso) return 0;
+  const t = Date.parse(iso);
+  return Number.isFinite(t) ? t : 0;
+}
+function freshnessFromTs(ts, nowMs) {
+  if (!ts) return "ok";
+  const ageSec = Math.max(0, (nowMs - ts) / 1000);
+  if (ageSec < 300) return "ok";
+  if (ageSec < 900) return "amber";
+  return "red";
+}
+function stampText(ts, nowMs) {
+  if (!ts) return "no update yet";
+  const sec = Math.max(0, Math.floor((nowMs - ts) / 1000));
+  if (sec < 60) return "updated " + sec + "s ago";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return "updated " + min + "m ago";
+  const hr = Math.floor(min / 60);
+  const rm = min % 60;
+  return "updated " + hr + "h" + (rm ? " " + rm + "m" : "") + " ago";
+}
+function ageString(createdIso, nowMs) {
+  const t = parseTs(createdIso);
+  if (!t) return "—";
+  const sec = Math.max(0, Math.floor((nowMs - t) / 1000));
+  if (sec < 60) return sec + "s";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return min + "m";
+  const hr = Math.floor(min / 60);
+  const rm = min % 60;
+  return hr + "h" + (rm ? " " + rm + "m" : "");
+}
+function ageStringSeconds(ageSec) {
+  const s = Math.max(0, Math.floor(ageSec || 0));
+  if (s < 60) return s + "s";
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + "m";
+  const hr = Math.floor(m / 60);
+  const rm = m % 60;
+  return hr + "h" + (rm ? " " + rm + "m" : "");
+}
 
-function Section({name, data}) {
-  const md = (data && data.markdown) || "";
-  return React.createElement("section", {className: "sec", "data-section": name},
-    React.createElement("h2", null, SECTION_LABELS[name] || name),
-    React.createElement("div", {
-      className: "sec-body",
-      dangerouslySetInnerHTML: {__html: renderMarkdown(md)},
+// Re-tint freshness tiles every ~10s so an idle-but-stale panel drifts
+// through ok → amber → red without needing a new SSE event.
+function useNowTick(intervalMs) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), intervalMs || 10000);
+    return () => clearInterval(id);
+  }, [intervalMs]);
+  return now;
+}
+
+// ── 7. primitive widgets (no JSX, no build step) ──────────────────
+function FxCard({children}) {
+  return h("div", {className: "fx-card"}, children);
+}
+function FxBig({number, of}) {
+  return h("span", {className: "fx-big"},
+    h("span", {className: "n"}, number),
+    of != null ? h("span", {className: "of"}, of) : null,
+  );
+}
+function UrgencyPill({rank}) {
+  const canon = rank || "UNSET";
+  return h("span", {className: "fx-urg " + canon}, canon);
+}
+function CyclePill({rank}) {
+  // Slice-2: visual placeholder for the effort/urgency cycle control.
+  // Click-to-cycle wiring arrives in slice-4.
+  return h("span", {className: "fx-pill", "data-cycle": rank || "—"}, rank || "—");
+}
+function FxTable({columns, rows, rowClass}) {
+  const header = h("thead", null,
+    h("tr", null, columns.map(c =>
+      h("th", {
+        key: c.key,
+        style: c.numeric ? {textAlign: "right", fontVariantNumeric: "tabular-nums"} : null,
+      }, c.label)
+    ))
+  );
+  const body = h("tbody", null,
+    (rows || []).map((row, i) => {
+      const extra = rowClass ? rowClass(row) : "";
+      return h("tr", {key: row.__key || row.id || row.slug || i, className: extra || null},
+        columns.map(c => {
+          const cell = c.cell ? c.cell(row) : row[c.key];
+          return h("td", {
+            key: c.key,
+            style: c.numeric ? {textAlign: "right", fontVariantNumeric: "tabular-nums"} : null,
+          }, cell == null ? "" : cell);
+        })
+      );
     })
+  );
+  return h("div", {className: "fx-tbl"}, h("table", null, header, body));
+}
+function FreshnessTile({title, dataFresh, stampText: stamp, children}) {
+  return h("div", {className: "fx-tile", "data-fresh": dataFresh || "ok"},
+    h("h3", null, title),
+    h("div", {className: "fx-card"}, children),
+    h("p", {className: "fx-stamp"}, stamp),
+  );
+}
+function MarkdownZone({markdown}) {
+  if (!markdown) return null;
+  return h("div", {
+    className: "sec-body",
+    dangerouslySetInnerHTML: {__html: renderMarkdown(markdown)},
+  });
+}
+
+// ── 8. section widgets (slice-2) ──────────────────────────────────
+function RunningNowBoard({rows, nowMs}) {
+  const safe = rows || [];
+  if (!safe.length) {
+    return h("p", {style: {color: "var(--color-fg-muted)", margin: 0}},
+      "(nothing building right now)");
+  }
+  const columns = [
+    {key: "branch", label: "branch", cell: r => h("code", null, r.branch || "")},
+    {key: "issue", label: "issue", cell: r => {
+      const n = r.issue;
+      if (!n) return "";
+      return h("a", {
+        href: "https://github.com/jcronq/alice/issues/" + n,
+        target: "_blank", rel: "noopener",
+        style: {fontVariantNumeric: "tabular-nums"},
+      }, "#" + n);
+    }},
+    {key: "alive", label: "alive", cell: r =>
+      h("span", {className: "fx-pill " + (r.alive ? "active" : "done")},
+        r.alive ? "alive" : "dead")
+    },
+    {key: "elapsed", label: "elapsed", numeric: true, cell: r =>
+      h("span", {className: "fx-num"}, r.elapsed || "")
+    },
+    {key: "pr_url", label: "PR", cell: r =>
+      r.pr_url
+        ? h("a", {href: r.pr_url, target: "_blank", rel: "noopener"}, "draft PR")
+        : h("span", {style: {color: "var(--color-fg-muted)"}}, "no PR yet")
+    },
+    {key: "task_status", label: "status", cell: r => r.task_status || ""},
+  ];
+  return h(FxTable, {
+    columns, rows: safe,
+    rowClass: r => r.alive ? "" : "",
+  });
+}
+
+function WaitingTable({rows, handZoneMd, nowMs}) {
+  const safe = rows || [];
+  const table = safe.length
+    ? h(FxTable, {
+        columns: [
+          {key: "urgency", label: "urgency", cell: r => h(UrgencyPill, {rank: r.urgency})},
+          {key: "text", label: "ask", cell: r => r.text || ""},
+          {key: "created", label: "age", cell: r => ageString(r.created, nowMs)},
+        ],
+        rows: safe,
+        rowClass: r => (r.urgency === "NOW" || r.urgency === "UNSET") ? "fx-now" : "",
+      })
+    : h("p", {style: {color: "var(--color-fg-muted)", margin: 0}},
+        "(nothing waiting on you)");
+  return h(React.Fragment, null,
+    handZoneMd ? h(MarkdownZone, {markdown: handZoneMd}) : null,
+    table,
   );
 }
 
+function AliceQueueList({rows, nowMs}) {
+  const safe = rows || [];
+  if (!safe.length) {
+    return h("p", {style: {color: "var(--color-fg-muted)", margin: 0}},
+      "(queue clear)");
+  }
+  const columns = [
+    {key: "age_seconds", label: "age", numeric: true, cell: r =>
+      h("span", {className: "fx-num"}, ageStringSeconds(r.age_seconds))
+    },
+    {key: "label", label: "surface", cell: r => r.label || ""},
+    {key: "link", label: "link", cell: r =>
+      r.link
+        ? h("a", {href: r.link, target: "_blank", rel: "noopener"}, "open")
+        : "—"
+    },
+    {key: "effort", label: "effort", cell: () => h(CyclePill, {rank: "—"})},
+  ];
+  return h(FxTable, {columns, rows: safe});
+}
+
+function DoneTodayList({prs, asksResolved}) {
+  const prRows = prs || [];
+  const askRows = asksResolved || [];
+  const hasAny = prRows.length || askRows.length;
+  if (!hasAny) {
+    return h("p", {style: {color: "var(--color-fg-muted)", margin: 0}},
+      "(nothing done today yet)");
+  }
+  const prsBlock = h("div", null,
+    h("h4", {style: {margin: "0 0 .3rem", fontWeight: 500}}, "PRs merged today"),
+    prRows.length
+      ? h(FxTable, {
+          columns: [
+            {key: "repo", label: "repo", cell: r => h("code", null, r.repo || "")},
+            {key: "number", label: "#", numeric: true, cell: r =>
+              r.url
+                ? h("a", {href: r.url, target: "_blank", rel: "noopener",
+                    style: {fontVariantNumeric: "tabular-nums"}},
+                    "#" + r.number)
+                : h("span", {className: "fx-num"}, "#" + r.number)
+            },
+            {key: "title", label: "title"},
+            {key: "merged_at", label: "merged"},
+          ],
+          rows: prRows.map((r, i) => ({...r, __key: (r.repo || "") + "#" + (r.number || i)})),
+        })
+      : h("p", {style: {color: "var(--color-fg-muted)", margin: 0}},
+          "(no PRs merged today)"),
+  );
+  const asksBlock = h("div", {style: {marginTop: "1rem"}},
+    h("h4", {style: {margin: "0 0 .3rem", fontWeight: 500}}, "Asks resolved today"),
+    askRows.length
+      ? h("ul", null, askRows.map((a, i) =>
+          h("li", {key: a.id || i}, a.text || "(unnamed ask)")))
+      : h("p", {style: {color: "var(--color-fg-muted)", margin: 0}},
+          "(no asks resolved today)"),
+  );
+  return h(React.Fragment, null, prsBlock, asksBlock);
+}
+
+// ── 9. section router ─────────────────────────────────────────────
+function SectionTile({name, data, ts, nowMs}) {
+  const fresh = freshnessFromTs(ts, nowMs);
+  const stamp = stampText(ts, nowMs);
+  const title = SECTION_LABELS[name] || name;
+  let inner;
+  if (name === "running_now") {
+    inner = h(RunningNowBoard, {rows: data && data.rows, nowMs});
+  } else if (name === "waiting_on_you") {
+    inner = h(WaitingTable, {
+      rows: data && data.rows,
+      handZoneMd: data && data.hand_zone_md,
+      nowMs,
+    });
+  } else if (name === "alice_queue") {
+    inner = h(AliceQueueList, {rows: data && data.rows, nowMs});
+  } else if (name === "done_today") {
+    inner = h(DoneTodayList, {
+      prs: data && data.prs,
+      asksResolved: data && data.asks_resolved,
+    });
+  } else {
+    // Markdown-only fallback for sections slice-2 doesn't widgetise
+    // yet (ready_for_review, known_issues, anything else the server
+    // might start emitting).
+    inner = h(MarkdownZone, {markdown: (data && data.markdown) || ""});
+  }
+  return h("section", {className: "sec", "data-section": name},
+    h(FreshnessTile, {title, dataFresh: fresh, stampText: stamp}, inner),
+  );
+}
+
+function LegacySection({data}) {
+  return h("section", {className: "sec", "data-section": "_legacy_md"},
+    h(MarkdownZone, {markdown: (data && data.markdown) || ""}),
+  );
+}
+
+// ── 10. header ────────────────────────────────────────────────────
+// Nav tabs: fetch pages.json so chat / bugs / review stay reachable from the
+// reactive shell. Each non-hidden tab links to legacy.html via ?p=<slug>
+// (the reactive shell already redirects anything but ?p=index there), so no
+// backend changes needed. Chat is auto-added if pages.json omits it, matching
+// legacy.html line 354-355.
+function NavTabs() {
+  const [pages, setPages] = useState([]);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch("pages.json?" + Date.now());
+        if (!r.ok) return;
+        const raw = await r.json();
+        if (cancelled) return;
+        const visible = raw.filter(p => !p.hidden && p.slug !== "index");
+        if (!visible.some(p => p.slug === "chat")) {
+          visible.push({slug: "chat", title: "Chat"});
+        }
+        setPages(visible);
+      } catch (e) { /* nav is best-effort */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+  const search = location.search;
+  return pages.map(p => h("a", {
+    key: p.slug,
+    href: "legacy.html" + (search ? search + "&" : "?") + "p=" + encodeURIComponent(p.slug),
+    title: p.title,
+  }, p.title));
+}
+
+function ThemeToggle() {
+  const [t, setT] = useState(() => localStorage.getItem("alice-theme") || "system");
+  function cycle() {
+    const next = t === "dark" ? "light" : t === "light" ? "system" : "dark";
+    if (next === "system") localStorage.removeItem("alice-theme");
+    else localStorage.setItem("alice-theme", next);
+    setT(next);
+    applyTheme();
+  }
+  const label = t === "dark" ? "Theme: dark" : t === "light" ? "Theme: light" : "Theme: auto";
+  return h("button", {className: "hdr", onClick: cycle, title: "Toggle theme"}, label);
+}
+
+// ── 11. app ───────────────────────────────────────────────────────
 function App() {
   const [state, dispatch] = useReducer(reducer, INITIAL);
   useEventStream(dispatch);
+  const nowMs = useNowTick(10000);
 
   const legacyHref = "legacy.html" + location.search;
   let statusClass = "sse-status";
@@ -268,34 +643,38 @@ function App() {
   else if (state.connected) { statusClass += " live"; statusLabel = "live"; }
   else if (state.error) { statusClass += " off"; statusLabel = state.error; }
 
+  const legacyPayload = state.sections._legacy_md;
   const sections = SECTION_ORDER
     .filter(n => state.sections[n])
-    .map(n => React.createElement(Section, {key: n, name: n, data: state.sections[n]}));
+    .map(n => h(SectionTile, {
+      key: n, name: n,
+      data: state.sections[n],
+      ts: parseTs(state.ts[n]),
+      nowMs,
+    }));
 
-  const legacyFallback = state.sections._legacy_md
-    ? React.createElement("div", {
-        className: "sec-body",
-        dangerouslySetInnerHTML: {__html: renderMarkdown(state.sections._legacy_md.markdown)},
-      })
-    : null;
-
-  return React.createElement(React.Fragment, null,
-    React.createElement("header", null,
-      React.createElement("b", null, "Alice"),
-      React.createElement("span", {className: "spacer"}),
-      React.createElement("a", {href: legacyHref, title: "Pre-#639 markdown shell"}, "Classic view"),
-      React.createElement("span", {className: statusClass}, statusLabel)
+  return h(React.Fragment, null,
+    h("header", null,
+      h("b", null, "Alice"),
+      h(NavTabs),
+      h("span", {className: "spacer"}),
+      h("a", {href: legacyHref, title: "Pre-#639 markdown shell"}, "Classic view"),
+      h(ThemeToggle),
+      h("span", {className: statusClass}, statusLabel),
     ),
-    React.createElement("main", null,
-      !KEY && React.createElement("div", {className: "notice err"},
-        "No key — open the link Alice sent once to install it."
-      ),
-      sections.length ? sections : (state.fallback ? null : React.createElement("div", {className: "notice"}, "Waiting for the first snapshot…")),
-      legacyFallback
-    )
+    h("main", null,
+      !KEY && h("div", {className: "notice err"},
+        "No key — open the link Alice sent once to install it."),
+      sections.length
+        ? sections
+        : (legacyPayload
+            ? h(LegacySection, {data: legacyPayload})
+            : (state.fallback ? null : h("div", {className: "notice"},
+                "Waiting for the first snapshot…"))),
+    ),
   );
 }
 
-createRoot(document.getElementById("root")).render(React.createElement(App));
+createRoot(document.getElementById("root")).render(h(App));
 </script>
 </body></html>
