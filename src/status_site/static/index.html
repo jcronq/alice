@@ -217,6 +217,13 @@ h2.sec-heading {
   background: transparent; border: 0; cursor: pointer; color: var(--color-fg-muted);
 }
 .a2ui-attach-err { color: var(--color-bad); font-size: .8rem; }
+.a2ui-reply-chip {
+  display: flex; align-items: center; justify-content: space-between; gap: .5rem;
+  padding: .25rem .6rem; font-size: .82rem; color: var(--color-fg-muted);
+  border-left: 3px solid var(--color-ok); background: var(--color-bg);
+  border-radius: 4px;
+}
+.a2ui-reply-chip button { background: transparent; border: 0; cursor: pointer; color: var(--color-fg-muted); }
 </style>
 </head><body>
 <div id="root">Loading Alice…</div>
@@ -233,8 +240,10 @@ h2.sec-heading {
 import React, {useEffect, useReducer, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
 import {
-  ACCEPT, attachmentName, imageFilesFromClipboard, isNearBottom,
-  readAsBase64, shouldSubmitOnKey, validateAttachment,
+  ACCEPT, attachmentName, HIGHLIGHT_MS, imageFilesFromClipboard, isNearBottom,
+  messageAnchorId, MORE_REACTS, parseMessageHash, permalinkFor, QUICK_REACTS,
+  quoteForReply, reactionsSignature, readAsBase64, replyPreview,
+  shouldSubmitOnKey, summarizeReactions, validateAttachment,
 } from "./chat-ux.js";
 const h = React.createElement;
 
@@ -256,7 +265,9 @@ const LEGACY_PAGE = new URLSearchParams(location.search).get("p");
 if (LEGACY_PAGE && LEGACY_PAGE !== "index") {
   const u = new URL(location.href);
   u.searchParams.delete("p");
-  u.hash = "#" + LEGACY_PAGE;
+  // ``?p=chat#msg-<at>`` permalinks (#668) keep their message fragment;
+  // parseHash treats ``#msg-…`` as the chat route.
+  if (!(LEGACY_PAGE === "chat" && parseMessageHash(u.hash))) u.hash = "#" + LEGACY_PAGE;
   history.replaceState(null, "", u.pathname + (u.search ? u.search : "") + u.hash);
 }
 
@@ -646,7 +657,7 @@ function applyDataModel(data, pointer, value) {
 // the switch maps each to the existing POST endpoint + payload shape
 // so ``handle_chat`` / ``handle_review_action`` on the server stay
 // untouched — A2UI only describes the UI around them.
-async function dispatchA2uiAction(kind, {text, slug, files}) {
+async function dispatchA2uiAction(kind, {text, slug, files, replyTo}) {
   if (!KEY) return {ok: false, error: "no key"};
   if (kind === "chat.send") {
     const r = await fetch("/api/chat", {
@@ -655,6 +666,7 @@ async function dispatchA2uiAction(kind, {text, slug, files}) {
       body: JSON.stringify({
         key: KEY, text,
         files: (files || []).map(f => ({name: f.name, data: f.data})),
+        ...(replyTo ? {reply_to: replyTo} : {}),
       }),
     });
     const j = await r.json().catch(() => ({}));
@@ -752,6 +764,13 @@ function renderA2uiComponent(id, surface, local, setLocal) {
           addA2uiFiles(id, Array.from(e.dataTransfer.files || []), local, setLocal);
         },
       },
+        local.replyTo ? h("div", {className: "a2ui-reply-chip", "data-testid": "reply-chip"},
+          h("span", null, "↩︎ Replying to: " + (local.replyTo.preview || "message")),
+          h("button", {
+            type: "button", "aria-label": "Cancel reply",
+            onClick: () => setLocal(s => ({...s, replyTo: null})),
+          }, "×"),
+        ) : null,
         // Pending attachments preview — renders ABOVE the textarea, inline
         // with Teams/Slack/Discord convention per Jason 2026-11-06 11:44.
         pending.length ? h("div", {className: "a2ui-attachments-preview"},
@@ -834,13 +853,103 @@ function renderA2uiComponent(id, surface, local, setLocal) {
   }
 }
 
+// Reply requests (#668): a message's "↩︎ Reply" button emits
+// ``{at, quote, preview}``; the chat A2uiSurface owns the composer state
+// and subscribes to fill the textarea.
+const chatReplyStore = {
+  listeners: new Set(),
+  request(req) { for (const fn of this.listeners) fn(req); },
+  subscribe(fn) {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  },
+};
+
+// Locally-known reactions per message ``at`` (#668), shown the moment a
+// POST /api/chat/react returns, until the SSE tick carries the same
+// state (or ~6 s pass — the server wins after that).
+const OVERRIDE_TTL_MS = 6000;
+const chatReactionStore = {
+  overrides: {},
+  listeners: new Set(),
+  set(at, reactions) {
+    this.overrides = {...this.overrides, [at]: {reactions, ts: Date.now()}};
+    this._emit();
+  },
+  reconcile(rows) {
+    const bySig = {};
+    for (const m of rows) if (m.at) bySig[m.at] = reactionsSignature(m.reactions);
+    const kept = {};
+    for (const [at, o] of Object.entries(this.overrides)) {
+      const fresh = Date.now() - o.ts < OVERRIDE_TTL_MS;
+      if (fresh && bySig[at] !== reactionsSignature(o.reactions)) kept[at] = o;
+    }
+    if (Object.keys(kept).length !== Object.keys(this.overrides).length) {
+      this.overrides = kept;
+      this._emit();
+    }
+  },
+  _emit() { for (const fn of this.listeners) fn(this.overrides); },
+  subscribe(fn) {
+    this.listeners.add(fn);
+    fn(this.overrides);
+    return () => this.listeners.delete(fn);
+  },
+};
+
+async function postReaction(at, emoji, action) {
+  if (!KEY) return;
+  try {
+    const r = await fetch("/api/chat/react", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({key: KEY, at, emoji, action}),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.reactions) chatReactionStore.set(at, j.reactions);
+  } catch (_) { /* the next tick shows the server's truth */ }
+}
+
+// Scroll a message into the middle of the thread and flash it (#668).
+function jumpToMessage(at) {
+  const el = document.getElementById(messageAnchorId(at));
+  if (!el) return false;
+  el.scrollIntoView({block: "center"});
+  el.classList.remove("highlight");
+  void el.offsetWidth;
+  el.classList.add("highlight");
+  setTimeout(() => el.classList.remove("highlight"), HIGHLIGHT_MS + 100);
+  return true;
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch (_) { /* ignore */ }
+    ta.remove();
+    return ok;
+  }
+}
+
 // Sticky-to-bottom message list: starts pinned to the latest message,
 // follows new messages while the user is within ~40px of the bottom,
-// and leaves the scroll position alone once they scroll up.
+// and leaves the scroll position alone once they scroll up. A
+// ``#msg-<at>`` hash (#668) scrolls that message into view once it
+// renders, and un-sticks the list so new ticks don't yank it away.
 function ChatThread({rows}) {
   const ref = useRef(null);
   const stick = useRef(true);
   const prevCount = useRef(0);
+  const jumped = useRef("");
   const [pending, setPending] = useState(() => chatPendingStore.pending);
   // atBottom drives whether the "Jump" button renders; hasUnread flips
   // its label from "To latest" to "To new message" when traffic lands
@@ -849,6 +958,18 @@ function ChatThread({rows}) {
   const [hasUnread, setHasUnread] = useState(false);
   useEffect(() => chatPendingStore.subscribe(setPending), []);
   useEffect(() => { chatPendingStore.reconcile(rows); }, [rows]);
+  const [overrides, setOverrides] = useState(() => chatReactionStore.overrides);
+  useEffect(() => chatReactionStore.subscribe(setOverrides), []);
+  useEffect(() => { chatReactionStore.reconcile(rows); }, [rows]);
+  const [hashAt, setHashAt] = useState(() => parseMessageHash(location.hash));
+  useEffect(() => {
+    const on = () => {
+      jumped.current = "";
+      setHashAt(parseMessageHash(location.hash));
+    };
+    window.addEventListener("hashchange", on);
+    return () => window.removeEventListener("hashchange", on);
+  }, []);
   const serverRows = pending.length
     ? rows.filter(r => !serverRowMatchesPending(r, pending))
     : rows;
@@ -885,12 +1006,20 @@ function ChatThread({rows}) {
     setAtBottom(nearBottom);
     if (nearBottom) setHasUnread(false);
   };
+  useEffect(() => {
+    if (!hashAt || jumped.current === hashAt) return;
+    if (jumpToMessage(hashAt)) {
+      jumped.current = hashAt;
+      stick.current = false;
+      setAtBottom(false);
+    }
+  }, [hashAt, merged.length]);
   return h(React.Fragment, null,
     h("div", {
       ref,
       className: "a2ui-list a2ui-chat-thread",
       onScroll,
-    }, renderChatMessages(merged)),
+    }, renderChatMessages(merged, overrides)),
     !atBottom ? h("button", {
       className: "chat-jump" + (hasUnread ? " unread" : ""),
       onClick: jumpToLatest,
@@ -899,52 +1028,107 @@ function ChatThread({rows}) {
 }
 
 const IMAGE_RE = /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i;
-function renderChatMessages(rows) {
+function renderChatMessages(rows, overrides) {
   if (!rows.length) {
     return h("div", {className: "typing"}, "No messages yet. Say hi.");
   }
+  const byAt = {};
+  for (const m of rows) if (m.at && !m.variant) byAt[m.at] = m;
   return rows.map((m, i) => {
     if (m.variant === "working-group") {
       return h(WorkingGroup, {key: "wg-" + (m.turn_id || i), group: m});
     }
-    // Prefer the richer `attachments` shape (name, url) over the
-    // legacy `files` name-only shape so historical messages still
-    // render with a filename if the url isn't present.
-    const atts = (m.attachments && m.attachments.length)
-      ? m.attachments
-      : (m.files || []).map(n => ({name: n}));
-    // Per-bubble status indicator for Jason's optimistic messages.
-    // sending — in-flight, muted dot pulse; sent — single check;
-    // delivered — single check in accent color. Server rows (from
-    // historical reload) have no status and get no indicator.
-    let statusIcon = null;
-    if (m.from === "jason" && m.status) {
-      const icons = {sending: "◌ sending", sent: "✓ sent", delivered: "✓ delivered"};
-      statusIcon = h("span", {className: "msg-status msg-status-" + m.status}, icons[m.status] || m.status);
-    }
-    return h("div", {
+    const reactions = (overrides && m.at && overrides[m.at])
+      ? overrides[m.at].reactions : m.reactions;
+    return h(ChatMessage, {
       key: (m._client_id || m.at || "") + "-" + i,
-      className: "msg " + (m.from === "jason" ? "jason" : "alice") + (m.status ? " status-" + m.status : ""),
-    },
-      m.text || "",
-      ...atts.map((a, j) => {
-        const name = a.name || "";
-        const url = a.url;
-        const isImage = url && IMAGE_RE.test(name);
-        if (isImage) {
-          const src = url + (url.includes("?") ? "&" : "?") + "k=" + encodeURIComponent(KEY || "");
-          return h("div", {key: "f-" + j, className: "chat-image"},
-            h("img", {src, alt: name, loading: "lazy"}));
-        }
-        return h("div", {key: "f-" + j, className: "chat-file"}, "📎 " + name);
-      }),
-      h("small", null,
-        (m.from === "jason" ? "You" : "Alice") + " · " + (m.at || ""),
-        statusIcon ? " · " : null,
-        statusIcon,
-      ),
-    );
+      m, reactions, quoted: m.reply_to ? byAt[m.reply_to] : null,
+    });
   });
+}
+
+function ChatMessage({m, reactions, quoted}) {
+  const [picker, setPicker] = useState(false);
+  const [copied, setCopied] = useState(false);
+  // Prefer the richer `attachments` shape (name, url) over the
+  // legacy `files` name-only shape so historical messages still
+  // render with a filename if the url isn't present.
+  const atts = (m.attachments && m.attachments.length)
+    ? m.attachments
+    : (m.files || []).map(n => ({name: n}));
+  const actionable = !!m.at && (!m._optimistic || m.status === "delivered");
+  // Per-bubble status indicator for Jason's optimistic messages.
+  // sending — in-flight; sent — single check; delivered — accent check.
+  // Server rows (historical reload) have no status and get no indicator.
+  let statusIcon = null;
+  if (m.from === "jason" && m.status) {
+    const icons = {sending: "◌ sending", sent: "✓ sent", delivered: "✓ delivered"};
+    statusIcon = h("span", {className: "msg-status msg-status-" + m.status}, icons[m.status] || m.status);
+  }
+  const summary = summarizeReactions(reactions);
+  const mine = new Set(summary.filter(r => r.mine).map(r => r.emoji));
+  const react = emoji => {
+    setPicker(false);
+    postReaction(m.at, emoji, mine.has(emoji) ? "remove" : "add");
+  };
+  const btn = (testid, label, title, onClick, extra) => h("button", {
+    type: "button", className: "msg-action", title, "aria-label": title,
+    "data-testid": testid, onClick, ...extra,
+  }, label);
+  return h("div", {
+    id: actionable ? messageAnchorId(m.at) : undefined,
+    "data-at": m.at || undefined,
+    className: "msg " + (m.from === "jason" ? "jason" : "alice") + (m.status ? " status-" + m.status : ""),
+  },
+    actionable ? h("div", {className: "msg-actions", "data-testid": "msg-actions"},
+      QUICK_REACTS.map(e => btn("react-btn", e, "React " + e, () => react(e),
+        {key: e, "data-emoji": e, className: "msg-action" + (mine.has(e) ? " mine" : "")})),
+      btn("react-more", "+", "More reactions", () => setPicker(p => !p), {key: "more"}),
+      btn("reply-btn", "↩︎ Reply", "Reply", () => chatReplyStore.request({
+        at: m.at, quote: quoteForReply(m), preview: replyPreview(m),
+      }), {key: "reply"}),
+      btn("copy-link-btn", copied ? "✓ Copied" : "🔗 Copy link", "Copy link", async () => {
+        if (await copyText(permalinkFor(location.origin, m.at))) {
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1500);
+        }
+      }, {key: "link"}),
+      btn("more-menu", "⋯", "More actions — coming soon", undefined,
+        {key: "menu", disabled: true}),
+      picker ? h("div", {className: "msg-picker", key: "picker", "data-testid": "react-picker"},
+        MORE_REACTS.map(e => btn("react-btn", e, "React " + e, () => react(e),
+          {key: e, "data-emoji": e}))) : null,
+    ) : null,
+    m.reply_to ? h("button", {
+      type: "button", className: "msg-reply-ref", "data-testid": "reply-ref",
+      title: "Jump to the quoted message",
+      onClick: () => jumpToMessage(m.reply_to),
+    }, "In reply to: " + ((quoted && replyPreview(quoted)) || "an earlier message")) : null,
+    m.text || "",
+    ...atts.map((a, j) => {
+      const name = a.name || "";
+      const url = a.url;
+      const isImage = url && IMAGE_RE.test(name);
+      if (isImage) {
+        const src = url + (url.includes("?") ? "&" : "?") + "k=" + encodeURIComponent(KEY || "");
+        return h("div", {key: "f-" + j, className: "chat-image"},
+          h("img", {src, alt: name, loading: "lazy"}));
+      }
+      return h("div", {key: "f-" + j, className: "chat-file"}, "📎 " + name);
+    }),
+    summary.length ? h("div", {className: "msg-reactions"},
+      summary.map(r => h("button", {
+        key: r.emoji, type: "button", "data-testid": "react-pill",
+        className: "msg-react-pill" + (r.mine ? " mine" : ""),
+        title: r.mine ? "Remove your reaction" : "React too",
+        onClick: () => react(r.emoji),
+      }, r.emoji + " " + r.count))) : null,
+    h("small", null,
+      (m.from === "jason" ? "You" : "Alice") + " · " + (m.at || ""),
+      statusIcon ? " · " : null,
+      statusIcon,
+    ),
+  );
 }
 
 // Per-turn working-status group (#656): "Alice is working…" plus one
@@ -1099,6 +1283,7 @@ async function runA2uiAction(id, props, surface, local, setLocal) {
   // Capture the composer state before awaiting the POST so the
   // optimistic bubble uses the text/files the user actually sent.
   const sentText = text;
+  const replyTo = action === "chat.send" && local.replyTo ? local.replyTo.at : "";
   const sentFiles = files.map(f => ({name: f.name, type: f.type}));
   // Pre-flight pending row: appears instantly as "sending".
   let clientId = null;
@@ -1111,6 +1296,7 @@ async function runA2uiAction(id, props, surface, local, setLocal) {
       text: sentText,
       files: sentFiles.map(f => f.name),
       attachments: sentFiles.map(f => ({name: f.name, type: f.type})),
+      ...(replyTo ? {reply_to: replyTo} : {}),
       status: "sending",
       _optimistic: true,
     });
@@ -1119,6 +1305,7 @@ async function runA2uiAction(id, props, surface, local, setLocal) {
     text,
     files,
     slug: surface.data && surface.data.slug,
+    replyTo,
   });
   if (clientId) {
     if (res.ok) chatPendingStore.setStatus(clientId, "sent");
@@ -1135,6 +1322,7 @@ async function runA2uiAction(id, props, surface, local, setLocal) {
       next.textareas = {...s.textareas, [taId]: ""};
       next.attachments = {...s.attachments, [taId]: []};
       next.attachErr = {...s.attachErr, [taId]: ""};
+      next.replyTo = null;
     }
     return next;
   });
@@ -1167,6 +1355,26 @@ function A2uiSurface({envelopes, surfaceId}) {
   // the user is typing (textarea ids are stable per surface).
   const [local, setLocal] = useState({textareas: {}, statuses: {}, pending: {}, attachments: {}, attachErr: {}, dragging: {}});
   const surface = React.useMemo(() => replayA2ui(envelopes), [envelopes]);
+  // Reply requests from a message's action strip (#668): quote the
+  // message into the surface's textarea and remember what it answers.
+  useEffect(() => chatReplyStore.subscribe(req => {
+    if (!surface || surface.surfaceId !== "chat") return;
+    let taId = "";
+    for (const [cid, c] of surface.components) if (c.type === "textarea") { taId = cid; break; }
+    if (!taId) return;
+    setLocal(s => {
+      const existing = s.textareas[taId] || "";
+      return {
+        ...s,
+        textareas: {...s.textareas, [taId]: req.quote + existing},
+        replyTo: {at: req.at, preview: req.preview},
+      };
+    });
+    setTimeout(() => {
+      const ta = document.querySelector(".a2ui-composer textarea");
+      if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
+    }, 0);
+  }), [surface]);
   if (!surface) {
     return h("div", {className: "notice"}, "Waiting for the " + surfaceId + " surface…");
   }
@@ -1281,7 +1489,13 @@ function PipelineBoard({pipeline, surfaces, tasks}) {
       h(FxTable, {
         columns: [
           {key: "type", label: "type", cell: r => r.type || ""},
-          {key: "label", label: "surface", cell: r => r.label || ""},
+          {key: "label", label: "surface", cell: r =>
+            r.preview
+              ? h("span", null, r.label || "", " ",
+                  h("span", {className: "surface-preview", "data-testid": "surface-preview",
+                    style: {color: "var(--color-fg-muted)"}}, "“" + r.preview + "”"))
+              : (r.label || "")
+          },
           {key: "age_seconds", label: "age", numeric: true, cell: ageCell},
           {key: "link", label: "link", cell: r =>
             r.link
@@ -1398,7 +1612,7 @@ function LegacySection({data}) {
 function parseHash(raw) {
   const h = (raw || "").replace(/^#/, "");
   if (!h || h === "overview" || h === "index") return {route: "overview", slug: null};
-  if (h === "chat") return {route: "chat", slug: null};
+  if (h === "chat" || parseMessageHash(h)) return {route: "chat", slug: null};
   if (h === "bugs") return {route: "bugs", slug: null};
   if (h.startsWith("review-")) return {route: "review", slug: h.slice("review-".length)};
   return {route: "overview", slug: null};

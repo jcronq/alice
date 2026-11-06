@@ -18,12 +18,13 @@ Working-status groups (issue #656) ride the same ``/messages`` list as
 rows with ``variant: "working-group"`` — one per turn, carrying its
 tool-call ``steps`` — interleaved by timestamp between Jason's message
 and Alice's reply. They come from the ``.chat-status.jsonl`` sidecar,
-not ``.chat.jsonl``. ``handle_chat`` / ``POST /api/chat`` are untouched — this module only
+not ``.chat.jsonl``. ``POST /api/chat`` is unchanged by this module — it only
 describes the UI around them.
 """
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 from status_site.chat_status import build_groups, merge_thread, read_status_rows
@@ -114,3 +115,32 @@ def render(cfg: "Config") -> dict:
         read_chat(cfg), build_groups(read_status_rows(cfg.status_dir))
     )
     return {"a2ui": build_envelopes(messages)}
+
+
+PREVIEW_CHARS = 80
+_PREVIEW_START = "His new message:\n"
+_PREVIEW_END = "\n\nAttachments"
+_ATTACHMENT_ONLY = "(no text: attachment only)"
+_TAG_RE = re.compile(r"</?[A-Za-z][^>]*>")
+
+
+def chat_preview(body: str, limit: int = PREVIEW_CHARS) -> str:
+    """Short plain-text preview of a ``status-chat`` surface body.
+
+    Reads the message between ``His new message:`` and ``Attachments``,
+    drops HTML-ish tags, collapses whitespace and elides past ``limit``
+    chars with ``…``. Attachment-only messages yield ``📎 attachment``;
+    a body without the expected shape yields ``""``.
+    """
+    start = body.find(_PREVIEW_START)
+    if start < 0:
+        return ""
+    start += len(_PREVIEW_START)
+    end = body.find(_PREVIEW_END, start)
+    raw = body[start : end if end >= 0 else len(body)].strip()
+    if raw == _ATTACHMENT_ONLY:
+        return "📎 attachment"
+    text = " ".join(_TAG_RE.sub("", raw).split())
+    if len(text) > limit:
+        text = text[: limit - 1].rstrip() + "…"
+    return text

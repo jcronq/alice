@@ -31,6 +31,9 @@ Stdlib-only (runs on a bare ``python:3.12-alpine`` image). Routes:
                                           auth): drops a ``type: status-review-<action>``
                                           surface into SURFACE_DIR. The server never calls
                                           ``gh``; Speaking executes the GitHub side.
+    POST /api/chat/react                  Add / remove an emoji reaction on a chat message (shared-key
+                                          auth, body ``{at, emoji, action}``): appends to the
+                                          ``.chat-reactions.jsonl`` sidecar, merged into ``GET /api/chat``
     POST /api/chat                        Jason's reply on the general Chat tab (shared-key auth):
                                           appends to ``.chat.jsonl`` (attachments stored under
                                           ``UPLOAD_DIR/chat/<date>/``, same rules as /api/reply) and drops a
@@ -38,7 +41,7 @@ Stdlib-only (runs on a bare ``python:3.12-alpine`` image). Routes:
                                           (no thread/item context — just the message).
 
 Anything else is a 404: dotfiles (``.replies.jsonl``, ``.item-state.json``, ``.chat.jsonl``,
-``.waiting-order.json``),
+``.chat-reactions.jsonl``, ``.waiting-order.json``),
 ``threads/``, the key and the uploads are never served. See docs/designs/status-site.md.
 """
 
@@ -100,6 +103,13 @@ from status_site.sources.common import (
     read_asks as _read_asks,
 )
 from status_site import urgency as _urgency
+from status_site.chat_reactions import (
+    fold as reaction_fold,
+    merge_reactions,
+    read_events as reaction_events,
+    reactions_for,
+    valid_emoji,
+)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 # ``legacy.html`` is the pre-#639 static shell, kept so the reactive
@@ -141,6 +151,8 @@ MAX_ITEM = 500
 MAX_CHAT_HISTORY = 150
 # How many tail lines to splice into the Speaking surface for context.
 CHAT_SURFACE_TAIL = 5
+# Longest message ``at`` / ``reply_to`` accepted from a client.
+MAX_MSG_AT = 64
 
 SPEAKING_FOOTER = (
     "For Speaking: this came from Jason via the status site ({url}, key-authenticated). "
@@ -263,6 +275,10 @@ class Config:
         return self.status_dir / ".chat.jsonl"
 
     @property
+    def chat_reactions_log(self) -> Path:
+        return self.status_dir / ".chat-reactions.jsonl"
+
+    @property
     def waiting_order(self) -> Path:
         # Dot-prefixed: kept out of the static handler; /api/waiting-order is the only way out.
         return self.status_dir / ".waiting-order.json"
@@ -319,7 +335,8 @@ def read_chat(cfg: Config, limit: int = MAX_CHAT_HISTORY) -> list[dict]:
 
     Rewrites each attachment's ``path`` into a ``url`` under
     ``/chat-upload/<date>/<filename>`` so the client can render images
-    inline. ``path`` stays for existing consumers.
+    inline. ``path`` stays for existing consumers. Reactions from the
+    ``.chat-reactions.jsonl`` sidecar are merged in as ``reactions``.
     """
     p = cfg.chat_log
     if not p.is_file():
@@ -344,7 +361,7 @@ def read_chat(cfg: Config, limit: int = MAX_CHAT_HISTORY) -> list[dict]:
             match = chat_suffix.search(raw)
             if match:
                 att["url"] = "/chat-upload/" + match.group(1)
-    return msgs
+    return merge_reactions(msgs, cfg.chat_reactions_log)
 
 
 def append_chat(cfg: Config, message: dict) -> None:
@@ -416,9 +433,19 @@ def ingest_attachments(cfg: Config, raw_files: object, subdir: str) -> list[dict
 
 
 def render_chat_surface(
-    cfg: Config, *, text: str, prior: list[dict], files: list[dict] | None = None
+    cfg: Config,
+    *,
+    text: str,
+    prior: list[dict],
+    files: list[dict] | None = None,
+    message_at: str = "",
 ) -> str:
-    """Build the ``type: status-chat`` surface document (no thread/item fields)."""
+    """Build the ``type: status-chat`` surface document (no thread/item fields).
+
+    ``message_at`` is the chat-log ``at`` of the message; it lets the
+    queue deep-link to ``?p=chat#msg-<at>``. Omitted → plain chat link.
+    """
+    message_line = f"message_at: {message_at}\n" if message_at else ""
     tail = "\n".join(f"  {m.get('from')}: {m.get('text')}" for m in prior)
     attached = "\n".join(f"  {x['path']} ({x['bytes']} bytes)" for x in files or [])
     return f"""---
@@ -428,7 +455,7 @@ reply_expected: true
 created: {time.strftime("%Y-%m-%d")}
 source: status-site
 page: chat
----
+{message_line}---
 
 # Jason sent a message on the Chat tab
 
@@ -465,18 +492,22 @@ def handle_chat(cfg: Config, d: dict) -> dict:
     with cfg.lock:
         files = ingest_attachments(cfg, raw_files, f"chat/{time.strftime('%Y-%m-%d')}")
         prior = read_chat(cfg)[-CHAT_SURFACE_TAIL:]
-        append_chat(
-            cfg,
-            {
-                "from": "jason",
-                "at": now_iso(),
-                "text": text,
-                "files": [x["name"] for x in files],
-                "attachments": files,
-            },
-        )
+        at = now_iso()
+        record = {
+            "from": "jason",
+            "at": at,
+            "text": text,
+            "files": [x["name"] for x in files],
+            "attachments": files,
+        }
+        reply_to = d.get("reply_to")
+        if isinstance(reply_to, str) and reply_to.strip():
+            record["reply_to"] = reply_to.strip()[:MAX_MSG_AT]
+        append_chat(cfg, record)
 
-        doc = render_chat_surface(cfg, text=text, prior=prior, files=files)
+        doc = render_chat_surface(
+            cfg, text=text, prior=prior, files=files, message_at=at
+        )
         cfg.surface_dir.mkdir(parents=True, exist_ok=True)
         fname = f"{time.strftime('%Y-%m-%dT%H-%M-%S')}-status-chat.md"
         tmp = cfg.surface_dir / f".tmp-chat-{os.getpid()}-{time.time_ns()}"
@@ -488,6 +519,53 @@ def handle_chat(cfg: Config, d: dict) -> dict:
             dest = cfg.surface_dir / fname.replace(".md", f"-{n}.md")
         os.rename(tmp, dest)
     return {"ok": True}
+
+
+def handle_chat_react(cfg: Config, d: dict) -> dict:
+    """Add or remove one emoji reaction on a chat message (issue #668).
+
+    Body: ``{key, at, emoji, action: "add"|"remove"}``. Appends an event to
+    the ``.chat-reactions.jsonl`` sidecar (``.chat.jsonl`` is untouched);
+    a no-op add/remove appends nothing. Returns the message's resulting
+    ``reactions``. The SSE broadcaster re-reads the log every tick, so
+    there is no cache to invalidate.
+    """
+    if not isinstance(d, dict):
+        raise ReplyError(400, "bad json")
+    if not hmac.compare_digest(str(d.get("key", "")).encode(), cfg.key.encode()):
+        raise ReplyError(403, "bad key")
+    at = d.get("at")
+    emoji = d.get("emoji")
+    action = d.get("action", "add")
+    if not isinstance(at, str) or not at or len(at) > MAX_MSG_AT:
+        raise ReplyError(400, "bad at")
+    if not valid_emoji(emoji):
+        raise ReplyError(400, "bad emoji")
+    if action not in ("add", "remove"):
+        raise ReplyError(400, "bad action")
+    who = "jason"
+    with cfg.lock:
+        if not any(m.get("at") == at for m in read_chat(cfg, limit=0)):
+            raise ReplyError(404, "no such message")
+        state = reaction_fold(reaction_events(cfg.chat_reactions_log))
+        has = who in (state.get(at) or {}).get(emoji, {})
+        if has != (action == "add"):
+            cfg.status_dir.mkdir(parents=True, exist_ok=True)
+            with open(cfg.chat_reactions_log, "a") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "at": at,
+                            "emoji": emoji,
+                            "from": who,
+                            "at_reacted": now_iso(),
+                            "action": action,
+                        }
+                    )
+                    + "\n"
+                )
+            state = reaction_fold(reaction_events(cfg.chat_reactions_log))
+    return {"ok": True, "reactions": reactions_for(state, at)}
 
 
 def render_surface(
@@ -1098,13 +1176,18 @@ def scan_surfaces(surface_dir: Path) -> list[dict]:
             dt = datetime.fromtimestamp(st.st_mtime)
             slug = p.stem
         try:
-            fm, _ = parse_frontmatter(text)
+            fm, body = parse_frontmatter(text)
         except Exception:
-            fm = {}
+            fm, body = {}, ""
+        stype = (fm.get("type") or "").strip()
         out.append(
             {
                 "slug": slug,
-                "type": (fm.get("type") or "").strip(),
+                "type": stype,
+                "message_at": (fm.get("message_at") or "").strip(),
+                "preview": (
+                    _chat_page.chat_preview(body) if stype == "status-chat" else ""
+                ),
                 "source": (fm.get("source") or "").strip(),
                 "page": (fm.get("page") or "").strip(),
                 "thread": (fm.get("thread") or "").strip(),
@@ -1117,6 +1200,12 @@ def scan_surfaces(surface_dir: Path) -> list[dict]:
         )
     out.sort(key=lambda it: it["created_epoch"])
     return out
+
+
+def _chat_link(item: dict) -> str:
+    """``?p=chat#msg-<at>`` when the surface knows its message, else ``?p=chat``."""
+    at = item.get("message_at", "")
+    return f"?p=chat#msg-{at}" if at else "?p=chat"
 
 
 def _surface_link_url(item: dict) -> str:
@@ -1133,7 +1222,7 @@ def _surface_link_url(item: dict) -> str:
         if page:
             return f"?p={page}"
     elif t == "status-chat":
-        return "?p=chat"
+        return _chat_link(item)
     for src in (item.get("slug", ""), item.get("detail", "")):
         if not src:
             continue
@@ -1152,7 +1241,7 @@ def _surface_link_md(item: dict) -> str:
         if page:
             return f"[{page}](?p={page})"
     elif t == "status-chat":
-        return "[open chat](?p=chat)"
+        return f"[open chat]({_chat_link(item)})"
     for src in (item.get("slug", ""), item.get("detail", "")):
         if not src:
             continue
@@ -1213,6 +1302,8 @@ def render_alice_queue(
         line = f"- {age} — **{label}**"
         if link:
             line += f" {link}"
+        if it.get("preview"):
+            line += f" — “{_md_escape(it['preview'])}”"
         lines.append(line)
     overflow = len(items) - len(shown)
     if overflow > 0:
@@ -1640,6 +1731,7 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
                     "type": it.get("type", ""),
                     "label": _surface_label(it),
                     "link": _surface_link_url(it),
+                    "preview": it.get("preview", ""),
                     "age_seconds": now - float(it.get("created_epoch", now)),
                     "created": it.get("created", ""),
                 }
@@ -2517,6 +2609,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/reply": handle_reply,
             "/api/page-visibility": handle_page_visibility,
             "/api/chat": handle_chat,
+            "/api/chat/react": handle_chat_react,
             "/api/waiting-order": handle_waiting_order,
             "/api/review-action": handle_review_action,
         }
