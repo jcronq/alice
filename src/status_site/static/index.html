@@ -115,7 +115,18 @@ h2.sec-heading {
 /* Settings gear + popover. The wrap is relative-positioned so the
  * absolute panel hangs off the button's right edge. */
 .cfg-wrap { position: relative; display: inline-block; }
-.cfg-gear { font-size: 1.35rem; line-height: 1; padding: .25rem .65rem; border-radius: 999px; }
+.cfg-gear {
+  font-size: 1.1rem;
+  line-height: 1;
+  width: 2.4rem;
+  height: 2.4rem;
+  padding: 0;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.cfg-gear svg { width: 1.3rem; height: 1.3rem; display: block; }
 .cfg-panel {
   position: absolute; right: 0; top: calc(100% + .35rem);
   min-width: 14rem;
@@ -1496,7 +1507,17 @@ function ConfigGear({legacyHref}) {
       onClick: () => setOpen(x => !x),
       title: "Settings",
       "aria-expanded": open,
-    }, "⚙︎"),
+    },
+      // Inline SVG for a consistent, large, crisp gear across
+      // platforms — the Unicode gear glyph renders tiny and dull on
+      // most fonts (what Jason flagged twice in a row).
+      h("svg", {viewBox: "0 0 24 24", fill: "none", stroke: "currentColor",
+                strokeWidth: 2, strokeLinecap: "round", strokeLinejoin: "round",
+                "aria-hidden": "true"},
+        h("circle", {cx: 12, cy: 12, r: 3}),
+        h("path", {d: "M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.3.63.94 1.02 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"}),
+      ),
+    ),
     open ? h("div", {className: "cfg-panel"},
       h("div", {className: "cfg-section"},
         h("div", {className: "cfg-label"}, "Theme"),
