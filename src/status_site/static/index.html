@@ -1202,7 +1202,14 @@ function ChatMessage({m, reactions, quoted}) {
     m.reply_to ? h("button", {
       type: "button", className: "msg-reply-ref", "data-testid": "reply-ref",
       title: "Jump to the quoted message",
-      onClick: () => jumpToMessage(m.reply_to),
+      onClick: () => {
+        // Push the hash so the jump is also a bookmarkable permalink
+        // (Jason explicitly asked for "a link to that other message").
+        if (location.hash !== "#msg-" + m.reply_to) {
+          history.pushState(null, "", location.pathname + location.search + "#msg-" + m.reply_to);
+        }
+        jumpToMessage(m.reply_to);
+      },
     }, "In reply to: " + ((quoted && replyPreview(quoted)) || "an earlier message")) : null,
     m.text || "",
     ...atts.map((a, j) => {
