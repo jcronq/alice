@@ -70,3 +70,64 @@ export function readAsBase64(file) {
     r.readAsDataURL(file);
   });
 }
+
+// ── message actions: permalinks, reactions, replies (issue #668) ──────
+
+export const QUICK_REACTS = ["👍", "❤️", "😂", "🎉", "👀"];
+export const MORE_REACTS = ["🙏", "🔥", "✅", "❌", "🤔", "😮", "😢", "💯"];
+export const HIGHLIGHT_MS = 1500;
+export const REPLY_PREVIEW_CHARS = 80;
+export const REPLY_QUOTE_CHARS = 300;
+
+// DOM id / hash fragment for a message: ``msg-<at>``.
+export function messageAnchorId(at) {
+  return "msg-" + at;
+}
+
+// ``#msg-<at>`` → ``<at>`` (percent-decoded), or "" when not a message hash.
+export function parseMessageHash(hash) {
+  const m = /^#?msg-(.+)$/.exec(hash || "");
+  if (!m) return "";
+  try { return decodeURIComponent(m[1]); } catch (_) { return m[1]; }
+}
+
+export function permalinkFor(origin, at) {
+  return origin + "/?p=chat#" + messageAnchorId(at);
+}
+
+// One-line plain-text preview for "In reply to: …" headers.
+export function replyPreview(msg, limit = REPLY_PREVIEW_CHARS) {
+  const text = String((msg && msg.text) || "").split(/\s+/).filter(Boolean).join(" ");
+  if (!text) {
+    return msg && ((msg.attachments && msg.attachments.length) || (msg.files && msg.files.length))
+      ? "📎 attachment" : "";
+  }
+  return text.length > limit ? text.slice(0, limit - 1).trimEnd() + "…" : text;
+}
+
+// ``> ``-quoted text block (text only) that pre-fills the composer on Reply.
+export function quoteForReply(msg, limit = REPLY_QUOTE_CHARS) {
+  let text = String((msg && msg.text) || "").trim();
+  if (!text) text = replyPreview(msg);
+  if (text.length > limit) text = text.slice(0, limit - 1).trimEnd() + "…";
+  return text.split("\n").map(l => ("> " + l).trimEnd()).join("\n") + "\n\n";
+}
+
+// ``{emoji: [{from, at}]}`` → ``[{emoji, count, mine}]`` in first-seen order.
+export function summarizeReactions(reactions, me = "jason") {
+  const out = [];
+  for (const [emoji, users] of Object.entries(reactions || {})) {
+    if (!Array.isArray(users) || !users.length) continue;
+    out.push({emoji, count: users.length, mine: users.some(u => u && u.from === me)});
+  }
+  return out;
+}
+
+// Stable signature of a reactions map, for comparing local vs server state.
+export function reactionsSignature(reactions) {
+  return JSON.stringify(
+    Object.keys(reactions || {}).sort()
+      .map(e => [e, (reactions[e] || []).map(u => u.from).sort()])
+      .filter(([, users]) => users.length),
+  );
+}
