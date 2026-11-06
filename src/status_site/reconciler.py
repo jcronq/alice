@@ -2,7 +2,7 @@
 
 One idempotent pass per invocation (CLI / cron, same shape as ``watchers/github.py``):
 
-* **Dedupe** — a top-level list item whose ``pull/NNN`` and ``task-NNNN`` refs are *all*
+* **Dedupe** — a top-level list item whose ``pull/NNN`` / bare ``#NNN`` and ``task-NNNN`` refs are *all*
   finished (PR merged/closed, task done/rejected) moves into ``## Done today`` as ``[x]``.
   Mixed, open or unresolvable refs (gh timeout, unknown task) leave the item untouched.
 * **Question-surface** — an item whose ``threads/<slug>.jsonl`` ends on an unanswered
@@ -41,8 +41,10 @@ DONE_SECTION = "done today"
 WAITING_SECTION = "waiting on you"
 POINTER_PREFIX = "Reply needed: "
 GH_TIMEOUT = 10
+DEFAULT_REPO = "jcronq/alice"
 
 _PR_URL_RE = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
+_BARE_PR_RE = re.compile(r"(?<![\w/&#])#(\d+)\b")
 _TASK_RE = re.compile(r"\btask-\d{4,}\b")
 _PR_FINISHED = {"MERGED", "CLOSED"}
 _TASK_FINISHED = {"done", "rejected"}
@@ -169,9 +171,18 @@ def _make_block(lines: list[str], page: str) -> _Block:
     return _Block(lines, items[0] if items else None)
 
 
-def _refs_finished(text: str, pr_state: PrState, task_state: TaskState) -> bool:
-    """True iff the text has refs and every one of them resolves to finished."""
+def _refs_finished(
+    text: str, pr_state: PrState, task_state: TaskState, repo: str = DEFAULT_REPO
+) -> bool:
+    """True iff the text has refs and every one of them resolves to finished.
+
+    Bare ``#NNN`` refs are looked up as PRs in ``repo``; an issue number makes ``gh pr view``
+    fail, which reads as ambiguous (item stays put).
+    """
     prs = [f"https://github.com/{m.group(1)}/pull/{m.group(2)}" for m in _PR_URL_RE.finditer(text)]
+    prs += [
+        f"https://github.com/{repo}/pull/{n}" for n in _BARE_PR_RE.findall(_PR_URL_RE.sub("", text))
+    ]
     tasks = _TASK_RE.findall(text)
     if not prs and not tasks:
         return False
@@ -207,6 +218,7 @@ def reconcile(
     pr_state: PrState,
     task_state: TaskState,
     page: str = "index",
+    repo: str = DEFAULT_REPO,
 ) -> str:
     """Pure transform: new ``index.md`` text (identical to ``text`` if nothing to do)."""
     pr_state, task_state = _cached(pr_state), _cached(task_state)
@@ -242,7 +254,7 @@ def reconcile(
             if sec is done:
                 kept.append(piece)
                 continue
-            if _refs_finished(block.text, pr_state, task_state):
+            if _refs_finished(block.text, pr_state, task_state, repo):
                 moved.append(_checked(piece))
                 continue
             if sec is not waiting and _unanswered(status_dir, item.slug):
@@ -308,6 +320,7 @@ def run(
     *,
     dry_run: bool = False,
     out=None,
+    repo: str = DEFAULT_REPO,
 ) -> bool:
     """One pass. Returns True if ``index.md`` changed (or would, under dry-run)."""
     index = status_dir / "index.md"
@@ -315,7 +328,7 @@ def run(
         return False
     pr_state, task_state = _cached(pr_state), _cached(task_state)  # shared across both reads
     old = index.read_text()
-    new = reconcile(old, status_dir, pr_state, task_state)
+    new = reconcile(old, status_dir, pr_state, task_state, repo=repo)
     if new == old:
         return False
     if dry_run:
@@ -335,7 +348,7 @@ def run(
         # Re-read under the lock: a hand-edit may have landed since the first read.
         # Ground-truth lookups are cached, so this costs no extra gh calls.
         old = index.read_text()
-        new = reconcile(old, status_dir, pr_state, task_state)
+        new = reconcile(old, status_dir, pr_state, task_state, repo=repo)
         if new == old:
             return False
         write_atomic(index, new)
@@ -349,6 +362,11 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("ALICE_MIND") or os.path.expanduser("~/alice-mind"),
         help="alice-mind directory (status pages in inner/status, tasks in inner/tasks)",
     )
+    ap.add_argument(
+        "--repo",
+        default=DEFAULT_REPO,
+        help="repo that bare #NNN PR refs resolve against (default: %(default)s)",
+    )
     ap.add_argument("--dry-run", action="store_true", help="print the diff, write nothing")
     args = ap.parse_args(sys.argv[1:] if argv is None else argv)
 
@@ -360,6 +378,7 @@ def main(argv: list[str] | None = None) -> int:
             gh_pr_state,
             store_task_state(mind / "inner" / "tasks"),
             dry_run=args.dry_run,
+            repo=args.repo,
         )
     except TimeoutError as e:
         print(f"status-reconciler: index.md is locked ({e}); try next cycle", file=sys.stderr)
