@@ -813,17 +813,14 @@ function ChatThread({rows}) {
   const serverRows = pending.length
     ? rows.filter(r => !serverRowMatchesPending(r, pending))
     : rows;
-  // Sort the merged list by at timestamp so messages stay in send
-  // order even if the optimistic pending row raced ahead of a server
-  // row that came back sooner. working-group rows carry their own
-  // ``at`` so they slot in between the trigger and Alice's reply.
-  const merged = [...serverRows, ...pending].sort((a, b) => {
-    const ax = a.at || "";
-    const bx = b.at || "";
-    if (ax < bx) return -1;
-    if (ax > bx) return 1;
-    return 0;
-  });
+  // Sort the merged list by numeric epoch, not lexical string — the
+  // optimistic bubble's at is UTC (``...T16:51:08.041-0000``) while
+  // the server at is EST (``...T11:51:08-0500``). Lexical compare
+  // flunks that cross-TZ even though the two are the same wall-clock.
+  // working-group rows carry their own ``at`` so they slot in
+  // between the trigger and Alice's reply.
+  const atEpoch = m => { const t = Date.parse(m.at || ""); return Number.isNaN(t) ? 0 : t; };
+  const merged = [...serverRows, ...pending].sort((a, b) => atEpoch(a) - atEpoch(b));
   const last = merged.length ? merged[merged.length - 1] : null;
   useEffect(() => {
     const el = ref.current;
