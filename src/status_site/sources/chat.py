@@ -53,7 +53,7 @@ def build_envelopes(messages: list[dict]) -> list[dict]:
                     "root",
                     "list",
                     props={"variant": "chat-page"},
-                    children=["thread", "composer", "send"],
+                    children=["thread", "composer"],
                 ),
                 component(
                     "thread",
