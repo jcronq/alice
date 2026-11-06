@@ -19,12 +19,21 @@ reads the cache.
 Age caveat: GitHub doesn't expose "time of last label change" without a
 per-issue timeline call, so the issue ``age`` is time since
 ``updatedAt`` — a proxy that also moves on comments.
+
+Review-note synthesis (issue #719): for every open issue carrying both
+``sm:design_review`` AND ``art:code``, :func:`ensure_review_notes`
+drops a ``review-ghi-<repo>-<num>.md`` into ``STATUS_DIR/notes`` so
+the status-site Review page has something to render. When an issue
+moves off ``sm:design_review`` the stale note is removed. The notes
+are idempotent against ``updatedAt`` — same stamp → no rewrite.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
@@ -130,6 +139,11 @@ def fetch_issues(
     then issue number. A repo whose ``gh`` call fails (or returns
     something unparseable) is logged, added to ``failed_repos``, and
     skipped.
+
+    Each row carries ``body`` (issue body markdown, possibly empty) and
+    ``updated_at`` (raw ISO-8601 from ``updatedAt``) so the review-note
+    synthesis step (:func:`ensure_review_notes`) can run off the same
+    fetch without re-querying.
     """
     rows: list[dict] = []
     failed: list[str] = []
@@ -146,7 +160,7 @@ def fetch_issues(
                     "--limit",
                     "200",
                     "--json",
-                    "number,title,url,labels,updatedAt",
+                    "number,title,url,labels,updatedAt,body",
                 ],
                 runner=runner,
             )
@@ -164,6 +178,8 @@ def fetch_issues(
                         "state": state,
                         "art": art,
                         "updated_epoch": _parse_iso(issue.get("updatedAt")),
+                        "updated_at": str(issue.get("updatedAt") or ""),
+                        "body": str(issue.get("body") or ""),
                     }
                 )
         except Exception as e:  # noqa: BLE001 — one repo must not poison the rest
@@ -338,3 +354,158 @@ def render_markdown(
     if tasks:
         parts.append(f"{len(tasks)} tasks")
     return ", ".join(parts)
+
+
+# ─── review-note synthesis (issue #719) ─────────────────────────────
+
+
+#: Prefix for review notes auto-emitted from GH issues. The status-site
+#: Review page keys on the full file stem (``review-<slug>.md``) — this
+#: constant is the ``<slug>`` portion's own prefix, used both when
+#: writing new notes and when sweeping stale ones.
+REVIEW_NOTE_PREFIX = "ghi-"
+
+
+def review_slug_for(repo: str, number: int | str) -> str:
+    """Stable slug for a GH-issue-backed review note.
+
+    ``jcronq/alice`` + ``704`` → ``ghi-jcronq-alice-704``. Lowercased
+    and sanitised to match :func:`status_site.server._review_slug`.
+    """
+    safe_repo = str(repo or "").lower().replace("/", "-")
+    safe_repo = "".join(c for c in safe_repo if c.isalnum() or c == "-")
+    return f"{REVIEW_NOTE_PREFIX}{safe_repo}-{int(number)}"
+
+
+def _render_review_note(row: dict) -> str:
+    """Build the full markdown text for one review note."""
+    title = str(row.get("title") or "").replace('"', "'")
+    repo = str(row.get("repo") or "")
+    number = row.get("number") or ""
+    url = str(row.get("url") or "")
+    updated_at = str(row.get("updated_at") or "")
+    body = str(row.get("body") or "").strip()
+    slug = review_slug_for(repo, number) if repo and number else ""
+    if not body:
+        body = "_(no description)_"
+    fm_lines = [
+        "---",
+        "kind: decide",
+        f"slug: {slug}",
+        f'title: "{title}"',
+        f"repo: {repo}",
+        f"issue: {number}",
+        f"url: {url}",
+        f"updated: {updated_at}",
+        "---",
+        "",
+        body,
+        "",
+    ]
+    return "\n".join(fm_lines)
+
+
+def _parse_review_frontmatter(text: str) -> dict[str, str]:
+    """Shallow YAML-ish parse of a review note's frontmatter.
+
+    Mirrors :func:`status_site.server.parse_frontmatter` without the
+    dependency. Only cares about the top-level scalar keys this module
+    writes; comments and nested structures are not expected.
+    """
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 4)
+    if end < 0:
+        return {}
+    out: dict[str, str] = {}
+    for line in text[4:end].splitlines():
+        if not line or line[0] in " \t#-" or ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _write_atomic(path: Path, body: str) -> None:
+    """Write ``body`` to ``path`` via a tmp file + rename (atomic on POSIX)."""
+    tmp = path.with_name(f".tmp-{path.name}-{os.getpid()}-{time.time_ns()}")
+    tmp.write_text(body)
+    os.replace(tmp, path)
+
+
+def ensure_review_notes(
+    rows: Sequence[dict], notes_dir: Path
+) -> dict[str, list[str]]:
+    """Reconcile ``notes_dir/review-ghi-*.md`` against the live row set.
+
+    For every row with ``state == "design_review"`` AND ``art ==
+    "code"`` AND a non-empty ``repo`` + ``number``: ensure a note file
+    exists with an up-to-date ``updated:`` frontmatter. If the file's
+    stored ``updated`` matches the row's ``updated_at`` the file is
+    left alone (idempotent).
+
+    Any pre-existing ``review-ghi-*.md`` whose slug is NOT in the live
+    set is deleted — the issue has moved off ``sm:design_review`` (or
+    off ``art:code``, or has been closed) and the note is stale.
+
+    Returns ``{"written": [slug, ...], "deleted": [slug, ...]}`` for
+    logging. The caller handles exceptions — a single bad row must not
+    stop the sweep.
+    """
+    written: list[str] = []
+    deleted: list[str] = []
+    live_slugs: set[str] = set()
+
+    try:
+        notes_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning("pipeline: cannot create notes_dir %s: %r", notes_dir, e)
+        return {"written": written, "deleted": deleted}
+
+    for row in rows:
+        if row.get("state") != "design_review" or row.get("art") != "code":
+            continue
+        repo = str(row.get("repo") or "")
+        number = row.get("number")
+        if not repo or not number:
+            continue
+        slug = review_slug_for(repo, number)
+        live_slugs.add(slug)
+        # File stem == slug. ``read_review`` opens ``notes/<slug>.md``
+        # (no "review-" filename prefix); the ``ghi-`` prefix inside
+        # the slug is the namespace that keeps us from colliding with
+        # existing hand-written notes.
+        path = notes_dir / f"{slug}.md"
+        desired_updated = str(row.get("updated_at") or "")
+        try:
+            existing = path.read_text(errors="replace") if path.exists() else ""
+        except OSError as e:
+            log.warning("pipeline: cannot read %s: %r", path, e)
+            existing = ""
+        if existing:
+            fm = _parse_review_frontmatter(existing)
+            if fm.get("updated") == desired_updated and fm.get("title") == str(
+                row.get("title") or ""
+            ).replace('"', "'"):
+                continue
+        try:
+            _write_atomic(path, _render_review_note(row))
+            written.append(slug)
+        except OSError as e:
+            log.warning("pipeline: cannot write %s: %r", path, e)
+
+    # Sweep stale notes that match our ownership prefix.
+    try:
+        for p in notes_dir.glob(f"{REVIEW_NOTE_PREFIX}*.md"):
+            slug = p.stem
+            if slug in live_slugs:
+                continue
+            try:
+                p.unlink()
+                deleted.append(slug)
+            except OSError as e:
+                log.warning("pipeline: cannot delete stale %s: %r", p, e)
+    except OSError as e:
+        log.warning("pipeline: cannot scan %s: %r", notes_dir, e)
+
+    return {"written": written, "deleted": deleted}
