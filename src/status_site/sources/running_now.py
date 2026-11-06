@@ -271,10 +271,16 @@ def render(
     else:
         lines: list[str] = []
         for t in tasks:
-            liveness = "alive" if t.alive else "dead"
+            # Dashboard-style pill: ``alive`` is ``active`` (warn),
+            # ``dead`` is ``blocked`` (bad). Classes are vendored from
+            # ``widgets.css``; GFM passes the raw span through.
+            if t.alive:
+                pill = '<span class="fx-pill active">alive</span>'
+            else:
+                pill = '<span class="fx-pill blocked">dead</span>'
             pr = t.pr_url or "no PR yet"
             lines.append(
-                f"- `{t.branch}`: {liveness}, {pr}, elapsed {t.elapsed}"
+                f"- `{t.branch}`: {pill}, {pr}, elapsed {t.elapsed}"
             )
         body = "\n".join(lines)
     return body + "\n\n" + staleness_footer(SOURCE_NAME, now=now)

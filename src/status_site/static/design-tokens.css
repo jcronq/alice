@@ -1,0 +1,95 @@
+/* Design tokens — ported from agentry-dashboard/dashboard/template.html
+ * (lines 3-29). Names kept 1:1 with the reference so future ports stay
+ * straightforward; map the status-site's older ``--bg`` / ``--fg`` / etc.
+ * in ``index.html`` onto these new tokens rather than renaming the
+ * tokens themselves.
+ *
+ * Light + ``prefers-color-scheme: dark`` + explicit ``data-theme``
+ * override; every numeric uses the tabular-nums utility ``font-variant-
+ * numeric: tabular-nums`` on ``.fx-num`` and related numeric spans so
+ * dashboard-style columns stay aligned.
+ */
+:root {
+  /* Colours (light) */
+  --color-bg: #f7f6f2;
+  --color-panel: #ffffff;
+  --color-fg: #1d1c1a;
+  --color-fg-muted: #66645e;
+  --color-border-line: #e3e0d6;
+  --color-ok: #2e7a4f;
+  --color-warn: #b06f14;
+  --color-bad: #b23a3a;
+
+  /* Chart-adjacent accents (kept because the dashboard references them
+   * from a dozen widget rules; harmless to keep around even though the
+   * status-site has no SVG charts yet). */
+  --dash-chart-grid: #ebe8df;
+  --dash-chart-status-warning: #c27c1a;
+  --dash-chart-status-critical: #b23a3a;
+  --dash-chart-reference: #3f72ad;
+  --dash-chart-muted: #b4b1a7;
+
+  /* Typography */
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-serif: "Source Serif 4", Georgia, "Times New Roman", serif;
+  --dash-font-size-caption: 12.5px;
+  --dash-font-size-body: 14px;
+  --dash-font-size-heading: 16px;
+  --dash-font-size-title: 26px;
+  --dash-font-weight-medium: 500;
+
+  /* Spacing + radii */
+  --dash-gap-xs: 4px;
+  --dash-gap-sm: 8px;
+  --dash-gap-md: 14px;
+  --dash-gap-lg: 22px;
+  --dash-pad-xs: 6px;
+  --dash-pad-sm: 10px;
+  --dash-pad-lg: 18px;
+  --dash-radius: 10px;
+  --dash-dur-slow: 300ms;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --color-bg: #1b1a18;
+    --color-panel: #24231f;
+    --color-fg: #ecebe6;
+    --color-fg-muted: #a6a39a;
+    --color-border-line: #38362f;
+    --color-ok: #67bd88;
+    --color-warn: #e0a24a;
+    --color-bad: #e07a7a;
+    --dash-chart-grid: #312f29;
+    --dash-chart-status-warning: #e0a24a;
+    --dash-chart-status-critical: #e07a7a;
+    --dash-chart-reference: #7aa7dd;
+    --dash-chart-muted: #6c6a62;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --color-bg: #1b1a18;
+  --color-panel: #24231f;
+  --color-fg: #ecebe6;
+  --color-fg-muted: #a6a39a;
+  --color-border-line: #38362f;
+  --color-ok: #67bd88;
+  --color-warn: #e0a24a;
+  --color-bad: #e07a7a;
+  --dash-chart-grid: #312f29;
+  --dash-chart-status-warning: #e0a24a;
+  --dash-chart-status-critical: #e07a7a;
+  --dash-chart-reference: #7aa7dd;
+  --dash-chart-muted: #6c6a62;
+  color-scheme: dark;
+}
+
+/* Tabular numerics utility — drop onto any numeric span/td/th so
+ * right-aligned columns stay aligned regardless of glyph widths. */
+.fx-num,
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}

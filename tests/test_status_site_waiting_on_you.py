@@ -40,12 +40,14 @@ def test_hand_zone_and_structured_concatenated(tmp_path):
     out = woy.render(hand, records)
     # Hand-zone appears first.
     hand_idx = out.index("Hey — can you bless")
-    struct_idx = out.index("- [ ] decide SM v2")
+    struct_idx = out.index("decide SM v2")
     assert hand_idx < struct_idx
     # Older ask first.
-    assert out.index("- [ ] decide SM v2") < out.index(
-        "- [ ] review new persona"
-    )
+    assert out.index("decide SM v2") < out.index("review new persona")
+    # Each structured line opens a checkbox and carries an urgency pill
+    # (ported from the agentry dashboard, #641).
+    assert "- [ ] " in out
+    assert 'class="fx-urg' in out
     # Staleness footer present.
     assert out.rstrip().splitlines()[-1].startswith("*last_rendered:")
 
@@ -113,5 +115,8 @@ def test_render_from_asks_path_reads_jsonl(tmp_path):
         '{"id":"b","text":"second","created":"2026-11-02T00:00:00+00:00","resolved":false}\n'
     )
     out = woy.render(hand, asks_path=asks_path)
-    assert "- [ ] first" in out
-    assert "- [ ] second" in out
+    assert "first" in out
+    assert "second" in out
+    # Both are checkbox lines carrying urgency pills.
+    assert out.count("- [ ] ") == 2
+    assert out.count('class="fx-urg') == 2

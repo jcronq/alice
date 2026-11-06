@@ -64,7 +64,15 @@ from status_site.sources.common import (
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-STATIC_FILES = {"index.html", "marked.min.js"}
+# Packaged frontend files served from ``static/``. ``design-tokens.css``
+# and ``widgets.css`` are the dashboard-primitives port (#641); the
+# ``.css`` suffix also picks up ``text/css; charset=utf-8`` below.
+STATIC_FILES = {
+    "index.html",
+    "marked.min.js",
+    "design-tokens.css",
+    "widgets.css",
+}
 
 # Content files served from STATUS_DIR: flat names only (no '/', no leading dot).
 CONTENT_NAME_RE = re.compile(
@@ -74,6 +82,7 @@ CONTENT_TYPES = {
     ".md": "text/markdown; charset=utf-8",
     ".json": "application/json",
     ".txt": "text/plain; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
 }
 
 MAX_FILES = 5
@@ -1218,6 +1227,24 @@ class OverviewPollers:
             entry = self._cache.get(key)
         return entry.value if entry else None
 
+    def fetched_at(self, key: str) -> float | None:
+        """Timestamp of the last successful fetch for ``key``, or
+        ``None`` if the poller has never populated the cache (the
+        ``owed`` freshness state).
+        """
+        with self.cfg.lock:
+            entry = self._cache.get(key)
+        return entry.fetched_at if entry else None
+
+    def interval(self, key: str) -> float:
+        """Poll interval (seconds) for a cached source, so the client
+        can compute amber/red thresholds without hardcoding them."""
+        return {
+            "running_now": self._running_now_poll,
+            "review_queue": self._review_poll,
+            "done_today": self._done_today_poll,
+        }.get(key, 300.0)
+
     def _set(self, key: str, value: object) -> None:
         with self.cfg.lock:
             self._cache[key] = _CachedValue(value=value, fetched_at=time.time())
@@ -1306,6 +1333,49 @@ class OverviewPollers:
             self._threads.append(t)
 
 
+def _freshness_prefix(
+    *,
+    source: str,
+    fetched_at: float | None,
+    poll_interval: float,
+    now: float,
+    inline: bool = False,
+    failed: bool = False,
+) -> str:
+    """Return the ``<span class="fx-pill freshness-tile" ...>`` snippet
+    prepended to each spliced section body.
+
+    ``inline=True`` means the source is cheap and read on every
+    request, so freshness is always "just now"; ``inline=False`` with
+    ``fetched_at=None`` means the poller hasn't completed yet
+    (``owed``). A trailing ``\n\n`` keeps the GFM parser happy when
+    the renderer's own body starts with a list.
+    """
+    # Local import keeps the server module import graph flat enough
+    # that tests can poke it without pulling the full urgency stack.
+    from status_site.freshness import FreshnessParams, tile_html
+
+    params = FreshnessParams(poll_interval_seconds=poll_interval)
+    if inline:
+        snippet = tile_html(0.0, params, source=source)
+    elif fetched_at is None:
+        snippet = tile_html(0.0, params, owed=True, source=source)
+    else:
+        age = max(0.0, now - fetched_at)
+        snippet = tile_html(
+            age, params, failed=failed, source=source
+        )
+    # Carry the render-time wall clock + the section's own poll
+    # interval into the DOM so the client can re-tint without another
+    # server round-trip. Inject the attributes alongside ``data-age``.
+    snippet = snippet.replace(
+        'data-age="',
+        f'data-rendered-at="{int(now)}" data-poll="{poll_interval:g}" data-base-age="{int(0 if inline else max(0.0, now - (fetched_at or now)))}" data-age="',
+        1,
+    )
+    return snippet + "\n\n"
+
+
 def overview_splice_sections(
     cfg: "Config",
     *,
@@ -1320,16 +1390,47 @@ def overview_splice_sections(
     markers, a renderer closure, and a fallback builder so the
     append-case keeps the page serveable while the mind repo catches
     up on the marker-insertion pass.
+
+    Each renderer's output is prefixed with a ``.fx-pill
+    .freshness-tile`` span so the section heading carries a
+    dashboard-style ok/amber/red/owed state (#641). Cheap inline
+    sources (waiting-on-you, known-issues, alice-queue) show "just
+    now"; cached sources (running-now, review-queue, done-today) age
+    against the poller's ``fetched_at``.
     """
     pollers = cfg.pollers
     # Running now — read cache; empty list is the "nothing yet" state.
     def _render_running_now() -> str:
         rows = (pollers.get("running_now") if pollers else None) or []
-        return _running_now.render(rows)
+        prefix = _freshness_prefix(
+            source="running_now",
+            fetched_at=(pollers.fetched_at("running_now") if pollers else None),
+            poll_interval=(
+                pollers.interval("running_now")
+                if pollers
+                else DEFAULT_RUNNING_NOW_POLL_SECONDS
+            ),
+            now=now,
+        )
+        return prefix + _running_now.render(rows)
 
     def _render_ready_for_review() -> str:
         cached = (pollers.get("review_queue") if pollers else None) or {}
-        return _review_queue.render(
+        prefix = _freshness_prefix(
+            source="review_queue",
+            fetched_at=(pollers.fetched_at("review_queue") if pollers else None),
+            poll_interval=(
+                pollers.interval("review_queue")
+                if pollers
+                else DEFAULT_REVIEW_POLL_SECONDS
+            ),
+            now=now,
+            failed=bool(
+                (cached.get("design_failed") if cached else None)
+                or (cached.get("pr_failed") if cached else None)
+            ),
+        )
+        return prefix + _review_queue.render(
             cached.get("design", []),
             cached.get("pr", []),
             design_failed=cached.get("design_failed", []),
@@ -1337,7 +1438,14 @@ def overview_splice_sections(
         )
 
     def _render_waiting_on_you() -> str:
-        return _waiting_on_you.render(
+        prefix = _freshness_prefix(
+            source="waiting_on_you",
+            fetched_at=now,
+            poll_interval=60.0,
+            now=now,
+            inline=True,
+        )
+        return prefix + _waiting_on_you.render(
             cfg.status_dir / "waiting-on-you.md",
             asks_path=_asks_path(cfg.status_dir),
         )
@@ -1347,10 +1455,28 @@ def overview_splice_sections(
         today = cached.get("today") or _done_today.today_local()
         asks = _read_asks(_asks_path(cfg.status_dir))
         resolved = _done_today.resolved_today(asks, today)
-        return _done_today.render(cached.get("prs", []), resolved)
+        prefix = _freshness_prefix(
+            source="done_today",
+            fetched_at=(pollers.fetched_at("done_today") if pollers else None),
+            poll_interval=(
+                pollers.interval("done_today")
+                if pollers
+                else DEFAULT_DONE_TODAY_POLL_SECONDS
+            ),
+            now=now,
+            failed=bool(cached.get("failed")),
+        )
+        return prefix + _done_today.render(cached.get("prs", []), resolved)
 
     def _render_known_issues() -> str:
-        return _known_issues.render(cfg.status_dir / "known-issues.md")
+        prefix = _freshness_prefix(
+            source="known_issues",
+            fetched_at=now,
+            poll_interval=300.0,
+            now=now,
+            inline=True,
+        )
+        return prefix + _known_issues.render(cfg.status_dir / "known-issues.md")
 
     return [
         (
@@ -1374,7 +1500,16 @@ def overview_splice_sections(
         (
             ALICE_QUEUE_START,
             ALICE_QUEUE_END,
-            lambda: render_alice_queue(items, now=now),
+            lambda: (
+                _freshness_prefix(
+                    source="alice_queue",
+                    fetched_at=now,
+                    poll_interval=60.0,
+                    now=now,
+                    inline=True,
+                )
+                + render_alice_queue(items, now=now)
+            ),
             _alice_queue_fallback,
         ),
         (

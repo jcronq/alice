@@ -7,7 +7,8 @@ Two inputs concatenated (hand-zone first, then structured asks):
    section can still have structured-queue items below).
 2. ``inner/status/asks.jsonl`` — one JSON object per ask. Unresolved
    records (``resolved: false``) render as ``- [ ] <text>`` lines,
-   oldest first (stable iteration by ``created``).
+   urgency-sorted by ``classify`` (``urgency.py``, #641 port) and
+   then oldest-first within a rank.
 
 Resolved asks are excluded here — they surface under the Done-today
 section via ``resolved_at`` filtering. The hand-zone content does
@@ -27,6 +28,13 @@ from pathlib import Path
 from typing import Sequence
 
 from status_site.sources.common import read_asks, staleness_footer
+from status_site.urgency import (
+    blocked_mark_html,
+    classify,
+    parse_inline_tag,
+    pill_html,
+    sort_key,
+)
 
 SOURCE_NAME = "asks-jsonl"
 
@@ -51,22 +59,47 @@ def _ask_sort_key(ask: dict) -> str:
 
 
 def unresolved_asks(records: Sequence[dict]) -> list[dict]:
-    """Return records with ``resolved != True``, oldest first."""
+    """Return records with ``resolved != True``, urgency- then
+    oldest-first."""
     pending = [r for r in records if not r.get("resolved")]
+    # Primary sort: oldest-first by ``created``. Secondary pass sorts
+    # by urgency rank so NOW/UNSET rise to the top without breaking
+    # within-rank ordering (list.sort is stable).
     pending.sort(key=_ask_sort_key)
+    pending.sort(key=lambda r: sort_key(r))
     return pending
+
+
+def _format_ask_line(record: dict) -> str:
+    """Render one ask as a ``- [ ] <pill> <blocked?> <text>`` line.
+
+    The urgency pill is an inline HTML span (``fx-urg``); GFM passes
+    it through untouched. An explicit ``blocks`` / ``blocked`` flag
+    adds the dashboard's ``fx-mark blocked`` marker in front of the
+    text.
+    """
+    raw_text = str(record.get("text") or "").strip()
+    inline_rank, remaining = parse_inline_tag(raw_text)
+    body_text = remaining if inline_rank else raw_text
+    rank = classify(record)
+    pill = pill_html(rank)
+    blocked = bool(record.get("blocks") or record.get("blocked"))
+    mark = blocked_mark_html("blocked") + " " if blocked else ""
+    return f"- [ ] {pill} {mark}{body_text}".rstrip()
 
 
 def render_structured(records: Sequence[dict]) -> str:
     """Render unresolved ``[ ]`` lines from the asks list.
 
+    Each line carries an urgency pill (``fx-urg RANK``) and, when the
+    ask is flagged blocked, a leading ``fx-mark.blocked`` marker.
     Empty input returns ``""`` (caller decides whether to show the
     "no asks" string or just omit the section).
     """
     pending = unresolved_asks(records)
     if not pending:
         return ""
-    return "\n".join(f"- [ ] {r.get('text', '').strip()}" for r in pending)
+    return "\n".join(_format_ask_line(r) for r in pending)
 
 
 def render(
