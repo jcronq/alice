@@ -45,6 +45,7 @@ button.ghost{background:transparent;color:var(--accent)}
 .conv.open{display:block}
 .conv .thread{max-height:320px;overflow-y:auto;padding:.5rem;margin:0;overscroll-behavior:contain}
 .conv .reply{display:block;margin:0;padding:.5rem;border-top:1px solid var(--line)}
+li.blocked{display:none!important}.blockedby{color:var(--muted);font-size:.85rem}
 li[data-tid]{position:relative;padding-right:5.8rem!important;display:flow-root}
 .ctog{position:absolute;right:.5rem;top:.35rem;font-size:.8rem;padding:.2rem .6rem;border-radius:999px;border:1px solid var(--line);background:var(--card);color:var(--muted);cursor:pointer}
 .ctog.unread{border-color:var(--accent);color:var(--accent);font-weight:600}
@@ -243,6 +244,24 @@ function collapseDone(){
   h.replaceWith(d);
 }
 let AVAIL=new Set();
+const depsOf=li=>{const out=[];
+  for(const n of [...li.childNodes,...[...li.querySelectorAll(':scope > p')].flatMap(p=>[...p.childNodes])])
+    if(n.nodeType===8){const m=/^\s*deps:([\s\S]*)$/.exec(n.nodeValue);if(m)for(const d of m[1].split(',')){const s=d.trim().toLowerCase().replace(/[^a-z0-9-]/g,'').slice(0,60).replace(/^-+|-+$/g,'');if(s&&!out.includes(s))out.push(s)}}
+  return out};
+// A dep is open unless its item is known and checked; unknown slugs stay open so typos fail safe.
+const openDeps=(deps,checked)=>deps.filter(d=>checked[d]!==true);
+async function applyBlocked(){
+  const checked={};
+  try{const r=await fetch('api/item-state?'+Date.now());if(r.ok){const st=await r.json();for(const k in st)checked[k]=st[k].checked}}catch(e){}
+  document.querySelectorAll('#doc li').forEach(li=>{const cb=li.querySelector(':scope > input[type=checkbox]'),st=li.querySelector('strong');
+    if(cb&&st)checked[slug(st.textContent.replace(/[:.]+$/,''))]=cb.checked});
+  document.querySelectorAll('#doc li').forEach(li=>{
+    const deps=depsOf(li);if(!deps.length)return;
+    const open=openDeps(deps,checked);if(!open.length)return;
+    const cb=li.querySelector(':scope > input[type=checkbox]');if(cb&&cb.checked)return;
+    const d=document.createElement('div');d.className='blockedby';d.textContent='blocked by '+open.join(', ');
+    li.appendChild(d);li.classList.add('blocked')});
+}
 function linkDetails(){
   document.querySelectorAll('#doc li').forEach(li=>{
     const st=li.querySelector('strong');if(!st||st.closest('a'))return;
@@ -432,7 +451,7 @@ async function load(){
     await pollThreads();addReplies();makeDraggable();
     if(lm){const m=Math.round((Date.now()-new Date(lm))/60000);document.getElementById('age').textContent='updated '+(m<1?'just now':m<60?m+' min ago':Math.round(m/60)+' h ago')}
     try{const ar=await fetch('api/pages?'+Date.now());if(ar.ok)AVAIL=new Set(await ar.json())}catch(e){}
-    linkDetails();linkLeaves();collapseDone();
+    linkDetails();linkLeaves();collapseDone();await applyBlocked();
     if(pr&&pr.ok){PAGES=await ensureTab(await pr.json());renderNav(PAGES)}
     document.title='Alice — '+(document.querySelector('#doc h1')?.textContent||page);
   }catch(e){document.getElementById('doc').textContent='Could not load '+page+'.md ('+e.message+')'}

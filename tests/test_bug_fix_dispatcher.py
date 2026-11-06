@@ -874,3 +874,53 @@ def test_default_poster_writes_thread_file(tmp_path, monkeypatch):
     tick(cfg, spawn=lambda *a: 4242)
     thread = status / "threads" / "bug-3-cake-box-swap.jsonl"
     assert "worker-spawned pid:4242" in thread.read_text()
+
+
+# ---------------------------------------------------------------- depends_on gate
+
+
+def _item_state(status_dir, **checked):
+    import json
+
+    (status_dir / ".item-state.json").write_text(
+        json.dumps({"items": {k: {"checked": v} for k, v in checked.items()}})
+    )
+
+
+def test_dispatch_declines_while_dep_open_then_proceeds(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    p = write_bug(cfg.status_dir, 9, extra_front={"depends_on": "[wave-a]"})
+    _item_state(cfg.status_dir, **{"wave-a": False})
+    spawned = []
+
+    def spawn(bug_id, scratch, prompt):
+        spawned.append(bug_id)
+        return 1
+
+    rep = tick(cfg, spawn=spawn)
+    assert spawned == [] and rep.dispatched == []
+    assert (9, "blocked") in rep.skipped
+    assert "blocked by wave-a" in (tmp_path / "journal.log").read_text()
+    assert fm.parse(p.read_text())[0]["status"] == "open"
+
+    _item_state(cfg.status_dir, **{"wave-a": True})
+    rep = tick(cfg, spawn=spawn)
+    assert spawned == [9] and rep.dispatched == [9]
+
+
+def test_dispatch_blocked_by_unknown_dep_slug(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    write_bug(cfg.status_dir, 9, extra_front={"depends_on": "wave-typo"})
+    rep = tick(cfg, spawn=lambda *a: 1)
+    assert rep.dispatched == [] and (9, "blocked") in rep.skipped
+
+
+def test_dispatch_dep_on_other_bug_resolves_when_fixed(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    write_bug(cfg.status_dir, 3, status="in-progress", extra_front={"pr_url": "https://x/1"})
+    write_bug(cfg.status_dir, 4, extra_front={"depends_on": "[bug-3]"})
+    rep = tick(cfg, spawn=lambda *a: 1, gh_pr_view=lambda url: {"state": "OPEN"})
+    assert 4 not in rep.dispatched
+    write_bug(cfg.status_dir, 3, status="fixed")
+    rep = tick(cfg, spawn=lambda *a: 1)
+    assert rep.dispatched == [4]

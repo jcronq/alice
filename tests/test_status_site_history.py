@@ -372,3 +372,52 @@ def test_receiver_pages_still_work(tmp_path):
     assert (tmp_path / "mind/inner/status/wave-a.md").read_text() == "# Wave A\n"
     assert drop(tmp_path, "index", b"# x\n").returncode != 0
     assert drop(tmp_path, "../x", b"# x\n").returncode != 0
+
+
+# ---------------------------------------------------------------- depends_on
+
+
+DEPS_PAGE = """## Waves
+
+- [ ] **Wave A**: build it
+- [ ] **Wave B**: after A <!--deps: wave-a, Wave-C-->
+  continued <!--deps: wave-a, extra-->
+"""
+
+
+def test_parse_page_extracts_deps_and_strips_marker():
+    items = {i.slug: i for i in H.parse_page(DEPS_PAGE, "index")}
+    b = items["wave-b"]
+    assert b.depends_on == ["wave-a", "wave-c", "extra"]
+    assert "<!--" not in b.text and "deps" not in b.text
+    assert b.text == "after A continued"
+    assert items["wave-a"].depends_on == []
+
+
+def test_deps_serialized_into_item_state(status):
+    (status / "index.md").write_text(DEPS_PAGE)
+    H.Tracker(status).step()
+    state = json.loads((status / ".item-state.json").read_text())["items"]
+    assert state["wave-b"]["depends_on"] == ["wave-a", "wave-c", "extra"]
+    assert state["wave-a"]["depends_on"] == []
+
+
+def test_unresolved_deps_unknown_slug_fails_safe():
+    items = {"a": {"checked": True}, "b": {"checked": False}, "c": {"checked": None}}
+    assert H.unresolved_deps(["a"], items) == []
+    assert H.unresolved_deps(["a", "b", "c", "typo"], items) == ["b", "c", "typo"]
+
+
+def test_api_item_state_and_bug_deps(site):
+    st, port = site
+    (st / "index.md").write_text(DEPS_PAGE)
+    (st / "bug-5.md").write_text(
+        "---\nreport_id: 5\ntitle: t\nstatus: open\ndepends_on: [wave-a, Bug 4]\n---\n\n# bug-5\n"
+    )
+    H.Tracker(st).step()
+    status_code, body = get(port, "/api/item-state")
+    assert status_code == 200
+    data = json.loads(body)
+    assert data["wave-b"] == {"checked": False, "depends_on": ["wave-a", "wave-c", "extra"]}
+    status_code, body = get(port, "/bugs.md")
+    assert b"<!--deps: wave-a, bug4-->" in body

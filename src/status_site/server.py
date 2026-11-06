@@ -11,6 +11,8 @@ Stdlib-only (runs on a bare ``python:3.12-alpine`` image). Routes:
                                           events from item-history/<s>.jsonl (written by the
                                           tracker thread, see history.py), thread from
                                           threads/<s>.jsonl, extra from item-extra/<s>.jsonl
+    GET  /api/item-state                  {slug: {checked, depends_on}} for every tracked item
+                                          (frontend uses it to resolve ``depends_on`` across pages)
     GET  /api/chat                        {messages: [...]} — general chat log, no item context
     GET  /api/waiting-order               {order: [slug, ...]} saved drag order of "Waiting on you"
     POST /api/page-visibility             dismiss/restore/open a nav tab (shared-key auth)
@@ -52,10 +54,12 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from status_site.history import (
     HISTORY_DIR,
+    STATE_FILE,
     Tracker,
     parse_page,
     read_history,
     read_jsonl,
+    safe_slug,
 )
 from status_site.sources import (
     done_today as _done_today,
@@ -683,6 +687,32 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
     return data, body
 
 
+def parse_depends_on(value: str) -> list[str]:
+    """``depends_on: [a, b]`` / ``a, b`` frontmatter value -> deduped safe slugs."""
+    out: list[str] = []
+    for raw in (value or "").strip().strip("[]").split(","):
+        s = safe_slug(raw.strip().strip("'\""))
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def read_item_state(status_dir: Path) -> dict[str, dict]:
+    """Slim ``{slug: {checked, depends_on}}`` view of ``.item-state.json`` (tombstones dropped)."""
+    try:
+        d = json.loads((status_dir / STATE_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    items = d.get("items") if isinstance(d, dict) else None
+    if not isinstance(items, dict):
+        return {}
+    return {
+        slug: {"checked": it.get("checked"), "depends_on": it.get("depends_on") or []}
+        for slug, it in items.items()
+        if isinstance(it, dict) and not it.get("gone")
+    }
+
+
 def _bug_summary_fallback(reported_at: str) -> str:
     """Fallback summary line built from ``reported_at`` when missing."""
     if not reported_at:
@@ -767,6 +797,7 @@ def collect_bugs(status_dir: Path) -> tuple[dict[str, list[dict]], float]:
                 "pr_url": pr_url,
                 "estimate_usd": estimate_usd,
                 "actual_usd": actual_usd,
+                "depends_on": parse_depends_on(fm.get("depends_on", "")),
             }
         )
     # Promote in-progress bugs that already have a draft PR into the
@@ -898,6 +929,8 @@ def render_bugs_md(status_dir: Path) -> tuple[str, float]:
                 summary_bits.append(pricing_segment)
             if summary_bits:
                 line += ": *" + " — ".join(summary_bits) + "*"
+            if b.get("depends_on"):
+                line += f" <!--deps: {', '.join(b['depends_on'])}-->"
             lines.append(line)
         parts.append("\n".join(lines) + "\n")
 
@@ -1931,6 +1964,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(
                 200, {"order": read_waiting_order(self.cfg)}, head=head
             )
+        if path == "/api/item-state":
+            return self._json(200, read_item_state(self.cfg.status_dir), head=head)
         if path == "/api/chat":
             return self._json(
                 200, {"messages": read_chat(self.cfg)}, head=head
