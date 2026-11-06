@@ -585,6 +585,38 @@ function LegacySection({data}) {
 }
 
 // ── 10. header ────────────────────────────────────────────────────
+// Nav tabs: fetch pages.json so chat / bugs / review stay reachable from the
+// reactive shell. Each non-hidden tab links to legacy.html via ?p=<slug>
+// (the reactive shell already redirects anything but ?p=index there), so no
+// backend changes needed. Chat is auto-added if pages.json omits it, matching
+// legacy.html line 354-355.
+function NavTabs() {
+  const [pages, setPages] = useState([]);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch("pages.json?" + Date.now());
+        if (!r.ok) return;
+        const raw = await r.json();
+        if (cancelled) return;
+        const visible = raw.filter(p => !p.hidden && p.slug !== "index");
+        if (!visible.some(p => p.slug === "chat")) {
+          visible.push({slug: "chat", title: "Chat"});
+        }
+        setPages(visible);
+      } catch (e) { /* nav is best-effort */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+  const search = location.search;
+  return pages.map(p => h("a", {
+    key: p.slug,
+    href: "legacy.html" + (search ? search + "&" : "?") + "p=" + encodeURIComponent(p.slug),
+    title: p.title,
+  }, p.title));
+}
+
 function ThemeToggle() {
   const [t, setT] = useState(() => localStorage.getItem("alice-theme") || "system");
   function cycle() {
@@ -624,6 +656,7 @@ function App() {
   return h(React.Fragment, null,
     h("header", null,
       h("b", null, "Alice"),
+      h(NavTabs),
       h("span", {className: "spacer"}),
       h("a", {href: legacyHref, title: "Pre-#639 markdown shell"}, "Classic view"),
       h(ThemeToggle),
