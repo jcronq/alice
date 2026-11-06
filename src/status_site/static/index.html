@@ -61,7 +61,8 @@ header a:hover, header button.hdr:hover {
 .sse-status.live { color: var(--color-ok); border-color: var(--color-ok); }
 .sse-status.fallback { color: var(--color-warn); border-color: var(--color-warn); }
 .sse-status.off { color: var(--color-bad); border-color: var(--color-bad); }
-main { max-width: 900px; margin: 0 auto; padding: 1rem 1rem 4rem; }
+main { max-width: min(1400px, 95vw); margin: 0 auto; padding: 1rem 1.5rem 4rem; }
+main:has(.a2ui-chat-page) { max-width: min(1600px, 98vw); padding: 1rem 1rem 1.5rem; }
 h1 { font-size: 1.5rem; margin: .6rem 0; }
 h2.sec-heading {
   font-size: 1.15rem; margin: 1.6rem 0 .5rem;
@@ -91,16 +92,16 @@ h2.sec-heading {
   font-variant-numeric: tabular-nums;
 }
 .fx-big .of { color: var(--color-fg-muted); font-size: var(--dash-font-size-caption); }
-.a2ui-chat-thread { max-height: 60vh; overflow-y: auto; }
+.a2ui-chat-thread { max-height: calc(100vh - 14rem); overflow-y: auto; }
 .a2ui-composer { display: flex; flex-direction: column; gap: .4rem; }
 .a2ui-composer.dragging { outline: 2px dashed var(--color-ok); outline-offset: 2px; }
 .a2ui-composer-bar { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; }
 .a2ui-composer-send { margin-left: auto; }
 .a2ui-composer-send .a2ui-btn-row { margin: 0; }
-.chat-image { margin: .4rem 0; }
+.chat-image { margin: .4rem 0; max-width: 100%; }
 .chat-image img {
   max-width: 100%;
-  max-height: 360px;
+  max-height: 420px;
   border-radius: 6px;
   display: block;
   background: var(--color-bg);
