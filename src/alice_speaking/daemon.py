@@ -39,6 +39,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import pathlib
 import signal as _signal
 import threading
 import time
@@ -604,6 +605,11 @@ class SpeakingDaemon:
             # which only fires when the CLI sends a permission request
             # — built-in tools in default mode never do — observed
             # empirically on the b06d2f1 deploy.)
+            chat_status_dir=(
+                pathlib.Path(os.environ["STATUS_DIR"])
+                if os.environ.get("STATUS_DIR")
+                else cfg.mind_dir / "inner" / "status"
+            ),
             hooks={
                 "PreToolUse": [
                     HookMatcher(

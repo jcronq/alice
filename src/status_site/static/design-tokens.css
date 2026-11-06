@@ -539,6 +539,28 @@ li.fx-now {
   font-size: .72rem;
   margin-top: .15rem;
 }
+.a2ui-list.a2ui-chat-thread .working-group {
+  align-self: flex-start;
+  max-width: 88%;
+  color: var(--color-fg-muted);
+  font-size: .82rem;
+  border-left: 2px solid var(--color-border-line);
+  padding-left: .6rem;
+}
+.a2ui-list.a2ui-chat-thread .working-group.active { border-left-color: var(--color-ok); }
+.a2ui-list.a2ui-chat-thread .working-group > summary {
+  cursor: pointer;
+  font-style: italic;
+}
+.a2ui-list.a2ui-chat-thread .working-group .wg-steps {
+  list-style: none;
+  margin: .25rem 0 0;
+  padding: 0;
+}
+.a2ui-list.a2ui-chat-thread .working-group .wg-step { margin: .1rem 0; }
+.a2ui-list.a2ui-chat-thread .working-group .wg-step.running::after { content: " …"; }
+.a2ui-list.a2ui-chat-thread .working-group .wg-step.error { color: var(--color-bad); }
+.a2ui-list.a2ui-chat-thread .working-group small { opacity: .65; font-size: .72rem; }
 .a2ui-list.a2ui-chat-thread .typing {
   color: var(--color-fg-muted);
   font-style: italic;

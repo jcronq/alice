@@ -14,7 +14,11 @@ Describes the ``chat`` surface as a server-sent component tree:
 The whole envelope list rides ``page:chat`` on the existing SSE
 stream. Since the broadcaster's tick does a deep dict-equality compare,
 an unchanged chat log costs one compare per tick and emits nothing.
-``handle_chat`` / ``POST /api/chat`` are untouched — this module only
+Working-status groups (issue #656) ride the same ``/messages`` list as
+rows with ``variant: "working-group"`` — one per turn, carrying its
+tool-call ``steps`` — interleaved by timestamp between Jason's message
+and Alice's reply. They come from the ``.chat-status.jsonl`` sidecar,
+not ``.chat.jsonl``. ``handle_chat`` / ``POST /api/chat`` are untouched — this module only
 describes the UI around them.
 """
 
@@ -22,6 +26,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from status_site.chat_status import build_groups, merge_thread, read_status_rows
 from status_site.a2ui import (
     component,
     create_surface,
@@ -105,5 +110,7 @@ def render(cfg: "Config") -> dict:
     # server imports this module via section_renderers.
     from status_site.server import read_chat
 
-    messages = read_chat(cfg)
+    messages = merge_thread(
+        read_chat(cfg), build_groups(read_status_rows(cfg.status_dir))
+    )
     return {"a2ui": build_envelopes(messages)}

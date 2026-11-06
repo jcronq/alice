@@ -751,7 +751,7 @@ function ChatThread({rows}) {
   useEffect(() => {
     const el = ref.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
-  }, [merged.length, last && last.at]);
+  }, [merged.length, last && last.at, last && last.step_count]);
   return h("div", {
     ref,
     className: "a2ui-list a2ui-chat-thread",
@@ -765,6 +765,9 @@ function renderChatMessages(rows) {
     return h("div", {className: "typing"}, "No messages yet. Say hi.");
   }
   return rows.map((m, i) => {
+    if (m.variant === "working-group") {
+      return h(WorkingGroup, {key: "wg-" + (m.turn_id || i), group: m});
+    }
     // Prefer the richer `attachments` shape (name, url) over the
     // legacy `files` name-only shape so historical messages still
     // render with a filename if the url isn't present.
@@ -791,6 +794,35 @@ function renderChatMessages(rows) {
         (m.from === "jason" ? "You" : "Alice") + " · " + (m.at || "")),
     );
   });
+}
+
+// Per-turn working-status group (#656): "Alice is working…" plus one
+// muted row per significant tool call. Open while the turn is active,
+// auto-collapses when it ends; clicking the summary pins the user's
+// choice for the rest of the page's life.
+function WorkingGroup({group}) {
+  const [pinned, setPinned] = useState(null);
+  const open = pinned === null ? !!group.active : pinned;
+  const n = group.step_count || 0;
+  const count = n + (n === 1 ? " step" : " steps");
+  return h("details", {
+    className: "working-group" + (group.active ? " active" : ""),
+    "data-testid": "working-group",
+    "data-turn-id": group.turn_id,
+    open,
+  },
+    h("summary", {
+      onClick: e => { e.preventDefault(); setPinned(!open); },
+    }, (group.text || "") + " · " + count),
+    h("ul", {className: "wg-steps"},
+      (group.steps || []).map(st => h("li", {
+        key: st.id,
+        className: "wg-step " + (st.state || "done"),
+        "data-testid": "working-step",
+      }, st.label)),
+    ),
+    h("small", null, "Alice · " + (group.at || "")),
+  );
 }
 
 // Read files into the composer's pending-attachment list for textarea ``id``.
