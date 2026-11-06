@@ -408,3 +408,105 @@ def test_parse_frontmatter_handles_quoted_values():
     assert fm["report_id"] == "42"
     assert fm["status"] == "open"
     assert body.startswith("\nhello")
+
+
+# ---------------------------------------------------------------- A2UI emitter (#651)
+
+
+def test_bugs_a2ui_envelope_shape(tmp_path):
+    """``sources.bugs.render`` emits createSurface → updateComponents →
+    two updateDataModel envelopes (``/sections`` + ``/pipeline``).
+    """
+    from status_site.sources import bugs as bugs_page
+
+    status = tmp_path / "status"
+    status.mkdir()
+    write_bug(status, 1, status="open", title="open one")
+    write_bug(status, 2, status="fixed", title="closed one")
+
+    payload = bugs_page.render(status)
+    assert "a2ui" in payload
+    envs = payload["a2ui"]
+    assert [e["type"] for e in envs] == [
+        "createSurface",
+        "updateComponents",
+        "updateDataModel",
+        "updateDataModel",
+    ]
+    assert all(e["surfaceId"] == "bugs" for e in envs)
+
+    # Sections data model carries one bucket per heading, in canonical
+    # order (Open first, Dispatch-failed last).
+    sections_env = next(
+        e for e in envs if e["type"] == "updateDataModel" and e["path"] == "/sections"
+    )
+    headings = [s["heading"] for s in sections_env["value"]]
+    assert headings == [
+        "Open",
+        "Waiting on review",
+        "In progress",
+        "Fixed",
+        "Won't fix",
+        "Dispatch failed (needs triage)",
+    ]
+    open_rows = next(s for s in sections_env["value"] if s["key"] == "open")["rows"]
+    assert len(open_rows) == 1
+    assert open_rows[0]["report_id"] == 1
+    assert open_rows[0]["title"] == "bug-1 — open one"
+
+
+def test_bugs_a2ui_dispatch_failed_prefix(tmp_path):
+    """Dispatch-failed bucket rows carry the ⚠ warning prefix so the
+    client doesn't have to re-derive it.
+    """
+    from status_site.sources import bugs as bugs_page
+
+    status = tmp_path / "status"
+    status.mkdir()
+    write_bug(status, 9, status="dispatch-failed", title="stalled one")
+    payload = bugs_page.render(status)
+    sections = next(
+        e for e in payload["a2ui"]
+        if e["type"] == "updateDataModel" and e["path"] == "/sections"
+    )["value"]
+    df = next(s for s in sections if s["key"] == "dispatch-failed")
+    assert df["rows"][0]["title"].startswith("⚠ bug-9 —")
+
+
+def test_bugs_a2ui_pipeline_null_until_priced(tmp_path):
+    """No priced bugs → ``/pipeline`` data-model entry is ``None`` so the
+    client hides the P&L pill (parity with ``render_bugs_md``'s "omit
+    the segment entirely").
+    """
+    from status_site.sources import bugs as bugs_page
+
+    status = tmp_path / "status"
+    status.mkdir()
+    write_bug(status, 1, status="open", title="unpriced")
+    payload = bugs_page.render(status)
+    pipeline = next(
+        e for e in payload["a2ui"]
+        if e["type"] == "updateDataModel" and e["path"] == "/pipeline"
+    )
+    assert pipeline["value"] is None
+
+
+def test_bugs_a2ui_pipeline_populated_once_priced(tmp_path):
+    from status_site.sources import bugs as bugs_page
+
+    status = tmp_path / "status"
+    status.mkdir()
+    (status / "bug-1.md").write_text(
+        "---\nreport_id: 1\ntitle: priced\nstatus: fixed\n"
+        "estimate_usd: 0.25\nactual_usd: 0.40\n---\n# bug-1\n"
+    )
+    payload = bugs_page.render(status)
+    pipeline = next(
+        e for e in payload["a2ui"]
+        if e["type"] == "updateDataModel" and e["path"] == "/pipeline"
+    )
+    assert pipeline["value"] == {
+        "estimate": "$0.25",
+        "actual": "$0.40",
+        "delta": "$0.15",
+    }

@@ -84,6 +84,16 @@ from status_site.sources import (
     running_now as _running_now,
     waiting_on_you as _waiting_on_you,
 )
+from status_site.sources import (
+    bugs as _bugs_page,
+    chat as _chat_page,
+    review as _review_page,
+)
+from status_site.sources.bugs import (
+    format_pricing_segment as _format_pricing_segment,
+    format_usd_local as _format_usd_local,
+    sum_pricing as _sum_pricing,
+)
 from status_site.sources.common import (
     asks_path as _asks_path,
     read_asks as _read_asks,
@@ -877,72 +887,6 @@ def collect_bugs(status_dir: Path) -> tuple[dict[str, list[dict]], float]:
     return buckets, max_mtime
 
 
-def _format_usd_local(dollars: float) -> str:
-    """Status-site-local USD formatter.
-
-    Mirrors ``alice_pricing.format_usd`` without taking a dep on the
-    pricing package — ``status_site`` is stdlib-only by design (see
-    the module docstring). Keep in sync.
-    """
-    if dollars == 0:
-        return "$0.00"
-    if dollars < 0:
-        return "-" + _format_usd_local(-dollars)
-    if dollars < 0.01:
-        return f"${dollars:.4g}"
-    return f"${dollars:.2f}"
-
-
-def _format_pricing_segment(estimate_usd: str, actual_usd: str) -> str:
-    """Build the ``$X est / $Y actual`` tail for a bug's summary line.
-
-    * both present  → ``$X est / $Y actual``
-    * only estimate → ``$X est``
-    * only actual   → ``$Y actual``
-    * neither       → ``""`` (caller omits the segment entirely)
-
-    Values that don't parse as floats, or that are the sentinel
-    strings ``null`` / ``none``, are treated as absent — a malformed
-    frontmatter row shouldn't crash the render.
-    """
-
-    def _render(raw: str) -> str:
-        s = (raw or "").strip()
-        if not s or s.lower() in ("null", "none"):
-            return ""
-        try:
-            dollars = float(s)
-        except ValueError:
-            return ""
-        return _format_usd_local(dollars)
-
-    est = _render(estimate_usd)
-    act = _render(actual_usd)
-    if est and act:
-        return f"{est} est / {act} actual"
-    if est:
-        return f"{est} est"
-    if act:
-        return f"{act} actual"
-    return ""
-
-
-def _sum_pricing(buckets: dict[str, list[dict]]) -> dict[str, float]:
-    """Return ``{"estimate": total, "actual": total}`` across every bug."""
-    totals = {"estimate": 0.0, "actual": 0.0}
-    for items in buckets.values():
-        for b in items:
-            for key, bucket in (("estimate_usd", "estimate"), ("actual_usd", "actual")):
-                raw = (b.get(key) or "").strip()
-                if not raw or raw.lower() in ("null", "none"):
-                    continue
-                try:
-                    totals[bucket] += float(raw)
-                except ValueError:
-                    continue
-    return totals
-
-
 def render_bugs_md(status_dir: Path) -> tuple[str, float]:
     """Build the full ``/bugs.md`` body + newest contributing-file mtime."""
     buckets, max_mtime = collect_bugs(status_dir)
@@ -1686,8 +1630,25 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
     def _render_known_issues() -> dict:
         return {"markdown": _known_issues.render(cfg.status_dir / "known-issues.md")}
 
+    # A2UI-rendered pages (issue #651). Each ``page:<slug>`` section
+    # emits a ``{"a2ui": [envelope, ...]}`` payload the client walks
+    # through its generic surface renderer. The broadcaster's dict-
+    # equality compare treats these payloads the same as any other
+    # section payload — unchanged → no event fires.
+    def _render_page_chat() -> dict:
+        return _chat_page.render(cfg)
+
+    def _render_page_bugs() -> dict:
+        return _bugs_page.render(cfg.status_dir)
+
+    def _render_page_review() -> dict:
+        return _review_page.render(cfg)
+
     # Preserve Overview order; the SSE client iterates this dict to
-    # draw sections top-to-bottom.
+    # draw sections top-to-bottom. Page sections live alongside
+    # Overview sections in the same snapshot — the client only mounts
+    # ``page:<slug>`` for the currently-active hash route, so idle
+    # pages cost one dict-equality check per tick.
     return {
         "running_now": _render_running_now,
         "ready_for_review": _render_ready_for_review,
@@ -1695,6 +1656,9 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         "alice_queue": _render_alice_queue,
         "done_today": _render_done_today,
         "known_issues": _render_known_issues,
+        "page:chat": _render_page_chat,
+        "page:bugs": _render_page_bugs,
+        "page:review": _render_page_review,
     }
 
 
@@ -2359,9 +2323,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, list_reviews(self.cfg), head=head)
         if path == "/api/review":
             q = parse_qs(urlsplit(self.path).query)
-            review = read_review(self.cfg, (q.get("slug") or [""])[0])
+            slug = (q.get("slug") or [""])[0]
+            review = read_review(self.cfg, slug)
             if review is None:
                 return self._json(404, {"error": "no review"}, head=head)
+            # Side-effect for the A2UI ``page:review`` renderer
+            # (issue #651): record the active slug so the next SSE
+            # tick emits a surface for this item. The renderer is
+            # generic — one entry in SectionBroadcaster — so the slug
+            # lives in module state rather than as a per-slug renderer
+            # key. See ``sources/review.py`` for the trade-off.
+            _review_page.set_active_slug(review["slug"])
             return self._json(200, review, head=head)
         if path == "/api/pages":
             return self._json(200, list_pages(self.cfg), head=head)

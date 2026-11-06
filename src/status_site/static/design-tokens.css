@@ -395,3 +395,149 @@ li.fx-now {
   border-radius: 50%;
   background: var(--color-bad);
 }
+
+/* A2UI surfaces (#651) ------------------------------------------------
+ *
+ * The reactive shell renders chat / bugs / review pages as A2UI
+ * surfaces. These styles are the minimal shell needed for the five
+ * component types the server emits (text, list, textarea, button,
+ * pill); anything fancier should go into design-tokens itself, not
+ * here, so overview + dynamic pages share the same visual language.
+ */
+.a2ui-surface {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dash-gap-md);
+}
+.a2ui-text {
+  line-height: 1.55;
+}
+.a2ui-text.review-meta {
+  color: var(--color-fg-muted);
+  font-size: var(--dash-font-size-caption);
+}
+.a2ui-text.review-plan {
+  padding: var(--dash-pad-sm) var(--dash-pad-lg);
+  border: 1px solid var(--color-border-line);
+  border-radius: var(--dash-radius);
+  background: var(--color-panel);
+}
+.a2ui-textarea {
+  width: 100%;
+  min-height: 3.4rem;
+  padding: var(--dash-pad-sm);
+  font: inherit;
+  color: var(--color-fg);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border-line);
+  border-radius: var(--dash-radius);
+}
+.a2ui-btn-row {
+  display: flex;
+  align-items: center;
+  gap: var(--dash-gap-sm);
+  margin-top: var(--dash-gap-xs);
+}
+.a2ui-btn {
+  font: inherit;
+  font-size: 0.9rem;
+  padding: 0.3rem 0.8rem;
+  border: 1px solid var(--color-ok);
+  border-radius: var(--dash-radius);
+  background: var(--color-ok);
+  color: var(--color-bg);
+  cursor: pointer;
+}
+.a2ui-btn[disabled] { opacity: .5; cursor: default; }
+.a2ui-btn-reject {
+  background: var(--color-warn);
+  border-color: var(--color-warn);
+}
+.a2ui-btn-modify {
+  background: transparent;
+  color: var(--color-ok);
+}
+.a2ui-pill {
+  display: inline-block;
+  padding: 0 .55rem;
+  border: 1px solid var(--color-border-line);
+  border-radius: 999px;
+  font-size: .85rem;
+  color: var(--color-fg-muted);
+}
+.a2ui-list.a2ui-chat-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dash-gap-sm);
+  height: calc(100vh - 8rem);
+  min-height: 24rem;
+}
+.a2ui-list.a2ui-chat-thread {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--dash-pad-sm);
+  border: 1px solid var(--color-border-line);
+  border-radius: var(--dash-radius);
+  background: var(--color-panel);
+  display: flex;
+  flex-direction: column;
+  gap: var(--dash-gap-xs);
+}
+.a2ui-list.a2ui-chat-thread .msg {
+  max-width: 88%;
+  padding: .4rem .65rem;
+  border-radius: 10px;
+  font-size: .92rem;
+  white-space: pre-wrap;
+  line-height: 1.4;
+}
+.a2ui-list.a2ui-chat-thread .msg.jason {
+  align-self: flex-end;
+  background: var(--color-ok);
+  color: var(--color-bg);
+  border-bottom-right-radius: 3px;
+}
+.a2ui-list.a2ui-chat-thread .msg.alice {
+  align-self: flex-start;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border-line);
+  border-bottom-left-radius: 3px;
+}
+.a2ui-list.a2ui-chat-thread .msg small {
+  display: block;
+  opacity: .65;
+  font-size: .72rem;
+  margin-top: .15rem;
+}
+.a2ui-list.a2ui-chat-thread .typing {
+  color: var(--color-fg-muted);
+  font-style: italic;
+  font-size: .85rem;
+}
+.a2ui-list.a2ui-bugs-sections .bugs-section {
+  margin: var(--dash-gap-md) 0;
+}
+.a2ui-list.a2ui-bugs-sections h2 {
+  font-size: 1.1rem;
+  margin: .6rem 0 .4rem;
+  padding-bottom: .2rem;
+  border-bottom: 1px solid var(--color-border-line);
+}
+.a2ui-list.a2ui-review-actions {
+  display: grid;
+  gap: var(--dash-gap-md);
+}
+.a2ui-list.a2ui-review-act {
+  padding: var(--dash-pad-sm);
+  border: 1px solid var(--color-border-line);
+  border-radius: var(--dash-radius);
+  background: var(--color-panel);
+}
+.a2ui-unknown {
+  color: var(--color-bad);
+  background: var(--color-panel);
+  padding: var(--dash-pad-sm);
+  border: 1px solid var(--color-bad);
+  border-radius: var(--dash-radius);
+}

@@ -4,20 +4,22 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Alice — status</title>
 <!--
-  Reactive status-site shell (#639, slice-2).
+  Reactive status-site shell (#639 + #651).
 
   SSE-driven React shell. The first SSE frame is a full snapshot;
-  subsequent `section.update` frames patch one section's state. Each
-  section payload is a typed dict (``{markdown, rows, ...}``) so the
-  widget components render without re-parsing markdown; a markdown
-  fallback is still shipped for sections slice-2 doesn't widgetise yet
-  (ready_for_review, known_issues), and for the ``/index.md`` legacy
-  path that kicks in when SSE dies.
+  subsequent `section.update` frames patch one section's state. Overview
+  section payloads are typed dicts (``{markdown, rows, ...}``) rendered
+  by the slice-2 widgets.
 
-  Non-Overview pages (?p=chat, ?p=bugs, …) continue to run through the
-  legacy shell at /legacy.html; the shell redirects there on mount for
-  anything but ?p=index so nav tabs + modal + reply flow + chat keep
-  working. Slices 3–6 fold more of that into the reactive tree.
+  Dynamic pages (Chat, Bugs, per-item Review) come through the same SSE
+  stream as A2UI (``page:<slug>``) sections: each payload is
+  ``{"a2ui": [createSurface, updateComponents, updateDataModel, ...]}``
+  and renders through the generic ``A2uiSurface`` component. Hash routes
+  (``#chat``, ``#bugs``, ``#review-<slug>``) pick which surface the
+  shell mounts.
+
+  ``legacy.html`` is still packaged for rollback — the "Classic view"
+  header link points at it. Retirement is a follow-up PR per the design.
 -->
 <link rel="stylesheet" href="design-tokens.css">
 <style>
@@ -116,11 +118,16 @@ if (kParam) {
   history.replaceState(null, "", url.pathname + (url.search ? "?" + url.search : "") + url.hash);
 }
 const KEY = localStorage.getItem("alice-key") || "";
-// Non-Overview pages continue to work through the legacy shell. The
-// reactive widget library (slice-3+) will fold these into the tree.
-const PAGE = (new URLSearchParams(location.search).get("p") || "index");
-if (PAGE !== "index") {
-  location.replace("legacy.html" + location.search + location.hash);
+// Dynamic pages (#651) render through the A2UI surface component in
+// this same shell — no more redirect to legacy.html for chat / bugs /
+// review. Pre-#651 ``?p=<slug>`` links are translated to the new
+// ``#<slug>`` route once so bookmarks and surface notes keep working.
+const LEGACY_PAGE = new URLSearchParams(location.search).get("p");
+if (LEGACY_PAGE && LEGACY_PAGE !== "index") {
+  const u = new URL(location.href);
+  u.searchParams.delete("p");
+  u.hash = "#" + LEGACY_PAGE;
+  history.replaceState(null, "", u.pathname + (u.search ? u.search : "") + u.hash);
 }
 
 // ── 1. theme toggle ───────────────────────────────────────────────
@@ -427,6 +434,283 @@ function MarkdownZone({markdown}) {
   });
 }
 
+// ── 7b. A2UI generic renderer (#651) ─────────────────────────────
+// Walks the component tree the server describes as a flat adjacency
+// list, resolves ``props.boundTo = "/path"`` against the surface's
+// data model (RFC-6901 JSON pointer, keys only — no array-index
+// support needed yet; the one place it'd help is inside the chat
+// thread list which we already resolve manually). Unknown component
+// types render as a visible ``<pre>`` dump so a schema drift is
+// loud, not silent — same philosophy as _safe_render on the server.
+function resolvePointer(data, pointer) {
+  if (!pointer || pointer === "") return data;
+  if (!pointer.startsWith("/")) return undefined;
+  const parts = pointer.slice(1).split("/").map(s =>
+    s.replace(/~1/g, "/").replace(/~0/g, "~"));
+  let cur = data;
+  for (const p of parts) {
+    if (cur == null) return undefined;
+    cur = cur[p];
+  }
+  return cur;
+}
+
+// Replay an A2UI envelope list into a plain ``{components, data}``
+// snapshot. Every ``section.update`` for a page reruns this fresh —
+// the server emits the full list each tick, so idempotent replay is
+// the whole story. ``null`` surface means "nothing to render".
+function replayA2ui(envelopes) {
+  if (!Array.isArray(envelopes) || !envelopes.length) return null;
+  let surfaceId = null;
+  const components = new Map();
+  let data = {};
+  for (const env of envelopes) {
+    if (!env || typeof env !== "object") continue;
+    const sid = env.surfaceId;
+    if (!sid) continue;
+    if (env.type === "createSurface") {
+      surfaceId = sid;
+      components.clear();
+      data = env.data ? {...env.data} : {};
+      for (const c of (env.components || [])) {
+        if (c && c.id) components.set(c.id, c);
+      }
+    } else if (env.type === "updateComponents") {
+      for (const c of (env.components || [])) {
+        if (c && c.id) components.set(c.id, c);
+      }
+    } else if (env.type === "updateDataModel") {
+      applyDataModel(data, env.path || "", env.value);
+    } else if (env.type === "deleteSurface") {
+      if (surfaceId === sid) return null;
+    }
+  }
+  if (!surfaceId || !components.has("root")) return null;
+  return {surfaceId, components, data};
+}
+
+function applyDataModel(data, pointer, value) {
+  if (!pointer || pointer === "") {
+    // Whole-document replace: mutate the caller's object in place so
+    // the ``data`` reference held by replayA2ui stays consistent.
+    for (const k of Object.keys(data)) delete data[k];
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      Object.assign(data, value);
+    }
+    return;
+  }
+  if (!pointer.startsWith("/")) return;
+  const parts = pointer.slice(1).split("/").map(s =>
+    s.replace(/~1/g, "/").replace(/~0/g, "~"));
+  const last = parts.pop();
+  let cur = data;
+  for (const p of parts) {
+    if (cur[p] == null || typeof cur[p] !== "object") cur[p] = {};
+    cur = cur[p];
+  }
+  cur[last] = value;
+}
+
+// Post helper for button actions. ``kind`` is the semantic action
+// string from the button's props (chat.send / review.approve / …);
+// the switch maps each to the existing POST endpoint + payload shape
+// so ``handle_chat`` / ``handle_review_action`` on the server stay
+// untouched — A2UI only describes the UI around them.
+async function dispatchA2uiAction(kind, {text, slug}) {
+  if (!KEY) return {ok: false, error: "no key"};
+  if (kind === "chat.send") {
+    const r = await fetch("/api/chat", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({key: KEY, text}),
+    });
+    const j = await r.json().catch(() => ({}));
+    return {ok: r.ok, status: r.status, error: j.error};
+  }
+  if (kind === "review.approve" || kind === "review.modify" || kind === "review.reject") {
+    const action = kind.slice("review.".length);
+    const r = await fetch("/api/review-action", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({key: KEY, slug, action, notes: text || ""}),
+    });
+    const j = await r.json().catch(() => ({}));
+    return {ok: r.ok, status: r.status, error: j.error};
+  }
+  return {ok: false, error: "unknown action: " + kind};
+}
+
+// Walker: render one component by id, resolving list children and
+// data-model references as it goes. The React key is the component
+// id — the server picks stable ids per surface. ``local`` is the
+// per-surface in-component state (textarea values keyed by id,
+// per-button send-status text) owned by ``A2uiSurface``.
+function renderA2uiComponent(id, surface, local, setLocal) {
+  const c = surface.components.get(id);
+  if (!c) return null;
+  const type = c.type || "";
+  const props = c.props || {};
+  const children = c.children || [];
+  switch (type) {
+    case "text": {
+      const md = props.markdown || props.text || "";
+      return h("div", {
+        key: id,
+        className: "a2ui-text" + (props.variant ? " " + props.variant.replace(/[^a-z0-9- ]/gi, "") : ""),
+        dangerouslySetInnerHTML: {__html: renderMarkdown(String(md))},
+      });
+    }
+    case "pill": {
+      const bound = props.boundTo ? resolvePointer(surface.data, props.boundTo) : null;
+      if (bound == null) return null;
+      // Pill payloads are either a string, or a struct the client
+      // flattens ("$0.10 est / $0.15 actual · Δ $0.05" for pricing).
+      let label;
+      if (typeof bound === "string") {
+        label = bound;
+      } else if (bound && typeof bound === "object") {
+        const parts = [];
+        if (bound.estimate) parts.push(bound.estimate + " est");
+        if (bound.actual) parts.push(bound.actual + " actual");
+        if (bound.delta) parts.push("Δ " + bound.delta);
+        label = parts.join(" · ") || JSON.stringify(bound);
+      } else {
+        label = String(bound);
+      }
+      return h("span", {key: id, className: "fx-pill a2ui-pill"}, label);
+    }
+    case "textarea": {
+      const current = local.textareas[id] ?? "";
+      return h("textarea", {
+        key: id,
+        className: "a2ui-textarea",
+        placeholder: props.placeholder || "",
+        value: current,
+        onChange: e => setLocal(s => ({
+          ...s,
+          textareas: {...s.textareas, [id]: e.target.value},
+        })),
+      });
+    }
+    case "button": {
+      const status = local.statuses[id] || "";
+      const disabled = local.pending[id] || !KEY;
+      const variant = props.variant ? " a2ui-btn-" + String(props.variant).replace(/[^a-z0-9-]/gi, "") : "";
+      return h("div", {key: id, className: "a2ui-btn-row"},
+        h("button", {
+          className: "a2ui-btn" + variant,
+          disabled,
+          onClick: async () => {
+            const action = props.action || "";
+            const taId = props.textareaId || "";
+            const text = taId ? (local.textareas[taId] ?? "") : "";
+            if (action === "chat.send" && !text.trim()) return;
+            if (action === "review.modify" && !text.trim()) {
+              setLocal(s => ({...s, statuses: {...s.statuses, [id]: "Say what to change first."}}));
+              return;
+            }
+            if (action === "review.reject" && !confirm("Reject this plan?")) {
+              return;
+            }
+            setLocal(s => ({
+              ...s,
+              pending: {...s.pending, [id]: true},
+              statuses: {...s.statuses, [id]: "Sending…"},
+            }));
+            const res = await dispatchA2uiAction(action, {
+              text,
+              slug: surface.data && surface.data.slug,
+            });
+            setLocal(s => {
+              const next = {
+                ...s,
+                pending: {...s.pending, [id]: false},
+                statuses: {...s.statuses, [id]: res.ok ? "" : ("Error: " + (res.error || res.status || "unknown"))},
+              };
+              if (res.ok && taId) {
+                next.textareas = {...s.textareas, [taId]: ""};
+              }
+              return next;
+            });
+          },
+        }, props.label || "Submit"),
+        status ? h("span", {className: "sse-status" + (status.startsWith("Error") ? " off" : "")}, status) : null,
+      );
+    }
+    case "list": {
+      // Lists have two flavours:
+      //   1. plain children — render each child component
+      //   2. boundTo → the data at that pointer is a list of row
+      //      objects (variant = "chat-thread" / "bugs-sections" / …)
+      if (props.boundTo) {
+        const rows = resolvePointer(surface.data, props.boundTo);
+        return h("div", {key: id, className: "a2ui-list a2ui-" + (props.variant || "boundlist")},
+          renderBoundList(id, props, rows || []));
+      }
+      const heading = props.heading;
+      return h("div", {key: id, className: "a2ui-list a2ui-" + (props.variant || "list")},
+        heading ? h("h3", null, heading) : null,
+        children.map(cid => renderA2uiComponent(cid, surface, local, setLocal)),
+      );
+    }
+    default:
+      return h("pre", {
+        key: id,
+        className: "a2ui-unknown",
+        style: {whiteSpace: "pre-wrap"},
+      }, "unknown a2ui component: " + JSON.stringify(c));
+  }
+}
+
+function renderBoundList(id, props, rows) {
+  const variant = props.variant || "";
+  if (variant === "chat-thread") {
+    if (!rows.length) {
+      return h("div", {className: "typing"}, "No messages yet. Say hi.");
+    }
+    return rows.map((m, i) => h("div", {
+      key: (m.at || "") + "-" + i,
+      className: "msg " + (m.from === "jason" ? "jason" : "alice"),
+    },
+      m.text || "",
+      ...(m.files || []).map((n, j) => h("div", {key: "f-" + j}, "📎 " + n)),
+      h("small", null,
+        (m.from === "jason" ? "You" : "Alice") + " · " + (m.at || "")),
+    ));
+  }
+  if (variant === "bugs-sections") {
+    return rows.map(sec => h("section", {key: sec.key, className: "bugs-section"},
+      h("h2", null, sec.heading),
+      sec.rows.length
+        ? h("ul", null, sec.rows.map(r => h("li", {key: r.id},
+            h("strong", null, r.title),
+            r.summary_bits && r.summary_bits.length
+              ? h("em", null, ": " + r.summary_bits.join(" — "))
+              : null,
+            r.pricing ? h("span", {className: "fx-pill", style: {marginLeft: ".4rem"}}, r.pricing) : null,
+          )))
+        : h("p", {className: "typing"}, "(none yet)"),
+    ));
+  }
+  // Fallback: dump each row as a <pre> so the drift is visible but
+  // the whole surface doesn't go dark.
+  return rows.map((r, i) => h("pre", {key: i}, JSON.stringify(r)));
+}
+
+function A2uiSurface({envelopes, surfaceId}) {
+  // Local-only state: textareas and button pending/status. Replayed
+  // from scratch each render so updateComponents never clobbers what
+  // the user is typing (textarea ids are stable per surface).
+  const [local, setLocal] = useState({textareas: {}, statuses: {}, pending: {}});
+  const surface = React.useMemo(() => replayA2ui(envelopes), [envelopes]);
+  if (!surface) {
+    return h("div", {className: "notice"}, "Waiting for the " + surfaceId + " surface…");
+  }
+  return h("div", {className: "a2ui-surface a2ui-surface-" + surface.surfaceId},
+    renderA2uiComponent("root", surface, local, setLocal),
+  );
+}
+
 // ── 8. section widgets (slice-2) ──────────────────────────────────
 function RunningNowBoard({rows, nowMs}) {
   const safe = rows || [];
@@ -584,12 +868,56 @@ function LegacySection({data}) {
   );
 }
 
+// ── 9b. hash routing (#651) ──────────────────────────────────────
+// ``#chat`` / ``#bugs`` / ``#review-<slug>`` pick which A2UI surface
+// the shell mounts. Anything else falls through to the Overview
+// board (``#``, ``#overview``, no hash at all). ``useHashRoute``
+// returns ``{route, slug}`` where route is "overview" | "chat" |
+// "bugs" | "review" and slug is only set for review.
+function parseHash(raw) {
+  const h = (raw || "").replace(/^#/, "");
+  if (!h || h === "overview" || h === "index") return {route: "overview", slug: null};
+  if (h === "chat") return {route: "chat", slug: null};
+  if (h === "bugs") return {route: "bugs", slug: null};
+  if (h.startsWith("review-")) return {route: "review", slug: h.slice("review-".length)};
+  return {route: "overview", slug: null};
+}
+function useHashRoute() {
+  const [r, setR] = useState(() => parseHash(location.hash));
+  useEffect(() => {
+    const on = () => setR(parseHash(location.hash));
+    window.addEventListener("hashchange", on);
+    return () => window.removeEventListener("hashchange", on);
+  }, []);
+  return r;
+}
+
+// When the hash route lands on ``review-<slug>`` we tell the server
+// which slug the A2UI ``page:review`` renderer should describe
+// (sources/review.py:set_active_slug). ``/api/review`` already
+// exists as the design-note body fetch; we piggy-back on it to set
+// the active slug as a side effect.
+function usePingReviewSlug(slug) {
+  useEffect(() => {
+    if (!slug) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        await fetch("/api/review?slug=" + encodeURIComponent(slug) + "&" + Date.now());
+      } catch (e) { /* best-effort — the next poll retries */ }
+      if (cancelled) return;
+    })();
+    return () => { cancelled = true; };
+  }, [slug]);
+}
+
 // ── 10. header ────────────────────────────────────────────────────
-// Nav tabs: fetch pages.json so chat / bugs / review stay reachable from the
-// reactive shell. Each non-hidden tab links to legacy.html via ?p=<slug>
-// (the reactive shell already redirects anything but ?p=index there), so no
-// backend changes needed. Chat is auto-added if pages.json omits it, matching
-// legacy.html line 354-355.
+// Nav tabs: fetch pages.json so chat / bugs / review stay reachable
+// from the reactive shell. Chat / Bugs link to ``#chat`` / ``#bugs``
+// (A2UI-rendered inside this shell, #651); everything else still
+// points at legacy.html via ``?p=<slug>`` until the markdown-page
+// pipeline moves across too.
+const A2UI_SLUGS = new Set(["chat", "bugs"]);
 function NavTabs() {
   const [pages, setPages] = useState([]);
   useEffect(() => {
@@ -610,11 +938,13 @@ function NavTabs() {
     return () => { cancelled = true; };
   }, []);
   const search = location.search;
-  return pages.map(p => h("a", {
-    key: p.slug,
-    href: "legacy.html" + (search ? search + "&" : "?") + "p=" + encodeURIComponent(p.slug),
-    title: p.title,
-  }, p.title));
+  return pages.map(p => {
+    const hashRoute = A2UI_SLUGS.has(p.slug);
+    const href = hashRoute
+      ? ("#" + p.slug)
+      : ("legacy.html" + (search ? search + "&" : "?") + "p=" + encodeURIComponent(p.slug));
+    return h("a", {key: p.slug, href, title: p.title}, p.title);
+  });
 }
 
 function ThemeToggle() {
@@ -635,6 +965,8 @@ function App() {
   const [state, dispatch] = useReducer(reducer, INITIAL);
   useEventStream(dispatch);
   const nowMs = useNowTick(10000);
+  const {route, slug} = useHashRoute();
+  usePingReviewSlug(route === "review" ? slug : null);
 
   const legacyHref = "legacy.html" + location.search;
   let statusClass = "sse-status";
@@ -643,19 +975,41 @@ function App() {
   else if (state.connected) { statusClass += " live"; statusLabel = "live"; }
   else if (state.error) { statusClass += " off"; statusLabel = state.error; }
 
-  const legacyPayload = state.sections._legacy_md;
-  const sections = SECTION_ORDER
-    .filter(n => state.sections[n])
-    .map(n => h(SectionTile, {
-      key: n, name: n,
-      data: state.sections[n],
-      ts: parseTs(state.ts[n]),
-      nowMs,
-    }));
+  // Route → content. Overview reuses the existing widget stack; A2UI
+  // routes mount ``A2uiSurface`` with the matching ``page:<slug>``
+  // section payload the broadcaster is already streaming.
+  let content;
+  if (route === "overview") {
+    const legacyPayload = state.sections._legacy_md;
+    const sections = SECTION_ORDER
+      .filter(n => state.sections[n])
+      .map(n => h(SectionTile, {
+        key: n, name: n,
+        data: state.sections[n],
+        ts: parseTs(state.ts[n]),
+        nowMs,
+      }));
+    content = sections.length
+      ? sections
+      : (legacyPayload
+          ? h(LegacySection, {data: legacyPayload})
+          : (state.fallback ? null : h("div", {className: "notice"},
+              "Waiting for the first snapshot…")));
+  } else {
+    const key = route === "review" ? "page:review" : ("page:" + route);
+    const payload = state.sections[key];
+    const envelopes = payload && payload.a2ui;
+    content = h(A2uiSurface, {
+      key: route + ":" + (slug || ""),
+      envelopes,
+      surfaceId: route,
+    });
+  }
 
   return h(React.Fragment, null,
     h("header", null,
       h("b", null, "Alice"),
+      h("a", {href: "#", title: "Overview"}, "Overview"),
       h(NavTabs),
       h("span", {className: "spacer"}),
       h("a", {href: legacyHref, title: "Pre-#639 markdown shell"}, "Classic view"),
@@ -665,12 +1019,7 @@ function App() {
     h("main", null,
       !KEY && h("div", {className: "notice err"},
         "No key — open the link Alice sent once to install it."),
-      sections.length
-        ? sections
-        : (legacyPayload
-            ? h(LegacySection, {data: legacyPayload})
-            : (state.fallback ? null : h("div", {className: "notice"},
-                "Waiting for the first snapshot…"))),
+      content,
     ),
   );
 }

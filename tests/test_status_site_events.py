@@ -436,6 +436,82 @@ def test_waiting_on_you_rows_carry_urgency(site):
 # ─── broadcaster unit ───────────────────────────────────────────────
 
 
+# ─── A2UI page sections (#651) ──────────────────────────────────────
+
+
+def test_snapshot_includes_a2ui_page_sections(site):
+    """The SSE snapshot carries the page:<slug> renderers alongside the
+    Overview sections. Each page section's payload is ``{"a2ui": [...]}``
+    — plain dicts the broadcaster's dict-equality diff handles the same
+    as any other section payload.
+    """
+    cfg, port = site
+    conn, resp = _open_sse(port, KEY)
+    try:
+        snap = _read_frames_until(
+            resp, lambda e: isinstance(e, dict) and e.get("type") == "snapshot"
+        )
+        secs = snap["sections"]
+        for name in ("page:chat", "page:bugs", "page:review"):
+            assert name in secs, f"missing {name} in snapshot"
+            assert "a2ui" in secs[name], f"{name} payload missing a2ui key"
+            assert isinstance(secs[name]["a2ui"], list)
+        # Chat & bugs always emit their surface shape; review stays
+        # empty until /api/review sets the active slug.
+        assert len(secs["page:chat"]["a2ui"]) >= 1
+        assert len(secs["page:bugs"]["a2ui"]) >= 1
+        assert secs["page:review"]["a2ui"] == []
+    finally:
+        conn.close()
+
+
+def test_api_review_arms_page_review_renderer(site):
+    """Hitting /api/review?slug=… sets the active slug so the next tick
+    fires a page:review section.update with a populated envelope list.
+    """
+    cfg, port = site
+    (cfg.status_dir / "notes").mkdir(exist_ok=True)
+    (cfg.status_dir / "notes" / "my-plan.md").write_text(
+        "---\nkind: decide\ntitle: Plan Y\n---\n# plan Y body\n"
+    )
+    # Reset the module-level slug so we start clean (prior tests may
+    # have left one armed via their own fixtures).
+    from status_site.sources import review as review_page
+
+    review_page.set_active_slug(None)
+
+    conn, resp = _open_sse(port, KEY)
+    try:
+        # Drain the initial snapshot (page:review is empty at this point).
+        _read_frames_until(
+            resp, lambda e: isinstance(e, dict) and e.get("type") == "snapshot"
+        )
+        # Ping /api/review in a short-lived connection.
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.request("GET", "/api/review?slug=my-plan")
+        r = c.getresponse()
+        assert r.status == 200
+        r.read()
+        c.close()
+        # Wait for the delta.
+        ev = _read_frames_until(
+            resp,
+            lambda e: isinstance(e, dict)
+            and e.get("type") == "section.update"
+            and e.get("name") == "page:review",
+            timeout=4.0,
+        )
+        env_types = [x["type"] for x in ev["data"]["a2ui"]]
+        assert env_types[:3] == [
+            "createSurface",
+            "updateComponents",
+            "updateDataModel",
+        ]
+    finally:
+        conn.close()
+        review_page.set_active_slug(None)
+
+
 def test_broadcaster_tick_broadcasts_only_on_change(tmp_path):
     """SectionBroadcaster.tick() publishes nothing when renders don't
     move, and one event per section when they do.

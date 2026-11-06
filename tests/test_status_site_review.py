@@ -152,3 +152,80 @@ def test_item_stays_reviewable_after_action(site):
     assert act(port, key=KEY, slug=SLUG, action="approve")[0] == 200
     assert SLUG in req(port, "GET", "/api/reviews")[1]
     assert req(port, "GET", f"/api/review?slug={SLUG}")[0] == 200
+
+
+# ---------------------------------------------------------------- A2UI emitter (#651)
+
+
+def test_review_a2ui_empty_before_slug_is_set(site):
+    """With no active slug the renderer emits an empty envelope list so
+    the SSE tick's dict-equality compare suppresses noise.
+    """
+    from status_site.sources import review as review_page
+
+    cfg, _ = site
+    review_page.set_active_slug(None)
+    assert review_page.render(cfg) == {"a2ui": []}
+
+
+def test_review_a2ui_emits_surface_after_api_review_sets_slug(site):
+    """``GET /api/review?slug=…`` is the hook that records the active
+    slug (design-note resolution: slug-in-data-model, no broadcaster
+    API change). The ``page:review`` renderer picks it up on the next
+    tick.
+    """
+    from status_site.sources import review as review_page
+
+    cfg, port = site
+    status, body = req(port, "GET", f"/api/review?slug={SLUG}")
+    assert status == 200
+
+    payload = review_page.render(cfg)
+    assert "a2ui" in payload
+    envelopes = payload["a2ui"]
+    assert [e["type"] for e in envelopes] == [
+        "createSurface",
+        "updateComponents",
+        "updateDataModel",
+    ]
+    assert all(e["surfaceId"] == "review" for e in envelopes)
+
+    # The slug rides in the data model so a client clicking a review
+    # button can POST /api/review-action with the right ``slug``.
+    assert envelopes[0]["data"] == {"slug": SLUG}
+    assert envelopes[-1]["path"] == "/slug"
+    assert envelopes[-1]["value"] == SLUG
+
+    # Three action buttons, each with its own textarea + semantic
+    # ``action`` string the client switches on.
+    comps = {c["id"]: c for c in envelopes[1]["components"]}
+    for key in ("approve", "modify", "reject"):
+        btn = comps[f"{key}-btn"]
+        assert btn["type"] == "button"
+        assert btn["props"]["action"] == f"review.{key}"
+        assert btn["props"]["textareaId"] == f"{key}-ta"
+        assert comps[f"{key}-ta"]["type"] == "textarea"
+
+    # Plan body + title + meta are text components.
+    assert comps["title"]["type"] == "text"
+    assert "Review page for plans" in comps["title"]["props"]["markdown"]
+    assert comps["plan"]["type"] == "text"
+    assert "## Shape" in comps["plan"]["props"]["markdown"]
+
+    # Clean up the module-level slug so subsequent tests start fresh.
+    review_page.set_active_slug(None)
+
+
+def test_review_a2ui_stays_empty_when_note_vanishes(site):
+    """If the active slug points at a note that was deleted (or was
+    never review-shaped), the renderer emits ``{"a2ui": []}`` rather
+    than blowing up the SSE tick.
+    """
+    from status_site.sources import review as review_page
+
+    cfg, _ = site
+    review_page.set_active_slug("plain-note")  # exists but not review-shaped
+    assert review_page.render(cfg) == {"a2ui": []}
+    review_page.set_active_slug("missing")
+    assert review_page.render(cfg) == {"a2ui": []}
+    review_page.set_active_slug(None)
