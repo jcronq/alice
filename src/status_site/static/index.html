@@ -95,6 +95,8 @@ h2.sec-heading {
 .a2ui-composer { display: flex; flex-direction: column; gap: .4rem; }
 .a2ui-composer.dragging { outline: 2px dashed var(--color-ok); outline-offset: 2px; }
 .a2ui-composer-bar { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; }
+.a2ui-composer-send { margin-left: auto; }
+.a2ui-composer-send .a2ui-btn-row { margin: 0; }
 .a2ui-attach {
   cursor: pointer; font-size: .85rem; color: var(--color-fg-muted);
   padding: .15rem .55rem; border: 1px solid var(--color-border-line);
@@ -674,6 +676,13 @@ function renderA2uiComponent(id, surface, local, setLocal) {
             }, "×"),
           )),
           attachErr ? h("span", {className: "a2ui-attach-err"}, attachErr) : null,
+          // Render the submit button inline on the right of the attach row
+          // when the textarea declares a submitId. Keeps Send + Attach on
+          // one line per Jason 2026-11-06 — the button is still a normal
+          // top-level a2ui component so it can be omitted from the root
+          // children list without losing its click handler.
+          submitBtn ? h("div", {className: "a2ui-composer-send"},
+            renderA2uiComponent(props.submitId, surface, local, setLocal)) : null,
         ),
       );
     }
