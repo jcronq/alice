@@ -494,6 +494,146 @@ def handle_reply(cfg: Config, d: dict) -> dict:
     return {"ok": True, "thread": tid}
 
 
+# ---------------------------------------------------------------- thinking queue
+#
+# ``/index.md`` gets a live ``## Thinking queue`` block spliced in between
+# sentinel markers. The data is a cache file (``.thinking-queue.json``) written
+# every ~60s by ``alice_forge.thinking_queue_poller`` (where ``gh`` is
+# authenticated); this server stays stdlib-only and never talks to GitHub.
+
+THINKING_QUEUE_START = "<!-- thinking-queue:start -->"
+THINKING_QUEUE_END = "<!-- thinking-queue:end -->"
+THINKING_QUEUE_CACHE = ".thinking-queue.json"
+THINKING_QUEUE_REPO = "jcronq/alice"
+THINKING_QUEUE_CAP = 15
+# Cache older than this is treated as unavailable (poller cadence is ~60s).
+THINKING_QUEUE_STALE_SECONDS = 600
+# (label, heading) in display order.
+THINKING_QUEUE_PHASES = (
+    ("sm:designing", "Designing"),
+    ("sm:needs_study", "Needs study"),
+    ("sm:design_review", "Design review"),
+    ("sm:designed", "Designed"),
+    ("sm:compacting", "Compacting"),
+    ("sm:blocked", "Blocked"),
+)
+
+
+def read_thinking_queue(status_dir: Path) -> dict | None:
+    """Load the poller's cache; ``None`` when missing or corrupt."""
+    path = status_dir / THINKING_QUEUE_CACHE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        synced_at = float(data["synced_at"])
+        items = data["items"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(items, list):
+        return None
+    return {
+        "synced_at": synced_at,
+        "items": [i for i in items if isinstance(i, dict) and "number" in i],
+    }
+
+
+def _format_age(updated_at: object, now: float) -> str:
+    try:
+        ts = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return "?"
+    secs = max(0, int(now - ts))
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 86400:
+        return f"{secs // 3600}h"
+    return f"{secs // 86400}d"
+
+
+def _thinking_phase(item: dict) -> int | None:
+    labels = {
+        (l.get("name") if isinstance(l, dict) else l) for l in item.get("labels") or []
+    }
+    for idx, (label, _) in enumerate(THINKING_QUEUE_PHASES):
+        if label in labels:
+            return idx
+    return None
+
+
+def render_thinking_queue(cache: dict | None, now: float | None = None) -> str:
+    """Render the ``## Thinking queue`` block (without sentinel markers)."""
+    now = time.time() if now is None else now
+    lines = ["## Thinking queue", ""]
+    if cache is None:
+        lines.append("*Queue unavailable — no sync from GitHub yet.*")
+        return "\n".join(lines) + "\n"
+    synced_at = cache["synced_at"]
+    if now - synced_at > THINKING_QUEUE_STALE_SECONDS:
+        synced = datetime.fromtimestamp(synced_at, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        lines.append(f"*Queue unavailable — last synced {synced}.*")
+        return "\n".join(lines) + "\n"
+
+    buckets: dict[int, list[dict]] = {}
+    for item in cache["items"]:
+        phase = _thinking_phase(item)
+        if phase is not None:
+            buckets.setdefault(phase, []).append(item)
+    if not buckets:
+        lines.append("*Nothing in the thinking queue.*")
+        return "\n".join(lines) + "\n"
+
+    shown = 0
+    total = sum(len(v) for v in buckets.values())
+    for idx, (_, heading) in enumerate(THINKING_QUEUE_PHASES):
+        entries = sorted(buckets.get(idx, []), key=lambda i: int(i["number"]))
+        entries = entries[: max(0, THINKING_QUEUE_CAP - shown)]
+        if not entries:
+            continue
+        lines.append(f"**{heading}**")
+        for item in entries:
+            num = int(item["number"])
+            title = " ".join(str(item.get("title", "")).split())
+            age = _format_age(item.get("updatedAt"), now)
+            lines.append(
+                f"- [#{num}](https://github.com/{THINKING_QUEUE_REPO}/issues/{num})"
+                f" {title} — {heading.lower()} · {age}"
+            )
+        shown += len(entries)
+        lines.append("")
+    if total > shown:
+        lines.append(
+            f"[{total - shown} more…](https://github.com/{THINKING_QUEUE_REPO}/issues"
+            "?q=is%3Aissue+is%3Aopen+label%3Asm%3Adesigning)"
+        )
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def splice_thinking_queue(text: str, block: str) -> str:
+    """Replace the region between the sentinels, or append the block once."""
+    region = f"{THINKING_QUEUE_START}\n{block}{THINKING_QUEUE_END}"
+    start = text.find(THINKING_QUEUE_START)
+    end = text.find(THINKING_QUEUE_END, start + len(THINKING_QUEUE_START)) if start != -1 else -1
+    if start != -1 and end != -1:
+        return text[:start] + region + text[end + len(THINKING_QUEUE_END) :]
+    sep = "" if not text or text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
+    return text + sep + region + "\n"
+
+
+def render_index_md(status_dir: Path, now: float | None = None) -> tuple[str, float] | None:
+    """``index.md`` with the live thinking queue; ``None`` if the file is missing."""
+    path = status_dir / "index.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    cache = read_thinking_queue(status_dir)
+    try:
+        mtime = max(mtime, (status_dir / THINKING_QUEUE_CACHE).stat().st_mtime)
+    except OSError:
+        pass
+    return splice_thinking_queue(text, render_thinking_queue(cache, now)), mtime
+
+
 # ---------------------------------------------------------------- bugs render
 #
 # ``/bugs.md`` is rendered on-the-fly from every ``bug-<N>.md`` detail file in
@@ -1826,7 +1966,17 @@ class Handler(BaseHTTPRequestHandler):
                     self.cfg, items=items, now=now
                 )
                 rendered = _splice_sections(source, sections)
-                mtime = max(file_mtime, newest)
+                cache = read_thinking_queue(self.cfg.status_dir)
+                rendered = splice_thinking_queue(
+                    rendered, render_thinking_queue(cache, now)
+                )
+                try:
+                    thinking_mtime = (
+                        self.cfg.status_dir / THINKING_QUEUE_CACHE
+                    ).stat().st_mtime
+                except OSError:
+                    thinking_mtime = 0.0
+                mtime = max(file_mtime, newest, thinking_mtime)
                 return self._send(
                     200,
                     rendered.encode("utf-8"),
