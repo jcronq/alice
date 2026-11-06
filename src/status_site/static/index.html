@@ -61,8 +61,15 @@ header a:hover, header button.hdr:hover {
 .sse-status.live { color: var(--color-ok); border-color: var(--color-ok); }
 .sse-status.fallback { color: var(--color-warn); border-color: var(--color-warn); }
 .sse-status.off { color: var(--color-bad); border-color: var(--color-bad); }
-main { max-width: min(1400px, 95vw); margin: 0 auto; padding: 1rem 1.5rem 4rem; }
-main:has(.a2ui-chat-page) { max-width: min(1600px, 98vw); padding: 1rem 1rem 1.5rem; }
+/* Readable (narrow) is the default — ~62ch per line. "Wide" fills most
+ * of the viewport for dense dashboards. Toggled from the gear menu
+ * via <html data-width="wide|narrow">. The chat page gets a tighter
+ * readable cap (56rem) and relaxes to a dashboard-ish width when the
+ * user picks Wide. */
+main { max-width: 62rem; margin: 0 auto; padding: 1rem 1.5rem 4rem; }
+html[data-width="wide"] main { max-width: min(1400px, 95vw); }
+main:has(.a2ui-chat-page) { max-width: 56rem; padding: 1rem 1rem 1.5rem; }
+html[data-width="wide"] main:has(.a2ui-chat-page) { max-width: min(1200px, 95vw); }
 h1 { font-size: 1.5rem; margin: .6rem 0; }
 h2.sec-heading {
   font-size: 1.15rem; margin: 1.6rem 0 .5rem;
@@ -105,6 +112,45 @@ h2.sec-heading {
   border-radius: 6px;
   background: var(--color-bg);
 }
+/* Settings gear + popover. The wrap is relative-positioned so the
+ * absolute panel hangs off the button's right edge. */
+.cfg-wrap { position: relative; display: inline-block; }
+.cfg-gear { font-size: 1rem; line-height: 1; padding: .2rem .55rem; }
+.cfg-panel {
+  position: absolute; right: 0; top: calc(100% + .35rem);
+  min-width: 14rem;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border-line);
+  border-radius: 10px;
+  padding: .6rem .75rem;
+  display: flex; flex-direction: column; gap: .55rem;
+  box-shadow: 0 6px 24px rgba(0,0,0,.14);
+  z-index: 10;
+}
+.cfg-section { display: flex; flex-direction: column; gap: .3rem; }
+.cfg-label { font-size: .75rem; color: var(--color-fg-muted); text-transform: uppercase; letter-spacing: .04em; }
+.cfg-row { display: flex; flex-wrap: wrap; gap: .3rem; }
+.cfg-pill {
+  background: transparent;
+  color: var(--color-fg-muted);
+  border: 1px solid var(--color-border-line);
+  border-radius: 999px;
+  padding: .15rem .6rem;
+  font-size: .82rem;
+  cursor: pointer;
+}
+.cfg-pill:hover { color: var(--color-ok); border-color: var(--color-ok); }
+.cfg-pill.on {
+  color: var(--color-bg);
+  background: var(--color-ok);
+  border-color: var(--color-ok);
+}
+.cfg-link {
+  font-size: .85rem;
+  color: var(--color-fg-muted);
+  text-decoration: none;
+}
+.cfg-link:hover { color: var(--color-ok); }
 .chat-image { margin: .4rem 0; max-width: 100%; }
 .chat-image img {
   max-width: 100%;
@@ -1273,17 +1319,72 @@ function NavTabs() {
   });
 }
 
-function ThemeToggle() {
-  const [t, setT] = useState(() => localStorage.getItem("alice-theme") || "system");
-  function cycle() {
-    const next = t === "dark" ? "light" : t === "light" ? "system" : "dark";
-    if (next === "system") localStorage.removeItem("alice-theme");
-    else localStorage.setItem("alice-theme", next);
-    setT(next);
+// Apply persisted width preference once on load so the first paint is
+// already at the right max-width (no jank-switch after the hook mounts).
+function applyWidth() {
+  const w = localStorage.getItem("alice-width") || "narrow";
+  if (w === "wide") document.documentElement.setAttribute("data-width", "wide");
+  else document.documentElement.removeAttribute("data-width");
+}
+applyWidth();
+
+function ConfigGear({legacyHref}) {
+  const [open, setOpen] = useState(false);
+  const [theme, setTheme] = useState(() => localStorage.getItem("alice-theme") || "system");
+  const [width, setWidth] = useState(() => localStorage.getItem("alice-width") || "narrow");
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    function onDoc(e) {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+  function pickTheme(v) {
+    if (v === "system") localStorage.removeItem("alice-theme");
+    else localStorage.setItem("alice-theme", v);
+    setTheme(v);
     applyTheme();
   }
-  const label = t === "dark" ? "Theme: dark" : t === "light" ? "Theme: light" : "Theme: auto";
-  return h("button", {className: "hdr", onClick: cycle, title: "Toggle theme"}, label);
+  function pickWidth(v) {
+    localStorage.setItem("alice-width", v);
+    setWidth(v);
+    applyWidth();
+  }
+  return h("div", {className: "cfg-wrap", ref},
+    h("button", {
+      className: "hdr cfg-gear",
+      onClick: () => setOpen(x => !x),
+      title: "Settings",
+      "aria-expanded": open,
+    }, "⚙︎"),
+    open ? h("div", {className: "cfg-panel"},
+      h("div", {className: "cfg-section"},
+        h("div", {className: "cfg-label"}, "Theme"),
+        h("div", {className: "cfg-row"},
+          ["system", "light", "dark"].map(v => h("button", {
+            key: v,
+            className: "cfg-pill" + (theme === v ? " on" : ""),
+            onClick: () => pickTheme(v),
+          }, v === "system" ? "Auto" : v[0].toUpperCase() + v.slice(1))),
+        ),
+      ),
+      h("div", {className: "cfg-section"},
+        h("div", {className: "cfg-label"}, "Line length"),
+        h("div", {className: "cfg-row"},
+          ["narrow", "wide"].map(v => h("button", {
+            key: v,
+            className: "cfg-pill" + (width === v ? " on" : ""),
+            onClick: () => pickWidth(v),
+          }, v === "narrow" ? "Readable" : "Wide")),
+        ),
+      ),
+      h("div", {className: "cfg-section"},
+        h("a", {className: "cfg-link", href: legacyHref}, "Classic view (legacy)"),
+      ),
+    ) : null,
+  );
 }
 
 // ── 11. app ───────────────────────────────────────────────────────
@@ -1338,9 +1439,8 @@ function App() {
       h("a", {href: "#", title: "Overview"}, "Overview"),
       h(NavTabs),
       h("span", {className: "spacer"}),
-      h("a", {href: legacyHref, title: "Pre-#639 markdown shell"}, "Classic view"),
-      h(ThemeToggle),
       h("span", {className: statusClass}, statusLabel),
+      h(ConfigGear, {legacyHref}),
     ),
     h("main", null,
       !KEY && h("div", {className: "notice err"},
