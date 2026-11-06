@@ -63,6 +63,7 @@ from .pipeline.handlers import (
     TurnLifecycleHandler,
 )
 from .retrieval import CueContext, build_cue_context
+from status_site.chat_status import ChatStatusWriter
 from .transports import ChannelRef
 
 
@@ -171,6 +172,7 @@ class TurnRunner:
         skills_cwd: Optional[pathlib.Path] = None,
         mind_dir: Optional[pathlib.Path] = None,
         hooks: Optional[dict] = None,
+        chat_status_dir: Optional[pathlib.Path] = None,
     ) -> None:
         self._cfg = cfg
         self._events = events
@@ -219,6 +221,12 @@ class TurnRunner:
         # SDK's built-in sub-agent tool and detach work into asyncio
         # background tasks instead of blocking the parent turn.
         self._hooks = hooks
+        # Chat-tab working-status (#656). ``chat_status_dir`` is where
+        # ``.chat-status.jsonl`` lives; ``chat_status`` is set by
+        # :meth:`begin_chat_status` only for the duration of a
+        # chat-origin turn, so other turns never write status rows.
+        self._chat_status_dir = chat_status_dir
+        self.chat_status: Optional[ChatStatusWriter] = None
         self.session_id: Optional[str] = None
         self._pending_preamble: Optional[str] = None
         # Most recent cue-runner packet (verbatim text injected at the
@@ -248,6 +256,20 @@ class TurnRunner:
         # session-resume retry keep writing to the same list.
         self._tool_capture: list[dict] = []
         self.last_tool_calls: Optional[list[dict]] = None
+
+    # ------------------------------------------------------------------
+    # Chat-tab working-status (#656)
+
+    def begin_chat_status(self, turn_id: str) -> None:
+        if self._chat_status_dir is None:
+            return
+        self.chat_status = ChatStatusWriter(self._chat_status_dir, turn_id)
+        self.chat_status.turn_start()
+
+    def end_chat_status(self, error: Optional[str] = None) -> None:
+        if self.chat_status is not None:
+            self.chat_status.turn_end(error)
+            self.chat_status = None
 
     # ------------------------------------------------------------------
     # Bootstrap preamble (Layer 2)
@@ -427,6 +449,8 @@ class TurnRunner:
                     get_channel=self._current_reply_channel_getter,
                 )
             )
+        if self.chat_status is not None and not silent:
+            handlers.append(ChatStatusHandler(self.chat_status))
         if self._backend.harness == "pi-mono" and self._pi_send_message is not None:
             handlers.append(PiSendMessageHandler(self._pi_send_message, self._events))
         return handlers
@@ -580,6 +604,7 @@ class TurnRunner:
 __all__ = [
     "BUILTIN_TOOLS",
     "SUMMARY_TAIL_TURNS",
+    "ChatStatusHandler",
     "ToolCaptureHandler",
     "TurnRunner",
 ]
@@ -642,6 +667,27 @@ class ToolCaptureHandler(NullHandler):
         self._sink.append(
             {"name": name, "id": id, "input": _truncate_tool_input(input)}
         )
+
+
+class ChatStatusHandler(NullHandler):
+    """Mirror the kernel's tool-call stream into the Chat tab's status log.
+
+    Installed only for chat-origin turns (see
+    :meth:`TurnRunner.begin_chat_status`). Sits on the kernel handler
+    seam rather than a settings.json hook so it knows the turn and works
+    on every backend (anthropic SDK, pi, hermes).
+    """
+
+    def __init__(self, writer: ChatStatusWriter) -> None:
+        self._writer = writer
+
+    async def on_tool_use(self, name: str, input: Any, id: str) -> None:
+        self._writer.tool_start(name, input, id)
+
+    async def on_tool_result(
+        self, tool_use_id: str, content: Any, is_error: bool
+    ) -> None:
+        self._writer.tool_end(tool_use_id, is_error)
 
 
 class PiSendMessageHandler(NullHandler):

@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import logging
+import re
 import time
 import uuid
 from typing import TYPE_CHECKING, Optional
@@ -960,6 +961,19 @@ async def handle_a2a(ctx: DaemonContext, event: "A2AEvent") -> None:
 # Surface turn
 
 
+_CHAT_SURFACE_TYPE = re.compile(r"^type:\s*status-chat\s*$", re.M)
+
+
+def _is_chat_surface(body: str) -> bool:
+    """True for the ``type: status-chat`` surfaces the status site's
+    Chat tab drops (the only turns that get a working-status group)."""
+    if not body.startswith("---\n"):
+        return False
+    end = body.find("\n---", 4)
+    front = body[4:end] if end != -1 else ""
+    return _CHAT_SURFACE_TYPE.search(front) is not None
+
+
 async def handle_surface(ctx: DaemonContext, event: "SurfaceEvent") -> None:
     path = event.path
     if not path.is_file():
@@ -987,6 +1001,9 @@ async def handle_surface(ctx: DaemonContext, event: "SurfaceEvent") -> None:
     error: Optional[str] = None
     prev_kind = ctx._current_turn_kind
     ctx._current_turn_kind = "surface"
+    is_chat_turn = _is_chat_surface(body)
+    if is_chat_turn:
+        ctx.turn_runner.begin_chat_status(turn_id)
     try:
         # Surface turns don't have a single inbound recipient; the
         # ``outbound_recipient`` is informational only. Quiet hours
@@ -997,6 +1014,8 @@ async def handle_surface(ctx: DaemonContext, event: "SurfaceEvent") -> None:
         error = f"{type(exc).__name__}: {exc}"
     finally:
         ctx._current_turn_kind = prev_kind
+        if is_chat_turn:
+            ctx.turn_runner.end_chat_status(error)
         if path.is_file():
             try:
                 ctx._surface_watcher.archive_unresolved(path)
