@@ -64,6 +64,12 @@ from alice_forge.dispatcher.constants import (
     WORKER_REPO_PATH,
     _now_iso,
 )
+from alice_forge.dispatcher.effort import (
+    DEFAULT as DEFAULT_EFFORT,
+    Effort,
+    effort_rules_block,
+    read_effort,
+)
 from alice_forge.dispatcher.errors import GHCommandError
 from alice_forge.dispatcher.gh import gh_post_comment
 from alice_forge.dispatcher.trust import _author_login, _current_sm_label, _label_names
@@ -620,14 +626,22 @@ _DESIGN_FRAMING_PERSONAS: frozenset[str] = frozenset({"designer-cli"})
 def compose_spawn_prompt(
     issue: dict[str, Any],
     spawn_config: dict[str, str],
+    *,
+    effort: Effort = DEFAULT_EFFORT,
 ) -> str:
     """Render the full prompt text fed to the spawned ``claude`` agent.
 
     The prompt embeds the issue body verbatim, the artifact label, the
-    issue source (author identity), and the registered
+    issue source (author identity), the registered
     :class:`AgentSpec`'s assembled system prompt (the rendered
     ``## Constraint: <id>`` blocks from each
-    :attr:`AgentSpec.behavioral_constraints` rule).
+    :attr:`AgentSpec.behavioral_constraints` rule), and — new in
+    issue #642 — a per-task "Effort" rules block when ``effort`` is
+    anything other than :data:`DEFAULT_EFFORT` (``"medium"``). Medium
+    renders no extra block so the baseline prompt stays byte-identical
+    to pre-#642 (the golden fixtures under
+    ``tests/fixtures/spawn_prompts/`` keep matching without
+    regeneration).
 
     Phase 4 of #194 (#321): the inline ``system_prompt_role`` /
     ``instruction_trailer`` fields on the SPAWN_MAP row are gone —
@@ -638,6 +652,12 @@ def compose_spawn_prompt(
     framing branches on :attr:`AgentSpec.persona` (research-writer →
     "produce the research note" framing, everything else → "implement
     the change" framing).
+
+    ``effort`` — the per-task effort level resolved by
+    :func:`alice_forge.dispatcher.effort.read_effort`. Callers that
+    don't care about effort (test paths that render the baseline
+    prompt) may omit it; the live dispatcher path threads the value
+    through from :func:`spawn_agent`.
 
     Raises :class:`KeyError` when the row is missing a recognised
     ``agent_spec`` — :func:`_resolve_agent_spec` enforces the
@@ -718,6 +738,15 @@ def compose_spawn_prompt(
             "transition comment (for research work)."
         )
 
+    # Issue #642 — per-task effort rules. Medium is empty so the
+    # legacy prompt stays byte-identical; low/high/max append a
+    # single "## Effort: <level>" block after the behavioral
+    # trailer. The block sits BEFORE the final "Operate as a real
+    # engineer" paragraph so it reads as an added expectation layered
+    # on top of the standard framing, not as a replacement.
+    effort_block = effort_rules_block(effort)
+    effort_section = f"\n{effort_block}\n" if effort_block else ""
+
     # The agent name itself is intentionally left out of the literal
     # prompt — the SM task is repo-anchored, not persona-anchored, and
     # the runtime persona system owns identity rendering. The role
@@ -737,6 +766,7 @@ def compose_spawn_prompt(
         f"{task_framing}\n"
         f"\n"
         f"{trailer}\n"
+        f"{effort_section}"
         f"\n"
         f"{tail}\n"
     )
@@ -772,6 +802,7 @@ def spawn_agent(
     log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
     clock: Callable[[], float] = None,  # type: ignore[assignment]
     new_session_id: Callable[[], str] = lambda: str(uuid.uuid4()),
+    effort: Effort | None = None,
 ) -> str | None:
     """Spawn a detached ``claude`` agent for an SM issue.
 
@@ -820,11 +851,28 @@ def spawn_agent(
     if claude_bin is None:
         claude_bin = resolve_claude_bin()
 
+    # Issue #642 — resolve the effort level up front. ``effort=None``
+    # means "read from the issue" (verb → label → DEFAULT); callers
+    # that already know the level (status-site API wiring, tests) pass
+    # it explicitly and short-circuit the gh calls. Any failure in
+    # :func:`read_effort` degrades to :data:`DEFAULT_EFFORT` so a
+    # transient gh blip can't block the spawn — the spawn with a
+    # medium-effort prompt is still better than no spawn at all.
+    if effort is None:
+        try:
+            effort = read_effort(number, repo)
+        except Exception as exc:  # pragma: no cover - defensive
+            log(
+                f"[sm-dispatcher] read_effort(#{number}) failed: {exc} "
+                f"— falling back to {DEFAULT_EFFORT!r}"
+            )
+            effort = DEFAULT_EFFORT
+
     spawn_id = f"spawn-{number}-{int(clock())}"
     work_dir = spawn_dir / spawn_id
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    prompt_text = compose_spawn_prompt(issue, spawn_config)
+    prompt_text = compose_spawn_prompt(issue, spawn_config, effort=effort)
     prompt_path = work_dir / "prompt.txt"
     prompt_path.write_text(prompt_text)
 

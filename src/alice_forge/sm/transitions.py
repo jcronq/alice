@@ -67,6 +67,12 @@ class Verbs(enum.Enum):
     # Universal self-loop verb (replaces v1's nine per-state verbs)
     CONTINUE = "continue"
 
+    # Amendment verb (issue #642): tune the effort level for the
+    # next dispatcher spawn on this task. Not a state transition —
+    # intentionally absent from TRANSITIONS, handled out-of-band by
+    # :mod:`alice_forge.sm.handlers.effort`.
+    EFFORT = "effort"
+
 
 @dataclass(frozen=True)
 class TransitionTo:

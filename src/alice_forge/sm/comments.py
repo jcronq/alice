@@ -97,6 +97,14 @@ AUDIT_PREFIXES: tuple[str, ...] = (
     "[SM] build-complete",
     "[SM] build-failed",
     "[SM] build-blocked",
+    # Issue #642 — per-task effort dial amendment. Jason posts
+    # ``[SM] effort=<level>`` on a task to change the effort level
+    # for the next dispatcher spawn. The amendment is read directly
+    # by :func:`alice_forge.dispatcher.effort.read_effort` via regex
+    # scan, so the parser doesn't need to understand the grammar —
+    # it just needs to treat the comment as prose rather than emit
+    # ``unknown verb 'effort=...'`` parse-errors every poll cycle.
+    "[SM] effort=",
 )
 
 
