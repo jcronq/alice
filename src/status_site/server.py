@@ -149,6 +149,11 @@ MAX_TEXT = 8000
 MAX_ITEM = 500
 # How many chat messages /api/chat returns, newest-at-end.
 MAX_CHAT_HISTORY = 150
+# Paginated ``GET /api/chat?before=<at>&limit=<N>``: default / cap page size.
+CHAT_PAGE_DEFAULT = 50
+CHAT_PAGE_MAX = 200
+# Messages the SSE ``page:chat`` snapshot carries (the recent tail).
+CHAT_SNAPSHOT_LIMIT = 50
 # How many tail lines to splice into the Speaking surface for context.
 CHAT_SURFACE_TAIL = 5
 # Longest message ``at`` / ``reply_to`` accepted from a client.
@@ -330,8 +335,24 @@ def append_thread(cfg: Config, tid: str, message: dict) -> None:
         f.write(json.dumps(message) + "\n")
 
 
-def read_chat(cfg: Config, limit: int = MAX_CHAT_HISTORY) -> list[dict]:
+def _chat_ts(value: object) -> float | None:
+    try:
+        return datetime.fromisoformat(str(value)).timestamp()
+    except ValueError:
+        return None
+
+
+def read_chat(
+    cfg: Config, limit: int = MAX_CHAT_HISTORY, before: str | None = None
+) -> list[dict]:
     """General chat log (``.chat.jsonl``), newest-at-end, trimmed to ``limit``.
+
+    With ``before`` (an ISO ``at`` timestamp) only messages strictly
+    older than it are considered, so the result is the ``limit`` newest
+    messages preceding ``before`` — still chronological, ready to
+    prepend. An unparsable ``before`` yields ``[]`` (never the tail,
+    which the client already has); messages with an unparsable ``at``
+    are skipped in that mode.
 
     Rewrites each attachment's ``path`` into a ``url`` under
     ``/chat-upload/<date>/<filename>`` so the client can render images
@@ -347,6 +368,17 @@ def read_chat(cfg: Config, limit: int = MAX_CHAT_HISTORY) -> list[dict]:
             msgs.append(json.loads(line))
         except ValueError:
             pass
+    if before is not None:
+        cutoff = _chat_ts(before)
+        if cutoff is None:
+            return []
+        msgs = [
+            m
+            for m in msgs
+            if isinstance(m, dict)
+            and (ts := _chat_ts(m.get("at"))) is not None
+            and ts < cutoff
+        ]
     msgs = msgs[-limit:] if limit else msgs
     # Extract the <date>/<filename> suffix from each attachment's path
     # so the client can build /chat-upload/<date>/<filename>. The stored
@@ -2497,8 +2529,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/item-state":
             return self._json(200, read_item_state(self.cfg.status_dir), head=head)
         if path == "/api/chat":
+            q = parse_qs(urlsplit(self.path).query)
+            before = (q.get("before") or [None])[0]
+            if before is None:
+                return self._json(
+                    200, {"messages": read_chat(self.cfg)}, head=head
+                )
+            try:
+                limit = int((q.get("limit") or [CHAT_PAGE_DEFAULT])[0])
+            except ValueError:
+                limit = CHAT_PAGE_DEFAULT
+            if limit < 1:
+                limit = CHAT_PAGE_DEFAULT
+            limit = min(limit, CHAT_PAGE_MAX)
             return self._json(
-                200, {"messages": read_chat(self.cfg)}, head=head
+                200,
+                {"messages": read_chat(self.cfg, limit=limit, before=before)},
+                head=head,
             )
         if path.startswith("/chat-upload/"):
             q = parse_qs(urlsplit(self.path).query)
