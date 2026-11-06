@@ -160,6 +160,11 @@ h2.sec-heading {
   background: var(--color-bg);
 }
 .chat-file { margin: .2rem 0; color: var(--color-fg-muted); font-size: .9rem; }
+.msg-status { opacity: .75; font-variant-numeric: tabular-nums; }
+.msg-status-sending { animation: msgPulse 1.2s ease-in-out infinite; }
+.msg-status-sent { color: var(--color-fg-muted); }
+.msg-status-delivered { color: var(--color-ok); }
+@keyframes msgPulse { 0%,100% {opacity:.5} 50% {opacity:1} }
 .a2ui-attach {
   cursor: pointer; font-size: .85rem; color: var(--color-fg-muted);
   padding: .15rem .55rem; border: 1px solid var(--color-border-line);
@@ -803,7 +808,22 @@ function ChatThread({rows}) {
   const [pending, setPending] = useState(() => chatPendingStore.pending);
   useEffect(() => chatPendingStore.subscribe(setPending), []);
   useEffect(() => { chatPendingStore.reconcile(rows); }, [rows]);
-  const merged = pending.length ? [...rows, ...pending] : rows;
+  // Hide server rows that have a matching pending bubble so the user
+  // never sees the two-bubble flash during the SSE tick window.
+  const serverRows = pending.length
+    ? rows.filter(r => !serverRowMatchesPending(r, pending))
+    : rows;
+  // Sort the merged list by at timestamp so messages stay in send
+  // order even if the optimistic pending row raced ahead of a server
+  // row that came back sooner. working-group rows carry their own
+  // ``at`` so they slot in between the trigger and Alice's reply.
+  const merged = [...serverRows, ...pending].sort((a, b) => {
+    const ax = a.at || "";
+    const bx = b.at || "";
+    if (ax < bx) return -1;
+    if (ax > bx) return 1;
+    return 0;
+  });
   const last = merged.length ? merged[merged.length - 1] : null;
   useEffect(() => {
     const el = ref.current;
@@ -845,9 +865,18 @@ function renderChatMessages(rows) {
     const atts = (m.attachments && m.attachments.length)
       ? m.attachments
       : (m.files || []).map(n => ({name: n}));
+    // Per-bubble status indicator for Jason's optimistic messages.
+    // sending — in-flight, muted dot pulse; sent — single check;
+    // delivered — single check in accent color. Server rows (from
+    // historical reload) have no status and get no indicator.
+    let statusIcon = null;
+    if (m.from === "jason" && m.status) {
+      const icons = {sending: "◌ sending", sent: "✓ sent", delivered: "✓ delivered"};
+      statusIcon = h("span", {className: "msg-status msg-status-" + m.status}, icons[m.status] || m.status);
+    }
     return h("div", {
-      key: (m.at || "") + "-" + i,
-      className: "msg " + (m.from === "jason" ? "jason" : "alice"),
+      key: (m._client_id || m.at || "") + "-" + i,
+      className: "msg " + (m.from === "jason" ? "jason" : "alice") + (m.status ? " status-" + m.status : ""),
     },
       m.text || "",
       ...atts.map((a, j) => {
@@ -862,7 +891,10 @@ function renderChatMessages(rows) {
         return h("div", {key: "f-" + j, className: "chat-file"}, "📎 " + name);
       }),
       h("small", null,
-        (m.from === "jason" ? "You" : "Alice") + " · " + (m.at || "")),
+        (m.from === "jason" ? "You" : "Alice") + " · " + (m.at || ""),
+        statusIcon ? " · " : null,
+        statusIcon,
+      ),
     );
   });
 }
@@ -929,18 +961,51 @@ async function addA2uiFiles(id, files, local, setLocal) {
 // messages below the server rows; a dedupe filter drops any pending
 // whose (text, files) matches a server row from Jason in the recent
 // tail, so the local echo quietly vanishes when the server catches up.
+// Single-message optimistic flow (fix for Jason 2026-11-06 11:52 EST):
+// the sent message is always the pending bubble — never a separate
+// server echo. Status transitions in place: "sending" immediately on
+// click, "sent" when POST returns, "delivered" when the SSE snapshot
+// confirms the server stored it. Server-side rows that match a
+// pending row (by text + file count) are hidden from render so there
+// is never a two-bubble flash during the SSE-tick window.
 const chatPendingStore = {
   pending: [],
   listeners: new Set(),
-  add(msg) { this.pending = [...this.pending, msg]; this._emit(); },
+  add(msg) {
+    this.pending = [...this.pending, msg];
+    this._emit();
+    return msg;
+  },
+  setStatus(client_id, status) {
+    this.pending = this.pending.map(p =>
+      p._client_id === client_id ? {...p, status} : p);
+    this._emit();
+  },
   reconcile(serverRows) {
-    const tail = serverRows.slice(-10).filter(r => r.from === "jason");
-    const stillPending = this.pending.filter(p => !tail.some(r =>
-      (r.text || "") === (p.text || "") &&
-      ((r.files && r.files.length) || 0) === ((p.files && p.files.length) || 0)
-    ));
-    if (stillPending.length !== this.pending.length) {
-      this.pending = stillPending;
+    // When the server echoes a pending message, upgrade its status to
+    // "delivered" and inherit the server's at / attachment URLs so
+    // inline images render. The server row itself is hidden by
+    // serverRowMatchesPending in the merge below.
+    let changed = false;
+    const tail = serverRows.slice(-20).filter(r => r.from === "jason");
+    const next = this.pending.map(p => {
+      if (p.status === "delivered") return p;
+      const match = tail.find(r =>
+        (r.text || "") === (p.text || "") &&
+        ((r.files && r.files.length) || 0) === ((p.files && p.files.length) || 0),
+      );
+      if (!match) return p;
+      changed = true;
+      return {
+        ...p,
+        status: "delivered",
+        at: match.at || p.at,
+        attachments: match.attachments || p.attachments,
+        files: match.files || p.files,
+      };
+    });
+    if (changed) {
+      this.pending = next;
       this._emit();
     }
   },
@@ -951,6 +1016,18 @@ const chatPendingStore = {
     return () => this.listeners.delete(fn);
   },
 };
+
+// A server row is a duplicate of one of our pending rows when they
+// share from=jason, text, and file count. Hiding the server row keeps
+// the pending bubble as the single rendered message with its own
+// status transitions.
+function serverRowMatchesPending(row, pending) {
+  if (row.from !== "jason") return false;
+  return pending.some(p =>
+    (row.text || "") === (p.text || "") &&
+    ((row.files && row.files.length) || 0) === ((p.files && p.files.length) || 0),
+  );
+}
 
 async function runA2uiAction(id, props, surface, local, setLocal) {
   const action = props.action || "";
@@ -969,26 +1046,36 @@ async function runA2uiAction(id, props, surface, local, setLocal) {
   setLocal(s => ({
     ...s,
     pending: {...s.pending, [id]: true},
-    statuses: {...s.statuses, [id]: "Sending…"},
+    statuses: {...s.statuses, [id]: ""},
   }));
   // Capture the composer state before awaiting the POST so the
-  // optimistic echo uses the text/files the user actually sent.
+  // optimistic bubble uses the text/files the user actually sent.
   const sentText = text;
   const sentFiles = files.map(f => ({name: f.name, type: f.type}));
+  // Pre-flight pending row: appears instantly as "sending".
+  let clientId = null;
+  if (action === "chat.send") {
+    clientId = "pending-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+    chatPendingStore.add({
+      _client_id: clientId,
+      from: "jason",
+      at: new Date().toISOString().replace("Z", "-0000"),
+      text: sentText,
+      files: sentFiles.map(f => f.name),
+      attachments: sentFiles.map(f => ({name: f.name, type: f.type})),
+      status: "sending",
+      _optimistic: true,
+    });
+  }
   const res = await dispatchA2uiAction(action, {
     text,
     files,
     slug: surface.data && surface.data.slug,
   });
-  if (res.ok && action === "chat.send") {
-    chatPendingStore.add({
-      from: "jason",
-      at: new Date().toISOString().replace("Z", "-0000"),
-      text: sentText,
-      files: sentFiles.map(f => f.name),
-      attachments: sentFiles.map(f => ({name: f.name})),
-      _optimistic: true,
-    });
+  if (clientId) {
+    if (res.ok) chatPendingStore.setStatus(clientId, "sent");
+    // On POST failure the pending row stays at "sending"; it'll
+    // disappear when the composer re-sends or the user reloads.
   }
   setLocal(s => {
     const next = {
