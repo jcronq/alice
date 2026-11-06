@@ -55,7 +55,9 @@ At the end of each tick the ``<!-- bug-review -->`` block under
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as _dt
+import io
 import json
 import pathlib
 import re
@@ -72,6 +74,10 @@ from alice_pricing import (
     read_worker_tokens,
 )
 from alice_pricing.rates import is_free
+
+from status_site import cli as _status_cli
+from status_site.history import title_slug as _site_title_slug
+from status_site.server import _bug_title_from_heading
 
 from . import frontmatter as _fm
 
@@ -342,6 +348,37 @@ def _journal(journal_path: pathlib.Path, line: str) -> None:
         pass
 
 
+def _status_reply_default(slug: str, msg: str) -> None:
+    """Append ``msg`` to the status-site thread ``slug`` (what ``status-reply`` does)."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        _status_cli.main([slug, msg])
+
+
+def _site_title(
+    report_id: int, fields: Mapping[str, str], bug_path: pathlib.Path
+) -> str:
+    """Title the status site renders for this bug: frontmatter, else ``# `` heading."""
+    title = (fields.get("title") or "").strip()
+    if title:
+        return title
+    return _bug_title_from_heading(_body_from(bug_path), report_id)
+
+
+def _post_transition(
+    report_id: int,
+    title: str,
+    msg: str,
+    *,
+    post_reply: Callable[[str, str], None] | None = None,
+) -> None:
+    """Post one line to the bug's status-site thread. Best-effort — never raises."""
+    slug = _site_title_slug(f"bug-{report_id} — {title}")
+    try:
+        (post_reply or _status_reply_default)(slug, msg)
+    except Exception:  # noqa: BLE001 — a thread post must never abort a transition
+        pass
+
+
 def _scan_bugs(status_dir: pathlib.Path) -> list[tuple[int, pathlib.Path, dict[str, str]]]:
     """Return ``[(report_id, path, frontmatter_dict), ...]`` sorted by id ascending."""
     out: list[tuple[int, pathlib.Path, dict[str, str]]] = []
@@ -432,6 +469,7 @@ def _dispatch_worker(
     log: Callable[[str], None],
     now_iso: Callable[[], str] = _now_utc_iso,
     spawn: Callable[[int, pathlib.Path, str], int | None] | None = None,
+    post_reply: Callable[[str, str], None] | None = None,
 ) -> tuple[bool, dict]:
     """Spawn a worker for an ``open`` bug and flip the frontmatter.
 
@@ -496,6 +534,12 @@ def _dispatch_worker(
     pid = spawner(report_id, scratch_dir, prompt)
     if pid is None:
         log(f"[bug-fix-dispatcher] bug-{report_id}: worker spawn failed")
+        _post_transition(
+            report_id,
+            _site_title(report_id, fields, bug_path),
+            "worker crash: spawn failed",
+            post_reply=post_reply,
+        )
         return False, {}
 
     patch: dict[str, object | None] = {
@@ -525,6 +569,12 @@ def _dispatch_worker(
         f"[bug-fix-dispatcher] bug-{report_id}: dispatched worker pid={pid} "
         f"scratch={scratch_dir} model={worker_model} "
         f"estimate_usd={estimate_label}"
+    )
+    _post_transition(
+        report_id,
+        _site_title(report_id, fields, bug_path),
+        f"worker-spawned pid:{pid}",
+        post_reply=post_reply,
     )
     return True, patch
 
@@ -680,6 +730,7 @@ def _adopt_worker_result(
     cfg: DispatcherConfig,
     log: Callable[[str], None],
     now_iso: Callable[[], str] = _now_utc_iso,
+    post_reply: Callable[[str, str], None] | None = None,
 ) -> tuple[bool, bool]:
     """If a worker produced a result.json, adopt its ``pr_url`` into the frontmatter.
 
@@ -723,6 +774,12 @@ def _adopt_worker_result(
             )
             return False, False
         log(f"[bug-fix-dispatcher] bug-{report_id}: adopted pr_url={pr_url}")
+        _post_transition(
+            report_id,
+            _site_title(report_id, fields, bug_path),
+            f"PR {pr_url} opened, CI pending",
+            post_reply=post_reply,
+        )
         return True, False
 
     # No pr_url yet — decide whether the worker has settled. If the
@@ -732,6 +789,9 @@ def _adopt_worker_result(
     # the actuals anyway so the bug line gets a real dollar figure.
     settled = _scratch_dir_settled(scratch_dir, ACTUALS_SETTLE_SECONDS)
     actuals_already_recorded = "actual_usd" in fields
+    # An unpriceable run writes ``cost_attribution_note`` instead of
+    # ``actual_usd``; either field means this crash was already handled.
+    first_settle = not actuals_already_recorded and "cost_attribution_note" not in fields
     if settled and not actuals_already_recorded:
         actuals_patch = _compute_actuals_patch(
             report_id=report_id,
@@ -744,6 +804,14 @@ def _adopt_worker_result(
             _fm.update(bug_path, actuals_patch)
         except OSError:
             pass  # best-effort; stall sweep still fires below
+        else:
+            if first_settle:
+                _post_transition(
+                    report_id,
+                    _site_title(report_id, fields, bug_path),
+                    "worker crash: exited without a PR",
+                    post_reply=post_reply,
+                )
 
     dispatched = _parse_iso(fields.get("dispatched_at", ""))
     if dispatched is None:
@@ -887,6 +955,7 @@ def _check_pr_state(
     gh_pr_view: Callable[[str], dict] | None = None,
     gh_pr_ready: Callable[[str], None] | None = None,
     body: str = "",
+    post_reply: Callable[[str, str], None] | None = None,
 ) -> str:
     """Poll the PR and apply any resulting transition.
 
@@ -913,6 +982,12 @@ def _check_pr_state(
         log(
             f"[bug-fix-dispatcher] bug-{report_id}: PR merged ({pr_url}) → "
             f"status=fixed fix_commit={fix_commit}"
+        )
+        _post_transition(
+            report_id,
+            _site_title(report_id, fields, bug_path),
+            f"merged {fix_commit}, bug flipped to fixed",
+            post_reply=post_reply,
         )
         return "fixed"
     if state == "CLOSED":
@@ -971,6 +1046,7 @@ def tick(
     spawn: Callable[[int, pathlib.Path, str], int | None] | None = None,
     gh_pr_view: Callable[[str], dict] | None = None,
     gh_pr_ready: Callable[[str], None] | None = None,
+    post_reply: Callable[[str, str], None] | None = None,
 ) -> TickReport:
     """Run one scan + act pass.
 
@@ -1019,6 +1095,7 @@ def tick(
                     log=_log,
                     now_iso=now_iso,
                     spawn=spawn,
+                    post_reply=post_reply,
                 )
                 if ok:
                     report.dispatched.append(report_id)
@@ -1051,6 +1128,7 @@ def tick(
                         gh_pr_view=gh_pr_view,
                         gh_pr_ready=gh_pr_ready,
                         body=_body_from(bug_path),
+                        post_reply=post_reply,
                     )
                     if outcome == "fixed":
                         report.fixed.append(report_id)
@@ -1066,6 +1144,7 @@ def tick(
                         cfg=cfg,
                         log=_log,
                         now_iso=now_iso,
+                        post_reply=post_reply,
                     )
                     if adopted:
                         report.adopted_pr_url.append(report_id)
@@ -1078,6 +1157,12 @@ def tick(
                         _log(
                             f"[bug-fix-dispatcher] bug-{report_id}: no PR within "
                             f"{cfg.stall_hours}h → status=dispatch-failed"
+                        )
+                        _post_transition(
+                            report_id,
+                            _site_title(report_id, fields, bug_path),
+                            f"worker no PR after {cfg.stall_hours}h, flagging",
+                            post_reply=post_reply,
                         )
                         report.stalled.append(report_id)
             else:
