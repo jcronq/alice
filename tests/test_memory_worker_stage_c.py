@@ -432,24 +432,24 @@ def test_atomize_sibling_children_share_collision_set(mind: pathlib.Path):
     in-flight collision (slug_index is mutated as children are
     written).
 
-    Phase 2 update: ``created`` set to today so the continuous decay
-    formula registers these (fresh, zero-access research) notes as
-    decay candidates → relaxed atomize threshold (0.8 × bloated_lines)
-    activates. The legacy ``created=2026-05-01`` would age-discount
-    the decay boost and require the full bloated threshold, which the
-    contrived 205-line bodies don't reach."""
+    ``created`` is 60 days ago so the continuous decay formula
+    (age_factor grows with age) registers these zero-access research
+    notes as decay candidates → relaxed atomize threshold
+    (0.8 × bloated_lines) activates. A just-created note scores 0 and
+    would need the full bloated threshold, which the contrived 205-line
+    bodies don't reach."""
     body_a = (
         "intro\n\n## Beta\n" + ("body\n" * 100) + "\n## Done\n" + ("body\n" * 100)
     )
     body_b = (
         "intro\n\n## Beta\n" + ("body\n" * 100) + "\n## Done\n" + ("body\n" * 100)
     )
-    today_iso = datetime.date.today().isoformat()
+    stale_iso = (datetime.date.today() - datetime.timedelta(days=60)).isoformat()
     _write_note(
-        mind, "research/parent-a.md", title="A", body=body_a, created=today_iso
+        mind, "research/parent-a.md", title="A", body=body_a, created=stale_iso
     )
     _write_note(
-        mind, "research/parent-b.md", title="B", body=body_b, created=today_iso
+        mind, "research/parent-b.md", title="B", body=body_b, created=stale_iso
     )
 
     n = stage_c.atomize(mind, max_items=10, journal_path=None)

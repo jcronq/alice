@@ -249,13 +249,15 @@ def test_register_builtins_is_idempotent_on_default_registry():
 def test_register_builtins_populates_a_fresh_registry():
     fresh = Registry()
     builtin_agents.register_builtins(fresh)
-    # Phase 1 + Phase 2 + cozylobe (issue #344) — nine built-in flavors.
+    # Phase 1 + Phase 2 + cozylobe (issue #344) + designer-cli (issue
+    # #620) — ten built-in flavors.
     # Sorted by Registry.names().
     assert fresh.names() == [
         "code-worker",
         "config-worker",
         "cozylobe",
         "designer",
+        "designer-cli",
         "research-writer",
         "reviewer",
         "speaking",
