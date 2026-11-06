@@ -608,6 +608,15 @@ def _resolve_agent_spec(spawn_config: dict[str, str]) -> Any:
 _RESEARCH_FRAMING_PERSONAS: frozenset[str] = frozenset({"research-writer"})
 
 
+# Issue #620 — persona-axis values whose v1 worker prompt frames the
+# task as "produce a design doc, no PR." Mirrors
+# :data:`_RESEARCH_FRAMING_PERSONAS`: a future variant (e.g. an
+# ``art:infra`` design flavor) can opt into the design framing by
+# declaring the persona on its :class:`AgentSpec` without touching
+# :func:`compose_spawn_prompt`.
+_DESIGN_FRAMING_PERSONAS: frozenset[str] = frozenset({"designer-cli"})
+
+
 def compose_spawn_prompt(
     issue: dict[str, Any],
     spawn_config: dict[str, str],
@@ -665,11 +674,48 @@ def compose_spawn_prompt(
             "frontmatter and wikilinks, then post the SM transition "
             "comment when finished."
         )
+    elif spec.persona in _DESIGN_FRAMING_PERSONAS:
+        # Issue #620 — design-only framing. The subagent reads +
+        # inspects + drafts a design note but does NOT open a PR or
+        # create a branch; the build phase is a separate worker that
+        # picks up the design note later. The exit contract is the
+        # ``[SM] design-ready note=[[<slug>]]`` comment, posted via
+        # ``gh issue comment``.
+        task_framing = (
+            "Your task: produce a concise design doc for the issue "
+            "above. Read the referenced code with Read / Grep / Glob, "
+            "write the design note to "
+            "``~/alice-mind/cortex-memory/designs/<date>-issue<N>-"
+            "<slug>.md`` with YAML frontmatter, and post exactly one "
+            "audit comment on the issue: "
+            "``[SM] design-ready note=[[<slug>]]``. Do NOT open a PR, "
+            "do NOT create a branch, do NOT edit source files. The "
+            "build phase is a separate worker that reads your design "
+            "note."
+        )
     else:
         task_framing = (
             "Your task: implement the change described above. Read the "
             "relevant code first, write a focused diff, run tests, and "
             "open a PR."
+        )
+
+    # Tail line varies by persona: design agents must NOT write code
+    # or open PRs, so the "self-merge when CI is green" nudge would be
+    # actively wrong for them.
+    if spec.persona in _DESIGN_FRAMING_PERSONAS:
+        tail = (
+            "Operate as a real engineer would: read the relevant code "
+            "first before drafting the design, cite prior art, and "
+            "exit after posting the [SM] design-ready audit comment. "
+            "Do not touch source files."
+        )
+    else:
+        tail = (
+            "Operate as a real engineer would: read the relevant code "
+            "first, test before merging, do not bypass CI hooks. "
+            "Self-merge when CI is green (for code work) or post the "
+            "transition comment (for research work)."
         )
 
     # The agent name itself is intentionally left out of the literal
@@ -692,10 +738,7 @@ def compose_spawn_prompt(
         f"\n"
         f"{trailer}\n"
         f"\n"
-        f"Operate as a real engineer would: read the relevant code "
-        f"first, test before merging, do not bypass CI hooks. "
-        f"Self-merge when CI is green (for code work) or post the "
-        f"transition comment (for research work).\n"
+        f"{tail}\n"
     )
 
 
@@ -826,9 +869,18 @@ def spawn_agent(
     stdin_fh = open(prompt_path, "rb")
     stdout_fh = open(stdout_path, "wb")
     stderr_fh = open(stderr_path, "wb")
+    # Issue #620 — optional ``--model`` override from the SPAWN_MAP row
+    # lets the designer-cli lane pin its one-shot subagent to Sonnet
+    # (``claude-sonnet-5``) while the rest of the v1 worker pool runs
+    # on the account default. Non-empty strings only — missing / empty
+    # falls through to the account default.
+    model_override = spawn_config.get("model")
+    argv = [claude_bin, "--print", "--session-id", session_id]
+    if isinstance(model_override, str) and model_override.strip():
+        argv.extend(["--model", model_override.strip()])
     try:
         proc = popen(
-            [claude_bin, "--print", "--session-id", session_id],
+            argv,
             stdin=stdin_fh,
             stdout=stdout_fh,
             stderr=stderr_fh,
@@ -848,6 +900,7 @@ def spawn_agent(
     log(
         f"[sm-dispatcher] spawned {spawn_id} (pid={pid}) on #{number} "
         f"art={art_label} session_id={session_id}"
+        + (f" model={model_override}" if model_override else "")
     )
     return spawn_id
 

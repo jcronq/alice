@@ -56,7 +56,10 @@ def test_spawn_map_rows_reference_registered_agent_spec() -> None:
 @pytest.mark.parametrize(
     "row_key,expected_name",
     [
-        (("sm:selected", "art:code"), "designer"),
+        # Issue #620 — (sm:selected, art:code) moved from the thinking
+        # SDK lane (persona=thinking, agent_spec=designer) to the v1
+        # worker pool (persona=worker, agent_spec=designer-cli).
+        (("sm:selected", "art:code"), "designer-cli"),
         (("sm:selected", "art:config_change"), "config-worker"),
         (("sm:selected", "art:research_note"), "research-writer"),
         (("sm:selected", "art:experiment"), "research-writer"),
