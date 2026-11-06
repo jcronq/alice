@@ -67,6 +67,39 @@ globalThis.FileReader = class {
   readAsDataURL(f) { this.result = "data:image/png;base64,UE5H"; setTimeout(() => this.onload(), 0); }
 };
 out.b64 = await ux.readAsBase64({});
+
+// rowMatchesPending (issue #713): ID match wins even when text differs;
+// falls back to text + file-count when either side lacks the ID; guards
+// on from === "jason"; empty pending list → false.
+out.pendIdWins = ux.rowMatchesPending(
+  {from: "jason", client_message_id: "x", text: "hello  world"},
+  [{_client_id: "x", text: "hello world"}],
+);
+out.pendIdMismatch = ux.rowMatchesPending(
+  {from: "jason", client_message_id: "x", text: "same"},
+  [{_client_id: "y", text: "same"}],
+);
+out.pendTextFallbackRowOnly = ux.rowMatchesPending(
+  {from: "jason", text: "hi", files: ["a"]},
+  [{_client_id: "p1", text: "hi", files: ["a"]}],
+);
+out.pendTextFallbackPendOnly = ux.rowMatchesPending(
+  {from: "jason", client_message_id: "x", text: "hi", files: ["a"]},
+  [{text: "hi", files: ["a"]}],
+);
+out.pendTextFallbackFileCountDiffers = ux.rowMatchesPending(
+  {from: "jason", text: "hi", files: ["a", "b"]},
+  [{_client_id: "p1", text: "hi", files: ["a"]}],
+);
+out.pendNotJason = ux.rowMatchesPending(
+  {from: "alice", client_message_id: "x", text: "hi"},
+  [{_client_id: "x", text: "hi"}],
+);
+out.pendEmpty = ux.rowMatchesPending(
+  {from: "jason", client_message_id: "x", text: "hi"},
+  [],
+);
+
 console.log(JSON.stringify(out));
 """
 
@@ -131,6 +164,29 @@ def test_load_older_helpers(result):
     assert result["rowKeyGroup"] == "wg:T"
     assert result["earliest"] == "2026-11-06T01:00:00+00:00"
     assert result["earliestNone"] is None
+
+
+def test_row_matches_pending_prefers_client_message_id(result):
+    # Round-tripped id wins even when the server reshaped text.
+    assert result["pendIdWins"] is True
+    # Non-matching ids reject even with same text.
+    assert result["pendIdMismatch"] is False
+
+
+def test_row_matches_pending_falls_back_to_text_and_file_count(result):
+    # Server row has no id → match on text + file count.
+    assert result["pendTextFallbackRowOnly"] is True
+    # Pending row has no id → still match on text + file count.
+    assert result["pendTextFallbackPendOnly"] is True
+    # Text matches but file count differs → no match.
+    assert result["pendTextFallbackFileCountDiffers"] is False
+
+
+def test_row_matches_pending_guards_author_and_empty(result):
+    # Only jason rows can match a pending bubble.
+    assert result["pendNotJason"] is False
+    # Empty pending list is never a match.
+    assert result["pendEmpty"] is False
 
 
 def test_chat_thread_wires_infinite_scroll():

@@ -166,6 +166,11 @@ CHAT_SNAPSHOT_LIMIT = 50
 CHAT_SURFACE_TAIL = 5
 # Longest message ``at`` / ``reply_to`` accepted from a client.
 MAX_MSG_AT = 64
+# Longest ``client_message_id`` accepted from a client (issue #713).
+# Round-tripped POST → persisted record → SSE echo so the UI can dedup
+# the optimistic bubble against the server echo by ID equality instead
+# of fragile text+file-count comparison.
+MAX_CLIENT_MSG_ID = 128
 
 SPEAKING_FOOTER = (
     "For Speaking: this came from Jason via the status site ({url}, key-authenticated). "
@@ -568,6 +573,9 @@ def handle_chat(cfg: Config, d: dict) -> dict:
         reply_to = d.get("reply_to")
         if isinstance(reply_to, str) and reply_to.strip():
             record["reply_to"] = reply_to.strip()[:MAX_MSG_AT]
+        client_message_id = d.get("client_message_id")
+        if isinstance(client_message_id, str) and client_message_id.strip():
+            record["client_message_id"] = client_message_id.strip()[:MAX_CLIENT_MSG_ID]
         append_chat(cfg, record)
 
         doc = render_chat_surface(

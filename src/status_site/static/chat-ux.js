@@ -152,6 +152,23 @@ export function summarizeReactions(reactions, me = "jason") {
   return out;
 }
 
+// True when ``row`` (a server chat row) is a duplicate echo of one of
+// our optimistic ``pending`` entries (issue #713). Prefers round-tripped
+// ``client_message_id`` / ``_client_id`` equality; falls back to
+// text + file-count match for rows persisted before the ID was wired
+// up. Only jason-authored rows are candidates — alice replies never
+// match a pending bubble.
+export function rowMatchesPending(row, pending) {
+  if (row.from !== "jason") return false;
+  return pending.some(p => {
+    if (row.client_message_id && p._client_id) {
+      return row.client_message_id === p._client_id;
+    }
+    return (row.text || "") === (p.text || "") &&
+      ((row.files && row.files.length) || 0) === ((p.files && p.files.length) || 0);
+  });
+}
+
 // Stable signature of a reactions map, for comparing local vs server state.
 export function reactionsSignature(reactions) {
   return JSON.stringify(
