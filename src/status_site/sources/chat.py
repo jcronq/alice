@@ -70,6 +70,11 @@ def build_envelopes(messages: list[dict]) -> list[dict]:
                         # fail test_no_hardcoded_personae_literals.
                         "placeholder": "Type a message…",
                         "name": "text",
+                        # Client wires Enter-to-send, paste-image and the
+                        # file picker for this textarea; ``submitId`` is
+                        # the button whose action Enter triggers.
+                        "attachments": True,
+                        "submitId": "send",
                     },
                 ),
                 component(

@@ -240,3 +240,62 @@ def test_chat_a2ui_empty_log_yields_empty_messages(site):
     cfg, _ = site
     payload = chat_page.render(cfg)
     assert payload["a2ui"][-1]["value"] == []
+
+
+def test_chat_post_with_image_then_get_returns_attachment(site):
+    """Integration (#655): POST an image, file lands under chat/<date>/, GET shows it."""
+    import base64
+    import time
+
+    cfg, port = site
+    status, j = post(
+        port,
+        {
+            "key": KEY,
+            "text": "",
+            "files": [
+                {"name": "pasted-20260101T000000.png", "data": base64.b64encode(b"PNG").decode()}
+            ],
+        },
+    )
+    assert status == 200 and j == {"ok": True}
+    stored = list((cfg.upload_dir / "chat" / time.strftime("%Y-%m-%d")).glob("*pasted-*.png"))
+    assert len(stored) == 1 and stored[0].read_bytes() == b"PNG"
+
+    status, body, _ = req(port, "GET", "/api/chat")
+    assert status == 200
+    (msg,) = json.loads(body)["messages"]
+    assert msg["files"] == ["pasted-20260101T000000.png"]
+    assert msg["attachments"][0]["path"].endswith(stored[0].name)
+
+
+def test_chat_post_rejects_disallowed_attachment_type(site):
+    import base64
+
+    _, port = site
+    status, _ = post(
+        port,
+        {"key": KEY, "text": "x", "files": [{"name": "a.exe", "data": base64.b64encode(b"x").decode()}]},
+    )
+    assert status == 415
+
+
+def test_chat_composer_declares_attachments_and_submit(site):
+    from status_site.sources import chat as chat_page
+
+    cfg, _ = site
+    comps = {c["id"]: c for c in chat_page.render(cfg)["a2ui"][1]["components"]}
+    assert comps["composer"]["props"]["attachments"] is True
+    assert comps["composer"]["props"]["submitId"] == "send"
+    assert comps[comps["composer"]["props"]["submitId"]]["props"]["action"] == "chat.send"
+
+
+def test_chat_ux_js_is_served_and_wired(site):
+    status, body, headers = req(site[1], "GET", "/chat-ux.js")
+    assert status == 200 and b"shouldSubmitOnKey" in body
+    assert "javascript" in headers.get("Content-Type", "")
+    status, html, _ = req(site[1], "GET", "/index.html")
+    html = html.decode()
+    assert 'from "./chat-ux.js"' in html
+    for needle in ("onKeyDown", "onPaste", "ChatThread", "chat-file-input"):
+        assert needle in html

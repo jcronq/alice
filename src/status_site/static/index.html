@@ -91,6 +91,27 @@ h2.sec-heading {
   font-variant-numeric: tabular-nums;
 }
 .fx-big .of { color: var(--color-fg-muted); font-size: var(--dash-font-size-caption); }
+.a2ui-chat-thread { max-height: 60vh; overflow-y: auto; }
+.a2ui-composer { display: flex; flex-direction: column; gap: .4rem; }
+.a2ui-composer.dragging { outline: 2px dashed var(--color-ok); outline-offset: 2px; }
+.a2ui-composer-bar { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; }
+.a2ui-attach {
+  cursor: pointer; font-size: .85rem; color: var(--color-fg-muted);
+  padding: .15rem .55rem; border: 1px solid var(--color-border-line);
+  border-radius: 999px;
+}
+.a2ui-attach:hover { color: var(--color-ok); border-color: var(--color-ok); }
+.a2ui-attach input { display: none; }
+.a2ui-attachment {
+  display: inline-flex; align-items: center; gap: .3rem; font-size: .8rem;
+  padding: .1rem .4rem; border: 1px solid var(--color-border-line);
+  border-radius: 6px; background: var(--color-panel);
+}
+.a2ui-attachment img { height: 28px; width: 28px; object-fit: cover; border-radius: 3px; }
+.a2ui-attachment button {
+  background: transparent; border: 0; cursor: pointer; color: var(--color-fg-muted);
+}
+.a2ui-attach-err { color: var(--color-bad); font-size: .8rem; }
 </style>
 </head><body>
 <div id="root">Loading Alice…</div>
@@ -106,6 +127,10 @@ h2.sec-heading {
 <script type="module">
 import React, {useEffect, useReducer, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
+import {
+  ACCEPT, attachmentName, imageFilesFromClipboard, isNearBottom,
+  readAsBase64, shouldSubmitOnKey, validateAttachment,
+} from "./chat-ux.js";
 const h = React.createElement;
 
 // ── 0. key + legacy redirect ──────────────────────────────────────
@@ -516,13 +541,16 @@ function applyDataModel(data, pointer, value) {
 // the switch maps each to the existing POST endpoint + payload shape
 // so ``handle_chat`` / ``handle_review_action`` on the server stay
 // untouched — A2UI only describes the UI around them.
-async function dispatchA2uiAction(kind, {text, slug}) {
+async function dispatchA2uiAction(kind, {text, slug, files}) {
   if (!KEY) return {ok: false, error: "no key"};
   if (kind === "chat.send") {
     const r = await fetch("/api/chat", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({key: KEY, text}),
+      body: JSON.stringify({
+        key: KEY, text,
+        files: (files || []).map(f => ({name: f.name, data: f.data})),
+      }),
     });
     const j = await r.json().catch(() => ({}));
     return {ok: r.ok, status: r.status, error: j.error};
@@ -581,8 +609,11 @@ function renderA2uiComponent(id, surface, local, setLocal) {
     }
     case "textarea": {
       const current = local.textareas[id] ?? "";
-      return h("textarea", {
-        key: id,
+      const submitBtn = props.submitId ? surface.components.get(props.submitId) : null;
+      const withFiles = !!props.attachments;
+      const pending = (local.attachments && local.attachments[id]) || [];
+      const attachErr = (local.attachErr && local.attachErr[id]) || "";
+      const ta = h("textarea", {
         className: "a2ui-textarea",
         placeholder: props.placeholder || "",
         value: current,
@@ -590,7 +621,61 @@ function renderA2uiComponent(id, surface, local, setLocal) {
           ...s,
           textareas: {...s.textareas, [id]: e.target.value},
         })),
+        onKeyDown: submitBtn ? (e => {
+          if (!shouldSubmitOnKey(e)) return;
+          e.preventDefault();
+          runA2uiAction(props.submitId, submitBtn.props || {}, surface, local, setLocal);
+        }) : undefined,
+        onPaste: withFiles ? (e => {
+          const imgs = imageFilesFromClipboard(e.clipboardData);
+          if (!imgs.length) return;
+          e.preventDefault();
+          addA2uiFiles(id, imgs, local, setLocal);
+        }) : undefined,
       });
+      if (!withFiles) return h(React.Fragment, {key: id}, ta);
+      const dragging = !!(local.dragging && local.dragging[id]);
+      const setDragging = v => setLocal(s => ({...s, dragging: {...s.dragging, [id]: v}}));
+      return h("div", {
+        key: id,
+        className: "a2ui-composer" + (dragging ? " dragging" : ""),
+        onDragOver: e => { e.preventDefault(); if (!dragging) setDragging(true); },
+        onDragLeave: () => setDragging(false),
+        onDrop: e => {
+          e.preventDefault();
+          setDragging(false);
+          addA2uiFiles(id, Array.from(e.dataTransfer.files || []), local, setLocal);
+        },
+      },
+        ta,
+        h("div", {className: "a2ui-composer-bar"},
+          h("label", {className: "a2ui-attach"},
+            "📎 Attach",
+            h("input", {
+              type: "file", multiple: true, accept: ACCEPT,
+              "data-testid": "chat-file-input",
+              onChange: e => {
+                addA2uiFiles(id, Array.from(e.target.files || []), local, setLocal);
+                e.target.value = "";
+              },
+            }),
+          ),
+          pending.map((f, i) => h("span", {key: f.name + "-" + i, className: "a2ui-attachment"},
+            f.type.startsWith("image/")
+              ? h("img", {alt: "", src: "data:" + f.type + ";base64," + f.data})
+              : null,
+            f.name,
+            h("button", {
+              type: "button", "aria-label": "Remove " + f.name,
+              onClick: () => setLocal(s => ({
+                ...s,
+                attachments: {...s.attachments, [id]: (s.attachments[id] || []).filter((_, j) => j !== i)},
+              })),
+            }, "×"),
+          )),
+          attachErr ? h("span", {className: "a2ui-attach-err"}, attachErr) : null,
+        ),
+      );
     }
     case "button": {
       const status = local.statuses[id] || "";
@@ -600,39 +685,7 @@ function renderA2uiComponent(id, surface, local, setLocal) {
         h("button", {
           className: "a2ui-btn" + variant,
           disabled,
-          onClick: async () => {
-            const action = props.action || "";
-            const taId = props.textareaId || "";
-            const text = taId ? (local.textareas[taId] ?? "") : "";
-            if (action === "chat.send" && !text.trim()) return;
-            if (action === "review.modify" && !text.trim()) {
-              setLocal(s => ({...s, statuses: {...s.statuses, [id]: "Say what to change first."}}));
-              return;
-            }
-            if (action === "review.reject" && !confirm("Reject this plan?")) {
-              return;
-            }
-            setLocal(s => ({
-              ...s,
-              pending: {...s.pending, [id]: true},
-              statuses: {...s.statuses, [id]: "Sending…"},
-            }));
-            const res = await dispatchA2uiAction(action, {
-              text,
-              slug: surface.data && surface.data.slug,
-            });
-            setLocal(s => {
-              const next = {
-                ...s,
-                pending: {...s.pending, [id]: false},
-                statuses: {...s.statuses, [id]: res.ok ? "" : ("Error: " + (res.error || res.status || "unknown"))},
-              };
-              if (res.ok && taId) {
-                next.textareas = {...s.textareas, [taId]: ""};
-              }
-              return next;
-            });
-          },
+          onClick: () => runA2uiAction(id, props, surface, local, setLocal),
         }, props.label || "Submit"),
         status ? h("span", {className: "sse-status" + (status.startsWith("Error") ? " off" : "")}, status) : null,
       );
@@ -644,6 +697,9 @@ function renderA2uiComponent(id, surface, local, setLocal) {
       //      objects (variant = "chat-thread" / "bugs-sections" / …)
       if (props.boundTo) {
         const rows = resolvePointer(surface.data, props.boundTo);
+        if (props.variant === "chat-thread") {
+          return h(ChatThread, {key: id, rows: rows || []});
+        }
         return h("div", {key: id, className: "a2ui-list a2ui-" + (props.variant || "boundlist")},
           renderBoundList(id, props, rows || []));
       }
@@ -662,22 +718,106 @@ function renderA2uiComponent(id, surface, local, setLocal) {
   }
 }
 
+// Sticky-to-bottom message list: starts pinned to the latest message,
+// follows new messages while the user is within ~40px of the bottom,
+// and leaves the scroll position alone once they scroll up.
+function ChatThread({rows}) {
+  const ref = useRef(null);
+  const stick = useRef(true);
+  const last = rows.length ? rows[rows.length - 1] : null;
+  useEffect(() => {
+    const el = ref.current;
+    if (el && stick.current) el.scrollTop = el.scrollHeight;
+  }, [rows.length, last && last.at]);
+  return h("div", {
+    ref,
+    className: "a2ui-list a2ui-chat-thread",
+    onScroll: e => { stick.current = isNearBottom(e.currentTarget); },
+  }, renderChatMessages(rows));
+}
+
+function renderChatMessages(rows) {
+  if (!rows.length) {
+    return h("div", {className: "typing"}, "No messages yet. Say hi.");
+  }
+  return rows.map((m, i) => h("div", {
+    key: (m.at || "") + "-" + i,
+    className: "msg " + (m.from === "jason" ? "jason" : "alice"),
+  },
+    m.text || "",
+    ...(m.files || []).map((n, j) => h("div", {key: "f-" + j}, "📎 " + n)),
+    h("small", null,
+      (m.from === "jason" ? "You" : "Alice") + " · " + (m.at || "")),
+  ));
+}
+
+// Read files into the composer's pending-attachment list for textarea ``id``.
+async function addA2uiFiles(id, files, local, setLocal) {
+  let count = ((local.attachments && local.attachments[id]) || []).length;
+  const added = [];
+  let err = "";
+  files.forEach((file, i) => {
+    const bad = validateAttachment(file, count + added.length);
+    if (bad) { err = bad; return; }
+    added.push({file, name: attachmentName(file, i)});
+  });
+  const loaded = [];
+  for (const {file, name} of added) {
+    try {
+      loaded.push({name, type: file.type || "", data: await readAsBase64(file)});
+    } catch (_) {
+      err = "Could not read " + name + ".";
+    }
+  }
+  setLocal(s => ({
+    ...s,
+    attachments: {...s.attachments, [id]: [...((s.attachments && s.attachments[id]) || []), ...loaded]},
+    attachErr: {...s.attachErr, [id]: err},
+  }));
+}
+
+// Shared by the Send button's click and the textarea's Enter key.
+async function runA2uiAction(id, props, surface, local, setLocal) {
+  const action = props.action || "";
+  const taId = props.textareaId || "";
+  const text = taId ? (local.textareas[taId] ?? "") : "";
+  const files = taId ? ((local.attachments && local.attachments[taId]) || []) : [];
+  if (local.pending[id] || !KEY) return;
+  if (action === "chat.send" && !text.trim() && !files.length) return;
+  if (action === "review.modify" && !text.trim()) {
+    setLocal(s => ({...s, statuses: {...s.statuses, [id]: "Say what to change first."}}));
+    return;
+  }
+  if (action === "review.reject" && !confirm("Reject this plan?")) {
+    return;
+  }
+  setLocal(s => ({
+    ...s,
+    pending: {...s.pending, [id]: true},
+    statuses: {...s.statuses, [id]: "Sending…"},
+  }));
+  const res = await dispatchA2uiAction(action, {
+    text,
+    files,
+    slug: surface.data && surface.data.slug,
+  });
+  setLocal(s => {
+    const next = {
+      ...s,
+      pending: {...s.pending, [id]: false},
+      statuses: {...s.statuses, [id]: res.ok ? "" : ("Error: " + (res.error || res.status || "unknown"))},
+    };
+    if (res.ok && taId) {
+      next.textareas = {...s.textareas, [taId]: ""};
+      next.attachments = {...s.attachments, [taId]: []};
+      next.attachErr = {...s.attachErr, [taId]: ""};
+    }
+    return next;
+  });
+}
+
 function renderBoundList(id, props, rows) {
   const variant = props.variant || "";
-  if (variant === "chat-thread") {
-    if (!rows.length) {
-      return h("div", {className: "typing"}, "No messages yet. Say hi.");
-    }
-    return rows.map((m, i) => h("div", {
-      key: (m.at || "") + "-" + i,
-      className: "msg " + (m.from === "jason" ? "jason" : "alice"),
-    },
-      m.text || "",
-      ...(m.files || []).map((n, j) => h("div", {key: "f-" + j}, "📎 " + n)),
-      h("small", null,
-        (m.from === "jason" ? "You" : "Alice") + " · " + (m.at || "")),
-    ));
-  }
   if (variant === "bugs-sections") {
     return rows.map(sec => h("section", {key: sec.key, className: "bugs-section"},
       h("h2", null, sec.heading),
@@ -701,7 +841,7 @@ function A2uiSurface({envelopes, surfaceId}) {
   // Local-only state: textareas and button pending/status. Replayed
   // from scratch each render so updateComponents never clobbers what
   // the user is typing (textarea ids are stable per surface).
-  const [local, setLocal] = useState({textareas: {}, statuses: {}, pending: {}});
+  const [local, setLocal] = useState({textareas: {}, statuses: {}, pending: {}, attachments: {}, attachErr: {}, dragging: {}});
   const surface = React.useMemo(() => replayA2ui(envelopes), [envelopes]);
   if (!surface) {
     return h("div", {className: "notice"}, "Waiting for the " + surfaceId + " surface…");
