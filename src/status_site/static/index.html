@@ -213,11 +213,45 @@ h2.sec-heading {
   animation: jumpPulse 1.8s ease-in-out infinite;
 }
 @keyframes jumpPulse { 0%,100% {transform:translateY(0)} 50% {transform:translateY(-2px)} }
-.msg-status { opacity: .75; font-variant-numeric: tabular-nums; }
-.msg-status-sending { animation: msgPulse 1.2s ease-in-out infinite; }
-.msg-status-sent { color: var(--color-fg-muted); }
-.msg-status-delivered { color: var(--color-ok); }
-@keyframes msgPulse { 0%,100% {opacity:.5} 50% {opacity:1} }
+/* Message status pill — visible chip in the metadata footer rather
+ * than tiny inline text. "sending" pulses, "sent" is muted grey check,
+ * "delivered" is accent check that fades to muted after a moment so it
+ * doesn't shout on old messages. */
+.msg-status {
+  display: inline-block;
+  padding: 0 .4rem;
+  margin-left: .25rem;
+  font-size: .7rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  line-height: 1.4;
+}
+.msg-status-sending {
+  color: var(--color-warn, #b06f14);
+  background: rgba(176, 111, 20, .1);
+  animation: msgPulse 1s ease-in-out infinite;
+}
+.msg-status-sent {
+  color: var(--color-fg-muted);
+  background: rgba(127, 127, 127, .12);
+}
+.msg-status-delivered {
+  color: var(--color-ok);
+  background: rgba(46, 122, 79, .12);
+  animation: msgDeliveredFade 3s ease-out forwards;
+}
+@keyframes msgPulse { 0%,100% {opacity:.55} 50% {opacity:1} }
+@keyframes msgDeliveredFade {
+  0% { color: var(--color-ok); opacity: 1; }
+  70% { color: var(--color-ok); opacity: 1; }
+  100% { color: var(--color-fg-muted); opacity: .55; background: transparent; }
+}
+/* Jason bubbles override the chip to show up on the green background */
+.msg.jason .msg-status { color: #fff; background: rgba(0, 0, 0, .22); border-color: rgba(255, 255, 255, .5); }
+.msg.jason .msg-status-sending { background: rgba(255, 180, 60, .32); color: #fff; border-color: #fff; }
+.msg.jason .msg-status-delivered { background: rgba(255, 255, 255, .25); color: #fff; animation: none; }
 .a2ui-attach {
   cursor: pointer; font-size: .85rem; color: var(--color-fg-muted);
   padding: .15rem .55rem; border: 1px solid var(--color-border-line);
