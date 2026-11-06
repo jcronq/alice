@@ -54,6 +54,8 @@ import json
 import mimetypes
 import os
 import re
+import socket
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -818,6 +820,39 @@ def render_thinking_queue(cache: dict | None, now: float | None = None) -> str:
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
+def thinking_queue_rows(cache: dict | None, now: float | None = None) -> dict:
+    """Typed twin of :func:`render_thinking_queue` for the Overview aside.
+
+    ``{"available": bool, "rows": [...], "total": int}``. Rows follow the
+    phase order then issue number and carry the same cap as the markdown.
+    """
+    now = time.time() if now is None else now
+    if cache is None or now - cache["synced_at"] > THINKING_QUEUE_STALE_SECONDS:
+        return {"available": False, "rows": [], "total": 0}
+    buckets: dict[int, list[dict]] = {}
+    for item in cache["items"]:
+        phase = _thinking_phase(item)
+        if phase is not None:
+            buckets.setdefault(phase, []).append(item)
+    rows: list[dict] = []
+    total = sum(len(v) for v in buckets.values())
+    for idx, (_, heading) in enumerate(THINKING_QUEUE_PHASES):
+        for item in sorted(buckets.get(idx, []), key=lambda i: int(i["number"])):
+            if len(rows) >= THINKING_QUEUE_CAP:
+                break
+            num = int(item["number"])
+            rows.append(
+                {
+                    "phase": heading,
+                    "number": num,
+                    "title": " ".join(str(item.get("title", "")).split()),
+                    "link": f"https://github.com/{THINKING_QUEUE_REPO}/issues/{num}",
+                    "age": _format_age(item.get("updatedAt"), now),
+                }
+            )
+    return {"available": True, "rows": rows, "total": total}
+
+
 def splice_thinking_queue(text: str, block: str) -> str:
     """Replace the region between the sentinels, or append the block once."""
     region = f"{THINKING_QUEUE_START}\n{block}{THINKING_QUEUE_END}"
@@ -1562,6 +1597,11 @@ class OverviewPollers:
             entry = self._cache.get(key)
         return entry.value if entry else None
 
+    def fetched_at(self) -> dict[str, float]:
+        """``{source: epoch of last successful poll}`` for system-health."""
+        with self.cfg.lock:
+            return {k: v.fetched_at for k, v in self._cache.items()}
+
     def _set(self, key: str, value: object) -> None:
         with self.cfg.lock:
             self._cache[key] = _CachedValue(value=value, fetched_at=time.time())
@@ -1668,6 +1708,35 @@ class OverviewPollers:
 # sync with the client's reducer.
 
 
+_DEPLOY_TTL_SECONDS = 60.0
+_deploy_cache: dict[str, object] = {"at": 0.0, "value": None}
+
+
+def deploy_status() -> dict:
+    """Commit the status-site checkout is serving, on this host (60s cache).
+
+    ``{"host", "sha", "subject", "committed"}``; ``sha`` is ``""`` when the
+    repo can't be queried (no git, not a checkout).
+    """
+    now = time.time()
+    cached = _deploy_cache["value"]
+    if cached is not None and now - float(_deploy_cache["at"]) < _DEPLOY_TTL_SECONDS:
+        return cached  # type: ignore[return-value]
+    value = {"host": socket.gethostname(), "sha": "", "subject": "", "committed": ""}
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(_running_now.repo_dir_from_env()), "log", "-1",
+             "--format=%h%x00%cI%x00%s"],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+        sha, committed, subject = (out.split("\0") + ["", "", ""])[:3]
+        value.update(sha=sha, committed=committed, subject=subject)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    _deploy_cache.update(at=now, value=value)
+    return value
+
+
 def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
     """Return ``{section_name: () -> payload}`` for every Overview section.
 
@@ -1714,10 +1783,7 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         )
         return {"markdown": md}
 
-    def _render_waiting_on_you() -> dict:
-        hand_zone_md = _waiting_on_you.read_hand_zone(
-            cfg.status_dir / "waiting-on-you.md"
-        )
+    def _ask_rows() -> list[dict]:
         asks = _read_asks(_asks_path(cfg.status_dir))
         pending = _waiting_on_you.unresolved_asks(asks)
         rows: list[dict] = []
@@ -1740,6 +1806,27 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
                 r.get("created") or "",
             )
         )
+        return rows
+
+    def _surface_rows(items: list[dict], now: float) -> list[dict]:
+        return [
+            {
+                "slug": it.get("slug", ""),
+                "type": it.get("type", ""),
+                "label": _surface_label(it),
+                "link": _surface_link_url(it),
+                "preview": it.get("preview", ""),
+                "age_seconds": now - float(it.get("created_epoch", now)),
+                "created": it.get("created", ""),
+            }
+            for it in items
+        ]
+
+    def _render_waiting_on_you() -> dict:
+        hand_zone_md = _waiting_on_you.read_hand_zone(
+            cfg.status_dir / "waiting-on-you.md"
+        )
+        rows = _ask_rows()
         md = _waiting_on_you.render(
             cfg.status_dir / "waiting-on-you.md",
             asks_path=_asks_path(cfg.status_dir),
@@ -1755,19 +1842,7 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         # ``pipeline`` (GH issues) and ``tasks`` are the new groups.
         items = scan_surfaces(cfg.surface_dir)
         now = time.time()
-        rows: list[dict] = []
-        for it in items:
-            rows.append(
-                {
-                    "slug": it.get("slug", ""),
-                    "type": it.get("type", ""),
-                    "label": _surface_label(it),
-                    "link": _surface_link_url(it),
-                    "preview": it.get("preview", ""),
-                    "age_seconds": now - float(it.get("created_epoch", now)),
-                    "created": it.get("created", ""),
-                }
-            )
+        rows = _surface_rows(items, now)
         cached = (pollers.get("pipeline") if pollers else None) or {}
         pipeline_rows = _pipeline.issue_rows(cached.get("issues") or [], now=now)
         task_rows = _pipeline.scan_tasks(_tasks_dir(), now=now)
@@ -1813,6 +1888,98 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
     def _render_known_issues() -> dict:
         return {"markdown": _known_issues.render(cfg.status_dir / "known-issues.md")}
 
+    # ── Overview tiers by who owns the next action (issue #691) ────
+    # ``your_todo`` / ``in_flight`` / ``thinking_queue`` / ``system_health``
+    # are the sections the reactive shell draws; the older per-source
+    # sections above stay because ``/index.md`` splices and existing
+    # consumers read them.
+
+    def _render_your_todo() -> dict:
+        now = time.time()
+        review = (pollers.get("review_queue") if pollers else None) or {}
+        pipe = (pollers.get("pipeline") if pollers else None) or {}
+        owner = _pipeline.split_by_owner(
+            _pipeline.issue_rows(pipe.get("issues") or [], now=now)
+        )
+        pr_rows = _pipeline.sort_rows(
+            [_pipeline.review_item_row(i) for i in review.get("pr") or []]
+        )
+        design_rows = _pipeline.merge_design_review(
+            owner["jason"], review.get("design") or []
+        )
+        ask_rows = _ask_rows()
+        your_todo_md = _waiting_on_you.read_hand_zone(
+            cfg.status_dir / "waiting-on-you.md"
+        )
+        external_todos_md = _waiting_on_you.read_hand_zone(
+            cfg.status_dir / "external-todos.md"
+        )
+        # Attention-reacts (👀 ⚠️ 👎 ❓) wait on #683; the key is the
+        # contract so the widget lights up as soon as it is populated.
+        attention_reacts: list[dict] = []
+        counts = {
+            "prs": len(pr_rows),
+            "design_review": len(design_rows),
+            "attention_reacts": len(attention_reacts),
+            "asks": len(ask_rows) + (1 if your_todo_md else 0),
+            "external": 1 if external_todos_md else 0,
+        }
+        total = sum(counts.values())
+        return {
+            "markdown": f"{total} items waiting on you" if total else "*(nothing waiting on you)*",
+            "prs": pr_rows,
+            "design_review": design_rows,
+            "attention_reacts": attention_reacts,
+            "rows": ask_rows,
+            "your_todo_md": your_todo_md,
+            "external_todos_md": external_todos_md,
+            "counts": counts,
+            "failed": {
+                "prs": list(review.get("pr_failed") or []),
+                "design_review": list(review.get("design_failed") or []),
+            },
+        }
+
+    def _render_in_flight() -> dict:
+        now = time.time()
+        running = _render_running_now()
+        pipe = (pollers.get("pipeline") if pollers else None) or {}
+        owner = _pipeline.split_by_owner(
+            _pipeline.issue_rows(pipe.get("issues") or [], now=now)
+        )
+        surfaces = _surface_rows(scan_surfaces(cfg.surface_dir), now)
+        tasks = _pipeline.scan_tasks(_tasks_dir(), now=now)
+        n = len(running["rows"]) + len(owner["alice"]) + len(surfaces) + len(tasks)
+        return {
+            "markdown": f"{n} in flight" if n else "*(nothing in flight)*",
+            "running": running["rows"],
+            "pipeline": owner["alice"],
+            "surfaces": surfaces,
+            "tasks": tasks,
+            "pipeline_failed": list(pipe.get("failed") or []),
+        }
+
+    def _render_thinking_queue() -> dict:
+        data = thinking_queue_rows(read_thinking_queue(cfg.status_dir))
+        md = (
+            f"{data['total']} in thinking queue"
+            if data["rows"]
+            else "*(thinking queue unavailable or empty)*"
+        )
+        return {"markdown": md, **data}
+
+    def _render_system_health() -> dict:
+        fetched = pollers.fetched_at() if pollers else {}
+        known = _known_issues.render(cfg.status_dir / "known-issues.md")
+        return {
+            "markdown": known,
+            "known_issues_md": known,
+            "deploy": [deploy_status()],
+            "pollers": [
+                {"name": k, "fetched_at": v} for k, v in sorted(fetched.items())
+            ],
+        }
+
     # A2UI-rendered pages (issue #651). Each ``page:<slug>`` section
     # emits a ``{"a2ui": [envelope, ...]}`` payload the client walks
     # through its generic surface renderer. The broadcaster's dict-
@@ -1833,6 +2000,10 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
     # ``page:<slug>`` for the currently-active hash route, so idle
     # pages cost one dict-equality check per tick.
     return {
+        "your_todo": _render_your_todo,
+        "in_flight": _render_in_flight,
+        "thinking_queue": _render_thinking_queue,
+        "system_health": _render_system_health,
         "running_now": _render_running_now,
         "ready_for_review": _render_ready_for_review,
         "waiting_on_you": _render_waiting_on_you,
