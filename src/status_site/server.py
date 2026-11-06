@@ -44,13 +44,19 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from status_site.history import Tracker, read_history
+from status_site.history import (
+    HISTORY_DIR,
+    Tracker,
+    parse_page,
+    read_history,
+    read_jsonl,
+)
 from status_site.sources import (
     done_today as _done_today,
     known_issues as _known_issues,
@@ -1420,6 +1426,193 @@ def surfaces_api_payload(
     return {"count": len(out), "surfaces": out}
 
 
+# ---------------------------------------------------------------- done archive
+#
+# ``## Done today`` in index.md only makes sense for one day. On date roll,
+# checked items whose completion date (from item-history) is before today move
+# to ``done-archive.md`` under a ``## YYYY-MM-DD`` heading (newest first). When
+# the completion date can't be determined the item is retained.
+
+ARCHIVE_PAGE = "done-archive"
+ARCHIVE_STATE = ".archive-state.json"
+ARCHIVE_INTERVAL = 600.0
+_DONE_HEAD_RE = re.compile(r"^##\s+done today\b", re.I)
+_ANY_H12_RE = re.compile(r"^#{1,2}\s")
+_TOP_ITEM_RE = re.compile(r"^(?:[-*+]|\d+[.)])\s")
+_CHECKED_ITEM_RE = re.compile(r"^[-*+]\s+\[[xX]\]\s")
+_ARCHIVE_HEAD_RE = re.compile(r"^##\s+(\d{4}-\d{2}-\d{2})\s*$")
+
+
+def _local_now() -> datetime:
+    return datetime.now().astimezone()
+
+
+def _split_top_items(lines: list[str]) -> list[tuple[int, int]]:
+    """``[start, end)`` line ranges of each top-level list item (with its continuation)."""
+    units: list[list[int]] = []
+    cur: list[int] | None = None
+    for i, line in enumerate(lines):
+        if _TOP_ITEM_RE.match(line):
+            cur = [i, i + 1]
+            units.append(cur)
+        elif cur is None or not line.strip():
+            continue
+        elif line[0] in " \t" or cur[1] == i:
+            cur[1] = i + 1
+        else:
+            cur = None
+    return [(a, b) for a, b in units]
+
+
+def completed_on(status_dir: Path, slug: str, tz) -> date | None:
+    """Local date the item was last checked off, or None when history can't say."""
+    when = None
+    for ev in read_jsonl(status_dir / HISTORY_DIR / f"{slug}.jsonl"):
+        t = ev.get("type")
+        if t == "checked" or (t == "appeared" and ev.get("checked") is True):
+            when = ev.get("at")
+        elif t == "unchecked":
+            when = None
+    if not when:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(when))
+    except ValueError:
+        return None
+    dt = dt.replace(tzinfo=tz) if dt.tzinfo is None else dt.astimezone(tz)
+    return dt.date()
+
+
+def _merge_archive(text: str, additions: dict[str, list[list[str]]]) -> str:
+    """Insert item line-groups under their ``## <date>`` headings, newest-first."""
+    lines = text.split("\n") if text.strip() else ["# Done archive"]
+    preamble: list[str] = []
+    sections: list[list] = []  # [date, body_lines]
+    for line in lines:
+        m = _ARCHIVE_HEAD_RE.match(line)
+        if m:
+            sections.append([m.group(1), []])
+        elif sections:
+            sections[-1][1].append(line)
+        else:
+            preamble.append(line)
+    for d in sorted(additions, reverse=True):
+        sec = next((s for s in sections if s[0] == d), None)
+        if sec is None:
+            sec = [d, []]
+            at = next((i for i, s in enumerate(sections) if s[0] < d), len(sections))
+            sections.insert(at, sec)
+        existing = {ln for ln in sec[1] if ln.strip()}
+        for group in additions[d]:
+            if group[0] in existing:
+                continue
+            sec[1] = [*sec[1], *group]
+    parts = ["\n".join(preamble).strip("\n")] if "".join(preamble).strip() else []
+    for d, body in sections:
+        chunk = f"## {d}"
+        body_txt = "\n".join(body).strip("\n")
+        parts.append(chunk + ("\n\n" + body_txt if body_txt else ""))
+    return "\n\n".join(parts) + "\n"
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def archive_done(cfg: Config, now: datetime | None = None) -> list[dict]:
+    """Move stale checked items out of index.md's ``## Done today`` into done-archive.md.
+
+    Returns ``[{"slug", "date", "lines"}, ...]`` for each archived item.
+    """
+    now = now or _local_now()
+    today = now.date()
+    index_path = cfg.status_dir / "index.md"
+    archive_path = cfg.status_dir / f"{ARCHIVE_PAGE}.md"
+    with cfg.lock:
+        try:
+            lines = index_path.read_text().split("\n")
+        except OSError:
+            return []
+        start = next((i for i, ln in enumerate(lines) if _DONE_HEAD_RE.match(ln)), None)
+        if start is None:
+            return []
+        end = next(
+            (i for i in range(start + 1, len(lines)) if _ANY_H12_RE.match(lines[i])),
+            len(lines),
+        )
+        body = lines[start + 1 : end]
+        archived: list[dict] = []
+        drop: set[int] = set()
+        for a, b in _split_top_items(body):
+            if not _CHECKED_ITEM_RE.match(body[a]):
+                continue
+            parsed = parse_page("\n".join(body[a:b]), "index")
+            if not parsed:
+                continue
+            slug = parsed[0].slug
+            day = completed_on(cfg.status_dir, slug, now.tzinfo)
+            if day is None or day >= today:
+                continue
+            archived.append({"slug": slug, "date": day.isoformat(), "lines": body[a:b]})
+            drop.update(range(start + 1 + a, start + 1 + b))
+        if not archived:
+            return []
+        additions: dict[str, list[list[str]]] = {}
+        for item in archived:
+            additions.setdefault(item["date"], []).append(item["lines"])
+        try:
+            old = archive_path.read_text()
+        except OSError:
+            old = ""
+        # Archive first: a crash between the two writes duplicates, never loses.
+        _atomic_write(archive_path, _merge_archive(old, additions))
+        _atomic_write(index_path, "\n".join(l for i, l in enumerate(lines) if i not in drop))
+    return archived
+
+
+def archive_tick(cfg: Config, now: datetime | None = None) -> list[dict] | None:
+    """Run ``archive_done`` once per local date; None if today already ran."""
+    now = now or _local_now()
+    today = now.date().isoformat()
+    state_path = cfg.status_dir / ARCHIVE_STATE
+    try:
+        last = json.loads(state_path.read_text()).get("last_run")
+    except (OSError, ValueError, AttributeError):
+        last = None
+    if last == today:
+        return None
+    archived = archive_done(cfg, now)
+    _atomic_write(state_path, json.dumps({"last_run": today, "archived": len(archived)}))
+    return archived
+
+
+def run_archive_roller(
+    cfg: Config,
+    interval: float = ARCHIVE_INTERVAL,
+    stop: threading.Event | None = None,
+    clock=_local_now,
+) -> None:
+    stop = stop or threading.Event()
+    while not stop.is_set():
+        try:
+            archived = archive_tick(cfg, clock())
+            if archived:
+                print(f"status_site: archived {len(archived)} done item(s)", flush=True)
+        except Exception as e:  # never let a bad page kill the thread
+            print(f"status_site: done-archive failed: {e!r}", flush=True)
+        stop.wait(interval)
+
+
+def start_archive_roller(cfg: Config, interval: float = ARCHIVE_INTERVAL) -> threading.Thread:
+    t = threading.Thread(
+        target=run_archive_roller, args=(cfg, interval), name="done-archive", daemon=True
+    )
+    t.start()
+    return t
+
+
 # ---------------------------------------------------------------- HTTP
 
 
@@ -1732,6 +1925,10 @@ def main() -> None:
         )
         cfg.pollers = pollers
         pollers.start()
+    if os.environ.get("ARCHIVE_ON_ROLL", "1") != "0":
+        start_archive_roller(
+            cfg, float(os.environ.get("ARCHIVE_INTERVAL", str(ARCHIVE_INTERVAL)))
+        )
     print(f"status_site: serving {cfg.status_dir} on {cfg.host}:{cfg.port}", flush=True)
     srv.serve_forever()
 

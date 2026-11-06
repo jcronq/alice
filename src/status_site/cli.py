@@ -13,6 +13,8 @@ has no item or thread context.
 manages structured asks on the Waiting-on-you section, writing to
 ``$STATUS_DIR/asks.jsonl``. See
 ``cortex-memory/designs/2026-11-05-issue638-overview-auto-render.md``.
+
+``status-archive`` runs the done-today -> done-archive.md roll once, on demand.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ import os
 import sys
 from pathlib import Path
 
-from status_site.server import now_iso, thread_id
+from status_site.server import Config, archive_done, now_iso, thread_id
 from status_site.sources.common import (
     asks_path as _asks_path,
     new_ask_id,
@@ -184,6 +186,21 @@ def main_waiting_ask(argv: list[str] | None = None) -> int:
     with open(path, "a") as f:
         f.write(json.dumps(record, sort_keys=True) + "\n")
     print(record["id"])
+    return 0
+
+
+def main_archive(argv: list[str] | None = None) -> int:
+    """status-archive — move stale checked "Done today" items into done-archive.md."""
+    args = sys.argv[1:] if argv is None else argv
+    if args:
+        print(main_archive.__doc__, file=sys.stderr)
+        return 2
+    d = status_dir()
+    # archive_done only needs status_dir; the other Config fields are unused here.
+    archived = archive_done(Config(status_dir=d, surface_dir=d, upload_dir=d, key=""))
+    for item in archived:
+        print(f"archived {item['slug']} -> {item['date']}")
+    print(f"archived {len(archived)} item(s)")
     return 0
 
 

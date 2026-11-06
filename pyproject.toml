@@ -107,6 +107,7 @@ alice-sm-thinking-perissue = "alice_thinking.cli.perissue:main"
 # thread. bin/status-reply is the repo-checkout wrapper for the same CLI.
 alice-status-site = "status_site.server:main"
 status-reply = "status_site.cli:main"
+status-archive = "status_site.cli:main_archive"
 # cozylobe-cortex-onboard and cozylobe-cortex-lint entry points moved
 # to the standalone alice-cozylobe repo (see dependencies above).
 
