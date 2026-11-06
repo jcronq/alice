@@ -138,7 +138,7 @@ MIME_ALLOWLIST = (
 MAX_TEXT = 8000
 MAX_ITEM = 500
 # How many chat messages /api/chat returns, newest-at-end.
-MAX_CHAT_HISTORY = 500
+MAX_CHAT_HISTORY = 150
 # How many tail lines to splice into the Speaking surface for context.
 CHAT_SURFACE_TAIL = 5
 
