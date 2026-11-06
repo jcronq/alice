@@ -189,3 +189,54 @@ def test_status_chat_cli_appends_as_alice(tmp_path, monkeypatch):
     assert cli.main_chat(["   "]) == 2
     assert cli.main_chat([]) == 2
     assert cli.main_chat(["a", "b"]) == 2
+
+
+# ---------------------------------------------------------------- A2UI emitter (#651)
+
+
+def test_chat_a2ui_emitter_shape(site):
+    """``sources.chat.render`` emits the three-envelope A2UI surface
+    (createSurface → updateComponents → updateDataModel) the Chat page
+    reduces into.
+    """
+    from status_site.sources import chat as chat_page
+
+    cfg, port = site
+    # Seed one message so the data-model envelope has real content.
+    assert post(port, {"key": KEY, "text": "hi alice"})[0] == 200
+
+    payload = chat_page.render(cfg)
+    assert "a2ui" in payload
+    envelopes = payload["a2ui"]
+    assert [e["type"] for e in envelopes] == [
+        "createSurface",
+        "updateComponents",
+        "updateDataModel",
+    ]
+    assert all(e["surfaceId"] == "chat" for e in envelopes)
+
+    # updateComponents includes a root, a thread list bound to
+    # ``/messages``, a textarea, and a send button whose action the
+    # client switches on.
+    comps = {c["id"]: c for c in envelopes[1]["components"]}
+    assert comps["root"]["type"] == "list"
+    assert comps["thread"]["type"] == "list"
+    assert comps["thread"]["props"]["boundTo"] == "/messages"
+    assert comps["composer"]["type"] == "textarea"
+    assert comps["send"]["type"] == "button"
+    assert comps["send"]["props"]["action"] == "chat.send"
+    assert comps["send"]["props"]["textareaId"] == "composer"
+
+    # The final updateDataModel carries the chat log at ``/messages``.
+    data_env = envelopes[2]
+    assert data_env["path"] == "/messages"
+    assert [m["text"] for m in data_env["value"]] == ["hi alice"]
+
+
+def test_chat_a2ui_empty_log_yields_empty_messages(site):
+    """No chat log yet → the data-model carries an empty list, not None."""
+    from status_site.sources import chat as chat_page
+
+    cfg, _ = site
+    payload = chat_page.render(cfg)
+    assert payload["a2ui"][-1]["value"] == []
