@@ -278,7 +278,10 @@ def test_cli_status_archive(tmp_path, monkeypatch, capsys):
 
 
 def test_frontend_collapses_done_today():
-    html = (Path(S.__file__).parent / "static" / "index.html").read_text()
+    # ``collapseDone`` + the ``linkLeaves();collapseDone();`` chain
+    # live in the pre-#639 markdown shell; slice-1 moved that JS to
+    # legacy.html while the reactive tree catches up.
+    html = (Path(S.__file__).parent / "static" / "legacy.html").read_text()
     assert "function collapseDone" in html
     assert "linkLeaves();collapseDone();" in html
     assert "details.done" in html

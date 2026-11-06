@@ -61,6 +61,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from status_site._sse import (
+    DEFAULT_HEARTBEAT_SECONDS,
+    DEFAULT_TICK_SECONDS,
+    SectionBroadcaster,
+    check_key as _sse_check_key,
+    stream_events as _sse_stream_events,
+)
 from status_site.history import (
     HISTORY_DIR,
     STATE_FILE,
@@ -83,7 +90,12 @@ from status_site.sources.common import (
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-STATIC_FILES = {"index.html", "marked.min.js"}
+# ``legacy.html`` is the pre-#639 static shell, kept so the reactive
+# page can link out to "Classic view" and so ``?p=<page>`` /
+# ``?p=chat`` keeps working while the widget library catches up
+# through slices 2–6. The new ``index.html`` is the SSE-driven React
+# shell that renders section updates live from ``/api/events``.
+STATIC_FILES = {"index.html", "legacy.html", "marked.min.js"}
 
 # Content files served from STATUS_DIR: flat names only (no '/', no leading dot).
 CONTENT_NAME_RE = re.compile(
@@ -202,6 +214,20 @@ class Config:
     # present and renders a "nothing yet" state when not (tests spin
     # up the server without background threads).
     pollers: "OverviewPollers | None" = field(default=None, repr=False)
+    # SSE wiring (#639, slice-1). ``broadcaster`` fans Overview
+    # section renders out to open ``GET /api/events`` connections.
+    # ``None`` → the endpoint 404s (same spin-up pattern as
+    # ``pollers``); tests construct a broadcaster explicitly so they
+    # don't need background threads they didn't ask for.
+    broadcaster: "SectionBroadcaster | None" = field(default=None, repr=False)
+    # Injectable for the heartbeat-cadence regression test (pinned at
+    # 0.1s). 15s matches the connectivity-guide default and most
+    # reverse-proxy idle cutoffs.
+    heartbeat_seconds: float = DEFAULT_HEARTBEAT_SECONDS
+    # Broadcast tick cadence. Fast enough that "Jason added an ask"
+    # lands on his screen within a second; slow enough that the render
+    # doesn't dominate CPU on an idle box.
+    sse_tick_seconds: float = DEFAULT_TICK_SECONDS
 
     @property
     def threads_dir(self) -> Path:
@@ -1517,23 +1543,32 @@ class OverviewPollers:
             self._threads.append(t)
 
 
-def overview_splice_sections(
-    cfg: "Config",
-    *,
-    items: list[dict],
-    now: float,
-) -> list[tuple]:
-    """Build the ``_splice_sections`` list for ``GET /index.md``.
+# ─── per-section markdown renderers ───────────────────────────────
+#
+# One place that knows how to turn each source's state into markdown.
+# ``/index.md`` (via ``overview_splice_sections``) and the SSE
+# broadcaster (via ``SectionBroadcaster`` in ``_sse.py``) both call
+# through here, so Overview on the markdown page and Overview on the
+# reactive shell are byte-identical. Section names are the stable
+# identifiers used on SSE ``section.update`` events; keep them in
+# sync with the client's reducer.
 
-    Order mirrors the Overview as it appears on the page:
-    Running now → Ready for Review → Waiting on you → Alice's queue →
-    Done today → Known issues I'm on. Each tuple carries sentinel
-    markers, a renderer closure, and a fallback builder so the
-    append-case keeps the page serveable while the mind repo catches
-    up on the marker-insertion pass.
+
+def section_renderers(cfg: "Config") -> dict[str, Callable[[], str]]:
+    """Return ``{section_name: () -> markdown}`` for every Overview section.
+
+    Closures read live state each call: TTL-cached sources via
+    ``cfg.pollers`` (an empty cache renders the "nothing yet" string so
+    the SSE snapshot and ``/index.md`` both stay serveable before the
+    first poll fires); cheap sources straight off disk. The
+    ``alice_queue`` closure scans surfaces on each call — fine for
+    broadcasting (surfaces dir is small), and the
+    ``/index.md`` path passes its own pre-scanned ``items`` through
+    :func:`overview_splice_sections` to avoid double-scanning per
+    request.
     """
     pollers = cfg.pollers
-    # Running now — read cache; empty list is the "nothing yet" state.
+
     def _render_running_now() -> str:
         rows = (pollers.get("running_now") if pollers else None) or []
         return _running_now.render(rows)
@@ -1553,6 +1588,10 @@ def overview_splice_sections(
             asks_path=_asks_path(cfg.status_dir),
         )
 
+    def _render_alice_queue() -> str:
+        items = scan_surfaces(cfg.surface_dir)
+        return render_alice_queue(items, now=time.time())
+
     def _render_done_today() -> str:
         cached = (pollers.get("done_today") if pollers else None) or {}
         today = cached.get("today") or _done_today.today_local()
@@ -1562,6 +1601,47 @@ def overview_splice_sections(
 
     def _render_known_issues() -> str:
         return _known_issues.render(cfg.status_dir / "known-issues.md")
+
+    # Preserve Overview order; the SSE client iterates this dict to
+    # draw sections top-to-bottom.
+    return {
+        "running_now": _render_running_now,
+        "ready_for_review": _render_ready_for_review,
+        "waiting_on_you": _render_waiting_on_you,
+        "alice_queue": _render_alice_queue,
+        "done_today": _render_done_today,
+        "known_issues": _render_known_issues,
+    }
+
+
+def overview_splice_sections(
+    cfg: "Config",
+    *,
+    items: list[dict],
+    now: float,
+) -> list[tuple]:
+    """Build the ``_splice_sections`` list for ``GET /index.md``.
+
+    Order mirrors the Overview as it appears on the page:
+    Running now → Ready for Review → Waiting on you → Alice's queue →
+    Done today → Known issues I'm on. Each tuple carries sentinel
+    markers, a renderer closure, and a fallback builder so the
+    append-case keeps the page serveable while the mind repo catches
+    up on the marker-insertion pass.
+
+    Renderers are shared with the SSE broadcaster via
+    :func:`section_renderers`. The ``alice_queue`` tuple below passes
+    the caller's pre-scanned ``items`` + ``now`` into
+    :func:`render_alice_queue` directly — ``/index.md`` already
+    collected them to compute Last-Modified, so we skip the extra
+    disk scan that the SSE path's closure does.
+    """
+    renderers = section_renderers(cfg)
+    _render_running_now = renderers["running_now"]
+    _render_ready_for_review = renderers["ready_for_review"]
+    _render_waiting_on_you = renderers["waiting_on_you"]
+    _render_done_today = renderers["done_today"]
+    _render_known_issues = renderers["known_issues"]
 
     return [
         (
@@ -2105,6 +2185,64 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code: int, obj: object, head: bool = False) -> None:
         self._send(code, json.dumps(obj).encode(), "application/json", head=head)
 
+    def _sse(self, head: bool) -> None:
+        """Serve ``GET /api/events`` — long-lived Server-Sent Events.
+
+        Key auth via ``?k=<key>`` (EventSource can't set headers; even
+        though the client uses fetch, the key still rides in the URL
+        so shape + reconnects stay URL-only). The broadcaster is
+        attached at boot — if it isn't wired yet, we 404 so tests that
+        spin up a bare server don't need SSE plumbing they didn't ask
+        for.
+        """
+        broadcaster = self.cfg.broadcaster
+        if broadcaster is None:
+            return self._json(404, {"error": "events disabled"}, head=head)
+        q = parse_qs(urlsplit(self.path).query)
+        key = (q.get("k") or [""])[0]
+        if not _sse_check_key(self.cfg.key, key):
+            return self._json(403, {"error": "bad key"}, head=head)
+        if head:
+            # A probe can check the endpoint is up without pinning a
+            # connection — same headers as the full GET, no body.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            return
+        # These headers are the connectivity-guide recipe:
+        # ``no-transform`` keeps intermediaries from buffering,
+        # ``X-Accel-Buffering: no`` turns off nginx's accrual buffer.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        # Opening comment is a cheap way to flush the headers through
+        # any TLS buffer + prove the stream is alive before the
+        # snapshot lands. Clients drop ``:`` comments.
+        try:
+            self.wfile.write(b": alice-sse v1\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+        try:
+            _sse_stream_events(
+                self.wfile,
+                broadcaster,
+                heartbeat_seconds=self.cfg.heartbeat_seconds,
+            )
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        # The stream closed — don't keep the TCP connection warm for a
+        # follow-up request on this socket.
+        self.close_connection = True
+
     def _resolve(self, path: str) -> Path | None:
         name = unquote(path).lstrip("/") or "index.html"
         if name in STATIC_FILES:
@@ -2165,6 +2303,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(
                 200, surfaces_api_payload(items, now=time.time()), head=head
             )
+        if path == "/api/events":
+            return self._sse(head=head)
         if path == "/index.md":
             index_path = self.cfg.status_dir / "index.md"
             if index_path.is_file():
@@ -2296,6 +2436,22 @@ def main() -> None:
         start_archive_roller(
             cfg, float(os.environ.get("ARCHIVE_INTERVAL", str(ARCHIVE_INTERVAL)))
         )
+    if os.environ.get("SSE_BROADCAST", "1") != "0":
+        # Snapshot-first SSE for #639 slice-1. Tick cadence is short
+        # (2s default) but each render just formats already-cached
+        # data, so CPU on an idle box is in the noise.
+        cfg.heartbeat_seconds = float(
+            os.environ.get("SSE_HEARTBEAT_SECONDS", str(cfg.heartbeat_seconds))
+        )
+        cfg.sse_tick_seconds = float(
+            os.environ.get("SSE_TICK_SECONDS", str(cfg.sse_tick_seconds))
+        )
+        broadcaster = SectionBroadcaster(
+            section_renderers(cfg),
+            tick_seconds=cfg.sse_tick_seconds,
+        )
+        cfg.broadcaster = broadcaster
+        broadcaster.start()
     print(f"status_site: serving {cfg.status_dir} on {cfg.host}:{cfg.port}", flush=True)
     srv.serve_forever()
 

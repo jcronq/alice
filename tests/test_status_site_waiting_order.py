@@ -86,7 +86,9 @@ def test_dotfile_not_served_statically(tmp_path):
     ],
 )
 def test_merge_waiting_order(natural, saved, expected):
-    html = (S.STATIC_DIR / "index.html").read_text()
+    # Drag-reorder lives in the pre-#639 markdown shell; slice-1 of
+    # #639 moved it to legacy.html while the reactive tree catches up.
+    html = (S.STATIC_DIR / "legacy.html").read_text()
     m = re.search(r"// <merge-order>(.*?)// </merge-order>", html, re.S)
     assert m
     script = (

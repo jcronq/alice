@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Alice — status</title>
+<style>
+:root{--bg:#fbfaf7;--fg:#1f2328;--muted:#6b7280;--card:#fff;--line:#e5e2db;--accent:#2f6f5e;--warn:#b45309}
+@media (prefers-color-scheme:dark){:root{--bg:#15171a;--fg:#e6e6e6;--muted:#9aa0a6;--card:#1d2024;--line:#2c3036;--accent:#6cc4a8;--warn:#f0a35e}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}
+header{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--line);padding:.6rem 1rem;display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;z-index:2}
+header b{font-size:1.05rem}header nav{display:flex;flex-direction:column;gap:.25rem}
+.navrow{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center}
+.navrow.dyn{padding-top:.15rem;border-top:1px dashed var(--line)}
+header a{color:var(--muted);text-decoration:none;padding:.15rem .55rem;border:1px solid var(--line);border-radius:999px;font-size:.85rem}
+header a.on{color:var(--bg);background:var(--accent);border-color:var(--accent)}
+#age{margin-left:auto;color:var(--muted);font-size:.8rem}
+main{max-width:860px;margin:0 auto;padding:1rem 1rem 4rem}
+h1{font-size:1.5rem;margin:.6rem 0}h2{font-size:1.15rem;margin:1.6rem 0 .5rem;padding-bottom:.25rem;border-bottom:1px solid var(--line)}h3{font-size:1rem}
+h2.stale{color:#c0392b;border-bottom-color:#c0392b}
+@media (prefers-color-scheme:dark){h2.stale{color:#f5766a;border-bottom-color:#f5766a}}
+em.stale-footer{display:block;font-size:.78em;opacity:.65;margin-top:.1rem}
+ul{padding-left:1.2rem}li{margin:.2rem 0}
+li:has(> input[type=checkbox]){list-style:none;margin-left:-1.2rem;padding:.45rem .7rem;background:var(--card);border:1px solid var(--line);border-radius:8px;margin-bottom:.35rem}
+li:has(> input:checked){color:var(--muted)}
+input[type=checkbox]{transform:scale(1.15);margin-right:.5rem;accent-color:var(--accent)}
+em{color:var(--muted);font-style:normal;font-size:.92em}
+code{background:var(--card);border:1px solid var(--line);border-radius:4px;padding:0 .3rem;font-size:.88em}
+table{border-collapse:collapse;width:100%;font-size:.92rem}th,td{border-bottom:1px solid var(--line);padding:.35rem .5rem;text-align:left}
+blockquote{margin:.6rem 0;padding:.4rem .8rem;border-left:3px solid var(--warn);background:var(--card);border-radius:0 6px 6px 0}
+progress{width:100%;height:10px;accent-color:var(--accent)}
+a{color:var(--accent)}
+.reply{margin-top:.45rem;display:none}.reply.open{display:block}
+.reply textarea{width:100%;min-height:4.2rem;font:inherit;padding:.45rem;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+.reply .row{display:flex;gap:.5rem;margin-top:.35rem;align-items:center}
+button{font:inherit;font-size:.85rem;padding:.3rem .8rem;border-radius:6px;border:1px solid var(--accent);background:var(--accent);color:var(--bg);cursor:pointer}
+button.ghost{background:transparent;color:var(--accent)}
+.rbtn{float:right;margin-left:.5rem}.sent{color:var(--accent);font-size:.85rem}
+.thread{margin-top:.5rem;display:flex;flex-direction:column;gap:.35rem}
+.msg{max-width:88%;padding:.4rem .65rem;border-radius:10px;font-size:.92rem;white-space:pre-wrap;line-height:1.4}
+.msg.jason{align-self:flex-end;background:var(--accent);color:var(--bg);border-bottom-right-radius:3px}
+.msg.alice{align-self:flex-start;background:var(--bg);border:1px solid var(--line);border-bottom-left-radius:3px}
+.msg small{display:block;opacity:.65;font-size:.72rem;margin-top:.15rem}
+.typing{align-self:flex-start;color:var(--muted);font-size:.82rem;font-style:italic}
+.attach{font-size:.85rem;color:var(--accent);cursor:pointer;border:1px solid var(--accent);border-radius:6px;padding:.3rem .7rem}
+.conv{display:none;margin-top:.5rem;border:1px solid var(--line);border-radius:8px;background:var(--bg)}
+.conv.open{display:block}
+.conv .thread{max-height:320px;overflow-y:auto;padding:.5rem;margin:0;overscroll-behavior:contain}
+.conv .reply{display:block;margin:0;padding:.5rem;border-top:1px solid var(--line)}
+li.blocked{display:none!important}.blockedby{color:var(--muted);font-size:.85rem}
+li[data-tid]{position:relative;padding-right:5.8rem!important;display:flow-root}
+.ctog{position:absolute;right:.5rem;top:.35rem;font-size:.8rem;padding:.2rem .6rem;border-radius:999px;border:1px solid var(--line);background:var(--card);color:var(--muted);cursor:pointer}
+.ctog.unread{border-color:var(--accent);color:var(--accent);font-weight:600}
+.ctog.on{background:var(--accent);color:var(--bg);border-color:var(--accent)}
+details.done{margin:1.6rem 0 .5rem}
+details.done>summary{cursor:pointer;font-size:1.15rem;font-weight:600;padding-bottom:.25rem;border-bottom:1px solid var(--line);color:var(--muted)}
+details.done[open]>summary{color:var(--fg);margin-bottom:.5rem}
+.tab{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;overflow:hidden}
+.tab a{border:0!important;border-radius:0!important}
+.tab.on{background:var(--accent);border-color:var(--accent)}.tab.on a{color:var(--bg)!important;background:transparent!important}
+.tab .x{border:0;background:transparent;color:var(--muted);padding:0 .45rem 0 0;font-size:.95rem;cursor:pointer}.tab.on .x{color:var(--bg)}
+.tab.hid{opacity:.55}.more{border:0!important;font-size:.8rem}
+a.detail{color:inherit;text-decoration:none;border-bottom:1px dashed var(--accent)}a.detail:after{content:' ›';color:var(--accent)}
+#modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10;align-items:flex-start;justify-content:center;padding:6vh 1rem}
+#modal.open{display:flex}
+#modal .mc{background:var(--card);border:1px solid var(--line);border-radius:12px;max-width:720px;width:100%;max-height:84vh;display:flex;flex-direction:column}
+#modal .mh{display:flex;align-items:center;gap:.5rem;padding:.7rem 1rem;border-bottom:1px solid var(--line)}#modal .mt{flex:1}
+#modal .mx{border:0;background:transparent;color:var(--muted);font-size:1.4rem;cursor:pointer}
+#modal .mb{padding:.4rem 1rem 1rem;overflow-y:auto}
+#modal .mi{margin:.5rem 0 .7rem;color:var(--muted);font-size:.92rem}
+#modal details.note{margin:.2rem 0 .8rem;border:1px solid var(--line);border-radius:8px;padding:.35rem .7rem;background:var(--bg)}
+#modal details.note summary{cursor:pointer;color:var(--muted);font-size:.88rem}
+#modal ol.tl{list-style:none;margin:0;padding:0 0 0 .2rem;border-left:2px solid var(--line)}
+#modal ol.tl li{position:relative;margin:0;padding:.3rem 0 .3rem .9rem;font-size:.92rem;line-height:1.4;white-space:pre-wrap;word-break:break-word}
+#modal ol.tl li:before{content:'';position:absolute;left:-6px;top:.72rem;width:10px;height:10px;border-radius:50%;background:var(--card);border:2px solid var(--line)}
+#modal ol.tl li.ev-checked:before,#modal ol.tl li.ev-commit:before{background:var(--accent);border-color:var(--accent)}
+#modal ol.tl li.ev-jason:before{border-color:var(--accent)}
+#modal ol.tl time{display:block;color:var(--muted);font-size:.75rem}
+#modal ol.tl del{color:var(--muted)}#modal ol.tl ins{text-decoration:none;color:var(--accent)}
+#modal ol.tl code{font-size:.82em}
+strong.leaf{cursor:pointer;text-decoration:underline dotted var(--muted);text-underline-offset:3px}
+li.dragging{opacity:.4}
+.dh{cursor:grab;color:var(--muted);user-select:none;margin-right:.35rem;font-size:.9rem}
+#chatpage{display:flex;flex-direction:column;height:calc(100vh - 7rem);min-height:28rem}
+#chatpage h1{margin:0 0 .4rem}
+#chatpage .intro{color:var(--muted);font-size:.9rem;margin:0 0 .6rem}
+#chatpage .thread{flex:1;overflow-y:auto;overscroll-behavior:contain;padding:.6rem;border:1px solid var(--line);border-radius:8px;background:var(--card);display:flex;flex-direction:column;gap:.35rem}
+#chatpage .reply{display:block;margin-top:.6rem;padding:0}
+#chatpage textarea{width:100%;min-height:3.4rem;font:inherit;padding:.5rem;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+#chatpage .row{display:flex;gap:.5rem;margin-top:.35rem;align-items:center}
+.pv{display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.35rem}.pv:empty{display:none}
+.pv .chip{position:relative;display:inline-flex;align-items:center;gap:.3rem;border:1px solid var(--line);border-radius:6px;background:var(--card);padding:.2rem .5rem;font-size:.8rem;max-width:14rem}
+.pv .chip img{height:3.2rem;max-width:6rem;object-fit:cover;border-radius:4px}
+.pv .chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pv .chip b{cursor:pointer;color:var(--muted);font-weight:normal;padding:0 .15rem}
+.rvbtn{display:inline-block;margin:.25rem 0 0 .5rem;font-size:.85rem;font-weight:600;padding:.2rem .7rem;border-radius:999px;background:var(--accent);color:var(--bg)!important;text-decoration:none!important;border:1px solid var(--accent)}
+#reviewpage .meta{color:var(--muted);font-size:.9rem;margin:0 0 .8rem}
+#reviewpage .plan{padding:.2rem 1rem;border:1px solid var(--line);border-radius:8px;background:var(--card)}
+#reviewpage .actions{display:grid;gap:.8rem;margin-top:1rem}
+#reviewpage .act{border:1px solid var(--line);border-radius:8px;padding:.6rem .8rem;background:var(--card)}
+#reviewpage .act h3{margin:0 0 .35rem}
+#reviewpage .act textarea{width:100%;min-height:3.4rem;font:inherit;padding:.45rem;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+#reviewpage .act .row{display:flex;gap:.5rem;margin-top:.35rem;align-items:center}
+#reviewpage .act.approve h3{color:var(--accent)}#reviewpage .act.reject h3{color:var(--warn)}
+#reviewpage button.reject{background:var(--warn);border-color:var(--warn)}
+</style></head><body>
+<header><b>Alice</b><nav id="nav"></nav><span id="age"></span></header>
+<div id="modal" onclick="if(event.target===this)closeModal()"><div class="mc"><div class="mh"><b class="mt"></b><button class="mx" onclick="closeModal()">×</button></div><div class="mb"></div></div></div>
+<main id="doc">Loading…</main>
+<script src="marked.min.js"></script>
+<script>
+const q=new URLSearchParams(location.search);const page=(q.get('p')||'index').replace(/[^a-z0-9_-]/gi,'');
+
+const KEY=(()=>{const k=q.get('k');if(k){localStorage.setItem('alice-key',k);history.replaceState(null,'',location.pathname+(page!=='index'?'?p='+page:''))}return localStorage.getItem('alice-key')||''})();
+let replyOpen=false,THREADS={};
+const slug=t=>t.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,60);
+const esc=t=>t.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+function fmt(at){const d=new Date(at);return isNaN(d)?'':d.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'})}
+const seen=JSON.parse(localStorage.getItem('alice-seen')||'{}'),openSet=new Set(JSON.parse(localStorage.getItem('alice-open')||'[]'));
+const saveUI=()=>{localStorage.setItem('alice-seen',JSON.stringify(seen));localStorage.setItem('alice-open',JSON.stringify([...openSet]))};
+const MAX_FILES=5,MAX_PER_FILE=10*1024*1024,OK_TYPE=/^(image\/|text\/|application\/(pdf|json|zip)$)/;
+const toB64=f=>new Promise((ok,no)=>{const rd=new FileReader();rd.onload=()=>ok({name:f.name,data:rd.result.split(',')[1]});rd.onerror=no;rd.readAsDataURL(f)});
+function attachState(ta,fi,pv,sm){
+  const pending=[];
+  const draw=()=>{
+    pv.innerHTML='';
+    pending.forEach((f,i)=>{
+      const c=document.createElement('div');c.className='chip';
+      if(f.type.startsWith('image/')){const im=document.createElement('img');im.src=URL.createObjectURL(f);im.onload=()=>URL.revokeObjectURL(im.src);c.appendChild(im)}
+      const n=document.createElement('span');n.textContent=f.name;n.title=f.name;c.appendChild(n);
+      const x=document.createElement('b');x.textContent='×';x.title='Remove';x.onclick=()=>{pending.splice(i,1);draw()};c.appendChild(x);
+      pv.appendChild(c)});
+    if(pending.length)replyOpen=true;
+  };
+  const add=list=>{
+    for(const f of list){
+      if(pending.length>=MAX_FILES){sm.textContent='At most '+MAX_FILES+' attachments.';break}
+      if(!OK_TYPE.test(f.type)){sm.textContent=f.name+': file type not allowed.';continue}
+      if(f.size>MAX_PER_FILE){sm.textContent=f.name+': over 10 MB.';continue}
+      const named=f.name&&f.name!=='image.png'?f:new File([f],'paste-'+Date.now()+'-'+pending.length+'.'+(f.type.split('/')[1]||'png').replace(/[^a-z0-9]/gi,''),{type:f.type});
+      pending.push(named)}
+    draw()};
+  ta.addEventListener('paste',e=>{const fs=[...(e.clipboardData?.files||[])];if(fs.length){e.preventDefault();add(fs)}});
+  if(fi)fi.onchange=()=>{add([...fi.files]);fi.value=''};
+  return {pending,encode:()=>Promise.all(pending.map(toB64)),clear:()=>{pending.length=0;draw()}};
+}
+function renderThread(li){
+  const tid=li.dataset.tid,conv=li.querySelector(':scope > .conv'),t=conv.querySelector('.thread'),tog=li.querySelector(':scope > .ctog');
+  const msgs=THREADS[tid]||[],open=conv.classList.contains('open');
+  const atBottom=t.scrollHeight-t.scrollTop-t.clientHeight<40;
+  t.innerHTML=msgs.length?msgs.map(m=>`<div class="msg ${m.from==='jason'?'jason':'alice'}">${esc(m.text||'')}${(m.files||[]).map(n=>`<div>📎 ${esc(n)}</div>`).join('')}<small>${m.from==='jason'?'You':'Alice'} · ${fmt(m.at)}</small></div>`).join('')+
+    (msgs[msgs.length-1].from==='jason'?'<div class="typing">Alice is on it…</div>':''):'<div class="typing">No messages yet.</div>';
+  t.style.display='flex';t.style.flexDirection='column';t.style.gap='.35rem';
+  if(open){seen[tid]=msgs.length;saveUI();if(atBottom||t.dataset.first!=='1'){t.scrollTop=t.scrollHeight;t.dataset.first='1'}}
+  const unread=msgs.length-(seen[tid]||0);
+  tog.textContent=open?'Hide':(msgs.length?`💬 ${msgs.length}${unread>0?` · ${unread} new`:''}`:'💬 Reply');
+  tog.classList.toggle('unread',!open&&unread>0);tog.classList.toggle('on',open);
+}
+const liTid=li=>{const st=li.querySelector('strong'); const label=(st?st.textContent:li.textContent.split(/[—:]/)[0]).trim(); return label?slug(label):''};
+function waitingLists(){
+  const out=[];let waiting=false;
+  document.querySelectorAll('#doc > *').forEach(el=>{
+    if(/^H[12]$/.test(el.tagName)) waiting=/waiting on you/i.test(el.textContent);
+    else if(waiting&&el.tagName==='UL')out.push(el);
+  });
+  return out;
+}
+// <merge-order>
+// Known slugs take the slots known items occupy, in saved sequence; unknown items keep their slot.
+function mergeWaitingOrder(natural,saved){
+  const rank=new Map();saved.forEach((t,i)=>{if(!rank.has(t))rank.set(t,i)});
+  const known=natural.filter(t=>rank.has(t)).sort((a,b)=>rank.get(a)-rank.get(b));
+  let k=0;return natural.map(t=>rank.has(t)?known[k++]:t);
+}
+// </merge-order>
+let WAITING_ORDER=[];
+function applyWaitingOrder(){
+  if(!WAITING_ORDER.length)return;
+  waitingLists().forEach(ul=>{
+    const lis=[...ul.querySelectorAll(':scope > li')],tids=lis.map(liTid);
+    if(tids.some(t=>!t)||new Set(tids).size!==tids.length)return;
+    const byTid=new Map(lis.map((li,i)=>[tids[i],li]));
+    const merged=mergeWaitingOrder(tids,WAITING_ORDER);
+    merged.forEach(t=>ul.appendChild(byTid.get(t)));
+  });
+}
+async function saveWaitingOrder(ul){
+  const order=[...ul.querySelectorAll(':scope > li')].map(li=>li.dataset.tid||liTid(li)).filter(Boolean);
+  try{const r=await fetch('api/waiting-order',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:KEY,order})});
+    if(r.ok)WAITING_ORDER=order}catch(e){}
+}
+function makeDraggable(){
+  if(!KEY)return;
+  waitingLists().forEach(ul=>{
+    let drag=null;
+    ul.querySelectorAll(':scope > li').forEach(li=>{
+      if(li.querySelector(':scope > .dh'))return;
+      const h=document.createElement('span');h.className='dh';h.textContent='⠿';h.title='Drag to reorder';
+      h.onmousedown=()=>{li.draggable=true};
+      h.onmouseup=()=>{li.draggable=false};
+      li.insertBefore(h,li.firstChild);
+      li.addEventListener('dragstart',e=>{drag=li;li.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',li.dataset.tid||'')});
+      li.addEventListener('dragover',e=>{
+        if(!drag||drag===li||drag.parentNode!==ul)return;
+        e.preventDefault();const r=li.getBoundingClientRect();
+        ul.insertBefore(drag,e.clientY<r.top+r.height/2?li:li.nextSibling);
+      });
+      li.addEventListener('drop',e=>{if(drag)e.preventDefault()});
+      li.addEventListener('dragend',()=>{li.draggable=false;li.classList.remove('dragging');if(drag===li){drag=null;saveWaitingOrder(ul)}});
+    });
+  });
+}
+function addReplies(){
+  let waiting=false;
+  document.querySelectorAll('#doc > *').forEach(el=>{
+    if(/^H[12]$/.test(el.tagName)) waiting=/waiting on you/i.test(el.textContent);
+    if(el.tagName!=='UL')return;
+    el.querySelectorAll(':scope > li').forEach(li=>{
+      if(li.dataset.tid)return; const tid=liTid(li); if(!tid)return;
+       li.dataset.tid=tid; const itemText=li.textContent.replace(/\s+/g,' ').trim().slice(0,400);
+      const has=(THREADS[tid]||[]).length>0;
+      const tog=document.createElement('button');tog.className='ctog';
+      const conv=document.createElement('div');conv.className='conv';
+      conv.innerHTML='<div class="thread"></div><div class="reply"><textarea placeholder="Message Alice about this…"></textarea><div class="row"><button>Send</button><label class="attach">📎 Attach<input type="file" multiple hidden></label><span class="sent"></span></div><div class="pv"></div></div>';
+      if(openSet.has(tid))conv.classList.add('open');
+      tog.onclick=()=>{const o=conv.classList.toggle('open');o?openSet.add(tid):openSet.delete(tid);saveUI();renderThread(li);if(o)conv.querySelector('textarea').focus({preventScroll:true})};
+      const ta=conv.querySelector('textarea'),sm=conv.querySelector('.sent'),send=conv.querySelector('.row button'),fi=conv.querySelector('input[type=file]');
+      const att=attachState(ta,fi,conv.querySelector('.pv'),sm);
+      ta.addEventListener('input',()=>{replyOpen=!!ta.value});
+      ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();send.click()}});
+      send.onclick=async()=>{
+        if(!ta.value.trim()&&!att.pending.length)return;
+        if(!KEY){sm.textContent='No key: open the link Alice sent once.';return}
+        send.disabled=true;sm.textContent='Sending…';
+        try{const files=await att.encode();
+          const r=await fetch('api/reply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:KEY,item:itemText,thread:tid,text:ta.value,files,page})});
+          const j=await r.json();
+          if(r.ok){sm.textContent='';ta.value='';att.clear();replyOpen=false;await pollThreads();const t=conv.querySelector('.thread');t.scrollTop=t.scrollHeight}else sm.textContent='Error: '+(j.error||r.status)}
+        catch(e){sm.textContent='Error: '+e.message}
+        send.disabled=false};
+      li.insertBefore(tog,li.firstChild.nextSibling);li.appendChild(conv);renderThread(li);
+      if(waiting&&REVIEWS.has(tid)){const a=document.createElement('a');a.className='rvbtn';a.href='?p=review-'+tid;a.textContent='Review plan →';li.insertBefore(a,conv)}
+    });
+  });
+}
+function collapseDone(){
+  const h=[...document.getElementById('doc').children].find(el=>el.tagName==='H2'&&/^done today/i.test(el.textContent.trim()));
+  if(!h)return;
+  const members=[];let n=h.nextElementSibling;
+  while(n&&!/^H[12]$/.test(n.tagName)){members.push(n);n=n.nextElementSibling}
+  const count=members.reduce((a,m)=>a+(m.tagName==='UL'?m.querySelectorAll(':scope > li').length:0),0);
+  const d=document.createElement('details');d.className='done';
+  const sm=document.createElement('summary');sm.textContent='Done today · '+count;
+  d.appendChild(sm);members.forEach(m=>d.appendChild(m));
+  d.open=localStorage.getItem('alice-done-open')==='1';
+  d.addEventListener('toggle',()=>localStorage.setItem('alice-done-open',d.open?'1':'0'));
+  h.replaceWith(d);
+}
+let AVAIL=new Set(),REVIEWS=new Set();
+const depsOf=li=>{const out=[];
+  for(const n of [...li.childNodes,...[...li.querySelectorAll(':scope > p')].flatMap(p=>[...p.childNodes])])
+    if(n.nodeType===8){const m=/^\s*deps:([\s\S]*)$/.exec(n.nodeValue);if(m)for(const d of m[1].split(',')){const s=d.trim().toLowerCase().replace(/[^a-z0-9-]/g,'').slice(0,60).replace(/^-+|-+$/g,'');if(s&&!out.includes(s))out.push(s)}}
+  return out};
+// A dep is open unless its item is known and checked; unknown slugs stay open so typos fail safe.
+const openDeps=(deps,checked)=>deps.filter(d=>checked[d]!==true);
+async function applyBlocked(){
+  const checked={};
+  try{const r=await fetch('api/item-state?'+Date.now());if(r.ok){const st=await r.json();for(const k in st)checked[k]=st[k].checked}}catch(e){}
+  document.querySelectorAll('#doc li').forEach(li=>{const cb=li.querySelector(':scope > input[type=checkbox]'),st=li.querySelector('strong');
+    if(cb&&st)checked[slug(st.textContent.replace(/[:.]+$/,''))]=cb.checked});
+  document.querySelectorAll('#doc li').forEach(li=>{
+    const deps=depsOf(li);if(!deps.length)return;
+    const open=openDeps(deps,checked);if(!open.length)return;
+    const cb=li.querySelector(':scope > input[type=checkbox]');if(cb&&cb.checked)return;
+    const d=document.createElement('div');d.className='blockedby';d.textContent='blocked by '+open.join(', ');
+    li.appendChild(d);li.classList.add('blocked')});
+}
+function linkDetails(){
+  document.querySelectorAll('#doc li').forEach(li=>{
+    const st=li.querySelector('strong');if(!st||st.closest('a'))return;
+    const s=slug(st.textContent.replace(/[:.]+$/,''));if(!AVAIL.has(s)||s===page)return;
+    const a=document.createElement('a');a.href='?p='+s;a.className='detail';a.title='Open details';st.replaceWith(a);a.appendChild(st);
+  });
+}
+let PAGES=[];
+const plain=t=>String(t??'').replace(/[*_`~]+/g,'').replace(/\s+/g,' ').trim();
+const clip=(t,n)=>t.length>n?t.slice(0,n-1)+'…':t;
+const pageTitle=p=>(PAGES.find(x=>x.slug===p)||{}).title||p;
+const where=(p,section)=>String(section?section+(p&&p!==page?' ('+pageTitle(p)+')':''):pageTitle(p||''));
+function ts(at){const s=String(at||'').replace(/([+-]\d\d)(\d\d)$/,'$1:$2');const d=new Date(s);return isNaN(d)?null:d}
+function when(d){return d?d.toLocaleString([],{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}):''}
+function wordDiff(a,b){
+  const A=plain(a).split(' '),B=plain(b).split(' ');let i=0;while(i<A.length&&i<B.length&&A[i]===B[i])i++;
+  let j=0;while(j<A.length-i&&j<B.length-i&&A[A.length-1-j]===B[B.length-1-j])j++;
+  const o=A.slice(i,A.length-j).join(' '),n=B.slice(i,B.length-j).join(' ');
+  return (i?'… ':'')+(o?`<del>${esc(clip(o,160))}</del>`:'')+(o&&n?' → ':'')+(n?`<ins>${esc(clip(n,160))}</ins>`:(o?' (removed)':''))+(j?' …':'')||'(formatting only)';
+}
+function timeline(h){
+  const rows=[];
+  for(const e of h.events||[]){let t='',c='ev';
+    if(e.type==='appeared')t=e.seeded?`Already in ${esc(where(e.page,e.section))} when tracking started`+(e.checked?' (checked)':''):`Added to ${esc(where(e.page,e.section))}`+(e.checked?' (checked)':'');
+    else if(e.type==='checked'){t='Checked off';c='ev-checked'}
+    else if(e.type==='unchecked')t='Unchecked';
+    else if(e.type==='text_changed')t='Text changed: '+wordDiff(e.old,e.new);
+    else if(e.type==='moved')t=`Moved to ${esc(where(e.to?.page,e.to?.section))}`+(e.from?` from ${esc(where(e.from.page,e.from.section))}`:'');
+    else if(e.type==='removed')t=`Removed from ${esc(where(e.page,e.section))}`;
+    else t=esc(e.type||'event');
+    rows.push({d:ts(e.at),t,c})}
+  for(const m of h.thread||[]){const me=m.from==='jason';
+    rows.push({d:ts(m.at),c:me?'ev-jason':'ev',t:`${me?'You':'Alice'}: ${esc(clip(m.text||'',600))}`+((m.files||[]).length?` 📎 ${esc(m.files.join(', '))}`:'')})}
+  for(const x of h.extra||[]){
+    const t=x.sha?`${x.merge?'Merged':'Commit'} <code>${esc(String(x.sha).slice(0,10))}</code>: ${esc(clip(x.subject||'',200))}`:esc(clip(x.text||x.subject||JSON.stringify(x),300));
+    rows.push({d:ts(x.at),t,c:x.sha?'ev-commit':'ev'})}
+  rows.forEach((r,i)=>r.i=i);
+  rows.sort((a,b)=>((a.d?a.d.getTime():0)-(b.d?b.d.getTime():0))||a.i-b.i);
+  return rows.length?'<ol class="tl">'+rows.map(r=>`<li class="${r.c}"><time>${when(r.d)}</time>${r.t}</li>`).join('')+'</ol>':'<p class="typing">No history recorded yet. Changes to this item show up here automatically.</p>';
+}
+function openModal(title,itemHtml,tid){
+  const m=document.getElementById('modal');m.querySelector('.mt').textContent=title;
+  const body=m.querySelector('.mb');body.innerHTML='<div class="typing">Loading…</div>';m.classList.add('open');m.dataset.tid=tid;
+  const get=u=>fetch(u).then(r=>r.ok?r.json():null).catch(()=>null);
+  Promise.all([get('api/history?slug='+encodeURIComponent(tid)),get('api/note?slug='+encodeURIComponent(tid))]).then(([h,n])=>{
+    if(m.dataset.tid!==tid)return;
+    if(!h&&!n){body.innerHTML='<p class="typing">Could not load.</p>';return}
+    body.innerHTML=`<div class="mi">${itemHtml}</div>`+
+      (n?`<details class="note"><summary>Alice's note (written summary) · updated ${when(new Date(n.updated*1000))}</summary>${marked.parse(n.markdown,{gfm:true})}</details>`:'')+
+      timeline(h||{});
+  });
+}
+function closeModal(){document.getElementById('modal').classList.remove('open')}
+function linkLeaves(){
+  document.querySelectorAll('#doc li').forEach(li=>{
+    const st=li.querySelector('strong');if(!st||st.closest('a')||st.dataset.leaf)return;
+    st.dataset.leaf='1';st.classList.add('leaf');st.title='What happened';
+    st.onclick=e=>{e.preventDefault();e.stopPropagation();const c=li.cloneNode(true);c.querySelectorAll('.ctog,.conv,.dh,input').forEach(x=>x.remove());
+      openModal(st.textContent.replace(/[:.]+$/,''),c.innerHTML,slug(st.textContent.replace(/[:.]+$/,'')))};
+  });
+}
+async function ensureTab(pages){
+  const me=pages.find(p=>p.slug===page);
+  if(KEY&&page!=='index'&&(!me||me.hidden)){
+    try{const r=await fetch('api/page-visibility',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:KEY,slug:page,action:'open'})});
+      if(r.ok){const j=await r.json();if(j.pages)return j.pages}}catch(e){}
+  }
+  return pages;
+}
+async function pollThreads(){
+  try{const r=await fetch('api/threads?'+Date.now());if(!r.ok)return;THREADS=await r.json();
+    document.querySelectorAll('#doc li[data-tid]').forEach(li=>{if(li.querySelector(':scope > .conv'))renderThread(li)});}catch(e){}
+}
+setInterval(pollThreads,5000);
+let SHOW_HIDDEN=false;
+const PINNED=new Set(['index','chat','bugs']);
+function withChatTab(pages){
+  // Inject the Chat tab (not in pages.json; always visible, not dismissible).
+  if(pages.some(p=>p.slug==='chat'))return pages;
+  return [...pages,{slug:'chat',title:'Chat'}];
+}
+function renderNav(pages){
+  pages=withChatTab(pages);
+  const vis=pages.filter(p=>!p.hidden||p.slug===page),hid=pages.filter(p=>p.hidden&&p.slug!==page);
+  const tab=p=>`<span class="tab ${p.slug===page?'on':''}${p.hidden?' hid':''}"><a href="?p=${p.slug}">${esc(p.title)}</a>${!PINNED.has(p.slug)&&KEY?`<button class="x" data-s="${p.slug}" data-a="${p.hidden?'restore':'dismiss'}" title="${p.hidden?'Restore':'Dismiss'} tab">${p.hidden?'↺':'×'}</button>`:''}</span>`;
+  const perm=vis.filter(p=>PINNED.has(p.slug)),dyn=vis.filter(p=>!PINNED.has(p.slug));
+  let dynhtml=dyn.map(tab).join('');
+  if(hid.length)dynhtml+=SHOW_HIDDEN?hid.map(tab).join('')+'<a class="more" href="#" data-t="1">hide dismissed</a>':`<a class="more" href="#" data-t="1">+${hid.length} dismissed</a>`;
+  const html=`<div class="navrow perm">${perm.map(tab).join('')}</div>`+(dynhtml?`<div class="navrow dyn">${dynhtml}</div>`:'');
+  const nav=document.getElementById('nav');nav.innerHTML=html;
+  nav.querySelectorAll('.x').forEach(b=>b.onclick=async e=>{e.preventDefault();
+    const r=await fetch('api/page-visibility',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:KEY,slug:b.dataset.s,action:b.dataset.a})});
+    if(r.ok){if(b.dataset.a==='dismiss'&&b.dataset.s===page)location.href='?p=index';else load()}});
+  nav.querySelectorAll('[data-t]').forEach(a=>a.onclick=e=>{e.preventDefault();SHOW_HIDDEN=!SHOW_HIDDEN;renderNav(pages)});
+}
+let CHAT=[],chatMounted=false;
+function renderChatThread(force){
+  const t=document.querySelector('#chatpage .thread');if(!t)return;
+  const atBottom=t.scrollHeight-t.scrollTop-t.clientHeight<60;
+  const last=CHAT[CHAT.length-1];
+  t.innerHTML=CHAT.length?CHAT.map(m=>`<div class="msg ${m.from==='jason'?'jason':'alice'}">${esc(m.text||'')}${(m.files||[]).map(n=>`<div>📎 ${esc(n)}</div>`).join('')}<small>${m.from==='jason'?'You':'Alice'} · ${fmt(m.at)}</small></div>`).join('')+
+    (last&&last.from==='jason'?'<div class="typing">Alice is on it…</div>':''):'<div class="typing">No messages yet. Say hi.</div>';
+  if(force||atBottom)t.scrollTop=t.scrollHeight;
+  seen.chat=CHAT.length;saveUI();
+}
+async function pollChat(force){
+  if(page!=='chat')return;
+  try{const r=await fetch('api/chat?'+Date.now());if(!r.ok)return;const j=await r.json();CHAT=j.messages||[];renderChatThread(force)}catch(e){}
+}
+function mountChat(){
+  chatMounted=true;replyOpen=false;
+  const doc=document.getElementById('doc');
+  doc.innerHTML=`<div id="chatpage"><h1>Chat</h1><p class="intro">General line to Alice — no todo item attached. She'll reply right here.</p><div class="thread"><div class="typing">Loading…</div></div><div class="reply"><textarea placeholder="Message Alice…"></textarea><div class="row"><button>Send</button><label class="attach">📎 Attach<input type="file" multiple hidden></label><span class="sent"></span></div><div class="pv"></div></div></div>`;
+  const ta=doc.querySelector('textarea'),sm=doc.querySelector('.sent'),send=doc.querySelector('.row button'),fi=doc.querySelector('input[type=file]');
+  const att=attachState(ta,fi,doc.querySelector('.pv'),sm);
+  ta.addEventListener('input',()=>{replyOpen=!!ta.value});
+  const submit=async()=>{
+    if(!ta.value.trim()&&!att.pending.length)return;
+    if(!KEY){sm.textContent='No key: open the link Alice sent once.';return}
+    send.disabled=true;sm.textContent='Sending…';
+    try{
+      const files=await att.encode();
+      const r=await fetch('api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:KEY,text:ta.value,files})});
+      const j=await r.json();
+      if(r.ok){sm.textContent='';ta.value='';att.clear();replyOpen=false;await pollChat(true)}
+      else sm.textContent='Error: '+(j.error||r.status);
+    }catch(e){sm.textContent='Error: '+e.message}
+    send.disabled=false;
+  };
+  send.onclick=submit;
+  ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();submit()}});
+}
+// Staleness tint: every spliced section renderer ends its body with an
+// italic ``*last_rendered: <iso> · source: <name>*`` line. Find those,
+// parse the timestamp, and add a .stale class to the h2 above when
+// the delta exceeds STALE_MS.
+const STALE_MS=30*1000;
+function markStaleSections(){
+  const doc=document.getElementById('doc');
+  if(!doc)return;
+  const now=Date.now();
+  // The parser renders the italic line as a trailing <em> inside the
+  // <p> that immediately precedes the next <h2> (or EOF). Walk every
+  // <em> and keep the ones whose text starts with "last_rendered:".
+  doc.querySelectorAll('em').forEach(em=>{
+    const txt=(em.textContent||'').trim();
+    if(!/^last_rendered:/.test(txt))return;
+    em.classList.add('stale-footer');
+    const m=txt.match(/^last_rendered:\s*(\S+)/);
+    if(!m)return;
+    const t=Date.parse(m[1]);
+    if(!isFinite(t))return;
+    if(now-t<=STALE_MS)return;
+    // Walk back to the nearest preceding <h2>.
+    let n=em;
+    while(n&&n.previousElementSibling==null&&n.parentElement)n=n.parentElement;
+    while(n){
+      n=n.previousElementSibling||(n.parentElement&&n.parentElement.previousElementSibling);
+      if(!n)break;
+      if(n.tagName==='H2'){n.classList.add('stale');break}
+    }
+  });
+}
+let reviewMounted=false;
+async function mountReview(){
+  reviewMounted=true;replyOpen=false;
+  const doc=document.getElementById('doc'),rslug=page.slice('review-'.length);
+  const r=await fetch('api/review?slug='+encodeURIComponent(rslug)+'&'+Date.now()).catch(()=>null);
+  if(!r||!r.ok){doc.innerHTML='<p class="typing">No such review item.</p><p><a href="?p=index">← Back to status</a></p>';return}
+  const v=await r.json();
+  const act=(k,label,hint,cls)=>`<div class="act ${k}"><h3>${label}</h3><textarea data-a="${k}" placeholder="${hint}"></textarea><div class="row"><button class="${cls||''}" data-a="${k}">${label}</button><span class="sent"></span></div></div>`;
+  doc.innerHTML=`<div id="reviewpage"><p><a href="?p=index">← Back to status</a></p><h1>${esc(v.title)}</h1><p class="meta">${v.url?`<a href="${esc(v.url)}">${esc((v.repo||'')+(v.issue?'#'+v.issue:'')||'source')}</a> · `:''}updated ${when(new Date(v.updated*1000))}</p><div class="plan">${marked.parse(v.markdown||'',{gfm:true})}</div><div class="actions">`+
+    act('approve','Approve','Optional notes for Alice…')+act('modify','Modify','What should change? (required)')+act('reject','Reject','Why? (optional)','reject')+'</div></div>';
+  doc.querySelectorAll('textarea').forEach(t=>t.addEventListener('input',()=>{replyOpen=[...doc.querySelectorAll('textarea')].some(x=>x.value)}));
+  doc.querySelectorAll('.act button').forEach(b=>b.onclick=async()=>{
+    const box=b.closest('.act'),ta=box.querySelector('textarea'),sm=box.querySelector('.sent'),a=b.dataset.a;
+    if(!KEY){sm.textContent='No key: open the link Alice sent once.';return}
+    if(a==='modify'&&!ta.value.trim()){sm.textContent='Say what to change first.';return}
+    if(a==='reject'&&!confirm('Reject this plan?'))return;
+    doc.querySelectorAll('.act button').forEach(x=>x.disabled=true);sm.textContent='Sending…';
+    try{const rr=await fetch('api/review-action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:KEY,slug:rslug,action:a,notes:ta.value})});
+      const j=await rr.json();
+      if(rr.ok){replyOpen=false;doc.querySelector('.actions').innerHTML=`<p class="sent">Sent: ${esc(a)}. Alice is on it. <a href="?p=index">Back to status</a></p>`;return}
+      sm.textContent='Error: '+(j.error||rr.status)}
+    catch(e){sm.textContent='Error: '+e.message}
+    doc.querySelectorAll('.act button').forEach(x=>x.disabled=false)});
+}
+async function load(){
+  if(replyOpen&&page!=='chat')return;
+  if(page.startsWith('review-')){
+    try{
+      if(!reviewMounted)await mountReview();
+      document.getElementById('age').textContent='';
+      const pr=await fetch('pages.json?'+Date.now()).catch(()=>null);
+      if(pr&&pr.ok){PAGES=await pr.json();renderNav(PAGES)}
+      document.title='Alice — Review';
+    }catch(e){document.getElementById('doc').textContent='Could not load review ('+e.message+')'}
+    return;
+  }
+  if(page==='chat'){
+    try{
+      const pr=await fetch('pages.json?'+Date.now()).catch(()=>null);
+      if(!chatMounted)mountChat();
+      await pollChat(true);
+      document.getElementById('age').textContent='';
+      try{const ar=await fetch('api/pages?'+Date.now());if(ar.ok)AVAIL=new Set(await ar.json())}catch(e){}
+      if(pr&&pr.ok){PAGES=await pr.json();renderNav(PAGES)}
+      document.title='Alice — Chat';
+    }catch(e){document.getElementById('doc').textContent='Could not load Chat ('+e.message+')'}
+    return;
+  }
+  try{
+    const [r,pr,wo]=await Promise.all([fetch(page+'.md?'+Date.now()),fetch('pages.json?'+Date.now()).catch(()=>null),fetch('api/waiting-order?'+Date.now()).catch(()=>null)]);
+    if(wo&&wo.ok){try{WAITING_ORDER=(await wo.json()).order||[]}catch(e){}}
+    if(!r.ok)throw new Error(r.status);
+    const lm=r.headers.get('last-modified');
+    document.getElementById('doc').innerHTML=marked.parse(await r.text(),{gfm:true});
+    document.querySelectorAll('#doc input[type=checkbox]').forEach(c=>c.disabled=true);
+    markStaleSections();
+    applyWaitingOrder();
+    try{const rv=await fetch('api/reviews?'+Date.now());REVIEWS=new Set(rv.ok?await rv.json():[])}catch(e){}
+    await pollThreads();addReplies();makeDraggable();
+    if(lm){const m=Math.round((Date.now()-new Date(lm))/60000);document.getElementById('age').textContent='updated '+(m<1?'just now':m<60?m+' min ago':Math.round(m/60)+' h ago')}
+    try{const ar=await fetch('api/pages?'+Date.now());if(ar.ok)AVAIL=new Set(await ar.json())}catch(e){}
+    linkDetails();linkLeaves();collapseDone();await applyBlocked();
+    if(pr&&pr.ok){PAGES=await ensureTab(await pr.json());renderNav(PAGES)}
+    document.title='Alice — '+(document.querySelector('#doc h1')?.textContent||page);
+  }catch(e){document.getElementById('doc').textContent='Could not load '+page+'.md ('+e.message+')'}
+}
+setInterval(()=>pollChat(false),5000);
+let PAGE_VER=null;
+async function checkVersion(){try{const r=await fetch('legacy.html',{method:'HEAD',cache:'no-store'});const v=r.headers.get('last-modified');if(PAGE_VER&&v&&v!==PAGE_VER&&!replyOpen)location.reload();PAGE_VER=PAGE_VER||v}catch(e){}}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal()});
+load();checkVersion();setInterval(load,60000);setInterval(checkVersion,30000);
+</script></body></html>
