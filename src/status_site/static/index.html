@@ -77,6 +77,24 @@ h2.sec-heading {
   border-bottom: 1px solid var(--color-border-line);
 }
 .sec { margin: 1rem 0; }
+.tier { margin: 1.6rem 0 0; }
+.tier-heading {
+  font-size: 1.2rem; margin: 0 0 .4rem;
+  padding-bottom: .25rem;
+  border-bottom: 2px solid var(--color-border-line);
+}
+.tier-heading .tier-hint {
+  font-size: .8rem; font-weight: 400; margin-left: .6rem;
+  color: var(--color-fg-muted);
+}
+.tier-top .tier-heading { border-bottom-color: var(--color-warn); }
+.tier-aside > summary {
+  cursor: pointer; font-weight: 600; color: var(--color-fg-muted);
+  padding: .3rem 0; border-bottom: 1px solid var(--color-border-line);
+}
+summary.fx-group-h { cursor: pointer; }
+details.fx-group { margin-top: .9rem; }
+details.fx-group:first-child { margin-top: 0; }
 .sec-body del { color: var(--color-fg-muted); }
 .sec-body a { color: var(--color-ok); }
 .sec-body ul { padding-left: 1.2rem; }
@@ -348,30 +366,25 @@ function applyTheme() {
 applyTheme();
 
 // ── 2. section catalogue ──────────────────────────────────────────
-const SECTION_ORDER = [
-  "running_now",
-  "ready_for_review",
-  "waiting_on_you",
-  "alice_queue",
-  "done_today",
-  "known_issues",
+// The Overview is split by WHO OWNS THE NEXT ACTION (#691): TOP is
+// Jason's TODO, MIDDLE is Alice's active work (info only), BOTTOM is
+// what already happened. Asides are collapsed disclosures for
+// thinking's queue and system health.
+const TIERS = [
+  {id: "top", title: "Waiting on you", hint: "your next action", sections: ["your_todo"]},
+  {id: "middle", title: "In flight", hint: "Alice's active work — nothing needed from you", sections: ["in_flight"]},
+  {id: "bottom", title: "Recent", hint: "already handled", sections: ["done_today"]},
+  {id: "thinking", title: "Thinking queue", aside: true, sections: ["thinking_queue"]},
+  {id: "health", title: "System health", aside: true, sections: ["system_health"]},
 ];
+const SECTION_ORDER = TIERS.flatMap(t => t.sections);
 const SECTION_LABELS = {
-  running_now: "Running now",
-  ready_for_review: "Ready for Review",
-  waiting_on_you: "Waiting on you",
-  alice_queue: "Alice's queue",
+  your_todo: "Your TODO",
+  in_flight: "Alice's active work",
   done_today: "Done today",
-  known_issues: "Known issues I'm on",
+  thinking_queue: "Thinking's work",
+  system_health: "Health",
 };
-// Which sections render via a typed widget (slice-2). Everything else
-// falls back to the markdown-only Section component.
-const WIDGET_SECTIONS = new Set([
-  "running_now",
-  "waiting_on_you",
-  "alice_queue",
-  "done_today",
-]);
 
 // ── 3. SSE parser ─────────────────────────────────────────────────
 function makeSseParser(onMessage) {
@@ -1630,10 +1643,122 @@ function SmStatePill({state}) {
   const st = state || "unknown";
   return h("span", {className: "fx-pill sm-" + st}, st.replace(/_/g, " "));
 }
-function PipelineGroup({title, count, children}) {
-  return h("div", {className: "fx-group", "data-group": title},
-    h("h4", {className: "fx-group-h"}, title + " (" + count + ")"),
+// Collapsible sub-group. ``open`` is only the initial state: React
+// leaves the attribute alone on re-render, so a user's toggle survives
+// SSE updates.
+function PipelineGroup({title, count, children, open}) {
+  return h("details", {className: "fx-group", "data-group": title, open: open !== false},
+    h("summary", {className: "fx-group-h"}, title + (count == null ? "" : " (" + count + ")")),
     children,
+  );
+}
+const MUTED = {color: "var(--color-fg-muted)", margin: 0};
+function ReviewLinkTable({rows}) {
+  return h(FxTable, {
+    columns: [
+      {key: "repo", label: "repo", cell: r => h("code", null, r.repo || "")},
+      {key: "number", label: "#", numeric: true, cell: r =>
+        r.link
+          ? h("a", {href: r.link, target: "_blank", rel: "noopener"}, "#" + r.number)
+          : h("span", {className: "fx-num"}, "#" + r.number)},
+      {key: "title", label: "title", cell: r =>
+        r.link ? h("a", {href: r.link, target: "_blank", rel: "noopener"}, r.title || "") : (r.title || "")},
+      {key: "age_seconds", label: "age", numeric: true, cell: r =>
+        h("span", {className: "fx-num"}, r.age_seconds == null ? "—" : ageStringSeconds(r.age_seconds))},
+    ],
+    rows: (rows || []).map(r => ({...r, __key: (r.repo || "") + "#" + r.number})),
+  });
+}
+function YourTodoBoard({data, nowMs}) {
+  const d = data || {};
+  const prs = d.prs || [], design = d.design_review || [], attn = d.attention_reacts || [];
+  const failed = d.failed || {};
+  const none = txt => h("p", {style: MUTED}, txt);
+  const warn = list => (list && list.length)
+    ? h("p", {style: {...MUTED, color: "var(--color-warn)"}}, "could not query: " + list.join(", "))
+    : null;
+  return h("div", {className: "your-todo", "data-board": "your-todo"},
+    h(PipelineGroup, {title: "PRs ready for review", count: prs.length},
+      prs.length ? h(ReviewLinkTable, {rows: prs}) : none("(no PRs awaiting review)"),
+      warn(failed.prs)),
+    h(PipelineGroup, {title: "Design review", count: design.length},
+      design.length ? h(ReviewLinkTable, {rows: design}) : none("(no designs awaiting review)"),
+      warn(failed.design_review)),
+    attn.length
+      ? h(PipelineGroup, {title: "Attention reacts", count: attn.length},
+          h(FxTable, {
+            columns: [
+              {key: "emoji", label: "react"},
+              {key: "preview", label: "on message", cell: r => r.preview || ""},
+              {key: "reacted_at", label: "age", cell: r => ageString(r.reacted_at, nowMs)},
+            ],
+            rows: attn.map((r, i) => ({...r, __key: (r.at || "") + i})),
+          }))
+      : null,
+    h(PipelineGroup, {title: "Asks", count: (d.rows || []).length},
+      h(WaitingTable, {rows: d.rows, handZoneMd: d.your_todo_md, nowMs})),
+    h(PipelineGroup, {title: "External TODOs", count: d.external_todos_md ? 1 : 0},
+      d.external_todos_md
+        ? h(MarkdownZone, {markdown: d.external_todos_md})
+        : none("(none listed — edit external-todos.md in the status dir)")),
+  );
+}
+function InFlightBoard({data, nowMs}) {
+  const d = data || {};
+  return h("div", {className: "in-flight", "data-board": "in-flight"},
+    h(PipelineGroup, {title: "Running now", count: (d.running || []).length},
+      h(RunningNowBoard, {rows: d.running, nowMs})),
+    h(PipelineBoard, {pipeline: d.pipeline, surfaces: d.surfaces, tasks: d.tasks}),
+  );
+}
+function ThinkingQueueBoard({data}) {
+  const d = data || {};
+  if (!d.rows || !d.rows.length) {
+    return h("p", {style: MUTED},
+      d.available === false ? "(queue unavailable — no recent sync)" : "(nothing in the thinking queue)");
+  }
+  return h(React.Fragment, null,
+    h(FxTable, {
+      columns: [
+        {key: "phase", label: "phase", cell: r => h("span", {className: "fx-pill"}, r.phase)},
+        {key: "number", label: "#", numeric: true, cell: r =>
+          h("a", {href: r.link, target: "_blank", rel: "noopener"}, "#" + r.number)},
+        {key: "title", label: "title"},
+        {key: "age", label: "age", numeric: true},
+      ],
+      rows: d.rows.map(r => ({...r, __key: "t" + r.number})),
+    }),
+    d.total > d.rows.length ? h("p", {style: MUTED}, (d.total - d.rows.length) + " more…") : null,
+  );
+}
+function SystemHealthBoard({data, nowMs}) {
+  const d = data || {};
+  const deploy = d.deploy || [], pollers = d.pollers || [];
+  return h("div", {"data-board": "system-health"},
+    h(PipelineGroup, {title: "Known issues"}, h(MarkdownZone, {markdown: d.known_issues_md || ""})),
+    h(PipelineGroup, {title: "Deploy status", count: deploy.length},
+      deploy.length
+        ? h(FxTable, {
+            columns: [
+              {key: "host", label: "host", cell: r => h("code", null, r.host || "")},
+              {key: "sha", label: "commit", cell: r => r.sha ? h("code", null, r.sha) : "unknown"},
+              {key: "subject", label: "subject"},
+              {key: "committed", label: "committed", cell: r => r.committed ? ageString(r.committed, nowMs) : ""},
+            ],
+            rows: deploy.map((r, i) => ({...r, __key: "d" + i})),
+          })
+        : h("p", {style: MUTED}, "(unknown)")),
+    h(PipelineGroup, {title: "Poller freshness", count: pollers.length},
+      pollers.length
+        ? h(FxTable, {
+            columns: [
+              {key: "name", label: "source", cell: r => h("code", null, r.name)},
+              {key: "fetched_at", label: "last poll", numeric: true, cell: r =>
+                ageStringSeconds(Math.max(0, nowMs / 1000 - r.fetched_at))},
+            ],
+            rows: pollers.map(r => ({...r, __key: r.name})),
+          })
+        : h("p", {style: MUTED}, "(no poller data yet)")),
   );
 }
 function PipelineBoard({pipeline, surfaces, tasks}) {
@@ -1752,33 +1877,42 @@ function SectionTile({name, data, ts, nowMs}) {
   const stamp = stampText(ts, nowMs);
   const title = SECTION_LABELS[name] || name;
   let inner;
-  if (name === "running_now") {
-    inner = h(RunningNowBoard, {rows: data && data.rows, nowMs});
-  } else if (name === "waiting_on_you") {
-    inner = h(WaitingTable, {
-      rows: data && data.rows,
-      handZoneMd: data && data.hand_zone_md,
-      nowMs,
-    });
-  } else if (name === "alice_queue") {
-    inner = h(PipelineBoard, {
-      pipeline: data && data.pipeline,
-      surfaces: data && data.rows,
-      tasks: data && data.tasks,
-    });
+  if (name === "your_todo") {
+    inner = h(YourTodoBoard, {data, nowMs});
+  } else if (name === "in_flight") {
+    inner = h(InFlightBoard, {data, nowMs});
   } else if (name === "done_today") {
     inner = h(DoneTodayList, {
       prs: data && data.prs,
       asksResolved: data && data.asks_resolved,
     });
+  } else if (name === "thinking_queue") {
+    inner = h(ThinkingQueueBoard, {data});
+  } else if (name === "system_health") {
+    inner = h(SystemHealthBoard, {data, nowMs});
   } else {
-    // Markdown-only fallback for sections slice-2 doesn't widgetise
-    // yet (ready_for_review, known_issues, anything else the server
-    // might start emitting).
+    // Markdown-only fallback for any section the server starts
+    // emitting before the shell learns a widget for it.
     inner = h(MarkdownZone, {markdown: (data && data.markdown) || ""});
   }
   return h("section", {className: "sec", "data-section": name},
     h(FreshnessTile, {title, dataFresh: fresh, stampText: stamp}, inner),
+  );
+}
+
+// A tier groups the section tiles that share an owner of the next
+// action. Asides are collapsed disclosures; the rest are headed blocks.
+function Tier({tier, children}) {
+  if (tier.aside) {
+    return h("details", {className: "tier tier-aside", "data-tier": tier.id},
+      h("summary", null, tier.title),
+      children,
+    );
+  }
+  return h("div", {className: "tier tier-" + tier.id, "data-tier": tier.id},
+    h("h2", {className: "tier-heading"}, tier.title,
+      tier.hint ? h("span", {className: "tier-hint"}, tier.hint) : null),
+    children,
   );
 }
 
@@ -1966,14 +2100,15 @@ function App() {
   let content;
   if (route === "overview") {
     const legacyPayload = state.sections._legacy_md;
-    const sections = SECTION_ORDER
-      .filter(n => state.sections[n])
-      .map(n => h(SectionTile, {
-        key: n, name: n,
-        data: state.sections[n],
-        ts: parseTs(state.ts[n]),
-        nowMs,
-      }));
+    const sections = TIERS
+      .filter(t => t.sections.some(n => state.sections[n]))
+      .map(t => h(Tier, {key: t.id, tier: t},
+        t.sections.filter(n => state.sections[n]).map(n => h(SectionTile, {
+          key: n, name: n,
+          data: state.sections[n],
+          ts: parseTs(state.ts[n]),
+          nowMs,
+        }))));
     content = sections.length
       ? sections
       : (legacyPayload

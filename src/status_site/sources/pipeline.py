@@ -192,6 +192,92 @@ def issue_rows(cached: list[dict], *, now: float) -> list[dict]:
     return out
 
 
+#: Issue states whose next action belongs to Jason (issue #691). Every
+#: other pipeline state — including ``blocked``, which stays visible but
+#: is the dispatcher's to unstick — is Alice-driven.
+JASON_STATES: frozenset[str] = frozenset({"design_review"})
+
+
+def owner_of(state: str) -> str:
+    """``"jason"`` or ``"alice"`` — who owns the next action for ``state``."""
+    return "jason" if state in JASON_STATES else "alice"
+
+
+def sort_rows(rows: Sequence[dict]) -> list[dict]:
+    """Oldest first (unknown age last), then pipeline state, repo, number.
+
+    Pipeline issues carry no urgency, so age is the only ordering signal
+    inside a block; ask rows are urgency-sorted separately.
+    """
+
+    def key(r: dict):
+        age = r.get("age_seconds")
+        return (
+            0 if age is not None else 1,
+            -(age or 0.0),
+            _STATE_RANK.get(r.get("state", ""), len(_STATE_RANK)),
+            r.get("repo", ""),
+            r.get("number") or 0,
+        )
+
+    return sorted(rows, key=key)
+
+
+def split_by_owner(issues: Sequence[dict]) -> dict[str, list[dict]]:
+    """Route SM-active issue rows into ``{"jason": [...], "alice": [...]}``.
+
+    ``design_review`` → Jason; ``selected`` / ``designing`` / ``designed`` /
+    ``building`` / ``reviewing`` / ``blocked`` (and anything unrecognised)
+    → Alice. Each list is :func:`sort_rows`-ordered.
+    """
+    buckets: dict[str, list[dict]] = {"jason": [], "alice": []}
+    for r in issues:
+        buckets[owner_of(str(r.get("state") or ""))].append(r)
+    return {k: sort_rows(v) for k, v in buckets.items()}
+
+
+def age_label_seconds(label: object) -> float | None:
+    """Approximate seconds for review-queue age labels (``<1h`` / ``5h`` / ``3d``)."""
+    s = str(label or "").strip()
+    if s == "<1h":
+        return 1800.0
+    if len(s) > 1 and s[:-1].isdigit() and s[-1] in "hd":
+        return int(s[:-1]) * (3600.0 if s[-1] == "h" else 86400.0)
+    return None
+
+
+def review_item_row(item: object, *, state: str = "") -> dict:
+    """A review-queue ``DesignItem`` / ``PRItem`` (or dict) → widget row."""
+    get = item.get if isinstance(item, dict) else lambda k, d=None: getattr(item, k, d)
+    return {
+        "repo": get("repo", "") or "",
+        "number": get("number"),
+        "title": get("title", "") or "",
+        "state": state,
+        "art": "",
+        "link": get("url", "") or "",
+        "age_seconds": age_label_seconds(get("age", "")),
+    }
+
+
+def merge_design_review(
+    pipeline_rows: Sequence[dict], review_items: Sequence[object]
+) -> list[dict]:
+    """Union of ``sm:design_review`` pipeline rows and review-queue items.
+
+    The two sources overlap (both are label queries); pipeline rows win
+    on ``(repo, number)`` because their age is exact.
+    """
+    out = list(pipeline_rows)
+    seen = {(r.get("repo"), r.get("number")) for r in out}
+    for item in review_items:
+        row = review_item_row(item, state="design_review")
+        if (row["repo"], row["number"]) not in seen:
+            out.append(row)
+            seen.add((row["repo"], row["number"]))
+    return sort_rows(out)
+
+
 def _read_task_yaml(text: str) -> dict[str, str]:
     """Top-level ``key: value`` scalars only; enough for status/title/updated."""
     data: dict[str, str] = {}
