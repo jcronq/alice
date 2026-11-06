@@ -1681,6 +1681,20 @@ class OverviewPollers:
                 repos = _pipeline.repos_sm_from_config()
                 issues, failed = _pipeline.fetch_issues(repos)
                 self._set("pipeline", {"issues": issues, "failed": failed})
+                # Issue #719: synthesise review notes for every open
+                # ``sm:design_review`` + ``art:code`` issue so the
+                # Review tab has something to render. Isolate failures
+                # so a bad disk write doesn't stop the pipeline cache
+                # from updating.
+                try:
+                    _pipeline.ensure_review_notes(
+                        issues, self.cfg.status_dir / "notes"
+                    )
+                except Exception as e:  # noqa: BLE001
+                    print(
+                        f"status_site: ensure_review_notes failed: {e!r}",
+                        flush=True,
+                    )
             except Exception as e:  # noqa: BLE001
                 print(f"status_site: pipeline poll failed: {e!r}", flush=True)
             self.stop.wait(self._pipeline_poll)
@@ -1907,6 +1921,20 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         design_rows = _pipeline.merge_design_review(
             owner["jason"], review.get("design") or []
         )
+        # Issue #719: tag design-review rows whose GH issue has a
+        # synthesised review note so the frontend can link the title
+        # to ``?p=review-<slug>`` instead of straight to GitHub.
+        notes_dir = cfg.status_dir / "notes"
+        if notes_dir.is_dir():
+            existing_slugs = {p.stem for p in notes_dir.glob("*.md")}
+            for row in design_rows:
+                repo = str(row.get("repo") or "")
+                number = row.get("number")
+                if not repo or not number:
+                    continue
+                slug = _pipeline.review_slug_for(repo, number)
+                if f"review-{slug}" in existing_slugs:
+                    row["review_slug"] = slug
         ask_rows = _ask_rows()
         your_todo_md = _waiting_on_you.read_hand_zone(
             cfg.status_dir / "waiting-on-you.md"
@@ -2424,12 +2452,110 @@ His notes:
 """
 
 
+def _sm_comment_body(action: str, notes: str) -> str | None:
+    """Comment body for ``gh issue comment`` or ``None`` if nothing to post.
+
+    Issue #719 contract:
+
+    * ``approve`` → ``[SM] select art=code`` + a note that Jason acted
+      from the status-site Review tab.
+    * ``reject``  → ``[SM] reject reason=<notes>`` (reason falls back
+      to a default phrase when Jason provided no text).
+    * ``modify``  → free-form comment with Jason's notes and a footer
+      that keeps the issue at ``sm:design_review`` for revision.
+    """
+    text = notes.strip()
+    if action == "approve":
+        verb = "[SM] select art=code"
+        return f"{verb}\n\nJason approved via status-site Review tab."
+    if action == "reject":
+        reason = text or "(no reason given)"
+        verb = f"[SM] reject reason={reason}"
+        return f"{verb}\n\nJason rejected via status-site Review tab."
+    if action == "modify":
+        return (
+            f"{text or '(see status-site Review tab)'}\n\n"
+            "(Change request via status-site Review tab — leaving at "
+            "sm:design_review for revision.)"
+        )
+    return None
+
+
+# Dependency-inject-able; tests patch this to assert the gh invocation
+# without shelling out. Takes ``(repo, number, body)`` and returns a
+# ``subprocess.CompletedProcess``-ish object; raise on hard failure.
+_GhCommentRunner = Callable[[str, int, str], subprocess.CompletedProcess]
+
+
+def _run_gh_issue_comment(repo: str, number: int, body: str) -> subprocess.CompletedProcess:
+    """Default ``gh issue comment`` invoker used by :func:`handle_review_action`."""
+    return subprocess.run(
+        [
+            "gh",
+            "issue",
+            "comment",
+            str(number),
+            "--repo",
+            repo,
+            "--body",
+            body,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+
+def _post_review_to_gh(
+    review: dict,
+    action: str,
+    notes: str,
+    *,
+    runner: _GhCommentRunner | None = None,
+) -> dict:
+    """Post Jason's decision back to GitHub as an SM verb comment.
+
+    Returns ``{"posted": bool, "error": str | None}``. ``posted`` is
+    True only on a successful gh invocation; empty repo/issue (non-GH
+    review notes), a non-zero gh exit, or a subprocess exception all
+    return ``{"posted": False, "error": "<reason>"}``.
+
+    Never raises — the local decision is already recorded; a failed
+    comment should not turn a 200 into a 500.
+    """
+    repo = str(review.get("repo") or "").strip()
+    issue = str(review.get("issue") or "").strip()
+    if not repo or not issue:
+        return {"posted": False, "error": None}  # non-GH review, by design
+    body = _sm_comment_body(action, notes)
+    if body is None:
+        return {"posted": False, "error": f"no body for action {action!r}"}
+    try:
+        number = int(issue)
+    except (TypeError, ValueError):
+        return {"posted": False, "error": f"bad issue number {issue!r}"}
+    try:
+        result = (runner or _run_gh_issue_comment)(repo, number, body)
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"posted": False, "error": f"gh invocation failed: {e!r}"}
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip()[:500]
+        return {"posted": False, "error": f"gh returncode={result.returncode}: {err}"}
+    return {"posted": True, "error": None}
+
+
 def handle_review_action(cfg: Config, d: dict) -> dict:
     """Validate one Approve / Modify / Reject click and drop its surface.
 
     Mirrors ``handle_reply``: key-authed, writes into ``SURFACE_DIR`` for
     Speaking. The review note itself is left alone — the item stays on
     *Waiting on you* until Speaking acts and updates the status index.
+
+    Issue #719: for GH-issue-backed reviews the decision is also
+    posted directly to the originating issue as an SM verb comment.
+    The comment failure is non-fatal — the surface and local record
+    still succeed.
     """
     if not isinstance(d, dict):
         raise ReplyError(400, "bad json")
@@ -2460,7 +2586,16 @@ def handle_review_action(cfg: Config, d: dict) -> dict:
             n += 1
             dest = cfg.surface_dir / fname.replace(".md", f"-{n}.md")
         os.rename(tmp, dest)
-    return {"ok": True, "action": action, "slug": review["slug"]}
+
+    gh_result = _post_review_to_gh(
+        review, action, notes, runner=getattr(cfg, "_gh_comment_runner", None)
+    )
+    resp: dict = {"ok": True, "action": action, "slug": review["slug"]}
+    if gh_result.get("posted"):
+        resp["gh_posted"] = True
+    elif gh_result.get("error"):
+        resp["gh_error"] = gh_result["error"]
+    return resp
 
 
 def list_pages(cfg: Config) -> list[str]:

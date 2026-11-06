@@ -234,3 +234,191 @@ def test_shell_uses_pipeline_board_and_state_pills_are_distinct():
         assert heading in html
     for cls in ("sm-designing", "sm-building", "sm-reviewing"):
         assert f".fx-pill.{cls}" in css
+
+
+# ─── review-note synthesis (issue #719) ─────────────────────────────
+
+
+def _dr_row(number: int, repo: str = "jcronq/alice", **over) -> dict:
+    """Build the pipeline-row shape ensure_review_notes expects."""
+    row = {
+        "repo": repo,
+        "number": number,
+        "title": f"issue {number}",
+        "url": f"https://github.com/{repo}/issues/{number}",
+        "state": "design_review",
+        "art": "code",
+        "updated_epoch": None,
+        "updated_at": "2026-11-06T21:00:00Z",
+        "body": f"Body for #{number}\n",
+    }
+    row.update(over)
+    return row
+
+
+def test_review_slug_for_is_stable_and_safe():
+    assert P.review_slug_for("jcronq/alice", 704) == "ghi-jcronq-alice-704"
+    assert P.review_slug_for("ACME/Widgets", 616) == "ghi-acme-widgets-616"
+
+
+def test_ensure_review_notes_writes_frontmatter_and_body(tmp_path):
+    out = P.ensure_review_notes([_dr_row(704)], tmp_path)
+    assert out["written"] == ["ghi-jcronq-alice-704"]
+    p = tmp_path / "review-ghi-jcronq-alice-704.md"
+    text = p.read_text()
+    for line in (
+        "kind: decide",
+        "slug: ghi-jcronq-alice-704",
+        "repo: jcronq/alice",
+        "issue: 704",
+        "url: https://github.com/jcronq/alice/issues/704",
+        "updated: 2026-11-06T21:00:00Z",
+    ):
+        assert line in text
+    assert "Body for #704" in text
+
+
+def test_ensure_review_notes_empty_body_renders_placeholder(tmp_path):
+    P.ensure_review_notes([_dr_row(704, body="")], tmp_path)
+    assert "_(no description)_" in (
+        tmp_path / "review-ghi-jcronq-alice-704.md"
+    ).read_text()
+
+
+def test_ensure_review_notes_is_idempotent_on_unchanged_updated_at(tmp_path):
+    row = _dr_row(704)
+    first = P.ensure_review_notes([row], tmp_path)
+    assert first["written"] == ["ghi-jcronq-alice-704"]
+    p = tmp_path / "review-ghi-jcronq-alice-704.md"
+    mtime_before = p.stat().st_mtime_ns
+    second = P.ensure_review_notes([row], tmp_path)
+    assert second["written"] == []
+    assert p.stat().st_mtime_ns == mtime_before
+
+
+def test_ensure_review_notes_rewrites_when_updated_at_changes(tmp_path):
+    P.ensure_review_notes([_dr_row(704, updated_at="2026-11-06T10:00:00Z")], tmp_path)
+    out = P.ensure_review_notes(
+        [_dr_row(704, updated_at="2026-11-06T22:00:00Z", body="new body")], tmp_path
+    )
+    assert out["written"] == ["ghi-jcronq-alice-704"]
+    text = (tmp_path / "review-ghi-jcronq-alice-704.md").read_text()
+    assert "updated: 2026-11-06T22:00:00Z" in text
+    assert "new body" in text
+
+
+def test_ensure_review_notes_skips_rows_not_matching_filter(tmp_path):
+    rows = [
+        _dr_row(1, state="building"),         # wrong state
+        _dr_row(2, art="study"),               # wrong art
+        _dr_row(3, repo="", art="code"),       # no repo
+        _dr_row(4),                            # matches
+    ]
+    out = P.ensure_review_notes(rows, tmp_path)
+    assert out["written"] == ["ghi-jcronq-alice-4"]
+    assert list(tmp_path.glob("review-ghi-*.md")) == [
+        tmp_path / "review-ghi-jcronq-alice-4.md"
+    ]
+
+
+def test_ensure_review_notes_sweeps_stale_notes(tmp_path):
+    # Seed two notes: one that matches a current row, one that does
+    # not. The sweep should drop the orphan.
+    P.ensure_review_notes([_dr_row(704), _dr_row(999)], tmp_path)
+    assert {p.name for p in tmp_path.glob("review-ghi-*.md")} == {
+        "review-ghi-jcronq-alice-704.md",
+        "review-ghi-jcronq-alice-999.md",
+    }
+    out = P.ensure_review_notes([_dr_row(704)], tmp_path)
+    # #999 moved off sm:design_review (or closed) → note gone.
+    assert out["deleted"] == ["ghi-jcronq-alice-999"]
+    assert list(tmp_path.glob("review-ghi-*.md")) == [
+        tmp_path / "review-ghi-jcronq-alice-704.md"
+    ]
+
+
+def test_ensure_review_notes_leaves_unrelated_notes_alone(tmp_path):
+    # Non-ghi-prefixed notes must never be touched by the sweep.
+    other = tmp_path / "review-local-only.md"
+    other.write_text("---\nkind: decide\n---\nbody\n")
+    P.ensure_review_notes([], tmp_path)
+    assert other.exists()
+
+
+def test_fetch_issues_carries_body_and_updated_at_through():
+    issue = _issue(704, "sm:design_review", "art:code")
+    issue["body"] = "the body"
+    rows, _ = P.fetch_issues(
+        ["jcronq/alice"], runner=_runner({"jcronq/alice": [issue]})
+    )
+    assert rows[0]["body"] == "the body"
+    assert rows[0]["updated_at"] == "2026-11-06T10:00:00Z"
+
+
+def test_your_todo_tags_design_rows_with_review_slug_when_note_exists(
+    tmp_path, monkeypatch
+):
+    """``_render_your_todo`` must set ``review_slug`` on design rows
+    whose synthesised note already exists on disk (so the frontend
+    can link the title to the local Review tab)."""
+    from status_site.server import Config, OverviewPollers, section_renderers
+
+    status = tmp_path / "status"
+    (status / "notes").mkdir(parents=True)
+    # Pre-seed the review note so _render_your_todo can find it.
+    P.ensure_review_notes([_dr_row(704)], status / "notes")
+    monkeypatch.setenv("ALICE_MIND", str(tmp_path / "mind"))
+    cfg = Config(
+        status_dir=status,
+        surface_dir=tmp_path / "surface",
+        upload_dir=tmp_path / "up",
+        key="k",
+        port=0,
+        host="127.0.0.1",
+    )
+    cfg.pollers = OverviewPollers(cfg)
+    issue = _issue(704, "sm:design_review", "art:code")
+    issue["body"] = "b"
+    rows, failed = P.fetch_issues(
+        ["jcronq/alice"], runner=_runner({"jcronq/alice": [issue]})
+    )
+    cfg.pollers._set("pipeline", {"issues": rows, "failed": failed})
+    cfg.pollers._set(
+        "review_queue",
+        {"design": [], "pr": [], "design_failed": [], "pr_failed": []},
+    )
+
+    data = section_renderers(cfg)["your_todo"]()
+    design = data["design_review"]
+    assert len(design) == 1
+    assert design[0]["review_slug"] == "ghi-jcronq-alice-704"
+
+
+def test_your_todo_omits_review_slug_when_note_missing(tmp_path, monkeypatch):
+    """Before the pipeline tick has written the note, the slug tag
+    must stay off so the frontend links straight to GitHub."""
+    from status_site.server import Config, OverviewPollers, section_renderers
+
+    status = tmp_path / "status"
+    (status / "notes").mkdir(parents=True)
+    monkeypatch.setenv("ALICE_MIND", str(tmp_path / "mind"))
+    cfg = Config(
+        status_dir=status,
+        surface_dir=tmp_path / "surface",
+        upload_dir=tmp_path / "up",
+        key="k",
+        port=0,
+        host="127.0.0.1",
+    )
+    cfg.pollers = OverviewPollers(cfg)
+    issue = _issue(999, "sm:design_review", "art:code")
+    rows, failed = P.fetch_issues(
+        ["jcronq/alice"], runner=_runner({"jcronq/alice": [issue]})
+    )
+    cfg.pollers._set("pipeline", {"issues": rows, "failed": failed})
+    cfg.pollers._set(
+        "review_queue",
+        {"design": [], "pr": [], "design_failed": [], "pr_failed": []},
+    )
+    data = section_renderers(cfg)["your_todo"]()
+    assert all("review_slug" not in r for r in data["design_review"])

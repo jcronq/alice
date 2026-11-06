@@ -1654,6 +1654,10 @@ function PipelineGroup({title, count, children, open}) {
 }
 const MUTED = {color: "var(--color-fg-muted)", margin: 0};
 function ReviewLinkTable({rows}) {
+  // Issue #719: when a row carries ``review_slug`` the title links to
+  // the local Review tab (``?p=review-<slug>``) and the GitHub URL
+  // becomes a small secondary ``(gh)`` link. Rows without a slug keep
+  // the original GH-only behaviour.
   return h(FxTable, {
     columns: [
       {key: "repo", label: "repo", cell: r => h("code", null, r.repo || "")},
@@ -1661,8 +1665,21 @@ function ReviewLinkTable({rows}) {
         r.link
           ? h("a", {href: r.link, target: "_blank", rel: "noopener"}, "#" + r.number)
           : h("span", {className: "fx-num"}, "#" + r.number)},
-      {key: "title", label: "title", cell: r =>
-        r.link ? h("a", {href: r.link, target: "_blank", rel: "noopener"}, r.title || "") : (r.title || "")},
+      {key: "title", label: "title", cell: r => {
+        if (r.review_slug) {
+          return h(React.Fragment, null,
+            h("a", {href: "?p=review-" + r.review_slug}, r.title || ""),
+            r.link ? h(React.Fragment, null,
+              " ",
+              h("a", {href: r.link, target: "_blank", rel: "noopener",
+                      className: "fx-secondary", style: {marginLeft: "0.4em"}},
+                "(gh)")) : null,
+          );
+        }
+        return r.link
+          ? h("a", {href: r.link, target: "_blank", rel: "noopener"}, r.title || "")
+          : (r.title || "");
+      }},
       {key: "age_seconds", label: "age", numeric: true, cell: r =>
         h("span", {className: "fx-num"}, r.age_seconds == null ? "—" : ageStringSeconds(r.age_seconds))},
     ],

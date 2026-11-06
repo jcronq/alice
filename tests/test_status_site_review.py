@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import subprocess
 import threading
 
 import pytest
@@ -48,6 +49,17 @@ def site(tmp_path):
         port=0,
         host="127.0.0.1",
     )
+    # Default: swallow gh comment calls so tests don't shell out. Each
+    # test that cares about the gh branch sets its own runner by
+    # assigning ``cfg._gh_comment_runner`` after this fixture yields.
+    gh_calls: list[dict] = []
+
+    def _fake_gh(repo: str, number: int, body: str) -> subprocess.CompletedProcess:
+        gh_calls.append({"repo": repo, "number": number, "body": body})
+        return subprocess.CompletedProcess([], 0, stdout="ok\n", stderr="")
+
+    cfg._gh_comment_runner = _fake_gh  # type: ignore[attr-defined]
+    cfg._gh_calls = gh_calls  # type: ignore[attr-defined]
     srv = make_server(cfg)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     yield cfg, srv.server_address[1]
@@ -229,3 +241,93 @@ def test_review_a2ui_stays_empty_when_note_vanishes(site):
     review_page.set_active_slug("missing")
     assert review_page.render(cfg) == {"a2ui": []}
     review_page.set_active_slug(None)
+
+
+# ---------------------------------------------------------------- GH comment branch (#719)
+
+
+@pytest.mark.parametrize(
+    "action,expect_substring",
+    [
+        ("approve", "[SM] select art=code"),
+        ("reject", "[SM] reject reason="),
+        ("modify", "status-site Review tab"),
+    ],
+)
+def test_action_posts_sm_verb_comment_to_gh(site, action, expect_substring):
+    """Each Approve / Reject / Modify click fires one ``gh issue comment``
+    with the contracted SM verb body, keyed off the review's repo+issue."""
+    cfg, port = site
+    notes = "please do X" if action != "approve" else ""
+    body = {"key": KEY, "slug": SLUG, "action": action}
+    if notes:
+        body["notes"] = notes
+    status, resp = req(port, "POST", "/api/review-action", body)
+    assert status == 200 and resp["ok"] and resp["action"] == action
+    assert resp.get("gh_posted") is True
+    assert resp.get("gh_error") is None
+    (call,) = cfg._gh_calls  # type: ignore[attr-defined]
+    assert call["repo"] == "acme/widgets"
+    assert call["number"] == 616
+    assert expect_substring in call["body"]
+    if action == "reject":
+        assert "please do X" in call["body"]
+    if action == "modify":
+        assert "please do X" in call["body"]
+    if action == "approve":
+        # approve with empty notes still works; fixed verb body.
+        assert call["body"].startswith("[SM] select art=code")
+
+
+def test_action_without_repo_or_issue_skips_gh(tmp_path):
+    """Review notes with no GH coordinates (non-pipeline notes) must
+    not attempt a ``gh issue comment``."""
+    from status_site.server import handle_review_action
+
+    status = tmp_path / "status"
+    notes = status / "notes"
+    notes.mkdir(parents=True)
+    (notes / "local-only.md").write_text(
+        "---\nkind: decide\ntitle: Local-only review\n---\nbody\n"
+    )
+    cfg = Config(
+        status_dir=status,
+        surface_dir=tmp_path / "surface",
+        upload_dir=tmp_path / "up",
+        key="k",
+        port=0,
+        host="127.0.0.1",
+    )
+    calls: list = []
+    cfg._gh_comment_runner = (  # type: ignore[attr-defined]
+        lambda repo, num, body: calls.append((repo, num, body))
+        or subprocess.CompletedProcess([], 0)
+    )
+    out = handle_review_action(
+        cfg, {"key": "k", "slug": "local-only", "action": "approve"}
+    )
+    assert out == {"ok": True, "action": "approve", "slug": "local-only"}
+    assert calls == []  # no gh call attempted
+
+
+def test_action_records_surface_even_when_gh_fails(site):
+    """A failing ``gh`` call must not turn a 200 into an error; the
+    surface still lands so Speaking can finish the job manually."""
+    cfg, port = site
+
+    def _boom(repo: str, number: int, body: str) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess([], 1, stdout="", stderr="auth fail")
+
+    cfg._gh_comment_runner = _boom  # type: ignore[attr-defined]
+    status, resp = req(
+        port,
+        "POST",
+        "/api/review-action",
+        {"key": KEY, "slug": SLUG, "action": "approve"},
+    )
+    assert status == 200
+    assert resp["ok"]
+    assert resp.get("gh_posted") is not True
+    assert "auth fail" in resp.get("gh_error", "")
+    # Surface file was still written.
+    assert surfaces(cfg)
