@@ -589,22 +589,21 @@ li.fx-now {
   border-top: 1px solid var(--color-border-line);
 }
 /* Reply header: an obvious clickable link that jumps to the parent
- * message. Rendered with an arrow glyph, accent color + underline so
- * Jason reads it as a hyperlink not a muted header. */
+ * message. Rendered with an arrow glyph, high-contrast color +
+ * underline so it reads as a hyperlink not a muted header. Colors
+ * flip per bubble type because jason bubbles use --color-ok as
+ * BACKGROUND and the accent would be invisible there. */
 .a2ui-list.a2ui-chat-thread .msg .msg-reply-ref {
   display: flex;
   align-items: center;
   gap: .3rem;
   max-width: 100%;
   margin: 0 0 .35rem;
-  padding: .2rem .5rem;
+  padding: .25rem .5rem;
   font: inherit;
   font-size: .78rem;
   text-align: left;
-  color: var(--color-accent, var(--color-ok));
-  background: rgba(127, 127, 127, .12);
   border: 0;
-  border-left: 3px solid var(--color-accent, var(--color-ok));
   border-radius: 4px;
   cursor: pointer;
   overflow: hidden;
@@ -612,13 +611,31 @@ li.fx-now {
   white-space: nowrap;
   text-decoration: underline;
   text-underline-offset: 2px;
+  font-weight: 500;
 }
 .a2ui-list.a2ui-chat-thread .msg .msg-reply-ref::before {
   content: "↪";
-  opacity: .8;
+  opacity: .9;
   text-decoration: none;
+  font-weight: normal;
 }
-.a2ui-list.a2ui-chat-thread .msg .msg-reply-ref:hover {
+/* Jason bubbles (green --color-ok background) — light reply-ref */
+.a2ui-list.a2ui-chat-thread .msg.jason .msg-reply-ref {
+  color: #fff;
+  background: rgba(0, 0, 0, .18);
+  border-left: 3px solid rgba(255, 255, 255, .55);
+}
+.a2ui-list.a2ui-chat-thread .msg.jason .msg-reply-ref:hover {
+  background: rgba(0, 0, 0, .28);
+  border-left-color: #fff;
+}
+/* Alice bubbles (muted --color-card background) — accent reply-ref */
+.a2ui-list.a2ui-chat-thread .msg.alice .msg-reply-ref {
+  color: var(--color-ok);
+  background: rgba(127, 127, 127, .12);
+  border-left: 3px solid var(--color-ok);
+}
+.a2ui-list.a2ui-chat-thread .msg.alice .msg-reply-ref:hover {
   background: rgba(127, 127, 127, .22);
 }
 .a2ui-list.a2ui-chat-thread .msg .msg-reactions {
