@@ -743,16 +743,20 @@ function renderA2uiComponent(id, surface, local, setLocal) {
 function ChatThread({rows}) {
   const ref = useRef(null);
   const stick = useRef(true);
-  const last = rows.length ? rows[rows.length - 1] : null;
+  const [pending, setPending] = useState(() => chatPendingStore.pending);
+  useEffect(() => chatPendingStore.subscribe(setPending), []);
+  useEffect(() => { chatPendingStore.reconcile(rows); }, [rows]);
+  const merged = pending.length ? [...rows, ...pending] : rows;
+  const last = merged.length ? merged[merged.length - 1] : null;
   useEffect(() => {
     const el = ref.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
-  }, [rows.length, last && last.at]);
+  }, [merged.length, last && last.at]);
   return h("div", {
     ref,
     className: "a2ui-list a2ui-chat-thread",
     onScroll: e => { stick.current = isNearBottom(e.currentTarget); },
-  }, renderChatMessages(rows));
+  }, renderChatMessages(merged));
 }
 
 const IMAGE_RE = /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i;
@@ -815,6 +819,36 @@ async function addA2uiFiles(id, files, local, setLocal) {
 }
 
 // Shared by the Send button's click and the textarea's Enter key.
+// Optimistic chat — a sent message is shown locally the instant the
+// POST returns, without waiting for the next SSE tick (the broadcaster
+// re-renders on a ~2 s cadence, so without this Jason saw a 1-2 s
+// delay). The ChatThread subscribes to this store and merges pending
+// messages below the server rows; a dedupe filter drops any pending
+// whose (text, files) matches a server row from Jason in the recent
+// tail, so the local echo quietly vanishes when the server catches up.
+const chatPendingStore = {
+  pending: [],
+  listeners: new Set(),
+  add(msg) { this.pending = [...this.pending, msg]; this._emit(); },
+  reconcile(serverRows) {
+    const tail = serverRows.slice(-10).filter(r => r.from === "jason");
+    const stillPending = this.pending.filter(p => !tail.some(r =>
+      (r.text || "") === (p.text || "") &&
+      ((r.files && r.files.length) || 0) === ((p.files && p.files.length) || 0)
+    ));
+    if (stillPending.length !== this.pending.length) {
+      this.pending = stillPending;
+      this._emit();
+    }
+  },
+  _emit() { for (const fn of this.listeners) fn(this.pending); },
+  subscribe(fn) {
+    this.listeners.add(fn);
+    fn(this.pending);
+    return () => this.listeners.delete(fn);
+  },
+};
+
 async function runA2uiAction(id, props, surface, local, setLocal) {
   const action = props.action || "";
   const taId = props.textareaId || "";
@@ -834,11 +868,25 @@ async function runA2uiAction(id, props, surface, local, setLocal) {
     pending: {...s.pending, [id]: true},
     statuses: {...s.statuses, [id]: "Sending…"},
   }));
+  // Capture the composer state before awaiting the POST so the
+  // optimistic echo uses the text/files the user actually sent.
+  const sentText = text;
+  const sentFiles = files.map(f => ({name: f.name, type: f.type}));
   const res = await dispatchA2uiAction(action, {
     text,
     files,
     slug: surface.data && surface.data.slug,
   });
+  if (res.ok && action === "chat.send") {
+    chatPendingStore.add({
+      from: "jason",
+      at: new Date().toISOString().replace("Z", "-0000"),
+      text: sentText,
+      files: sentFiles.map(f => f.name),
+      attachments: sentFiles.map(f => ({name: f.name})),
+      _optimistic: true,
+    });
+  }
   setLocal(s => {
     const next = {
       ...s,
