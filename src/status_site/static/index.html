@@ -807,7 +807,21 @@ function ChatThread({rows}) {
   const last = merged.length ? merged[merged.length - 1] : null;
   useEffect(() => {
     const el = ref.current;
-    if (el && stick.current) el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    const scroll = () => { if (stick.current) el.scrollTop = el.scrollHeight; };
+    // First pass: snap to bottom before any async image load.
+    scroll();
+    // ResizeObserver catches image-load reflows and any other async
+    // height change inside the thread (working-group disclosures
+    // toggling, attachments resolving) so the view stays pinned
+    // exactly to the bottom instead of "close to" it.
+    const ro = new ResizeObserver(scroll);
+    for (const child of Array.from(el.children)) ro.observe(child);
+    // Also re-scroll when the window finishes painting the first frame
+    // — covers any layout that resolves between mount and the next
+    // ResizeObserver tick.
+    const raf = requestAnimationFrame(scroll);
+    return () => { ro.disconnect(); cancelAnimationFrame(raf); };
   }, [merged.length, last && last.at, last && last.step_count]);
   return h("div", {
     ref,
