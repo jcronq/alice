@@ -27,7 +27,12 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
-from status_site.chat_status import build_groups, merge_thread, read_status_rows
+from status_site.chat_status import (
+    _parse_ts,
+    build_groups,
+    merge_thread,
+    read_status_rows,
+)
 from status_site.a2ui import (
     component,
     create_surface,
@@ -109,12 +114,21 @@ def render(cfg: "Config") -> dict:
     """
     # Local import to avoid a server↔sources cycle at module load:
     # server imports this module via section_renderers.
-    from status_site.server import read_chat
+    from status_site.server import CHAT_SNAPSHOT_LIMIT, read_chat
 
-    messages = merge_thread(
-        read_chat(cfg), build_groups(read_status_rows(cfg.status_dir))
-    )
-    return {"a2ui": build_envelopes(messages)}
+    recent = read_chat(cfg, limit=CHAT_SNAPSHOT_LIMIT)
+    groups = build_groups(read_status_rows(cfg.status_dir))
+    if len(recent) >= CHAT_SNAPSHOT_LIMIT:
+        # Older history is only reachable via ``/api/chat?before=``; drop
+        # working-groups that predate the snapshot window so they don't
+        # float above the first message.
+        floor = _parse_ts(recent[0].get("at"))
+        if floor is not None:
+            groups = [
+                g for g in groups
+                if (ts := _parse_ts(g.get("at"))) is None or ts >= floor
+            ]
+    return {"a2ui": build_envelopes(merge_thread(recent, groups))}
 
 
 PREVIEW_CHARS = 80

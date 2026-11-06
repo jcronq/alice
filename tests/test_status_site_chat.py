@@ -299,3 +299,143 @@ def test_chat_ux_js_is_served_and_wired(site):
     assert 'from "./chat-ux.js"' in html
     for needle in ("onKeyDown", "onPaste", "ChatThread", "chat-file-input"):
         assert needle in html
+
+
+# ---------------------------------------------------------------- pagination (#671)
+
+
+def _seed_chat(cfg, n):
+    """n messages, one minute apart, ``m000`` oldest."""
+    from datetime import datetime, timedelta, timezone
+
+    t0 = datetime(2026, 11, 6, 0, 0, 0, tzinfo=timezone.utc)
+    cfg.chat_log.parent.mkdir(parents=True, exist_ok=True)
+    with open(cfg.chat_log, "w") as f:
+        for i in range(n):
+            f.write(json.dumps({
+                "from": "jason" if i % 2 == 0 else "alice",
+                "at": (t0 + timedelta(minutes=i)).isoformat(timespec="seconds"),
+                "text": f"m{i:03d}",
+            }) + "\n")
+
+
+def test_read_chat_before_returns_older_chronological_page(site):
+    from status_site.server import read_chat
+
+    cfg, _ = site
+    _seed_chat(cfg, 100)
+    cutoff = read_chat(cfg, limit=0)[60]["at"]
+    page = read_chat(cfg, limit=10, before=cutoff)
+    assert [m["text"] for m in page] == [f"m{i:03d}" for i in range(50, 60)]
+    assert all(m["at"] < cutoff for m in page)
+
+
+def test_read_chat_before_compares_across_timezone_offsets(site):
+    from status_site.server import read_chat
+
+    cfg, _ = site
+    _seed_chat(cfg, 5)  # 00:00Z .. 00:04Z
+    # 2026-11-05T19:03:00-05:00 == 2026-11-06T00:03:00Z
+    page = read_chat(cfg, limit=50, before="2026-11-05T19:03:00-05:00")
+    assert [m["text"] for m in page] == ["m000", "m001", "m002"]
+
+
+def test_read_chat_before_invalid_timestamp_returns_empty(site):
+    from status_site.server import read_chat
+
+    cfg, _ = site
+    _seed_chat(cfg, 10)
+    assert read_chat(cfg, limit=5, before="not-a-timestamp") == []
+    assert read_chat(cfg, limit=5, before="") == []
+
+
+def test_read_chat_before_skips_rows_without_parsable_at(site):
+    from status_site.server import read_chat
+
+    cfg, _ = site
+    _seed_chat(cfg, 3)
+    with open(cfg.chat_log, "a") as f:
+        f.write(json.dumps({"from": "alice", "text": "no at"}) + "\n")
+    page = read_chat(cfg, limit=50, before="2030-01-01T00:00:00+00:00")
+    assert [m["text"] for m in page] == ["m000", "m001", "m002"]
+
+
+def test_get_chat_paginates_backward_through_300_messages(site):
+    from urllib.parse import quote
+
+    cfg, port = site
+    _seed_chat(cfg, 300)
+    _, body, _ = req(port, "GET", "/api/chat")
+    tail = json.loads(body)["messages"]
+    assert [m["text"] for m in tail][-1] == "m299"
+
+    seen = [m["text"] for m in tail]
+    earliest = tail[0]["at"]
+    for _ in range(3):
+        status, body, _ = req(
+            port, "GET", f"/api/chat?before={quote(earliest)}&limit=50"
+        )
+        assert status == 200
+        page = json.loads(body)["messages"]
+        assert len(page) == 50
+        assert page == sorted(page, key=lambda m: m["at"])
+        seen = [m["text"] for m in page] + seen
+        earliest = page[0]["at"]
+    assert seen == [f"m{i:03d}" for i in range(300 - len(seen), 300)]
+    assert len(seen) == len(tail) + 150
+
+
+def test_get_chat_before_limit_defaults_and_caps(site):
+    from urllib.parse import quote
+
+    cfg, port = site
+    _seed_chat(cfg, 300)
+    far = quote("2030-01-01T00:00:00+00:00")
+
+    def fetch(qs):
+        _, body, _ = req(port, "GET", f"/api/chat?before={far}{qs}")
+        return json.loads(body)["messages"]
+
+    assert len(fetch("")) == 50
+    assert len(fetch("&limit=1000")) == 200
+    assert len(fetch("&limit=7")) == 7
+    assert len(fetch("&limit=abc")) == 50
+    assert len(fetch("&limit=0")) == 50
+    assert len(fetch("&limit=-3")) == 50
+    assert fetch("&limit=7")[-1]["text"] == "m299"
+
+
+def test_get_chat_before_invalid_is_empty_not_tail(site):
+    cfg, port = site
+    _seed_chat(cfg, 10)
+    _, body, _ = req(port, "GET", "/api/chat?before=garbage&limit=5")
+    assert json.loads(body) == {"messages": []}
+
+
+def test_chat_snapshot_carries_only_recent_tail(site):
+    from status_site.server import CHAT_SNAPSHOT_LIMIT
+    from status_site.sources import chat as chat_page
+
+    cfg, _ = site
+    _seed_chat(cfg, 300)
+    msgs = chat_page.render(cfg)["a2ui"][-1]["value"]
+    assert len(msgs) == CHAT_SNAPSHOT_LIMIT == 50
+    assert msgs[0]["text"] == "m250" and msgs[-1]["text"] == "m299"
+
+
+def test_chat_snapshot_drops_working_groups_older_than_window(site):
+    from status_site.chat_status import STATUS_FILE
+    from status_site.sources import chat as chat_page
+
+    cfg, _ = site
+    _seed_chat(cfg, 300)  # window starts at m250 = 04:10Z
+    rows = [
+        {"turn_id": "old", "kind": "turn_start", "at": "2026-11-06T00:05:00+00:00"},
+        {"turn_id": "new", "kind": "turn_start", "at": "2026-11-06T04:55:30+00:00"},
+    ]
+    (cfg.status_dir / STATUS_FILE).write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n"
+    )
+    msgs = chat_page.render(cfg)["a2ui"][-1]["value"]
+    groups = [m["turn_id"] for m in msgs if m.get("variant") == "working-group"]
+    assert groups == ["new"]

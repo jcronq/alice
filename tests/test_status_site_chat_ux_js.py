@@ -51,6 +51,18 @@ out.tooMany = ux.validateAttachment({name: "a.png", size: 1}, ux.MAX_FILES);
 out.tooBig = ux.validateAttachment({name: "a.png", size: ux.MAX_PER_FILE + 1}, 0);
 out.ok = ux.validateAttachment({name: "a.png", size: 10}, 0);
 
+out.nearTop = ux.isNearTop({scrollTop: 150});
+out.notNearTop = ux.isNearTop({scrollTop: 400});
+out.rowKeyMsg = ux.chatRowKey({from: "jason", at: "t1", text: "x"});
+out.rowKeyGroup = ux.chatRowKey({variant: "working-group", turn_id: "T"});
+out.earliest = ux.earliestAt([
+  {variant: "working-group", at: "2026-11-06T00:00:00+00:00"},
+  {from: "a", at: "2026-11-06T02:00:00+00:00"},
+  {from: "b", at: "2026-11-06T01:00:00+00:00"},
+  {from: "c", at: "garbage"},
+]);
+out.earliestNone = ux.earliestAt([{variant: "working-group", at: "2026-11-06T00:00:00+00:00"}]);
+
 globalThis.FileReader = class {
   readAsDataURL(f) { this.result = "data:image/png;base64,UE5H"; setTimeout(() => this.onload(), 0); }
 };
@@ -110,3 +122,21 @@ def test_chat_thread_scrolls_to_bottom_on_mount():
     body = html[html.index("function ChatThread") : html.index("function renderChatMessages")]
     assert "el.scrollTop = el.scrollHeight" in body
     assert "useRef(true)" in body and "isNearBottom" in body
+
+
+def test_load_older_helpers(result):
+    assert result["nearTop"] is True
+    assert result["notNearTop"] is False
+    assert result["rowKeyMsg"] == "jason|t1|x"
+    assert result["rowKeyGroup"] == "wg:T"
+    assert result["earliest"] == "2026-11-06T01:00:00+00:00"
+    assert result["earliestNone"] is None
+
+
+def test_chat_thread_wires_infinite_scroll():
+    html = (Path(STATIC_DIR) / "index.html").read_text()
+    body = html[html.index("function ChatThread") : html.index("function renderChatMessages")]
+    assert "/api/chat?before=" in body
+    assert "loadingRef" in body and "isNearTop" in body
+    assert "loading older" in body
+    assert "useLayoutEffect" in body and "anchor" in body

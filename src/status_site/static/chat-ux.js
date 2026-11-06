@@ -15,6 +15,35 @@ const IMAGE_EXT = {
   "image/svg+xml": "svg",
 };
 
+export const LOAD_OLDER_THRESHOLD_PX = 200;
+// Page size for ``/api/chat?before=``; matches the server's SSE snapshot tail.
+export const CHAT_PAGE_SIZE = 50;
+
+// True when the scroll container is within ``threshold`` px of its top.
+export function isNearTop(el, threshold = LOAD_OLDER_THRESHOLD_PX) {
+  return el.scrollTop <= threshold;
+}
+
+// Stable identity for a server chat row, so overlapping snapshots and
+// older pages fold into one list. Working-groups are keyed by turn.
+export function chatRowKey(m) {
+  if (m.variant === "working-group") return "wg:" + m.turn_id;
+  return (m.from || "") + "|" + (m.at || "") + "|" + (m.text || "");
+}
+
+// ``at`` of the earliest real (non working-group) message with a parsable
+// timestamp, or null — the cursor for the next ``?before=`` fetch.
+export function earliestAt(rows) {
+  let best = null;
+  let bestT = Infinity;
+  for (const m of rows) {
+    if (m.variant === "working-group") continue;
+    const t = Date.parse(m.at || "");
+    if (!Number.isNaN(t) && t < bestT) { bestT = t; best = m.at; }
+  }
+  return best;
+}
+
 // True when the scroll container is within ``threshold`` px of its bottom.
 export function isNearBottom(el, threshold = STICK_THRESHOLD_PX) {
   return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;

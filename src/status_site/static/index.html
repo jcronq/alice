@@ -99,7 +99,25 @@ h2.sec-heading {
   font-variant-numeric: tabular-nums;
 }
 .fx-big .of { color: var(--color-fg-muted); font-size: var(--dash-font-size-caption); }
-.a2ui-chat-thread { max-height: calc(100vh - 14rem); overflow-y: auto; }
+.a2ui-chat-thread { max-height: calc(100vh - 14rem); overflow-y: auto; overflow-anchor: none; }
+.chat-loading-older {
+  position: sticky;
+  top: 0;
+  height: 0;
+  margin-bottom: calc(-1 * var(--dash-gap-xs, 0px));
+  overflow: visible;
+  text-align: center;
+  z-index: 4;
+  pointer-events: none;
+}
+.chat-loading-older span {
+  display: inline-block;
+  padding: .1rem .6rem;
+  font-size: .78rem;
+  color: var(--color-fg-muted);
+  background: var(--color-panel);
+  border-radius: 999px;
+}
 .a2ui-composer { display: flex; flex-direction: column; gap: .4rem; }
 .a2ui-composer.dragging { outline: 2px dashed var(--color-ok); outline-offset: 2px; }
 .a2ui-composer-bar { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; }
@@ -237,10 +255,11 @@ h2.sec-heading {
 }
 </script>
 <script type="module">
-import React, {useEffect, useReducer, useRef, useState} from "react";
+import React, {useEffect, useLayoutEffect, useReducer, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
 import {
-  ACCEPT, attachmentName, HIGHLIGHT_MS, imageFilesFromClipboard, isNearBottom,
+  ACCEPT, CHAT_PAGE_SIZE, attachmentName, chatRowKey, earliestAt,
+  HIGHLIGHT_MS, imageFilesFromClipboard, isNearBottom, isNearTop,
   messageAnchorId, MORE_REACTS, parseMessageHash, permalinkFor, QUICK_REACTS,
   quoteForReply, reactionsSignature, readAsBase64, replyPreview,
   shouldSubmitOnKey, summarizeReactions, validateAttachment,
@@ -970,20 +989,78 @@ function ChatThread({rows}) {
     window.addEventListener("hashchange", on);
     return () => window.removeEventListener("hashchange", on);
   }, []);
+  // Infinite scroll (#671): the SSE snapshot only carries the recent
+  // tail, so every row ever seen (snapshots + fetched older pages) is
+  // accumulated here and survives the tail window sliding forward.
+  const known = useRef(new Map());
+  const loadingRef = useRef(false);
+  const exhausted = useRef(false);
+  const failed = useRef(false);
+  const anchor = useRef(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [, bump] = useState(0);
+  // Working-groups come only from the latest snapshot (their state
+  // changes in place and old ones fall out of the window).
+  for (const k of Array.from(known.current.keys())) {
+    if (k.startsWith("wg:")) known.current.delete(k);
+  }
+  for (const r of rows) known.current.set(chatRowKey(r), r);
+  const allRows = Array.from(known.current.values());
   const serverRows = pending.length
-    ? rows.filter(r => !serverRowMatchesPending(r, pending))
-    : rows;
+    ? allRows.filter(r => !serverRowMatchesPending(r, pending))
+    : allRows;
   const atEpoch = m => { const t = Date.parse(m.at || ""); return Number.isNaN(t) ? 0 : t; };
   const merged = [...serverRows, ...pending].sort((a, b) => atEpoch(a) - atEpoch(b));
   const last = merged.length ? merged[merged.length - 1] : null;
+  const lastKey = last ? (last._client_id || chatRowKey(last)) : "";
+  const prevLastKey = useRef("");
+  const canLoadOlder = () =>
+    !loadingRef.current && !exhausted.current &&
+    allRows.filter(r => r.variant !== "working-group").length >= CHAT_PAGE_SIZE;
+  const loadOlder = async () => {
+    const before = earliestAt(Array.from(known.current.values()));
+    if (!before || loadingRef.current || exhausted.current) return;
+    loadingRef.current = true;
+    failed.current = false;
+    setLoadingOlder(true);
+    try {
+      const r = await fetch(
+        "/api/chat?before=" + encodeURIComponent(before) + "&limit=" + CHAT_PAGE_SIZE);
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const j = await r.json();
+      const older = Array.isArray(j.messages) ? j.messages : [];
+      const el = ref.current;
+      if (el) anchor.current = {height: el.scrollHeight, top: el.scrollTop};
+      for (const m of older) known.current.set(chatRowKey(m), m);
+      if (older.length < CHAT_PAGE_SIZE) exhausted.current = true;
+    } catch (_) {
+      failed.current = true;
+    } finally {
+      loadingRef.current = false;
+      setLoadingOlder(false);
+      bump(n => n + 1);
+    }
+  };
+  // Keep the visible message pinned after older rows are prepended:
+  // the content above grew by (scrollHeight delta), so shift scrollTop
+  // by the same amount before paint.
+  useLayoutEffect(() => {
+    const el = ref.current;
+    const a = anchor.current;
+    if (!el || !a) return;
+    anchor.current = null;
+    el.scrollTop = a.top + (el.scrollHeight - a.height);
+  });
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    // Mark new-unread only when the merged count grew AND the user
-    // is scrolled away from the bottom. Growth at the bottom with
-    // stick=true is already auto-followed below.
-    const grew = merged.length > prevCount.current;
+    // Mark new-unread only when the newest message changed (a tail
+    // arrival, not an older page prepended) AND the user is scrolled
+    // away from the bottom. Growth at the bottom with stick=true is
+    // already auto-followed below.
+    const grew = merged.length > prevCount.current && lastKey !== prevLastKey.current;
     prevCount.current = merged.length;
+    prevLastKey.current = lastKey;
     const scroll = () => { if (stick.current) el.scrollTop = el.scrollHeight; };
     scroll();
     const ro = new ResizeObserver(scroll);
@@ -992,6 +1069,12 @@ function ChatThread({rows}) {
     if (grew && !stick.current) setHasUnread(true);
     return () => { ro.disconnect(); cancelAnimationFrame(raf); };
   }, [merged.length, last && last.at, last && last.step_count]);
+  // Short threads (e.g. a tall window) never scroll, so scrolling can't
+  // trigger the fetch: keep pulling older pages until the thread overflows.
+  useEffect(() => {
+    const el = ref.current;
+    if (el && !failed.current && isNearTop(el) && canLoadOlder()) loadOlder();
+  }, [merged.length, loadingOlder]);
   const jumpToLatest = () => {
     const el = ref.current;
     if (!el) return;
@@ -1005,6 +1088,7 @@ function ChatThread({rows}) {
     stick.current = nearBottom;
     setAtBottom(nearBottom);
     if (nearBottom) setHasUnread(false);
+    if (isNearTop(e.currentTarget) && canLoadOlder()) loadOlder();
   };
   useEffect(() => {
     if (!hashAt || jumped.current === hashAt) return;
@@ -1012,14 +1096,24 @@ function ChatThread({rows}) {
       jumped.current = hashAt;
       stick.current = false;
       setAtBottom(false);
+    } else if (!failed.current && canLoadOlder()) {
+      // Permalink target predates the loaded window: page older history
+      // until it renders (each page re-fires this effect).
+      loadOlder();
     }
-  }, [hashAt, merged.length]);
+  }, [hashAt, merged.length, loadingOlder]);
   return h(React.Fragment, null,
     h("div", {
       ref,
       className: "a2ui-list a2ui-chat-thread",
       onScroll,
-    }, renderChatMessages(merged, overrides)),
+    },
+      loadingOlder ? h("div", {
+        key: "loading-older",
+        className: "chat-loading-older",
+        "data-testid": "chat-loading-older",
+      }, h("span", null, "loading older…")) : null,
+      renderChatMessages(merged, overrides)),
     !atBottom ? h("button", {
       className: "chat-jump" + (hasUnread ? " unread" : ""),
       onClick: jumpToLatest,
@@ -1034,14 +1128,20 @@ function renderChatMessages(rows, overrides) {
   }
   const byAt = {};
   for (const m of rows) if (m.at && !m.variant) byAt[m.at] = m;
+  // Keys must not depend on list position: older pages are prepended and
+  // an index key would remount (and reload images of) every bubble.
+  const keyCounts = new Map();
   return rows.map((m, i) => {
+    const baseKey = (m._client_id || m.at || "") + "|" + (m.from || "");
+    const dup = keyCounts.get(baseKey) || 0;
+    keyCounts.set(baseKey, dup + 1);
     if (m.variant === "working-group") {
       return h(WorkingGroup, {key: "wg-" + (m.turn_id || i), group: m});
     }
     const reactions = (overrides && m.at && overrides[m.at])
       ? overrides[m.at].reactions : m.reactions;
     return h(ChatMessage, {
-      key: (m._client_id || m.at || "") + "-" + i,
+      key: baseKey + "-" + dup,
       m, reactions, quoted: m.reply_to ? byAt[m.reply_to] : null,
     });
   });
