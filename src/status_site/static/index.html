@@ -930,14 +930,58 @@ async function postReaction(at, emoji, action) {
 }
 
 // Scroll a message into the middle of the thread and flash it (#668).
+//
+// Image loads can push the target up/down AFTER the initial scrollIntoView,
+// leaving the viewport near-but-not-on the target — Jason 2026-11-06 12:55
+// EST: "The links to specific messages don't take me to that specific
+// message. Maybe the img height is not accounted for?"
+//
+// Fix: observe the thread's children with a ResizeObserver and re-center
+// the target on every reflow for a short window (2s). Also pin to image
+// load events on the target itself and its preceding siblings — those are
+// the images that can shift the target downward as they decode. The whole
+// thing bails out on a manual scroll or on the 2s budget, whichever
+// comes first.
 function jumpToMessage(at) {
   const el = document.getElementById(messageAnchorId(at));
   if (!el) return false;
+  // Initial scroll.
   el.scrollIntoView({block: "center"});
   el.classList.remove("highlight");
   void el.offsetWidth;
   el.classList.add("highlight");
   setTimeout(() => el.classList.remove("highlight"), HIGHLIGHT_MS + 100);
+
+  // Re-anchor across image/working-group reflows.
+  const thread = el.closest(".a2ui-chat-thread");
+  if (!thread) return true;
+  const recenter = () => el.scrollIntoView({block: "center"});
+  let ro = null;
+  try {
+    ro = new ResizeObserver(recenter);
+    for (const child of Array.from(thread.children)) ro.observe(child);
+  } catch (_) { /* ResizeObserver unavailable — initial scroll is best-effort */ }
+  // Re-center as images that precede the target finish decoding.
+  const imgsBefore = [];
+  for (const sib of Array.from(thread.children)) {
+    if (sib === el) break;
+    sib.querySelectorAll && imgsBefore.push(...sib.querySelectorAll("img"));
+  }
+  imgsBefore.push(...el.querySelectorAll("img"));
+  const onLoad = () => recenter();
+  for (const img of imgsBefore) {
+    if (!img.complete) img.addEventListener("load", onLoad, {once: true});
+  }
+  // Bail out on manual scroll so we don't fight the user.
+  let cancelled = false;
+  const cancel = () => { cancelled = true; };
+  thread.addEventListener("wheel", cancel, {once: true, passive: true});
+  thread.addEventListener("touchmove", cancel, {once: true, passive: true});
+  // Hard timeout.
+  setTimeout(() => {
+    if (ro) ro.disconnect();
+    for (const img of imgsBefore) img.removeEventListener("load", onLoad);
+  }, 2000);
   return true;
 }
 
