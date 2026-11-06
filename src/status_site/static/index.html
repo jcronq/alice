@@ -97,6 +97,15 @@ h2.sec-heading {
 .a2ui-composer-bar { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; }
 .a2ui-composer-send { margin-left: auto; }
 .a2ui-composer-send .a2ui-btn-row { margin: 0; }
+.chat-image { margin: .4rem 0; }
+.chat-image img {
+  max-width: 100%;
+  max-height: 360px;
+  border-radius: 6px;
+  display: block;
+  background: var(--color-bg);
+}
+.chat-file { margin: .2rem 0; color: var(--color-fg-muted); font-size: .9rem; }
 .a2ui-attach {
   cursor: pointer; font-size: .85rem; color: var(--color-fg-muted);
   padding: .15rem .55rem; border: 1px solid var(--color-border-line);
@@ -745,19 +754,38 @@ function ChatThread({rows}) {
   }, renderChatMessages(rows));
 }
 
+const IMAGE_RE = /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i;
 function renderChatMessages(rows) {
   if (!rows.length) {
     return h("div", {className: "typing"}, "No messages yet. Say hi.");
   }
-  return rows.map((m, i) => h("div", {
-    key: (m.at || "") + "-" + i,
-    className: "msg " + (m.from === "jason" ? "jason" : "alice"),
-  },
-    m.text || "",
-    ...(m.files || []).map((n, j) => h("div", {key: "f-" + j}, "📎 " + n)),
-    h("small", null,
-      (m.from === "jason" ? "You" : "Alice") + " · " + (m.at || "")),
-  ));
+  return rows.map((m, i) => {
+    // Prefer the richer `attachments` shape (name, url) over the
+    // legacy `files` name-only shape so historical messages still
+    // render with a filename if the url isn't present.
+    const atts = (m.attachments && m.attachments.length)
+      ? m.attachments
+      : (m.files || []).map(n => ({name: n}));
+    return h("div", {
+      key: (m.at || "") + "-" + i,
+      className: "msg " + (m.from === "jason" ? "jason" : "alice"),
+    },
+      m.text || "",
+      ...atts.map((a, j) => {
+        const name = a.name || "";
+        const url = a.url;
+        const isImage = url && IMAGE_RE.test(name);
+        if (isImage) {
+          const src = url + (url.includes("?") ? "&" : "?") + "k=" + encodeURIComponent(KEY || "");
+          return h("div", {key: "f-" + j, className: "chat-image"},
+            h("img", {src, alt: name, loading: "lazy"}));
+        }
+        return h("div", {key: "f-" + j, className: "chat-file"}, "📎 " + name);
+      }),
+      h("small", null,
+        (m.from === "jason" ? "You" : "Alice") + " · " + (m.at || "")),
+    );
+  });
 }
 
 // Read files into the composer's pending-attachment list for textarea ``id``.

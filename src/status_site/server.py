@@ -315,7 +315,12 @@ def append_thread(cfg: Config, tid: str, message: dict) -> None:
 
 
 def read_chat(cfg: Config, limit: int = MAX_CHAT_HISTORY) -> list[dict]:
-    """General chat log (``.chat.jsonl``), newest-at-end, trimmed to ``limit``."""
+    """General chat log (``.chat.jsonl``), newest-at-end, trimmed to ``limit``.
+
+    Rewrites each attachment's ``path`` into a ``url`` under
+    ``/chat-upload/<date>/<filename>`` so the client can render images
+    inline. ``path`` stays for existing consumers.
+    """
     p = cfg.chat_log
     if not p.is_file():
         return []
@@ -325,7 +330,19 @@ def read_chat(cfg: Config, limit: int = MAX_CHAT_HISTORY) -> list[dict]:
             msgs.append(json.loads(line))
         except ValueError:
             pass
-    return msgs[-limit:] if limit else msgs
+    msgs = msgs[-limit:] if limit else msgs
+    upload_root = cfg.upload_dir / "chat"
+    for m in msgs:
+        for att in m.get("attachments") or []:
+            raw = att.get("path") or ""
+            if not raw:
+                continue
+            try:
+                rel = Path(raw).resolve().relative_to(upload_root.resolve())
+                att["url"] = "/chat-upload/" + rel.as_posix()
+            except (ValueError, OSError):
+                continue
+    return msgs
 
 
 def append_chat(cfg: Config, message: dict) -> None:
@@ -2388,6 +2405,35 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/chat":
             return self._json(
                 200, {"messages": read_chat(self.cfg)}, head=head
+            )
+        if path.startswith("/chat-upload/"):
+            q = parse_qs(urlsplit(self.path).query)
+            key = (q.get("k") or [""])[0]
+            if not _sse_check_key(self.cfg.key, key):
+                return self._json(403, {"error": "bad key"}, head=head)
+            # Strip the leading segment, split <date>/<filename>, reject
+            # anything with '..' or '/' in the filename part.
+            rel = unquote(path[len("/chat-upload/"):])
+            parts = rel.split("/")
+            if len(parts) != 2 or ".." in parts or not parts[0] or not parts[1]:
+                return self._json(404, {"error": "not found"}, head=head)
+            date_part, fname = parts
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_part):
+                return self._json(404, {"error": "not found"}, head=head)
+            if "/" in fname or fname.startswith(".") or "\0" in fname:
+                return self._json(404, {"error": "not found"}, head=head)
+            fpath = (self.cfg.upload_dir / "chat" / date_part / fname).resolve()
+            uploads_root = (self.cfg.upload_dir / "chat").resolve()
+            try:
+                fpath.relative_to(uploads_root)
+            except ValueError:
+                return self._json(404, {"error": "not found"}, head=head)
+            if not fpath.is_file():
+                return self._json(404, {"error": "not found"}, head=head)
+            ctype = mimetypes.guess_type(str(fpath))[0] or "application/octet-stream"
+            return self._send(
+                200, fpath.read_bytes(), ctype,
+                mtime=fpath.stat().st_mtime, head=head,
             )
         if path == "/bugs.md":
             body, mtime = render_bugs_md(self.cfg.status_dir)
