@@ -160,6 +160,30 @@ h2.sec-heading {
   background: var(--color-bg);
 }
 .chat-file { margin: .2rem 0; color: var(--color-fg-muted); font-size: .9rem; }
+.chat-jump {
+  position: sticky;
+  bottom: 1.5rem;
+  margin-left: auto;
+  margin-right: 1.5rem;
+  margin-top: -3rem;
+  padding: .45rem .9rem;
+  font-size: .9rem;
+  color: var(--color-bg);
+  background: var(--color-fg-muted);
+  border: 1px solid var(--color-fg-muted);
+  border-radius: 999px;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(0,0,0,.18);
+  align-self: flex-end;
+  z-index: 5;
+}
+.chat-jump:hover { background: var(--color-fg); border-color: var(--color-fg); }
+.chat-jump.unread {
+  background: var(--color-ok);
+  border-color: var(--color-ok);
+  animation: jumpPulse 1.8s ease-in-out infinite;
+}
+@keyframes jumpPulse { 0%,100% {transform:translateY(0)} 50% {transform:translateY(-2px)} }
 .msg-status { opacity: .75; font-variant-numeric: tabular-nums; }
 .msg-status-sending { animation: msgPulse 1.2s ease-in-out infinite; }
 .msg-status-sent { color: var(--color-fg-muted); }
@@ -805,46 +829,62 @@ function renderA2uiComponent(id, surface, local, setLocal) {
 function ChatThread({rows}) {
   const ref = useRef(null);
   const stick = useRef(true);
+  const prevCount = useRef(0);
   const [pending, setPending] = useState(() => chatPendingStore.pending);
+  // atBottom drives whether the "Jump" button renders; hasUnread flips
+  // its label from "To latest" to "To new message" when traffic lands
+  // while the user is scrolled away.
+  const [atBottom, setAtBottom] = useState(true);
+  const [hasUnread, setHasUnread] = useState(false);
   useEffect(() => chatPendingStore.subscribe(setPending), []);
   useEffect(() => { chatPendingStore.reconcile(rows); }, [rows]);
-  // Hide server rows that have a matching pending bubble so the user
-  // never sees the two-bubble flash during the SSE tick window.
   const serverRows = pending.length
     ? rows.filter(r => !serverRowMatchesPending(r, pending))
     : rows;
-  // Sort the merged list by numeric epoch, not lexical string — the
-  // optimistic bubble's at is UTC (``...T16:51:08.041-0000``) while
-  // the server at is EST (``...T11:51:08-0500``). Lexical compare
-  // flunks that cross-TZ even though the two are the same wall-clock.
-  // working-group rows carry their own ``at`` so they slot in
-  // between the trigger and Alice's reply.
   const atEpoch = m => { const t = Date.parse(m.at || ""); return Number.isNaN(t) ? 0 : t; };
   const merged = [...serverRows, ...pending].sort((a, b) => atEpoch(a) - atEpoch(b));
   const last = merged.length ? merged[merged.length - 1] : null;
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
+    // Mark new-unread only when the merged count grew AND the user
+    // is scrolled away from the bottom. Growth at the bottom with
+    // stick=true is already auto-followed below.
+    const grew = merged.length > prevCount.current;
+    prevCount.current = merged.length;
     const scroll = () => { if (stick.current) el.scrollTop = el.scrollHeight; };
-    // First pass: snap to bottom before any async image load.
     scroll();
-    // ResizeObserver catches image-load reflows and any other async
-    // height change inside the thread (working-group disclosures
-    // toggling, attachments resolving) so the view stays pinned
-    // exactly to the bottom instead of "close to" it.
     const ro = new ResizeObserver(scroll);
     for (const child of Array.from(el.children)) ro.observe(child);
-    // Also re-scroll when the window finishes painting the first frame
-    // — covers any layout that resolves between mount and the next
-    // ResizeObserver tick.
     const raf = requestAnimationFrame(scroll);
+    if (grew && !stick.current) setHasUnread(true);
     return () => { ro.disconnect(); cancelAnimationFrame(raf); };
   }, [merged.length, last && last.at, last && last.step_count]);
-  return h("div", {
-    ref,
-    className: "a2ui-list a2ui-chat-thread",
-    onScroll: e => { stick.current = isNearBottom(e.currentTarget); },
-  }, renderChatMessages(merged));
+  const jumpToLatest = () => {
+    const el = ref.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    stick.current = true;
+    setAtBottom(true);
+    setHasUnread(false);
+  };
+  const onScroll = e => {
+    const nearBottom = isNearBottom(e.currentTarget);
+    stick.current = nearBottom;
+    setAtBottom(nearBottom);
+    if (nearBottom) setHasUnread(false);
+  };
+  return h(React.Fragment, null,
+    h("div", {
+      ref,
+      className: "a2ui-list a2ui-chat-thread",
+      onScroll,
+    }, renderChatMessages(merged)),
+    !atBottom ? h("button", {
+      className: "chat-jump" + (hasUnread ? " unread" : ""),
+      onClick: jumpToLatest,
+    }, hasUnread ? "↓ To new message" : "↓ To latest") : null,
+  );
 }
 
 const IMAGE_RE = /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i;
