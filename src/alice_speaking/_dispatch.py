@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Optional
 from core.sdk_compat import _short
 
 from . import signal_outbound
+from . import slash_commands
 from . import worker_report as worker_report_module
 from .domain.turn_log import new_turn
 from .pipeline.quiet_hours import is_quiet_hours
@@ -143,6 +144,83 @@ def _with_outbound_awareness(
     return f"{block}\n\n{prompt}"
 
 
+async def _maybe_dispatch_slash(
+    ctx: DaemonContext, head: "SignalEvent"
+) -> bool:
+    """Try to run ``head`` as a Jason-only slash command.
+
+    Returns ``True`` when the slash dispatcher produced a direct reply
+    (caller should skip the normal turn pipeline). Returns ``False``
+    when the caller should fall through:
+
+    - head isn't actually a recognized slash command (``/foo`` with
+      an unknown verb) — the normal pipeline sees the original text;
+    - the sender isn't Jason — the slash dispatcher logs a warning
+      and does nothing, then the normal pipeline handles the message
+      as literal content;
+    - the dispatcher returned a ``rewritten_text`` (``//foo`` escape)
+      — the head body is mutated in place and the normal pipeline
+      runs on the rewritten content.
+
+    Direct-reply failures (``signal_transport.send`` raising) are
+    logged and swallowed; a slash-command dispatch that fails to
+    deliver still short-circuits the turn so Jason doesn't get an
+    LLM-generated response to ``/status``.
+    """
+    body = head.envelope.body or ""
+    principal = ctx.address_book.lookup_by_native("signal", head.envelope.source)
+    principal_id = principal.id if principal is not None else ""
+    if principal_id.lower() != "jason":
+        # ACL: only Jason can drive slash commands in slice-1. Log the
+        # rejection and let normal ingest handle the content (which may
+        # or may not reply — the dispatcher just doesn't execute).
+        log.warning(
+            "slash command %r from non-jason principal %r; "
+            "dispatch rejected, falling through to normal pipeline",
+            body.split(None, 1)[0] if body else "",
+            principal_id or head.envelope.source,
+        )
+        return False
+    try:
+        response = await slash_commands.handle(body, principal_id, ctx)
+    except Exception:  # noqa: BLE001
+        log.exception("slash_commands.handle raised; falling through")
+        return False
+    if response is None:
+        return False
+    if response.rewritten_text is not None:
+        # //foo escape — mutate the head body so the normal pipeline
+        # sees the literal content and short-circuit here without
+        # reporting consumed.
+        head.envelope.body = response.rewritten_text
+        return False
+    if response.reply_text is None:
+        # Recognized verb, no observable action. Skip the turn — the
+        # command was intentionally silent.
+        return True
+    channel = ChannelRef(transport="signal", address=head.envelope.source, durable=True)
+    try:
+        await ctx.signal_transport.send(
+            OutboundMessage(destination=channel, text=response.reply_text)
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("slash-command reply send failed")
+    # React to the inbound so Jason sees the usual replied check even
+    # on the fast path. Reactions are cosmetic — swallow failures.
+    with contextlib.suppress(Exception):
+        await ctx.signal_transport.set_message_state(
+            channel, head.envelope.timestamp, "replied"
+        )
+    with contextlib.suppress(Exception):
+        ctx.events.emit(
+            "slash_command_dispatched",
+            principal_id=principal_id,
+            body=_short(body, 200),
+            reply_chars=len(response.reply_text or ""),
+        )
+    return True
+
+
 async def handle_signal(ctx: DaemonContext, batch: list["SignalEvent"]) -> None:
     """Process a batch of one or more SignalEvents from the same sender.
 
@@ -160,6 +238,14 @@ async def handle_signal(ctx: DaemonContext, batch: list["SignalEvent"]) -> None:
     head = batch[0]
     sender_name = head.sender_name
     source = head.envelope.source
+    # Slash-command intercept (issue #624 slice-1). Jason-only;
+    # single-message batches only — multi-message batches are
+    # conversational flow that the normal pipeline handles. The
+    # intercept may short-circuit the turn (direct reply) or rewrite
+    # the head body for ``//foo`` escapes before falling through.
+    if len(batch) == 1 and (head.envelope.body or "").startswith("/"):
+        if await _maybe_dispatch_slash(ctx, head):
+            return
     # Idle tracking (issue #373): every inbound refreshes the per-channel
     # ``last seen`` timestamp and clears any prior flush flag so the
     # session-close watcher will re-arm on the next quiet window.
