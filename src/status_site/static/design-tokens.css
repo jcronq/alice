@@ -1,0 +1,397 @@
+/* Design tokens — ported from agentry-dashboard/dashboard/template.html
+ * (lines 3-29). Names kept 1:1 with the reference so future ports stay
+ * straightforward; map the status-site's older ``--bg`` / ``--fg`` / etc.
+ * in ``index.html`` onto these new tokens rather than renaming the
+ * tokens themselves.
+ *
+ * Light + ``prefers-color-scheme: dark`` + explicit ``data-theme``
+ * override; every numeric uses the tabular-nums utility ``font-variant-
+ * numeric: tabular-nums`` on ``.fx-num`` and related numeric spans so
+ * dashboard-style columns stay aligned.
+ */
+:root {
+  /* Colours (light) */
+  --color-bg: #f7f6f2;
+  --color-panel: #ffffff;
+  --color-fg: #1d1c1a;
+  --color-fg-muted: #66645e;
+  --color-border-line: #e3e0d6;
+  --color-ok: #2e7a4f;
+  --color-warn: #b06f14;
+  --color-bad: #b23a3a;
+
+  /* Chart-adjacent accents (kept because the dashboard references them
+   * from a dozen widget rules; harmless to keep around even though the
+   * status-site has no SVG charts yet). */
+  --dash-chart-grid: #ebe8df;
+  --dash-chart-status-warning: #c27c1a;
+  --dash-chart-status-critical: #b23a3a;
+  --dash-chart-reference: #3f72ad;
+  --dash-chart-muted: #b4b1a7;
+
+  /* Typography */
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-serif: "Source Serif 4", Georgia, "Times New Roman", serif;
+  --dash-font-size-caption: 12.5px;
+  --dash-font-size-body: 14px;
+  --dash-font-size-heading: 16px;
+  --dash-font-size-title: 26px;
+  --dash-font-weight-medium: 500;
+
+  /* Spacing + radii */
+  --dash-gap-xs: 4px;
+  --dash-gap-sm: 8px;
+  --dash-gap-md: 14px;
+  --dash-gap-lg: 22px;
+  --dash-pad-xs: 6px;
+  --dash-pad-sm: 10px;
+  --dash-pad-lg: 18px;
+  --dash-radius: 10px;
+  --dash-dur-slow: 300ms;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --color-bg: #1b1a18;
+    --color-panel: #24231f;
+    --color-fg: #ecebe6;
+    --color-fg-muted: #a6a39a;
+    --color-border-line: #38362f;
+    --color-ok: #67bd88;
+    --color-warn: #e0a24a;
+    --color-bad: #e07a7a;
+    --dash-chart-grid: #312f29;
+    --dash-chart-status-warning: #e0a24a;
+    --dash-chart-status-critical: #e07a7a;
+    --dash-chart-reference: #7aa7dd;
+    --dash-chart-muted: #6c6a62;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --color-bg: #1b1a18;
+  --color-panel: #24231f;
+  --color-fg: #ecebe6;
+  --color-fg-muted: #a6a39a;
+  --color-border-line: #38362f;
+  --color-ok: #67bd88;
+  --color-warn: #e0a24a;
+  --color-bad: #e07a7a;
+  --dash-chart-grid: #312f29;
+  --dash-chart-status-warning: #e0a24a;
+  --dash-chart-status-critical: #e07a7a;
+  --dash-chart-reference: #7aa7dd;
+  --dash-chart-muted: #6c6a62;
+  color-scheme: dark;
+}
+
+/* Tabular numerics utility — drop onto any numeric span/td/th so
+ * right-aligned columns stay aligned regardless of glyph widths. */
+.fx-num,
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ─────────────────────────────────────────────────────────────── */
+/* Widget primitives (consolidated into design-tokens.css per #649). */
+/* ─────────────────────────────────────────────────────────────── */
+
+/* Widget primitives — ported from
+ * agentry-dashboard/dashboard/template.html lines 51-163.
+ *
+ * Generic ``fx-*`` classes only — the agentry-specific bits (``fx-ops``
+ * charts, Gantt, pilot overlay) are left behind; the status-site can
+ * pull them in later if we ever ship those panels. Tokens live in
+ * ``design-tokens.css``.
+ *
+ * Classes:
+ *   fx-card    — padded panel with 1px border + radius
+ *   fx-ms      — milestone-board grid (fx-msrow children are
+ *                label / bar / count)
+ *   fx-tbl     — scrollable table shell with aligned numerics
+ *   fx-bar     — horizontal bar (used inside fx-ms and as tiles)
+ *   fx-legend  — colour-dot legend under a bar
+ *   fx-pill    — small inline pill (blocked / done / active)
+ *   fx-urg     — urgency label (NOW / TODAY / WHEN / FYI / UNSET)
+ *   fx-mark    — short bordered mark for inline blockers
+ *   fx-tile    — tile with coloured left-border freshness state
+ *   fx-stamp   — muted "updated 5 min ago" caption under a tile
+ *
+ * Layout rules keep the status-site's single-column reading order;
+ * panels flow top-to-bottom, not into a grid (that's a future port
+ * once the fleetops / pipeline sections land).
+ */
+
+/* Card ---------------------------------------------------------------- */
+.fx-card {
+  background: var(--color-panel);
+  border: 1px solid var(--color-border-line);
+  border-radius: var(--dash-radius);
+  padding: var(--dash-pad-lg);
+  min-width: 0;
+}
+.fx-card h2 {
+  font-size: var(--dash-font-size-heading);
+  font-weight: var(--dash-font-weight-medium);
+  margin: 0;
+}
+.fx-note {
+  color: var(--color-fg-muted);
+  font-size: var(--dash-font-size-caption);
+  margin: var(--dash-gap-xs) 0 var(--dash-gap-md);
+}
+
+/* Milestone-board rows ------------------------------------------------- */
+.fx-ms {
+  display: grid;
+  gap: var(--dash-gap-sm);
+}
+.fx-msrow {
+  display: grid;
+  grid-template-columns: minmax(8rem, 13rem) 1fr 4.5rem;
+  gap: var(--dash-gap-sm);
+  align-items: center;
+  font-size: var(--dash-font-size-body);
+}
+.fx-msrow .lab {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.fx-msrow .cnt {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-fg-muted);
+}
+.fx-msrow .fx-bar {
+  margin-top: 0;
+  height: 12px;
+  min-height: 12px;
+}
+@media (max-width: 34rem) {
+  .fx-msrow {
+    grid-template-columns: 1fr 4rem;
+  }
+  .fx-msrow .fx-bar {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+}
+
+/* Bars ---------------------------------------------------------------- */
+.fx-bar {
+  display: flex;
+  height: 18px;
+  border-radius: 9px;
+  overflow: hidden;
+  background: var(--dash-chart-grid);
+  margin-top: var(--dash-gap-md);
+  min-height: 18px;
+}
+.fx-bar span {
+  display: block;
+  height: 100%;
+}
+.fx-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--dash-gap-sm) var(--dash-gap-md);
+  margin-top: var(--dash-gap-sm);
+  font-size: var(--dash-font-size-caption);
+  color: var(--color-fg-muted);
+}
+.fx-legend i {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  margin-right: 6px;
+  vertical-align: -1px;
+}
+.fx-legend b {
+  font-weight: 500;
+  color: var(--color-fg);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Tables -------------------------------------------------------------- */
+.fx-tbl {
+  overflow-x: auto;
+}
+.fx-tbl table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--dash-font-size-caption);
+}
+.fx-tbl th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--color-fg-muted);
+  border-bottom: 1px solid var(--color-border-line);
+  padding: var(--dash-pad-xs) var(--dash-pad-sm) var(--dash-pad-xs) 0;
+}
+.fx-tbl td {
+  padding: var(--dash-pad-xs) var(--dash-pad-sm) var(--dash-pad-xs) 0;
+  border-bottom: 1px solid var(--color-border-line);
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+/* Pills --------------------------------------------------------------- */
+.fx-pill {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: var(--dash-font-size-caption);
+  border: 1px solid var(--color-border-line);
+  white-space: nowrap;
+}
+.fx-pill.blocked {
+  color: var(--color-bad);
+  border-color: currentColor;
+}
+.fx-pill.done {
+  color: var(--color-ok);
+  border-color: currentColor;
+}
+.fx-pill.active {
+  color: var(--color-warn);
+  border-color: currentColor;
+}
+
+/* Urgency labels ------------------------------------------------------ */
+.fx-urg {
+  font-weight: 600;
+  white-space: nowrap;
+}
+.fx-urg.NOW,
+.fx-urg.UNSET {
+  color: var(--color-bad);
+}
+.fx-urg.TODAY {
+  color: var(--color-warn);
+}
+.fx-urg.FYI,
+.fx-urg.WHEN {
+  color: var(--color-fg-muted);
+  font-weight: 500;
+}
+tr.fx-now td,
+li.fx-now {
+  background: color-mix(in srgb, var(--color-bad) 9%, transparent);
+}
+
+/* Blocker marks ------------------------------------------------------- */
+.fx-mark {
+  display: inline-block;
+  padding: 0 6px;
+  margin-right: 4px;
+  border-radius: 4px;
+  font-size: var(--dash-font-size-caption);
+  border: 1px solid currentColor;
+  white-space: nowrap;
+}
+.fx-mark.blocked {
+  color: var(--color-bad);
+}
+.fx-mark.queued {
+  color: var(--color-fg-muted);
+  border-style: dashed;
+}
+.fx-mark a {
+  color: inherit;
+}
+
+/* Tiles + freshness --------------------------------------------------- */
+.fx-tile {
+  border: 1px solid var(--color-border-line);
+  border-left-width: 6px;
+  border-radius: var(--dash-radius);
+  padding: var(--dash-pad-sm);
+  min-width: 0;
+}
+.fx-tile h3 {
+  margin: 0 0 var(--dash-gap-xs);
+  font-size: var(--dash-font-size-body);
+  font-weight: 600;
+}
+.fx-tile a {
+  color: inherit;
+}
+.fx-tile .hl {
+  font-size: var(--dash-font-size-heading);
+  overflow-wrap: anywhere;
+}
+.fx-stamp {
+  font-size: var(--dash-font-size-caption);
+  color: var(--color-fg-muted);
+  margin-top: var(--dash-gap-xs);
+  overflow-wrap: anywhere;
+}
+[data-fresh="ok"] {
+  border-left-color: var(--color-ok);
+}
+[data-fresh="amber"] {
+  border-left-color: var(--color-warn);
+}
+[data-fresh="amber"] .fx-stamp {
+  color: var(--color-warn);
+}
+[data-fresh="red"],
+[data-fresh="stale_last_good"],
+[data-fresh="owed"] {
+  border-left-color: var(--color-bad);
+}
+[data-fresh="red"] .fx-stamp,
+[data-fresh="stale_last_good"] .fx-stamp,
+[data-fresh="owed"] .fx-stamp {
+  color: var(--color-bad);
+  font-weight: 600;
+}
+
+/* Freshness pill used right above each spliced section heading. The
+ * ``.freshness-tile`` class is a pill variant — same pill shape, but
+ * the left-border/data-fresh colour rules apply because ``[data-fresh]``
+ * matches any element. ``data-age`` is seconds; a small inline script
+ * in ``index.html`` updates the attribute + the "ago" label on refresh. */
+.fx-pill.freshness-tile {
+  font-variant-numeric: tabular-nums;
+}
+.fx-pill.freshness-tile[data-fresh="ok"] {
+  border-color: var(--color-ok);
+  color: var(--color-ok);
+}
+.fx-pill.freshness-tile[data-fresh="amber"] {
+  border-color: var(--color-warn);
+  color: var(--color-warn);
+}
+.fx-pill.freshness-tile[data-fresh="red"] {
+  border-color: var(--color-bad);
+  color: var(--color-bad);
+  font-weight: 600;
+}
+.fx-pill.freshness-tile[data-fresh="owed"] {
+  border-color: var(--color-bad);
+  color: var(--color-bad);
+  font-weight: 600;
+  font-style: italic;
+}
+
+/* The ``fx-fail`` dot-prefix line marks a source whose last poll failed. */
+.fx-fail {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--color-fg-muted);
+  font-size: var(--dash-font-size-caption);
+  min-height: 3rem;
+}
+.fx-fail::before {
+  content: "";
+  width: 0.375rem;
+  height: 0.375rem;
+  border-radius: 50%;
+  background: var(--color-bad);
+}

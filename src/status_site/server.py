@@ -54,7 +54,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -88,6 +88,7 @@ from status_site.sources.common import (
     asks_path as _asks_path,
     read_asks as _read_asks,
 )
+from status_site import urgency as _urgency
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 # ``legacy.html`` is the pre-#639 static shell, kept so the reactive
@@ -95,7 +96,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 # ``?p=chat`` keeps working while the widget library catches up
 # through slices 2–6. The new ``index.html`` is the SSE-driven React
 # shell that renders section updates live from ``/api/events``.
-STATIC_FILES = {"index.html", "legacy.html", "marked.min.js"}
+STATIC_FILES = {"index.html", "legacy.html", "marked.min.js", "design-tokens.css"}
 
 # Content files served from STATUS_DIR: flat names only (no '/', no leading dot).
 CONTENT_NAME_RE = re.compile(
@@ -105,6 +106,7 @@ CONTENT_TYPES = {
     ".md": "text/markdown; charset=utf-8",
     ".json": "application/json",
     ".txt": "text/plain; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
 }
 
 MAX_FILES = 5
@@ -1554,8 +1556,15 @@ class OverviewPollers:
 # sync with the client's reducer.
 
 
-def section_renderers(cfg: "Config") -> dict[str, Callable[[], str]]:
-    """Return ``{section_name: () -> markdown}`` for every Overview section.
+def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
+    """Return ``{section_name: () -> payload}`` for every Overview section.
+
+    Payloads are typed dicts shaped per #649: every renderer at least
+    emits ``{"markdown": "..."}`` so the legacy Section component keeps
+    rendering; the four slice-2 sections (running_now, waiting_on_you,
+    alice_queue, done_today) also carry typed ``rows`` so widgets can
+    render without re-parsing markdown. Dict equality is deep, so the
+    broadcaster's change-detection compare still works unchanged.
 
     Closures read live state each call: TTL-cached sources via
     ``cfg.pollers`` (an empty cache renders the "nothing yet" string so
@@ -1569,38 +1578,113 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], str]]:
     """
     pollers = cfg.pollers
 
-    def _render_running_now() -> str:
+    def _render_running_now() -> dict:
         rows = (pollers.get("running_now") if pollers else None) or []
-        return _running_now.render(rows)
+        md = _running_now.render(rows)
+        typed_rows: list[dict] = []
+        for t in rows:  # type: ignore[attr-defined]
+            try:
+                typed_rows.append(asdict(t))
+            except TypeError:
+                # Already a dict (defensive: shouldn't happen with the
+                # frozen dataclass, but we never want a payload coerce
+                # to blow up the SSE tick).
+                typed_rows.append(dict(t) if isinstance(t, dict) else {})
+        return {"markdown": md, "rows": typed_rows}
 
-    def _render_ready_for_review() -> str:
+    def _render_ready_for_review() -> dict:
         cached = (pollers.get("review_queue") if pollers else None) or {}
-        return _review_queue.render(
+        md = _review_queue.render(
             cached.get("design", []),
             cached.get("pr", []),
             design_failed=cached.get("design_failed", []),
             pr_failed=cached.get("pr_failed", []),
         )
+        return {"markdown": md}
 
-    def _render_waiting_on_you() -> str:
-        return _waiting_on_you.render(
+    def _render_waiting_on_you() -> dict:
+        hand_zone_md = _waiting_on_you.read_hand_zone(
+            cfg.status_dir / "waiting-on-you.md"
+        )
+        asks = _read_asks(_asks_path(cfg.status_dir))
+        pending = _waiting_on_you.unresolved_asks(asks)
+        rows: list[dict] = []
+        for r in pending:
+            rank = _urgency.classify(r)
+            rows.append(
+                {
+                    "id": r.get("id", ""),
+                    "text": str(r.get("text") or "").strip(),
+                    "created": r.get("created", ""),
+                    "urgency": rank,
+                }
+            )
+        # Stable NOW-first sort (NOW rises above UNSET rises above
+        # TODAY, oldest within a rank); existing markdown render keeps
+        # its own ordering for /index.md parity.
+        rows.sort(
+            key=lambda r: (
+                _urgency.RANK_ORDER.get(r["urgency"], len(_urgency.RANK_ORDER)),
+                r.get("created") or "",
+            )
+        )
+        md = _waiting_on_you.render(
             cfg.status_dir / "waiting-on-you.md",
             asks_path=_asks_path(cfg.status_dir),
         )
+        return {
+            "markdown": md,
+            "hand_zone_md": hand_zone_md,
+            "rows": rows,
+        }
 
-    def _render_alice_queue() -> str:
+    def _render_alice_queue() -> dict:
         items = scan_surfaces(cfg.surface_dir)
-        return render_alice_queue(items, now=time.time())
+        now = time.time()
+        md = render_alice_queue(items, now=now)
+        rows: list[dict] = []
+        for it in items:
+            rows.append(
+                {
+                    "slug": it.get("slug", ""),
+                    "type": it.get("type", ""),
+                    "label": _surface_label(it),
+                    "link": _surface_link_url(it),
+                    "age_seconds": now - float(it.get("created_epoch", now)),
+                    "created": it.get("created", ""),
+                }
+            )
+        return {"markdown": md, "rows": rows}
 
-    def _render_done_today() -> str:
+    def _render_done_today() -> dict:
         cached = (pollers.get("done_today") if pollers else None) or {}
         today = cached.get("today") or _done_today.today_local()
         asks = _read_asks(_asks_path(cfg.status_dir))
         resolved = _done_today.resolved_today(asks, today)
-        return _done_today.render(cached.get("prs", []), resolved)
+        md = _done_today.render(cached.get("prs", []), resolved)
+        prs_rows: list[dict] = []
+        for pr in cached.get("prs", []) or []:  # type: ignore[attr-defined]
+            try:
+                prs_rows.append(asdict(pr))
+            except TypeError:
+                if isinstance(pr, dict):
+                    prs_rows.append(dict(pr))
+        asks_rows: list[dict] = [
+            {
+                "id": r.get("id", ""),
+                "text": str(r.get("text") or "").strip(),
+                "resolved_at": r.get("resolved_at", ""),
+            }
+            for r in resolved
+        ]
+        return {
+            "markdown": md,
+            "prs": prs_rows,
+            "asks_resolved": asks_rows,
+        }
 
-    def _render_known_issues() -> str:
-        return _known_issues.render(cfg.status_dir / "known-issues.md")
+    def _render_known_issues() -> dict:
+        return {"markdown": _known_issues.render(cfg.status_dir / "known-issues.md")}
 
     # Preserve Overview order; the SSE client iterates this dict to
     # draw sections top-to-bottom.
@@ -1637,29 +1721,33 @@ def overview_splice_sections(
     disk scan that the SSE path's closure does.
     """
     renderers = section_renderers(cfg)
-    _render_running_now = renderers["running_now"]
-    _render_ready_for_review = renderers["ready_for_review"]
-    _render_waiting_on_you = renderers["waiting_on_you"]
-    _render_done_today = renderers["done_today"]
-    _render_known_issues = renderers["known_issues"]
+
+    def _md(name: str) -> Callable[[], str]:
+        """Adapt a typed-dict renderer to the markdown-string shape
+        ``_splice_sections`` wants. Falsy / missing ``markdown`` → ``""``
+        so the /index.md path stays serveable even if a renderer only
+        returns typed rows.
+        """
+        fn = renderers[name]
+        return lambda: str((fn() or {}).get("markdown") or "")
 
     return [
         (
             RUNNING_NOW_START,
             RUNNING_NOW_END,
-            _render_running_now,
+            _md("running_now"),
             _running_now_fallback,
         ),
         (
             READY_FOR_REVIEW_START,
             READY_FOR_REVIEW_END,
-            _render_ready_for_review,
+            _md("ready_for_review"),
             _ready_for_review_fallback,
         ),
         (
             WAITING_ON_YOU_START,
             WAITING_ON_YOU_END,
-            _render_waiting_on_you,
+            _md("waiting_on_you"),
             _waiting_on_you_fallback,
         ),
         (
@@ -1671,13 +1759,13 @@ def overview_splice_sections(
         (
             DONE_TODAY_START,
             DONE_TODAY_END,
-            _render_done_today,
+            _md("done_today"),
             _done_today_fallback,
         ),
         (
             KNOWN_ISSUES_START,
             KNOWN_ISSUES_END,
-            _render_known_issues,
+            _md("known_issues"),
             _known_issues_fallback,
         ),
     ]
