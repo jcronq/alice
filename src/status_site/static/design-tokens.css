@@ -588,26 +588,39 @@ li.fx-now {
   padding-top: .15rem;
   border-top: 1px solid var(--color-border-line);
 }
+/* Reply header: an obvious clickable link that jumps to the parent
+ * message. Rendered with an arrow glyph, accent color + underline so
+ * Jason reads it as a hyperlink not a muted header. */
 .a2ui-list.a2ui-chat-thread .msg .msg-reply-ref {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: .3rem;
   max-width: 100%;
-  margin: 0 0 .25rem;
-  padding: .1rem .4rem;
+  margin: 0 0 .35rem;
+  padding: .2rem .5rem;
   font: inherit;
-  font-size: .75rem;
+  font-size: .78rem;
   text-align: left;
-  color: inherit;
-  opacity: .75;
-  background: rgba(127, 127, 127, .15);
+  color: var(--color-accent, var(--color-ok));
+  background: rgba(127, 127, 127, .12);
   border: 0;
-  border-left: 2px solid currentColor;
-  border-radius: 3px;
+  border-left: 3px solid var(--color-accent, var(--color-ok));
+  border-radius: 4px;
   cursor: pointer;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
-.a2ui-list.a2ui-chat-thread .msg .msg-reply-ref:hover { opacity: 1; }
+.a2ui-list.a2ui-chat-thread .msg .msg-reply-ref::before {
+  content: "↪";
+  opacity: .8;
+  text-decoration: none;
+}
+.a2ui-list.a2ui-chat-thread .msg .msg-reply-ref:hover {
+  background: rgba(127, 127, 127, .22);
+}
 .a2ui-list.a2ui-chat-thread .msg .msg-reactions {
   display: flex;
   flex-wrap: wrap;
