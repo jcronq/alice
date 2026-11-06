@@ -190,3 +190,37 @@ def test_main_missing_index_is_clean(tmp_path, capsys):
     (mind / "inner" / "status").mkdir(parents=True)
     assert R.main(["--mind", str(mind)]) == 0
     assert "no changes" in capsys.readouterr().out
+
+
+BARE_PAGE = """# Status
+
+## Running now
+
+- [ ] ⏳ **Bare merged**: shipped as #601
+- [ ] ⏳ **Bare open**: in review at #603
+- [ ] ⏳ **Bare issue**: tracking issue #700
+- [ ] ⏳ **Anchor only**: see https://github.com/jcronq/alice/pull/603#issuecomment-1
+
+## Done today
+"""
+
+
+def test_bare_pr_refs_resolve_against_repo(tmp_path):
+    seen: list[str] = []
+
+    def prs(url: str):
+        seen.append(url)
+        return {MERGED: "MERGED", OPEN: "OPEN"}.get(url)  # #700 is an issue → None
+
+    out = R.reconcile(BARE_PAGE, tmp_path, prs, {}.get)
+    assert "- [x] ⏳ **Bare merged**" in section(out, "Done today")
+    running = section(out, "Running now")
+    for title in ("Bare open", "Bare issue", "Anchor only"):
+        assert title in running
+    assert "https://github.com/jcronq/alice/pull/700" in seen
+
+
+def test_bare_pr_refs_honor_repo_option(tmp_path):
+    other = "https://github.com/jcronq/other/pull/601"
+    out = R.reconcile(BARE_PAGE, tmp_path, {other: "MERGED"}.get, {}.get, repo="jcronq/other")
+    assert "Bare merged" in section(out, "Done today")
