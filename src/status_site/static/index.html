@@ -769,25 +769,78 @@ function WaitingTable({rows, handZoneMd, nowMs}) {
   );
 }
 
-function AliceQueueList({rows, nowMs}) {
-  const safe = rows || [];
-  if (!safe.length) {
+function SmStatePill({state}) {
+  const st = state || "unknown";
+  return h("span", {className: "fx-pill sm-" + st}, st.replace(/_/g, " "));
+}
+function PipelineGroup({title, count, children}) {
+  return h("div", {className: "fx-group", "data-group": title},
+    h("h4", {className: "fx-group-h"}, title + " (" + count + ")"),
+    children,
+  );
+}
+function PipelineBoard({pipeline, surfaces, tasks}) {
+  const issues = pipeline || [];
+  const surf = surfaces || [];
+  const tks = tasks || [];
+  if (!issues.length && !surf.length && !tks.length) {
     return h("p", {style: {color: "var(--color-fg-muted)", margin: 0}},
       "(queue clear)");
   }
-  const columns = [
-    {key: "age_seconds", label: "age", numeric: true, cell: r =>
-      h("span", {className: "fx-num"}, ageStringSeconds(r.age_seconds))
-    },
-    {key: "label", label: "surface", cell: r => r.label || ""},
-    {key: "link", label: "link", cell: r =>
-      r.link
-        ? h("a", {href: r.link, target: "_blank", rel: "noopener"}, "open")
-        : "—"
-    },
-    {key: "effort", label: "effort", cell: () => h(CyclePill, {rank: "—"})},
-  ];
-  return h(FxTable, {columns, rows: safe});
+  const ageCell = r => h("span", {className: "fx-num"},
+    r.age_seconds == null ? "—" : ageStringSeconds(r.age_seconds));
+  const groups = [];
+  if (issues.length) {
+    groups.push(h(PipelineGroup, {key: "pipeline", title: "In SM pipeline", count: issues.length},
+      h(FxTable, {
+        columns: [
+          {key: "state", label: "state", cell: r => h(SmStatePill, {state: r.state})},
+          {key: "number", label: "#", numeric: true, cell: r =>
+            r.link
+              ? h("a", {href: r.link, target: "_blank", rel: "noopener",
+                  style: {fontVariantNumeric: "tabular-nums"}}, "#" + r.number)
+              : h("span", {className: "fx-num"}, "#" + r.number)
+          },
+          {key: "title", label: "title", cell: r =>
+            r.link
+              ? h("a", {href: r.link, target: "_blank", rel: "noopener"}, r.title || "")
+              : (r.title || "")
+          },
+          {key: "art", label: "art", cell: r => r.art || "—"},
+          {key: "age_seconds", label: "age", numeric: true, cell: ageCell},
+        ],
+        rows: issues.map(r => ({...r, __key: (r.repo || "") + "#" + r.number})),
+      })));
+  }
+  if (surf.length) {
+    groups.push(h(PipelineGroup, {key: "surfaces", title: "Surfaces", count: surf.length},
+      h(FxTable, {
+        columns: [
+          {key: "type", label: "type", cell: r => r.type || ""},
+          {key: "label", label: "surface", cell: r => r.label || ""},
+          {key: "age_seconds", label: "age", numeric: true, cell: ageCell},
+          {key: "link", label: "link", cell: r =>
+            r.link
+              ? h("a", {href: r.link, target: "_blank", rel: "noopener"}, "open")
+              : "—"
+          },
+        ],
+        rows: surf,
+      })));
+  }
+  if (tks.length) {
+    groups.push(h(PipelineGroup, {key: "tasks", title: "Tasks", count: tks.length},
+      h(FxTable, {
+        columns: [
+          {key: "state", label: "state", cell: r => h("span", {className: "fx-pill"}, r.state || "")},
+          {key: "slug", label: "task", cell: r => h("code", null, r.slug || "")},
+          {key: "title", label: "title", cell: r => r.title || ""},
+          {key: "age_seconds", label: "age", numeric: true, cell: ageCell},
+        ],
+        rows: tks,
+      })));
+  }
+  return h(React.Fragment, null, groups);
 }
 
 function DoneTodayList({prs, asksResolved}) {
@@ -845,7 +898,11 @@ function SectionTile({name, data, ts, nowMs}) {
       nowMs,
     });
   } else if (name === "alice_queue") {
-    inner = h(AliceQueueList, {rows: data && data.rows, nowMs});
+    inner = h(PipelineBoard, {
+      pipeline: data && data.pipeline,
+      surfaces: data && data.rows,
+      tasks: data && data.tasks,
+    });
   } else if (name === "done_today") {
     inner = h(DoneTodayList, {
       prs: data && data.prs,
