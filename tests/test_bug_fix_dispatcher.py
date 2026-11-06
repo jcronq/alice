@@ -306,12 +306,19 @@ def test_dispatch_idempotency_dispatched_at_blocks_respawn(tmp_path):
     """A bug whose ``status`` was flipped to ``in-progress`` on a prior
     tick must never re-trigger a spawn, even if the file is scanned again."""
     cfg = _make_cfg(tmp_path)
+    # Recent enough to stay inside the stall TTL, otherwise the stall
+    # sweep flips the bug to dispatch-failed instead of leaving it alone.
+    recent = (
+        (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=5))
+        .replace(microsecond=0)
+        .isoformat()
+    )
     p = write_bug(
         cfg.status_dir,
         7,
         status="in-progress",
         extra_front={
-            "dispatched_at": "2026-11-02T17:00:00+00:00",
+            "dispatched_at": recent,
             "worker_task_id": "pid:4242",
         },
     )

@@ -220,7 +220,7 @@ def test_load_spawn_map_missing_file_returns_default(
 ) -> None:
     missing = tmp_path / "missing.json"
     spawn_map = load_spawn_map(config_path=missing, log=lambda _msg: None)
-    assert spawn_map[("sm:selected", "art:code")]["agent_spec"] == "designer"
+    assert spawn_map[("sm:selected", "art:code")]["agent_spec"] == "designer-cli"
     assert spawn_map[("sm:reviewing", "art:code")]["agent_spec"] == "reviewer"
 
 

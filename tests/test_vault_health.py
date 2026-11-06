@@ -4729,24 +4729,24 @@ def test_compute_decay_score_decay_exempt_returns_zero(tmp_path: Path) -> None:
 
 
 def test_compute_decay_score_active_project_above_threshold(tmp_path: Path) -> None:
-    """Fresh ``projects/`` note with zero access scores above 0.20."""
+    """Aged ``projects/`` note with zero access scores above 0.20."""
     vault = _make_vault(tmp_path)
     note = vault / "projects" / "alpha.md"
     note.parent.mkdir(parents=True, exist_ok=True)
     note.write_text("just a project body", encoding="utf-8")
     score = compute_decay_score(
-        fm=_decay_fm(created="2026-06-11"),
+        fm=_decay_fm(created="2026-05-12"),
         body="just a project body",
         in_degree=0,
         vault_dir=vault,
         note_path=note,
         today=datetime(2026, 6, 12),
     )
-    # folder_resistance=0.30, age_factor=exp(-ln(2)*1/7)≈0.906
-    # link_resistance=0, trigger_proxy=0, access_term=0
-    # D = 1 * 0.70 * 1 * 0.906 * 1 ≈ 0.634
+    # 31 days old: age_factor=1-exp(-ln(2)*31/7)≈0.954
+    # folder_resistance=0.30, link_resistance=0, trigger_proxy=0, access_term=0
+    # D = 1 * 0.70 * 1 * 0.954 * 1 ≈ 0.668
     assert score > DEFAULT_DECAY_SCORE_THRESHOLD
-    assert 0.55 < score < 0.70
+    assert 0.60 < score < 0.72
 
 
 def test_compute_decay_score_hub_in_degree_caps_at_0_85(tmp_path: Path) -> None:
@@ -4837,7 +4837,7 @@ def test_compute_decay_score_invalid_access_field_is_zero(tmp_path: Path) -> Non
 
 
 def test_compute_decay_score_future_dated_note_no_age_penalty(tmp_path: Path) -> None:
-    """A note dated in the future clamps age_days to 0 (age_factor = 1)."""
+    """A note dated in the future clamps age_days to 0 (age_factor = 0)."""
     vault = _make_vault(tmp_path)
     note = vault / "projects" / "future.md"
     note.parent.mkdir(parents=True, exist_ok=True)
@@ -4850,8 +4850,8 @@ def test_compute_decay_score_future_dated_note_no_age_penalty(tmp_path: Path) ->
         note_path=note,
         today=datetime(2026, 6, 12),
     )
-    # age_days=0 → age_factor=1, formula = 1*0.7*1*1*1 = 0.7
-    assert 0.65 < score < 0.75
+    # age_days=0 → age_factor=1-exp(0)=0, so D = 0.0 (not decayed)
+    assert score == 0.0
 
 
 def test_compute_decay_score_unparseable_created(tmp_path: Path) -> None:
@@ -4911,8 +4911,9 @@ def test_compute_decay_score_unknown_folder_uses_default(tmp_path: Path) -> None
         note_path=note,
         today=datetime(2026, 6, 12),
     )
-    # folder_resistance=0.15 default, age_factor=0.906 → D ≈ 1*0.85*1*0.906*1 ≈ 0.770
-    assert 0.70 < score < 0.80
+    # folder_resistance=0.15 default, 1 day old → age_factor≈0.094
+    # D ≈ 1*0.85*1*0.094*1 ≈ 0.080
+    assert 0.07 < score < 0.09
 
 
 def test_compute_decay_score_no_note_path_falls_back_to_default(tmp_path: Path) -> None:
@@ -4926,8 +4927,8 @@ def test_compute_decay_score_no_note_path_falls_back_to_default(tmp_path: Path) 
         today=datetime(2026, 6, 12),
     )
     # default folder_resistance=0.15, no folder-specific access weight,
-    # age_factor ≈ 0.906, no access protection.
-    assert 0.70 < score < 0.80
+    # 1 day old → age_factor ≈ 0.094, no access protection.
+    assert 0.07 < score < 0.09
 
 
 def test_compute_all_links_degree_counts_body_and_frontmatter(tmp_path: Path) -> None:
@@ -5693,6 +5694,7 @@ def test_fragmentation_baseline_single_note(tmp_path: Path) -> None:
         "alert": False,
         "high_priority_alert": False,
         "mega_cluster_anomaly": False,
+        "alert_type": None,
     }
 
 
