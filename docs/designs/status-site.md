@@ -76,6 +76,9 @@ versions), the server uses the text before the first `:` of `item`, then
 | `GET /<name>.(md\|json\|png\|jpg\|jpeg\|gif\|webp\|txt)` | none | Top-level files in `STATUS_DIR` only. The name must match `[A-Za-z0-9][A-Za-z0-9_-]*` before the extension |
 | `GET /api/threads` | none | `{thread_id: [message, …]}` |
 | `GET /api/surfaces` | none | `{"count": N, "surfaces": [{slug, type, source, created, age_seconds, link?}, …]}` — full unresolved-surface list oldest-first, no cap, no bodies, no attachment paths. Backs the "full list" link that the Alice's queue section shows on overflow. |
+| `GET /api/reviews` | none | Slugs of `notes/*.md` whose frontmatter has `kind: decide` or `needs: review`; drives the "Review plan →" button on *Waiting on you* items |
+| `GET /api/review?slug=` | none | One review item `{slug, title, repo, issue, url, markdown}`; rendered at `?p=review-<slug>` |
+| `POST /api/review-action` | key | JSON `{key, slug, action: approve\|modify\|reject, notes?}` → drops a `type: status-review-<action>` surface; Speaking does the GitHub side (the server never calls `gh`). `modify` requires notes |
 | `POST /api/reply` | key | JSON `{key, item, thread?, text, page, files?: [{name, data(base64)}]}` → `{ok, thread}` |
 
 Everything else returns 404. The server never serves dotfiles, `threads/`,

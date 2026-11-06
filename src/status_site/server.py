@@ -22,6 +22,15 @@ Stdlib-only (runs on a bare ``python:3.12-alpine`` image). Routes:
                                           privately under UPLOAD_DIR, and drops a
                                           ``type: status-reply`` surface into SURFACE_DIR
                                           so Speaking gets a turn.
+    GET  /api/reviews                     slugs of review-shaped notes (``kind: decide`` or
+                                          ``needs: review`` frontmatter) — drives the "Review
+                                          plan →" button on *Waiting on you* items
+    GET  /api/review?slug=<s>             one review item: title/repo/issue + plan markdown
+                                          (body only; the page renders at ``?p=review-<s>``)
+    POST /api/review-action               Approve / Modify / Reject a review item (shared-key
+                                          auth): drops a ``type: status-review-<action>``
+                                          surface into SURFACE_DIR. The server never calls
+                                          ``gh``; Speaking executes the GitHub side.
     POST /api/chat                        Jason's reply on the general Chat tab (shared-key auth):
                                           appends to ``.chat.jsonl`` (attachments stored under
                                           ``UPLOAD_DIR/chat/<date>/``, same rules as /api/reply) and drops a
@@ -118,6 +127,29 @@ CHAT_SPEAKING_FOOTER = (
     "the chat log and shows up on his screen within seconds. Use send_message only if it's "
     "urgent or needs him away from the page."
 )
+
+REVIEW_SLUG_MAX = 60
+REVIEW_ACTIONS = ("approve", "modify", "reject")
+
+REVIEW_SPEAKING_FOOTERS = {
+    "approve": (
+        "For Speaking: Jason APPROVED this plan via the status site's Review page "
+        "({url}?p=review-{slug}, key-authenticated). Execute the GitHub side: post "
+        "`[SM] design-approved` on {ref}, move the issue to `sm:selected` / ship it, "
+        "include his notes in the comment if any. Then move the item off *Waiting on you*."
+    ),
+    "modify": (
+        "For Speaking: Jason wants this plan MODIFIED (Review page, "
+        "{url}?p=review-{slug}). Execute the GitHub side: post his notes as an amendment "
+        "comment on {ref} (`[SM] design-revise`) and move the issue back to `sm:designing`. "
+        "Keep the item on *Waiting on you* until the revised plan is ready."
+    ),
+    "reject": (
+        "For Speaking: Jason REJECTED this plan (Review page, {url}?p=review-{slug}). "
+        "Execute the GitHub side: comment his notes on {ref}, close the issue and label it "
+        "`sm:rejected`. Then move the item off *Waiting on you*."
+    ),
+}
 
 
 # ---------------------------------------------------------------- helpers
@@ -1803,6 +1835,147 @@ def read_note(cfg: Config, slug: str) -> dict | None:
         "updated": p.stat().st_mtime,
     }
 
+# ---------------------------------------------------------------- reviews
+#
+# Review-shaped items are ``STATUS_DIR/notes/<slug>.md`` files whose frontmatter
+# carries ``kind: decide`` or ``needs: review`` (written by the gh watcher on
+# ``→ sm:design_review``, or by Speaking for stopgap/decide filings). The plan
+# body is embedded in the note, so the Review page renders without ``gh``.
+
+
+def _review_slug(raw: object) -> str:
+    return re.sub(r"[^a-z0-9-]", "", str(raw).lower())[:REVIEW_SLUG_MAX]
+
+
+def _is_review_frontmatter(fm: dict[str, str]) -> bool:
+    return (
+        fm.get("kind", "").strip().lower() == "decide"
+        or fm.get("needs", "").strip().lower() == "review"
+    )
+
+
+def read_review(cfg: Config, slug: str) -> dict | None:
+    """One review item, or ``None`` if the note is missing / not review-shaped."""
+    slug = _review_slug(slug)
+    if not slug:
+        return None
+    p = cfg.status_dir / "notes" / f"{slug}.md"
+    try:
+        text = p.read_text(errors="replace")[:200_000]
+        mtime = p.stat().st_mtime
+    except OSError:
+        return None
+    fm, body = parse_frontmatter(text)
+    if not _is_review_frontmatter(fm):
+        return None
+    return {
+        "slug": slug,
+        "title": fm.get("title", "") or slug,
+        "repo": fm.get("repo", ""),
+        "issue": fm.get("issue", ""),
+        "url": fm.get("url", ""),
+        "markdown": body.strip(),
+        "updated": mtime,
+    }
+
+
+def list_reviews(cfg: Config) -> list[str]:
+    """Slugs of every review-shaped note under ``STATUS_DIR/notes``."""
+    notes = cfg.status_dir / "notes"
+    if not notes.is_dir():
+        return []
+    out = []
+    for p in sorted(notes.glob("*.md")):
+        if p.name.startswith("."):
+            continue
+        try:
+            fm, _ = parse_frontmatter(p.read_text(errors="replace")[:20_000])
+        except OSError:
+            continue
+        if _is_review_frontmatter(fm):
+            out.append(p.stem)
+    return out
+
+
+def render_review_surface(
+    cfg: Config, *, action: str, review: dict, notes: str
+) -> str:
+    """Build the ``type: status-review-<action>`` surface document."""
+    slug = review["slug"]
+    ref = (
+        f"{review['repo']}#{review['issue']}"
+        if review.get("repo") and review.get("issue")
+        else slug
+    )
+    footer = REVIEW_SPEAKING_FOOTERS[action].format(
+        url=cfg.public_url, slug=slug, ref=ref
+    )
+    return f"""---
+priority: action
+type: status-review-{action}
+reply_expected: false
+created: {time.strftime("%Y-%m-%d")}
+detail: status-review-{slug}
+source: status-site
+page: review-{slug}
+review: {slug}
+repo: {review.get("repo", "")}
+issue: {review.get("issue", "")}
+action: {action}
+---
+
+# Jason chose to {action.upper()} a plan on the status page
+
+Item: {review["title"]}
+Reference: {ref}
+Plan link: {review.get("url") or "(none)"}
+
+His notes:
+{notes or "(no notes)"}
+
+---
+{footer}
+"""
+
+
+def handle_review_action(cfg: Config, d: dict) -> dict:
+    """Validate one Approve / Modify / Reject click and drop its surface.
+
+    Mirrors ``handle_reply``: key-authed, writes into ``SURFACE_DIR`` for
+    Speaking. The review note itself is left alone — the item stays on
+    *Waiting on you* until Speaking acts and updates the status index.
+    """
+    if not isinstance(d, dict):
+        raise ReplyError(400, "bad json")
+    if not hmac.compare_digest(str(d.get("key", "")).encode(), cfg.key.encode()):
+        raise ReplyError(403, "bad key")
+    action = str(d.get("action", "")).lower()
+    if action not in REVIEW_ACTIONS:
+        raise ReplyError(400, "bad action")
+    review = read_review(cfg, str(d.get("slug", "")))
+    if review is None:
+        raise ReplyError(404, "no such review")
+    notes = str(d.get("notes", "")).strip()[:MAX_TEXT]
+    if action == "modify" and not notes:
+        raise ReplyError(400, "say what to change")
+
+    doc = render_review_surface(cfg, action=action, review=review, notes=notes)
+    with cfg.lock:
+        cfg.surface_dir.mkdir(parents=True, exist_ok=True)
+        fname = (
+            f"{time.strftime('%Y-%m-%dT%H-%M-%S')}-status-review-{action}-"
+            f"{review['slug']}.md"
+        )
+        tmp = cfg.surface_dir / f".tmp-review-{os.getpid()}-{time.time_ns()}"
+        tmp.write_text(doc)
+        dest = cfg.surface_dir / fname
+        n = 1
+        while dest.exists():
+            n += 1
+            dest = cfg.surface_dir / fname.replace(".md", f"-{n}.md")
+        os.rename(tmp, dest)
+    return {"ok": True, "action": action, "slug": review["slug"]}
+
 
 def list_pages(cfg: Config) -> list[str]:
     """Slugs of every top-level markdown page (detail pages included)."""
@@ -1956,6 +2129,14 @@ class Handler(BaseHTTPRequestHandler):
             if hist is None:
                 return self._json(400, {"error": "bad slug"}, head=head)
             return self._json(200, hist, head=head)
+        if path == "/api/reviews":
+            return self._json(200, list_reviews(self.cfg), head=head)
+        if path == "/api/review":
+            q = parse_qs(urlsplit(self.path).query)
+            review = read_review(self.cfg, (q.get("slug") or [""])[0])
+            if review is None:
+                return self._json(404, {"error": "no review"}, head=head)
+            return self._json(200, review, head=head)
         if path == "/api/pages":
             return self._json(200, list_pages(self.cfg), head=head)
         if path == "/api/threads":
@@ -2049,6 +2230,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/page-visibility": handle_page_visibility,
             "/api/chat": handle_chat,
             "/api/waiting-order": handle_waiting_order,
+            "/api/review-action": handle_review_action,
         }
         fn = handlers.get(route)
         if fn is None:

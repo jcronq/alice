@@ -121,6 +121,10 @@ def _login(obj: dict[str, Any]) -> str | None:
 # watcher decoupled from the dispatcher package.
 SM_DRAFT_LABEL = "sm:draft"
 SM_LABEL_PREFIX = "sm:"
+# Label whose arrival means "a design is waiting on Jason's review". The
+# watcher turns the transition into a ``kind: decide`` item for the status
+# site's Review page (issue #616).
+SM_DESIGN_REVIEW_LABEL = "sm:design_review"
 
 
 def _extract_label_names(labels: Any) -> list[str]:
@@ -369,6 +373,10 @@ def _empty_repo_state() -> dict[str, Any]:
         "seen_check_run_ids": [],
         "pr_state": {},
         "issue_state": {},
+        # ``{issue number: [label names]}`` as of the last poll — the
+        # edge detector for ``→ sm:design_review`` transitions. A missing
+        # entry (legacy state, or an issue we've never seen) is silent.
+        "issue_labels": {},
         # ``first_run`` primes the PR-side seen-ID sets on the very first
         # poll; ``issues_primed`` is the same idea for the issue-side, but
         # versioned independently so an existing-state file (written before
@@ -422,8 +430,11 @@ class Event:
     # Kinds:
     #   new_pr, pr_state, review, review_comment, issue_comment, check_failure
     #     — PR-scoped events. ``number`` is the PR number.
-    #   new_issue, issue_state, standalone_issue_comment
+    #   new_issue, issue_state, standalone_issue_comment, design_review
     #     — issue-scoped events. ``number`` is the issue number.
+    #     ``design_review`` fires once when an open issue gains
+    #     ``sm:design_review``; ``run`` turns it into a status-site
+    #     decide item rather than an ``inner/notes/`` entry.
     kind: str
     repo: str
     number: int
@@ -483,6 +494,7 @@ def poll_repo(
     seen_check_run_ids: set[int] = set(repo_state.get("seen_check_run_ids") or [])
     pr_state: dict[str, str] = dict(repo_state.get("pr_state") or {})
     issue_state_map: dict[str, str] = dict(repo_state.get("issue_state") or {})
+    issue_labels_map: dict[str, list[str]] = dict(repo_state.get("issue_labels") or {})
 
     # ---- PRs ---------------------------------------------------------------
     pulls = (
@@ -753,6 +765,32 @@ def poll_repo(
                     pass
         issue_state_map[str(n)] = new_state
 
+        # ``→ sm:design_review`` edge. Fires once per transition: the
+        # label set is persisted every poll, so a still-labeled issue
+        # never re-fires. Silent while priming and when we have no prior
+        # label snapshot for the issue.
+        current_labels = _extract_label_names(issue.get("labels"))
+        prev_labels = issue_labels_map.get(str(n))
+        if (
+            not first_run
+            and issues_primed
+            and new_state == "open"
+            and prev_labels is not None
+            and SM_DESIGN_REVIEW_LABEL in current_labels
+            and SM_DESIGN_REVIEW_LABEL not in prev_labels
+        ):
+            events.append(
+                Event(
+                    kind="design_review",
+                    repo=repo,
+                    number=n,
+                    title=title,
+                    url=url,
+                    payload={"issue": issue},
+                )
+            )
+        issue_labels_map[str(n)] = sorted(set(current_labels))
+
         # Same skip-the-detail-fetch shortcut as PRs: closed-and-unchanged
         # issues don't need their comments re-pulled.
         if new_state != "open" and prev_state == new_state:
@@ -795,6 +833,7 @@ def poll_repo(
     repo_state["seen_check_run_ids"] = sorted(seen_check_run_ids)
     repo_state["pr_state"] = pr_state
     repo_state["issue_state"] = issue_state_map
+    repo_state["issue_labels"] = issue_labels_map
     repo_state["first_run"] = False
     repo_state["issues_primed"] = True
     repo_state["last_poll_at"] = _now_iso()
@@ -991,6 +1030,118 @@ def write_note(
     return path
 
 
+# ---------------------------------------------------------------------------
+# Design-review decide items (issue #616)
+# ---------------------------------------------------------------------------
+
+_DESIGN_READY_NOTE_RE = re.compile(r"note=\[\[([^\]\s]+)\]\]")
+_DESIGN_NOTE_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,120}$")
+# Same lookup order as the dispatcher's ``_resolve_design_note_path``
+# (re-stated to keep the watcher decoupled from alice_forge).
+_DESIGN_NOTE_DIRS = ("cortex-memory/designs", "cortex-memory/research")
+# Matches ``status_site.server.REVIEW_SLUG_MAX`` so the note's file stem
+# survives the server's slug sanitiser unchanged.
+_REVIEW_SLUG_MAX = 60
+
+
+def _design_review_slug(repo: str, number: int) -> str:
+    return _slugify(
+        f"design-review-{repo.replace('/', '-')}-{number}", max_len=_REVIEW_SLUG_MAX
+    )
+
+
+def _find_design_ready_comment(
+    comments: list[dict[str, Any]], trusted: frozenset[str]
+) -> dict[str, Any] | None:
+    """Newest trusted ``[SM] design-ready`` comment (audit echoes skipped)."""
+    for c in reversed(comments):
+        if not isinstance(c, dict):
+            continue
+        body = c.get("body")
+        if not isinstance(body, str) or not body.startswith("[SM] design-ready"):
+            continue
+        if body.startswith("[SM] design-ready-audit"):
+            continue
+        if not is_trusted_association(c.get("author_association"), trusted):
+            continue
+        return c
+    return None
+
+
+def _read_design_note(mind_dir: pathlib.Path, slug: str) -> str | None:
+    if not _DESIGN_NOTE_SLUG_RE.match(slug):
+        return None
+    for rel in _DESIGN_NOTE_DIRS:
+        candidate = mind_dir / rel / f"{slug}.md"
+        if candidate.is_file():
+            try:
+                return candidate.read_text(errors="replace")
+            except OSError:
+                return None
+    return None
+
+
+def write_design_review_item(
+    mind_dir: pathlib.Path,
+    event: Event,
+    *,
+    api: Callable[[str], Any],
+    trusted: frozenset[str],
+) -> pathlib.Path | None:
+    """Write the ``kind: decide`` note the status site's Review page renders.
+
+    The plan body is embedded (design note if it resolves, else the
+    ``[SM] design-ready`` comment itself) so ``status_site`` can render
+    offline without ``gh``. Returns ``None`` when no plan could be found —
+    the item is skipped rather than shown empty.
+    """
+    try:
+        comments = api(f"repos/{event.repo}/issues/{event.number}/comments?per_page=100") or []
+    except GHCommandError:
+        return None
+    ready = _find_design_ready_comment(comments, trusted)
+    if ready is None:
+        return None
+    ready_body = ready["body"]
+    plan: str | None = None
+    note_slug = ""
+    m = _DESIGN_READY_NOTE_RE.search(ready_body)
+    if m:
+        note_slug = m.group(1)
+        plan = _read_design_note(mind_dir, note_slug)
+    if plan is None:
+        plan = ready_body
+    # Plan notes may carry their own frontmatter; drop it so ours is the
+    # only block the server parses.
+    if plan.startswith("---\n"):
+        end = plan.find("\n---\n", 4)
+        if end >= 0:
+            plan = plan[end + len("\n---\n") :]
+
+    slug = _design_review_slug(event.repo, event.number)
+    title = " ".join(event.title.replace('"', "'").split())
+    front = (
+        "---\n"
+        "kind: decide\n"
+        "needs: review\n"
+        f"repo: {event.repo}\n"
+        f"issue: {event.number}\n"
+        f'title: "{title}"\n'
+        f"url: {event.url}\n"
+        f"design_note: {note_slug}\n"
+        f"created: {_now_local_iso()}\n"
+        "---\n"
+    )
+    heading = f"# Design review — {event.repo}#{event.number}: {title}\n\n"
+    out_dir = mind_dir / "inner" / "status" / "notes"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{slug}.md"
+    tmp = out_dir / f".{slug}.tmp"
+    tmp.write_text(front + "\n" + heading + plan.strip() + "\n")
+    os.replace(tmp, path)
+    return path
+
+
 # Telemetry event kinds — high-volume, low-conversation signal (new PRs,
 # PR state transitions, CI failures, issue open/close). These bypass the
 # inner/notes/ → thinking pipeline and land directly in events.jsonl so
@@ -1141,6 +1292,23 @@ def run(
             log(f"[gh-watcher] {repo}: unexpected error — {type(exc).__name__}: {exc}")
             continue
         for event in events:
+            if event.kind == "design_review":
+                try:
+                    path = write_design_review_item(
+                        mind_dir, event, api=api, trusted=cfg.trusted_associations
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log(f"[gh-watcher] {repo}: design-review item failed — {exc}")
+                    continue
+                if path is None:
+                    log(
+                        f"[gh-watcher] {repo}#{event.number}: design_review "
+                        "edge but no design-ready plan found — skipped"
+                    )
+                else:
+                    notes_written += 1
+                    log(f"[gh-watcher] {repo}: wrote decide item {path.name}")
+                continue
             slug, body = render_note(event)
             if event.kind in TELEMETRY_KINDS:
                 write_event(
