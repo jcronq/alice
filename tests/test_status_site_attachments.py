@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 
 import pytest
 
@@ -156,3 +157,27 @@ def test_handle_chat_rejects_bad_file_without_logging(cfg):
         )
     assert e.value.code == 415
     assert not cfg.chat_log.exists()
+
+
+def test_chat_message_record_carries_attachment_paths(cfg):
+    """GET /api/chat serves ``read_chat``; the record must expose the stored alias (#655)."""
+    from status_site.server import read_chat
+
+    handle_chat(
+        cfg,
+        {
+            "key": KEY,
+            "text": "look",
+            "files": [{"name": "shot.png", "data": b64(b"PNG")}],
+        },
+    )
+    (msg,) = read_chat(cfg)
+    (att,) = msg["attachments"]
+    stored = next((cfg.upload_dir / "chat").rglob("*shot.png"))
+    assert stored.parent.name == time.strftime("%Y-%m-%d")
+    assert stored.parent.parent.name == "chat"
+    assert att == {
+        "name": "shot.png",
+        "path": f"{ALIAS}/{stored.relative_to(cfg.upload_dir)}",
+        "bytes": 3,
+    }

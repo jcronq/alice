@@ -2,7 +2,7 @@
 
 Stdlib-only (runs on a bare ``python:3.12-alpine`` image). Routes:
 
-    GET  /, /index.html, /marked.min.js   packaged frontend (status_site/static/)
+    GET  /, /index.html, /marked.min.js, /chat-ux.js   packaged frontend (status_site/static/)
     GET  /<page>.md, /pages.json, images  content, read from STATUS_DIR (top level only)
     GET  /api/threads                     {thread_id: [message, ...]} for every thread
     GET  /api/pages                       slugs of all markdown pages (for item detail links)
@@ -106,7 +106,13 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 # ``?p=chat`` keeps working while the widget library catches up
 # through slices 2–6. The new ``index.html`` is the SSE-driven React
 # shell that renders section updates live from ``/api/events``.
-STATIC_FILES = {"index.html", "legacy.html", "marked.min.js", "design-tokens.css"}
+STATIC_FILES = {
+    "index.html",
+    "legacy.html",
+    "marked.min.js",
+    "design-tokens.css",
+    "chat-ux.js",
+}
 
 # Content files served from STATUS_DIR: flat names only (no '/', no leading dot).
 CONTENT_NAME_RE = re.compile(
@@ -446,6 +452,7 @@ def handle_chat(cfg: Config, d: dict) -> dict:
                 "at": now_iso(),
                 "text": text,
                 "files": [x["name"] for x in files],
+                "attachments": files,
             },
         )
 
