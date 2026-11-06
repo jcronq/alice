@@ -80,6 +80,7 @@ from status_site.history import (
 from status_site.sources import (
     done_today as _done_today,
     known_issues as _known_issues,
+    pipeline as _pipeline,
     review_queue as _review_queue,
     running_now as _running_now,
     waiting_on_you as _waiting_on_you,
@@ -1355,7 +1356,16 @@ def _known_issues_fallback(rendered: str) -> str:
 # local state.
 DEFAULT_REVIEW_POLL_SECONDS = 300
 DEFAULT_RUNNING_NOW_POLL_SECONDS = 15
+DEFAULT_PIPELINE_POLL_SECONDS = 30
 DEFAULT_DONE_TODAY_POLL_SECONDS = 300
+
+
+def _tasks_dir() -> Path:
+    return (
+        Path(os.environ.get("ALICE_MIND", os.path.expanduser("~/alice-mind")))
+        / "inner"
+        / "tasks"
+    )
 
 
 @dataclass
@@ -1385,6 +1395,7 @@ class OverviewPollers:
         review_poll: float = DEFAULT_REVIEW_POLL_SECONDS,
         running_now_poll: float = DEFAULT_RUNNING_NOW_POLL_SECONDS,
         done_today_poll: float = DEFAULT_DONE_TODAY_POLL_SECONDS,
+        pipeline_poll: float = DEFAULT_PIPELINE_POLL_SECONDS,
         stop: threading.Event | None = None,
     ):
         self.cfg = cfg
@@ -1392,6 +1403,7 @@ class OverviewPollers:
         self._review_poll = review_poll
         self._running_now_poll = running_now_poll
         self._done_today_poll = done_today_poll
+        self._pipeline_poll = pipeline_poll
         self.stop = stop or threading.Event()
         self._threads: list[threading.Thread] = []
 
@@ -1408,11 +1420,7 @@ class OverviewPollers:
     # ── background loops ────────────────────────────────────────
     def _loop_running_now(self) -> None:
         repo_dir = _running_now.repo_dir_from_env()
-        tasks_dir = (
-            Path(os.environ.get("ALICE_MIND", os.path.expanduser("~/alice-mind")))
-            / "inner"
-            / "tasks"
-        )
+        tasks_dir = _tasks_dir()
         while not self.stop.is_set():
             try:
                 worktrees = _running_now.parse_worktrees(
@@ -1478,9 +1486,20 @@ class OverviewPollers:
                 print(f"status_site: done_today poll failed: {e!r}", flush=True)
             self.stop.wait(self._done_today_poll)
 
+    def _loop_pipeline(self) -> None:
+        while not self.stop.is_set():
+            try:
+                repos = _pipeline.repos_sm_from_config()
+                issues, failed = _pipeline.fetch_issues(repos)
+                self._set("pipeline", {"issues": issues, "failed": failed})
+            except Exception as e:  # noqa: BLE001
+                print(f"status_site: pipeline poll failed: {e!r}", flush=True)
+            self.stop.wait(self._pipeline_poll)
+
     def start(self) -> None:
         for name, target in (
             ("running-now-poll", self._loop_running_now),
+            ("pipeline-poll", self._loop_pipeline),
             ("review-queue-poll", self._loop_review_queue),
             ("done-today-poll", self._loop_done_today),
         ):
@@ -1583,9 +1602,10 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         }
 
     def _render_alice_queue() -> dict:
+        # ``rows`` stays the surfaces list (the pre-#653 contract);
+        # ``pipeline`` (GH issues) and ``tasks`` are the new groups.
         items = scan_surfaces(cfg.surface_dir)
         now = time.time()
-        md = render_alice_queue(items, now=now)
         rows: list[dict] = []
         for it in items:
             rows.append(
@@ -1598,7 +1618,20 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
                     "created": it.get("created", ""),
                 }
             )
-        return {"markdown": md, "rows": rows}
+        cached = (pollers.get("pipeline") if pollers else None) or {}
+        pipeline_rows = _pipeline.issue_rows(cached.get("issues") or [], now=now)
+        task_rows = _pipeline.scan_tasks(_tasks_dir(), now=now)
+        if pipeline_rows or task_rows:
+            md = _pipeline.render_markdown(pipeline_rows, rows, task_rows)
+        else:
+            md = render_alice_queue(items, now=now)
+        return {
+            "markdown": md,
+            "rows": rows,
+            "pipeline": pipeline_rows,
+            "tasks": task_rows,
+            "pipeline_failed": list(cached.get("failed") or []),
+        }
 
     def _render_done_today() -> dict:
         cached = (pollers.get("done_today") if pollers else None) or {}
@@ -2487,6 +2520,12 @@ def main() -> None:
                 os.environ.get(
                     "DONE_TODAY_POLL_SECONDS",
                     str(DEFAULT_DONE_TODAY_POLL_SECONDS),
+                )
+            ),
+            pipeline_poll=float(
+                os.environ.get(
+                    "PIPELINE_POLL_SECONDS",
+                    str(DEFAULT_PIPELINE_POLL_SECONDS),
                 )
             ),
         )

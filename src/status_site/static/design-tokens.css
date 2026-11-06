@@ -19,6 +19,7 @@
   --color-ok: #2e7a4f;
   --color-warn: #b06f14;
   --color-bad: #b23a3a;
+  --color-info: #2f6fb0;
 
   /* Chart-adjacent accents (kept because the dashboard references them
    * from a dozen widget rules; harmless to keep around even though the
@@ -61,6 +62,7 @@
     --color-ok: #67bd88;
     --color-warn: #e0a24a;
     --color-bad: #e07a7a;
+  --color-info: #6aa5e0;
     --dash-chart-grid: #312f29;
     --dash-chart-status-warning: #e0a24a;
     --dash-chart-status-critical: #e07a7a;
@@ -79,6 +81,7 @@
   --color-ok: #67bd88;
   --color-warn: #e0a24a;
   --color-bad: #e07a7a;
+  --color-info: #6aa5e0;
   --dash-chart-grid: #312f29;
   --dash-chart-status-warning: #e0a24a;
   --dash-chart-status-critical: #e07a7a;
@@ -259,6 +262,32 @@
   color: var(--color-warn);
   border-color: currentColor;
 }
+/* SM pipeline phase pills (#653): planning=amber, building=green,
+   reviewing=blue, queued (selected)=muted. */
+.fx-pill.sm-selected { color: var(--color-fg-muted); }
+.fx-pill.sm-designing,
+.fx-pill.sm-design_review,
+.fx-pill.sm-designed {
+  color: var(--color-warn);
+  border-color: currentColor;
+}
+.fx-pill.sm-building {
+  color: var(--color-ok);
+  border-color: currentColor;
+}
+.fx-pill.sm-reviewing {
+  color: var(--color-info);
+  border-color: currentColor;
+}
+.fx-group-h {
+  margin: 1rem 0 .3rem;
+  font-weight: 500;
+  font-size: var(--dash-font-size-caption);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--color-fg-muted);
+}
+.fx-group-h:first-child { margin-top: 0; }
 
 /* Urgency labels ------------------------------------------------------ */
 .fx-urg {
