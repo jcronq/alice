@@ -86,9 +86,6 @@ from . import frontmatter as _fm
 # check; the gate runs once per bug before the ``claude -p`` spawn so
 # a burst of in-flight bugs can't trip the secondary rate limit.
 from alice_forge.rate_limit import (
-    DEFAULT_MIN_CORE as _RL_DEFAULT_MIN_CORE,
-    DEFAULT_MIN_GRAPHQL as _RL_DEFAULT_MIN_GRAPHQL,
-    DeferDecision as _RateLimitDeferDecision,
     should_defer as _rate_limit_should_defer,
 )
 

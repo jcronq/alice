@@ -40,17 +40,8 @@ import sys
 import time
 from typing import Any
 
-from core.events import EventLogger
-
-# ``task reindex`` is run from this wake on a slower sub-cadence than
-# the main 30-min loop (default every 2h). The reindex is cheap (<1s
-# for ~900 tasks on local disk per #781 smoke test) but there's no
-# gain from running it every tick — the store only drifts when a
-# writer bypasses :mod:`alice_forge.task_store`. See issue #781.
-TASK_REINDEX_INTERVAL_SECONDS_DEFAULT = 2 * 60 * 60  # 2h
-TASK_REINDEX_STAMP_FILENAME = "task-reindex-last-ran"
-
 from alice_state_db import derive as alice_state_db_derive
+from core.events import EventLogger
 
 from . import (
     correction_cascade as cascade_mod,
@@ -61,6 +52,14 @@ from . import (
     stage_d,
     thalamus,
 )
+
+# ``task reindex`` is run from this wake on a slower sub-cadence than
+# the main 30-min loop (default every 2h). The reindex is cheap (<1s
+# for ~900 tasks on local disk per #781 smoke test) but there's no
+# gain from running it every tick — the store only drifts when a
+# writer bypasses :mod:`alice_forge.task_store`. See issue #781.
+TASK_REINDEX_INTERVAL_SECONDS_DEFAULT = 2 * 60 * 60  # 2h
+TASK_REINDEX_STAMP_FILENAME = "task-reindex-last-ran"
 
 
 DEFAULT_MIND = pathlib.Path("/home/alice/alice-mind")
