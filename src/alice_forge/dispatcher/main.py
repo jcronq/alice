@@ -5,7 +5,38 @@
 
 from __future__ import annotations
 
+import sys as _sys
+
 from alice_forge.sm.legacy.handlers._common import *  # noqa: F401, F403
+
+# Issue #797 — resolve ``gh_*`` helpers through the parent dispatcher
+# package's namespace at call time instead of binding them locally via
+# the ``_common`` star-import above. The autouse test fixtures (and any
+# runtime operator who wants to mock a CLI call) monkey-patch attributes
+# on :mod:`alice_forge.dispatcher`; a star-imported local binding is a
+# *second* copy of the name that the monkey-patch can't reach, which is
+# how real ``gh`` calls leaked through the dispatcher test suite and
+# contributed to GitHub rate-limit exhaustion. Looking the attribute up
+# through ``sys.modules["alice_forge.dispatcher"]`` at call time — the
+# same trick :func:`alice_forge.dispatcher.gh._run_gh_via_parent` uses
+# for ``_run_gh`` — gives tests a single patch target.
+#
+# A plain ``import alice_forge.dispatcher as _sm`` at module top would
+# work too, but main.py is imported *from* ``dispatcher/__init__.py``
+# while the package is still partially initialised, so we defer the
+# attribute lookup to call time via :func:`_sm_pkg`.
+def _sm_pkg():
+    """Return the fully-initialised :mod:`alice_forge.dispatcher` module."""
+    return _sys.modules["alice_forge.dispatcher"]
+
+
+# Sentinel distinct from ``None`` so :func:`run` can distinguish "caller
+# left the arg at its default, resolve through the parent package" from
+# "caller explicitly passed ``None`` to disable this hook". Every ``gh_*``
+# default on :func:`run` uses this sentinel.
+_USE_PROD_DEFAULT: Any = object()
+
+
 from alice_forge.sm.ledger import EmittedLedger, load_or_migrate
 from alice_forge.sm.states import SMState
 from alice_forge.sm.enforcement import (
@@ -334,18 +365,28 @@ def run(
     list_issues: ListIssuesFn | None = None,
     list_stale_closed: ListIssuesFn | None = None,
     list_open_done: ListIssuesFn | None = None,
-    post_comment: PostCommentFn = gh_post_comment,
-    edit_labels: EditLabelsFn = gh_edit_labels,
-    close_issue: CloseIssueFn = gh_close_issue,
-    find_linked_pr: FindLinkedPRFn = gh_find_linked_pr,
+    # Issue #797 — ``gh_*`` defaults use the ``_USE_PROD_DEFAULT`` sentinel
+    # so :func:`run` resolves the production helper through
+    # :func:`_sm_pkg` at call time. That gives autouse-fixture
+    # monkeypatches on :mod:`alice_forge.dispatcher` a single patch
+    # target. Callers that previously relied on the compile-time default
+    # ``= gh_post_comment`` behave identically; callers that explicitly
+    # pass a fake callable (every existing test that overrides a hook)
+    # still win. The sentinel is distinct from ``None`` because
+    # ``find_open_linked_prs=None`` means "disable the check" — we must
+    # not conflate the two.
+    post_comment: "PostCommentFn" = _USE_PROD_DEFAULT,
+    edit_labels: "EditLabelsFn" = _USE_PROD_DEFAULT,
+    close_issue: "CloseIssueFn" = _USE_PROD_DEFAULT,
+    find_linked_pr: "FindLinkedPRFn" = _USE_PROD_DEFAULT,
     # Issue #784 — default to the production ``gh_find_open_linked_prs``
     # helper so the Phase 1.6 sweep's "open follow-up PR → wait" check
     # is live out of the box. Tests pass ``None`` explicitly to disable
     # the check and exercise the legacy code path.
-    find_open_linked_prs: "Callable[[str, int], list[int]] | None" = gh_find_open_linked_prs,
-    pr_merge_status: PRMergeStatusFn = gh_get_pr_merge_status,
+    find_open_linked_prs: "Callable[[str, int], list[int]] | None" = _USE_PROD_DEFAULT,
+    pr_merge_status: "PRMergeStatusFn" = _USE_PROD_DEFAULT,
     pr_mergeable: PRMergeableFn | None = None,
-    master_ci_status: MasterCIStatusFn = gh_get_master_ci_status,
+    master_ci_status: "MasterCIStatusFn" = _USE_PROD_DEFAULT,
     has_live_spawn: Callable[[int], bool] | None = None,
     live_spawn_dir: Callable[[int], pathlib.Path | None] | None = None,
     count_running: Callable[[], int] | None = None,
@@ -409,19 +450,42 @@ def run(
     if v3_dry_run_log_dir is not None and v3_log_dir is None:
         v3_log_dir = v3_dry_run_log_dir
 
+    # Issue #797 — resolve ``gh_*`` sentinels through the parent
+    # dispatcher package so test monkeypatches reach the fallback. The
+    # star-imported names (``gh_list_sm_issues`` etc.) were a *second*
+    # local binding — autouse fixtures on :mod:`alice_forge.dispatcher`
+    # never reached them, and tests that didn't inject a fake sometimes
+    # shelled out to real ``gh`` (contributing to #786's rate-limit
+    # exhaustion).
+    _sm = _sm_pkg()
+    if post_comment is _USE_PROD_DEFAULT:
+        post_comment = _sm.gh_post_comment
+    if edit_labels is _USE_PROD_DEFAULT:
+        edit_labels = _sm.gh_edit_labels
+    if close_issue is _USE_PROD_DEFAULT:
+        close_issue = _sm.gh_close_issue
+    if find_linked_pr is _USE_PROD_DEFAULT:
+        find_linked_pr = _sm.gh_find_linked_pr
+    if find_open_linked_prs is _USE_PROD_DEFAULT:
+        find_open_linked_prs = _sm.gh_find_open_linked_prs
+    if pr_merge_status is _USE_PROD_DEFAULT:
+        pr_merge_status = _sm.gh_get_pr_merge_status
+    if master_ci_status is _USE_PROD_DEFAULT:
+        master_ci_status = _sm.gh_get_master_ci_status
+
     if list_issues is None:
-        list_issues = gh_list_sm_issues
+        list_issues = _sm.gh_list_sm_issues
     if list_stale_closed is None:
-        list_stale_closed = gh_list_stale_closed_sm_issues
+        list_stale_closed = _sm.gh_list_stale_closed_sm_issues
     if list_open_done is None:
-        list_open_done = gh_list_open_done_sm_issues
+        list_open_done = _sm.gh_list_open_done_sm_issues
     if sweeper_config is None:
         # Issue #784 — read ``sm_dispatcher.sweeper`` once per pass so
         # a mid-run config edit requires a fresh cadence to take effect
         # (matches how ``load_dispatcher_repos`` is read).
         sweeper_config = load_sweeper_config(log=log)
     if list_comments is None:
-        list_comments = gh_list_issue_comments
+        list_comments = _sm.gh_list_issue_comments
     if enable_spawn:
         # Default to live production wiring when the caller hasn't
         # provided test fixtures. enable_spawn=False is the test escape
@@ -451,7 +515,11 @@ def run(
                 )
         if get_issue is None:
             def get_issue(number: int) -> dict[str, Any] | None:
-                return gh_get_issue(repo, number)
+                # Issue #797 — resolve through the parent package so
+                # tests that monkeypatch ``sm.gh_get_issue`` reach the
+                # lookup (the ``_common`` star-import binding above
+                # would otherwise be a stale second copy).
+                return _sm.gh_get_issue(repo, number)
         if proactive_reap is None:
             def proactive_reap() -> tuple[int, int]:
                 return proactive_reap_dead_spawns(
@@ -564,7 +632,8 @@ def run(
     # the test escape hatch.
     if enable_verify and verify_pr is None and _verify_enabled():
         if pr_files is None:
-            pr_files = gh_get_pr_files
+            # Issue #797 — resolve through the parent package namespace.
+            pr_files = _sm.gh_get_pr_files
         verify_pr = default_verifier
     elif not enable_verify or not _verify_enabled():
         # Operator/test explicitly disabled — None signals "skip the
@@ -578,7 +647,8 @@ def run(
     # escape-hatch shape for ``_process_reviewing``.
     if enable_rebase and not dry_run:
         if pr_mergeable is None:
-            pr_mergeable = gh_get_pr_mergeable
+            # Issue #797 — resolve through the parent package namespace.
+            pr_mergeable = _sm.gh_get_pr_mergeable
         if attempt_rebase is None:
             def attempt_rebase(branch: str) -> dict[str, Any]:
                 return _attempt_auto_rebase(
