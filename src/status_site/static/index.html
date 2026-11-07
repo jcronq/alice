@@ -1964,10 +1964,34 @@ function todoCountSuffix(d) {
 
 // A tier groups the section tiles that share an owner of the next
 // action. Asides are collapsed disclosures; the rest are headed blocks.
-function Tier({tier, children}) {
+// Issue #726: collapsed aside headers carry a count / status so problems
+// are visible without expanding. Returns {text, bad}.
+const POLLER_STALE_S = 900;
+function asideSummary(tierId, sections, nowMs) {
+  if (tierId === "thinking") {
+    const d = sections.thinking_queue || {};
+    if (d.available === false) return {text: "unavailable", bad: true};
+    const n = d.total != null ? d.total : (d.rows || []).length;
+    return {text: "(" + n + ")", bad: false};
+  }
+  if (tierId === "health") {
+    const d = sections.system_health || {};
+    const stale = (d.pollers || []).filter(p =>
+      p.fetched_at == null || nowMs / 1000 - p.fetched_at > POLLER_STALE_S).length;
+    const deployBad = (d.deploy || []).filter(r => !r.sha).length;
+    const n = stale + deployBad;
+    return n
+      ? {text: "· " + n + (n === 1 ? " warning" : " warnings"), bad: true}
+      : {text: "· all OK", bad: false};
+  }
+  return null;
+}
+function Tier({tier, summary, children}) {
   if (tier.aside) {
-    return h("details", {className: "tier tier-aside", "data-tier": tier.id},
-      h("summary", null, tier.title),
+    return h("details", {className: "tier tier-aside", "data-tier": tier.id, open: summary && summary.bad ? true : undefined},
+      h("summary", null,
+        summary ? h("span", {"aria-hidden": "true", style: {color: summary.bad ? "var(--color-warn)" : "var(--color-ok)", marginRight: ".4rem"}}, "●") : null,
+        tier.title, summary ? " " + summary.text : null),
       children,
     );
   }
@@ -2171,7 +2195,7 @@ function App() {
     const legacyPayload = state.sections._legacy_md;
     const sections = TIERS
       .filter(t => t.sections.some(n => state.sections[n]))
-      .map(t => h(Tier, {key: t.id, tier: t.id === "top" ? {...t, title: t.title + todoCountSuffix(state.sections.your_todo)} : t},
+      .map(t => h(Tier, {key: t.id, summary: t.aside ? asideSummary(t.id, state.sections, nowMs) : null, tier: t.id === "top" ? {...t, title: t.title + todoCountSuffix(state.sections.your_todo)} : t},
         t.sections.filter(n => state.sections[n]).map(n => h(SectionTile, {
           key: n, name: n,
           data: state.sections[n],
