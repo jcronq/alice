@@ -111,6 +111,7 @@ from status_site.chat_reactions import (
     read_events as reaction_events,
     reactions_for,
     valid_emoji,
+    ATTENTION_EMOJI,
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -555,6 +556,52 @@ def handle_chat(cfg: Config, d: dict) -> dict:
     return {"ok": True}
 
 
+_REACT_SURFACE_SEEN: dict[tuple[str, str], float] = {}
+REACT_SURFACE_COOLDOWN_S = 60.0
+
+
+def _drop_reaction_surface(cfg: Config, msg: dict, emoji: str, reacted_at: str) -> None:
+    """Write a ``chat-reaction`` surface for an attention emoji on Alice's message."""
+    key = (str(msg.get("at")), emoji)
+    mono = time.monotonic()
+    last = _REACT_SURFACE_SEEN.get(key)
+    if last is not None and mono - last < REACT_SURFACE_COOLDOWN_S:
+        return
+    _REACT_SURFACE_SEEN[key] = mono
+    at = str(msg.get("at"))
+    doc = f"""---
+priority: wander
+type: chat-reaction
+reply_expected: false
+created: {time.strftime("%Y-%m-%d")}
+source: status-site
+page: chat
+message_at: {at}
+---
+
+# Jason reacted {emoji} to one of your Chat messages
+
+He flagged this message as needing a look. Decide whether to edit it,
+send a clarifying follow-up, or just acknowledge in chat.
+
+Your message:
+{msg.get("text") or "(no text)"}
+
+Reaction: {emoji} at {reacted_at}
+Link: {cfg.public_url}?p=chat#msg-{at}
+"""
+    cfg.surface_dir.mkdir(parents=True, exist_ok=True)
+    fname = f"{time.strftime('%Y-%m-%dT%H-%M-%S')}-chat-reaction.md"
+    tmp = cfg.surface_dir / f".tmp-react-{os.getpid()}-{time.time_ns()}"
+    tmp.write_text(doc)
+    dest = cfg.surface_dir / fname
+    n = 1
+    while dest.exists():
+        n += 1
+        dest = cfg.surface_dir / fname.replace(".md", f"-{n}.md")
+    os.rename(tmp, dest)
+
+
 def handle_chat_react(cfg: Config, d: dict) -> dict:
     """Add or remove one emoji reaction on a chat message (issue #668).
 
@@ -579,7 +626,8 @@ def handle_chat_react(cfg: Config, d: dict) -> dict:
         raise ReplyError(400, "bad action")
     who = "jason"
     with cfg.lock:
-        if not any(m.get("at") == at for m in read_chat(cfg, limit=0)):
+        target = next((m for m in read_chat(cfg, limit=0) if m.get("at") == at), None)
+        if target is None:
             raise ReplyError(404, "no such message")
         state = reaction_fold(reaction_events(cfg.chat_reactions_log))
         has = who in (state.get(at) or {}).get(emoji, {})
@@ -599,6 +647,12 @@ def handle_chat_react(cfg: Config, d: dict) -> dict:
                     + "\n"
                 )
             state = reaction_fold(reaction_events(cfg.chat_reactions_log))
+            if (
+                action == "add"
+                and emoji in ATTENTION_EMOJI
+                and target.get("from") == "alice"
+            ):
+                _drop_reaction_surface(cfg, target, emoji, now_iso())
     return {"ok": True, "reactions": reactions_for(state, at)}
 
 
