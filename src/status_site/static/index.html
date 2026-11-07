@@ -1558,7 +1558,12 @@ function renderBoundList(id, props, rows) {
         ? h("ul", null, sec.rows.map(r => h("li", {key: r.id, style: r.stale ? {borderLeft: "3px solid #d9a441", paddingLeft: ".4rem"} : null},
             h("strong", null, r.title),
             r.summary_bits && r.summary_bits.length
-              ? h("em", null, ": " + r.summary_bits.join(" — "))
+              ? h("em", null, ": ", r.summary_bits.map((b, i) => {
+                  const m = /^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/.exec(b);
+                  return h(React.Fragment, {key: i},
+                    i ? " — " : null,
+                    m ? h("a", {href: m[2], target: "_blank", rel: "noopener"}, m[1]) : b);
+                }))
               : null,
             r.pricing ? h("span", {className: "fx-pill", style: {marginLeft: ".4rem"}}, r.pricing) : null,
             r.meta || r.pr_url
