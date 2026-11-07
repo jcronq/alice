@@ -522,7 +522,6 @@ def test_group_rows_by_component_empty_input_empty_output():
 @pytest.fixture
 def history_site(tmp_path, monkeypatch):
     """Spin up a status_site server pointed at a seeded alice-state.db."""
-    import http.client as _http
     import sqlite3 as _sqlite
     import threading as _thr
 
