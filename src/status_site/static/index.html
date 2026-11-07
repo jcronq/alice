@@ -1756,7 +1756,19 @@ function YourTodoBoard({data, nowMs}) {
       prs.length ? h(ReviewLinkTable, {rows: prs}) : none("(no PRs awaiting review)"),
       warn(failed.prs)),
     h(PipelineGroup, {title: "Design review", count: design.length},
-      design.length ? h(ReviewLinkTable, {rows: design, limit: 5}) : none("(no designs awaiting review)"),
+      design.length
+        ? (() => {
+            // Issue #718: split auditor-filed ``[status-site:*]`` findings
+            // from other design reviews; auditor group starts collapsed.
+            const isAud = r => /^\s*\[status-site:/i.test(r.title || "");
+            const aud = design.filter(isAud), other = design.filter(r => !isAud(r));
+            return h(React.Fragment, null,
+              other.length ? h(PipelineGroup, {title: "Design / feature", count: other.length},
+                h(ReviewLinkTable, {rows: other})) : null,
+              aud.length ? h(PipelineGroup, {title: "Status-site auditor findings", count: aud.length, open: !other.length},
+                h(ReviewLinkTable, {rows: aud})) : null);
+          })()
+        : none("(no designs awaiting review)"),
       warn(failed.design_review)),
     attn.length
       ? h(PipelineGroup, {title: "Attention reacts", count: attn.length},
