@@ -10,6 +10,7 @@
 #   task list [--status STATE|open] [--tag TAG] [--actor ACTOR]
 #   task view <id>
 #   task close <id> [--reason R] [--merge-ref REF] [--actor ACTOR]
+#   task reindex [--dry-run]
 #
 # Add --json to any subcommand for machine-readable output.
 #

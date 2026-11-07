@@ -27,6 +27,25 @@ def _isolate_status_dir(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_gh_rate_limit_backoff(tmp_path_factory, monkeypatch):
+    """Redirect the shared gh rate-limit backoff file to a per-test tmp path.
+
+    Issue #786 M4. Without this, a test that triggers a real (or
+    fake-with-429-shape) ``gh`` error would write to
+    ``/state/worker/gh-rate-limit-backoff.json``, poisoning the
+    production state for every subsequent test AND for the live
+    speaking daemon running on the same host. The rate-limit module
+    resolves the env var lazily on each call so the redirect is
+    effective throughout the test's lifetime.
+    """
+    monkeypatch.setenv(
+        "ALICE_GH_RATE_LIMIT_BACKOFF_PATH",
+        str(tmp_path_factory.mktemp("gh-rate-limit") / "backoff.json"),
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_pi_models_staging(tmp_path_factory, monkeypatch):
     """Redirect kernels.pi.models_staging at tmp paths for every test.
 

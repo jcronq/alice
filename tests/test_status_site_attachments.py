@@ -176,8 +176,12 @@ def test_chat_message_record_carries_attachment_paths(cfg):
     stored = next((cfg.upload_dir / "chat").rglob("*shot.png"))
     assert stored.parent.name == time.strftime("%Y-%m-%d")
     assert stored.parent.parent.name == "chat"
+    # read_chat rewrites each attachment's ``path`` into a ``url`` under
+    # ``/chat-upload/<date>/<filename>`` so the client can render images
+    # inline (``path`` stays for existing consumers).
     assert att == {
         "name": "shot.png",
         "path": f"{ALIAS}/{stored.relative_to(cfg.upload_dir)}",
         "bytes": 3,
+        "url": f"/chat-upload/{stored.relative_to(cfg.upload_dir / 'chat')}",
     }

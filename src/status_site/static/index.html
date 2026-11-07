@@ -17,9 +17,6 @@
   and renders through the generic ``A2uiSurface`` component. Hash routes
   (``#chat``, ``#bugs``, ``#review-<slug>``) pick which surface the
   shell mounts.
-
-  ``legacy.html`` is still packaged for rollback — the "Classic view"
-  header link points at it. Retirement is a follow-up PR per the design.
 -->
 <link rel="stylesheet" href="design-tokens.css">
 <style>
@@ -74,7 +71,6 @@ header a:hover, header button.hdr:hover {
   border-radius: 999px;
 }
 .sse-status.live { color: var(--color-ok); border-color: var(--color-ok); }
-.sse-status.fallback { color: var(--color-warn); border-color: var(--color-warn); }
 .sse-status.off { color: var(--color-bad); border-color: var(--color-bad); }
 /* Readable (narrow) is the default — ~62ch per line. "Wide" fills most
  * of the viewport for dense dashboards. Toggled from the gear menu
@@ -85,6 +81,11 @@ main { max-width: 62rem; margin: 0 auto; padding: 1rem 1.5rem 4rem; }
 html[data-width="wide"] main { max-width: min(1400px, 95vw); }
 main:has(.a2ui-chat-page) { max-width: 56rem; padding: 1rem 1rem 1.5rem; }
 html[data-width="wide"] main:has(.a2ui-chat-page) { max-width: min(1200px, 95vw); }
+/* Tighter main gutters on phones give the chat thread more horizontal
+ * room for message bubbles (#805). */
+@media (max-width: 600px) {
+  main:has(.a2ui-chat-page) { padding: .5rem .5rem .75rem; }
+}
 h1 { font-size: 1.5rem; margin: .6rem 0; }
 h2.sec-heading {
   font-size: 1.15rem; margin: 1.6rem 0 .5rem;
@@ -219,12 +220,6 @@ details.fx-group:first-child { margin-top: 0; }
   background: var(--color-ok);
   border-color: var(--color-ok);
 }
-.cfg-link {
-  font-size: .85rem;
-  color: var(--color-fg-muted);
-  text-decoration: none;
-}
-.cfg-link:hover { color: var(--color-ok); }
 .chat-image { margin: .4rem 0; max-width: 100%; }
 .chat-image img {
   max-width: 100%;
@@ -287,6 +282,10 @@ details.fx-group:first-child { margin-top: 0; }
   background: rgba(46, 122, 79, .12);
   animation: msgDeliveredFade 3s ease-out forwards;
 }
+.msg-status-read {
+  color: var(--color-accent, var(--color-ok));
+  background: rgba(46, 122, 79, .12);
+}
 @keyframes msgPulse { 0%,100% {opacity:.55} 50% {opacity:1} }
 @keyframes msgDeliveredFade {
   0% { color: var(--color-ok); opacity: 1; }
@@ -297,6 +296,7 @@ details.fx-group:first-child { margin-top: 0; }
 .msg.jason .msg-status { color: #fff; background: rgba(0, 0, 0, .22); border-color: rgba(255, 255, 255, .5); }
 .msg.jason .msg-status-sending { background: rgba(255, 180, 60, .32); color: #fff; border-color: #fff; }
 .msg.jason .msg-status-delivered { background: rgba(255, 255, 255, .25); color: #fff; animation: none; }
+.msg.jason .msg-status-read { background: rgba(255, 255, 255, .25); color: #fff; font-weight: 700; }
 .a2ui-attach {
   cursor: pointer; font-size: .85rem; color: var(--color-fg-muted);
   padding: .15rem .55rem; border: 1px solid var(--color-border-line);
@@ -345,8 +345,8 @@ import {
 } from "./chat-ux.js";
 const h = React.createElement;
 
-// ── 0. key + legacy redirect ──────────────────────────────────────
-// Key handling mirrors legacy.html: ?k=<key> → localStorage → bare URL.
+// ── 0. key + legacy ?p= redirect ──────────────────────────────────
+// Key handling: ?k=<key> → localStorage → bare URL.
 const url = new URL(location.href);
 const kParam = url.searchParams.get("k");
 if (kParam) {
@@ -355,17 +355,15 @@ if (kParam) {
   history.replaceState(null, "", url.pathname + (url.search ? "?" + url.search : "") + url.hash);
 }
 const KEY = localStorage.getItem("alice-key") || "";
-// Dynamic pages (#651) render through the A2UI surface component in
-// this same shell — no more redirect to legacy.html for chat / bugs /
-// review. Pre-#651 ``?p=<slug>`` links are translated to the new
-// ``#<slug>`` route once so bookmarks and surface notes keep working.
-const LEGACY_PAGE = new URLSearchParams(location.search).get("p");
-if (LEGACY_PAGE && LEGACY_PAGE !== "index") {
+// Pre-#651 ``?p=<slug>`` URLs are translated to the new ``#<slug>``
+// hash route once so bookmarks and surface notes keep working.
+const PAGE_PARAM = new URLSearchParams(location.search).get("p");
+if (PAGE_PARAM && PAGE_PARAM !== "index") {
   const u = new URL(location.href);
   u.searchParams.delete("p");
   // ``?p=chat#msg-<at>`` permalinks (#668) keep their message fragment;
   // parseHash treats ``#msg-…`` as the chat route.
-  if (!(LEGACY_PAGE === "chat" && parseMessageHash(u.hash))) u.hash = "#" + LEGACY_PAGE;
+  if (!(PAGE_PARAM === "chat" && parseMessageHash(u.hash))) u.hash = "#" + PAGE_PARAM;
   history.replaceState(null, "", u.pathname + (u.search ? u.search : "") + u.hash);
 }
 
@@ -444,7 +442,7 @@ function makeSseParser(onMessage) {
 // replaces one. ts is used by freshness tiles to tint by age.
 const INITIAL = {
   sections: {}, ts: {},
-  connected: false, fallback: false, error: null,
+  connected: false, error: null,
 };
 function reducer(state, event) {
   switch (event.type) {
@@ -455,7 +453,7 @@ function reducer(state, event) {
         ...state,
         sections: event.sections || {},
         ts: {...state.ts, ...next},
-        connected: true, fallback: false, error: null,
+        connected: true, error: null,
       };
     }
     case "section.update":
@@ -469,13 +467,7 @@ function reducer(state, event) {
       return {
         ...state,
         connected: !!event.connected,
-        fallback: !!event.fallback,
         error: event.error || null,
-      };
-    case "__legacy":
-      return {
-        ...state,
-        sections: {_legacy_md: {markdown: event.markdown || ""}},
       };
     default:
       return state;
@@ -483,7 +475,6 @@ function reducer(state, event) {
 }
 
 // ── 5. event-stream hook ──────────────────────────────────────────
-const MAX_RECONNECT_ATTEMPTS = 5;
 const BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 10000];
 function useEventStream(dispatch) {
   const abortRef = useRef(null);
@@ -494,16 +485,6 @@ function useEventStream(dispatch) {
     }
     let cancelled = false;
     let attempts = 0;
-    async function fallbackPoll() {
-      try {
-        const r = await fetch("/index.md?" + Date.now(), {cache: "no-store"});
-        if (r.ok) {
-          const md = await r.text();
-          dispatch({type: "__legacy", markdown: md});
-          dispatch({type: "__status", connected: false, fallback: true});
-        }
-      } catch (e) { /* silent */ }
-    }
     async function connect() {
       while (!cancelled) {
         const ac = new AbortController();
@@ -513,7 +494,7 @@ function useEventStream(dispatch) {
             headers: {Accept: "text/event-stream"}, signal: ac.signal,
           });
           if (!r.ok) throw new Error("HTTP " + r.status);
-          dispatch({type: "__status", connected: true, fallback: false});
+          dispatch({type: "__status", connected: true});
           attempts = 0;
           const reader = r.body.getReader();
           const decoder = new TextDecoder("utf-8");
@@ -526,14 +507,8 @@ function useEventStream(dispatch) {
         } catch (e) {
           if (cancelled) return;
         }
-        dispatch({type: "__status", connected: false, fallback: false});
+        dispatch({type: "__status", connected: false});
         attempts++;
-        if (attempts >= MAX_RECONNECT_ATTEMPTS) {
-          await fallbackPoll();
-          await new Promise(res => setTimeout(res, 30000));
-          attempts = MAX_RECONNECT_ATTEMPTS;
-          continue;
-        }
         const wait = BACKOFF_MS[Math.min(attempts, BACKOFF_MS.length - 1)];
         await new Promise(res => setTimeout(res, wait));
       }
@@ -1290,7 +1265,7 @@ function ChatMessage({m, reactions, quoted}) {
   // Server rows (historical reload) have no status and get no indicator.
   let statusIcon = null;
   if (m.from === "jason" && m.status) {
-    const icons = {sending: "◌ sending", sent: "✓ sent", delivered: "✓ delivered"};
+    const icons = {sending: "◌ sending", sent: "✓ sent", delivered: "✓ delivered", read: "✓✓ read"};
     statusIcon = h("span", {className: "msg-status msg-status-" + m.status}, icons[m.status] || m.status);
   }
   const summary = summarizeReactions(reactions);
@@ -1954,16 +1929,17 @@ function DoneTodayList({prs, asksResolved}) {
     prRows.length
       ? h(FxTable, {
           columns: [
-            {key: "repo", label: "repo", cell: r => h("code", null, r.repo || "")},
+            {key: "repo", label: "repo", cell: r => h("code", {style: {whiteSpace: "nowrap"}}, r.repo || "")},
             {key: "number", label: "#", numeric: true, cell: r =>
               r.url
                 ? h("a", {href: r.url, target: "_blank", rel: "noopener",
-                    style: {fontVariantNumeric: "tabular-nums"}},
+                    style: {fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap"}},
                     "#" + r.number)
-                : h("span", {className: "fx-num"}, "#" + r.number)
+                : h("span", {className: "fx-num", style: {whiteSpace: "nowrap"}}, "#" + r.number)
             },
             {key: "title", label: "title"},
-            {key: "merged_at", label: "merged"},
+            {key: "merged_at", label: "merged", cell: r =>
+              h("span", {style: {whiteSpace: "nowrap"}}, r.merged_at || "")},
           ],
           rows: prRows.map((r, i) => ({...r, __key: (r.repo || "") + "#" + (r.number || i)})),
         })
@@ -2065,12 +2041,6 @@ function Tier({tier, summary, ts, nowMs, children}) {
   );
 }
 
-function LegacySection({data}) {
-  return h("section", {className: "sec", "data-section": "_legacy_md"},
-    h(MarkdownZone, {markdown: (data && data.markdown) || ""}),
-  );
-}
-
 // ── 9b. hash routing (#651) ──────────────────────────────────────
 // ``#chat`` / ``#bugs`` / ``#review-<slug>`` pick which A2UI surface
 // the shell mounts. Anything else falls through to the Overview
@@ -2116,11 +2086,9 @@ function usePingReviewSlug(slug) {
 
 // ── 10. header ────────────────────────────────────────────────────
 // Nav tabs: fetch pages.json so chat / bugs / review stay reachable
-// from the reactive shell. Chat / Bugs link to ``#chat`` / ``#bugs``
-// (A2UI-rendered inside this shell, #651); everything else still
-// points at legacy.html via ``?p=<slug>`` until the markdown-page
-// pipeline moves across too.
-const A2UI_SLUGS = new Set(["chat", "bugs"]);
+// from the reactive shell. All tabs link to ``#<slug>``; parseHash
+// routes chat / bugs / review-<slug> to their A2UI surfaces and
+// everything else falls through to the Overview board.
 function NavTabs() {
   const [pages, setPages] = useState([]);
   useEffect(() => {
@@ -2140,14 +2108,10 @@ function NavTabs() {
     })();
     return () => { cancelled = true; };
   }, []);
-  const search = location.search;
   const route = useHashRoute();
   const current = route.route === "review" ? "review-" + route.slug : route.route;
   return pages.map(p => {
-    const hashRoute = A2UI_SLUGS.has(p.slug);
-    const href = hashRoute
-      ? ("#" + p.slug)
-      : ("legacy.html" + (search ? search + "&" : "?") + "p=" + encodeURIComponent(p.slug));
+    const href = "#" + p.slug;
     const active = p.slug === current;
     return h("a", {
       key: p.slug, href, title: p.title,
@@ -2166,7 +2130,7 @@ function applyWidth() {
 }
 applyWidth();
 
-function ConfigGear({legacyHref}) {
+function ConfigGear() {
   const [open, setOpen] = useState(false);
   const [theme, setTheme] = useState(() => localStorage.getItem("alice-theme") || "system");
   const [width, setWidth] = useState(() => localStorage.getItem("alice-width") || "narrow");
@@ -2228,9 +2192,6 @@ function ConfigGear({legacyHref}) {
           }, v === "narrow" ? "Readable" : "Wide")),
         ),
       ),
-      h("div", {className: "cfg-section"},
-        h("a", {className: "cfg-link", href: legacyHref}, "Classic view (legacy)"),
-      ),
     ) : null,
   );
 }
@@ -2243,11 +2204,9 @@ function App() {
   const {route, slug} = useHashRoute();
   usePingReviewSlug(route === "review" ? slug : null);
 
-  const legacyHref = "legacy.html" + location.search;
   let statusClass = "sse-status";
   let statusLabel = "connecting…";
-  if (state.fallback) { statusClass += " fallback"; statusLabel = "fallback: /index.md"; }
-  else if (state.connected) { statusClass += " live"; statusLabel = "live"; }
+  if (state.connected) { statusClass += " live"; statusLabel = "live"; }
   else if (state.error) { statusClass += " off"; statusLabel = state.error; }
 
   // Route → content. Overview reuses the existing widget stack; A2UI
@@ -2255,7 +2214,6 @@ function App() {
   // section payload the broadcaster is already streaming.
   let content;
   if (route === "overview") {
-    const legacyPayload = state.sections._legacy_md;
     const sections = TIERS
       .filter(t => t.sections.some(n => state.sections[n]))
       .map(t => h(Tier, {key: t.id,
@@ -2271,10 +2229,7 @@ function App() {
         }))));
     content = sections.length
       ? sections
-      : (legacyPayload
-          ? h(LegacySection, {data: legacyPayload})
-          : (state.fallback ? null : h("div", {className: "notice"},
-              "Waiting for the first snapshot…")));
+      : h("div", {className: "notice"}, "Waiting for the first snapshot…");
   } else {
     const key = route === "review" ? "page:review" : ("page:" + route);
     const payload = state.sections[key];
@@ -2295,7 +2250,7 @@ function App() {
       ),
       h("span", {className: "spacer"}),
       h("span", {className: statusClass}, statusLabel),
-      h(ConfigGear, {legacyHref}),
+      h(ConfigGear),
     ),
     h("main", null,
       !KEY && h("div", {className: "notice err"},
