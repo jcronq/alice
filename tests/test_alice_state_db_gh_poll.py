@@ -405,3 +405,343 @@ def test_derive_gh_poll_is_idempotent(mind):
 def _row_count(db_path: pathlib.Path, table: str) -> int:
     with sqlite3.connect(str(db_path)) as conn:
         return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+# ─── Issue #821: PR-files → touches_component refs ──────────────────
+
+
+def _files_response(filenames: list[str]) -> list[dict]:
+    return [{"filename": f} for f in filenames]
+
+
+def test_poll_writes_touches_component_rows_from_pr_files(mind):
+    """A PR with ``Closes #42`` touching ``src/status_site/foo.py``
+    writes a ``touches_component`` row on the issue's item_id."""
+    issues = [
+        {
+            "number": 42,
+            "title": "layout tweak",
+            "created_at": "2026-11-06T09:00:00Z",
+            "updated_at": "2026-11-07T10:00:00Z",
+            "user": {"login": "jcronq"},
+            "body": "",
+            "labels": [{"name": "sm:building"}],
+        }
+    ]
+    prs = [
+        {
+            "number": 900,
+            "title": "fix layout",
+            "created_at": "2026-11-07T09:00:00Z",
+            "updated_at": "2026-11-07T10:00:00Z",
+            "user": {"login": "jcronq"},
+            "body": "Closes #42",
+            "state": "open",
+            "merged_at": None,
+            "draft": False,
+        }
+    ]
+    files_calls = {"n": 0}
+
+    def runner(cmd):
+        url = cmd[-1]
+        if "/pulls/900/files" in url:
+            files_calls["n"] += 1
+            body = json.dumps(_files_response(["src/status_site/server.py"]))
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, "files-etag-1", body), stderr=""
+            )
+        if "/pulls" in url:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, "prs-etag", json.dumps(prs)), stderr=""
+            )
+        if "/issues" in url:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=_mk_curl_output(200, "issues-etag", json.dumps(issues)),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=_mk_curl_output(200, None, "[]"), stderr=""
+        )
+
+    db_path = mind / "inner" / "state" / "alice-state.db"
+    report = P.derive_gh_poll(
+        mind, db_path=db_path, repos=["jcronq/alice"], env={}, runner=runner
+    )
+    assert report.status == "ok", report.errors
+    assert files_calls["n"] == 1
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT item_id, ref_target_item_id, ref_source
+            FROM item_external_refs
+            WHERE ref_type = 'touches_component'
+            """
+        ).fetchall()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["item_id"] == "gh:jcronq/alice#42"
+    assert row["ref_target_item_id"] == "component:status_site"
+    assert row["ref_source"].startswith("pr-files:")
+    assert "gh:pr:jcronq/alice#900" in row["ref_source"]
+
+
+def test_poll_skips_pr_files_when_updated_at_unchanged(mind):
+    """A re-poll of a PR with the same ``updated_at`` does NOT hit the
+    files endpoint again."""
+    issues = [
+        {
+            "number": 42,
+            "title": "layout tweak",
+            "created_at": "2026-11-06T09:00:00Z",
+            "updated_at": "2026-11-07T10:00:00Z",
+            "user": {"login": "jcronq"},
+            "body": "",
+            "labels": [{"name": "sm:building"}],
+        }
+    ]
+    prs = [
+        {
+            "number": 900,
+            "title": "fix layout",
+            "created_at": "2026-11-07T09:00:00Z",
+            "updated_at": "2026-11-07T10:00:00Z",
+            "user": {"login": "jcronq"},
+            "body": "Closes #42",
+            "state": "open",
+            "merged_at": None,
+            "draft": False,
+        }
+    ]
+    files_calls = {"n": 0}
+
+    def runner(cmd):
+        url = cmd[-1]
+        if "/pulls/900/files" in url:
+            files_calls["n"] += 1
+            body = json.dumps(_files_response(["src/status_site/server.py"]))
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, "files-etag-1", body), stderr=""
+            )
+        if "/pulls" in url:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, "prs-etag", json.dumps(prs)), stderr=""
+            )
+        if "/issues" in url:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=_mk_curl_output(200, "issues-etag", json.dumps(issues)),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=_mk_curl_output(200, None, "[]"), stderr=""
+        )
+
+    db_path = mind / "inner" / "state" / "alice-state.db"
+    # First poll fires the files endpoint.
+    r1 = P.derive_gh_poll(
+        mind, db_path=db_path, repos=["jcronq/alice"], env={}, runner=runner
+    )
+    assert r1.status == "ok", r1.errors
+    assert files_calls["n"] == 1
+
+    # Second poll with same response — files endpoint must NOT fire again.
+    r2 = P.derive_gh_poll(
+        mind, db_path=db_path, repos=["jcronq/alice"], env={}, runner=runner
+    )
+    assert r2.status == "ok", r2.errors
+    assert files_calls["n"] == 1
+
+
+def test_poll_fan_out_multi_component_pr(mind):
+    """A PR touching multiple components lands one row per bucket."""
+    issues = [
+        {
+            "number": 42,
+            "title": "multi-touch",
+            "created_at": "2026-11-06T09:00:00Z",
+            "updated_at": "2026-11-07T10:00:00Z",
+            "user": {"login": "jcronq"},
+            "body": "",
+            "labels": [{"name": "sm:building"}],
+        }
+    ]
+    prs = [
+        {
+            "number": 901,
+            "title": "both",
+            "created_at": "2026-11-07T09:00:00Z",
+            "updated_at": "2026-11-07T10:00:00Z",
+            "user": {"login": "jcronq"},
+            "body": "Closes #42",
+            "state": "open",
+            "merged_at": None,
+            "draft": False,
+        }
+    ]
+
+    def runner(cmd):
+        url = cmd[-1]
+        if "/pulls/901/files" in url:
+            body = json.dumps(
+                _files_response(
+                    [
+                        "src/status_site/server.py",
+                        "src/alice_state_db/gh_poll.py",
+                        "sandbox/docker-compose.yml",
+                        "tests/test_x.py",
+                    ]
+                )
+            )
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, "e", body), stderr=""
+            )
+        if "/pulls" in url:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, "prs-etag", json.dumps(prs)), stderr=""
+            )
+        if "/issues" in url:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=_mk_curl_output(200, "issues-etag", json.dumps(issues)),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=_mk_curl_output(200, None, "[]"), stderr=""
+        )
+
+    db_path = mind / "inner" / "state" / "alice-state.db"
+    P.derive_gh_poll(
+        mind, db_path=db_path, repos=["jcronq/alice"], env={}, runner=runner
+    )
+    with sqlite3.connect(str(db_path)) as conn:
+        comps = {
+            r[0]
+            for r in conn.execute(
+                "SELECT ref_target_item_id FROM item_external_refs WHERE ref_type='touches_component'"
+            )
+        }
+    assert comps == {
+        "component:status_site",
+        "component:alice_state_db",
+        "component:infra",
+    }
+
+
+def test_poll_component_label_on_issue_writes_fallback_row(mind):
+    """An issue carrying ``component:alice_forge`` label gets a row with
+    ``ref_source='issue-label'`` and no extra GH call."""
+    issues = [
+        {
+            "number": 50,
+            "title": "needs forge",
+            "created_at": "2026-11-05T10:00:00Z",
+            "updated_at": "2026-11-07T10:00:00Z",
+            "user": {"login": "jcronq"},
+            "body": "",
+            "labels": [
+                {"name": "sm:selected"},
+                {"name": "component:alice_forge"},
+            ],
+        }
+    ]
+    files_calls = {"n": 0}
+
+    def runner(cmd):
+        url = cmd[-1]
+        if "/files" in url:
+            files_calls["n"] += 1
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, "e", "[]"), stderr=""
+            )
+        if "/issues" in url:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=_mk_curl_output(200, "issues-etag", json.dumps(issues)),
+                stderr="",
+            )
+        if "/pulls" in url:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, "prs-etag", "[]"), stderr=""
+            )
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=_mk_curl_output(200, None, "[]"), stderr=""
+        )
+
+    db_path = mind / "inner" / "state" / "alice-state.db"
+    P.derive_gh_poll(
+        mind, db_path=db_path, repos=["jcronq/alice"], env={}, runner=runner
+    )
+    assert files_calls["n"] == 0
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT item_id, ref_target_item_id, ref_source
+            FROM item_external_refs
+            WHERE ref_type = 'touches_component'
+            """
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["item_id"] == "gh:jcronq/alice#50"
+    assert rows[0]["ref_target_item_id"] == "component:alice_forge"
+    assert rows[0]["ref_source"] == "issue-label"
+
+
+def test_poll_skips_pr_files_when_closes_target_unknown(mind):
+    """A PR whose ``Closes #N`` points at an issue not in the local DB
+    still runs the files endpoint, but the FK-guarded insert is a
+    silent no-op — no row written and no crash."""
+    # Only the PR is in the response; the issue it closes is not.
+    prs = [
+        {
+            "number": 902,
+            "title": "fix ancient thing",
+            "created_at": "2026-11-07T09:00:00Z",
+            "updated_at": "2026-11-07T10:00:00Z",
+            "user": {"login": "jcronq"},
+            "body": "Closes #9999",
+            "state": "open",
+            "merged_at": None,
+            "draft": False,
+        }
+    ]
+
+    def runner(cmd):
+        url = cmd[-1]
+        if "/pulls/902/files" in url:
+            body = json.dumps(_files_response(["src/status_site/server.py"]))
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, "e", body), stderr=""
+            )
+        if "/pulls" in url:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, "prs-etag", json.dumps(prs)), stderr=""
+            )
+        if "/issues" in url:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, "issues-etag", "[]"), stderr=""
+            )
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=_mk_curl_output(200, None, "[]"), stderr=""
+        )
+
+    db_path = mind / "inner" / "state" / "alice-state.db"
+    report = P.derive_gh_poll(
+        mind, db_path=db_path, repos=["jcronq/alice"], env={}, runner=runner
+    )
+    assert report.status == "ok", report.errors
+
+    with sqlite3.connect(str(db_path)) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM item_external_refs WHERE ref_type='touches_component'"
+        ).fetchone()[0]
+    assert count == 0

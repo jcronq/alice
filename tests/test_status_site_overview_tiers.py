@@ -178,6 +178,17 @@ def test_in_flight_payload_is_alice_owned_only(tmp_path, monkeypatch):
     assert [r["number"] for r in data["pipeline"]] == [60]
     assert [s["slug"] for s in data["surfaces"]] == ["one"]
     assert data["running"] == [] and data["tasks"] == []
+    # Issue #821: the per-component grouping is additive — flat
+    # ``pipeline`` keeps its contract; ``pipeline_by_component`` is
+    # a parallel view of the same rows. With no components attached
+    # by the test seed, everything lands in ``pre-build``.
+    assert "pipeline_by_component" in data
+    flattened = []
+    for bucket in data["pipeline_by_component"].values():
+        flattened.extend(bucket)
+    assert sorted(r["number"] for r in flattened) == sorted(
+        r["number"] for r in data["pipeline"]
+    )
 
 
 def test_system_health_and_thinking_queue_payloads(tmp_path, monkeypatch):

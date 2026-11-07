@@ -68,8 +68,21 @@ _PRS_RESPONSE = [
 ]
 
 
+_FILES_RESPONSE = [
+    {"filename": "src/status_site/sources/pipeline.py"},
+    {"filename": "src/alice_state_db/gh_poll.py"},
+]
+
+
 def _runner(cmd):
     url = cmd[-1]
+    if "/pulls/" in url and "/files" in url:
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=_mk_curl_output(200, "files-etag", json.dumps(_FILES_RESPONSE)),
+            stderr="",
+        )
     if "/issues" in url and "/pulls" not in url:
         return subprocess.CompletedProcess(
             cmd,
@@ -143,6 +156,37 @@ def test_poller_populates_db_done_today_reports_zero_merged_prs(
     items, failed = D.fetch_merged_prs(["jcronq/alice"], today=date(2026, 11, 7))
     assert failed == []
     assert items == []
+
+
+def test_poller_populates_db_pipeline_source_attaches_components(seeded_from_poll):
+    """Issue #821 end-to-end: the poller's PR-files call writes
+    ``touches_component`` rows on each ``Closes #N`` target issue;
+    the pipeline source reads them back and attaches ``components``
+    to each row. Confirms zero GH subprocess calls happen during the
+    read path — the whole thing is DB-local."""
+    import subprocess as _sp
+
+    gh_calls: list[list[str]] = []
+    real_run = _sp.run
+
+    def tracking_run(cmd, *args, **kwargs):
+        # Any ``gh`` subprocess during the render path would prove the
+        # read path leaked back to the CLI — forbidden by design.
+        if isinstance(cmd, list) and cmd and cmd[0] == "gh":
+            gh_calls.append(cmd)
+        return real_run(cmd, *args, **kwargs)
+
+    _sp.run = tracking_run
+    try:
+        rows, failed = P.fetch_issues(["jcronq/alice"])
+    finally:
+        _sp.run = real_run
+    assert failed == []
+    assert gh_calls == [], gh_calls
+
+    by_number = {r["number"]: r for r in rows}
+    # #790 is closed by PR #803 which touches status_site + alice_state_db.
+    assert set(by_number[790]["components"]) == {"status_site", "alice_state_db"}
 
 
 def test_fallback_to_gh_when_flag_flipped(seeded_from_poll, monkeypatch):

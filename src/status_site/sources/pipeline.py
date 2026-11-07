@@ -40,6 +40,7 @@ from typing import Callable, Sequence
 
 from alice_forge.review_queue_renderer import _coerce_repos, _load_config, gh
 from status_site.sources import db_readers as _db_readers
+from status_site.sources.components import CANONICAL_BUCKET_ORDER, order_buckets
 
 log = logging.getLogger("status_site.pipeline")
 
@@ -201,7 +202,14 @@ def fetch_issues(
 
 
 def issue_rows(cached: list[dict], *, now: float) -> list[dict]:
-    """Cached issues → widget rows with ``age_seconds`` (``None`` if unknown)."""
+    """Cached issues → widget rows with ``age_seconds`` (``None`` if unknown).
+
+    Carries ``components`` through when the DB reader attached one
+    (issue #821). The GH-subprocess path doesn't populate it, so rows
+    from that source always come through with ``components=[]`` and
+    bucket as ``pre-build`` — that's by design (see "Explicitly not
+    in scope" in the design doc).
+    """
     out: list[dict] = []
     for r in cached:
         ts = r.get("updated_epoch")
@@ -214,6 +222,7 @@ def issue_rows(cached: list[dict], *, now: float) -> list[dict]:
                 "art": r.get("art", ""),
                 "link": r.get("url", ""),
                 "age_seconds": max(0.0, now - ts) if ts else None,
+                "components": list(r.get("components") or []),
             }
         )
     return out
@@ -248,6 +257,39 @@ def sort_rows(rows: Sequence[dict]) -> list[dict]:
         )
 
     return sorted(rows, key=key)
+
+
+def group_by_component(rows: Sequence[dict]) -> dict[str, list[dict]]:
+    """Group pipeline rows by ``components`` (issue #821).
+
+    A row with multiple components appears in EACH relevant bucket —
+    Jason wants to see "which components is this issue touching" at a
+    glance, not "pick one". A row with an empty / missing
+    ``components`` list falls into ``pre-build``.
+
+    The returned dict preserves :data:`CANONICAL_BUCKET_ORDER` for the
+    well-known buckets; newly-discovered components (e.g. ``indexer``)
+    sort alphabetically immediately before ``pre-build``, which always
+    comes last. Empty buckets are dropped so the caller doesn't render
+    a header with ``(0)``.
+
+    Each bucket is :func:`sort_rows`-ordered so the oldest work
+    surfaces first inside each component — matching the pre-#821 flat
+    view's behaviour.
+    """
+    buckets: dict[str, list[dict]] = {}
+    for r in rows:
+        comps = r.get("components") or []
+        targets = list(comps) if comps else ["pre-build"]
+        for c in targets:
+            if not c:
+                continue
+            buckets.setdefault(c, []).append(r)
+    ordered: dict[str, list[dict]] = {}
+    for name in order_buckets(list(buckets.keys())):
+        if buckets[name]:
+            ordered[name] = sort_rows(buckets[name])
+    return ordered
 
 
 def split_by_owner(issues: Sequence[dict]) -> dict[str, list[dict]]:

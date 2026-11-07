@@ -229,8 +229,88 @@ def fetch_issues_from_db(
         log.warning("db_readers.fetch_issues_from_db: %r", exc)
         return [], []
 
+    # Issue #821: attach per-row ``components`` so the pipeline board
+    # can group by ``src/`` bucket without a second query per render.
+    if rows:
+        comp_map = fetch_issue_components_from_db(
+            [
+                f"gh:{r['repo']}#{r['number']}" for r in rows
+            ],
+            db_path=path,
+        )
+        for r in rows:
+            r["components"] = comp_map.get(
+                f"gh:{r['repo']}#{r['number']}", []
+            )
+
     rows.sort(key=lambda r: (_STATE_RANK[r["state"]], r["repo"], r["number"]))
     return rows, []
+
+
+def fetch_issue_components_from_db(
+    item_ids: Iterable[str],
+    *,
+    db_path: Optional[pathlib.Path] = None,
+) -> dict[str, list[str]]:
+    """Return ``{issue_item_id: [component, ...]}`` for issue #821.
+
+    Resolution precedence (per item_id):
+
+    1. PR-files rows (``ref_source LIKE 'pr-files:%'``) take precedence
+       whenever any are present — they're the ground truth for what a
+       PR actually touches, so the issue-label fallback is only used
+       when no PR is linked yet.
+    2. Issue-label rows (``ref_source='issue-label'``) are the fallback
+       for pre-build items that carry a ``component:*`` label but
+       don't yet have a PR.
+    3. Neither → empty list. The caller buckets as ``pre-build``.
+
+    One batched SELECT, grouping in Python — a single cold round-trip
+    for the whole pipeline page.
+    """
+    ids = [i for i in item_ids if i]
+    if not ids:
+        return {}
+    path = db_path or _resolve_db_path()
+    pr_files: dict[str, list[str]] = {}
+    labels: dict[str, list[str]] = {}
+    try:
+        with connect(path) as conn:
+            placeholders = ",".join("?" * len(ids))
+            cur = conn.execute(
+                f"""
+                SELECT item_id, ref_target_item_id, ref_source
+                FROM item_external_refs
+                WHERE ref_type = 'touches_component'
+                  AND item_id IN ({placeholders})
+                """,
+                tuple(ids),
+            )
+            for row in cur.fetchall():
+                target = str(row["ref_target_item_id"] or "")
+                if not target.startswith("component:"):
+                    continue
+                comp = target[len("component:") :]
+                src = str(row["ref_source"] or "")
+                item_id = str(row["item_id"])
+                if src.startswith("pr-files:"):
+                    pr_files.setdefault(item_id, []).append(comp)
+                elif src == "issue-label":
+                    labels.setdefault(item_id, []).append(comp)
+    except sqlite3.Error as exc:
+        log.warning("db_readers.fetch_issue_components_from_db: %r", exc)
+        return {}
+
+    out: dict[str, list[str]] = {}
+    for item_id in ids:
+        if item_id in pr_files:
+            # Dedup and sort for stable display order.
+            out[item_id] = sorted(set(pr_files[item_id]))
+        elif item_id in labels:
+            out[item_id] = sorted(set(labels[item_id]))
+        else:
+            out[item_id] = []
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -124,6 +124,102 @@ def test_issue_rows_age_math_and_missing_timestamp():
     assert out[0]["link"].endswith("/issues/1")
 
 
+# ─── group_by_component (issue #821) ────────────────────────────────
+
+
+def _bare_row(number, state="building", components=None, age=10):
+    return {
+        "repo": "jcronq/alice",
+        "number": number,
+        "title": f"t{number}",
+        "state": state,
+        "art": "",
+        "link": f"https://x/{number}",
+        "age_seconds": age,
+        "components": list(components or []),
+    }
+
+
+def test_group_by_component_fans_a_multi_component_row_into_each_bucket():
+    row = _bare_row(1, components=["status_site", "alice_state_db"])
+    out = P.group_by_component([row])
+    assert set(out.keys()) == {"alice_state_db", "status_site"}
+    assert out["status_site"][0]["number"] == 1
+    assert out["alice_state_db"][0]["number"] == 1
+
+
+def test_group_by_component_empty_components_bucket_as_prebuild():
+    out = P.group_by_component([_bare_row(1, components=[])])
+    assert list(out.keys()) == ["pre-build"]
+    assert out["pre-build"][0]["number"] == 1
+
+
+def test_group_by_component_order_matches_canonical_with_unknowns_alphabetical():
+    rows = [
+        _bare_row(1, components=["status_site"]),
+        _bare_row(2, components=["alice_forge"]),
+        _bare_row(3, components=["indexer"]),      # unknown
+        _bare_row(4, components=["metrics"]),       # unknown
+        _bare_row(5, components=[]),                # → pre-build
+        _bare_row(6, components=["alice_state_db"]),
+    ]
+    out = P.group_by_component(rows)
+    # canonical dirs first (alice_forge, alice_state_db, status_site),
+    # then unknowns alphabetically (indexer, metrics), then pre-build.
+    assert list(out.keys()) == [
+        "alice_forge",
+        "alice_state_db",
+        "status_site",
+        "indexer",
+        "metrics",
+        "pre-build",
+    ]
+
+
+def test_group_by_component_bucket_counts_match_contents():
+    rows = [
+        _bare_row(1, components=["status_site"]),
+        _bare_row(2, components=["status_site"]),
+        _bare_row(3, components=["status_site", "core"]),
+    ]
+    out = P.group_by_component(rows)
+    assert len(out["status_site"]) == 3
+    assert len(out["core"]) == 1
+
+
+def test_group_by_component_empty_buckets_dropped():
+    out = P.group_by_component([])
+    assert out == {}
+
+
+def test_group_by_component_sorts_inside_bucket():
+    # sort_rows: oldest first (highest age). Unknown age (None) goes last.
+    rows = [
+        _bare_row(1, components=["status_site"], age=10),
+        _bare_row(2, components=["status_site"], age=None),
+        _bare_row(3, components=["status_site"], age=500),
+    ]
+    out = P.group_by_component(rows)
+    assert [r["number"] for r in out["status_site"]] == [3, 1, 2]
+
+
+def test_issue_rows_carries_components_through_from_db_row():
+    cached = [
+        {
+            "repo": "jcronq/alice",
+            "number": 42,
+            "title": "t",
+            "state": "building",
+            "art": "code",
+            "url": "https://x/42",
+            "updated_epoch": 1_000_000.0,
+            "components": ["status_site"],
+        }
+    ]
+    rows = P.issue_rows(cached, now=1_000_100.0)
+    assert rows[0]["components"] == ["status_site"]
+
+
 # ─── tasks ──────────────────────────────────────────────────────────
 
 

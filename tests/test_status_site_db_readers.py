@@ -278,3 +278,92 @@ def test_review_queue_fetch_respects_explicit_runner(seeded_db, monkeypatch):
     # The runner returns empty, so the rows are empty — distinct from
     # the DB path which would have returned real seeded rows.
     assert design == [] and prs == []
+
+
+# ─── fetch_issue_components_from_db (issue #821) ───────────────────
+
+
+@pytest.fixture
+def seeded_components_db(seeded_db):
+    """Extend ``seeded_db`` with ``touches_component`` refs across both
+    sources so the precedence tests have something to assert against."""
+    conn = sqlite3.connect(str(seeded_db))
+    # #790 → pr-files picks ``status_site`` + ``alice_state_db``.
+    conn.execute(
+        """
+        INSERT INTO item_external_refs
+            (item_id, ref_type, ref_target_item_id, ref_source, created_at)
+        VALUES
+            ('gh:jcronq/alice#790', 'touches_component',
+             'component:status_site', 'pr-files:gh:pr:jcronq/alice#803',
+             '2026-11-07T10:00:00Z'),
+            ('gh:jcronq/alice#790', 'touches_component',
+             'component:alice_state_db', 'pr-files:gh:pr:jcronq/alice#803',
+             '2026-11-07T10:00:00Z')
+        """
+    )
+    # #790 also has a stale component label — ignored because PR-files
+    # rows exist.
+    conn.execute(
+        """
+        INSERT INTO item_external_refs
+            (item_id, ref_type, ref_target_item_id, ref_source, created_at)
+        VALUES
+            ('gh:jcronq/alice#790', 'touches_component',
+             'component:alice_forge', 'issue-label',
+             '2026-11-07T10:00:00Z')
+        """
+    )
+    # #802 has only an issue-label — used as the fallback.
+    conn.execute(
+        """
+        INSERT INTO item_external_refs
+            (item_id, ref_type, ref_target_item_id, ref_source, created_at)
+        VALUES
+            ('gh:jcronq/alice#802', 'touches_component',
+             'component:alice_forge', 'issue-label',
+             '2026-11-06T10:00:00Z')
+        """
+    )
+    # #700 has nothing — returns [].
+    conn.commit()
+    conn.close()
+    return seeded_db
+
+
+def test_fetch_issue_components_pr_files_win_over_issue_label(seeded_components_db):
+    out = R.fetch_issue_components_from_db(
+        [
+            "gh:jcronq/alice#790",
+            "gh:jcronq/alice#802",
+            "gh:jcronq/alice#700",
+        ]
+    )
+    assert out["gh:jcronq/alice#790"] == ["alice_state_db", "status_site"]
+    # #802: only issue-label → used.
+    assert out["gh:jcronq/alice#802"] == ["alice_forge"]
+    # #700: nothing → [].
+    assert out["gh:jcronq/alice#700"] == []
+
+
+def test_fetch_issue_components_empty_input_returns_empty(seeded_components_db):
+    assert R.fetch_issue_components_from_db([]) == {}
+
+
+def test_fetch_issues_from_db_attaches_components(seeded_components_db):
+    rows, failed = R.fetch_issues_from_db(["jcronq/alice"])
+    assert failed == []
+    by_number = {r["number"]: r for r in rows}
+    assert "components" in by_number[790]
+    assert by_number[790]["components"] == ["alice_state_db", "status_site"]
+    assert by_number[802]["components"] == ["alice_forge"]
+    assert by_number[700]["components"] == []
+
+
+def test_fetch_issue_components_missing_file_degrades_gracefully(tmp_path):
+    # Missing DB should not crash — connect() creates an empty one and
+    # the function returns ``[]`` for every requested id.
+    out = R.fetch_issue_components_from_db(
+        ["gh:jcronq/alice#1"], db_path=tmp_path / "missing.db"
+    )
+    assert out == {"gh:jcronq/alice#1": []}

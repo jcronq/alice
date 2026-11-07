@@ -2084,10 +2084,15 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         surfaces = _surface_rows(scan_surfaces(cfg.surface_dir), now)
         tasks = _pipeline.scan_tasks(_tasks_dir(), now=now)
         n = len(running["rows"]) + len(owner["alice"]) + len(surfaces) + len(tasks)
+        # Issue #821: group Alice-owned rows by ``src/`` component so
+        # the frontend can render one bucket per component. The flat
+        # ``pipeline`` key stays (two tests assert against it; frontend
+        # falls back to it if ``pipeline_by_component`` is absent).
         return {
             "markdown": f"{n} in flight" if n else "*(nothing in flight)*",
             "running": running["rows"],
             "pipeline": owner["alice"],
+            "pipeline_by_component": _pipeline.group_by_component(owner["alice"]),
             "surfaces": surfaces,
             "tasks": tasks,
             "pipeline_failed": list(pipe.get("failed") or []),

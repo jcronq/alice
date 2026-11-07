@@ -61,6 +61,7 @@ from alice_forge.rate_limit import (
     observe_gh_error,
     read_backoff_state,
 )
+from status_site.sources.components import component_for_path
 
 from .schema import apply_schema
 from .sm_seed import (
@@ -623,7 +624,140 @@ def poll_repo_issues(
             entered_at=updated_at,
         )
 
+        # Issue #821: scan ``component:<name>`` labels so the pipeline
+        # board has a fallback when no PR is linked yet. No extra GH
+        # call — the labels are already in the payload. Uses the same
+        # ``touches_component`` ref_type as the PR-files path; the
+        # reader picks PR-files over issue-label when both are present.
+        _sync_issue_component_labels(
+            conn, item_id=item_id, label_names=label_names
+        )
+
     return result.etag or etag
+
+
+def _sync_issue_component_labels(
+    conn: sqlite3.Connection,
+    *,
+    item_id: str,
+    label_names: list[str],
+) -> None:
+    """Fan out ``component:<name>`` issue labels into ``item_external_refs``.
+
+    One ``INSERT OR IGNORE`` per label, keyed on the composite primary
+    key ``(item_id, ref_type, ref_target_item_id)`` so re-polls are
+    free. ``ref_source='issue-label'`` is the convention the reader
+    uses to know this row came from the label fallback rather than a
+    PR-files scan.
+    """
+    now = _utc_now_iso()
+    for name in label_names:
+        if not name.startswith("component:"):
+            continue
+        comp = name[len("component:") :].strip()
+        if not comp:
+            continue
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO item_external_refs
+                (item_id, ref_type, ref_target_item_id, ref_source, created_at)
+            VALUES (?, 'touches_component', ?, 'issue-label', ?)
+            """,
+            (item_id, f"component:{comp}", now),
+        )
+
+
+def _sync_pr_file_components(
+    conn: sqlite3.Connection,
+    report: PollReport,
+    *,
+    repo: str,
+    pr_number: int,
+    pr_item_id: str,
+    closes_targets: list[str],
+    token: Optional[str],
+    runner: Runner,
+) -> None:
+    """Fetch ``pulls/<n>/files`` and fan out component tags per issue (#821).
+
+    For each file the PR touches, map the path to a ``src/`` component
+    bucket via :func:`component_for_path`. Dedup to a set, then write
+    one ``item_external_refs`` row per ``(issue_item_id, component)``
+    pair with ``ref_source='pr-files:<pr_item_id>'`` — namespacing the
+    source so later cleanup (not implemented here) can
+    ``DELETE WHERE ref_source='pr-files:<pr_item_id>'`` before
+    re-inserting if a PR's file list shrinks.
+
+    Shares :func:`fetch_github`'s curl/ETag/backoff plumbing so the
+    files endpoint counts toward the same rate-limit observation and
+    gets the same User-Agent / auth headers as the main poll calls.
+    Does NOT cache its own ETag — the caller already gated on
+    ``updated_at`` changing, so a second call this cycle would be
+    redundant anyway.
+    """
+    url = (
+        f"https://api.github.com/repos/{repo}/pulls/{pr_number}/files"
+        "?per_page=100"
+    )
+    report.http_calls += 1
+    result = fetch_github(url, token=token, runner=runner)
+    if result.status != 200 or result.body is None:
+        report.errors.append(
+            {
+                "kind": "pr_files_fetch",
+                "path": f"{repo}#{pr_number}",
+                "reason": f"status={result.status}",
+            }
+        )
+        return
+
+    try:
+        payload = json.loads(result.body)
+    except json.JSONDecodeError as exc:
+        report.errors.append(
+            {
+                "kind": "pr_files_json",
+                "path": f"{repo}#{pr_number}",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        return
+
+    if not isinstance(payload, list):
+        return
+
+    components: set[str] = set()
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        filename = entry.get("filename")
+        if not isinstance(filename, str):
+            continue
+        comp = component_for_path(filename)
+        if comp:
+            components.add(comp)
+
+    if not components:
+        return
+
+    now = _utc_now_iso()
+    ref_source = f"pr-files:{pr_item_id}"
+    for issue_item_id in closes_targets:
+        for comp in components:
+            # ``WHERE EXISTS`` guards against the FK ``item_external_refs
+            # (item_id) REFERENCES items(item_id)`` when the PR's
+            # ``Closes #N`` target isn't tracked locally yet (e.g.
+            # already-closed issue the poller skipped). FK violations
+            # aren't suppressed by ``OR IGNORE``, so this is the way.
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO item_external_refs
+                    (item_id, ref_type, ref_target_item_id, ref_source, created_at)
+                SELECT ?, 'touches_component', ?, ?, ?
+                WHERE EXISTS (SELECT 1 FROM items WHERE item_id = ?)
+                """,
+                (issue_item_id, f"component:{comp}", ref_source, now, issue_item_id),
+            )
 
 
 def poll_repo_prs(
@@ -694,6 +828,16 @@ def poll_repo_prs(
 
         report.prs_seen += 1
 
+        # Capture the stored ``updated_at`` BEFORE the upsert overwrites
+        # it — needed to decide whether to re-fetch the PR's file list
+        # for the #821 component-derivation cache.
+        old_updated_at_row = conn.execute(
+            "SELECT updated_at FROM items WHERE item_id = ?", (item_id,)
+        ).fetchone()
+        old_updated_at = (
+            str(old_updated_at_row[0] or "") if old_updated_at_row else ""
+        )
+
         _upsert_item(
             conn,
             _SeedShim(report),  # type: ignore[arg-type]
@@ -726,12 +870,15 @@ def poll_repo_prs(
             entered_at=updated_at,
         )
 
-        # ``Closes #NNN`` scan — link PR → issue.
+        # ``Closes #NNN`` scan — link PR → issue. Collect targets as we
+        # go so the #821 component-file sync can reuse them.
         body = str(pr.get("body") or "")
+        closes_targets: list[str] = []
         for m in re.finditer(
             r"\b(?:closes|fixes|resolves)\s+#(\d+)\b", body, flags=re.IGNORECASE
         ):
             target = gh_issue_id(repo, int(m.group(1)))
+            closes_targets.append(target)
             conn.execute(
                 """
                 INSERT OR IGNORE INTO item_external_refs
@@ -740,6 +887,42 @@ def poll_repo_prs(
                 """,
                 (item_id, "closes", target, "pr-body", _utc_now_iso()),
             )
+
+        # Issue #821: cache PR-file-derived components on the *issue*
+        # item_ids this PR closes. Bounded to PRs that both changed
+        # since last poll AND carry a ``Closes #N`` directive — so a
+        # repo with 100 unrelated PRs costs zero extra HTTP calls.
+        if (
+            closes_targets
+            and resolved in ("pr:open", "pr:draft", "pr:merged")
+            and (updated_at or "") != old_updated_at
+        ):
+            try:
+                _sync_pr_file_components(
+                    conn,
+                    report,
+                    repo=repo,
+                    pr_number=number,
+                    pr_item_id=item_id,
+                    closes_targets=closes_targets,
+                    token=token,
+                    runner=runner,
+                )
+            except GHPollError as exc:
+                # One PR's files endpoint failing must not poison the
+                # rest of the poll pass. Rate-limit observations
+                # bubble up to the outer loop (which stops the fleet
+                # on primary RL); everything else is recorded and we
+                # keep going.
+                if exc.looks_like_rate_limit:
+                    raise
+                report.errors.append(
+                    {
+                        "kind": "pr_files_fetch",
+                        "path": f"{repo}#{number}",
+                        "reason": str(exc),
+                    }
+                )
 
         # Cache the merged_at timestamp (used by done_today readers)
         # as a non-indexed amendment with source='pr-merged-at'. This
