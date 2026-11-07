@@ -1695,8 +1695,19 @@ function ReviewLinkTable({rows}) {
           ? h("a", {href: r.link, target: "_blank", rel: "noopener"}, r.title || "")
           : (r.title || "");
       }},
+      {key: "author", label: "author", cell: r => r.author ? h("code", null, "@" + r.author) : ""},
+      {key: "ci", label: "CI", cell: r => r.ci
+        ? h("span", {
+            title: "CI: " + r.ci,
+            style: {color: r.ci === "success" ? "var(--color-ok, #2a9d4a)"
+                         : r.ci === "failure" ? "var(--color-err, #d33)" : "var(--color-fg-muted)"},
+          }, r.ci === "success" ? "✓ pass" : r.ci === "failure" ? "✗ fail" : "● pending")
+        : ""},
       {key: "age_seconds", label: "age", numeric: true, cell: r =>
-        h("span", {className: "fx-num"}, r.age_seconds == null ? "—" : ageStringSeconds(r.age_seconds))},
+        h("span", {className: "fx-num",
+                   title: r.age_seconds > 86400 ? "waiting over 24h" : undefined,
+                   style: r.age_seconds > 86400 ? {color: "var(--color-warn, #d98a00)", fontWeight: 600} : undefined},
+          r.age_seconds == null ? "—" : ageStringSeconds(r.age_seconds))},
     ],
     rows: (rows || []).map(r => ({...r, __key: (r.repo || "") + "#" + r.number})),
   });
