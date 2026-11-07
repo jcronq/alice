@@ -14,7 +14,13 @@ Modes:
 Transport: ssh with a restricted key to aimax1, whose forced command drops the doc in
 Alice's inner/surface/ inbox.
 """
-import json, os, re, socket, subprocess, sys, time
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
 
 LONG_TURN_S = 600
 ALICE = os.environ.get("ALICE_SSH", "cronqj@10.20.30.177")
@@ -218,7 +224,7 @@ def progress(repo, branch, session_dir, pid):
         head = git(repo, "rev-parse", branch)
         if head and head != last:
             log = git(repo, "log", "--format=%ad %s", "--date=format:%H:%M", f"{last}..{head}")
-            pending += [l for l in log.splitlines() if l][::-1]
+            pending += [line for line in log.splitlines() if line][::-1]
             last, last_commit_at = head, time.time()
         if pending and time.time() - last_commit_at > 480:
             body = f"New commits on {branch} ({len(pending)}):\n" + "\n".join(pending[-30:])

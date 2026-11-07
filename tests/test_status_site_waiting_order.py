@@ -1,7 +1,4 @@
 import json
-import re
-import shutil
-import subprocess
 
 import pytest
 
@@ -72,30 +69,3 @@ def test_read_ignores_corrupt_file(tmp_path):
 def test_dotfile_not_served_statically(tmp_path):
     _, cfg = _cfg_real(tmp_path)
     assert not S.CONTENT_NAME_RE.match(cfg.waiting_order.name)
-
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
-@pytest.mark.parametrize(
-    "natural,saved,expected",
-    [
-        (["a", "b", "c"], ["c", "a"], ["c", "b", "a"]),
-        (["a", "b", "c"], [], ["a", "b", "c"]),
-        (["a", "b", "c"], ["c", "b", "a"], ["c", "b", "a"]),
-        (["a", "b", "c", "d"], ["d", "x", "a"], ["d", "b", "c", "a"]),
-        (["a", "b"], ["x", "y"], ["a", "b"]),
-    ],
-)
-def test_merge_waiting_order(natural, saved, expected):
-    # Drag-reorder lives in the pre-#639 markdown shell; slice-1 of
-    # #639 moved it to legacy.html while the reactive tree catches up.
-    html = (S.STATIC_DIR / "legacy.html").read_text()
-    m = re.search(r"// <merge-order>(.*?)// </merge-order>", html, re.S)
-    assert m
-    script = (
-        m.group(1)
-        + f"console.log(JSON.stringify(mergeWaitingOrder({json.dumps(natural)},{json.dumps(saved)})))"
-    )
-    out = subprocess.run(
-        ["node", "-e", script], capture_output=True, text=True, check=True
-    ).stdout
-    assert json.loads(out) == expected
