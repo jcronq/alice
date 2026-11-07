@@ -1898,16 +1898,17 @@ function DoneTodayList({prs, asksResolved}) {
     prRows.length
       ? h(FxTable, {
           columns: [
-            {key: "repo", label: "repo", cell: r => h("code", null, r.repo || "")},
+            {key: "repo", label: "repo", cell: r => h("code", {style: {whiteSpace: "nowrap"}}, r.repo || "")},
             {key: "number", label: "#", numeric: true, cell: r =>
               r.url
                 ? h("a", {href: r.url, target: "_blank", rel: "noopener",
-                    style: {fontVariantNumeric: "tabular-nums"}},
+                    style: {fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap"}},
                     "#" + r.number)
-                : h("span", {className: "fx-num"}, "#" + r.number)
+                : h("span", {className: "fx-num", style: {whiteSpace: "nowrap"}}, "#" + r.number)
             },
             {key: "title", label: "title"},
-            {key: "merged_at", label: "merged"},
+            {key: "merged_at", label: "merged", cell: r =>
+              h("span", {style: {whiteSpace: "nowrap"}}, r.merged_at || "")},
           ],
           rows: prRows.map((r, i) => ({...r, __key: (r.repo || "") + "#" + (r.number || i)})),
         })
