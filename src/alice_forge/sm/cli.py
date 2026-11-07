@@ -266,7 +266,7 @@ def _do_transition(
         return 8
     if require_reason and not reason:
         print(
-            f"error: --reason is required for this transition.",
+            "error: --reason is required for this transition.",
             file=sys.stderr,
         )
         return 9
