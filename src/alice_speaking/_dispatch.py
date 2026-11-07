@@ -26,6 +26,7 @@ from core.sdk_compat import _short
 
 from . import signal_outbound
 from . import slash_commands
+from . import worker_markers as worker_markers_module
 from . import worker_report as worker_report_module
 from .domain.turn_log import new_turn
 from .pipeline.quiet_hours import is_quiet_hours
@@ -1004,6 +1005,9 @@ async def handle_surface(ctx: DaemonContext, event: "SurfaceEvent") -> None:
     is_chat_turn = _is_chat_surface(body)
     if is_chat_turn:
         ctx.turn_runner.begin_chat_status(turn_id)
+        m = re.search(r"^message_at:\s*(\S+)\s*$", body.split("\n---", 1)[0], re.M)
+        if m and ctx.turn_runner.chat_status is not None:
+            ctx.turn_runner.chat_status.read(m.group(1))
     try:
         # Surface turns don't have a single inbound recipient; the
         # ``outbound_recipient`` is informational only. Quiet hours
@@ -1245,6 +1249,29 @@ async def handle_background_task_complete(
             description=event.description,
             reason_count=len(report_issues),
             note_path=(str(note_path) if note_path else None),
+        )
+
+    # Issue #789 PR 1: persistent worker-completed marker. Partners
+    # with :func:`alice_speaking.worker_markers.write_dispatch_marker`
+    # written at ``_dispatch_subagent`` time. The memory worker's
+    # derive pass merges both markers into one ``workers`` row.
+    # Best-effort — a failed write is logged and swallowed so the
+    # completion turn still runs.
+    try:
+        mind_dir_done = getattr(getattr(ctx, "cfg", None), "mind_dir", None)
+        worker_markers_module.write_done_marker(
+            mind_dir_done,
+            bg_id=event.handle,
+            outcome=worker_markers_module.outcome_from_report(
+                report, is_error=event.is_error
+            ),
+            pr_url=worker_markers_module.pr_url_from_report(report),
+            commit_sha=worker_markers_module.commit_sha_from_report(report),
+            error=(event.result_text or None) if event.is_error else None,
+        )
+    except Exception:  # noqa: BLE001 — never block the completion turn
+        log.exception(
+            "worker done marker write failed for %s", event.handle
         )
 
     report_section = ""
