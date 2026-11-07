@@ -37,20 +37,36 @@ from .read_api import (
     connect,
     events_for_issue,
     events_for_task,
+    item_detail,
+    item_transitions,
     state_of,
     tasks_for_issue,
     workers_for_bg_id,
     workers_for_task,
 )
 from .schema import apply_schema
+from .sm_seed import (
+    SmSeedReport,
+    derive_sm_seed,
+    gh_issue_id,
+    gh_pr_id,
+    local_task_id,
+)
 
 __all__ = [
     "DEFAULT_DB_PATH",
+    "SmSeedReport",
     "WorkerRow",
     "apply_schema",
     "connect",
+    "derive_sm_seed",
     "events_for_issue",
     "events_for_task",
+    "gh_issue_id",
+    "gh_pr_id",
+    "item_detail",
+    "item_transitions",
+    "local_task_id",
     "state_of",
     "tasks_for_issue",
     "workers_for_bg_id",
