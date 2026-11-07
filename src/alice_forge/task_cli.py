@@ -197,6 +197,97 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Who is closing the task. Default: speaking.",
     )
 
+    # ---- db — read-only joins over the derived alice-state.db
+    # (issue #789). The DB is populated by the memory worker's
+    # ``derive_tasks_workers_events`` step; this CLI is a pure
+    # reader, so ``--root`` is irrelevant here (the DB lives under
+    # ``inner/state/`` not ``inner/tasks/``). All db subcommands
+    # default to --json output because they feed status-site and
+    # dispatcher checks downstream.
+    pdb = sub.add_parser(
+        "db",
+        help=(
+            "Read joins over alice-state.db (derived index over "
+            "tasks/workers/events). Issue #789 PR 1."
+        ),
+    )
+    pdb.add_argument(
+        "--db-path",
+        default=None,
+        help=(
+            "Override alice-state.db path. Default: "
+            "$ALICE_MIND_DIR/inner/state/alice-state.db, else "
+            "~/alice-mind/inner/state/alice-state.db."
+        ),
+    )
+    db_sub = pdb.add_subparsers(dest="db_command", required=True)
+
+    db_state = db_sub.add_parser(
+        "state",
+        help=(
+            "One-shot cross-store snapshot for a 'jcronq/alice#784' "
+            "style qualifier. Returns task + workers + recent events."
+        ),
+    )
+    db_state.add_argument(
+        "qualifier",
+        help="GH qualifier, e.g. jcronq/alice#784.",
+    )
+
+    db_workers = db_sub.add_parser(
+        "workers", help="Recent background-worker handles."
+    )
+    db_workers.add_argument(
+        "--outcome",
+        default=None,
+        help="Filter by outcome (pr_opened | no_change | error | ...).",
+    )
+    db_workers.add_argument(
+        "--kind",
+        default=None,
+        help="Filter by worker kind.",
+    )
+    db_workers.add_argument(
+        "--limit", type=int, default=20,
+        help="Row cap. Default 20.",
+    )
+
+    db_tasks = db_sub.add_parser(
+        "tasks", help="List tasks, optionally filtered by GH issue."
+    )
+    db_tasks.add_argument(
+        "--gh-issue",
+        default=None,
+        help="Filter by 'jcronq/alice#784' style qualifier.",
+    )
+    db_tasks.add_argument(
+        "--status",
+        default=None,
+        help="Filter by exact SM v2 status.",
+    )
+    db_tasks.add_argument(
+        "--limit", type=int, default=50,
+        help="Row cap. Default 50.",
+    )
+
+    db_events = db_sub.add_parser(
+        "events", help="Recent events.jsonl rows (derived index)."
+    )
+    db_events.add_argument(
+        "--type",
+        default=None,
+        help="Filter by event type.",
+    )
+    db_events.add_argument(
+        "--since",
+        default=None,
+        help="ISO-8601 lower bound on event ts.",
+    )
+    db_events.add_argument(
+        "--limit", type=int, default=20,
+        help="Row cap. Default 20.",
+    )
+
     return p
 
 
@@ -380,6 +471,76 @@ def _cmd_close(store: TaskStore, args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# db subcommand — read-only joins over alice-state.db (issue #789 PR 1)
+#
+# These handlers import ``alice_state_db`` lazily so the rest of the
+# CLI keeps working even if the sibling package is missing (e.g. on
+# very old container images that predate this PR).
+
+
+def _cmd_db(store: TaskStore, args: argparse.Namespace) -> int:
+    try:
+        from alice_state_db import connect
+        from alice_state_db import read_api
+    except ImportError as exc:  # pragma: no cover
+        print(
+            f"error: alice_state_db not importable ({exc}) — rebuild the "
+            "container or add src/alice_state_db to PYTHONPATH.",
+            file=sys.stderr,
+        )
+        return 5
+
+    db_path = None
+    if args.db_path:
+        db_path = args.db_path
+
+    try:
+        with connect(db_path=db_path) as conn:
+            if args.db_command == "state":
+                payload = read_api.state_of(conn, args.qualifier)
+                print(json.dumps(payload, sort_keys=False, default=str))
+                return 0
+
+            if args.db_command == "workers":
+                rows = read_api.list_workers(
+                    conn,
+                    outcome=args.outcome,
+                    kind=args.kind,
+                    limit=args.limit,
+                )
+                print(json.dumps(rows, sort_keys=False, default=str))
+                return 0
+
+            if args.db_command == "tasks":
+                rows = read_api.list_tasks(
+                    conn,
+                    gh_issue=args.gh_issue,
+                    status=args.status,
+                    limit=args.limit,
+                )
+                print(json.dumps(rows, sort_keys=False, default=str))
+                return 0
+
+            if args.db_command == "events":
+                rows = read_api.list_events(
+                    conn,
+                    type=args.type,
+                    since=args.since,
+                    limit=args.limit,
+                )
+                print(json.dumps(rows, sort_keys=False, default=str))
+                return 0
+    except ValueError as exc:
+        # Raised by _parse_gh_qualifier for malformed state queries.
+        print(f"error: {exc}", file=sys.stderr)
+        return 6
+
+    # argparse enforces db_command is required, so this is unreachable.
+    print(f"error: unknown db subcommand {args.db_command!r}", file=sys.stderr)
+    return 5
+
+
 _HANDLERS = {
     "create": _cmd_create,
     "update": _cmd_update,
@@ -387,6 +548,7 @@ _HANDLERS = {
     "view": _cmd_view,
     "close": _cmd_close,
     "reindex": _cmd_reindex,
+    "db": _cmd_db,
 }
 
 

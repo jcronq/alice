@@ -50,6 +50,8 @@ from core.events import EventLogger
 TASK_REINDEX_INTERVAL_SECONDS_DEFAULT = 2 * 60 * 60  # 2h
 TASK_REINDEX_STAMP_FILENAME = "task-reindex-last-ran"
 
+from alice_state_db import derive as alice_state_db_derive
+
 from . import (
     correction_cascade as cascade_mod,
     correction_cascade_auto_propagate as autoprop_mod,
@@ -254,6 +256,22 @@ def main() -> int:
         cfg=cfg,
     )
 
+    # Phase 6 (#789 PR 1): derive tasks + workers + events into
+    # ``inner/state/alice-state.db``. Runs after the reindex so the
+    # task index is current before the SQLite snapshot is written.
+    # Swallows derive-level errors so a pathological event line or
+    # permission snag can't take the memory-worker wake with it —
+    # the report is surfaced in the heartbeat event so operators
+    # can see the error count without reading logs.
+    try:
+        state_db_report = alice_state_db_derive.derive_tasks_workers_events(
+            mind
+        )
+    except Exception as exc:  # noqa: BLE001 — telemetry-only path
+        state_db_report = alice_state_db_derive.DeriveReport(
+            errors=[{"kind": "derive", "path": str(mind), "reason": str(exc)}]
+        )
+
     # Heartbeat phase: precedence is the heaviest stage that actually
     # ran (D > C > B). ``stage_d.ran`` is True iff a pair was selected
     # this cycle — null-result outcomes still count, because Stage D
@@ -282,6 +300,7 @@ def main() -> int:
         **{f"stage_d_{k}": v for k, v in synth.to_dict().items()},
         stage_d_ran=bool(synth.ran),
         **{f"task_reindex_{k}": v for k, v in reindex_result.items()},
+        **{f"state_db_{k}": v for k, v in state_db_report.to_dict().items()},
     )
 
     return 0
