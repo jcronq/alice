@@ -90,6 +90,20 @@ def _disable_sweeper_safe_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SM_SWEEPER_SAFE_MODE", "0")
 
 
+@pytest.fixture(autouse=True)
+def _stub_gh_find_open_linked_prs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default the issue #784 follow-up-PR lookup to the empty list.
+
+    ``sm.run()`` now defaults ``find_open_linked_prs`` to the
+    production ``gh_find_open_linked_prs`` helper so the sweeper's
+    "open follow-up → wait" check is live out of the box. Tests that
+    don't override the kwarg would otherwise shell out to real ``gh``
+    (hitting rate limits or spurious results). Tests exercising the
+    wait-path override the kwarg explicitly, which takes precedence.
+    """
+    monkeypatch.setattr(sm, "gh_find_open_linked_prs", lambda _repo, _n: [])
+
+
 @pytest.fixture
 def state_path(tmp_path: pathlib.Path) -> pathlib.Path:
     return tmp_path / "sm-dispatcher-state.json"
