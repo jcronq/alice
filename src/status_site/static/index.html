@@ -1529,7 +1529,10 @@ async function runA2uiAction(id, props, surface, local, setLocal) {
 function renderBoundList(id, props, rows) {
   const variant = props.variant || "";
   if (variant === "bugs-sections") {
-    return rows.map(sec => h("section", {key: sec.key, className: "bugs-section"},
+    return rows.map(sec => !sec.rows.length
+      ? h("section", {key: sec.key, className: "bugs-section bugs-section-empty"},
+          h("p", {className: "typing", style: {margin: ".25rem 0"}}, sec.heading + " (0)"))
+      : h("section", {key: sec.key, className: "bugs-section"},
       h("h2", null, sec.heading),
       sec.rows.length
         ? h("ul", null, sec.rows.map(r => h("li", {key: r.id},
