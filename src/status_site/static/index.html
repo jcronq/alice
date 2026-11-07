@@ -783,12 +783,13 @@ function renderA2uiComponent(id, surface, local, setLocal) {
         const parts = [];
         if (bound.estimate) parts.push(bound.estimate + " est");
         if (bound.actual) parts.push(bound.actual + " actual");
-        if (bound.delta) parts.push("Δ " + bound.delta);
-        label = parts.join(" · ") || JSON.stringify(bound);
+        if (bound.delta) parts.push((bound.count ? "over by " : "Δ ") + bound.delta);
+        label = parts.join(" / ") || JSON.stringify(bound);
+        if (bound.count) label = "Total dispatch cost across " + bound.count + " bugs: " + label;
       } else {
         label = String(bound);
       }
-      return h("span", {key: id, className: "fx-pill a2ui-pill"}, label);
+      return h("span", {key: id, className: "fx-pill a2ui-pill", style: bound && bound.overrun ? {color: "#b45309", borderColor: "#f59e0b"} : undefined}, label);
     }
     case "textarea": {
       const current = local.textareas[id] ?? "";
