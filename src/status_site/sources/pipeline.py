@@ -49,6 +49,7 @@ DEFAULT_REPOS_SM = ["jcronq/alice"]
 
 #: Pipeline order (also the display group order).
 PIPELINE_STATES: tuple[str, ...] = (
+    "draft",
     "selected",
     "designing",
     "design_review",
@@ -65,7 +66,6 @@ _STATE_RANK = {s: i for i, s in enumerate(PIPELINE_STATES)}
 #: dispatcher failures (bug #342) don't vanish from the queue.
 EXCLUDED_LABELS: frozenset[str] = frozenset(
     {
-        "sm:draft",
         "sm:done",
         "sm:closed",
         "sm:rejected",
@@ -122,10 +122,15 @@ def classify_issue(issue: dict) -> tuple[str, str] | None:
         for lbl in labels
         if lbl.startswith("sm:") and lbl[len("sm:"):] in _STATE_RANK
     ]
+    art = next((l[len("art:"):] for l in sorted(labels) if l.startswith("art:")), "")
     if not states:
+        # Untriaged (issue #695): explicit sm:draft, or no sm:* label at
+        # all but an art:* label (an intentionally-filed work item).
+        has_sm = any(l.startswith("sm:") for l in labels)
+        if "sm:draft" in labels or (not has_sm and art):
+            return "draft", art
         return None
     state = max(states, key=_STATE_RANK.__getitem__)
-    art = next((lb[len("art:"):] for lb in sorted(labels) if lb.startswith("art:")), "")
     return state, art
 
 
