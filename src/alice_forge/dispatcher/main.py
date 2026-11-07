@@ -491,9 +491,7 @@ def run(
         # [default], or (b) uses DB with GH as fail-open fallback.
         # Tests inject their own ``list_issues=`` and bypass this.
         from alice_forge.dispatcher.db_source import (
-            db_list_open_done_sm_issues as _db_open_done,
             db_list_sm_issues as _db_list_sm,
-            db_list_stale_closed_sm_issues as _db_stale_closed,
             shadow_resolve as _shadow_resolve,
         )
 
