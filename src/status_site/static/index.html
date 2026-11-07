@@ -325,7 +325,7 @@ details.fx-group:first-child { margin-top: 0; }
 import React, {useEffect, useLayoutEffect, useReducer, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
 import {
-  ACCEPT, CHAT_PAGE_SIZE, attachmentName, chatRowKey, earliestAt,
+  ACCEPT, CHAT_PAGE_SIZE, attachmentName, chatTextToHtml, chatRowKey, earliestAt,
   HIGHLIGHT_MS, imageFilesFromClipboard, isNearBottom, isNearTop,
   messageAnchorId, MORE_REACTS, parseMessageHash, permalinkFor, QUICK_REACTS,
   quoteForReply, reactionsSignature, readAsBase64, replyPreview,
@@ -1322,7 +1322,7 @@ function ChatMessage({m, reactions, quoted}) {
         jumpToMessage(m.reply_to);
       },
     }, "In reply to: " + ((quoted && replyPreview(quoted)) || "an earlier message")) : null,
-    m.text || "",
+    m.text ? h("span", {dangerouslySetInnerHTML: {__html: chatTextToHtml(m.text)}}) : null,
     ...atts.map((a, j) => {
       const name = a.name || "";
       const url = a.url;
