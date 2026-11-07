@@ -16,6 +16,16 @@ relevant context, instructing the sub-agent to implement and open a
 draft PR. The shim then posts ``[SM] build-complete pr=<url>`` (or an
 error variant) and exits.
 
+Integration note (#828, PR-5): once the PhaseRunner entrypoint lands,
+it should call
+:func:`alice_forge.self_merge.record_pr_item_ref` immediately after a
+successful ``gh pr create`` and before posting
+``[SM] build-complete pr=<url>``, as
+``record_pr_item_ref(conn=<db>, repo=<repo>, pr_body=<pr body>,
+pr_url=<url>, actor="speaking")``. That call writes the
+``item_external_refs`` row the status-site done-today join (and
+PR-6's label strip) depend on.
+
 For now the shim exits cleanly so the dispatcher path can be exercised
 end-to-end (spawn dir layout, audit comment, pidfile, reap) without
 pulling in the speaking runtime — mirrors :mod:`alice_forge.thinking_shim`

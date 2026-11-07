@@ -531,3 +531,46 @@ def record_dependency(
         "record_dependency requires the item_dependencies table "
         "(lands in PR-10 of #823). Import is safe; invocation is not."
     )
+
+
+# ---------------------------------------------------------------------------
+# PR → item linking (#828, PR-5)
+# ---------------------------------------------------------------------------
+
+
+def record_pr_ref(
+    *,
+    conn: sqlite3.Connection,
+    item_id: str,
+    pr_url: str,
+    actor: str,
+    now: Optional[datetime] = None,
+) -> None:
+    """Record a ``gh:pr`` reference from ``item_id`` to ``pr_url``.
+
+    Idempotent — the underlying ``item_external_refs`` table has a
+    composite primary key over ``(item_id, ref_type,
+    ref_target_item_id)`` and this INSERT uses ``OR IGNORE``, so
+    calling twice with identical arguments is a no-op on the second
+    call. Different ``pr_url`` values for the same item simply append
+    additional rows (the row-level key differs).
+
+    The actor must be a member of :data:`ALLOWED_ACTORS` or
+    :class:`ActorNotTrustedError` is raised before any DB write.
+
+    Design: #823's PR→item linking section — the self-merge path
+    (and PR-7's gh-watcher wire-up) calls this on PR-open events
+    so the status-site done-today join (and PR-6's label strip) can
+    identify which item each merged PR closed.
+    """
+    if actor not in ALLOWED_ACTORS:
+        raise ActorNotTrustedError(actor)
+    with conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO item_external_refs (
+                item_id, ref_type, ref_target_item_id, ref_source, created_at
+            ) VALUES (?, 'gh:pr', ?, ?, ?)
+            """,
+            (item_id, pr_url, actor, _utc_iso(now)),
+        )
