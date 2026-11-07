@@ -60,7 +60,6 @@ from alice_forge.sm.states import SMState
 from alice_state_db.read_api import connect as state_db_connect
 from alice_state_db.schema import apply_schema
 from alice_thinking.cli.perissue import (
-    PHASE_BY_NAME,
     PerIssueDispatchError,
     _build_wake_context,
     _default_cwd,
