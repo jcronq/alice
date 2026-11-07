@@ -225,8 +225,8 @@ def _build_parser() -> argparse.ArgumentParser:
     db_state = db_sub.add_parser(
         "state",
         help=(
-            "One-shot cross-store snapshot for a '<owner>/<repo>#<N>' "
-            "qualifier. Returns task + workers + recent events."
+            "One-shot cross-store snapshot for a 'jcronq/alice#784' "
+            "style qualifier. Returns task + workers + recent events."
         ),
     )
     db_state.add_argument(
@@ -258,7 +258,7 @@ def _build_parser() -> argparse.ArgumentParser:
     db_tasks.add_argument(
         "--gh-issue",
         default=None,
-        help="Filter by '<owner>/<repo>#<N>'.",
+        help="Filter by 'jcronq/alice#784' style qualifier.",
     )
     db_tasks.add_argument(
         "--status",

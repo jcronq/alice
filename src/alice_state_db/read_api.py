@@ -127,10 +127,16 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _parse_gh_qualifier(qualifier: str) -> tuple[str, int]:
-    """Parse ``owner/repo#N`` → ``('owner/repo', N)``. Raises ValueError."""
+    """Parse a ``jcronq/alice#784``-style qualifier.
+
+    Returns ``(repo, issue_number)``. Raises ``ValueError`` on
+    malformed input. The repo half is returned verbatim (slash
+    included); callers that need the org/name split can partition
+    further.
+    """
     if "#" not in qualifier:
         raise ValueError(
-            f"expected '<owner>/<repo>#<N>', got {qualifier!r}"
+            f"expected 'org/repo#<N>' qualifier, got {qualifier!r}"
         )
     repo, _, num = qualifier.partition("#")
     try:
