@@ -333,6 +333,11 @@ def run(
     edit_labels: EditLabelsFn = gh_edit_labels,
     close_issue: CloseIssueFn = gh_close_issue,
     find_linked_pr: FindLinkedPRFn = gh_find_linked_pr,
+    # Issue #784 — default to the production ``gh_find_open_linked_prs``
+    # helper so the Phase 1.6 sweep's "open follow-up PR → wait" check
+    # is live out of the box. Tests pass ``None`` explicitly to disable
+    # the check and exercise the legacy code path.
+    find_open_linked_prs: "Callable[[str, int], list[int]] | None" = gh_find_open_linked_prs,
     pr_merge_status: PRMergeStatusFn = gh_get_pr_merge_status,
     pr_mergeable: PRMergeableFn | None = None,
     master_ci_status: MasterCIStatusFn = gh_get_master_ci_status,
@@ -376,6 +381,11 @@ def run(
     log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
     now_iso: Callable[[], str] = _now_iso,
     validate_issue: Callable[..., tuple[bool, str]] | None = None,
+    # Issue #784 — Phase 1.6 sweeper audit-mode config. When ``None``
+    # the defaults are loaded from ``alice.config.json``'s
+    # ``sm_dispatcher.sweeper`` block (see :func:`load_sweeper_config`).
+    # The env var :envvar:`SM_SWEEPER_SAFE_MODE` overrides at call time.
+    sweeper_config: "SweeperConfig | None" = None,
 ) -> tuple[int, RunReport]:
     """Run one dispatcher pass. Returns ``(exit_code, report)``.
 
@@ -400,6 +410,11 @@ def run(
         list_stale_closed = gh_list_stale_closed_sm_issues
     if list_open_done is None:
         list_open_done = gh_list_open_done_sm_issues
+    if sweeper_config is None:
+        # Issue #784 — read ``sm_dispatcher.sweeper`` once per pass so
+        # a mid-run config edit requires a fresh cadence to take effect
+        # (matches how ``load_dispatcher_repos`` is read).
+        sweeper_config = load_sweeper_config(log=log)
     if list_comments is None:
         list_comments = gh_list_issue_comments
     if enable_spawn:
@@ -1251,6 +1266,8 @@ def run(
                     master_ci_status=master_ci_status,
                     dry_run=dry_run,
                     log=log,
+                    find_open_linked_prs=find_open_linked_prs,
+                    sweeper_config=sweeper_config,
                 )
             except GHCommandError as exc:
                 fatal_exit = True
