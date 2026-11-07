@@ -296,18 +296,13 @@ def test_root_references_events_endpoint(site):
     assert "marked.min.js" in text
 
 
-def test_legacy_html_still_served(site):
-    """The pre-#639 shell stays available at /legacy.html so nav tabs
-    + modal + reply + chat keep working during the slice-2 port.
+def test_legacy_html_is_gone(site):
+    """#804 removed the pre-#639 static shell — ``/legacy.html`` must
+    404 so stale bookmarks fail loud instead of serving dead UI.
     """
     cfg, port = site
-    status, body, headers = _get(port, "/legacy.html")
-    assert status == 200
-    assert headers["content-type"].startswith("text/html")
-    # Nav/modal markers unique to the legacy shell.
-    text = body.decode("utf-8", errors="replace")
-    assert "id=\"modal\"" in text
-    assert "api/threads" in text
+    status, _body, _headers = _get(port, "/legacy.html")
+    assert status == 404
 
 
 # ─── encoder unit ───────────────────────────────────────────────────
@@ -330,9 +325,9 @@ def test_encode_event_shape():
 
 def test_section_payload_is_typed_dict(site):
     """Each section's payload dict carries the keys slice-2's widgets
-    rely on: markdown for the legacy fallback + typed fields (rows,
-    hand_zone_md, prs, asks_resolved) so the client never has to
-    re-parse markdown.
+    rely on: markdown for the generic ``SectionTile`` fallback +
+    typed fields (rows, hand_zone_md, prs, asks_resolved) so the
+    client never has to re-parse markdown.
     """
     cfg, port = site
     conn, resp = _open_sse(port, KEY)
@@ -350,7 +345,8 @@ def test_section_payload_is_typed_dict(site):
             sections["done_today"].keys()
         )
         # Unchanged sections keep the markdown-only shape (and MUST
-        # retain the ``markdown`` key for the legacy Section fallback).
+        # retain the ``markdown`` key for the generic markdown
+        # fallback in ``SectionTile``).
         assert "markdown" in sections["ready_for_review"]
         assert "markdown" in sections["known_issues"]
     finally:
