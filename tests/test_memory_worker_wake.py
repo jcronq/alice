@@ -15,6 +15,10 @@ import pytest
 from alice_thinking.memory_worker import (
     correction_cascade_auto_propagate as _autoprop,
     journal,
+    stage_b,
+    stage_c,
+    stage_d,
+    thalamus,
     wake,
 )
 
@@ -348,3 +352,161 @@ def test_journal_cli_override_wins_over_config(
 
     record = json.loads(log.read_text().splitlines()[0])
     assert record["journal_path"] == str(cli_journal)
+
+
+# ---------------------------------------------------------------------------
+# Issue #853 — Fix 3: Stage B/C/D + thalamus are wrapped in telemetry-
+# only try/except so a raise in any one of them doesn't take the wake
+# with it. Previously an unguarded Stage D raise had the exact same
+# blast radius as the timeout — the wake died before the heartbeat
+# emit fired, leaving operators blind.
+
+
+def _run_wake_with_stage_raising(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    stage_module,
+    attr: str,
+) -> dict:
+    """Common harness: patch ``stage_module.attr`` to raise, run a
+    wake, return the parsed heartbeat record.
+    """
+    mind = tmp_path / "mind"
+    log = tmp_path / "memory-worker.log"
+    journal_path = tmp_path / "journal.jsonl"
+    _write_config(
+        mind,
+        {
+            "memory_worker": {
+                "enabled": True,
+                "cadence_minutes": 30,
+                "journal_path": str(journal_path),
+            }
+        },
+    )
+
+    def _boom(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError(f"boom from {stage_module.__name__}.{attr}")
+
+    monkeypatch.setattr(stage_module, attr, _boom)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["memory-worker", "--mind", str(mind), "--log", str(log)],
+    )
+    monkeypatch.setattr(wake, "MEMORY_WORKER_LIVENESS_PATH", tmp_path / "liveness")
+
+    rc = wake.main()
+    assert rc == 0, "wake must return 0 even when a stage raises"
+    assert log.is_file(), "heartbeat emit should still land"
+    lines = [ln for ln in log.read_text().splitlines() if ln.strip()]
+    assert len(lines) == 1
+    return json.loads(lines[0])
+
+
+def test_wake_swallows_stage_d_exception(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stage D raising → wake still returns 0 + heartbeat records the error."""
+    record = _run_wake_with_stage_raising(
+        tmp_path, monkeypatch, stage_module=stage_d, attr="run"
+    )
+    assert record["event"] == "memory_worker_heartbeat"
+    assert record.get("stage_d_error"), (
+        f"expected stage_d_error marker, got record keys {list(record.keys())}"
+    )
+    assert "boom from" in record["stage_d_error"]
+    # ``stage_d_ran`` on a stub Report is False.
+    assert record["stage_d_ran"] is False
+
+
+def test_wake_swallows_stage_c_exception(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stage C raising → wake still returns 0 + heartbeat records the error."""
+    record = _run_wake_with_stage_raising(
+        tmp_path, monkeypatch, stage_module=stage_c, attr="run"
+    )
+    assert record["event"] == "memory_worker_heartbeat"
+    assert record.get("stage_c_error"), (
+        f"expected stage_c_error marker, got record keys {list(record.keys())}"
+    )
+    assert record["stage_c_ran"] is False
+
+
+def test_wake_swallows_stage_b_exception(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stage B raising → wake still returns 0 + heartbeat records the error."""
+    record = _run_wake_with_stage_raising(
+        tmp_path, monkeypatch, stage_module=stage_b, attr="run"
+    )
+    assert record["event"] == "memory_worker_heartbeat"
+    assert record.get("stage_b_error"), (
+        f"expected stage_b_error marker, got record keys {list(record.keys())}"
+    )
+    # The stub DrainReport records an error count of 1.
+    assert record["stage_b_errors"] == 1
+
+
+def test_wake_swallows_thalamus_exception(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Thalamus raising → wake still returns 0 + heartbeat records the error."""
+    record = _run_wake_with_stage_raising(
+        tmp_path, monkeypatch, stage_module=thalamus, attr="run"
+    )
+    assert record["event"] == "memory_worker_heartbeat"
+    assert record.get("thalamus_error"), (
+        f"expected thalamus_error marker, got record keys {list(record.keys())}"
+    )
+    assert record["thalamus_errors"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #853 — Fix 2: Phases 6/7/8 (state_db / sm_seed / gh_poll) have
+# been moved out of the wake into the dedicated alice-gh-poll s6
+# service, so the heartbeat event no longer carries their flattened
+# keys. This test pins the removal so a future "oh I'll add gh_poll
+# back here for belt-and-braces" change gets caught.
+
+
+def test_heartbeat_no_longer_carries_state_db_sm_seed_gh_poll_keys(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phases 6/7/8 moved to alice-gh-poll — heartbeat omits them."""
+    mind = tmp_path / "mind"
+    log = tmp_path / "memory-worker.log"
+    journal_path = tmp_path / "journal.jsonl"
+    _write_config(
+        mind,
+        {
+            "memory_worker": {
+                "enabled": True,
+                "cadence_minutes": 30,
+                "journal_path": str(journal_path),
+            }
+        },
+    )
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["memory-worker", "--mind", str(mind), "--log", str(log)],
+    )
+    monkeypatch.setattr(wake, "MEMORY_WORKER_LIVENESS_PATH", tmp_path / "liveness")
+
+    rc = wake.main()
+    assert rc == 0
+    record = json.loads(log.read_text().splitlines()[0])
+
+    # The three removed-phase prefixes must be absent.
+    for key in record:
+        assert not key.startswith("state_db_"), (
+            f"unexpected state_db_* key in heartbeat: {key}"
+        )
+        assert not key.startswith("sm_seed_"), (
+            f"unexpected sm_seed_* key in heartbeat: {key}"
+        )
+        assert not key.startswith("gh_poll_"), (
+            f"unexpected gh_poll_* key in heartbeat: {key}"
+        )
