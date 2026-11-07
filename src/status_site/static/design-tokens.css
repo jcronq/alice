@@ -250,6 +250,33 @@
   text-decoration: underline;
 }
 
+/* Mobile: stack table rows as cards (title on top, meta line below). */
+.fx-tbl td[data-col="number"],
+.fx-tbl td[data-col="age_seconds"],
+.fx-tbl td[data-col="age"] {
+  white-space: nowrap;
+}
+@media (max-width: 37.5rem) {
+  .fx-tbl table, .fx-tbl tbody { display: block; }
+  .fx-tbl thead { display: none; }
+  .fx-tbl tr {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 var(--dash-pad-sm);
+    padding: var(--dash-pad-xs) 0;
+    border-bottom: 1px solid var(--color-border-line);
+  }
+  .fx-tbl td {
+    border-bottom: 0;
+    padding: 2px 0;
+    text-align: left !important;
+  }
+  .fx-tbl td[data-col="title"] {
+    order: -1;
+    flex: 1 0 100%;
+  }
+}
+
 /* Pills --------------------------------------------------------------- */
 .fx-pill {
   display: inline-block;

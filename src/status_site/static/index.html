@@ -608,6 +608,7 @@ function FxTable({columns, rows, rowClass}) {
           const cell = c.cell ? c.cell(row) : row[c.key];
           return h("td", {
             key: c.key,
+            "data-col": c.key,
             style: c.numeric ? {textAlign: "right", fontVariantNumeric: "tabular-nums"} : null,
           }, cell == null ? "" : cell);
         })
