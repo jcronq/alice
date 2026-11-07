@@ -10,6 +10,8 @@ Example issue body that the worker reads.
 
 Your task: produce a concise design doc for the issue above. Read the referenced code with Read / Grep / Glob, write the design note to ``~/alice-mind/cortex-memory/designs/<date>-issue<N>-<slug>.md`` with YAML frontmatter, and post exactly one audit comment on the issue: ``[SM] design-ready note=[[<slug>]]``. Do NOT open a PR, do NOT create a branch, do NOT edit source files. The build phase is a separate worker that reads your design note.
 
+Effort: MEDIUM (ship + verify). Build to spec, add tests covering the spec's test plan, run the targeted suite, open the PR, and verify the CI delta before self-merging.
+
 ## Constraint: read-project-profile-first
 Before starting, read ``PROJECT_PROFILE.md`` at the top of the repo you're working in. It tells you how to run tests, where the daemon lives, how to deploy, and which invariants are non-negotiable.
 
