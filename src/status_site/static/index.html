@@ -791,6 +791,9 @@ function renderA2uiComponent(id, surface, local, setLocal) {
         className: "a2ui-textarea",
         placeholder: props.placeholder || "",
         "aria-label": props.ariaLabel || props.placeholder || "Message Alice",
+        autoCorrect: "off",
+        autoCapitalize: "off",
+        spellCheck: false,
         value: current,
         onChange: e => setLocal(s => ({
           ...s,
