@@ -54,9 +54,13 @@ def test_classify_includes_each_pipeline_state():
 
 
 @pytest.mark.parametrize(
-    "excluded", ["sm:draft", "sm:done", "sm:closed", "sm:rejected", "sm:blocked"]
+    "excluded", ["sm:draft", "sm:done", "sm:closed", "sm:rejected"]
 )
 def test_classify_excludes_terminal_even_with_stale_active_label(excluded):
+    # ``sm:blocked`` is intentionally NOT in this list — the pipeline
+    # board now surfaces blocked work so dispatcher failures (bug #342)
+    # don't vanish from the queue. See ``EXCLUDED_LABELS`` in
+    # ``status_site.sources.pipeline``.
     assert P.classify_issue(_issue(1, "sm:building", excluded)) is None
 
 
@@ -204,7 +208,7 @@ def test_alice_queue_payload_has_three_grouped_lists(tmp_path, monkeypatch):
     assert len(data["rows"]) == 2  # surfaces keep the pre-#653 key
     assert [t["slug"] for t in data["tasks"]] == ["task-0010"]
     assert data["pipeline_failed"] == []
-    assert data["markdown"].startswith("6 items in pipeline")
+    assert data["markdown"].startswith(f"{len(P.PIPELINE_STATES)} items in pipeline")
 
 
 def test_alice_queue_without_pollers_still_renders(tmp_path, monkeypatch):
