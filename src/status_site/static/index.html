@@ -1848,9 +1848,14 @@ function PipelineBoard({pipeline, surfaces, tasks}) {
   return h(React.Fragment, null, groups);
 }
 
+const DONE_TODAY_LIMIT = 8;
 function DoneTodayList({prs, asksResolved}) {
-  const prRows = prs || [];
-  const askRows = asksResolved || [];
+  const [showAll, setShowAll] = useState(false);
+  const allPrRows = prs || [];
+  const allAskRows = asksResolved || [];
+  const prRows = showAll ? allPrRows : allPrRows.slice(0, DONE_TODAY_LIMIT);
+  const askRows = showAll ? allAskRows : allAskRows.slice(0, DONE_TODAY_LIMIT);
+  const hidden = (allPrRows.length - prRows.length) + (allAskRows.length - askRows.length);
   const hasAny = prRows.length || askRows.length;
   if (!hasAny) {
     return h("p", {style: {color: "var(--color-fg-muted)", margin: 0}},
@@ -1885,7 +1890,12 @@ function DoneTodayList({prs, asksResolved}) {
       : h("p", {style: {color: "var(--color-fg-muted)", margin: 0}},
           "(no asks resolved today)"),
   );
-  return h(React.Fragment, null, prsBlock, asksBlock);
+  const toggle = (hidden > 0 || showAll)
+    ? h("button", {type: "button", style: {marginTop: ".5rem"},
+        onClick: () => setShowAll(v => !v)},
+        showAll ? "show fewer" : "show all (" + hidden + " more)")
+    : null;
+  return h(React.Fragment, null, prsBlock, asksBlock, toggle);
 }
 
 // ── 9. section router ─────────────────────────────────────────────
