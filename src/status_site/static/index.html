@@ -1906,7 +1906,12 @@ function InFlightBoard({data, nowMs}) {
       ? h(PipelineGroup, {title: "Running now", count: d.running.length},
           h(RunningNowBoard, {rows: d.running, nowMs}))
       : null,
-    h(PipelineBoard, {pipeline: d.pipeline, surfaces: d.surfaces, tasks: d.tasks}),
+    h(PipelineBoard, {
+      pipeline: d.pipeline,
+      pipelineByComponent: d.pipeline_by_component,
+      surfaces: d.surfaces,
+      tasks: d.tasks,
+    }),
   );
 }
 function ThinkingQueueBoard({data}) {
@@ -1962,8 +1967,9 @@ function SystemHealthBoard({data, nowMs}) {
         : h("p", {style: MUTED}, "(no poller data yet)")),
   );
 }
-function PipelineBoard({pipeline, surfaces, tasks}) {
+function PipelineBoard({pipeline, pipelineByComponent, surfaces, tasks}) {
   const issues = pipeline || [];
+  const byComponent = pipelineByComponent || [];
   const surf = surfaces || [];
   const tks = tasks || [];
   if (!issues.length && !surf.length && !tks.length) {
@@ -1971,28 +1977,52 @@ function PipelineBoard({pipeline, surfaces, tasks}) {
       "(queue clear)");
   }
   const ageCell = r => h(AgePill, {ageSec: r.age_seconds});
+  const issueColumns = [
+    {key: "state", nowrap: true, label: "state", cell: r => h(SmStatePill, {state: r.state})},
+    {key: "number", nowrap: true, label: "#", numeric: true, cell: r =>
+      r.link
+        ? h("a", {href: r.link, target: "_blank", rel: "noopener",
+            style: {fontVariantNumeric: "tabular-nums"}}, "#" + r.number)
+        : h("span", {className: "fx-num"}, "#" + r.number)
+    },
+    {key: "title", label: "title", cell: r =>
+      r.link
+        ? h("a", {href: r.link, target: "_blank", rel: "noopener"}, r.title || "")
+        : (r.title || "")
+    },
+    {key: "art", nowrap: true, label: "art", cell: r => r.art || "—"},
+    {key: "age_seconds", nowrap: true, label: "age", numeric: true, cell: ageCell},
+  ];
   const groups = [];
   if (issues.length) {
-    groups.push(h(PipelineGroup, {key: "pipeline", title: "In SM pipeline", count: issues.length},
-      h(FxTable, {
-        columns: [
-          {key: "state", nowrap: true, label: "state", cell: r => h(SmStatePill, {state: r.state})},
-          {key: "number", nowrap: true, label: "#", numeric: true, cell: r =>
-            r.link
-              ? h("a", {href: r.link, target: "_blank", rel: "noopener",
-                  style: {fontVariantNumeric: "tabular-nums"}}, "#" + r.number)
-              : h("span", {className: "fx-num"}, "#" + r.number)
+    // Issue #821: when the server supplies pre-bucketed groups,
+    // render one FxTable per component so Jason can scan which
+    // part of src/ the active work touches. Fallback to the flat
+    // table when the backend didn't produce the bucket map (older
+    // cache, GH-fallback reader, or empty component rows).
+    const componentGroups = (byComponent || []).filter(g => (g.rows || []).length);
+    if (componentGroups.length) {
+      groups.push(h(PipelineGroup, {key: "pipeline", title: "In SM pipeline", count: issues.length},
+        ...componentGroups.map(g =>
+          h(PipelineGroup, {
+            key: "pipeline-" + g.component,
+            title: "▸ " + String(g.component || "").toUpperCase(),
+            count: g.count,
           },
-          {key: "title", label: "title", cell: r =>
-            r.link
-              ? h("a", {href: r.link, target: "_blank", rel: "noopener"}, r.title || "")
-              : (r.title || "")
-          },
-          {key: "art", nowrap: true, label: "art", cell: r => r.art || "—"},
-          {key: "age_seconds", nowrap: true, label: "age", numeric: true, cell: ageCell},
-        ],
-        rows: issues.map(r => ({...r, __key: (r.repo || "") + "#" + r.number})),
-      })));
+            h(FxTable, {
+              columns: issueColumns,
+              rows: (g.rows || []).map(r => ({...r, __key: (r.repo || "") + "#" + r.number})),
+            })
+          )
+        )
+      ));
+    } else {
+      groups.push(h(PipelineGroup, {key: "pipeline", title: "In SM pipeline", count: issues.length},
+        h(FxTable, {
+          columns: issueColumns,
+          rows: issues.map(r => ({...r, __key: (r.repo || "") + "#" + r.number})),
+        })));
+    }
   }
   if (surf.length) {
     groups.push(h(PipelineGroup, {key: "surfaces", title: "Surfaces", count: surf.length},

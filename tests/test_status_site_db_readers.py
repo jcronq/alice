@@ -140,6 +140,32 @@ def test_fetch_issues_from_db_missing_file_degrades_gracefully(tmp_path):
     assert rows == [] and failed == []
 
 
+def test_fetch_issues_from_db_includes_components_column(seeded_db):
+    """Each row carries a ``components`` list drawn from ``item_components``."""
+    import sqlite3
+
+    # Seed component rows directly — the poller writes these in prod.
+    conn = sqlite3.connect(str(seeded_db))
+    conn.executemany(
+        "INSERT INTO item_components (item_id, component, source) VALUES (?, ?, ?)",
+        [
+            ("gh:jcronq/alice#790", "alice_forge", "issue-derived"),
+            ("gh:jcronq/alice#790", "status_site", "issue-derived"),
+            ("gh:jcronq/alice#802", "pre-build", "pre-build"),
+            # #700 intentionally has no component row — the reader
+            # must still return it with ``components == []``.
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    rows, _ = R.fetch_issues_from_db(["jcronq/alice"])
+    by_num = {r["number"]: r for r in rows}
+    assert by_num[790]["components"] == ["alice_forge", "status_site"]
+    assert by_num[802]["components"] == ["pre-build"]
+    assert by_num[700]["components"] == []
+
+
 # ─── fetch_design_review_from_db ──────────────────────────────────
 
 

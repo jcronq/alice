@@ -2086,10 +2086,16 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         )
         tasks = _pipeline.scan_tasks(_tasks_dir(), now=now)
         n = len(running["rows"]) + len(owner["alice"]) + len(surfaces) + len(tasks)
+        # Group the Alice-owned pipeline rows by src/ component bucket
+        # (issue #821). ``pipeline`` stays on the payload for any
+        # legacy consumer; the frontend prefers ``pipeline_by_component``
+        # when present.
+        pipeline_by_component = _pipeline.group_rows_by_component(owner["alice"])
         return {
             "markdown": f"{n} in flight" if n else "*(nothing in flight)*",
             "running": running["rows"],
             "pipeline": owner["alice"],
+            "pipeline_by_component": pipeline_by_component,
             "surfaces": surfaces,
             "tasks": tasks,
             "pipeline_failed": list(pipe.get("failed") or []),

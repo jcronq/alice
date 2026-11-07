@@ -62,6 +62,7 @@ from alice_forge.rate_limit import (
     read_backoff_state,
 )
 
+from .components import PRE_BUILD, components_for_paths
 from .schema import apply_schema
 from .sm_seed import (
     _pick_sm_label,
@@ -131,6 +132,13 @@ class PollReport:
     not_modified_responses: int = 0
     http_calls: int = 0
     rate_limit_hits: int = 0
+    # Component bucketing (issue #821). ``pr_files_fetched`` counts
+    # successful 200 responses from ``/pulls/<N>/files``;
+    # ``component_rows_inserted`` / ``_deleted`` track mutations to
+    # ``item_components``.
+    pr_files_fetched: int = 0
+    component_rows_inserted: int = 0
+    component_rows_deleted: int = 0
     errors: list[dict[str, str]] = dataclasses.field(default_factory=list)
     duration_ms: int = 0
 
@@ -147,6 +155,9 @@ class PollReport:
             "not_modified_responses": self.not_modified_responses,
             "http_calls": self.http_calls,
             "rate_limit_hits": self.rate_limit_hits,
+            "pr_files_fetched": self.pr_files_fetched,
+            "component_rows_inserted": self.component_rows_inserted,
+            "component_rows_deleted": self.component_rows_deleted,
             "error_count": len(self.errors),
             "duration_ms": self.duration_ms,
         }
@@ -511,11 +522,17 @@ def poll_repo_issues(
     etag: Optional[str],
     runner: Runner,
     report: PollReport,
+    seen_open_issues: Optional[list[str]] = None,
 ) -> Optional[str]:
     """Fetch open issues for ``repo``, upsert items + SM state.
 
     Returns the new ETag to store, or ``None`` when the response was a
     304 (``not_modified``). Raises :class:`GHPollError` on failure.
+
+    ``seen_open_issues``, when supplied, is extended with the item_id
+    of every open issue the API returned. The component derivation
+    step (issue #821) uses this list so a stale row for an issue the
+    API no longer includes isn't flipped to ``pre-build`` by mistake.
     """
     url = (
         f"https://api.github.com/repos/{repo}/issues"
@@ -622,6 +639,8 @@ def poll_repo_issues(
             state=sm_state,
             entered_at=updated_at,
         )
+        if seen_open_issues is not None:
+            seen_open_issues.append(item_id)
 
     return result.etag or etag
 
@@ -634,10 +653,15 @@ def poll_repo_prs(
     etag: Optional[str],
     runner: Runner,
     report: PollReport,
+    seen_open_prs: Optional[list[tuple[str, int, str]]] = None,
 ) -> Optional[str]:
     """Fetch open PRs for ``repo`` and upsert ``gh:pr`` items.
 
     Same return / error contract as :func:`poll_repo_issues`.
+
+    ``seen_open_prs`` collects ``(item_id, number, repo)`` triples for
+    every open PR the API returned so the follow-up component step
+    (issue #821) knows which PR file lists to pull.
     """
     url = (
         f"https://api.github.com/repos/{repo}/pulls"
@@ -726,6 +750,15 @@ def poll_repo_prs(
             entered_at=updated_at,
         )
 
+        # Record the item_id for the component sync pass so the
+        # outer loop knows which PR file lists to fetch (issue #821).
+        # Draft / merged / closed PRs are included — the pipeline
+        # board still needs component derivation for an issue whose
+        # fix is sitting in a draft PR, and a just-merged PR on an
+        # open ``sm:*`` issue keeps its history until the next sweep.
+        if seen_open_prs is not None:
+            seen_open_prs.append((item_id, number, repo))
+
         # ``Closes #NNN`` scan — link PR → issue.
         body = str(pr.get("body") or "")
         for m in re.finditer(
@@ -756,6 +789,194 @@ def poll_repo_prs(
             )
 
     return result.etag or etag
+
+
+# ---------------------------------------------------------------------------
+# Component sync (issue #821) — PR file list → ``item_components``.
+
+
+def _replace_components(
+    conn: sqlite3.Connection,
+    *,
+    item_id: str,
+    components: list[str],
+    source: str,
+    updated_at: Optional[str],
+    report: PollReport,
+) -> None:
+    """Replace the component row set for ``item_id`` with ``components``.
+
+    Idempotent: rows that already match the new set stay untouched
+    (no write), extras are deleted, and genuinely-new rows are
+    inserted. The counters on ``report`` reflect the net delta so
+    two consecutive polls over the same data record zero mutations.
+    """
+    cur = conn.execute(
+        "SELECT component FROM item_components WHERE item_id = ?", (item_id,)
+    )
+    existing = {r[0] for r in cur.fetchall()}
+    new = set(components)
+    for c in sorted(existing - new):
+        conn.execute(
+            "DELETE FROM item_components WHERE item_id = ? AND component = ?",
+            (item_id, c),
+        )
+        report.component_rows_deleted += 1
+    for c in sorted(new - existing):
+        conn.execute(
+            """
+            INSERT INTO item_components
+                (item_id, component, source, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (item_id, c, source, updated_at or _utc_now_iso()),
+        )
+        report.component_rows_inserted += 1
+
+
+def poll_pr_files(
+    conn: sqlite3.Connection,
+    repo: str,
+    number: int,
+    *,
+    pr_item_id: str,
+    token: Optional[str],
+    etag: Optional[str],
+    runner: Runner,
+    report: PollReport,
+) -> Optional[str]:
+    """Fetch ``/repos/<repo>/pulls/<N>/files`` and refresh component rows.
+
+    Returns the new ETag to cache under the PR-files key. A 304 keeps
+    the existing rows (etag preserved); a 200 replaces them via
+    :func:`_replace_components`. Non-200/304 responses are recorded as
+    an error and the existing rows are left alone — a transient GH
+    hiccup must not blank a known component list.
+
+    ``per_page=100`` is set so almost every PR fits in one call; the
+    status-site Overview is tolerant of a very large PR missing a few
+    files from its first page (the first 100 paths capture every
+    component in the diff for anything short of a repo-wide rename).
+    """
+    url = (
+        f"https://api.github.com/repos/{repo}/pulls/{number}/files"
+        "?per_page=100"
+    )
+    report.http_calls += 1
+    result = fetch_github(url, token=token, etag=etag, runner=runner)
+
+    if result.status == 304:
+        report.not_modified_responses += 1
+        return etag
+
+    if result.status != 200 or result.body is None:
+        report.errors.append(
+            {
+                "kind": "pr_files_fetch",
+                "path": f"{repo}#{number}",
+                "reason": f"status={result.status}",
+            }
+        )
+        return result.etag or etag
+
+    try:
+        files = json.loads(result.body)
+    except json.JSONDecodeError as exc:
+        report.errors.append(
+            {
+                "kind": "pr_files_json",
+                "path": f"{repo}#{number}",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        return result.etag or etag
+
+    if not isinstance(files, list):
+        return result.etag or etag
+
+    paths = [
+        str(f.get("filename") or "")
+        for f in files
+        if isinstance(f, dict)
+    ]
+    components = components_for_paths(paths)
+    report.pr_files_fetched += 1
+    _replace_components(
+        conn,
+        item_id=pr_item_id,
+        components=components,
+        source="pr-files",
+        updated_at=_utc_now_iso(),
+        report=report,
+    )
+    return result.etag or etag
+
+
+def derive_issue_components(
+    conn: sqlite3.Connection,
+    seen_open_issue_ids: list[str],
+    *,
+    report: PollReport,
+) -> None:
+    """Aggregate linked-PR components onto each open issue.
+
+    For every ``item_id`` in ``seen_open_issue_ids`` the function looks
+    up the PRs that carry a ``closes`` ref back to that issue in
+    ``item_external_refs``, unions their component rows, and writes
+    the result as ``source='issue-derived'``. An issue with no linked
+    PR (or whose linked PRs have no component rows yet) lands in the
+    ``pre-build`` bucket — the sentinel the renderer uses to surface
+    "selected but nobody's started" items.
+
+    Runs after :func:`poll_repo_prs` so the ``item_external_refs``
+    rows and PR component rows are already in place.
+    """
+    for issue_id in seen_open_issue_ids:
+        # Find linked PRs. Only PRs whose state is open or merged
+        # feed components onto the issue — a closed-but-unmerged PR
+        # that abandoned the work should NOT pin the issue to that
+        # component set. Readers want "where does the current fix
+        # live," not "where did a withdrawn attempt live."
+        cur = conn.execute(
+            """
+            SELECT r.item_id
+            FROM item_external_refs r
+            JOIN state_machine sm ON sm.item_id = r.item_id
+            WHERE r.ref_type = 'closes'
+              AND r.ref_target_item_id = ?
+              AND sm.state IN ('pr:open', 'pr:draft', 'pr:merged')
+            """,
+            (issue_id,),
+        )
+        pr_item_ids = [r[0] for r in cur.fetchall()]
+
+        components: list[str] = []
+        if pr_item_ids:
+            placeholders = ",".join(["?"] * len(pr_item_ids))
+            comp_rows = conn.execute(
+                f"""
+                SELECT DISTINCT component
+                FROM item_components
+                WHERE item_id IN ({placeholders})
+                """,
+                pr_item_ids,
+            ).fetchall()
+            components = sorted({r[0] for r in comp_rows})
+
+        if not components:
+            components = [PRE_BUILD]
+            source = "pre-build"
+        else:
+            source = "issue-derived"
+
+        _replace_components(
+            conn,
+            item_id=issue_id,
+            components=components,
+            source=source,
+            updated_at=_utc_now_iso(),
+            report=report,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -844,8 +1065,21 @@ def derive_gh_poll(
     try:
         apply_schema(conn)
 
+        # Flag we flip to True inside the loop when a 429 / 403-rate
+        # drop forces an early exit. The outer flow needs to know
+        # whether to run the component derivation step or not (a
+        # partial PR scan + derivation would blank issue components
+        # whose linked PRs weren't polled yet).
+        rate_limited = False
+
         for repo in repos:
             report.repos_polled += 1
+
+            # Per-repo accumulators for the component sync pass
+            # (issue #821). Lists stay local to the repo so a failing
+            # repo doesn't poison the component view of a healthy one.
+            seen_open_issues: list[str] = []
+            seen_open_prs: list[tuple[str, int, str]] = []
 
             for endpoint, fn in (
                 ("issues", poll_repo_issues),
@@ -854,14 +1088,26 @@ def derive_gh_poll(
                 key = f"{repo}:{endpoint}"
                 etag = cache.get(key)
                 try:
-                    new_etag = fn(
-                        conn,
-                        repo,
-                        token=token,
-                        etag=etag,
-                        runner=runner,
-                        report=report,
-                    )
+                    if endpoint == "issues":
+                        new_etag = fn(
+                            conn,
+                            repo,
+                            token=token,
+                            etag=etag,
+                            runner=runner,
+                            report=report,
+                            seen_open_issues=seen_open_issues,
+                        )
+                    else:
+                        new_etag = fn(
+                            conn,
+                            repo,
+                            token=token,
+                            etag=etag,
+                            runner=runner,
+                            report=report,
+                            seen_open_prs=seen_open_prs,
+                        )
                 except GHPollError as exc:
                     if exc.looks_like_rate_limit:
                         report.rate_limit_hits += 1
@@ -877,6 +1123,7 @@ def derive_gh_poll(
                                 }
                             )
                         report.status = "rate_limited"
+                        rate_limited = True
                         # Stop polling further repos / endpoints — the
                         # window belongs to the whole fleet now.
                         conn.commit()
@@ -903,6 +1150,77 @@ def derive_gh_poll(
 
                 if new_etag:
                     cache[key] = new_etag
+
+            # Component sync (issue #821) — skipped on rate-limit
+            # since the early-return above exits before we reach
+            # this line anyway. If both endpoint passes errored
+            # without rate-limiting, ``seen_open_*`` is empty and
+            # the loops below are no-ops; existing component rows
+            # survive untouched.
+            if rate_limited:
+                continue
+
+            for pr_item_id, pr_number, pr_repo in seen_open_prs:
+                files_key = f"{pr_repo}:pr-files:{pr_number}"
+                files_etag = cache.get(files_key)
+                try:
+                    new_etag = poll_pr_files(
+                        conn,
+                        pr_repo,
+                        pr_number,
+                        pr_item_id=pr_item_id,
+                        token=token,
+                        etag=files_etag,
+                        runner=runner,
+                        report=report,
+                    )
+                except GHPollError as exc:
+                    if exc.looks_like_rate_limit:
+                        report.rate_limit_hits += 1
+                        try:
+                            observe_gh_error(exc, path=backoff_path)
+                        except Exception as inner:  # noqa: BLE001
+                            report.errors.append(
+                                {
+                                    "kind": "backoff_write",
+                                    "path": str(backoff_path),
+                                    "reason": f"{type(inner).__name__}: {inner}",
+                                }
+                            )
+                        report.status = "rate_limited"
+                        rate_limited = True
+                        conn.commit()
+                        _record_run(
+                            db_path,
+                            started_at,
+                            _utc_now_iso(),
+                            report.status,
+                            report,
+                        )
+                        _write_etag_cache(etag_cache_path, cache)
+                        report.duration_ms = int(
+                            (time.monotonic() - started_mono) * 1000
+                        )
+                        return report
+                    report.errors.append(
+                        {
+                            "kind": "pr_files_error",
+                            "path": f"{pr_repo}#{pr_number}",
+                            "reason": str(exc),
+                        }
+                    )
+                    continue
+                if new_etag:
+                    cache[files_key] = new_etag
+
+            # Issue derivation runs even if PR-files fetches all 304'd:
+            # the DB's existing per-PR component rows plus the newly-seen
+            # (or still-live) ``item_external_refs`` ``closes`` edges
+            # produce the aggregate. A no-op issue (same PR set, same
+            # component union as last run) writes zero rows.
+            derive_issue_components(
+                conn, seen_open_issues, report=report
+            )
 
         conn.commit()
     finally:

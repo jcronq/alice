@@ -196,6 +196,11 @@ def fetch_issues(
                         "updated_epoch": _parse_iso(issue.get("updatedAt")),
                         "updated_at": str(issue.get("updatedAt") or ""),
                         "body": str(issue.get("body") or ""),
+                        # The GH fallback path doesn't know components;
+                        # the DB path fills these in (issue #821).
+                        # Empty list → the renderer falls back to the
+                        # ``pre-build`` bucket.
+                        "components": [],
                     }
                 )
         except Exception as e:  # noqa: BLE001 — one repo must not poison the rest
@@ -206,10 +211,19 @@ def fetch_issues(
 
 
 def issue_rows(cached: list[dict], *, now: float) -> list[dict]:
-    """Cached issues → widget rows with ``age_seconds`` (``None`` if unknown)."""
+    """Cached issues → widget rows with ``age_seconds`` (``None`` if unknown).
+
+    The widget row keeps ``components`` as-is from the cached payload so
+    the renderer can group by component bucket (issue #821). When the
+    cached row has no component list (older cache, or the GH fallback
+    path which doesn't derive components), ``components`` is an empty
+    list — the renderer treats that as the ``pre-build`` bucket.
+    """
     out: list[dict] = []
     for r in cached:
         ts = r.get("updated_epoch")
+        raw_components = r.get("components") or []
+        components = [c for c in raw_components if isinstance(c, str) and c]
         out.append(
             {
                 "repo": r.get("repo", ""),
@@ -219,6 +233,7 @@ def issue_rows(cached: list[dict], *, now: float) -> list[dict]:
                 "art": r.get("art", ""),
                 "link": r.get("url", ""),
                 "age_seconds": max(0.0, now - ts) if ts else None,
+                "components": sorted(set(components)),
             }
         )
     return out
@@ -291,7 +306,50 @@ def review_item_row(item: object, *, state: str = "") -> dict:
         "age_seconds": age_label_seconds(get("age", "")),
         "author": get("author", "") or "",
         "ci": get("ci", "") or "",
+        "components": [],
     }
+
+
+#: Component bucket surfaced when an issue has no linked PR yet.
+#: Matches :data:`alice_state_db.components.PRE_BUILD` byte-for-byte so
+#: the renderer and the poller agree on the sentinel.
+PRE_BUILD_COMPONENT = "pre-build"
+
+
+def group_rows_by_component(
+    rows: Sequence[dict],
+) -> list[dict]:
+    """Bucket pipeline rows by ``components`` (issue #821).
+
+    Each row contributes a copy of itself to every bucket in its
+    ``components`` list. A row with no components (either the field is
+    missing or empty) lands in the :data:`PRE_BUILD_COMPONENT` bucket.
+
+    Returns a list of
+    ``{"component": str, "count": int, "rows": [...]}`` dicts sorted by
+    count descending, then by component name ascending for stability.
+    The ``rows`` inside each bucket preserve the input order — callers
+    that need a specific per-bucket sort should re-sort afterward.
+    """
+    buckets: dict[str, list[dict]] = {}
+    for r in rows:
+        comps = r.get("components") or []
+        comps = [c for c in comps if isinstance(c, str) and c]
+        if not comps:
+            comps = [PRE_BUILD_COMPONENT]
+        for c in comps:
+            buckets.setdefault(c, []).append(r)
+
+    result = [
+        {"component": name, "count": len(bucket_rows), "rows": list(bucket_rows)}
+        for name, bucket_rows in buckets.items()
+    ]
+    # Sort: count desc, then component name asc. ``pre-build`` lands
+    # in the regular sort — it shows up at the top when it's the
+    # biggest bucket (early-queue state) and at the bottom when the
+    # pipeline is mostly in build.
+    result.sort(key=lambda g: (-g["count"], g["component"]))
+    return result
 
 
 def merge_design_review(
