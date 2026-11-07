@@ -85,6 +85,11 @@ main { max-width: 62rem; margin: 0 auto; padding: 1rem 1.5rem 4rem; }
 html[data-width="wide"] main { max-width: min(1400px, 95vw); }
 main:has(.a2ui-chat-page) { max-width: 56rem; padding: 1rem 1rem 1.5rem; }
 html[data-width="wide"] main:has(.a2ui-chat-page) { max-width: min(1200px, 95vw); }
+/* Tighter main gutters on phones give the chat thread more horizontal
+ * room for message bubbles (#805). */
+@media (max-width: 600px) {
+  main:has(.a2ui-chat-page) { padding: .5rem .5rem .75rem; }
+}
 h1 { font-size: 1.5rem; margin: .6rem 0; }
 h2.sec-heading {
   font-size: 1.15rem; margin: 1.6rem 0 .5rem;
