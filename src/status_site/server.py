@@ -3044,15 +3044,24 @@ class Handler(BaseHTTPRequestHandler):
             # lazy-import of the same module.
             from status_site.sources.db_readers import (
                 fetch_item_history_from_db,
-                item_exists_in_db,
+                fetch_item_meta_from_db,
             )
-            rows = fetch_item_history_from_db(item_id, limit=limit)
-            if not rows and not item_exists_in_db(item_id):
+            meta = fetch_item_meta_from_db(item_id)
+            if meta is None:
                 # Distinguish "no transitions yet" from "no such item" —
                 # same pattern as ``/api/review``'s 404 on unknown slug.
                 return self._json(404, {"error": "no such item"}, head=head)
+            rows = fetch_item_history_from_db(item_id, limit=limit)
             return self._json(
-                200, {"item_id": item_id, "transitions": rows}, head=head
+                200,
+                {
+                    "item_id": item_id,
+                    "title": meta["title"],
+                    "state": meta["state"],
+                    "entered_at": meta["entered_at"],
+                    "transitions": rows,
+                },
+                head=head,
             )
         if path.startswith("/history/"):
             # SPA shell for ``/history/<url-encoded-item-id>`` — the
