@@ -973,28 +973,6 @@ def write_note(
 # `Closes item-<id>` PR→item linking extractor (issue #828, PR-5)
 # ---------------------------------------------------------------------------
 
-_CLOSES_ITEM_RE = re.compile(r"[Cc]loses\s+item-(\d+)")
-
-
-def extract_closes_item_ref(
-    pr_body: str | None, pr_url: str
-) -> tuple[str, str] | None:
-    """Pull the ``Closes item-<id>`` alias out of a PR body.
-
-    Returns ``(alias, pr_url)`` verbatim — ``alias`` keeps whatever
-    digit string the worker wrote (e.g. ``"item-0821"``), no
-    canonicalization. Returns ``None`` if the line is absent. Not
-    wired into :func:`poll_repo` or any caller in this PR — full
-    wire-up (consuming this on PR-open/merge events) is #823's PR-7.
-    """
-    if not pr_body:
-        return None
-    m = _CLOSES_ITEM_RE.search(pr_body)
-    if not m:
-        return None
-    return (f"item-{m.group(1)}", pr_url)
-
-
 # ---------------------------------------------------------------------------
 # Design-review decide items (issue #616)
 # ---------------------------------------------------------------------------
