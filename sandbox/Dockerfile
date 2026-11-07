@@ -170,12 +170,13 @@ WORKDIR /home/alice/alice-mind
 # `--target cozylobe` stage is retired — see the header docstring.
 FROM base AS main
 
-# Per-stage s6 copy: 16 native alice-* service dirs plus init-state-perms and signal-daemon.
+# Per-stage s6 copy: 17 native alice-* service dirs plus init-state-perms and signal-daemon.
 # Plugin service dirs (e.g. alice-cozylobe, alice-cozylobe-reload-watcher)
 # are NOT copied here — they ship inside their plugin wheels and land
 # in /etc/s6-overlay/s6-rc.d/ via install-plugins.sh.
 COPY sandbox/s6/alice-autopush/            /etc/s6-overlay/s6-rc.d/alice-autopush/
 COPY sandbox/s6/alice-bug-fix-dispatcher/  /etc/s6-overlay/s6-rc.d/alice-bug-fix-dispatcher/
+COPY sandbox/s6/alice-ci-remediation/   /etc/s6-overlay/s6-rc.d/alice-ci-remediation/
 COPY sandbox/s6/alice-embedder/         /etc/s6-overlay/s6-rc.d/alice-embedder/
 COPY sandbox/s6/alice-face-caption/     /etc/s6-overlay/s6-rc.d/alice-face-caption/
 COPY sandbox/s6/alice-gh-reconciler/    /etc/s6-overlay/s6-rc.d/alice-gh-reconciler/
@@ -205,6 +206,7 @@ COPY sandbox/logrotate/alice-logs.conf /etc/alice/logrotate.conf
 COPY sandbox/s6/user/type                                       /etc/s6-overlay/s6-rc.d/user/type
 COPY sandbox/s6/user/contents.d/alice-autopush                  /etc/s6-overlay/s6-rc.d/user/contents.d/alice-autopush
 COPY sandbox/s6/user/contents.d/alice-bug-fix-dispatcher        /etc/s6-overlay/s6-rc.d/user/contents.d/alice-bug-fix-dispatcher
+COPY sandbox/s6/user/contents.d/alice-ci-remediation            /etc/s6-overlay/s6-rc.d/user/contents.d/alice-ci-remediation
 COPY sandbox/s6/user/contents.d/alice-embedder                  /etc/s6-overlay/s6-rc.d/user/contents.d/alice-embedder
 COPY sandbox/s6/user/contents.d/alice-face-caption              /etc/s6-overlay/s6-rc.d/user/contents.d/alice-face-caption
 COPY sandbox/s6/user/contents.d/alice-gh-reconciler             /etc/s6-overlay/s6-rc.d/user/contents.d/alice-gh-reconciler

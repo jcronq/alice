@@ -14,6 +14,7 @@ kwargs on :func:`alice_forge.dispatcher.run`).
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from typing import Any, Callable, Iterable
@@ -35,7 +36,22 @@ def _run_gh(args: list[str], *, timeout: int = 60) -> str:
     """Invoke ``gh`` with the given args, raise GHCommandError on failure.
 
     Returns stdout as a string. Empty stdout is returned as ``""``.
+
+    **Dry-run gate (#803).** When :envvar:`ALICE_DISPATCHER_DRY` is set
+    to ``"1"``, this function short-circuits and returns ``""`` without
+    forking ``gh``. Every ``gh_*`` helper in this module is written to
+    treat empty stdout as "no results" (empty list / ``None`` / empty
+    dict), so a dry-gated dispatcher pass is a benign no-op across the
+    board. The test suite's autouse fixture sets this env var so a
+    partially-mocked test can't accidentally shell out to real
+    ``gh`` on CI (#797 → #801 fixed four leaks by rewiring
+    monkeypatch resolution; this gate catches the remaining class).
+    Production never sets the var — a prod dispatcher with it on
+    silently makes no progress, which is the safer failure mode than
+    writing to real issues under an unexpected configuration.
     """
+    if os.environ.get("ALICE_DISPATCHER_DRY") == "1":
+        return ""
     try:
         result = subprocess.run(
             args,
@@ -491,6 +507,57 @@ def gh_find_linked_pr(
                     "state": pr.get("state"),
                 }
     return None
+
+
+def gh_find_open_linked_prs(
+    repo: str, issue_number: int, *, gh_bin: str = "gh"
+) -> list[int]:
+    """Return the numbers of OPEN PRs that close ``issue_number``.
+
+    Issue #784. Companion to :func:`gh_find_linked_pr`; used by the
+    Phase 1.6 sweeper to decide whether a closed-unmerged PR should
+    flip the issue to ``sm:rejected`` or wait for an in-flight
+    follow-up attempt.
+
+    Returns an empty list when no open follow-up PRs exist, the issue
+    is not referenced by any PR, or the ``gh`` payload is malformed.
+    """
+    args = [
+        gh_bin,
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "open",
+        "--search",
+        "linked:issue",
+        "--json",
+        "number,state,closingIssuesReferences",
+        "--limit",
+        "100",
+    ]
+    stdout = _dispatch_run_gh(args)
+    if not stdout.strip():
+        return []
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, list):
+        return []
+    out: list[int] = []
+    for pr in payload:
+        if (pr.get("state") or "").upper() != "OPEN":
+            continue
+        refs = pr.get("closingIssuesReferences") or []
+        for ref in refs:
+            if isinstance(ref, dict) and ref.get("number") == issue_number:
+                n = pr.get("number")
+                if isinstance(n, int):
+                    out.append(n)
+                break
+    return out
 
 
 def gh_get_pr_merge_status(

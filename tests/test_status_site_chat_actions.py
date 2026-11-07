@@ -397,10 +397,10 @@ def test_shell_wires_permalinks_reactions_and_replies(site):
         "parseMessageHash(location.hash)",
         "copy-link-btn",
         "reply-ref",
-        "More actions — coming soon",
         "reply_to",
     ):
         assert needle in html, needle
+    assert "More actions" not in html  # dead placeholder removed (#725)
     css = (STATIC_DIR / "design-tokens.css").read_text()
     assert ".msg.highlight" in css and ".msg-actions" in css
 
