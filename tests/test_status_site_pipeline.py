@@ -26,7 +26,7 @@ def _issue(n: int, *labels: str, updated: str = "2026-11-06T10:00:00Z", title: s
         "number": n,
         "title": title or f"issue {n}",
         "url": f"https://github.com/jcronq/alice/issues/{n}",
-        "labels": [{"name": l} for l in labels],
+        "labels": [{"name": lb} for lb in labels],
         "updatedAt": updated,
     }
 
