@@ -803,6 +803,11 @@ function renderA2uiComponent(id, surface, local, setLocal) {
         placeholder: props.placeholder || "",
         "aria-label": props.ariaLabel || props.placeholder || "Message Alice",
         value: current,
+        ref: el => {
+          if (!el) return;
+          el.style.height = "auto";
+          el.style.height = el.scrollHeight + 2 + "px";
+        },
         onChange: e => setLocal(s => ({
           ...s,
           textareas: {...s.textareas, [id]: e.target.value},

@@ -79,7 +79,7 @@ def build_envelopes(messages: list[dict]) -> list[dict]:
                         # name is set by the persona loader at the
                         # layer above, and hardcoding it here would
                         # fail test_no_hardcoded_personae_literals.
-                        "placeholder": "Type a message…",
+                        "placeholder": "Type a message… (Enter to send · Shift+Enter for newline)",
                         "name": "text",
                         # Client wires Enter-to-send, paste-image and the
                         # file picker for this textarea; ``submitId`` is
