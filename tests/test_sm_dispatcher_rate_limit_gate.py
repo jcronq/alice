@@ -12,7 +12,6 @@ from typing import Any
 
 import pytest
 
-import alice_forge.dispatcher as sm
 from alice_forge import rate_limit as rl
 from alice_forge.dispatcher import spawn as spawn_mod
 
