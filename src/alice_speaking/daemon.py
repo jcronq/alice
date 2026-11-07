@@ -40,10 +40,12 @@ import contextlib
 import logging
 import os
 import pathlib
+import re
 import signal as _signal
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
@@ -57,6 +59,7 @@ from claude_agent_sdk import HookMatcher
 from . import _dispatch as _dispatch_module
 from . import auto_fix as auto_fix_module
 from . import factory as factory_module
+from . import schedule_state
 from . import tools as tools_module
 from . import worker_markers as worker_markers_module
 from . import worker_report as worker_report_module
@@ -125,6 +128,21 @@ from .turn_runner import BUILTIN_TOOLS, TurnRunner
 
 
 log = logging.getLogger("alice_speaking")
+
+
+#: Tool names whose PostToolUse outcomes we mirror into the
+#: ``schedule_state`` snapshot so the status-site Schedules panel
+#: reflects reality. See :meth:`SpeakingDaemon._record_cron_tool_result`.
+_CRON_TOOL_NAMES: frozenset[str] = frozenset(
+    {"CronCreate", "CronDelete", "ScheduleWakeup"}
+)
+
+#: ``CronCreate`` echoes its minted job id back only in the
+#: human-readable ``tool_response`` string ("Scheduled [recurring] job
+#: <id> (...)"). The regex is deliberately permissive — unknown
+#: phrasing is a silent no-op, not a crash, since the CLI binary that
+#: implements these tools isn't pinned by this repo.
+_CRON_CREATE_ID_RE = re.compile(r"^Scheduled(?: recurring)? job (\S+)")
 
 
 # Public names re-exported from this module for back-compat. The
@@ -1405,6 +1423,60 @@ class SpeakingDaemon:
             }
         }
 
+    def _record_cron_tool_result(self, input_data: dict[str, Any]) -> None:
+        """Mirror ``CronCreate`` / ``CronDelete`` / ``ScheduleWakeup``
+        outcomes into :mod:`schedule_state` so the status-site
+        Schedules panel reflects reality (issue #815).
+
+        Observation-only: never raises, never changes the caller's
+        return value. ``PostToolUse`` only fires on tool-call success,
+        so there is no ``is_error`` branch to worry about — failures
+        route through a separate ``PostToolUseFailure`` event we
+        deliberately don't hook.
+
+        Per the design note, this method never reads
+        ``tool_input["prompt"]`` for any tool; the only
+        description-like field it surfaces is ``ScheduleWakeup``'s
+        ``reason``, which is explicitly user/telemetry-facing by the
+        tool's own schema.
+        """
+        tool_name = input_data.get("tool_name") or ""
+        if tool_name not in _CRON_TOOL_NAMES:
+            return
+        tool_input = input_data.get("tool_input") or {}
+        try:
+            if tool_name == "CronDelete":
+                job_id = str(tool_input.get("id") or "")
+                if job_id:
+                    schedule_state.forget_cron(job_id)
+                return
+            if tool_name == "CronCreate":
+                response = str(input_data.get("tool_response") or "")
+                match = _CRON_CREATE_ID_RE.match(response)
+                if not match:
+                    return
+                schedule_state.record_cron(
+                    id=match.group(1),
+                    cron=str(tool_input.get("cron") or ""),
+                )
+                return
+            # ScheduleWakeup — no id in the response; synthesize one
+            # from tool_use_id (always present on PostToolUseHookInput,
+            # unique per call). There is no CronDelete-equivalent
+            # cancel path for these, so "upsert" is really "insert".
+            delay = float(tool_input.get("delaySeconds") or 0)
+            next_at = (
+                datetime.now(tz=timezone.utc) + timedelta(seconds=delay)
+            ).isoformat(timespec="seconds")
+            schedule_state.record_cron(
+                id=f"wakeup-{input_data.get('tool_use_id')}",
+                cron="once",
+                description=str(tool_input.get("reason") or ""),
+                next_run_at=next_at,
+            )
+        except Exception:  # noqa: BLE001 — observation-only, must not break the turn
+            log.exception("schedule_state mirror failed for %s", tool_name)
+
     async def _posttooluse_hook(
         self,
         input_data: dict[str, Any],
@@ -1426,7 +1498,14 @@ class SpeakingDaemon:
         Drained-but-too-late messages would land in context that the
         model can't act on; better to let them queue as the next turn
         from the user's POV. (Alice's design call.)
+
+        Also mirrors ``CronCreate`` / ``CronDelete`` / ``ScheduleWakeup``
+        outcomes into :mod:`schedule_state` for the status-site
+        Schedules panel. That side-effect runs unconditionally at the
+        top of the hook — it is independent of the mid-turn-inbox
+        drain and must not be gated by the early-returns below.
         """
+        self._record_cron_tool_result(input_data)
         if self._current_reply_channel is None:
             return {}
         if self._current_turn_replied:
