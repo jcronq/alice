@@ -669,7 +669,9 @@ function FxTable({columns, rows, rowClass}) {
           return h("td", {
             key: c.key,
             "data-col": c.key,
-            style: c.numeric ? {textAlign: "right", fontVariantNumeric: "tabular-nums"} : null,
+            style: c.numeric
+              ? {textAlign: "right", fontVariantNumeric: "tabular-nums", ...(c.nowrap ? {whiteSpace: "nowrap"} : null)}
+              : (c.nowrap ? {whiteSpace: "nowrap"} : null),
           }, cell == null ? "" : cell);
         })
       );
@@ -1895,8 +1897,8 @@ function PipelineBoard({pipeline, surfaces, tasks}) {
     groups.push(h(PipelineGroup, {key: "pipeline", title: "In SM pipeline", count: issues.length},
       h(FxTable, {
         columns: [
-          {key: "state", label: "state", cell: r => h(SmStatePill, {state: r.state})},
-          {key: "number", label: "#", numeric: true, cell: r =>
+          {key: "state", nowrap: true, label: "state", cell: r => h(SmStatePill, {state: r.state})},
+          {key: "number", nowrap: true, label: "#", numeric: true, cell: r =>
             r.link
               ? h("a", {href: r.link, target: "_blank", rel: "noopener",
                   style: {fontVariantNumeric: "tabular-nums"}}, "#" + r.number)
@@ -1907,8 +1909,8 @@ function PipelineBoard({pipeline, surfaces, tasks}) {
               ? h("a", {href: r.link, target: "_blank", rel: "noopener"}, r.title || "")
               : (r.title || "")
           },
-          {key: "art", label: "art", cell: r => r.art || "—"},
-          {key: "age_seconds", label: "age", numeric: true, cell: ageCell},
+          {key: "art", nowrap: true, label: "art", cell: r => r.art || "—"},
+          {key: "age_seconds", nowrap: true, label: "age", numeric: true, cell: ageCell},
         ],
         rows: issues.map(r => ({...r, __key: (r.repo || "") + "#" + r.number})),
       })));
