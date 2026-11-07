@@ -2413,7 +2413,7 @@ function App() {
   return h(React.Fragment, null,
     h("header", null,
       h("b", null, "Alice"),
-      h("nav", {className: "nav-tabs"},
+      h("nav", {className: "nav-tabs", "aria-label": "Primary"},
         h("a", {href: "#", title: "Overview"}, "Overview"),
         h(NavTabs),
       ),
