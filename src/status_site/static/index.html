@@ -163,6 +163,18 @@ h2.sec-heading {
   font-size: .8rem; font-weight: 400; margin-left: .6rem;
   color: var(--color-fg-muted);
 }
+.tier-heading .tier-stamp {
+  font-size: .75rem; font-weight: 400; margin-left: .6rem;
+  color: var(--color-fg-muted);
+}
+.tier-heading .tier-stamp[data-fresh="amber"] { color: var(--color-warn); }
+.tier-heading .tier-stamp[data-fresh="red"] { color: var(--color-alert, #c0392b); }
+.age-pill { font-variant-numeric: tabular-nums; }
+.age-pill-warn, .age-pill-alert {
+  padding: 0 .4em; border-radius: 4px; color: #fff; font-weight: 600;
+}
+.age-pill-warn { background: var(--color-warn); }
+.age-pill-alert { background: var(--color-alert, #c0392b); }
 .tier-top .tier-heading { border-bottom-color: var(--color-warn); }
 .tier-aside > summary {
   cursor: pointer; font-weight: 600; color: var(--color-fg-muted);
@@ -469,10 +481,9 @@ const TIERS = [
   {id: "health", title: "System health", aside: true, sections: ["system_health"]},
 ];
 const SECTION_ORDER = TIERS.flatMap(t => t.sections);
+// Only the collapsible aside sections keep their own label; primary
+// tiers are titled by the tier heading.
 const SECTION_LABELS = {
-  your_todo: "Your TODO",
-  in_flight: "Alice's active work",
-  done_today: "Done today",
   thinking_queue: "Thinking's work",
   system_health: "Health",
 };
@@ -660,6 +671,12 @@ function FxBig({number, of}) {
     of != null ? h("span", {className: "of"}, of) : null,
   );
 }
+function AgePill({ageSec}) {
+  if (ageSec == null) return h("span", {className: "age-pill fx-num"}, "—");
+  const hours = ageSec / 3600;
+  const cls = hours >= 72 ? " age-pill-alert" : hours >= 24 ? " age-pill-warn" : "";
+  return h("span", {className: "age-pill fx-num" + cls}, ageStringSeconds(ageSec));
+}
 function UrgencyPill({rank}) {
   const canon = rank || "UNSET";
   return h("span", {className: "fx-urg " + canon}, canon);
@@ -699,9 +716,9 @@ function FxTable({columns, rows, rowClass}) {
 }
 function FreshnessTile({title, dataFresh, stampText: stamp, children}) {
   return h("div", {className: "fx-tile", "data-fresh": dataFresh || "ok"},
-    h("h3", null, title),
+    title ? h("h3", null, title) : null,
     h("div", {className: "fx-card"}, children),
-    h("p", {className: "fx-stamp"}, stamp),
+    stamp ? h("p", {className: "fx-stamp"}, stamp) : null,
   );
 }
 function MarkdownZone({markdown}) {
@@ -1822,10 +1839,7 @@ function ReviewLinkTable({rows, limit}) {
           }, r.ci === "success" ? "✓ pass" : r.ci === "failure" ? "✗ fail" : "● pending")
         : ""},
       {key: "age_seconds", label: "age", numeric: true, cell: r =>
-        h("span", {className: "fx-num",
-                   title: r.age_seconds > 86400 ? "waiting over 24h" : undefined,
-                   style: r.age_seconds > 86400 ? {color: "var(--color-warn, #d98a00)", fontWeight: 600} : undefined},
-          r.age_seconds == null ? "—" : ageStringSeconds(r.age_seconds))},
+        h(AgePill, {ageSec: r.age_seconds})},
     ],
     rows: (rows || []).map(r => ({...r, __key: (r.repo || "") + "#" + r.number})),
   });
@@ -1834,38 +1848,47 @@ function YourTodoBoard({data, nowMs}) {
   const d = data || {};
   const prs = d.prs || [], design = d.design_review || [], attn = d.attention_reacts || [];
   const failed = d.failed || {};
-  const none = txt => h("p", {style: MUTED}, txt);
   const warn = list => (list && list.length)
     ? h("p", {style: {...MUTED, color: "var(--color-warn)"}}, "could not query: " + list.join(", "))
     : null;
+  const hasAsks = (d.rows || []).length > 0 || !!d.your_todo_md;
+  const groups = [];
+  if (prs.length) {
+    groups.push(h(PipelineGroup, {key: "prs", title: "PRs ready for review", count: prs.length},
+      h(ReviewLinkTable, {rows: prs}), warn(failed.prs)));
+  }
+  if (design.length) {
+    groups.push(h(PipelineGroup, {key: "design", title: "Design review", count: design.length},
+      h(ReviewLinkTable, {rows: design}), warn(failed.design_review)));
+  }
+  if (attn.length) {
+    groups.push(h(PipelineGroup, {key: "attn", title: "Attention reacts", count: attn.length},
+      h(FxTable, {
+        columns: [
+          {key: "emoji", label: "react"},
+          {key: "preview", label: "on message", cell: r => r.preview || ""},
+          {key: "reacted_at", label: "age", cell: r => {
+            const t = Date.parse(r.reacted_at);
+            return h(AgePill, {ageSec: isNaN(t) ? null : Math.max(0, (nowMs - t) / 1000)});
+          }},
+        ],
+        rows: attn.map((r, i) => ({...r, __key: (r.at || "") + i})),
+      })));
+  }
+  if (hasAsks) {
+    groups.push(h(PipelineGroup, {key: "asks", title: "Asks", count: (d.rows || []).length},
+      h(WaitingTable, {rows: d.rows, handZoneMd: d.your_todo_md, nowMs})));
+  }
+  if (d.external_todos_md) {
+    groups.push(h(PipelineGroup, {key: "ext", title: "External TODOs", count: 1},
+      h(MarkdownZone, {markdown: d.external_todos_md})));
+  }
+  const failedAll = [].concat(failed.prs || [], failed.design_review || []);
   return h("div", {className: "your-todo", "data-board": "your-todo"},
-    h(PipelineGroup, {title: "PRs ready for review", count: prs.length},
-      prs.length ? h(ReviewLinkTable, {rows: prs}) : none("(no PRs awaiting review)"),
-      warn(failed.prs)),
-    (design.length || (failed.design_review && failed.design_review.length))
-      ? h(PipelineGroup, {title: "Design review", count: design.length},
-          design.length ? h(ReviewLinkTable, {rows: design, limit: 5}) : null,
-          warn(failed.design_review))
-      : null,
-    attn.length
-      ? h(PipelineGroup, {title: "Attention reacts", count: attn.length},
-          h(FxTable, {
-            columns: [
-              {key: "emoji", label: "react"},
-              {key: "preview", label: "on message", cell: r => r.preview || ""},
-              {key: "reacted_at", label: "age", cell: r => ageString(r.reacted_at, nowMs)},
-            ],
-            rows: attn.map((r, i) => ({...r, __key: (r.at || "") + i})),
-          }))
-      : null,
-    ((d.rows || []).length || d.your_todo_md)
-      ? h(PipelineGroup, {title: "Asks", count: (d.rows || []).length},
-          h(WaitingTable, {rows: d.rows, handZoneMd: d.your_todo_md, nowMs}))
-      : null,
-    d.external_todos_md
-      ? h(PipelineGroup, {title: "External TODOs", count: 1},
-          h(MarkdownZone, {markdown: d.external_todos_md}))
-      : null,
+    groups.length
+      ? groups
+      : h("p", {style: MUTED, "data-testid": "nothing-waiting"}, "(nothing waiting on you — 👋)"),
+    groups.length ? null : warn(failedAll),
   );
 }
 function InFlightBoard({data, nowMs}) {
@@ -1900,7 +1923,9 @@ function ThinkingQueueBoard({data}) {
 }
 function SystemHealthBoard({data, nowMs}) {
   const d = data || {};
-  const deploy = d.deploy || [], pollers = d.pollers || [];
+  // Rows with no sha and no subject carry only a container-id host
+  // (status-site runs from a bind-mount without .git) — treat as absent.
+  const deploy = (d.deploy || []).filter(r => r.sha || r.subject), pollers = d.pollers || [];
   return h("div", {"data-board": "system-health"},
     h(PipelineGroup, {title: "Known issues"}, h(MarkdownZone, {markdown: d.known_issues_md || ""})),
     h(PipelineGroup, {title: "Deploy status", count: deploy.length},
@@ -1914,7 +1939,8 @@ function SystemHealthBoard({data, nowMs}) {
             ],
             rows: deploy.map((r, i) => ({...r, __key: "d" + i})),
           })
-        : h("p", {style: MUTED}, "(unknown)")),
+        : h("p", {style: MUTED},
+            "(deploy info unavailable — expected while status-site runs from a bind-mount)")),
     h(PipelineGroup, {title: "Poller freshness", count: pollers.length},
       pollers.length
         ? h(FxTable, {
@@ -1936,8 +1962,7 @@ function PipelineBoard({pipeline, surfaces, tasks}) {
     return h("p", {style: {color: "var(--color-fg-muted)", margin: 0}},
       "(queue clear)");
   }
-  const ageCell = r => h("span", {className: "fx-num"},
-    r.age_seconds == null ? "—" : ageStringSeconds(r.age_seconds));
+  const ageCell = r => h(AgePill, {ageSec: r.age_seconds});
   const groups = [];
   if (issues.length) {
     groups.push(h(PipelineGroup, {key: "pipeline", title: "In SM pipeline", count: issues.length},
@@ -2138,7 +2163,7 @@ function SchedulesPanel({data, nowMs, ts}) {
 function SectionTile({name, data, ts, nowMs}) {
   const fresh = freshnessFromTs(ts, nowMs);
   const stamp = stampText(ts, nowMs);
-  const title = SECTION_LABELS[name] || name;
+  const title = SECTION_LABELS[name] || (TIERS.some(t => !t.aside && t.sections.includes(name)) ? null : name);
   let inner;
   if (name === "your_todo") {
     inner = h(YourTodoBoard, {data, nowMs});
@@ -2159,7 +2184,7 @@ function SectionTile({name, data, ts, nowMs}) {
     inner = h(MarkdownZone, {markdown: (data && data.markdown) || ""});
   }
   return h("section", {className: "sec", "data-section": name},
-    h(FreshnessTile, {title, dataFresh: fresh, stampText: stamp}, inner),
+    h(FreshnessTile, {title, dataFresh: fresh, stampText: title ? stamp : null}, inner),
   );
 }
 
@@ -2195,7 +2220,7 @@ function asideSummary(tierId, sections, nowMs) {
   }
   return null;
 }
-function Tier({tier, summary, children}) {
+function Tier({tier, summary, ts, nowMs, children}) {
   if (tier.aside) {
     return h("details", {className: "tier tier-aside", "data-tier": tier.id, open: summary && summary.bad ? true : undefined},
       h("summary", null,
@@ -2206,7 +2231,9 @@ function Tier({tier, summary, children}) {
   }
   return h("div", {className: "tier tier-" + tier.id, "data-tier": tier.id},
     h("h2", {className: "tier-heading"}, tier.title,
-      tier.hint ? h("span", {className: "tier-hint"}, tier.hint) : null),
+      tier.hint ? h("span", {className: "tier-hint"}, tier.hint) : null,
+      ts != null ? h("span", {className: "tier-stamp", "data-fresh": freshnessFromTs(ts, nowMs) || "ok"},
+        stampText(ts, nowMs)) : null),
     children,
   );
 }
@@ -2389,7 +2416,11 @@ function App() {
   if (route === "overview") {
     const sections = TIERS
       .filter(t => t.sections.some(n => state.sections[n]))
-      .map(t => h(Tier, {key: t.id, summary: t.aside ? asideSummary(t.id, state.sections, nowMs) : null, tier: t.id === "top" ? {...t, title: t.title + todoCountSuffix(state.sections.your_todo)} : t},
+      .map(t => h(Tier, {key: t.id,
+          tier: t.id === "top" ? {...t, title: t.title + todoCountSuffix(state.sections.your_todo)} : t,
+          summary: t.aside ? asideSummary(t.id, state.sections, nowMs) : null,
+          ts: parseTs(state.ts[t.sections.find(n => state.sections[n])]),
+          nowMs},
         t.sections.filter(n => state.sections[n]).map(n => h(SectionTile, {
           key: n, name: n,
           data: state.sections[n],
