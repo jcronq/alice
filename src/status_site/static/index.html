@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Alice — status</title>
 <!--
   Reactive status-site shell (#639 + #651).
@@ -194,6 +194,24 @@ details.fx-group:first-child { margin-top: 0; }
 }
 .fx-big .of { color: var(--color-fg-muted); font-size: var(--dash-font-size-caption); }
 .a2ui-chat-thread { max-height: calc(100vh - 14rem); overflow-y: auto; overflow-anchor: none; }
+@supports (height: 100dvh) {
+  .a2ui-chat-thread { max-height: calc(100dvh - 14rem); }
+}
+@media (max-width: 600px) {
+  /* Header wraps to several rows on phones: reserve more room so the
+     composer (Attach/Send) is never pushed below the viewport (#711). */
+  .a2ui-chat-thread { max-height: calc(100vh - 22rem); }
+  @supports (height: 100dvh) {
+    .a2ui-chat-thread { max-height: calc(100dvh - 22rem); }
+  }
+  .a2ui-composer {
+    position: sticky;
+    bottom: 0;
+    z-index: 5;
+    background: var(--color-bg);
+    padding-bottom: calc(.4rem + env(safe-area-inset-bottom, 0px));
+  }
+}
 .chat-loading-older {
   position: sticky;
   top: 0;
