@@ -31,6 +31,19 @@ Module layout:
 
 from __future__ import annotations
 
+from .dependencies import (
+    CycleError,
+    DependencyError,
+    TERMINAL_STATES,
+    UnknownItemError,
+    VALID_KINDS,
+    add_dependency,
+    blocked_by_count,
+    blockers_for,
+    is_ready,
+    non_terminal_blocker_detail,
+    remove_dependency,
+)
 from .gh_poll import PollReport, derive_gh_poll
 from .read_api import (
     DEFAULT_DB_PATH,
@@ -55,11 +68,19 @@ from .sm_seed import (
 )
 
 __all__ = [
+    "CycleError",
     "DEFAULT_DB_PATH",
+    "DependencyError",
     "PollReport",
     "SmSeedReport",
+    "TERMINAL_STATES",
+    "UnknownItemError",
+    "VALID_KINDS",
     "WorkerRow",
+    "add_dependency",
     "apply_schema",
+    "blocked_by_count",
+    "blockers_for",
     "connect",
     "derive_gh_poll",
     "derive_sm_seed",
@@ -67,9 +88,12 @@ __all__ = [
     "events_for_task",
     "gh_issue_id",
     "gh_pr_id",
+    "is_ready",
     "item_detail",
     "item_transitions",
     "local_task_id",
+    "non_terminal_blocker_detail",
+    "remove_dependency",
     "state_of",
     "tasks_for_issue",
     "workers_for_bg_id",

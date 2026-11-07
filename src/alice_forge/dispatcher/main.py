@@ -431,6 +431,19 @@ def run(
     # ``sm_dispatcher.sweeper`` block (see :func:`load_sweeper_config`).
     # The env var :envvar:`SM_SWEEPER_SAFE_MODE` overrides at call time.
     sweeper_config: "SweeperConfig | None" = None,
+    # Issue #833 — dependency gate hook. When set, each ``sm:selected``
+    # issue is passed to ``dependency_gate(repo, number)`` before any
+    # v3 / v1 handler runs. A non-empty string return gates the issue
+    # for this cadence: the dispatcher emits the returned log line and
+    # skips to the next issue; the item stays at ``sm:selected`` with
+    # no transition. ``None`` return means "ready — proceed."
+    # When ``enable_dependency_gate=True`` and the caller leaves
+    # ``dependency_gate=None``, the production binding (reading
+    # ``alice-state.db`` via :mod:`alice_forge.dispatcher.dependency_gate`)
+    # is wired in. Tests inject their own closure; legacy tests pass
+    # ``enable_dependency_gate=False`` to opt out entirely.
+    dependency_gate: Callable[[str, int], "str | None"] | None = None,
+    enable_dependency_gate: bool = True,
 ) -> tuple[int, RunReport]:
     """Run one dispatcher pass. Returns ``(exit_code, report)``.
 
@@ -675,6 +688,18 @@ def run(
         attempt_rebase = None
         spawn_rebase = None
 
+    # Issue #833 — bind the default dependency gate when enabled and the
+    # caller hasn't injected a fake. The default reads ``alice-state.db``
+    # via :mod:`alice_forge.dispatcher.dependency_gate`. Tests pass
+    # ``enable_dependency_gate=False`` (or inject a fake) to steer this.
+    if enable_dependency_gate and dependency_gate is None:
+        from alice_forge.dispatcher.dependency_gate import (
+            build_default_check as _build_dep_gate,
+        )
+        dependency_gate = _build_dep_gate(log=log)
+    elif not enable_dependency_gate:
+        dependency_gate = None
+
     report = RunReport()
 
     # Issue #142 — proactive sweep of stale ``active/`` spawn dirs.
@@ -845,6 +870,28 @@ def run(
 
         try:
             if sm_label == ACTIVE_SM_LABEL:
+                # Issue #833 — dependency gate. Checked before any v3
+                # or v1 handler so a gated item stays at ``sm:selected``
+                # and no spawn / hello / transition side-effect fires
+                # this cadence. The gate reads ``alice-state.db``'s
+                # ``item_dependencies`` table (populated via
+                # ``task deps add``); when the item has any transitive
+                # ``blocks`` prerequisite whose state isn't terminal
+                # (``sm:done`` / ``sm:rejected``), the gate returns a
+                # log line and we skip.
+                if dependency_gate is not None:
+                    try:
+                        gated_log = dependency_gate(repo, number)
+                    except Exception as exc:  # noqa: BLE001 — fail open
+                        log(
+                            f"[sm-dispatcher] dependency gate for "
+                            f"#{number} raised {type(exc).__name__}: "
+                            f"{exc} (fail-open)"
+                        )
+                        gated_log = None
+                    if gated_log:
+                        log(gated_log)
+                        continue
                 v3_transitioned = False
                 if ACTIVE_SM_LABEL in v3_authoritative_states:
                     from alice_forge.sm.handlers.selected import handle as _h_selected
