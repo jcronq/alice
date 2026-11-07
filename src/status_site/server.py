@@ -818,7 +818,7 @@ def _format_age(updated_at: object, now: float) -> str:
 
 def _thinking_phase(item: dict) -> int | None:
     labels = {
-        (l.get("name") if isinstance(l, dict) else l) for l in item.get("labels") or []
+        (lb.get("name") if isinstance(lb, dict) else lb) for lb in item.get("labels") or []
     }
     for idx, (label, _) in enumerate(THINKING_QUEUE_PHASES):
         if label in labels:
@@ -2346,7 +2346,7 @@ def archive_done(cfg: Config, now: datetime | None = None) -> list[dict]:
             old = ""
         # Archive first: a crash between the two writes duplicates, never loses.
         _atomic_write(archive_path, _merge_archive(old, additions))
-        _atomic_write(index_path, "\n".join(l for i, l in enumerate(lines) if i not in drop))
+        _atomic_write(index_path, "\n".join(ln for i, ln in enumerate(lines) if i not in drop))
     return archived
 
 

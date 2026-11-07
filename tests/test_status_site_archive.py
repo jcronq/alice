@@ -122,7 +122,7 @@ def test_archive_groups_by_date_newest_first_and_keeps_existing(tmp_path):
     hist(cfg, "mystery", checked_at("2026-10-30T10:00:00-04:00"))
     archive_done(cfg, NOW)
     arch = (tmp_path / "done-archive.md").read_text()
-    heads = [l for l in arch.splitlines() if l.startswith("## ")]
+    heads = [ln for ln in arch.splitlines() if ln.startswith("## ")]
     assert heads == ["## 2026-11-04", "## 2026-11-03", "## 2026-10-30"]
     day4 = arch.split("## 2026-11-04")[1].split("## 2026-11-03")[0]
     assert "**Old win**" in day4 and "with a continuation line" in day4
