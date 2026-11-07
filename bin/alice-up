@@ -52,24 +52,57 @@ _print_banner() {
     fi
 }
 
-# Is the container already up? Noop unless it's stuck unhealthy.
+# Is the container already up? alice-up NEVER recreates a live container.
+# "unhealthy" is a signal for an operator (or a deliberate alice-deploy),
+# not a reason to tear Alice down: the HEALTHCHECK's thinking-alive window
+# trips on legitimately long thinker wakes, and `docker compose up -d`
+# against an unhealthy-but-running container recreates it — a 5-min+
+# outage that also drops every container-local hot-swap. On 2026-11-07
+# that path stopped + destroyed the old container, renamed the new one
+# into place, and exited before starting it, leaving `alice` in Created.
 state="$(docker inspect -f '{{.State.Status}}' "$ALICE_CONTAINER" 2>/dev/null || echo missing)"
-if [ "$state" = "running" ]; then
-    health="$(docker inspect -f '{{.State.Health.Status}}' "$ALICE_CONTAINER" 2>/dev/null || echo none)"
-    case "$health" in
-        healthy|starting|none) _print_banner; exit 0 ;;
-    esac
-fi
-
-# First-run build only. Routine rebuilds after a `git pull` belong to
-# alice-deploy — that path also re-tags the previous image as
-# `alice:premigration` so --rollback has an anchor; alice-up touching
-# the build would silently obliterate that anchor.
-if ! docker image inspect alice:latest >/dev/null 2>&1; then
-    docker compose build alice >/dev/null
-fi
-
-docker compose up -d alice >/dev/null
+case "$state" in
+    running)
+        health="$(docker inspect -f '{{.State.Health.Status}}' "$ALICE_CONTAINER" 2>/dev/null || echo none)"
+        case "$health" in
+            healthy|starting|none) _print_banner; exit 0 ;;
+            *)
+                echo "alice-up: $ALICE_CONTAINER is running but reports health '$health'; refusing to recreate a live container." >&2
+                echo "alice-up: inspect with 'docker logs $ALICE_CONTAINER' and 'docker exec $ALICE_CONTAINER /command/s6-svstat /run/service/<svc>'; use alice-deploy for a deliberate replace." >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    restarting)
+        # Docker's own restart policy is already on it; just wait below.
+        ;;
+    created|exited)
+        # Exists but isn't running (crashed, `alice-down`, or a compose
+        # recreate interrupted between rename and start). Start the
+        # container we already have — no compose reconciliation, which
+        # could decide to recreate it.
+        docker start "$ALICE_CONTAINER" >/dev/null
+        ;;
+    paused)
+        docker unpause "$ALICE_CONTAINER" >/dev/null
+        ;;
+    missing)
+        # First-run build only. Routine rebuilds after a `git pull` belong to
+        # alice-deploy — that path also re-tags the previous image as
+        # `alice:premigration` so --rollback has an anchor; alice-up touching
+        # the build would silently obliterate that anchor.
+        if ! docker image inspect alice:latest >/dev/null 2>&1; then
+            docker compose build alice >/dev/null
+        fi
+        # --no-recreate is belt-and-braces: we only get here when no
+        # container exists, so there is nothing compose could replace.
+        docker compose up -d --no-recreate alice >/dev/null
+        ;;
+    *)
+        echo "alice-up: $ALICE_CONTAINER is in unexpected state '$state'; not touching it." >&2
+        exit 1
+        ;;
+esac
 
 # Wait for the docker healthcheck to flip to healthy. ~45 s matches the
 # worker-lease wait the legacy alice-up used; the viewer typically

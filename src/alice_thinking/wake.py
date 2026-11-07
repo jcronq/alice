@@ -32,6 +32,7 @@ import json
 import os
 import pathlib
 import sys
+import threading
 import time
 from datetime import datetime
 from typing import Any, Optional
@@ -359,6 +360,43 @@ def _touch_liveness(path: pathlib.Path) -> None:
         pass
 
 
+#: Cadence of the in-wake heartbeat thread, in seconds. Must sit well inside
+#: the HEALTHCHECK's 600s thinking-alive window.
+THINKING_LIVENESS_INTERVAL_SECONDS = 60.0
+
+
+def _start_liveness_heartbeat(
+    path: pathlib.Path,
+    interval: float = THINKING_LIVENESS_INTERVAL_SECONDS,
+) -> threading.Event:
+    """Keep ``path``'s mtime fresh for the lifetime of this wake.
+
+    The start-of-wake touch alone is not enough. The HEALTHCHECK window is
+    600s, but a wake legitimately runs for up to WAKE_TIMEOUT (20 min) on
+    the slow local thinking model, and while it holds ``thinking.lock`` the
+    5-min cron ticks fail their ``flock -n`` before ever reaching the touch
+    in ``main()``. Net effect: a chronic false "unhealthy" on every long
+    wake — which is what made ``alice-up`` recreate the container on
+    2026-11-07. A daemon thread touching every ``interval`` seconds keeps
+    the probe truthful about what it actually measures (the thinker
+    process is alive). Stuck-wake detection stays with
+    alice-thinker-watchdog and the ``timeout`` wrapper in
+    /usr/local/bin/alice-think — both kill the process, and this thread
+    with it, so the mtime goes stale and the probe fires as before.
+
+    Returns the stop event so tests (or a future graceful path) can end the
+    thread early. Daemon thread: never keeps the interpreter alive.
+    """
+    stop = threading.Event()
+
+    def _beat() -> None:
+        while not stop.wait(interval):
+            _touch_liveness(path)
+
+    threading.Thread(target=_beat, name="thinking-liveness", daemon=True).start()
+    return stop
+
+
 def main() -> int:
     # Liveness heartbeat — fires BEFORE argparse / config / model calls.
     # If the wake hangs in the kernel later, the next cron tick (5 min)
@@ -366,6 +404,7 @@ def main() -> int:
     # window (600s) catches it. NOT wrapped in try/except: if
     # /state/worker isn't writable, the probe SHOULD fire.
     _touch_liveness(THINKING_LIVENESS_PATH)
+    _start_liveness_heartbeat(THINKING_LIVENESS_PATH)
     parser = argparse.ArgumentParser(
         description="One thinking wake (Claude Agent kernel)."
     )

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import pathlib
+import sys
 import time
 
 import pytest
@@ -223,3 +224,87 @@ def test_thinking_wake_main_touches_liveness_before_model_calls(
     )
     mtime = liveness.stat().st_mtime
     assert mtime >= time.time() - 5.0
+
+
+# ---------------------------------------------------------------------------
+# Thinking-side in-wake heartbeat thread (2026-11-07: long wakes on the slow
+# local model outlived the 600s window; cron ticks can't touch while the
+# wake holds thinking.lock, so the container went false-unhealthy and
+# alice-up recreated it).
+
+
+def _rewind_mtime(path: pathlib.Path, seconds: float) -> float:
+    import os
+
+    past = time.time() - seconds
+    os.utime(path, (past, past))
+    assert path.stat().st_mtime == past
+    return past
+
+
+def test_thinking_heartbeat_thread_keeps_touching_until_stopped(
+    tmp_path: pathlib.Path,
+) -> None:
+    """While a wake is in flight the heartbeat thread must keep moving the
+    mtime forward on its own, without any further call from ``main()``."""
+    liveness = tmp_path / "thinking-alive"
+    liveness.touch()
+    past = _rewind_mtime(liveness, 1000)
+
+    stop = wake_module._start_liveness_heartbeat(liveness, interval=0.02)
+    try:
+        deadline = time.time() + 5.0
+        while liveness.stat().st_mtime == past and time.time() < deadline:
+            time.sleep(0.01)
+        assert liveness.stat().st_mtime > past
+
+        # Still beating: rewind again and it should recover again.
+        past = _rewind_mtime(liveness, 1000)
+        deadline = time.time() + 5.0
+        while liveness.stat().st_mtime == past and time.time() < deadline:
+            time.sleep(0.01)
+        assert liveness.stat().st_mtime > past
+    finally:
+        stop.set()
+
+
+def test_thinking_heartbeat_thread_stops_on_event(
+    tmp_path: pathlib.Path,
+) -> None:
+    """After ``stop`` is set the thread exits; the mtime no longer moves.
+    This is also what a killed wake looks like to the HEALTHCHECK — the
+    probe still fires on a genuinely dead thinker."""
+    liveness = tmp_path / "thinking-alive"
+    liveness.touch()
+    stop = wake_module._start_liveness_heartbeat(liveness, interval=0.02)
+    stop.set()
+    time.sleep(0.1)  # let the loop observe the event and return
+
+    past = _rewind_mtime(liveness, 1000)
+    time.sleep(0.15)  # several would-be intervals
+    assert liveness.stat().st_mtime == past
+
+
+def test_wake_main_starts_heartbeat_with_liveness_path(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``main()`` must hand the (monkeypatched) liveness path to the
+    heartbeat starter right after the initial touch. Argparse is given
+    ``--help`` so main() exits before touching config or the model."""
+    liveness = tmp_path / "thinking-alive"
+    monkeypatch.setattr(wake_module, "THINKING_LIVENESS_PATH", liveness)
+    seen: list[pathlib.Path] = []
+
+    def _fake_start(path: pathlib.Path, interval: float = 0.0):
+        seen.append(path)
+        import threading
+
+        return threading.Event()
+
+    monkeypatch.setattr(wake_module, "_start_liveness_heartbeat", _fake_start)
+    monkeypatch.setattr(sys, "argv", ["alice-think", "--help"])
+    with pytest.raises(SystemExit):
+        wake_module.main()
+    assert liveness.exists()
+    assert seen == [liveness]
