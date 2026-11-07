@@ -240,6 +240,10 @@
   vertical-align: top;
   overflow-wrap: anywhere;
 }
+.fx-tbl td.fx-nowrap {
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
 .fx-tbl tbody tr:hover {
   background: color-mix(in srgb, var(--color-fg) 6%, transparent);
 }
