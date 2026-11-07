@@ -195,7 +195,7 @@ def test_renders_header_and_intro_paragraph(tmp_path):
     write_bug(status, 1, status="open", title="t")
     out, _ = render_bugs_md(status)
     assert out.startswith("# In-game bug reports\n")
-    assert "Click one for the full state" in out
+    assert "Click one for the full state" not in out
 
 
 def test_ignores_non_bug_files(tmp_path):

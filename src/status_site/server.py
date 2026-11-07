@@ -1119,9 +1119,7 @@ def render_bugs_md(status_dir: Path) -> tuple[str, float]:
     buckets, max_mtime = collect_bugs(status_dir)
     parts = [
         "# In-game bug reports\n",
-        "Every /bug report that reaches me from the game. Click one for the "
-        "full state at the moment of reporting — location, flags, inventory, "
-        "last 20 messages.\n",
+        "Every /bug report that reaches me from the game, grouped by status.\n",
     ]
     # Section order: Open → In progress → Fixed → Won't fix →
     # Dispatch failed (needs triage). ``prefix`` is prepended to the
