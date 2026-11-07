@@ -28,6 +28,30 @@ from alice_forge import dispatcher as sm
 
 
 @pytest.fixture(autouse=True)
+def _enable_dispatcher_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bolt the dispatcher's ``gh`` CLI shim off for every test (#803).
+
+    ``alice_forge.dispatcher.gh._run_gh`` is the single choke point every
+    ``gh_*`` helper routes through (via ``_dispatch_run_gh`` →
+    ``sys.modules["alice_forge.dispatcher"]._run_gh``). When
+    :envvar:`ALICE_DISPATCHER_DRY` is ``"1"``, ``_run_gh`` short-
+    circuits to ``""`` and the helpers' empty-stdout branches return
+    empty results — PR #801 fixed four specific gh_* fixtures that
+    were silently missing main.py; this autouse gate catches the
+    remaining ~16 that have no autouse coverage (``gh_list_stale_
+    closed_sm_issues``, ``gh_get_pr_merge_status``, ``gh_find_
+    linked_pr``, ``gh_edit_labels``, ``gh_close_issue``, …) and
+    every future ``gh_*`` helper added after this patch.
+
+    Individual tests that *want* ``_run_gh`` to produce canned stdout
+    (e.g. ``test_gh_get_pr_files_parses_payload``) monkeypatch
+    ``sm._run_gh`` directly — that replaces the function object, which
+    bypasses this env check unconditionally.
+    """
+    monkeypatch.setenv("ALICE_DISPATCHER_DRY", "1")
+
+
+@pytest.fixture(autouse=True)
 def _stub_gh_list_issue_comments(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default the gh comments fetcher to a benign empty result.
 
@@ -77,6 +101,31 @@ def _stub_gh_list_open_done(monkeypatch: pytest.MonkeyPatch) -> None:
     their own ``sm.run`` call, which takes precedence.
     """
     monkeypatch.setattr(sm, "gh_list_open_done_sm_issues", lambda _repo: [])
+
+
+@pytest.fixture(autouse=True)
+def _disable_sweeper_safe_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #784 ships the Phase 1.6 sweeper in safe-mode (dry-run-only)
+    by default via :envvar:`SM_SWEEPER_SAFE_MODE`. The dispatcher tests
+    assert against live-write behaviour (labels edited, close_issue
+    noted as skipped by the sweep), so we switch safe-mode off here.
+    The issue #784 safe-mode-specific tests set it back on explicitly.
+    """
+    monkeypatch.setenv("SM_SWEEPER_SAFE_MODE", "0")
+
+
+@pytest.fixture(autouse=True)
+def _stub_gh_find_open_linked_prs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default the issue #784 follow-up-PR lookup to the empty list.
+
+    ``sm.run()`` now defaults ``find_open_linked_prs`` to the
+    production ``gh_find_open_linked_prs`` helper so the sweeper's
+    "open follow-up → wait" check is live out of the box. Tests that
+    don't override the kwarg would otherwise shell out to real ``gh``
+    (hitting rate limits or spurious results). Tests exercising the
+    wait-path override the kwarg explicitly, which takes precedence.
+    """
+    monkeypatch.setattr(sm, "gh_find_open_linked_prs", lambda _repo, _n: [])
 
 
 @pytest.fixture
@@ -1146,15 +1195,22 @@ def test_sweep_closed_selected_no_linked_pr_to_rejected(
     assert report.swept == 1
 
 
-def test_sweep_closed_selected_merged_red_ci_to_rejected(
+def test_sweep_closed_selected_merged_red_ci_to_done_issue_784(
     state_path: pathlib.Path,
 ) -> None:
-    """Merged PR with red master CI on a closed sm:selected issue is rejected.
+    """Issue #784: merged PR with red master CI now resolves to sm:done.
 
-    Rationale: the work shipped but broke master. The merge artifact
-    exists, but downstream tracking should treat it as needing
-    follow-up — we don't have the Phase 2 quality-gate plumbing yet,
-    so the safest terminal is rejected rather than done.
+    Rationale: pre-#784, the code flipped to ``sm:rejected`` when
+    master CI was red at merge time. That silently killed completed
+    work whenever master was red for pre-existing reasons (#613, #614,
+    #616, #617, #618, #620, #621, #656). The PR-merge artifact is now
+    treated as authoritative — CI colour at merge time is a property
+    of master and not of this PR's diff. CI remediation is a separate
+    watcher (#782).
+
+    The behaviour change is reflected in both the applied label and
+    the new ``sweep_merged_pr_legacy_would_reject`` counter which
+    increments so operators can audit the delta.
     """
     recorder = Recorder()
     label_rec = LabelRecorder()
@@ -1200,13 +1256,332 @@ def test_sweep_closed_selected_merged_red_ci_to_rejected(
     assert exit_code == 0
     assert len(label_rec.calls) == 1
     edit = label_rec.calls[0]
-    assert edit["add"] == ["sm:rejected"]
+    assert edit["add"] == ["sm:done"]
     assert edit["remove"] == ["sm:selected"]
     assert close_rec.closed == []
     bodies = [b for _r, _n, b in recorder.posted]
-    assert any("[SM] transition from=selected to=rejected" in b for b in bodies)
-    assert any("master CI failure" in b for b in bodies)
+    assert any("[SM] transition from=selected to=done" in b for b in bodies)
+    # The transition comment records that the old logic would have
+    # rejected this (operator audit trail).
+    assert any("#784" in b for b in bodies)
     assert report.swept == 1
+    assert report.sweep_merged_pr_legacy_would_reject == 1
+
+
+def test_sweep_closed_selected_merged_pending_ci_to_done_issue_784(
+    state_path: pathlib.Path,
+) -> None:
+    """Issue #784: pending CI on a merged PR also resolves to sm:done.
+
+    Pre-#784 the code held the stale label for another cadence; now
+    the merge artifact is enough to call it done.
+    """
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    stale = [_make_issue(94, sm_labels=("sm:selected",))]
+
+    def find_pr(_repo: str, _n: int) -> dict | None:
+        return {
+            "number": 101,
+            "url": "https://github.com/jcronq/alice/pull/101",
+            "state": "MERGED",
+        }
+
+    def merge_status(_repo: str, _pr: int) -> dict:
+        return {
+            "merged": True,
+            "merge_commit_oid": "cafecafecafe",
+            "pr_url": "https://github.com/jcronq/alice/pull/101",
+        }
+
+    def ci(_repo: str, _sha: str) -> dict:
+        return {"conclusion": "pending"}
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: stale,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=ci,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert len(label_rec.calls) == 1
+    edit = label_rec.calls[0]
+    assert edit["add"] == ["sm:done"]
+    assert edit["remove"] == ["sm:selected"]
+    assert report.swept == 1
+    # Pending CI is not a legacy "would reject" case — only explicit
+    # failure/non-success conclusions bump the delta counter.
+    assert report.sweep_merged_pr_legacy_would_reject == 0
+
+
+def test_sweep_closed_selected_pr_closed_with_open_followup_waits_issue_784(
+    state_path: pathlib.Path,
+) -> None:
+    """Issue #784: closed-unmerged + open follow-up PR → hold, don't reject.
+
+    When the worker's first PR closed unmerged but a second attempt is
+    already open, the sweeper should wait rather than flip the issue
+    to sm:rejected. The in-flight PR might land and the issue needs to
+    reach sm:done on its merge.
+    """
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    stale = [_make_issue(95, sm_labels=("sm:selected",))]
+
+    def find_pr(_repo: str, _n: int) -> dict | None:
+        return {
+            "number": 102,
+            "url": "https://github.com/jcronq/alice/pull/102",
+            "state": "CLOSED",
+        }
+
+    def find_open_followups(_repo: str, _n: int) -> list[int]:
+        return [103]  # follow-up PR #103 is still open
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: stale,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        find_open_linked_prs=find_open_followups,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # No label change — the sweeper held.
+    assert label_rec.calls == []
+    assert close_rec.closed == []
+    # Nothing posted either; the hold is silent (just a log line).
+    assert recorder.posted == []
+    assert report.swept == 0
+    assert report.sweep_wait_followup_in_flight == 1
+
+
+def test_sweep_closed_selected_pr_closed_with_only_the_closed_pr_as_followup(
+    state_path: pathlib.Path,
+) -> None:
+    """Issue #784: ``find_open_linked_prs`` may return the already-closed
+    PR itself (defensive: GH search semantics drift). The handler must
+    filter that out and still reject.
+    """
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    stale = [_make_issue(96, sm_labels=("sm:selected",))]
+
+    def find_pr(_repo: str, _n: int) -> dict | None:
+        return {
+            "number": 104,
+            "url": "https://github.com/jcronq/alice/pull/104",
+            "state": "CLOSED",
+        }
+
+    def find_open_followups(_repo: str, _n: int) -> list[int]:
+        # Only the closed PR itself shows up — handler must filter it.
+        return [104]
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: stale,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        find_open_linked_prs=find_open_followups,
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    assert len(label_rec.calls) == 1
+    assert label_rec.calls[0]["add"] == ["sm:rejected"]
+    assert report.sweep_wait_followup_in_flight == 0
+    assert report.swept == 1
+
+
+def test_sweep_safe_mode_does_not_gate_merged_done_path(
+    state_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #784 safe-mode (tightened): the merged-PR sweep writes
+    labels live even while ``SM_SWEEPER_SAFE_MODE=1`` is in effect.
+
+    Merge is terminal — there's no ambiguity to audit, so the
+    ``sm:done`` branch is never gated. Only the REJECT branch is gated
+    (see :func:`test_sweep_safe_mode_gates_reject_path_only`).
+    """
+    monkeypatch.setenv("SM_SWEEPER_SAFE_MODE", "1")
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    stale = [_make_issue(97, sm_labels=("sm:selected",))]
+
+    def find_pr(_repo: str, _n: int) -> dict | None:
+        return {
+            "number": 105,
+            "url": "https://github.com/jcronq/alice/pull/105",
+            "state": "MERGED",
+        }
+
+    def merge_status(_repo: str, _pr: int) -> dict:
+        return {
+            "merged": True,
+            "merge_commit_oid": "deadbeefdead",
+            "pr_url": "https://github.com/jcronq/alice/pull/105",
+        }
+
+    def ci(_repo: str, _sha: str) -> dict:
+        return {"conclusion": "success"}
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: stale,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        pr_merge_status=merge_status,
+        master_ci_status=ci,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # DONE path is NOT gated by safe-mode — label write happened.
+    assert len(label_rec.calls) == 1
+    assert label_rec.calls[0]["add"] == ["sm:done"]
+    bodies = [b for _r, _n, b in recorder.posted]
+    assert any("[SM] transition from=selected to=done" in b for b in bodies)
+    assert report.swept == 1
+    assert (97, "sm:selected", "sm:done") in report.transitions
+    # No REJECT suppression occurred.
+    assert report.sweep_would_reject == 0
+
+
+def test_sweep_safe_mode_gates_reject_path_only(
+    state_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #784 safe-mode (tightened): REJECT decisions are dry-runs
+    while safe-mode is on; the ``sweep_would_reject`` counter records
+    how many flips would have happened.
+    """
+    monkeypatch.setenv("SM_SWEEPER_SAFE_MODE", "1")
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    stale = [_make_issue(98, sm_labels=("sm:selected",))]
+
+    # Closed-unmerged PR + no open follow-up → REJECT normally.
+    def find_pr(_repo: str, _n: int) -> dict | None:
+        return {
+            "number": 106,
+            "url": "https://github.com/jcronq/alice/pull/106",
+            "state": "CLOSED",
+        }
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: stale,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        # No open follow-ups — closed-unmerged resolves to REJECT.
+        find_open_linked_prs=lambda _r, _n: [],
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # REJECT is suppressed by safe-mode: no live writes.
+    assert label_rec.calls == []
+    assert recorder.posted == []
+    # But counters and the audit trail still populate.
+    assert report.swept == 1
+    assert (98, "sm:selected", "sm:rejected") in report.transitions
+    assert report.sweep_would_reject == 1
+
+
+def test_sweep_safe_mode_env_overrides_config(
+    state_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #784: :envvar:`SM_SWEEPER_SAFE_MODE=0` overrides a config
+    that has ``rejected_dry_run=True``. Env is authoritative when set.
+    """
+    monkeypatch.setenv("SM_SWEEPER_SAFE_MODE", "0")
+    from alice_forge.dispatcher.constants import SweeperConfig
+
+    recorder = Recorder()
+    label_rec = LabelRecorder()
+    close_rec = CloseRecorder()
+    stale = [_make_issue(99, sm_labels=("sm:selected",))]
+
+    def find_pr(_repo: str, _n: int) -> dict | None:
+        return {
+            "number": 107,
+            "url": "https://github.com/jcronq/alice/pull/107",
+            "state": "CLOSED",
+        }
+
+    exit_code, report = sm.run(
+        repo="jcronq/alice",
+        state_path=state_path,
+        enable_spawn=False,
+        list_issues=lambda _r: [],
+        list_stale_closed=lambda _r: stale,
+        post_comment=recorder,
+        edit_labels=label_rec,
+        close_issue=close_rec,
+        find_linked_pr=find_pr,
+        find_open_linked_prs=lambda _r, _n: [],
+        pr_merge_status=_no_call,
+        master_ci_status=_no_call,
+        # Config says dry-run but env overrides to live.
+        sweeper_config=SweeperConfig(rejected_dry_run=True),
+        now_iso=_frozen_now,
+        log=lambda _m: None,
+    )
+
+    assert exit_code == 0
+    # Env wins: live REJECT write.
+    assert len(label_rec.calls) == 1
+    assert label_rec.calls[0]["add"] == ["sm:rejected"]
+    assert report.sweep_would_reject == 0
 
 
 def test_sweep_helper_filters_terminal_labels_defensively() -> None:

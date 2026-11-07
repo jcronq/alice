@@ -359,6 +359,30 @@ def test_rate_limit_403_not_classified_as_auth_failure() -> None:
     assert err.looks_like_auth_failure is False
 
 
+def test_rate_limit_error_detected_via_looks_like_rate_limit() -> None:
+    """Issue #786 M4 — watcher's GHCommandError now exposes
+    ``looks_like_rate_limit`` so the shared backoff observer can tell
+    whether to record a hit without a secondary type cascade."""
+    err = gh_watcher.GHCommandError(
+        returncode=1,
+        stderr='HTTP 403: {"message":"API rate limit exceeded"}',
+        args=["gh", "api", "x"],
+    )
+    assert err.looks_like_rate_limit is True
+
+    err_secondary = gh_watcher.GHCommandError(
+        returncode=1,
+        stderr="You have exceeded a secondary rate limit.",
+        args=["gh", "api", "x"],
+    )
+    assert err_secondary.looks_like_rate_limit is True
+
+    err_other = gh_watcher.GHCommandError(
+        returncode=1, stderr="HTTP 404: not found", args=["gh", "api", "x"]
+    )
+    assert err_other.looks_like_rate_limit is False
+
+
 def test_bad_credentials_403_still_classified_as_auth_failure() -> None:
     """A 403 with a real auth-failure body (no rate-limit markers) must
     still route through the auth-failure branch. This is the case we

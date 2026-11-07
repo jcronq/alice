@@ -57,7 +57,7 @@ def collect(fetch=gh_issue_list) -> list[dict]:
                 "number": int(issue["number"]),
                 "title": issue.get("title", ""),
                 "labels": [
-                    l["name"] if isinstance(l, dict) else l for l in issue.get("labels") or []
+                    lb["name"] if isinstance(lb, dict) else lb for lb in issue.get("labels") or []
                 ],
                 "updatedAt": issue.get("updatedAt", ""),
             })

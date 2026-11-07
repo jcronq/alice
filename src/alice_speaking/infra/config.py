@@ -146,6 +146,22 @@ SPEAKING_DEFAULTS: dict[str, Any] = {
             "min_edge_weight_sum": 1,
         },
     },
+    # Self-merge policy (issue #784). Gate the auto-merge path on a
+    # /code-review run so the pipeline catches diffs that pass CI but
+    # still carry dead code / off-by-ones / subtle regressions.
+    # ``require_agent_review: False`` disables the gate entirely
+    # (pre-#784 behaviour). ``review_effort`` is the agent's effort
+    # level; ``auto_apply_findings`` applies fixes via
+    # ``/code-review --fix`` when findings are low-risk; a timeout
+    # greater than ``review_timeout_seconds`` logs + proceeds with
+    # merge to avoid blocking the pipeline on a stuck agent. See
+    # alice_forge.self_merge for the policy module.
+    "self_merge": {
+        "require_agent_review": True,
+        "review_effort": "low",
+        "auto_apply_findings": True,
+        "review_timeout_seconds": 300,
+    },
 }
 
 
