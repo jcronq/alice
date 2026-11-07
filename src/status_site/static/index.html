@@ -633,6 +633,7 @@ function FxTable({columns, rows, rowClass}) {
           const cell = c.cell ? c.cell(row) : row[c.key];
           return h("td", {
             key: c.key,
+            className: (c.numeric || c.nowrap) ? "fx-nowrap" : null,
             style: c.numeric ? {textAlign: "right", fontVariantNumeric: "tabular-nums"} : null,
           }, cell == null ? "" : cell);
         })
@@ -1706,7 +1707,7 @@ function ReviewLinkTable({rows, limit}) {
   // the original GH-only behaviour.
   return h(FxTable, {
     columns: [
-      ...(sameRepo ? [] : [{key: "repo", label: "repo", cell: r => h("code", null, r.repo || "")}]),
+      ...(sameRepo ? [] : [{key: "repo", label: "repo", nowrap: true, cell: r => h("code", null, r.repo || "")}]),
       {key: "number", label: "#", numeric: true, cell: r =>
         r.link
           ? h("a", {href: r.link, target: "_blank", rel: "noopener"}, "#" + r.number)
