@@ -7145,9 +7145,14 @@ def test_thinking_spawn_writes_correctly_formed_spawn_dir(tmp_path) -> None:
 
 
 def test_thinking_spawn_invokes_python_shim_with_args(tmp_path) -> None:
-    """Popen is called with the venv python + ``-m alice_thinking.cli.perissue``
+    """Popen is called with the venv python + ``-m alice_forge.thinking_shim``
     + spawn-dir + session-id + mode=design, detached via
-    ``start_new_session=True``."""
+    ``start_new_session=True``.
+
+    PR-4 of #823 (#827) re-pointed ``THINKING_SHIM_MODULE`` back at
+    :mod:`alice_forge.thinking_shim` — the shim now delegates the
+    kernel drive to :mod:`alice_thinking.cli.perissue` and then writes
+    the SM transition via :mod:`alice_forge.sm.store` directly."""
     spawn_dir = tmp_path / "thinking-spawns"
     spawn_dir.mkdir()
     recorder = Recorder()
@@ -7176,7 +7181,7 @@ def test_thinking_spawn_invokes_python_shim_with_args(tmp_path) -> None:
     assert len(popens) == 1
     cmd = popens[0].args
     assert cmd[0] == "/opt/alice-venv/bin/python"
-    assert cmd[1:3] == ["-m", "alice_thinking.cli.perissue"]
+    assert cmd[1:3] == ["-m", "alice_forge.thinking_shim"]
     # --spawn-dir / --session-id / --mode passed through. The
     # entrypoint contract (sub-issue 3 of #149) consumes these.
     assert "--spawn-dir" in cmd
@@ -7461,41 +7466,23 @@ def test_resolve_python_bin_prefers_venv_then_falls_back(tmp_path) -> None:
     )
 
 
-def test_thinking_shim_module_is_importable_and_exits_cleanly() -> None:
-    """The placeholder shim is a real Python module — the dispatcher
-    path can be exercised without the thinking runtime. Sub-issue 3
-    replaces this with the real PhaseRunner dispatch."""
+def test_thinking_shim_module_is_importable_and_has_main() -> None:
+    """The shim is a real Python module with a ``main`` entrypoint —
+    the dispatcher path can be exercised without end-to-end-booting
+    the kernel. PR-4 of #823 (#827) promoted this from placeholder to
+    the real per-issue entrypoint; the full behaviour contract lives
+    in ``tests/test_thinking_shim.py``."""
     import importlib
 
     shim = importlib.import_module("alice_forge.thinking_shim")
     assert hasattr(shim, "main")
 
 
-def test_thinking_shim_main_exits_zero_with_valid_args(tmp_path) -> None:
-    """Calling thinking_shim.main with a valid --spawn-dir / --session-id
-    / --mode returns 0 (placeholder behavior — sub-issue 3 swaps in the
-    real entrypoint)."""
-    from alice_forge import thinking_shim
-
-    spawn_dir = tmp_path / "spawn-dir"
-    spawn_dir.mkdir()
-    (spawn_dir / "prompt.txt").write_text("placeholder prompt")
-    rc = thinking_shim.main(
-        [
-            "--spawn-dir",
-            str(spawn_dir),
-            "--session-id",
-            "11111111-2222-3333-4444-555555555555",
-            "--mode",
-            "design",
-        ]
-    )
-    assert rc == 0
-
-
 def test_thinking_shim_main_exits_nonzero_when_prompt_missing(tmp_path) -> None:
     """A spawn dir without ``prompt.txt`` is malformed → the shim exits
-    non-zero so the reaper sees a clean failure."""
+    non-zero so the reaper sees a clean failure. The pre-flight check
+    runs before the kernel is touched so the whole test stays
+    pure-Python."""
     from alice_forge import thinking_shim
 
     spawn_dir = tmp_path / "spawn-dir"
