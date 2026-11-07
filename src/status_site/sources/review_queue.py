@@ -28,6 +28,7 @@ from alice_forge.review_queue_renderer import (
     fetch_pr_review,
     render_section,
 )
+from status_site.sources import db_readers as _db_readers
 from status_site.sources.common import staleness_footer
 
 SOURCE_NAME = "gh-review-queue"
@@ -42,12 +43,26 @@ def fetch(
     """Run both gh queries and return ``(design, pr, design_failed,
     pr_failed)``. Repos are loaded from
     ``alice.config.json.review_queue_renderer`` with the same keys
-    #622 uses; ``runner`` is injectable for tests."""
+    #622 uses; ``runner`` is injectable for tests.
+
+    Source selection follows the ``STATUS_SITE_READ_FROM`` env flag —
+    ``db`` (default) reads alice-state.db, ``gh`` keeps the pre-#790
+    subprocess fetcher. Explicit ``runner`` forces the subprocess
+    path so existing test harnesses still work.
+    """
     cfg = cfg_loader()
     repos_pr = _coerce_repos(cfg.get("repos_pr"), DEFAULT_REPOS_PR)
     repos_design = _coerce_repos(
         cfg.get("repos_design_review"), DEFAULT_REPOS_DESIGN_REVIEW
     )
+    if runner is None and _db_readers.read_from() == _db_readers.MODE_DB:
+        design_items, design_failed = _db_readers.fetch_design_review_from_db(
+            repos_design, now=now
+        )
+        pr_items, pr_failed = _db_readers.fetch_pr_review_from_db(
+            repos_pr, now=now
+        )
+        return design_items, pr_items, design_failed, pr_failed
     design_items, design_failed = fetch_design_review_issues(
         repos_design, runner=runner, now=now
     )
