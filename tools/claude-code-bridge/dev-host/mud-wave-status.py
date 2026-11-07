@@ -11,7 +11,12 @@ line) so the item's "what happened" modal shows them. slug = the package ID slug
 the way the status site does, which matches the page's bold `**<ID>**` title. A local
 hash cache means a package is only re-sent when its commit list changes.
 """
-import hashlib, json, os, re, subprocess, time
+import hashlib
+import json
+import os
+import re
+import subprocess
+import time
 
 R = "/home/cronqj/dev/modern-mud"
 PKGS = "/home/cronqj/dev/modern-mud-notes/story/build/waveA_packages.json"
@@ -76,7 +81,6 @@ def main():
     pk = json.load(open(PKGS))["packages"]
     branches = sh("git", "-C", R, "branch", "--format=%(refname:short)|%(committerdate:format:%H:%M)").split()
     bdate = dict(b.split("|") for b in branches if "|" in b)
-    merged = set(sh("git", "-C", R, "branch", "--merged", "howl/wave-a", "--format=%(refname:short)").split())
     log = sh("git", "-C", R, "log", "howl/wave-a", "--format=%H|%ad|%s", "--date=format:%H:%M")
     rows, done, extras = [], 0, {}
     for p in pk:
@@ -84,7 +88,7 @@ def main():
         pat = re.compile(rf"^howl/[A-Z]-{re.escape(i)}(-r(\d+))?$")
         mine = [b for b in bdate if pat.match(b)]
         rnd = max([int(pat.match(b).group(2) or 1) for b in mine] or [0])
-        mline = next((l for l in log.splitlines() if re.search(rf"Merge howl/[A-Z]-{re.escape(i)}\b", l.split("|", 2)[-1])), None)
+        mline = next((line for line in log.splitlines() if re.search(rf"Merge howl/[A-Z]-{re.escape(i)}\b", line.split("|", 2)[-1])), None)
         is_done = bool(mline)  # only an explicit merge commit counts; a fresh branch with no commits is trivially "merged"
         extras[slugify(i)] = commit_rows(mine, mline.split("|")[0] if mline else None)
         title = re.sub(r"^[A-Z0-9-]+ ", "", p.get("title", i)).split(":")[0][:70]
@@ -100,15 +104,15 @@ def main():
         else:
             rows.append((p["layer"], f"- [ ] **{i}** {title} — *not started*"))
     wf = sh("tmux", "capture-pane", "-p", "-t", "claude-first")
-    runs = [re.sub(r"\s+", " ", l.strip(" ◯◉")) for l in wf.splitlines() if "howl-wave" in l and "▰" in l]
+    runs = [re.sub(r"\s+", " ", line.strip(" ◯◉")) for line in wf.splitlines() if "howl-wave" in line and "▰" in line]
     runs = [re.sub(r"[▰▱]+", "", r) for r in runs]
-    out = [f"# Howl Wave A build", "",
+    out = ["# Howl Wave A build", "",
            f"<progress value=\"{done}\" max=\"{len(pk)}\"></progress>", "",
            f"**{done} of {len(pk)} packages merged** · branch `howl/wave-a` on Bazzite", ""]
     if runs:
         out += ["> Workflows running: " + " · ".join(r.split("·")[0].strip() + " (" + "·".join(r.split("·")[1:3]).strip() + ")" for r in runs), ""]
-    for L in sorted(set(l for l, _ in rows)):
-        out += [f"## {LAYER.get(L, f'Layer {L}')}", ""] + [r for l, r in rows if l == L] + [""]
+    for L in sorted(set(layer for layer, _ in rows)):
+        out += [f"## {LAYER.get(L, f'Layer {L}')}", ""] + [r for layer, r in rows if layer == L] + [""]
     out += ["## After the build", "", "- [ ] Agents play chapters 1-7 through the walkthrough; fixes", "- [ ] Open the PR to main",
             "- [ ] Wave B design (chapters 8-12)", "", f"*Generated {time.strftime('%Y-%m-%d %H:%M')} on bazzite, every 3 minutes.*"]
     subprocess.run(SSH + ["wave-a"], input="\n".join(out).encode(), timeout=30)

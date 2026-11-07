@@ -54,7 +54,7 @@ import json
 import logging
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 
@@ -485,7 +485,7 @@ def decide_self_merge(
 # ---------------------------------------------------------------------------
 
 
-def _build_argparser() -> "argparse.ArgumentParser":  # type: ignore[name-defined]
+def _build_argparser() -> "argparse.ArgumentParser":  # type: ignore[name-defined]  # noqa: F821  (local-import keeps module-level deps light)
     import argparse
 
     parser = argparse.ArgumentParser(
