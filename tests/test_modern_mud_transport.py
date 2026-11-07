@@ -8,7 +8,6 @@ import hmac
 import json
 
 import httpx
-import pytest
 
 from alice_speaking.transports.base import ChannelRef, OutboundMessage
 from alice_speaking.transports.modern_mud import (

@@ -172,6 +172,7 @@ from alice_forge.dispatcher.gh import (  # noqa: E402, F401
     gh_close_issue,
     gh_edit_labels,
     gh_find_linked_pr,
+    gh_find_open_linked_prs,
     gh_find_unspawned_selected_issues,
     gh_get_issue,
     gh_get_master_ci_status,

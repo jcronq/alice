@@ -1,0 +1,51 @@
+#!/command/with-contenv bash
+# alice-ci-remediation — timer loop that polls master CI on each
+# configured repo and spawns a remediation worker when master goes
+# red. See watchers/ci_remediation.py for the full policy.
+#
+# Singleton via `flock -n` so a slow poll can't double-fire.
+#
+# Cadence is read from alice.config.json `ci_remediation.poll_interval_seconds`
+# on each cycle (live reconfig, no restart needed). Default: 180s.
+# Watcher is a no-op when disabled or no repos are configured, so it
+# is safe to leave running.
+set -e
+
+LOCK=/state/worker/ci-remediation.lock
+CONFIG_JSON=/home/alice/alice-mind/config/alice.config.json
+DEFAULT_INTERVAL=180
+
+mkdir -p "$(dirname "$LOCK")"
+touch "$LOCK"
+chown alice:alice "$LOCK" || true
+
+# Stagger startup so we don't all wake up in lockstep when the worker boots.
+sleep 45
+
+while true; do
+    interval="$DEFAULT_INTERVAL"
+    if [ -f "$CONFIG_JSON" ] && command -v jq >/dev/null 2>&1; then
+        v=$(jq -r '.ci_remediation.poll_interval_seconds // empty' "$CONFIG_JSON" 2>/dev/null || true)
+        case "$v" in
+            ''|*[!0-9]*) ;;
+            *) interval="$v" ;;
+        esac
+    fi
+    if [ "$interval" -lt 60 ]; then
+        # Polling faster than once a minute burns rate limit for
+        # nothing — gh run list is the slowest call here.
+        interval=60
+    fi
+
+    start_ts=$(date +%s)
+    # Match alice-gh-watcher: redirfd (execline) opens fd 2 after the
+    # privilege drop so the log file is owned by alice.
+    flock -n "$LOCK" s6-setuidgid alice redirfd -a 2 /state/worker/ci-remediation-stderr.log \
+        /usr/local/bin/alice-ci-remediation || true
+    end_ts=$(date +%s)
+    elapsed=$(( end_ts - start_ts ))
+    remainder=$(( interval - elapsed ))
+    if [ "$remainder" -gt 0 ]; then
+        sleep "$remainder"
+    fi
+done
