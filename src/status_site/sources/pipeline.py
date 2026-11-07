@@ -122,11 +122,11 @@ def classify_issue(issue: dict) -> tuple[str, str] | None:
         for lbl in labels
         if lbl.startswith("sm:") and lbl[len("sm:"):] in _STATE_RANK
     ]
-    art = next((l[len("art:"):] for l in sorted(labels) if l.startswith("art:")), "")
+    art = next((lb[len("art:"):] for lb in sorted(labels) if lb.startswith("art:")), "")
     if not states:
         # Untriaged (issue #695): explicit sm:draft, or no sm:* label at
         # all but an art:* label (an intentionally-filed work item).
-        has_sm = any(l.startswith("sm:") for l in labels)
+        has_sm = any(lb.startswith("sm:") for lb in labels)
         if "sm:draft" in labels or (not has_sm and art):
             return "draft", art
         return None
