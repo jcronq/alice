@@ -31,6 +31,7 @@ from alice_forge.review_queue_renderer import (
     age_str,
     gh,
 )
+from status_site.sources import db_readers as _db_readers
 from status_site.sources.common import staleness_footer
 
 SOURCE_NAME = "gh-merged-prs"
@@ -70,7 +71,14 @@ def fetch_merged_prs(
     to catch the UTC-vs-local-date boundary (a merge at 23:58 local
     time could have been ``merged:>=today`` in UTC but belong to
     tomorrow once converted back, or vice versa).
+
+    Source selection: the ``STATUS_SITE_READ_FROM`` env flag picks
+    between ``db`` (default) and ``gh``. Explicit ``runner`` wiring
+    still forces the subprocess path so existing tests keep working.
     """
+    if runner is None and _db_readers.read_from() == _db_readers.MODE_DB:
+        return _db_readers.fetch_merged_prs_from_db(repos, today=today)
+
     if today is None:
         today = today_local()
     items: list[MergedPR] = []

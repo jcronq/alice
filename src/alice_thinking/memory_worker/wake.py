@@ -289,6 +289,41 @@ def main() -> int:
             errors=[{"kind": "sm_seed", "path": str(mind), "reason": str(exc)}]
         )
 
+    # Phase 8 (#790 Step 2): live GH poll into alice-state.db —
+    # ETag-aware, shared-backoff-aware, idempotent. The memory-worker
+    # 30-min cadence is the floor refresh rate; a dedicated 90-s s6
+    # timer is a sandbox-config follow-up. Any 4xx / 5xx surfaces in
+    # the heartbeat as ``gh_poll_error_count``; rate-limit hits are
+    # recorded and the shared backoff ripples out to every other
+    # gh-caller. Disabled by setting
+    # ``memory_worker.gh_poll_enabled = false`` in alice.config.json
+    # (default: enabled).
+    if cfg.get("gh_poll_enabled", True):
+        try:
+            from alice_state_db import gh_poll as _gh_poll_mod
+
+            configured_repos = cfg.get("gh_poll_repos") or None
+            gh_poll_report = _gh_poll_mod.derive_gh_poll(
+                mind, repos=configured_repos
+            )
+        except Exception as exc:  # noqa: BLE001 — telemetry-only path
+            from alice_state_db.gh_poll import PollReport as _PollReport
+
+            gh_poll_report = _PollReport(
+                status="error",
+                errors=[
+                    {
+                        "kind": "gh_poll",
+                        "path": str(mind),
+                        "reason": str(exc),
+                    }
+                ],
+            )
+    else:
+        from alice_state_db.gh_poll import PollReport as _PollReport
+
+        gh_poll_report = _PollReport(status="disabled")
+
     # Heartbeat phase: precedence is the heaviest stage that actually
     # ran (D > C > B). ``stage_d.ran`` is True iff a pair was selected
     # this cycle — null-result outcomes still count, because Stage D
@@ -319,6 +354,7 @@ def main() -> int:
         **{f"task_reindex_{k}": v for k, v in reindex_result.items()},
         **{f"state_db_{k}": v for k, v in state_db_report.to_dict().items()},
         **{f"sm_seed_{k}": v for k, v in sm_seed_report.to_dict().items()},
+        **{f"gh_poll_{k}": v for k, v in gh_poll_report.to_dict().items()},
     )
 
     return 0
