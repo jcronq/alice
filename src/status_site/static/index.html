@@ -1730,9 +1730,11 @@ function YourTodoBoard({data, nowMs}) {
     h(PipelineGroup, {title: "PRs ready for review", count: prs.length},
       prs.length ? h(ReviewLinkTable, {rows: prs}) : none("(no PRs awaiting review)"),
       warn(failed.prs)),
-    h(PipelineGroup, {title: "Design review", count: design.length},
-      design.length ? h(ReviewLinkTable, {rows: design, limit: 5}) : none("(no designs awaiting review)"),
-      warn(failed.design_review)),
+    (design.length || (failed.design_review && failed.design_review.length))
+      ? h(PipelineGroup, {title: "Design review", count: design.length},
+          design.length ? h(ReviewLinkTable, {rows: design, limit: 5}) : null,
+          warn(failed.design_review))
+      : null,
     attn.length
       ? h(PipelineGroup, {title: "Attention reacts", count: attn.length},
           h(FxTable, {
@@ -1744,19 +1746,23 @@ function YourTodoBoard({data, nowMs}) {
             rows: attn.map((r, i) => ({...r, __key: (r.at || "") + i})),
           }))
       : null,
-    h(PipelineGroup, {title: "Asks", count: (d.rows || []).length},
-      h(WaitingTable, {rows: d.rows, handZoneMd: d.your_todo_md, nowMs})),
-    h(PipelineGroup, {title: "External TODOs", count: d.external_todos_md ? 1 : 0},
-      d.external_todos_md
-        ? h(MarkdownZone, {markdown: d.external_todos_md})
-        : none("(none listed — edit external-todos.md in the status dir)")),
+    ((d.rows || []).length || d.your_todo_md)
+      ? h(PipelineGroup, {title: "Asks", count: (d.rows || []).length},
+          h(WaitingTable, {rows: d.rows, handZoneMd: d.your_todo_md, nowMs}))
+      : null,
+    d.external_todos_md
+      ? h(PipelineGroup, {title: "External TODOs", count: 1},
+          h(MarkdownZone, {markdown: d.external_todos_md}))
+      : null,
   );
 }
 function InFlightBoard({data, nowMs}) {
   const d = data || {};
   return h("div", {className: "in-flight", "data-board": "in-flight"},
-    h(PipelineGroup, {title: "Running now", count: (d.running || []).length},
-      h(RunningNowBoard, {rows: d.running, nowMs})),
+    (d.running || []).length
+      ? h(PipelineGroup, {title: "Running now", count: d.running.length},
+          h(RunningNowBoard, {rows: d.running, nowMs}))
+      : null,
     h(PipelineBoard, {pipeline: d.pipeline, surfaces: d.surfaces, tasks: d.tasks}),
   );
 }
