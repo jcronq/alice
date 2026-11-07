@@ -263,6 +263,34 @@ def test_chat_post_stores_reply_to(site):
     assert "reply_to" not in plain
 
 
+def test_chat_post_stores_client_message_id(site):
+    cfg, port = site
+    seed_chat(cfg)
+    assert req(
+        port, "POST", "/api/chat",
+        {"key": KEY, "text": "with id", "client_message_id": "abc123"},
+    )[0] == 200
+    assert req(port, "POST", "/api/chat", {"key": KEY, "text": "no id"})[0] == 200
+    *_, tagged, plain = get_msgs(port)
+    assert tagged["client_message_id"] == "abc123"
+    assert "client_message_id" not in plain
+
+
+def test_chat_post_truncates_long_client_message_id(site):
+    from status_site.server import MAX_CLIENT_MSG_ID
+
+    cfg, port = site
+    seed_chat(cfg)
+    long_id = "z" * 250
+    assert req(
+        port, "POST", "/api/chat",
+        {"key": KEY, "text": "long id", "client_message_id": long_id},
+    )[0] == 200
+    *_, tagged = get_msgs(port)
+    assert tagged["client_message_id"] == "z" * MAX_CLIENT_MSG_ID
+    assert len(tagged["client_message_id"]) == MAX_CLIENT_MSG_ID
+
+
 # ------------------------------------------------- queue preview + link
 
 
