@@ -16,7 +16,9 @@ import imaplib
 import json
 import logging
 import mimetypes
+import os
 import pathlib
+import re
 import smtplib
 import ssl
 import time
@@ -26,6 +28,7 @@ from email.message import EmailMessage, Message
 from email.policy import default
 from email.utils import make_msgid, parseaddr, parsedate_to_datetime
 from html.parser import HTMLParser
+from collections import Counter
 from typing import AsyncIterator, Callable, Optional
 
 from .base import (
@@ -98,6 +101,70 @@ def decode_address(value: str) -> GmailAddress:
     )
 
 
+# Drop counters by reason (telemetry: a spike = spoof attempt or a
+# verification regression).
+DROP_COUNTS: Counter = Counter()
+
+
+def parse_authentication_results(
+    headers: list[str], trusted_authserv_id: str = "mx.google.com"
+) -> Optional[dict[str, dict[str, str]]]:
+    """Parse ``Authentication-Results`` headers (RFC 8601).
+
+    Only a header whose authserv-id equals ``trusted_authserv_id`` is
+    trusted. Returns ``{method: {"result": ..., "domain": ...}}`` for the
+    first trusted header, or ``None`` if there is none.
+    """
+    for raw in headers:
+        parts = [p.strip() for p in " ".join(str(raw).split()).split(";")]
+        if not parts:
+            continue
+        authserv = parts[0].split(" ")[0].strip().lower()
+        if authserv != trusted_authserv_id.lower():
+            continue
+        out: dict[str, dict[str, str]] = {}
+        for part in parts[1:]:
+            m = re.match(r"(spf|dkim|dmarc)\s*=\s*(\w+)", part, re.I)
+            if not m:
+                continue
+            method = m.group(1).lower()
+            if method in out:
+                continue
+            d = re.search(r"header\.(?:d|i|from)\s*=\s*\"?@?([^\s\";]+)", part, re.I)
+            domain = d.group(1).lower().rpartition("@")[2] if d else ""
+            out[method] = {"result": m.group(2).lower(), "domain": domain}
+        return out
+    return None
+
+
+def _aligned(signing: str, from_domain: str) -> bool:
+    return bool(signing) and (
+        from_domain == signing or from_domain.endswith("." + signing)
+    )
+
+
+def verify_inbound(
+    auth_headers: list[str],
+    from_address: str,
+    trusted_authserv_id: str = "mx.google.com",
+) -> tuple[bool, str]:
+    """Fail-closed sender verification. Returns ``(accepted, reason)``."""
+    if not auth_headers:
+        return False, "no_auth_results"
+    results = parse_authentication_results(auth_headers, trusted_authserv_id)
+    if results is None:
+        return False, "authserv_mismatch"
+    if results.get("dmarc", {}).get("result") == "pass":
+        return True, "dmarc_pass"
+    dkim = results.get("dkim", {})
+    if dkim.get("result") == "pass":
+        from_domain = from_address.rpartition("@")[2].lower()
+        if _aligned(dkim.get("domain", ""), from_domain):
+            return True, "dkim_aligned"
+        return False, "dkim_pass_from_misalign"
+    return False, "dkim_fail_dmarc_fail"
+
+
 def _header(value: object) -> str:
     if value is None:
         return ""
@@ -163,6 +230,10 @@ class GmailTransport:
         self._imap_factory = imap_factory
         self._smtp_factory = smtp_factory
         self._stopping = asyncio.Event()
+        self._require_verified = os.environ.get("GMAIL_REQUIRE_VERIFIED", "1") != "0"
+        self._authserv_id = (
+            os.environ.get("GMAIL_TRUSTED_AUTHSERV_ID") or "mx.google.com"
+        )
 
     async def start(self) -> None:
         self._stopping.clear()
@@ -192,6 +263,21 @@ class GmailTransport:
                         )
                         await asyncio.to_thread(self._mark_seen, uid)
                         continue
+                    if self._require_verified:
+                        ok, reason = verify_inbound(
+                            inbound.metadata.get("auth_results") or [],
+                            inbound.principal.native_id,
+                            self._authserv_id,
+                        )
+                        if not ok:
+                            DROP_COUNTS[reason] += 1
+                            log.warning(
+                                "dropping unverified Gmail message from %s: %s",
+                                inbound.principal.native_id,
+                                reason,
+                            )
+                            await asyncio.to_thread(self._mark_seen, uid)
+                            continue
                     inbound.principal = Principal(
                         transport=self.name,
                         native_id=inbound.principal.native_id,
@@ -316,6 +402,7 @@ class GmailTransport:
                 "thread_root_message_id": root,
                 "subject": subject,
                 "references": list(all_refs),
+                "auth_results": [str(v) for v in msg.get_all("Authentication-Results") or []],
             },
         )
 
