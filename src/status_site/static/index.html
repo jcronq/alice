@@ -1290,8 +1290,6 @@ function ChatMessage({m, reactions, quoted}) {
           setTimeout(() => setCopied(false), 1500);
         }
       }, {key: "link"}),
-      btn("more-menu", "⋯", "More actions — coming soon", undefined,
-        {key: "menu", disabled: true}),
       picker ? h("div", {className: "msg-picker", key: "picker", "data-testid": "react-picker"},
         MORE_REACTS.map(e => btn("react-btn", e, "React " + e, () => react(e),
           {key: e, "data-emoji": e}))) : null,
