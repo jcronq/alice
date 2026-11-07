@@ -14,7 +14,6 @@ import json
 import socket
 import threading
 import time
-from pathlib import Path
 
 import pytest
 
@@ -118,12 +117,12 @@ def _read_frame(resp: http.client.HTTPResponse, *, timeout: float = 3.0) -> dict
             text = buf.decode("utf-8", errors="replace")
             buf = b""
             lines = text.rstrip("\n").split("\n")
-            if all(l.startswith(":") for l in lines if l):
+            if all(ln.startswith(":") for ln in lines if ln):
                 return "heartbeat"
             data_parts = [
-                l[len("data:"):].lstrip(" ")
-                for l in lines
-                if l.startswith("data:")
+                ln[len("data:"):].lstrip(" ")
+                for ln in lines
+                if ln.startswith("data:")
             ]
             if not data_parts:
                 continue  # unknown frame — keep reading
