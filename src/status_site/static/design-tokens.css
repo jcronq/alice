@@ -240,6 +240,15 @@
   vertical-align: top;
   overflow-wrap: anywhere;
 }
+.fx-tbl tbody tr:hover {
+  background: color-mix(in srgb, var(--color-fg) 6%, transparent);
+}
+.fx-tbl td a {
+  text-decoration: none;
+}
+.fx-tbl td a:hover {
+  text-decoration: underline;
+}
 
 /* Mobile: stack table rows as cards (title on top, meta line below). */
 .fx-tbl td[data-col="number"],
@@ -528,6 +537,21 @@ li.fx-now {
   height: calc(100vh - 8rem);
   min-height: 24rem;
 }
+/* Prefer the small/dynamic viewport unit so the chat column tracks the
+ * actual visible height on mobile browsers whose toolbars retract. The
+ * 100vh fallback above stays in place for pre-dvh browsers (#805). */
+@supports (height: 100dvh) {
+  .a2ui-list.a2ui-chat-page { height: calc(100dvh - 8rem); }
+}
+/* Mobile: chat has no h1 above it, so 8rem over-reserves. Tighten to
+ * match the actual header footprint (~75px) and reclaim thread rows
+ * (#805). */
+@media (max-width: 600px) {
+  .a2ui-list.a2ui-chat-page { height: calc(100vh - 5rem); min-height: 18rem; }
+  @supports (height: 100dvh) {
+    .a2ui-list.a2ui-chat-page { height: calc(100dvh - 5rem); }
+  }
+}
 .a2ui-list.a2ui-chat-thread {
   flex: 1;
   overflow-y: auto;
@@ -545,6 +569,9 @@ li.fx-now {
   padding: .4rem .65rem;
   border-radius: 10px;
   font-size: .92rem;
+  /* Long unbroken strings (URLs, paths, hashes) must break inside the
+   * bubble rather than push its width past the 88% cap on mobile (#805). */
+  overflow-wrap: anywhere;
   white-space: pre-wrap;
   line-height: 1.4;
 }
