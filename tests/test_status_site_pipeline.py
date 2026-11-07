@@ -26,7 +26,7 @@ def _issue(n: int, *labels: str, updated: str = "2026-11-06T10:00:00Z", title: s
         "number": n,
         "title": title or f"issue {n}",
         "url": f"https://github.com/jcronq/alice/issues/{n}",
-        "labels": [{"name": l} for l in labels],
+        "labels": [{"name": lb} for lb in labels],
         "updatedAt": updated,
     }
 
@@ -54,10 +54,21 @@ def test_classify_includes_each_pipeline_state():
 
 
 @pytest.mark.parametrize(
-    "excluded", ["sm:draft", "sm:done", "sm:closed", "sm:rejected", "sm:blocked"]
+    "excluded", ["sm:done", "sm:closed", "sm:rejected"]
 )
 def test_classify_excludes_terminal_even_with_stale_active_label(excluded):
+    # ``sm:blocked`` is intentionally NOT in this list — the pipeline
+    # board now surfaces blocked work so dispatcher failures (bug #342)
+    # don't vanish from the queue. See ``EXCLUDED_LABELS`` in
+    # ``status_site.sources.pipeline``.
     assert P.classify_issue(_issue(1, "sm:building", excluded)) is None
+
+
+def test_classify_untriaged():
+    assert P.classify_issue(_issue(1, "sm:draft", "art:code")) == ("draft", "code")
+    assert P.classify_issue(_issue(1, "art:code")) == ("draft", "code")
+    assert P.classify_issue(_issue(1, "bug")) is None
+    assert P.classify_issue(_issue(1, "sm:done", "art:code")) is None
 
 
 def test_classify_ignores_non_sm_issue_and_picks_most_advanced():
@@ -73,10 +84,14 @@ def test_fetch_sorts_by_pipeline_order_then_number():
         _issue(2, "sm:designing"),
         _issue(7, "sm:draft"),
         _issue(8),
+        _issue(10, "art:code"),
+        _issue(11, "sm:done", "art:code"),
     ]
     rows, failed = P.fetch_issues(["jcronq/alice"], runner=_runner({"jcronq/alice": issues}))
     assert failed == []
     assert [(r["state"], r["number"]) for r in rows] == [
+        ("draft", 7),
+        ("draft", 10),
         ("selected", 3),
         ("designing", 2),
         ("designing", 9),
@@ -204,7 +219,7 @@ def test_alice_queue_payload_has_three_grouped_lists(tmp_path, monkeypatch):
     assert len(data["rows"]) == 2  # surfaces keep the pre-#653 key
     assert [t["slug"] for t in data["tasks"]] == ["task-0010"]
     assert data["pipeline_failed"] == []
-    assert data["markdown"].startswith("6 items in pipeline")
+    assert data["markdown"].startswith(f"{len(P.PIPELINE_STATES)} items in pipeline")
 
 
 def test_alice_queue_without_pollers_still_renders(tmp_path, monkeypatch):

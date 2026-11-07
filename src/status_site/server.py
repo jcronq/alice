@@ -88,6 +88,8 @@ from status_site.sources import (
     pipeline as _pipeline,
     review_queue as _review_queue,
     running_now as _running_now,
+    schedules as _schedules,
+    tasks as _tasks,
     waiting_on_you as _waiting_on_you,
 )
 from status_site.sources import (
@@ -115,14 +117,10 @@ from status_site.chat_reactions import (
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-# ``legacy.html`` is the pre-#639 static shell, kept so the reactive
-# page can link out to "Classic view" and so ``?p=<page>`` /
-# ``?p=chat`` keeps working while the widget library catches up
-# through slices 2–6. The new ``index.html`` is the SSE-driven React
-# shell that renders section updates live from ``/api/events``.
+# The SSE-driven React shell at ``index.html`` is the only UI; it
+# renders section updates live from ``/api/events``.
 STATIC_FILES = {
     "index.html",
-    "legacy.html",
     "marked.min.js",
     "design-tokens.css",
     "chat-ux.js",
@@ -818,7 +816,7 @@ def _format_age(updated_at: object, now: float) -> str:
 
 def _thinking_phase(item: dict) -> int | None:
     labels = {
-        (l.get("name") if isinstance(l, dict) else l) for l in item.get("labels") or []
+        (lb.get("name") if isinstance(lb, dict) else lb) for lb in item.get("labels") or []
     }
     for idx, (label, _) in enumerate(THINKING_QUEUE_PHASES):
         if label in labels:
@@ -1121,9 +1119,7 @@ def render_bugs_md(status_dir: Path) -> tuple[str, float]:
     buckets, max_mtime = collect_bugs(status_dir)
     parts = [
         "# In-game bug reports\n",
-        "Every /bug report that reaches me from the game. Click one for the "
-        "full state at the moment of reporting — location, flags, inventory, "
-        "last 20 messages.\n",
+        "Every /bug report that reaches me from the game, grouped by status.\n",
     ]
     # Section order: Open → In progress → Fixed → Won't fix →
     # Dispatch failed (needs triage). ``prefix`` is prepended to the
@@ -1504,6 +1500,9 @@ DONE_TODAY_END = "<!-- done-today:end -->"
 KNOWN_ISSUES_START = "<!-- known-issues:start -->"
 KNOWN_ISSUES_END = "<!-- known-issues:end -->"
 
+TRACKED_TASKS_START = "<!-- tracked-tasks:start -->"
+TRACKED_TASKS_END = "<!-- tracked-tasks:end -->"
+
 
 def _agent_name() -> str:
     """Resolve the agent's name from ``mind/personae.yml``.
@@ -1580,6 +1579,20 @@ def _known_issues_fallback(rendered: str) -> str:
     return (
         "\n## Known issues I'm on\n"
         f"{KNOWN_ISSUES_START}\n{rendered}\n{KNOWN_ISSUES_END}\n"
+    )
+
+
+def _tracked_tasks_fallback(rendered: str) -> str:
+    """Appended-section shape for the SM v2 task list (issue #780).
+
+    Lives between ``Alice's queue`` and ``Thinking queue`` so repo-less
+    todos sit next to the GH-backed pipeline without being mixed into
+    it. The marker-less fallback keeps the page serveable while the
+    one-time index.md edit that inserts the markers catches up.
+    """
+    return (
+        "\n## Tracked tasks\n"
+        f"{TRACKED_TASKS_START}\n{rendered}\n{TRACKED_TASKS_END}\n"
     )
 
 
@@ -1812,8 +1825,9 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
     """Return ``{section_name: () -> payload}`` for every Overview section.
 
     Payloads are typed dicts shaped per #649: every renderer at least
-    emits ``{"markdown": "..."}`` so the legacy Section component keeps
-    rendering; the four slice-2 sections (running_now, waiting_on_you,
+    emits ``{"markdown": "..."}`` so the generic markdown fallback in
+    ``SectionTile`` keeps rendering sections the shell has no typed
+    widget for yet; the four slice-2 sections (running_now, waiting_on_you,
     alice_queue, done_today) also carry typed ``rows`` so widgets can
     render without re-parsing markdown. Dict equality is deep, so the
     broadcaster's change-detection compare still works unchanged.
@@ -1959,6 +1973,37 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
     def _render_known_issues() -> dict:
         return {"markdown": _known_issues.render(cfg.status_dir / "known-issues.md")}
 
+    def _render_schedules() -> dict:
+        """Active scheduled jobs (issue #810, Phase 1).
+
+        Reads ``~/alice-mind/inner/state/active-crons.json`` inline on
+        each tick — the file is tiny (a handful of jobs at most) so we
+        skip the TTL poller. Missing / unreadable file degrades to an
+        empty list; the frontend widget renders a "no scheduled jobs"
+        placeholder. Never blocks the main Overview render path.
+        """
+        try:
+            jobs = _schedules.read_jobs(_schedules.active_crons_path())
+        except Exception as e:  # noqa: BLE001 — never poison Overview
+            print(f"status_site: schedules read failed: {e!r}", flush=True)
+            jobs = []
+        return {
+            "markdown": _schedules.render(jobs),
+            "jobs": _schedules.typed_rows(jobs),
+        }
+
+    def _render_tracked_tasks() -> dict:
+        """Live scan of the SM v2 task store (issue #780).
+
+        Scan is cheap (a few hundred tiny YAML files, max) so we skip
+        the TTL cache and read on each tick. Tasks already tracked via
+        a GitHub issue are filtered out inside :func:`scan_tasks` so
+        the GH-pipeline source stays the single owner of those rows.
+        """
+        rows = _tasks.scan_tasks(_tasks_dir(), now=time.time())
+        md = _tasks.render(rows)
+        return {"markdown": md, "rows": _tasks.typed_rows(rows)}
+
     # ── Overview tiers by who owns the next action (issue #691) ────
     # ``your_todo`` / ``in_flight`` / ``thinking_queue`` / ``system_health``
     # are the sections the reactive shell draws; the older per-source
@@ -2095,8 +2140,10 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         "ready_for_review": _render_ready_for_review,
         "waiting_on_you": _render_waiting_on_you,
         "alice_queue": _render_alice_queue,
+        "tracked_tasks": _render_tracked_tasks,
         "done_today": _render_done_today,
         "known_issues": _render_known_issues,
+        "schedules": _render_schedules,
         "page:chat": _render_page_chat,
         "page:bugs": _render_page_bugs,
         "page:review": _render_page_review,
@@ -2113,10 +2160,14 @@ def overview_splice_sections(
 
     Order mirrors the Overview as it appears on the page:
     Running now → Ready for Review → Waiting on you → Alice's queue →
-    Done today → Known issues I'm on. Each tuple carries sentinel
-    markers, a renderer closure, and a fallback builder so the
-    append-case keeps the page serveable while the mind repo catches
-    up on the marker-insertion pass.
+    Tracked tasks → Done today → Known issues I'm on. (``## Thinking
+    queue`` is spliced separately by :func:`splice_thinking_queue`
+    directly from the hand-edit position in ``index.md``, so it slots
+    between Tracked tasks and Done today in the rendered page without
+    appearing in this list.) Each tuple carries sentinel markers, a
+    renderer closure, and a fallback builder so the append-case keeps
+    the page serveable while the mind repo catches up on the
+    marker-insertion pass.
 
     Renderers are shared with the SSE broadcaster via
     :func:`section_renderers`. The ``alice_queue`` tuple below passes
@@ -2160,6 +2211,12 @@ def overview_splice_sections(
             ALICE_QUEUE_END,
             lambda: render_alice_queue(items, now=now),
             _alice_queue_fallback,
+        ),
+        (
+            TRACKED_TASKS_START,
+            TRACKED_TASKS_END,
+            _md("tracked_tasks"),
+            _tracked_tasks_fallback,
         ),
         (
             DONE_TODAY_START,
@@ -2346,7 +2403,7 @@ def archive_done(cfg: Config, now: datetime | None = None) -> list[dict]:
             old = ""
         # Archive first: a crash between the two writes duplicates, never loses.
         _atomic_write(archive_path, _merge_archive(old, additions))
-        _atomic_write(index_path, "\n".join(l for i, l in enumerate(lines) if i not in drop))
+        _atomic_write(index_path, "\n".join(ln for i, ln in enumerate(lines) if i not in drop))
     return archived
 
 

@@ -10,6 +10,8 @@ Example issue body that the worker reads.
 
 Your task: produce the research note described above. Read prior art in the vault, write the note with proper frontmatter and wikilinks, then post the SM transition comment when finished.
 
+Effort: MEDIUM (ship + verify). Build to spec, add tests covering the spec's test plan, run the targeted suite, open the PR, and verify the CI delta before self-merging.
+
 ## Constraint: write-research-note-under-vault
 Produce a research note at ``~/alice-mind/cortex-memory/research/<date>-<slug>.md`` with YAML frontmatter. For ``art:experiment`` tasks the frontmatter must carry ``hypothesis``, ``null``, and ``verdict`` keys.
 

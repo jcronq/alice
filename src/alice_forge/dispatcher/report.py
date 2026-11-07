@@ -82,6 +82,24 @@ class RunReport:
     # comment. Tracked separately so the operator can see at a glance
     # whether the dispatcher woke Speaking on idle drafts.
     triage_surfaced: int = 0
+    # Issue #784 — Phase 1.6 sweep counters for the false-negative
+    # ``sm:rejected`` fix. ``sweep_merged_pr_legacy_would_reject``
+    # increments for each merged-PR sweep where the old (pre-#784)
+    # logic would have flipped the issue to ``sm:rejected`` because
+    # master CI was red at merge time. Non-zero means the fix is
+    # earning its keep. ``sweep_wait_followup_in_flight`` increments
+    # when a closed-unmerged PR would have become ``sm:rejected`` but
+    # an open follow-up PR for the same issue is still in flight;
+    # the sweeper holds for another cadence instead.
+    sweep_merged_pr_legacy_would_reject: int = 0
+    sweep_wait_followup_in_flight: int = 0
+    # Issue #784 — count of REJECT sweep decisions that were suppressed
+    # by :envvar:`SM_SWEEPER_SAFE_MODE` / the
+    # ``sweeper.rejected_dry_run`` config key. Lets the operator see at
+    # a glance how many flips the sweeper would have made so they can
+    # audit the delta before enabling live writes. Only the REJECT path
+    # is gated — merged-PR sweeps are terminal and always applied.
+    sweep_would_reject: int = 0
 
 
 @dataclass(frozen=True)
