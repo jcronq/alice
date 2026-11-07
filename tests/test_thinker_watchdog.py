@@ -452,6 +452,195 @@ def test_telemetry_event_emitted_on_intervention(tmp_path, monkeypatch):
     assert e["sigterm_sufficient"] is True
 
 
+# ---------- find_signal_target ----------
+
+
+def _euid_lookup(mapping: dict):
+    def lookup(pid: int):
+        return mapping.get(pid)
+
+    return lookup
+
+
+def _cmdline_lookup(mapping: dict):
+    def lookup(pid: int):
+        return mapping.get(pid, "")
+
+    return lookup
+
+
+def test_find_signal_target_trivial_tree_returns_root(monkeypatch):
+    """Root has no children in /proc and its own euid is unreadable →
+    fallback branch returns root_pid unchanged."""
+    monkeypatch.setattr(wd, "_proc_euid", lambda pid: None)
+    monkeypatch.setattr(wd, "_proc_cmdline", lambda pid: "")
+    assert wd.find_signal_target(4242, want_euid=1000, tree={}) == 4242
+
+
+def test_find_signal_target_prefers_named_descendant(monkeypatch):
+    """Classic exec chain: root (euid=0, flock) → A (euid=0, s6-setuidgid
+    exec'd through) → B (euid=1000, intermediate ``timeout`` wrapper) →
+    C (euid=1000, the real python worker). ``want_euid=1000``, cmdline
+    hint ``alice_thinking`` on C only → resolver picks C."""
+    tree = {100: 99, 200: 100, 300: 200, 400: 300}  # root=100, children: 200, 300, 400
+    euids = {100: 0, 200: 0, 300: 1000, 400: 1000}
+    cmdlines = {
+        100: "flock -n /state/worker/thinking.lock s6-setuidgid alice /usr/local/bin/alice-think",
+        200: "s6-setuidgid alice /usr/local/bin/alice-think",
+        300: "timeout --kill-after=60 1200 /opt/alice-venv/bin/python -m alice_thinking",
+        400: "/opt/alice-venv/bin/python -m alice_thinking",
+    }
+    monkeypatch.setattr(wd, "_proc_euid", _euid_lookup(euids))
+    monkeypatch.setattr(wd, "_proc_cmdline", _cmdline_lookup(cmdlines))
+
+    assert wd.find_signal_target(100, want_euid=1000, tree=tree) == 400
+
+
+def test_find_signal_target_falls_back_to_euid_when_no_name_hint(monkeypatch):
+    """Same tree shape, but no descendant's cmdline matches the hint —
+    the deepest euid match still wins over the root pid."""
+    tree = {100: 99, 200: 100, 300: 200}
+    euids = {100: 0, 200: 0, 300: 1000}
+    cmdlines = {100: "flock", 200: "s6-setuidgid", 300: "some-other-wrapper"}
+    monkeypatch.setattr(wd, "_proc_euid", _euid_lookup(euids))
+    monkeypatch.setattr(wd, "_proc_cmdline", _cmdline_lookup(cmdlines))
+
+    assert wd.find_signal_target(100, want_euid=1000, tree=tree) == 300
+
+
+def test_find_signal_target_no_euid_match_returns_root(monkeypatch):
+    """No descendant has the requested euid → fallback to root_pid
+    unchanged (status-quo behavior; never worse than today)."""
+    tree = {100: 99, 200: 100, 300: 200}
+    euids = {100: 0, 200: 0, 300: 0}  # all root
+    cmdlines = {100: "flock", 200: "s6-setuidgid", 300: "python -m alice_thinking"}
+    monkeypatch.setattr(wd, "_proc_euid", _euid_lookup(euids))
+    monkeypatch.setattr(wd, "_proc_cmdline", _cmdline_lookup(cmdlines))
+
+    assert wd.find_signal_target(100, want_euid=1000, tree=tree) == 100
+
+
+def test_proc_ppid_handles_parens_in_comm():
+    """``/proc/<pid>/stat`` comm field may contain spaces AND parens,
+    so parsing must split on the *last* ``)`` before tokenizing the
+    rest. Example comm: ``(some (nested) thing)`` — field 4 (ppid)
+    is the second whitespace-separated token after that last ``)``."""
+    # Format: pid (comm) state ppid pgrp session ...
+    # We want ppid=4242, so after the last ')' we need: "S 4242 ..."
+    stat = "12345 (some (nested) thing) S 4242 12300 12300 0 -1 ...\n"
+    assert wd._proc_ppid(12345, stat_text=stat) == 4242
+
+
+def test_proc_ppid_handles_plain_comm():
+    """Baseline sanity: a normal comm field (no parens inside) parses
+    the same way."""
+    stat = "12345 (python3) S 4242 12300 12300 0 -1 ...\n"
+    assert wd._proc_ppid(12345, stat_text=stat) == 4242
+
+
+def test_proc_ppid_returns_none_on_unparseable():
+    """No close-paren, or not enough fields after it → None, not a
+    ValueError."""
+    assert wd._proc_ppid(12345, stat_text="garbage without paren") is None
+    assert wd._proc_ppid(12345, stat_text="12345 (comm) S") is None
+
+
+# ---------- run_tick uses the resolved target pid ----------
+
+
+def test_telemetry_event_pid_is_signal_target_not_lock_holder(tmp_path, monkeypatch):
+    """Regression for issue #785: ``find_thinker_pid`` returns the
+    root-owned flock wrapper, but ``os.kill`` runs as alice and needs
+    the python descendant. ``state.pid``, ``_read_wchan`` input, the
+    intervene() pid, and the telemetry event's ``pid`` must all reflect
+    the resolved signal target, not the lock holder."""
+    today = "2026-05-08"
+    state = _make_state_dir(tmp_path, cadence=300)
+    mind = _make_mind(tmp_path, today=today, wake_age_seconds=1700)
+    lock = _make_lock(tmp_path)
+    wrapper_pid = 11111  # root-owned flock holder (what find_thinker_pid returns)
+    python_pid = 22222  # alice-owned python -m alice_thinking (what we must signal)
+
+    monkeypatch.setattr(wd, "find_thinker_pid", lambda *a, **kw: wrapper_pid)
+    monkeypatch.setattr(wd, "find_signal_target", lambda root, **kw: python_pid)
+    # Also ensure the Bug 2 anchor-to-proc-start check doesn't null out
+    # wake_age in this test — we want the STUCK verdict via the stale
+    # wake-age branch, same as the lock-holder-era telemetry test.
+    monkeypatch.setattr(wd, "_proc_age_seconds", lambda pid, now=None: 99999.0)
+
+    wchan_calls: list[int] = []
+
+    def fake_wchan(pid):
+        wchan_calls.append(pid)
+        return "ep_poll"
+
+    monkeypatch.setattr(wd, "_read_wchan", fake_wchan)
+
+    intervene_calls: list[int] = []
+
+    def fake_intervene(pid, **kw):
+        intervene_calls.append(pid)
+        return {
+            "sigterm_sent": True,
+            "sigterm_sufficient": True,
+            "sigkill_sent": False,
+            "elapsed_seconds": 1.0,
+            "exited": True,
+        }
+
+    monkeypatch.setattr(wd, "intervene", fake_intervene)
+
+    events_log = mind / "memory" / "events.jsonl"
+    result = wd.run_tick(
+        lock_path=lock,
+        state_dir=state,
+        mind=mind,
+        events_log=events_log,
+        today=today,
+    )
+
+    assert result.decision == wd.Decision.STUCK
+    assert result.pid == python_pid, "state.pid must be the signal target, not the lock holder"
+    assert wchan_calls == [python_pid]
+    assert intervene_calls == [python_pid]
+
+    events = _read_events(events_log)
+    assert len(events) == 1
+    assert events[0]["pid"] == python_pid
+
+
+# ---------- is_stuck anchors wake_age to process start (Bug 2) ----------
+
+
+def test_is_stuck_ignores_wake_age_older_than_process_age(monkeypatch):
+    """Direct regression for the "STUCK within 3 minutes of fresh
+    start" false positive: a leftover wake file from before this
+    process's lifetime is not evidence of this process being stuck.
+    Falls through to _classify_no_wake_file(pid, threshold), which with
+    a young proc_age returns WORKING."""
+    # Process is 5s old (fresh). Wake file is 99999s old (leftover from
+    # a prior container lifetime). Threshold at 5min cadence is 1560s.
+    monkeypatch.setattr(wd, "_proc_age_seconds", lambda pid, now=None: 5.0)
+    decision = wd.is_stuck(
+        pid=4242, wake_age=99999.0, cadence=300, lock_exists=True
+    )
+    assert decision == wd.Decision.WORKING
+
+
+def test_is_stuck_old_process_with_leftover_wake_is_still_stuck(monkeypatch):
+    """Companion to the above: the anchor-to-proc-start fix MUST NOT
+    paper over a genuinely hung long-lived process. If the process has
+    been running 35 minutes and the only wake file is older than it,
+    the no-wake-file classifier still fires STUCK."""
+    # Process is 35min old. Wake file is 99999s (ancient leftover).
+    # proc_age=2100s > threshold=1560s → STUCK via _classify_no_wake_file.
+    monkeypatch.setattr(wd, "_proc_age_seconds", lambda pid, now=None: 35 * 60)
+    decision = wd.is_stuck(
+        pid=4242, wake_age=99999.0, cadence=300, lock_exists=True
+    )
+    assert decision == wd.Decision.STUCK
+
+
 def test_run_tick_working_no_events(tmp_path, monkeypatch):
     today = "2026-05-08"
     state = _make_state_dir(tmp_path, cadence=300)

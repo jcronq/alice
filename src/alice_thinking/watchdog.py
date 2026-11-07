@@ -233,6 +233,160 @@ def _read_wchan(pid: int) -> Optional[str]:
         return None
 
 
+# ---------- signal-target resolution ----------
+#
+# The flock holder (per :func:`find_thinker_pid`) is the root-owned
+# supervisor/wrapper PID — ``flock`` opens the lock as root before the
+# ``s6-setuidgid`` / ``timeout`` fork flips to uid=alice and forks the
+# real ``python -m alice_thinking`` process. ``os.kill`` from uid=alice
+# against that root pid is ``PermissionError``. These helpers resolve
+# the signal target to the alice-owned python descendant: BFS the pid
+# tree from the root, pick the euid-matched descendant whose cmdline
+# positively identifies the python worker (so we skip past an already-
+# alice-owned ``timeout`` monitor whose signal-forwarding is both
+# indirect and can't forward ``SIGKILL``).
+
+
+def _proc_ppid(pid: int, *, stat_text: Optional[str] = None) -> Optional[int]:
+    """Parse field 4 (ppid) of ``/proc/<pid>/stat``.
+
+    The comm field (field 2) is parenthesized and may itself contain
+    spaces and nested parens (e.g. ``(some (nested) thing)``), so we
+    split on the *last* ``)`` before tokenizing the remainder — the
+    classic ``/proc/<pid>/stat`` parsing gotcha.
+
+    ``stat_text`` is a test seam. Returns ``None`` if the pid is gone
+    or the stat line is unparseable.
+    """
+    if stat_text is None:
+        try:
+            stat_text = pathlib.Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            return None
+    end = stat_text.rfind(")")
+    if end == -1:
+        return None
+    rest = stat_text[end + 1 :].split()
+    # After the comm close-paren, the next fields are: state, ppid, pgrp, ...
+    if len(rest) < 2:
+        return None
+    try:
+        return int(rest[1])
+    except ValueError:
+        return None
+
+
+def _proc_euid(pid: int) -> Optional[int]:
+    """Return ``st_uid`` of ``/proc/<pid>`` — the process's euid as
+    exposed through the ``/proc`` dirent. Returns ``None`` if the pid
+    is gone."""
+    try:
+        return os.stat(f"/proc/{pid}").st_uid
+    except OSError:
+        return None
+
+
+def _proc_cmdline(pid: int) -> str:
+    """Return ``/proc/<pid>/cmdline`` with NUL separators replaced by
+    spaces, stripped. Returns ``""`` if unreadable."""
+    try:
+        raw = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+
+
+def _scan_proc_tree() -> dict[int, int]:
+    """One pass over ``/proc/[0-9]+/stat`` → ``{pid: ppid}``.
+
+    Built once per resolution call; the container's process count is
+    small (dozens), so this is cheap at a 30s cadence. Pids we can't
+    parse are silently skipped.
+    """
+    tree: dict[int, int] = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return tree
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            pid = int(entry)
+        except ValueError:
+            continue
+        ppid = _proc_ppid(pid)
+        if ppid is None:
+            continue
+        tree[pid] = ppid
+    return tree
+
+
+def find_signal_target(
+    root_pid: int,
+    *,
+    want_euid: Optional[int] = None,
+    name_hint: str = "alice_thinking",
+    tree: Optional[dict[int, int]] = None,
+) -> int:
+    """Resolve the actual PID to signal.
+
+    BFS the descendants of ``root_pid`` (using ``tree``, or a fresh
+    :func:`_scan_proc_tree` if not given — ``tree`` is the test seam,
+    mirroring :func:`find_thinker_pid`'s ``locks_text`` arg). Consider
+    ``root_pid`` itself plus all descendants. Among candidates whose
+    euid equals ``want_euid`` (default ``os.geteuid()``):
+
+    * Prefer one whose cmdline contains ``name_hint`` (positively
+      identifies the python worker over an intermediate wrapper
+      that's already alice-owned, e.g. ``timeout``).
+    * Else the deepest euid match found.
+    * Else return ``root_pid`` unchanged — status-quo fallback, never
+      worse than the pre-fix behavior. If ``/proc`` visibility ever
+      tightens such that no descendant is visible, we degrade to the
+      prior bug rather than silently doing nothing.
+    """
+    if want_euid is None:
+        want_euid = os.geteuid()
+    if tree is None:
+        tree = _scan_proc_tree()
+
+    # BFS: build (pid, depth) list of root + its descendants.
+    children: dict[int, list[int]] = {}
+    for child, parent in tree.items():
+        children.setdefault(parent, []).append(child)
+
+    order: list[tuple[int, int]] = [(root_pid, 0)]
+    seen: set[int] = {root_pid}
+    i = 0
+    while i < len(order):
+        pid, depth = order[i]
+        i += 1
+        for child in children.get(pid, ()):
+            if child in seen:
+                continue
+            seen.add(child)
+            order.append((child, depth + 1))
+
+    best_named: Optional[tuple[int, int]] = None  # (depth, pid)
+    best_euid: Optional[tuple[int, int]] = None
+    for pid, depth in order:
+        euid = _proc_euid(pid)
+        if euid != want_euid:
+            continue
+        if name_hint and name_hint in _proc_cmdline(pid):
+            if best_named is None or depth > best_named[0]:
+                best_named = (depth, pid)
+        if best_euid is None or depth > best_euid[0]:
+            best_euid = (depth, pid)
+
+    if best_named is not None:
+        return best_named[1]
+    if best_euid is not None:
+        return best_euid[1]
+    return root_pid
+
+
 # ---------- wake-file freshness ----------
 
 
@@ -346,6 +500,18 @@ def is_stuck(
             return Decision.ORPHAN_LOCK
         return Decision.IDLE
     threshold = stale_threshold_seconds(cadence)
+    # Anchor staleness to the live process's own start: if the newest
+    # wake file we found predates *this* process's lifetime, it's a
+    # carry-over from a prior thinker (container restart leaving the
+    # bind-mounted /state/worker + today's thoughts dir intact, or a
+    # leftover from several cadence cycles ago). Not evidence about
+    # this process; treat as if it hasn't written anything yet and
+    # fall through to the no-wake-file classifier, which already has
+    # the right young-vs-old-process semantics.
+    if wake_age is not None:
+        proc_age = _proc_age_seconds(pid)
+        if proc_age is not None and wake_age > proc_age:
+            wake_age = None
     # No wake file at all is *not* automatically stuck — a fresh thinker
     # process that has yet to write its first wake file looks indistinguishable
     # from a hung one. We treat that as "working" until the threshold has
@@ -386,14 +552,25 @@ def _classify_no_wake_file(pid: int, threshold: int) -> Decision:
 
 def _kill(pid: int, sig: int) -> bool:
     """Best-effort ``os.kill``. Returns False if the process was already
-    gone — that's a normal race, not an error."""
+    gone or if we lack permission — both are recoverable by letting the
+    watchdog log and skip, rather than crashing the whole tick.
+
+    ``PermissionError`` should not happen once :func:`find_signal_target`
+    has resolved the alice-owned descendant; catching it here is a belt-
+    and-suspenders diagnostic for the edge case where ``/proc`` visibility
+    tightens enough that the resolver falls back to the root pid.
+    """
     try:
         os.kill(pid, sig)
         return True
     except ProcessLookupError:
         return False
+    except PermissionError:
+        return False
     except OSError as exc:
         if exc.errno == errno.ESRCH:
+            return False
+        if exc.errno == errno.EPERM:
             return False
         raise
 
@@ -447,7 +624,24 @@ def intervene(
     started = now()
     sigterm_sent = kill(pid, signal.SIGTERM)
     if not sigterm_sent:
-        # Process was already gone before we could SIGTERM it.
+        # kill() returned False for one of two reasons: the process is
+        # already gone (the normal race window), or we lack permission
+        # to signal it (:func:`_kill` catches PermissionError as a
+        # recoverable case rather than crashing the tick). Check
+        # proc_alive to tell them apart so the telemetry record is
+        # accurate — the python pid resolver should make the permission
+        # path effectively unreachable, but when it fires we want a
+        # clean diagnostic rather than another "process exited" false
+        # positive.
+        if proc_alive(pid):
+            return {
+                "sigterm_sent": False,
+                "sigterm_sufficient": False,
+                "sigkill_sent": False,
+                "elapsed_seconds": 0.0,
+                "exited": False,
+                "permission_denied": True,
+            }
         return {
             "sigterm_sent": False,
             "sigterm_sufficient": True,
@@ -552,25 +746,34 @@ def run_tick(
     lock_exists = lock_path.exists()
     cadence = current_cadence_seconds(state_dir)
     threshold = stale_threshold_seconds(cadence)
+    # Resolve the root (lock-holder) pid to the actual alice-owned
+    # python worker pid. See :func:`find_signal_target`'s docstring for
+    # the full rationale; the short version is that the lock holder is
+    # root-owned (``flock`` runs before ``s6-setuidgid`` + ``timeout``
+    # forks to uid=alice), so signaling it fails with PermissionError
+    # on every intervention. ``target_pid`` is what flows into
+    # ``is_stuck``'s staleness check, ``_read_wchan``, ``intervene``,
+    # and the ``thinker_watchdog_intervention`` telemetry record.
+    target_pid = find_signal_target(pid) if pid is not None else None
     wake_path, wake_age = wake_file_age(mind, today=today, now=now)
-    decision = is_stuck(pid, wake_age, cadence, lock_exists=lock_exists)
+    decision = is_stuck(target_pid, wake_age, cadence, lock_exists=lock_exists)
 
     state = WatchdogState(
         decision=decision,
-        pid=pid,
+        pid=target_pid,
         cadence_seconds=cadence,
         stale_threshold_seconds=threshold,
         wake_file=wake_path,
         wake_file_age_seconds=wake_age,
-        wchan=_read_wchan(pid) if pid is not None else None,
+        wchan=_read_wchan(target_pid) if target_pid is not None else None,
     )
 
-    if decision == Decision.STUCK and pid is not None:
-        timeline = intervene(pid)
+    if decision == Decision.STUCK and target_pid is not None:
+        timeline = intervene(target_pid)
         _append_event(
             events_log,
             {
-                "pid": pid,
+                "pid": target_pid,
                 "wchan": state.wchan,
                 "wake_file": str(wake_path) if wake_path else None,
                 "wake_file_age_seconds": wake_age,
