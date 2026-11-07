@@ -386,9 +386,9 @@ import React, {useEffect, useLayoutEffect, useReducer, useRef, useState} from "r
 import {createRoot} from "react-dom/client";
 import {
   ACCEPT, CHAT_PAGE_SIZE, attachmentName, chatTextToHtml, chatRowKey, earliestAt,
-  HIGHLIGHT_MS, imageFilesFromClipboard, isNearBottom, isNearTop,
-  messageAnchorId, MORE_REACTS, parseMessageHash, permalinkFor, QUICK_REACTS,
-  quoteForReply, reactionsSignature, readAsBase64, replyPreview,
+  formatMessageTime, HIGHLIGHT_MS, imageFilesFromClipboard, isNearBottom,
+  isNearTop, messageAnchorId, MORE_REACTS, parseMessageHash, permalinkFor,
+  QUICK_REACTS, quoteForReply, reactionsSignature, readAsBase64, replyPreview,
   shouldSubmitOnKey, summarizeReactions, validateAttachment,
 } from "./chat-ux.js";
 const h = React.createElement;
@@ -1381,7 +1381,8 @@ function ChatMessage({m, reactions, quoted}) {
         onClick: () => react(r.emoji),
       }, r.emoji + " " + r.count))) : null,
     h("small", null,
-      (m.from === "jason" ? "You" : "Alice") + " · " + (m.at || ""),
+      (m.from === "jason" ? "You" : "Alice") + " · ",
+      m.at ? h("time", {dateTime: m.at, title: m.at}, formatMessageTime(m.at)) : null,
       statusIcon ? " · " : null,
       statusIcon,
     ),
@@ -1413,7 +1414,10 @@ function WorkingGroup({group}) {
         "data-testid": "working-step",
       }, st.label)),
     ),
-    h("small", null, "Alice · " + (group.at || "")),
+    h("small", null,
+      "Alice · ",
+      group.at ? h("time", {dateTime: group.at, title: group.at}, formatMessageTime(group.at)) : null,
+    ),
   );
 }
 

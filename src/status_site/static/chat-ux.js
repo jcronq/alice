@@ -31,6 +31,18 @@ export function chatRowKey(m) {
   return (m.from || "") + "|" + (m.at || "") + "|" + (m.text || "");
 }
 
+// Display text for a message/group timestamp: "3:44 PM" for today, with a
+// "Nov 5" date prefix once the message is from a prior day. Returns "" for
+// an unparsable/missing ``at`` so callers can skip rendering the <time>.
+export function formatMessageTime(at, now = new Date()) {
+  const t = Date.parse(at || "");
+  if (Number.isNaN(t)) return "";
+  const d = new Date(t);
+  const time = d.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+  if (d.toDateString() === now.toDateString()) return time;
+  return d.toLocaleDateString([], {month: "short", day: "numeric"}) + ", " + time;
+}
+
 // ``at`` of the earliest real (non working-group) message with a parsable
 // timestamp, or null — the cursor for the next ``?before=`` fetch.
 export function earliestAt(rows) {
