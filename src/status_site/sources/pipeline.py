@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from alice_forge.review_queue_renderer import _coerce_repos, _load_config, gh
+from status_site.sources import db_readers as _db_readers
 
 log = logging.getLogger("status_site.pipeline")
 
@@ -144,7 +145,17 @@ def fetch_issues(
     ``updated_at`` (raw ISO-8601 from ``updatedAt``) so the review-note
     synthesis step (:func:`ensure_review_notes`) can run off the same
     fetch without re-querying.
+
+    Source selection: the ``STATUS_SITE_READ_FROM`` env flag picks
+    between ``db`` (default; reads ``alice-state.db``) and ``gh``
+    (the pre-#790 subprocess path). ``runner`` is still honoured when
+    set — explicit test wiring overrides the flag so the subprocess
+    path can be exercised regardless of the env default (see
+    issue #790 Step 3).
     """
+    if runner is None and _db_readers.read_from() == _db_readers.MODE_DB:
+        return _db_readers.fetch_issues_from_db(repos)
+
     rows: list[dict] = []
     failed: list[str] = []
     for repo in repos:
