@@ -26,6 +26,7 @@ from typing import Optional, Sequence
 from .task_store import (
     InvalidState,
     InvalidTransition,
+    ReindexReport,
     TaskNotFound,
     TaskRecord,
     TaskStore,
@@ -158,6 +159,23 @@ def _build_parser() -> argparse.ArgumentParser:
     # ---- view
     pv = sub.add_parser("view", help="Print task.yaml + transitions.jsonl.")
     pv.add_argument("id", help="Task id (task-NNNN).")
+
+    # ---- reindex
+    pr = sub.add_parser(
+        "reindex",
+        help=(
+            "Rebuild index.jsonl from task-*/task.yaml. "
+            "Use --dry-run to preview changes."
+        ),
+    )
+    pr.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Print the diff (added/removed/changed/errors) without "
+            "writing index.jsonl."
+        ),
+    )
 
     # ---- close
     pcl = sub.add_parser(
@@ -297,6 +315,60 @@ def _cmd_view(store: TaskStore, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_reindex(store: TaskStore, args: argparse.Namespace) -> int:
+    """Rebuild ``index.jsonl`` from ``task-*/task.yaml``.
+
+    Issue #781: index.jsonl had 608 lines while the task store held
+    912 directories — ~33% miss rate. This subcommand walks the store
+    and rewrites the index atomically, flagging any malformed task
+    directories to stderr.
+
+    Exit codes:
+        0 — reindex ran cleanly (even if dry-run); zero errors.
+        6 — reindex ran but some task.yaml files were missing/malformed.
+            Operators should investigate the stderr output.
+    """
+    report: ReindexReport = store.reindex(dry_run=args.dry_run)
+
+    # Errors go to stderr unconditionally. #781 requires that
+    # orphan/malformed task directories are flagged — never silently
+    # dropped from the rebuild.
+    for err in report.errors:
+        print(
+            f"error: {err['id']}: {err['reason']} ({err['path']})",
+            file=sys.stderr,
+        )
+
+    if args.json:
+        print(json.dumps(report.to_dict(), sort_keys=False))
+    else:
+        verb = "would write" if args.dry_run else "wrote"
+        print(
+            f"reindex: scanned={report.scanned} {verb}={report.written} "
+            f"errors={len(report.errors)} "
+            f"added={len(report.added)} removed={len(report.removed)} "
+            f"changed={len(report.changed)}"
+        )
+        if args.dry_run:
+            # The operator-facing diff. Capped per bucket so a
+            # pathological case (hundreds added) doesn't spam the
+            # terminal; the --json path still carries the full lists.
+            def _preview(label: str, ids: list[str]) -> None:
+                if not ids:
+                    return
+                head = ids[:20]
+                suffix = "" if len(ids) == len(head) else f" (+{len(ids) - len(head)} more)"
+                print(f"  {label}: {', '.join(head)}{suffix}")
+
+            _preview("added", report.added)
+            _preview("removed", report.removed)
+            _preview("changed", report.changed)
+
+    # Non-zero exit when we found malformed/missing task.yaml files so
+    # schedulers and operators notice. A clean dry-run still returns 0.
+    return 6 if report.errors else 0
+
+
 def _cmd_close(store: TaskStore, args: argparse.Namespace) -> int:
     record = store.close(
         args.id,
@@ -314,6 +386,7 @@ _HANDLERS = {
     "list": _cmd_list,
     "view": _cmd_view,
     "close": _cmd_close,
+    "reindex": _cmd_reindex,
 }
 
 
