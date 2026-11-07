@@ -116,6 +116,7 @@ class FakeAPI:
         self.issues: list[dict] = []
         self.issue_thread_comments: dict[int, list[dict]] = {}
         self.calls: list[str] = []
+        self.closed_by: dict[int, str] = {}
 
     def __call__(self, path: str):
         self.calls.append(path)
@@ -138,6 +139,10 @@ class FakeAPI:
             if n in issue_numbers:
                 return self.issue_thread_comments.get(n, [])
             return self.pr_conversation_comments.get(n, [])
+        if "/issues/" in path and path.split("/issues/")[1].isdigit():
+            n = int(path.split("/issues/")[1])
+            login = self.closed_by.get(n)
+            return {"closed_by": {"login": login} if login else None}
         if "/check-runs" in path:
             sha = path.split("/commits/")[1].split("/")[0]
             return {"check_runs": self.check_runs.get(sha, [])}
@@ -352,6 +357,30 @@ def test_rate_limit_403_not_classified_as_auth_failure() -> None:
         args=["gh", "api", "repos/acme/widgets/issues"],
     )
     assert err.looks_like_auth_failure is False
+
+
+def test_rate_limit_error_detected_via_looks_like_rate_limit() -> None:
+    """Issue #786 M4 — watcher's GHCommandError now exposes
+    ``looks_like_rate_limit`` so the shared backoff observer can tell
+    whether to record a hit without a secondary type cascade."""
+    err = gh_watcher.GHCommandError(
+        returncode=1,
+        stderr='HTTP 403: {"message":"API rate limit exceeded"}',
+        args=["gh", "api", "x"],
+    )
+    assert err.looks_like_rate_limit is True
+
+    err_secondary = gh_watcher.GHCommandError(
+        returncode=1,
+        stderr="You have exceeded a secondary rate limit.",
+        args=["gh", "api", "x"],
+    )
+    assert err_secondary.looks_like_rate_limit is True
+
+    err_other = gh_watcher.GHCommandError(
+        returncode=1, stderr="HTTP 404: not found", args=["gh", "api", "x"]
+    )
+    assert err_other.looks_like_rate_limit is False
 
 
 def test_bad_credentials_403_still_classified_as_auth_failure() -> None:
@@ -867,9 +896,7 @@ def test_own_authored_comments_suppressed_but_marked_seen(
     api.pr_conversation_comments[5] = [
         _comment(9001, user="alice", body="pushed a fix")
     ]
-    api.issue_thread_comments[12] = [
-        _comment(9002, user="Alice", body="working on it")
-    ]
+    api.issue_thread_comments[12] = [_comment(9002, user="Alice", body="working on it")]
     _prime(mind_dir, state_path, api)
 
     assert _notes(mind_dir) == []
@@ -914,9 +941,7 @@ def test_non_own_non_sm_activity_still_emitted(
     api.issue_thread_comments[12] = []
     _prime(mind_dir, state_path, api)
 
-    api.issues.append(
-        _make_issue(number=13, user="jcronq", author_association="OWNER")
-    )
+    api.issues.append(_make_issue(number=13, user="jcronq", author_association="OWNER"))
     api.issue_thread_comments[13] = []
     api.pr_conversation_comments[5] = [
         _comment(9201, user="jcronq", body="looks good, see [SM] above")
@@ -1013,9 +1038,7 @@ def test_labeler_fires_on_fresh_trusted_new_issue(
     # Prime pass — labeler must not fire because no new_issue event.
     assert labeler.calls == []
 
-    api.issues = [
-        _make_issue(number=247, title="Real issue", user="jcronq", labels=[])
-    ]
+    api.issues = [_make_issue(number=247, title="Real issue", user="jcronq", labels=[])]
     api.issue_thread_comments[247] = []
     gh_watcher.run(
         mind_dir=mind_dir,
@@ -1073,9 +1096,7 @@ def test_labeler_skips_when_issue_already_has_sm_label(
     assert "sm:needs_study" in names and "bug" in names
 
     # Direct check on the real production helper: same input ⇒ no apply.
-    assert (
-        gh_watcher._apply_sm_draft_label("acme/widgets", 260, names) is False
-    )
+    assert gh_watcher._apply_sm_draft_label("acme/widgets", 260, names) is False
 
 
 def test_labeler_gates_still_suppress(
@@ -1107,9 +1128,7 @@ def test_labeler_gates_still_suppress(
 
     # Case 2 — untrusted author: a rando-opened issue is never labeled.
     api.issues = [
-        _make_issue(
-            number=2, title="Rando", user="rando", author_association="NONE"
-        )
+        _make_issue(number=2, title="Rando", user="rando", author_association="NONE")
     ]
     api.issue_thread_comments[2] = []
     gh_watcher.run(
@@ -1142,9 +1161,7 @@ def test_labeler_gates_still_suppress(
 
     # Case 4 — closed issue: the ``new_state == "open"`` guard keeps closed
     # issues out of the SM lifecycle even when trusted and unlabeled.
-    api.issues = [
-        _make_issue(number=4, title="Closed", user="jcronq", state="closed")
-    ]
+    api.issues = [_make_issue(number=4, title="Closed", user="jcronq", state="closed")]
     api.issue_thread_comments[4] = []
     gh_watcher.run(
         mind_dir=mind_dir,
@@ -1185,9 +1202,7 @@ def test_labeler_backfills_preexisting_open_issue(
     labeler = FakeLabeler()
 
     # Prime: the issue is already open (a pre-existing backlog ticket).
-    api.issues = [
-        _make_issue(number=17, title="Pre-existing backlog", user="jcronq")
-    ]
+    api.issues = [_make_issue(number=17, title="Pre-existing backlog", user="jcronq")]
     api.issue_thread_comments[17] = []
     gh_watcher.run(
         mind_dir=mind_dir,
@@ -1317,6 +1332,7 @@ def test_new_pr_writes_to_events_not_notes(
     assert row["ts"], "ts must be present"
     # Timestamp is a parseable ISO-8601 with tz offset.
     import datetime as _dt
+
     assert _dt.datetime.fromisoformat(row["ts"]).utcoffset() is not None
     assert row["body"].strip(), "body must not be empty"
     assert "Fresh PR" in row["body"]
@@ -1413,9 +1429,7 @@ def test_issue_state_writes_to_events_not_notes(
     )
 
     api.issues = [
-        _make_issue(
-            number=55, title="Track something", user="jcronq", state="closed"
-        )
+        _make_issue(number=55, title="Track something", user="jcronq", state="closed")
     ]
     api.issue_thread_comments[55] = []
     gh_watcher.run(
@@ -1701,3 +1715,27 @@ def test_design_review_ignores_untrusted_design_ready_comment(
     ]
     _run(mind_dir, state_path, api)
     assert not _decide_note(mind_dir).exists()
+
+
+def test_own_pr_close_and_own_reviews_suppressed(
+    mind_dir: pathlib.Path, state_path: pathlib.Path
+) -> None:
+    api = FakeAPI()
+    api.pulls = [_make_pr(number=7, user="jcronq"), _make_pr(number=8, user="jcronq")]
+    _prime(mind_dir, state_path, api)
+
+    api.pulls = [
+        _make_pr(number=7, user="jcronq", state="closed"),
+        _make_pr(number=8, user="jcronq", state="closed"),
+    ]
+    api.closed_by = {7: "alice", 8: "jcronq"}
+    api.reviews[7] = [
+        {"id": 1, "user": {"login": "alice"}, "state": "COMMENTED", "body": "x"}
+    ]
+    api.review_comments[7] = [{"id": 2, "user": {"login": "alice"}, "body": "y"}]
+    _prime(mind_dir, state_path, api)
+
+    assert _notes(mind_dir) == []
+    events = (mind_dir / "memory" / "events.jsonl").read_text()
+    assert "#8" in events
+    assert "#7" not in events

@@ -19,6 +19,10 @@ from pathlib import Path
 
 MAX_EMOJI_CHARS = 16
 
+# Reactions meaning "please look at this message" (issue #683). Anything
+# else (👍 ❤️ 🎉 ...) is a silent ack and drops no surface.
+ATTENTION_EMOJI: frozenset = frozenset({"👀", "⚠️", "👎", "❓"})
+
 
 def valid_emoji(value: object) -> bool:
     """A short, non-blank string with no whitespace or control characters."""

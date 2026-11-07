@@ -17,6 +17,8 @@ them under their old private names for back-compat with
 
 from __future__ import annotations
 
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from status_site.a2ui import (
@@ -100,6 +102,49 @@ def format_pricing_segment(estimate_usd: str, actual_usd: str) -> str:
 # ─── A2UI builders ───────────────────────────────────────────────────
 
 
+STALE_REVIEW_DAYS = 3
+
+
+def _age(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 3600:
+        return f"{seconds // 60}m ago"
+    if seconds < 86400:
+        return f"{seconds // 3600}h ago"
+    return f"{seconds // 86400}d ago"
+
+
+def _parse_ts(raw: str) -> float | None:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _meta_line(bucket_key: str, bug: dict, now: float) -> tuple[str, bool]:
+    """Muted meta text (reported age, updated age, severity) + stale flag."""
+    bits: list[str] = []
+    reported = _parse_ts(bug.get("reported_at", ""))
+    if reported is not None:
+        bits.append(f"reported {_age(now - reported)}")
+    updated = bug.get("updated_ts")
+    if updated:
+        bits.append(f"updated {_age(now - updated)}")
+    if bug.get("severity"):
+        bits.append(f"severity: {bug['severity']}")
+    stale = False
+    if bucket_key == "waiting-on-review":
+        since = updated or reported
+        stale = bool(since) and now - since > STALE_REVIEW_DAYS * 86400
+    return " · ".join(bits), stale
+
+
 def _bug_row(bucket_key: str, prefix: str, bug: dict) -> dict:
     """One bug's typed row for the data model.
 
@@ -116,7 +161,10 @@ def _bug_row(bucket_key: str, prefix: str, bug: dict) -> dict:
     pricing_segment = format_pricing_segment(
         bug.get("estimate_usd", ""), bug.get("actual_usd", "")
     )
+    meta, stale = _meta_line(bucket_key, bug, time.time())
     return {
+        "meta": meta,
+        "stale": stale,
         "id": f"bug-{bug['report_id']}",
         "report_id": bug["report_id"],
         "title": f"{prefix}bug-{bug['report_id']} — {bug['title']}",
@@ -184,12 +232,23 @@ def build_envelopes(status_dir: Path) -> list[dict]:
         section_rows.append({"key": key, "heading": heading, "rows": rows})
 
     totals = sum_pricing(buckets)
-    if totals["estimate"] > 0 or totals["actual"] > 0:
+    priced = sum(
+        1
+        for items in buckets.values()
+        for b in items
+        if (b.get("estimate_usd") or b.get("actual_usd") or "").strip()
+        not in ("", "null", "None")
+    )
+    # Hide when the footer would just repeat a single row's pill.
+    if priced > 1 and (totals["estimate"] > 0 or totals["actual"] > 0):
         delta = totals["actual"] - totals["estimate"]
         pipeline: dict | None = {
             "estimate": format_usd_local(totals["estimate"]),
             "actual": format_usd_local(totals["actual"]),
             "delta": format_usd_local(delta),
+            "count": priced,
+            "overrun": totals["estimate"] > 0
+            and totals["actual"] > 2 * totals["estimate"],
         }
     else:
         pipeline = None

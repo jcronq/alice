@@ -111,7 +111,7 @@ def test_react_shows_pill_and_updates_sidecar(page):
     pill = msg.locator('[data-testid="react-pill"]')
     pill.wait_for()
     assert pill.inner_text().strip() == "👍 1"
-    events = [json.loads(l) for l in cfg.chat_reactions_log.read_text().splitlines()]
+    events = [json.loads(ln) for ln in cfg.chat_reactions_log.read_text().splitlines()]
     assert [(e["at"], e["emoji"], e["action"]) for e in events] == [(NEW, "👍", "add")]
     pill.click()  # clicking your own pill removes it
     pg.wait_for_function(f"!document.getElementById('msg-{NEW}').querySelector('[data-testid=react-pill]')")
@@ -139,7 +139,7 @@ def test_reply_prefills_composer_and_sends_reply_to(page):
     ta.type("agreed")
     pg.locator(".a2ui-composer-send button").click()
     pg.wait_for_function("document.querySelectorAll('.msg').length > 41")
-    last = [json.loads(l) for l in cfg.chat_log.read_text().splitlines()][-1]
+    last = [json.loads(ln) for ln in cfg.chat_log.read_text().splitlines()][-1]
     assert last["reply_to"] == MID and last["text"].endswith("agreed")
 
 

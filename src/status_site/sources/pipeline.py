@@ -124,7 +124,7 @@ def classify_issue(issue: dict) -> tuple[str, str] | None:
     if not states:
         return None
     state = max(states, key=_STATE_RANK.__getitem__)
-    art = next((l[len("art:"):] for l in sorted(labels) if l.startswith("art:")), "")
+    art = next((lb[len("art:"):] for lb in sorted(labels) if lb.startswith("art:")), "")
     return state, art
 
 
@@ -273,6 +273,8 @@ def review_item_row(item: object, *, state: str = "") -> dict:
         "art": "",
         "link": get("url", "") or "",
         "age_seconds": age_label_seconds(get("age", "")),
+        "author": get("author", "") or "",
+        "ci": get("ci", "") or "",
     }
 
 

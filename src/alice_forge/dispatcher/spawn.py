@@ -68,6 +68,53 @@ from alice_forge.dispatcher.errors import GHCommandError
 from alice_forge.dispatcher.gh import gh_post_comment
 from alice_forge.dispatcher.trust import _author_login, _current_sm_label, _label_names
 from alice_forge.dispatcher.types import PostCommentFn
+from alice_forge.rate_limit import (
+    DEFAULT_BACKOFF_PATH,
+    DEFAULT_MIN_CORE,
+    DEFAULT_MIN_GRAPHQL,
+    DeferDecision,
+    should_defer as _rate_limit_should_defer,
+)
+
+
+# ---------------------------------------------------------------------------
+# Issue #786 — rate-limit pre-flight gate
+# ---------------------------------------------------------------------------
+
+
+def rate_limit_gate(
+    worker_kind: str,
+    *,
+    min_core: int = DEFAULT_MIN_CORE,
+    min_graphql: int = DEFAULT_MIN_GRAPHQL,
+    backoff_path: pathlib.Path = DEFAULT_BACKOFF_PATH,
+    should_defer: Callable[..., DeferDecision] = _rate_limit_should_defer,
+    log: Callable[[str], None] = lambda s: None,
+) -> DeferDecision:
+    """Return the fan-out gate decision for a worker-spawn call.
+
+    Reads the shared backoff file at :data:`DEFAULT_BACKOFF_PATH` — a
+    fast local filesystem check, no network. If another process has
+    recorded a 429 within the current window, OR the cached
+    ``remaining`` numbers are below the safety floor, returns a
+    :class:`DeferDecision` with ``defer=True``; the caller aborts the
+    spawn.
+
+    Keeps each spawn_* function's body small — a single call at the
+    top guards the whole fan-out. The ``worker_kind`` label flows into
+    the log line so an operator grepping ``speaking.log`` can see which
+    lane got throttled.
+
+    Tests inject a fake ``should_defer`` to force defer/pass without
+    touching the real backoff file.
+    """
+    decision = should_defer(min_core=min_core, min_graphql=min_graphql, path=backoff_path)
+    if decision.defer:
+        log(
+            f"[sm-dispatcher] rate-limit gate deferred {worker_kind} spawn: "
+            f"{decision.reason} (retry in ~{decision.retry_after_s:.0f}s)"
+        )
+    return decision
 
 
 def _current_spawn_map() -> dict[tuple[str, str], dict[str, str]]:
@@ -777,6 +824,7 @@ def spawn_agent(
     log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
     clock: Callable[[], float] = None,  # type: ignore[assignment]
     new_session_id: Callable[[], str] = lambda: str(uuid.uuid4()),
+    rate_gate: Callable[..., DeferDecision] | None = rate_limit_gate,
 ) -> str | None:
     """Spawn a detached ``claude`` agent for an SM issue.
 
@@ -821,6 +869,15 @@ def spawn_agent(
             f"number: {number!r}"
         )
         return None
+
+    # Issue #786 M3 — rate-limit pre-flight gate. If another process
+    # observed a 429 (or the quota is below the floor), defer this spawn.
+    # The next dispatcher cadence will retry. ``rate_gate=None`` is the
+    # test escape hatch.
+    if rate_gate is not None:
+        decision = rate_gate("sm-code-worker", log=log)
+        if decision.defer:
+            return None
 
     if claude_bin is None:
         claude_bin = resolve_claude_bin()
@@ -965,6 +1022,7 @@ def spawn_rebase_agent(
     log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
     clock: Callable[[], float] = None,  # type: ignore[assignment]
     new_session_id: Callable[[], str] = lambda: str(uuid.uuid4()),
+    rate_gate: Callable[..., DeferDecision] | None = rate_limit_gate,
 ) -> str | None:
     """Spawn a detached ``claude`` worker to resolve a merge conflict.
 
@@ -991,6 +1049,12 @@ def spawn_rebase_agent(
             f"number: {number!r}"
         )
         return None
+
+    # Issue #786 M3 — rate-limit pre-flight gate.
+    if rate_gate is not None:
+        decision = rate_gate("sm-rebase-worker", log=log)
+        if decision.defer:
+            return None
 
     if claude_bin is None:
         claude_bin = resolve_claude_bin()
@@ -1145,6 +1209,7 @@ def spawn_thinking_agent(
     log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
     clock: Callable[[], float] | None = None,
     new_session_id: Callable[[], str] = lambda: str(uuid.uuid4()),
+    rate_gate: Callable[..., DeferDecision] | None = rate_limit_gate,
 ) -> str | None:
     """Spawn a per-issue thinking-agent for an SM issue.
 
@@ -1189,6 +1254,12 @@ def spawn_thinking_agent(
             f"non-integer issue number: {number!r}"
         )
         return None
+
+    # Issue #786 M3 — rate-limit pre-flight gate.
+    if rate_gate is not None:
+        decision = rate_gate("sm-thinking-agent", log=log)
+        if decision.defer:
+            return None
 
     if python_bin is None:
         python_bin = resolve_python_bin()
@@ -1376,6 +1447,7 @@ def spawn_speaking_agent(
     log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
     clock: Callable[[], float] | None = None,
     new_session_id: Callable[[], str] = lambda: str(uuid.uuid4()),
+    rate_gate: Callable[..., DeferDecision] | None = rate_limit_gate,
 ) -> str | None:
     """Spawn a per-issue speaking-agent for the build phase of an SM issue.
 
@@ -1424,6 +1496,12 @@ def spawn_speaking_agent(
             f"non-integer issue number: {number!r}"
         )
         return None
+
+    # Issue #786 M3 — rate-limit pre-flight gate.
+    if rate_gate is not None:
+        decision = rate_gate("sm-speaking-agent", log=log)
+        if decision.defer:
+            return None
 
     if python_bin is None:
         python_bin = resolve_python_bin()
@@ -1588,6 +1666,7 @@ def spawn_design_reviewer_agent(
     log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
     clock: Callable[[], float] | None = None,
     new_session_id: Callable[[], str] = lambda: str(uuid.uuid4()),
+    rate_gate: Callable[..., DeferDecision] | None = rate_limit_gate,
 ) -> str | None:
     """Spawn a per-issue design-reviewer for an sm:design_review issue.
 
@@ -1616,6 +1695,12 @@ def spawn_design_reviewer_agent(
             f"non-integer issue number: {number!r}"
         )
         return None
+
+    # Issue #786 M3 — rate-limit pre-flight gate.
+    if rate_gate is not None:
+        decision = rate_gate("sm-design-reviewer", log=log)
+        if decision.defer:
+            return None
 
     if python_bin is None:
         python_bin = resolve_python_bin()
