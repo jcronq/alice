@@ -3,7 +3,28 @@
 
 from __future__ import annotations
 
+import os
+
 from alice_forge.sm.legacy.handlers._common import *  # noqa: F401, F403
+
+
+#: Env flag forcing just the Phase 1.6 sweep into dry-run mode even when
+#: the dispatcher's ``dry_run`` is False. Issue #784 ships this on by
+#: default for the first week so operators can diff old vs new labelling
+#: decisions before acting. Flip ``SM_SWEEPER_SAFE_MODE=0`` to act.
+_SWEEPER_SAFE_MODE_ENV = "SM_SWEEPER_SAFE_MODE"
+_SWEEPER_SAFE_MODE_DEFAULT = "1"
+
+
+def _safe_mode_enabled() -> bool:
+    """Return True when the sweeper should operate in dry-run-only mode
+    regardless of the dispatcher's ``dry_run`` flag (issue #784).
+
+    Reads :data:`_SWEEPER_SAFE_MODE_ENV` at call time so an operator can
+    flip it between runs without a restart.
+    """
+    raw = (os.environ.get(_SWEEPER_SAFE_MODE_ENV, _SWEEPER_SAFE_MODE_DEFAULT) or "").strip().lower()
+    return raw not in {"0", "false", "no", "off", ""}
 
 
 def _process_stale_closed(
@@ -18,29 +39,39 @@ def _process_stale_closed(
     master_ci_status: MasterCIStatusFn,
     dry_run: bool,
     log: Callable[[str], None],
+    find_open_linked_prs: "Callable[[str, int], list[int]] | None" = None,
 ) -> None:
     """Phase 1.6 sweep: route a closed issue with a non-terminal ``sm:*``
     label to its correct terminal state.
 
     The issue is already closed — we never re-open and we never close
     further; only labels and the ``[SM] transition`` audit comment are
-    written. Decision tree:
+    written. Decision tree (issue #784 — the merged-PR branch no
+    longer depends on master CI color):
 
-      * linked PR merged + master CI green → ``sm:done``
-      * linked PR merged + master CI red   → ``sm:rejected``
-        (the merge happened but broke master; the work shipped-but-bad
-        and downstream tracking should treat it as rejected pending
-        follow-up.)
-      * linked PR closed-unmerged          → ``sm:rejected``
+      * linked PR merged                   → ``sm:done``
+        (work shipped; downstream CI color at merge time is a property
+        of master, not of this PR's own diff. CI remediation runs on a
+        separate loop — see watcher #782 — and doesn't belong in a
+        per-issue close verdict.)
+      * linked PR closed-unmerged, no open follow-up PR → ``sm:rejected``
+      * linked PR closed-unmerged, open follow-up PR present → wait
+        (another attempt is in flight; the sweeper leaves the stale
+        label alone and re-evaluates on the next cadence.)
       * no linked PR at all                → ``sm:rejected``
         (manual close or supersession — there's no merge artifact, so
         the safe terminal state is rejected.)
 
-    A pending master CI verdict is treated as "wait" — we stay at the
-    stale label and let the next pass re-evaluate. This keeps the
-    sweep idempotent under flaky CI: we'd rather leave a stale label
-    one more cadence than commit to ``sm:done`` before the build is
-    actually green.
+    ``find_open_linked_prs`` (issue #784): optional callable returning
+    the list of OPEN PR numbers that close this issue. When None (the
+    legacy default), the "open follow-up" check is skipped and
+    closed-unmerged always resolves to ``sm:rejected``.
+
+    Safe-mode (issue #784): when :envvar:`SM_SWEEPER_SAFE_MODE` is
+    truthy (default on), the handler forces a dry-run even if the
+    dispatcher is acting. The intended rollout is ``safe_mode=on`` for
+    the first week post-merge so operators can audit the label-change
+    counters before enabling live writes.
     """
     number = issue["number"]
     stale_label = _current_sm_label(issue)
@@ -105,39 +136,73 @@ def _process_stale_closed(
                     f"PR #{pr_number} reports MERGED but no merge_commit_oid"
                 )
                 return
+            # Issue #784: a merged PR is always ``sm:done``, regardless
+            # of master CI color. The CI verdict reflects the state of
+            # master, not of this PR's own diff — pre-existing master
+            # red cascades to every merged PR and was silently killing
+            # completed work (see #613, #614, #616, #617, #618, #620,
+            # #621, #656). CI remediation runs on a separate watcher
+            # (#782) and doesn't belong in the close verdict.
+            #
+            # We still fetch CI status for logging/observability so the
+            # done-line records what the old code would have done.
+            legacy_would_reject = False
             try:
                 ci = master_ci_status(repo, sha)
             except GHCommandError as exc:
-                log(f"[sm-dispatcher] sweep: CI lookup failed for {sha[:8]}: {exc}")
+                log(
+                    f"[sm-dispatcher] sweep: CI lookup failed for "
+                    f"{sha[:8]}: {exc} — proceeding to sm:done anyway"
+                )
                 if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
                     raise
-                return
+                ci = {}
             conclusion = ci.get("conclusion")
-            if conclusion is None or conclusion == "pending":
-                # Hold the stale label one more cadence rather than
-                # commit to a terminal before CI returns a verdict.
-                log(
-                    f"[sm-dispatcher] sweep wait #{number}: "
-                    f"PR #{pr_number} merged but master CI is {conclusion!r}"
-                )
-                return
-            if conclusion == "success":
-                target_label = DONE_SM_LABEL
-                reason = (
-                    f"closed-by-merge sweep: PR #{pr_number} merged at {sha}, "
-                    f"master CI success ({pr_url})"
-                )
-            else:
-                # CI red post-merge: the work shipped but broke master.
-                # Downgrade to rejected so a human picks up the follow-up;
-                # we don't have the Phase 2 quality-gate plumbing yet.
+            if conclusion not in (None, "pending", "success"):
+                # The old code (pre-#784) would have labelled this
+                # sm:rejected. Count the delta so operators can audit
+                # the behaviour change via the done-line counter.
+                legacy_would_reject = True
+                report.sweep_merged_pr_legacy_would_reject += 1
+            target_label = DONE_SM_LABEL
+            reason = (
+                f"closed-by-merge sweep: PR #{pr_number} merged at {sha} "
+                f"({pr_url})"
+            )
+            if legacy_would_reject:
                 run_url = ci.get("run_url") or "<unknown>"
-                target_label = REJECTED_SM_LABEL
-                reason = (
-                    f"closed-by-merge sweep: PR #{pr_number} merged at {sha} "
-                    f"but master CI failure ({run_url})"
+                reason += (
+                    f" [master CI was {conclusion!r} at merge time "
+                    f"({run_url}); #784: PR-merge is authoritative, "
+                    f"treating as sm:done]"
                 )
         elif pr_state == "CLOSED":
+            # Issue #784: don't flip to sm:rejected while a follow-up
+            # PR for the same issue is still open — the work is in
+            # flight on a second attempt, let the sweeper re-evaluate
+            # next cadence once that PR lands or closes.
+            if find_open_linked_prs is not None:
+                try:
+                    open_followups = find_open_linked_prs(repo, number)
+                except GHCommandError as exc:
+                    log(
+                        f"[sm-dispatcher] sweep: follow-up lookup failed for "
+                        f"#{number}: {exc}"
+                    )
+                    if exc.looks_like_auth_failure or exc.looks_like_rate_limit:
+                        raise
+                    open_followups = []
+                open_followups = [
+                    n for n in open_followups if n != pr_number
+                ]
+                if open_followups:
+                    log(
+                        f"[sm-dispatcher] sweep wait #{number}: "
+                        f"PR #{pr_number} closed-unmerged but open follow-up "
+                        f"PR(s) in flight: {open_followups!r}"
+                    )
+                    report.sweep_wait_followup_in_flight += 1
+                    return
             target_label = REJECTED_SM_LABEL
             reason = f"PR #{pr_number} closed without merge"
         else:
@@ -153,9 +218,11 @@ def _process_stale_closed(
             return
 
     body = render_transition_comment(stale_label, target_label, reason)
-    if dry_run:
+    safe_mode = _safe_mode_enabled()
+    if dry_run or safe_mode:
+        mode = "DRY-RUN" if dry_run else "SAFE-MODE"
         log(
-            f"[sm-dispatcher] DRY-RUN would sweep #{number}: "
+            f"[sm-dispatcher] {mode} would sweep #{number}: "
             f"{stale_label} → {target_label} ({reason})"
         )
         report.swept += 1

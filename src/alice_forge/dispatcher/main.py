@@ -333,6 +333,7 @@ def run(
     edit_labels: EditLabelsFn = gh_edit_labels,
     close_issue: CloseIssueFn = gh_close_issue,
     find_linked_pr: FindLinkedPRFn = gh_find_linked_pr,
+    find_open_linked_prs: Callable[[str, int], list[int]] | None = None,
     pr_merge_status: PRMergeStatusFn = gh_get_pr_merge_status,
     pr_mergeable: PRMergeableFn | None = None,
     master_ci_status: MasterCIStatusFn = gh_get_master_ci_status,
@@ -1251,6 +1252,7 @@ def run(
                     master_ci_status=master_ci_status,
                     dry_run=dry_run,
                     log=log,
+                    find_open_linked_prs=find_open_linked_prs,
                 )
             except GHCommandError as exc:
                 fatal_exit = True

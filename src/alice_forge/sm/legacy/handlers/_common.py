@@ -88,6 +88,7 @@ from alice_forge.dispatcher.gh import (
     gh_close_issue,
     gh_edit_labels,
     gh_find_linked_pr,
+    gh_find_open_linked_prs,
     gh_find_unspawned_selected_issues,
     gh_get_issue,
     gh_get_master_ci_status,
@@ -226,6 +227,7 @@ __all__ = [
     "GHCommandError",
     # gh helpers
     "gh_close_issue", "gh_edit_labels", "gh_find_linked_pr",
+    "gh_find_open_linked_prs",
     "gh_find_unspawned_selected_issues", "gh_get_issue",
     "gh_get_master_ci_status", "gh_get_pr_files", "gh_get_pr_mergeable",
     "gh_get_pr_merge_status", "gh_list_issue_comments",
