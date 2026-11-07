@@ -240,6 +240,15 @@
   vertical-align: top;
   overflow-wrap: anywhere;
 }
+.fx-tbl tbody tr:hover {
+  background: color-mix(in srgb, var(--color-fg) 6%, transparent);
+}
+.fx-tbl td a {
+  text-decoration: none;
+}
+.fx-tbl td a:hover {
+  text-decoration: underline;
+}
 
 /* Pills --------------------------------------------------------------- */
 .fx-pill {

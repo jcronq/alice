@@ -14,9 +14,14 @@ What this entry point does today:
 2. Load ``memory_worker.*`` overrides from ``alice.config.json``.
 3. Replay the write-ahead journal so any in-flight mutation from a
    crashed prior wake is verified or skipped before new work runs.
-4. Emit a ``memory_worker_heartbeat`` event with the replay report
+4. Run Stage B/C/D + thalamus intake + SM v2 task-index reindex
+   (issue #781 — the task index drifts whenever ``task.yaml`` is
+   written out-of-band; this wake rebuilds the index on a 2h
+   sub-cadence, configurable via
+   ``memory_worker.task_reindex_interval_seconds``).
+5. Emit a ``memory_worker_heartbeat`` event with the replay report
    so operators can confirm the loop is firing.
-5. Exit 0. The s6 supervisor loop sleeps for ``cadence_minutes``
+6. Exit 0. The s6 supervisor loop sleeps for ``cadence_minutes``
    and fires us again.
 
 The B/C/D stage dispatch lives between steps 3 and 4 once those
@@ -32,8 +37,10 @@ import argparse
 import json
 import pathlib
 import sys
+import time
 from typing import Any
 
+from alice_state_db import derive as alice_state_db_derive
 from core.events import EventLogger
 
 from . import (
@@ -45,6 +52,14 @@ from . import (
     stage_d,
     thalamus,
 )
+
+# ``task reindex`` is run from this wake on a slower sub-cadence than
+# the main 30-min loop (default every 2h). The reindex is cheap (<1s
+# for ~900 tasks on local disk per #781 smoke test) but there's no
+# gain from running it every tick — the store only drifts when a
+# writer bypasses :mod:`alice_forge.task_store`. See issue #781.
+TASK_REINDEX_INTERVAL_SECONDS_DEFAULT = 2 * 60 * 60  # 2h
+TASK_REINDEX_STAMP_FILENAME = "task-reindex-last-ran"
 
 
 DEFAULT_MIND = pathlib.Path("/home/alice/alice-mind")
@@ -227,6 +242,53 @@ def main() -> int:
     # already reflected in the candidate set's frontmatter timestamps.
     synth = stage_d.run(mind, journal_path=journal_path)
 
+    # Phase 5: SM v2 task-index fsck / reindex (#781). The task store's
+    # ``index.jsonl`` drifts whenever a task.yaml is written by a
+    # crashed wake, hand-edited, or migrated — #781 observed a ~33%
+    # miss rate on a 912-task store. We rebuild the index on a 2h
+    # sub-cadence so the drift never grows into a day-scale backlog
+    # without demanding operator attention. See
+    # :func:`_maybe_reindex_tasks` for the gate and stamp-file logic.
+    reindex_result = _maybe_reindex_tasks(
+        mind=mind,
+        state_dir=pathlib.Path(args.state_dir),
+        cfg=cfg,
+    )
+
+    # Phase 6 (#789 PR 1): derive tasks + workers + events into
+    # ``inner/state/alice-state.db``. Runs after the reindex so the
+    # task index is current before the SQLite snapshot is written.
+    # Swallows derive-level errors so a pathological event line or
+    # permission snag can't take the memory-worker wake with it —
+    # the report is surfaced in the heartbeat event so operators
+    # can see the error count without reading logs.
+    try:
+        state_db_report = alice_state_db_derive.derive_tasks_workers_events(
+            mind
+        )
+    except Exception as exc:  # noqa: BLE001 — telemetry-only path
+        state_db_report = alice_state_db_derive.DeriveReport(
+            errors=[{"kind": "derive", "path": str(mind), "reason": str(exc)}]
+        )
+
+    # Phase 7 (#790 Step 1): SM v2 substrate seed — items +
+    # state_machine + transitions + amendments from the GH mirror
+    # and inner/tasks/. Runs AFTER ``derive_tasks_workers_events``
+    # so the task-level rows are fresh; the seed queries the same
+    # DB file and shares its WAL. Mirror-only mode (no live-gh
+    # fetcher wired in Step 1 — that moves in Step 2) keeps the
+    # memory-worker tick off the GH rate-limit budget.
+    try:
+        from alice_state_db import sm_seed as _sm_seed_mod
+
+        sm_seed_report = _sm_seed_mod.derive_sm_seed(mind)
+    except Exception as exc:  # noqa: BLE001 — telemetry-only path
+        from alice_state_db.sm_seed import SmSeedReport as _SmSeedReport
+
+        sm_seed_report = _SmSeedReport(
+            errors=[{"kind": "sm_seed", "path": str(mind), "reason": str(exc)}]
+        )
+
     # Heartbeat phase: precedence is the heaviest stage that actually
     # ran (D > C > B). ``stage_d.ran`` is True iff a pair was selected
     # this cycle — null-result outcomes still count, because Stage D
@@ -254,9 +316,93 @@ def main() -> int:
         stage_c_ran=bool(groom.ran),
         **{f"stage_d_{k}": v for k, v in synth.to_dict().items()},
         stage_d_ran=bool(synth.ran),
+        **{f"task_reindex_{k}": v for k, v in reindex_result.items()},
+        **{f"state_db_{k}": v for k, v in state_db_report.to_dict().items()},
+        **{f"sm_seed_{k}": v for k, v in sm_seed_report.to_dict().items()},
     )
 
     return 0
+
+
+def _maybe_reindex_tasks(
+    *,
+    mind: pathlib.Path,
+    state_dir: pathlib.Path,
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Run ``task reindex`` on a slow sub-cadence from the memory-worker.
+
+    Gated by a stamp file at ``state_dir / TASK_REINDEX_STAMP_FILENAME``;
+    the interval defaults to
+    :data:`TASK_REINDEX_INTERVAL_SECONDS_DEFAULT` but can be overridden
+    via ``memory_worker.task_reindex_interval_seconds`` in
+    ``alice.config.json``. Setting the override to ``0`` or a negative
+    number disables the hook entirely (the stamp is never written and
+    the status in the heartbeat is ``"disabled"``).
+
+    Returned dict is flattened into the heartbeat event with a
+    ``task_reindex_`` prefix so operators can grep for it in
+    events.jsonl without decoding a nested blob.
+    """
+    interval = int(
+        cfg.get(
+            "task_reindex_interval_seconds",
+            TASK_REINDEX_INTERVAL_SECONDS_DEFAULT,
+        )
+    )
+    if interval <= 0:
+        return {"ran": False, "status": "disabled"}
+
+    stamp_path = state_dir / TASK_REINDEX_STAMP_FILENAME
+    now = time.time()
+    if stamp_path.is_file():
+        try:
+            last = stamp_path.stat().st_mtime
+        except OSError:
+            last = 0.0
+        if now - last < interval:
+            return {
+                "ran": False,
+                "status": "throttled",
+                "seconds_until_due": int(interval - (now - last)),
+            }
+
+    # Import late so a broken task store can't wedge the memory-worker
+    # service startup — a reindex failure is contained to this phase.
+    try:
+        from alice_forge.task_store import TaskStore
+
+        tasks_dir = mind / "inner" / "tasks"
+        store = TaskStore(tasks_dir)
+        report = store.reindex()
+    except Exception as exc:  # noqa: BLE001 — never kill the wake
+        return {
+            "ran": True,
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    # Only bump the stamp on a successful run so a throttled interval
+    # doesn't suppress the next retry after a transient failure.
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        stamp_path.touch()
+    except OSError:
+        # Stamp-file write failure is non-fatal — the reindex succeeded
+        # and the next tick will retry the stamp. Worst case we reindex
+        # on every wake, which is still ~1s of work.
+        pass
+
+    return {
+        "ran": True,
+        "status": "ok" if not report.errors else "errors",
+        "scanned": report.scanned,
+        "written": report.written,
+        "errors": len(report.errors),
+        "added": len(report.added),
+        "removed": len(report.removed),
+        "changed": len(report.changed),
+    }
 
 
 if __name__ == "__main__":

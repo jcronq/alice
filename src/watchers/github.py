@@ -223,10 +223,7 @@ class GHCommandError(RuntimeError):
         # research/2026-07-23-gh-watcher-rate-limit-403-misdiagnosis.md
         # and research/2026-07-09-gh-watcher-rate-limit-root-cause.md.
         if self.returncode == 403 or "403" in msg:
-            if any(
-                n in msg
-                for n in ("rate limit", "rate-limit", "abuse detection")
-            ):
+            if any(n in msg for n in ("rate limit", "rate-limit", "abuse detection")):
                 return False
         return any(
             needle in msg
@@ -237,6 +234,27 @@ class GHCommandError(RuntimeError):
                 "requires authentication",
                 "must authenticate",
                 "auth login",
+            )
+        )
+
+    @property
+    def looks_like_rate_limit(self) -> bool:
+        """Mirror of ``dispatcher.errors.GHCommandError.looks_like_rate_limit``.
+
+        Issue #786 M4 — exposes the same property shape so
+        :func:`alice_forge.rate_limit.observe_gh_error` can instrument the
+        watcher's rate-limit path without a second type cascade. Matches
+        the inline detection used above by :attr:`looks_like_auth_failure`.
+        """
+        msg = self.stderr.lower()
+        return any(
+            needle in msg
+            for needle in (
+                "rate limit",
+                "rate-limit",
+                "secondary rate limit",
+                "abuse detection",
+                "api rate limit exceeded",
             )
         )
 
@@ -516,7 +534,24 @@ def poll_repo(
         # "closed". Don't emit on first run — only on actual transitions.
         new_state = _classify_pr_state(pr)
         prev_state = pr_state.get(str(n))
-        if not first_run and prev_state and prev_state != new_state:
+        closed_by_self = False
+        if (
+            not first_run
+            and prev_state
+            and prev_state != new_state
+            and new_state == "closed"
+        ):
+            # The pulls list lacks closed_by; the issues endpoint has it.
+            try:
+                detail = api(f"repos/{repo}/issues/{n}") or {}
+                closed_by_self = _is_own_activity(
+                    (detail.get("closed_by") or {}).get("login"), own_login
+                )
+            except Exception:
+                closed_by_self = False
+        if closed_by_self:
+            pass  # Alice closed it herself — no signal for thinking.
+        elif not first_run and prev_state and prev_state != new_state:
             events.append(
                 Event(
                     kind="pr_state",
@@ -559,7 +594,7 @@ def poll_repo(
             if not isinstance(rid, int) or rid in seen_review_ids:
                 continue
             seen_review_ids.add(rid)
-            if first_run:
+            if first_run or _is_own_activity(_login(r), own_login):
                 continue
             events.append(
                 Event(
@@ -582,7 +617,7 @@ def poll_repo(
             if not isinstance(cid, int) or cid in seen_review_comment_ids:
                 continue
             seen_review_comment_ids.add(cid)
-            if first_run:
+            if first_run or _is_own_activity(_login(c), own_login):
                 continue
             events.append(
                 Event(
@@ -1096,7 +1131,9 @@ def write_design_review_item(
     the item is skipped rather than shown empty.
     """
     try:
-        comments = api(f"repos/{event.repo}/issues/{event.number}/comments?per_page=100") or []
+        comments = (
+            api(f"repos/{event.repo}/issues/{event.number}/comments?per_page=100") or []
+        )
     except GHCommandError:
         return None
     ready = _find_design_ready_comment(comments, trusted)
@@ -1147,9 +1184,7 @@ def write_design_review_item(
 # inner/notes/ → thinking pipeline and land directly in events.jsonl so
 # the inbox stays focused on true conversation events (reviews, comments,
 # new issues) that actually want thinking's attention. See task-0603.
-TELEMETRY_KINDS = frozenset(
-    {"new_pr", "pr_state", "check_failure", "issue_state"}
-)
+TELEMETRY_KINDS = frozenset({"new_pr", "pr_state", "check_failure", "issue_state"})
 
 
 def write_event(
@@ -1287,6 +1322,19 @@ def run(
                 saw_auth_error = True
                 # Skip remaining repos — auth is global, retrying just spams logs.
                 break
+            if exc.looks_like_rate_limit:
+                # Issue #786 M4 — record the hit in the shared backoff
+                # file so sibling processes (SM dispatcher, bug-fix
+                # dispatcher, status-site pollers) defer their next
+                # fan-out until the jittered window elapses.
+                try:
+                    from alice_forge.rate_limit import observe_gh_error
+                    observe_gh_error(exc)
+                except Exception as rl_exc:  # noqa: BLE001
+                    log(
+                        f"[gh-watcher] rate-limit observation failed "
+                        f"(non-fatal): {rl_exc}"
+                    )
             continue
         except Exception as exc:  # noqa: BLE001
             log(f"[gh-watcher] {repo}: unexpected error — {type(exc).__name__}: {exc}")
@@ -1323,9 +1371,7 @@ def run(
                     },
                 )
                 events_written += 1
-                log(
-                    f"[gh-watcher] {repo}: appended events.jsonl entry ({event.kind})"
-                )
+                log(f"[gh-watcher] {repo}: appended events.jsonl entry ({event.kind})")
             else:
                 path = write_note(notes_dir, slug, body)
                 notes_written += 1

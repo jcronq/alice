@@ -26,6 +26,7 @@ from typing import Optional, Sequence
 from .task_store import (
     InvalidState,
     InvalidTransition,
+    ReindexReport,
     TaskNotFound,
     TaskRecord,
     TaskStore,
@@ -159,6 +160,23 @@ def _build_parser() -> argparse.ArgumentParser:
     pv = sub.add_parser("view", help="Print task.yaml + transitions.jsonl.")
     pv.add_argument("id", help="Task id (task-NNNN).")
 
+    # ---- reindex
+    pr = sub.add_parser(
+        "reindex",
+        help=(
+            "Rebuild index.jsonl from task-*/task.yaml. "
+            "Use --dry-run to preview changes."
+        ),
+    )
+    pr.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Print the diff (added/removed/changed/errors) without "
+            "writing index.jsonl."
+        ),
+    )
+
     # ---- close
     pcl = sub.add_parser(
         "close", help="Sugar over update --status done."
@@ -177,6 +195,139 @@ def _build_parser() -> argparse.ArgumentParser:
         default="speaking",
         choices=["speaking", "thinking", "jason", "alice"],
         help="Who is closing the task. Default: speaking.",
+    )
+
+    # ---- db — read-only joins over the derived alice-state.db
+    # (issue #789). The DB is populated by the memory worker's
+    # ``derive_tasks_workers_events`` step; this CLI is a pure
+    # reader, so ``--root`` is irrelevant here (the DB lives under
+    # ``inner/state/`` not ``inner/tasks/``). All db subcommands
+    # default to --json output because they feed status-site and
+    # dispatcher checks downstream.
+    pdb = sub.add_parser(
+        "db",
+        help=(
+            "Read joins over alice-state.db (derived index over "
+            "tasks/workers/events). Issue #789 PR 1."
+        ),
+    )
+    pdb.add_argument(
+        "--db-path",
+        default=None,
+        help=(
+            "Override alice-state.db path. Default: "
+            "$ALICE_MIND_DIR/inner/state/alice-state.db, else "
+            "~/alice-mind/inner/state/alice-state.db."
+        ),
+    )
+    db_sub = pdb.add_subparsers(dest="db_command", required=True)
+
+    db_state = db_sub.add_parser(
+        "state",
+        help=(
+            "One-shot cross-store snapshot for a 'jcronq/alice#784' "
+            "style qualifier. Returns task + workers + recent events."
+        ),
+    )
+    db_state.add_argument(
+        "qualifier",
+        help="GH qualifier, e.g. jcronq/alice#784.",
+    )
+
+    db_workers = db_sub.add_parser(
+        "workers", help="Recent background-worker handles."
+    )
+    db_workers.add_argument(
+        "--outcome",
+        default=None,
+        help="Filter by outcome (pr_opened | no_change | error | ...).",
+    )
+    db_workers.add_argument(
+        "--kind",
+        default=None,
+        help="Filter by worker kind.",
+    )
+    db_workers.add_argument(
+        "--limit", type=int, default=20,
+        help="Row cap. Default 20.",
+    )
+
+    db_tasks = db_sub.add_parser(
+        "tasks", help="List tasks, optionally filtered by GH issue."
+    )
+    db_tasks.add_argument(
+        "--gh-issue",
+        default=None,
+        help="Filter by 'jcronq/alice#784' style qualifier.",
+    )
+    db_tasks.add_argument(
+        "--status",
+        default=None,
+        help="Filter by exact SM v2 status.",
+    )
+    db_tasks.add_argument(
+        "--limit", type=int, default=50,
+        help="Row cap. Default 50.",
+    )
+
+    db_events = db_sub.add_parser(
+        "events", help="Recent events.jsonl rows (derived index)."
+    )
+    db_events.add_argument(
+        "--type",
+        default=None,
+        help="Filter by event type.",
+    )
+    db_events.add_argument(
+        "--since",
+        default=None,
+        help="ISO-8601 lower bound on event ts.",
+    )
+    db_events.add_argument(
+        "--limit", type=int, default=20,
+        help="Row cap. Default 20.",
+    )
+
+    # ---- db item <item_id> — one item + current SM state + last few
+    # transitions + external refs. The item_id is the human-readable
+    # surrogate written by the #790 seeder: ``gh:jcronq/alice#790``
+    # or ``local:task-0760``.
+    db_item = db_sub.add_parser(
+        "item",
+        help=(
+            "Print an item + its state + last 5 transitions + "
+            "external refs. SM v2 (#790)."
+        ),
+    )
+    db_item.add_argument(
+        "item_id",
+        help=(
+            "Item surrogate id — ``gh:jcronq/alice#790`` for GH "
+            "issues, ``local:task-0760`` for local tasks."
+        ),
+    )
+    db_item.add_argument(
+        "--transition-limit",
+        type=int,
+        default=5,
+        help="How many recent transitions to include. Default 5.",
+    )
+
+    # ---- db transitions <item_id> — full transition history for
+    # one item. Separate from ``db item`` so the common case (a quick
+    # peek) stays small and the full-audit path is explicit.
+    db_transitions = db_sub.add_parser(
+        "transitions",
+        help="Full transition history for one item_id (oldest-first).",
+    )
+    db_transitions.add_argument(
+        "item_id", help="Item surrogate id (see ``db item`` --help)."
+    )
+    db_transitions.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Cap on rows returned. Omit for the full audit trail.",
     )
 
     return p
@@ -297,6 +448,60 @@ def _cmd_view(store: TaskStore, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_reindex(store: TaskStore, args: argparse.Namespace) -> int:
+    """Rebuild ``index.jsonl`` from ``task-*/task.yaml``.
+
+    Issue #781: index.jsonl had 608 lines while the task store held
+    912 directories — ~33% miss rate. This subcommand walks the store
+    and rewrites the index atomically, flagging any malformed task
+    directories to stderr.
+
+    Exit codes:
+        0 — reindex ran cleanly (even if dry-run); zero errors.
+        6 — reindex ran but some task.yaml files were missing/malformed.
+            Operators should investigate the stderr output.
+    """
+    report: ReindexReport = store.reindex(dry_run=args.dry_run)
+
+    # Errors go to stderr unconditionally. #781 requires that
+    # orphan/malformed task directories are flagged — never silently
+    # dropped from the rebuild.
+    for err in report.errors:
+        print(
+            f"error: {err['id']}: {err['reason']} ({err['path']})",
+            file=sys.stderr,
+        )
+
+    if args.json:
+        print(json.dumps(report.to_dict(), sort_keys=False))
+    else:
+        verb = "would write" if args.dry_run else "wrote"
+        print(
+            f"reindex: scanned={report.scanned} {verb}={report.written} "
+            f"errors={len(report.errors)} "
+            f"added={len(report.added)} removed={len(report.removed)} "
+            f"changed={len(report.changed)}"
+        )
+        if args.dry_run:
+            # The operator-facing diff. Capped per bucket so a
+            # pathological case (hundreds added) doesn't spam the
+            # terminal; the --json path still carries the full lists.
+            def _preview(label: str, ids: list[str]) -> None:
+                if not ids:
+                    return
+                head = ids[:20]
+                suffix = "" if len(ids) == len(head) else f" (+{len(ids) - len(head)} more)"
+                print(f"  {label}: {', '.join(head)}{suffix}")
+
+            _preview("added", report.added)
+            _preview("removed", report.removed)
+            _preview("changed", report.changed)
+
+    # Non-zero exit when we found malformed/missing task.yaml files so
+    # schedulers and operators notice. A clean dry-run still returns 0.
+    return 6 if report.errors else 0
+
+
 def _cmd_close(store: TaskStore, args: argparse.Namespace) -> int:
     record = store.close(
         args.id,
@@ -308,12 +513,106 @@ def _cmd_close(store: TaskStore, args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# db subcommand — read-only joins over alice-state.db (issue #789 PR 1)
+#
+# These handlers import ``alice_state_db`` lazily so the rest of the
+# CLI keeps working even if the sibling package is missing (e.g. on
+# very old container images that predate this PR).
+
+
+def _cmd_db(store: TaskStore, args: argparse.Namespace) -> int:
+    try:
+        from alice_state_db import connect
+        from alice_state_db import read_api
+    except ImportError as exc:  # pragma: no cover
+        print(
+            f"error: alice_state_db not importable ({exc}) — rebuild the "
+            "container or add src/alice_state_db to PYTHONPATH.",
+            file=sys.stderr,
+        )
+        return 5
+
+    db_path = None
+    if args.db_path:
+        db_path = args.db_path
+
+    try:
+        with connect(db_path=db_path) as conn:
+            if args.db_command == "state":
+                payload = read_api.state_of(conn, args.qualifier)
+                print(json.dumps(payload, sort_keys=False, default=str))
+                return 0
+
+            if args.db_command == "workers":
+                rows = read_api.list_workers(
+                    conn,
+                    outcome=args.outcome,
+                    kind=args.kind,
+                    limit=args.limit,
+                )
+                print(json.dumps(rows, sort_keys=False, default=str))
+                return 0
+
+            if args.db_command == "tasks":
+                rows = read_api.list_tasks(
+                    conn,
+                    gh_issue=args.gh_issue,
+                    status=args.status,
+                    limit=args.limit,
+                )
+                print(json.dumps(rows, sort_keys=False, default=str))
+                return 0
+
+            if args.db_command == "events":
+                rows = read_api.list_events(
+                    conn,
+                    type=args.type,
+                    since=args.since,
+                    limit=args.limit,
+                )
+                print(json.dumps(rows, sort_keys=False, default=str))
+                return 0
+
+            if args.db_command == "item":
+                payload = read_api.item_detail(
+                    conn,
+                    args.item_id,
+                    transition_limit=args.transition_limit,
+                )
+                if payload is None:
+                    print(
+                        f"error: item not found: {args.item_id}",
+                        file=sys.stderr,
+                    )
+                    return 2
+                print(json.dumps(payload, sort_keys=False, default=str))
+                return 0
+
+            if args.db_command == "transitions":
+                rows = read_api.item_transitions(
+                    conn, args.item_id, limit=args.limit
+                )
+                print(json.dumps(rows, sort_keys=False, default=str))
+                return 0
+    except ValueError as exc:
+        # Raised by _parse_gh_qualifier for malformed state queries.
+        print(f"error: {exc}", file=sys.stderr)
+        return 6
+
+    # argparse enforces db_command is required, so this is unreachable.
+    print(f"error: unknown db subcommand {args.db_command!r}", file=sys.stderr)
+    return 5
+
+
 _HANDLERS = {
     "create": _cmd_create,
     "update": _cmd_update,
     "list": _cmd_list,
     "view": _cmd_view,
     "close": _cmd_close,
+    "reindex": _cmd_reindex,
+    "db": _cmd_db,
 }
 
 

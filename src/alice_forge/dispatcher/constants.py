@@ -819,3 +819,82 @@ def load_dispatcher_repos(
     if not out:
         return fallback
     return out
+
+
+# ---------------------------------------------------------------------------
+# Issue #784 — ``sm_dispatcher.sweeper`` config block
+# ---------------------------------------------------------------------------
+#
+# Governs the Phase 1.6 sweep's dry-run audit mode for REJECT
+# decisions. The env var :envvar:`SM_SWEEPER_SAFE_MODE` overrides this
+# config at call-time so an operator can toggle without a config
+# redeploy; when the env is unset the loaded :class:`SweeperConfig` is
+# authoritative.
+#
+# Default ships ``rejected_dry_run=True`` so a missing section degrades
+# to the safe-by-default behaviour described in the #784 design note.
+# After one week of clean audit logs the operator flips the JSON to
+# ``false`` (or exports ``SM_SWEEPER_SAFE_MODE=0``) to enable live
+# REJECT writes. Merged-PR sweeps are terminal and never gated.
+
+
+@dataclass(frozen=True)
+class SweeperConfig:
+    """Phase 1.6 sweeper knobs loaded from ``sm_dispatcher.sweeper``.
+
+    ``rejected_dry_run`` — when True (default), REJECT sweep decisions
+    are logged into :attr:`RunReport.sweep_would_reject` instead of
+    editing the GitHub label. Only the REJECT path is gated; merged-PR
+    sweeps (``sm:done``) always apply. The env var
+    :envvar:`SM_SWEEPER_SAFE_MODE` overrides this value at call time.
+    """
+
+    rejected_dry_run: bool = True
+
+
+def load_sweeper_config(
+    *,
+    config_path: pathlib.Path = DEFAULT_DISPATCHER_CONFIG_PATH,
+    log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
+) -> SweeperConfig:
+    """Read the ``sm_dispatcher.sweeper`` block from alice.config.json.
+
+    Missing file, unreadable file, or missing section degrades to
+    :class:`SweeperConfig` defaults. Shape::
+
+        {
+          "sm_dispatcher": {
+            "sweeper": {"rejected_dry_run": true}
+          }
+        }
+    """
+    if not config_path.is_file():
+        return SweeperConfig()
+    try:
+        raw = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        log(f"[sm-dispatcher] failed to read sweeper config {config_path}: {exc}")
+        return SweeperConfig()
+    block = (raw or {}).get("sm_dispatcher")
+    if not isinstance(block, dict):
+        return SweeperConfig()
+    sweeper = block.get("sweeper")
+    if not isinstance(sweeper, dict):
+        return SweeperConfig()
+    val = sweeper.get("rejected_dry_run", True)
+    return SweeperConfig(rejected_dry_run=bool(val))
+
+
+# ---------------------------------------------------------------------------
+# Issue #784 Part A — code-review findings notes directory
+# ---------------------------------------------------------------------------
+#
+# Directory the dispatcher's self-merge code-review gate writes per-PR
+# findings notes into. The ``[SM] code-review verdict=... findings=
+# [[<slug>]]`` audit comment carries the bare slug; the filesystem
+# layout mirrors :data:`DESIGNS_DIR` (same cortex-memory vault,
+# different subdir). Kept as a path constant for the same
+# test-override / cycle-avoidance reasons as :data:`DESIGNS_DIR`.
+CODE_REVIEW_NOTES_DIR = pathlib.Path(
+    "/home/alice/alice-mind/cortex-memory/code-review"
+)

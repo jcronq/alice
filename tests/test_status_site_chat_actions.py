@@ -403,3 +403,49 @@ def test_shell_wires_permalinks_reactions_and_replies(site):
         assert needle in html, needle
     css = (STATIC_DIR / "design-tokens.css").read_text()
     assert ".msg.highlight" in css and ".msg-actions" in css
+
+
+# ------------------------------------------- attention-react surface (#683)
+
+
+def _react_surfaces(cfg):
+    return sorted(cfg.surface_dir.glob("*-chat-reaction*.md")) if cfg.surface_dir.is_dir() else []
+
+
+def test_attention_react_on_alice_message_drops_one_surface(site):
+    cfg, port = site
+    seed_chat(cfg)
+    assert react(port, at=T2, emoji="👀")[0] == 200
+    [p] = _react_surfaces(cfg)
+    doc = p.read_text()
+    assert "type: chat-reaction" in doc and "priority: wander" in doc
+    assert "reply_expected: false" in doc
+    assert "hi back" in doc and "👀" in doc and f"?p=chat#msg-{T2}" in doc
+    # duplicate add is a no-op, and cooldown blocks add/remove/add spam
+    react(port, at=T2, emoji="👀")
+    react(port, at=T2, emoji="👀", action="remove")
+    react(port, at=T2, emoji="👀")
+    assert len(_react_surfaces(cfg)) == 1
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"at": T2, "emoji": "👍"},  # ack-only
+        {"at": T1, "emoji": "👀"},  # jason's own message
+    ],
+)
+def test_non_attention_react_drops_nothing(site, over):
+    cfg, port = site
+    seed_chat(cfg)
+    assert react(port, **over)[0] == 200
+    assert _react_surfaces(cfg) == []
+
+
+def test_remove_react_drops_nothing(site):
+    cfg, port = site
+    seed_chat(cfg)
+    react(port, at=T2, emoji="❓")
+    n = len(_react_surfaces(cfg))
+    react(port, at=T2, emoji="❓", action="remove")
+    assert len(_react_surfaces(cfg)) == n
