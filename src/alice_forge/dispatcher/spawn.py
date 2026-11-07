@@ -617,6 +617,9 @@ _RESEARCH_FRAMING_PERSONAS: frozenset[str] = frozenset({"research-writer"})
 _DESIGN_FRAMING_PERSONAS: frozenset[str] = frozenset({"designer-cli"})
 
 
+from alice_forge.dispatcher.effort import EFFORT_RULES, read_effort  # noqa: E402
+
+
 def compose_spawn_prompt(
     issue: dict[str, Any],
     spawn_config: dict[str, str],
@@ -735,6 +738,8 @@ def compose_spawn_prompt(
         f"{body}\n"
         f"\n"
         f"{task_framing}\n"
+        f"\n"
+        f"{EFFORT_RULES[read_effort(issue)]}\n"
         f"\n"
         f"{trailer}\n"
         f"\n"
