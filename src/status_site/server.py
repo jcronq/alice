@@ -116,14 +116,10 @@ from status_site.chat_reactions import (
 )
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-# ``legacy.html`` is the pre-#639 static shell, kept so the reactive
-# page can link out to "Classic view" and so ``?p=<page>`` /
-# ``?p=chat`` keeps working while the widget library catches up
-# through slices 2–6. The new ``index.html`` is the SSE-driven React
-# shell that renders section updates live from ``/api/events``.
+# The SSE-driven React shell at ``index.html`` is the only UI; it
+# renders section updates live from ``/api/events``.
 STATIC_FILES = {
     "index.html",
-    "legacy.html",
     "marked.min.js",
     "design-tokens.css",
     "chat-ux.js",
@@ -1830,8 +1826,9 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
     """Return ``{section_name: () -> payload}`` for every Overview section.
 
     Payloads are typed dicts shaped per #649: every renderer at least
-    emits ``{"markdown": "..."}`` so the legacy Section component keeps
-    rendering; the four slice-2 sections (running_now, waiting_on_you,
+    emits ``{"markdown": "..."}`` so the generic markdown fallback in
+    ``SectionTile`` keeps rendering sections the shell has no typed
+    widget for yet; the four slice-2 sections (running_now, waiting_on_you,
     alice_queue, done_today) also carry typed ``rows`` so widgets can
     render without re-parsing markdown. Dict equality is deep, so the
     broadcaster's change-detection compare still works unchanged.

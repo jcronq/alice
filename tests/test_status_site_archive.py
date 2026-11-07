@@ -275,13 +275,3 @@ def test_cli_status_archive(tmp_path, monkeypatch, capsys):
     assert "archived old-win -> 2020-01-01" in out and "archived 1 item(s)" in out
     assert "## 2020-01-01" in (tmp_path / "done-archive.md").read_text()
     assert cli.main_archive(["extra"]) == 2
-
-
-def test_frontend_collapses_done_today():
-    # ``collapseDone`` + the ``linkLeaves();collapseDone();`` chain
-    # live in the pre-#639 markdown shell; slice-1 moved that JS to
-    # legacy.html while the reactive tree catches up.
-    html = (Path(S.__file__).parent / "static" / "legacy.html").read_text()
-    assert "function collapseDone" in html
-    assert "linkLeaves();collapseDone();" in html
-    assert "details.done" in html
