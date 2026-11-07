@@ -1668,14 +1668,26 @@ function PipelineGroup({title, count, children, open}) {
   );
 }
 const MUTED = {color: "var(--color-fg-muted)", margin: 0};
-function ReviewLinkTable({rows}) {
+function ReviewLinkTable({rows, limit}) {
+  // Issue #715: optional ``limit`` caps visible rows; the rest sit in a
+  // "+N more" <details> expander. The repo column is dropped when every
+  // row shares the same repo.
+  const all = rows || [];
+  if (limit && all.length > limit) {
+    return h(React.Fragment, null,
+      h(ReviewLinkTable, {rows: all.slice(0, limit)}),
+      h("details", {className: "fx-more"},
+        h("summary", null, "+" + (all.length - limit) + " more"),
+        h(ReviewLinkTable, {rows: all.slice(limit)})));
+  }
+  const sameRepo = all.length > 0 && all.every(r => r.repo === all[0].repo);
   // Issue #719: when a row carries ``review_slug`` the title links to
   // the local Review tab (``?p=review-<slug>``) and the GitHub URL
   // becomes a small secondary ``(gh)`` link. Rows without a slug keep
   // the original GH-only behaviour.
   return h(FxTable, {
     columns: [
-      {key: "repo", label: "repo", cell: r => h("code", null, r.repo || "")},
+      ...(sameRepo ? [] : [{key: "repo", label: "repo", cell: r => h("code", null, r.repo || "")}]),
       {key: "number", label: "#", numeric: true, cell: r =>
         r.link
           ? h("a", {href: r.link, target: "_blank", rel: "noopener"}, "#" + r.number)
@@ -1714,7 +1726,7 @@ function YourTodoBoard({data, nowMs}) {
       prs.length ? h(ReviewLinkTable, {rows: prs}) : none("(no PRs awaiting review)"),
       warn(failed.prs)),
     h(PipelineGroup, {title: "Design review", count: design.length},
-      design.length ? h(ReviewLinkTable, {rows: design}) : none("(no designs awaiting review)"),
+      design.length ? h(ReviewLinkTable, {rows: design, limit: 5}) : none("(no designs awaiting review)"),
       warn(failed.design_review)),
     attn.length
       ? h(PipelineGroup, {title: "Attention reacts", count: attn.length},
@@ -1942,6 +1954,14 @@ function SectionTile({name, data, ts, nowMs}) {
   );
 }
 
+// Issue #715: "Waiting on you (N)" counts PRs + designs + attention reacts + asks.
+function todoCountSuffix(d) {
+  d = d || {};
+  const n = (d.prs || []).length + (d.design_review || []).length +
+    (d.attention_reacts || []).length + (d.rows || []).length;
+  return n ? " (" + n + ")" : "";
+}
+
 // A tier groups the section tiles that share an owner of the next
 // action. Asides are collapsed disclosures; the rest are headed blocks.
 function Tier({tier, children}) {
@@ -2151,7 +2171,7 @@ function App() {
     const legacyPayload = state.sections._legacy_md;
     const sections = TIERS
       .filter(t => t.sections.some(n => state.sections[n]))
-      .map(t => h(Tier, {key: t.id, tier: t},
+      .map(t => h(Tier, {key: t.id, tier: t.id === "top" ? {...t, title: t.title + todoCountSuffix(state.sections.your_todo)} : t},
         t.sections.filter(n => state.sections[n]).map(n => h(SectionTile, {
           key: n, name: n,
           data: state.sections[n],
