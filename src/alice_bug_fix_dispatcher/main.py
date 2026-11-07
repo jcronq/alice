@@ -81,6 +81,17 @@ from status_site.server import _bug_title_from_heading
 
 from . import frontmatter as _fm
 
+# Issue #786 M3 — rate-limit pre-flight gate shared with the SM
+# dispatcher. Reading the backoff file is a fast local-filesystem
+# check; the gate runs once per bug before the ``claude -p`` spawn so
+# a burst of in-flight bugs can't trip the secondary rate limit.
+from alice_forge.rate_limit import (
+    DEFAULT_MIN_CORE as _RL_DEFAULT_MIN_CORE,
+    DEFAULT_MIN_GRAPHQL as _RL_DEFAULT_MIN_GRAPHQL,
+    DeferDecision as _RateLimitDeferDecision,
+    should_defer as _rate_limit_should_defer,
+)
+
 
 DEFAULT_STATUS_DIR = pathlib.Path("/home/alice/alice-mind/inner/status")
 DEFAULT_JOURNAL = pathlib.Path("/home/alice/alice-mind/inner/state/bug-fix-dispatcher.log")
@@ -564,6 +575,19 @@ def _dispatch_worker(
             f"unknown worker model {worker_model!r}: {exc}"
         )
         estimate_usd = None
+
+    # Issue #786 M3 — rate-limit pre-flight gate. If the shared backoff
+    # file says another process just hit a 429, defer this spawn rather
+    # than firing another ~20 gh calls into an already-throttled window.
+    # The next tick will retry. The gate is file-local; no network call.
+    rate_decision = _rate_limit_should_defer()
+    if rate_decision.defer:
+        log(
+            f"[bug-fix-dispatcher] bug-{report_id}: rate-limit gate "
+            f"deferred spawn — {rate_decision.reason} "
+            f"(retry in ~{rate_decision.retry_after_s or 0:.0f}s)"
+        )
+        return False, {}
 
     spawner = spawn or _spawn_claude_detached
     pid = spawner(report_id, scratch_dir, prompt)

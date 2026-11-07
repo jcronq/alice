@@ -237,6 +237,27 @@ class GHCommandError(RuntimeError):
             )
         )
 
+    @property
+    def looks_like_rate_limit(self) -> bool:
+        """Mirror of ``dispatcher.errors.GHCommandError.looks_like_rate_limit``.
+
+        Issue #786 M4 — exposes the same property shape so
+        :func:`alice_forge.rate_limit.observe_gh_error` can instrument the
+        watcher's rate-limit path without a second type cascade. Matches
+        the inline detection used above by :attr:`looks_like_auth_failure`.
+        """
+        msg = self.stderr.lower()
+        return any(
+            needle in msg
+            for needle in (
+                "rate limit",
+                "rate-limit",
+                "secondary rate limit",
+                "abuse detection",
+                "api rate limit exceeded",
+            )
+        )
+
 
 # ---------------------------------------------------------------------------
 # Config + state
@@ -1301,6 +1322,19 @@ def run(
                 saw_auth_error = True
                 # Skip remaining repos — auth is global, retrying just spams logs.
                 break
+            if exc.looks_like_rate_limit:
+                # Issue #786 M4 — record the hit in the shared backoff
+                # file so sibling processes (SM dispatcher, bug-fix
+                # dispatcher, status-site pollers) defer their next
+                # fan-out until the jittered window elapses.
+                try:
+                    from alice_forge.rate_limit import observe_gh_error
+                    observe_gh_error(exc)
+                except Exception as rl_exc:  # noqa: BLE001
+                    log(
+                        f"[gh-watcher] rate-limit observation failed "
+                        f"(non-fatal): {rl_exc}"
+                    )
             continue
         except Exception as exc:  # noqa: BLE001
             log(f"[gh-watcher] {repo}: unexpected error — {type(exc).__name__}: {exc}")

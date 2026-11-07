@@ -33,6 +33,11 @@ from alice_forge.sm.legacy.handlers.reviewing import _process_reviewing
 from alice_forge.sm.legacy.handlers.selected import _process_selected
 from alice_forge.sm.legacy.handlers.stale_closed import _process_stale_closed
 
+# Issue #786 — rate-limit backoff side-effect. Written on any
+# ``looks_like_rate_limit`` observation so sibling processes defer
+# their next fan-out until the jittered window elapses.
+from alice_forge.rate_limit import observe_gh_error as _observe_gh_rate_limit
+
 
 def _save_ledger_best_effort(
     ledger: EmittedLedger,
@@ -621,6 +626,9 @@ def run(
             log(f"[sm-dispatcher] auth failure listing {repo}: {exc}")
         elif exc.looks_like_rate_limit:
             log(f"[sm-dispatcher] rate-limited listing {repo}: {exc}")
+            # Issue #786 M4 — record the hit in the shared backoff file
+            # so sibling processes defer their next fan-out.
+            _observe_gh_rate_limit(exc)
         else:
             log(f"[sm-dispatcher] failed to list {repo}: {exc}")
         # Do NOT write partial state. The s6 supervisor retries.
@@ -1243,6 +1251,8 @@ def run(
             elif exc.looks_like_rate_limit:
                 log(f"[sm-dispatcher] sweep rate-limited listing {repo}: {exc}")
                 fatal_exit = True
+                # Issue #786 M4 — record the hit for sibling processes.
+                _observe_gh_rate_limit(exc)
             else:
                 log(f"[sm-dispatcher] sweep failed to list closed {repo}: {exc}")
             stale_issues = []
@@ -1296,6 +1306,8 @@ def run(
                     f"{repo}: {exc}"
                 )
                 fatal_exit = True
+                # Issue #786 M4 — record the hit for sibling processes.
+                _observe_gh_rate_limit(exc)
             else:
                 log(
                     f"[sm-dispatcher] open-done sweep failed to list "
