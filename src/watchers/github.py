@@ -33,11 +33,16 @@ import json
 import os
 import pathlib
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
+
+from alice_forge.sm.states import SMState
+from alice_state_db.schema import apply_schema
+from alice_state_db.sm_seed import gh_issue_id
 
 # ---------------------------------------------------------------------------
 # Defaults + paths
@@ -109,93 +114,6 @@ def _is_sm_protocol_comment(body: str | None) -> bool:
 
 def _login(obj: dict[str, Any]) -> str | None:
     return (obj.get("user") or {}).get("login")
-
-
-# Label the SM v2 dispatcher uses as the lifecycle entry point. The
-# dispatcher's GitHub query (``src/alice_forge/dispatcher/gh.py``) filters
-# by ``label:sm:draft,sm:needs_study,...`` — an unlabeled trusted-author
-# issue is invisible to the dispatcher and stalls indefinitely. The
-# watcher applies this on ``new_issue`` intake so every fresh trusted
-# issue enters the SM lifecycle automatically. Re-stated here rather
-# than imported from ``alice_forge.dispatcher.constants`` to keep the
-# watcher decoupled from the dispatcher package.
-SM_DRAFT_LABEL = "sm:draft"
-SM_LABEL_PREFIX = "sm:"
-# Label whose arrival means "a design is waiting on Jason's review". The
-# watcher turns the transition into a ``kind: decide`` item for the status
-# site's Review page (issue #616).
-SM_DESIGN_REVIEW_LABEL = "sm:design_review"
-
-
-def _extract_label_names(labels: Any) -> list[str]:
-    """Pull ``name`` strings out of the GitHub-API labels payload.
-
-    ``gh api`` returns labels as a list of dicts ``{"id":..., "name":...,
-    "color":...}``. Be tolerant of bare strings (older fixtures / future
-    schema drift) and skip anything that doesn't yield a usable name.
-    """
-    if not isinstance(labels, list):
-        return []
-    names: list[str] = []
-    for entry in labels:
-        if isinstance(entry, dict):
-            name = entry.get("name")
-            if isinstance(name, str) and name:
-                names.append(name)
-        elif isinstance(entry, str) and entry:
-            names.append(entry)
-    return names
-
-
-def _apply_sm_draft_label(
-    repo: str,
-    number: int,
-    current_labels: list[str],
-    *,
-    gh_bin: str = "gh",
-    log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
-) -> bool:
-    """Best-effort: stamp ``sm:draft`` on a freshly-emitted issue.
-
-    Returns True iff the label was actually applied. Idempotency: if the
-    issue already carries any ``sm:*`` label it's already inside the SM
-    lifecycle and we leave it alone (don't clobber ``sm:needs_study`` or
-    later states a human pre-set).
-
-    Failures (gh missing, network blip, label-doesn't-exist-yet) are
-    logged and swallowed — labeling must never block the ``new_issue``
-    note emission, which is the primary product of this loop.
-    """
-    if any(lbl.startswith(SM_LABEL_PREFIX) for lbl in current_labels):
-        return False
-    args = [
-        gh_bin,
-        "issue",
-        "edit",
-        str(number),
-        "--repo",
-        repo,
-        "--add-label",
-        SM_DRAFT_LABEL,
-    ]
-    try:
-        result = subprocess.run(
-            args,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        log(f"[gh-watcher] {repo}#{number}: sm:draft label apply failed — {exc}")
-        return False
-    if result.returncode != 0:
-        log(
-            f"[gh-watcher] {repo}#{number}: sm:draft label apply exited "
-            f"{result.returncode} — {(result.stderr or result.stdout).strip()[:200]}"
-        )
-        return False
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -391,10 +309,6 @@ def _empty_repo_state() -> dict[str, Any]:
         "seen_check_run_ids": [],
         "pr_state": {},
         "issue_state": {},
-        # ``{issue number: [label names]}`` as of the last poll — the
-        # edge detector for ``→ sm:design_review`` transitions. A missing
-        # entry (legacy state, or an issue we've never seen) is silent.
-        "issue_labels": {},
         # ``first_run`` primes the PR-side seen-ID sets on the very first
         # poll; ``issues_primed`` is the same idea for the issue-side, but
         # versioned independently so an existing-state file (written before
@@ -473,7 +387,6 @@ def poll_repo(
     trusted: frozenset[str] = frozenset(DEFAULT_TRUSTED_ASSOCIATIONS),
     own_login: str = "alice",
     api: Callable[[str], Any] = gh_api,
-    label_apply: Callable[[str, int, list[str]], bool] = _apply_sm_draft_label,
 ) -> list[Event]:
     """Poll one repo, mutate ``repo_state`` in place, return new events.
 
@@ -512,7 +425,6 @@ def poll_repo(
     seen_check_run_ids: set[int] = set(repo_state.get("seen_check_run_ids") or [])
     pr_state: dict[str, str] = dict(repo_state.get("pr_state") or {})
     issue_state_map: dict[str, str] = dict(repo_state.get("issue_state") or {})
-    issue_labels_map: dict[str, list[str]] = dict(repo_state.get("issue_labels") or {})
 
     # ---- PRs ---------------------------------------------------------------
     pulls = (
@@ -765,66 +677,7 @@ def poll_repo(
                         payload={"issue": issue},
                     )
                 )
-            # Best-effort SM v2 intake: stamp ``sm:draft`` so the
-            # dispatcher's labeled-issue query can see the issue. This is
-            # deliberately *decoupled* from the ``new_issue`` event above:
-            # that ``elif`` only fires on an unseen→open transition seen
-            # *after* priming, so issues that were already open when the
-            # repo was first wired into the watcher (recorded as "open"
-            # during the prime pass — e.g. a repo onboarded with a
-            # pre-existing backlog like cozyhem-engine) never hit it and
-            # would stall forever at no label, invisible to the
-            # dispatcher's ``label:sm:*`` query. Gating the stamp on
-            # open + trusted + non-self-filed (rather than the
-            # unseen→open transition) back-fills that priming gap.
-            #
-            # ``_apply_sm_draft_label`` is idempotent — it no-ops if any
-            # ``sm:*`` label is already present — so re-stamping a fresh
-            # issue we just emitted a ``new_issue`` for is harmless, and
-            # we never replay a historical ``new_issue`` note just to fix
-            # a missing label. Failures are logged inside the labeler and
-            # must not tank the pass. Issues #247/#258/#260/#261 are the
-            # structural backlog that motivated this.
-            if new_state == "open":
-                try:
-                    label_apply(
-                        repo,
-                        n,
-                        _extract_label_names(issue.get("labels")),
-                    )
-                except Exception:  # noqa: BLE001
-                    # Defensive: even a buggy injected labeler must not
-                    # tank the watcher pass. Already-logged failures
-                    # come back as False; this catches programming
-                    # errors in label_apply itself.
-                    pass
         issue_state_map[str(n)] = new_state
-
-        # ``→ sm:design_review`` edge. Fires once per transition: the
-        # label set is persisted every poll, so a still-labeled issue
-        # never re-fires. Silent while priming and when we have no prior
-        # label snapshot for the issue.
-        current_labels = _extract_label_names(issue.get("labels"))
-        prev_labels = issue_labels_map.get(str(n))
-        if (
-            not first_run
-            and issues_primed
-            and new_state == "open"
-            and prev_labels is not None
-            and SM_DESIGN_REVIEW_LABEL in current_labels
-            and SM_DESIGN_REVIEW_LABEL not in prev_labels
-        ):
-            events.append(
-                Event(
-                    kind="design_review",
-                    repo=repo,
-                    number=n,
-                    title=title,
-                    url=url,
-                    payload={"issue": issue},
-                )
-            )
-        issue_labels_map[str(n)] = sorted(set(current_labels))
 
         # Same skip-the-detail-fetch shortcut as PRs: closed-and-unchanged
         # issues don't need their comments re-pulled.
@@ -868,11 +721,62 @@ def poll_repo(
     repo_state["seen_check_run_ids"] = sorted(seen_check_run_ids)
     repo_state["pr_state"] = pr_state
     repo_state["issue_state"] = issue_state_map
-    repo_state["issue_labels"] = issue_labels_map
     repo_state["first_run"] = False
     repo_state["issues_primed"] = True
     repo_state["last_poll_at"] = _now_iso()
     return events
+
+
+_CLOSES_ITEM_RE = re.compile(r"[Cc]loses\s+item-(\d+)")
+
+
+def extract_closes_item_ref(pr_body: str | None, pr_url: str) -> tuple[str, str] | None:
+    """Extract (item_alias, pr_url) from a PR body's ``Closes item-NNNN`` line.
+
+    Returns None if no match. The alias format is ``item-NNNN`` (display-only);
+    resolve to canonical ``items.item_id`` via
+    :func:`alice_state_db.sm_seed.gh_issue_id`.
+    """
+    if not pr_body:
+        return None
+    m = _CLOSES_ITEM_RE.search(pr_body)
+    if not m:
+        return None
+    return (f"item-{m.group(1)}", pr_url)
+
+
+DEFAULT_DB_PATH = pathlib.Path("/home/alice/alice-mind/inner/state/alice-state.db")
+
+
+def _sm_transition(
+    *,
+    item_id: str,
+    to: SMState,
+    source_ref: str,
+    db_path: pathlib.Path,
+) -> int:
+    """Open alice-state.db and record one state_machine transition.
+
+    Lazy import of ``sm_store`` because PR-1 (#824) hasn't merged yet;
+    when it does, this call just works. Tests inject a Mock via ``run``'s
+    ``transition=`` parameter so this path need not be exercised directly.
+    """
+    from alice_forge.sm import store as sm_store  # local import — see PR-1 gap
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        apply_schema(conn)
+        conn.execute("PRAGMA foreign_keys = ON;")
+        return sm_store.transition(
+            conn=conn,
+            item_id=item_id,
+            to=to,
+            actor="gh-watcher",
+            source="gh-watcher",
+            source_ref=source_ref,
+        )
+    finally:
+        conn.close()
 
 
 def _classify_pr_state(pr: dict[str, Any]) -> str:
@@ -1278,7 +1182,8 @@ def run(
     state_path: pathlib.Path,
     api: Callable[[str], Any] = gh_api,
     log: Callable[[str], None] = lambda s: print(s, file=sys.stderr),
-    label_apply: Callable[[str, int, list[str]], bool] = _apply_sm_draft_label,
+    transition: Callable[..., int] = _sm_transition,
+    db_path: pathlib.Path | None = None,
 ) -> int:
     """Run one watcher pass. Returns the desired process exit code.
 
@@ -1298,6 +1203,8 @@ def run(
     # need to read every closed PR or CI failure, but a structured log
     # is still useful for auditing / "when did X last happen" queries.
     events_path = mind_dir / "memory" / "events.jsonl"
+    if db_path is None:
+        db_path = mind_dir / "inner" / "state" / "alice-state.db"
     state = load_state(state_path)
     repos_state = state.setdefault("repos", {})
     notes_written = 0
@@ -1313,7 +1220,6 @@ def run(
                 trusted=cfg.trusted_associations,
                 own_login=cfg.own_login,
                 api=api,
-                label_apply=label_apply,
             )
         except GHCommandError as exc:
             log(f"[gh-watcher] {repo}: gh failed — {exc}")
@@ -1329,6 +1235,7 @@ def run(
                 # fan-out until the jittered window elapses.
                 try:
                     from alice_forge.rate_limit import observe_gh_error
+
                     observe_gh_error(exc)
                 except Exception as rl_exc:  # noqa: BLE001
                     log(
@@ -1357,6 +1264,43 @@ def run(
                     notes_written += 1
                     log(f"[gh-watcher] {repo}: wrote decide item {path.name}")
                 continue
+            if event.kind == "pr_state" and event.payload.get("to") in (
+                "merged",
+                "closed",
+            ):
+                pr = event.payload.get("pr") or {}
+                extracted = extract_closes_item_ref(pr.get("body"), event.url)
+                if extracted is None:
+                    log(
+                        f"[gh-watcher] {repo}#{event.number}: no `Closes item-<N>` "
+                        "line in PR body — skipping state_machine transition"
+                    )
+                else:
+                    alias, _ = extracted
+                    item_id = gh_issue_id(repo, int(alias.removeprefix("item-")))
+                    target = (
+                        SMState.DONE
+                        if event.payload["to"] == "merged"
+                        else SMState.REJECTED
+                    )
+                    try:
+                        transition(
+                            item_id=item_id,
+                            to=target,
+                            source_ref=(
+                                f"gh:pr:{repo}#{event.number}:{event.payload['to']}"
+                            ),
+                            db_path=db_path,
+                        )
+                        log(
+                            f"[gh-watcher] {repo}: transitioned {item_id} -> "
+                            f"{target.label} (pr {event.number})"
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log(
+                            f"[gh-watcher] {repo}#{event.number}: "
+                            f"transition failed — {type(exc).__name__}: {exc}"
+                        )
             slug, body = render_note(event)
             if event.kind in TELEMETRY_KINDS:
                 write_event(
