@@ -31,6 +31,7 @@ from status_site.chat_status import (
     _parse_ts,
     build_groups,
     merge_thread,
+    read_message_ats,
     read_status_rows,
 )
 from status_site.a2ui import (
@@ -117,7 +118,15 @@ def render(cfg: "Config") -> dict:
     from status_site.server import CHAT_SNAPSHOT_LIMIT, read_chat
 
     recent = read_chat(cfg, limit=CHAT_SNAPSHOT_LIMIT)
-    groups = build_groups(read_status_rows(cfg.status_dir))
+    status_rows = read_status_rows(cfg.status_dir)
+    groups = build_groups(status_rows)
+    read_ats = read_message_ats(status_rows)
+    if read_ats:
+        recent = [
+            {**m, "status": "read"}
+            if m.get("from") == "jason" and m.get("at") in read_ats else m
+            for m in recent
+        ]
     if len(recent) >= CHAT_SNAPSHOT_LIMIT:
         # Older history is only reachable via ``/api/chat?before=``; drop
         # working-groups that predate the snapshot window so they don't

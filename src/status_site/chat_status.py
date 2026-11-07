@@ -156,6 +156,11 @@ class ChatStatusWriter:
     def turn_end(self, error: str | None = None) -> None:
         self._append("turn_end", text=DONE_TEXT, **({"error": error} if error else {}))
 
+    def read(self, message_at: str) -> None:
+        """Mark the Jason message at ``message_at`` as read (loaded into
+        Alice's inbound context)."""
+        self._append("read", event="read", msg_at=message_at, read_at=now_iso())
+
     def tool_start(self, name: str, tool_input: Any, tool_use_id: str) -> None:
         label, category, significant = describe_tool(name, tool_input)
         self._append(
@@ -189,6 +194,14 @@ def read_status_rows(status_dir: Path, limit: int = MAX_STATUS_ROWS) -> list[dic
     return rows[-limit:] if limit else rows
 
 
+def read_message_ats(rows: list[dict]) -> set[str]:
+    """``at`` values of chat messages that have a ``read`` row."""
+    return {
+        str(r["msg_at"]) for r in rows
+        if r.get("kind") == "read" and r.get("msg_at")
+    }
+
+
 def _parse_ts(s: object) -> float | None:
     try:
         return datetime.fromisoformat(str(s)).timestamp()
@@ -215,6 +228,8 @@ def build_groups(rows: list[dict], now: float | None = None) -> list[dict]:
     now = time.time() if now is None else now
     turns: dict[str, dict] = {}
     for r in rows:
+        if r.get("kind") == "read":
+            continue
         tid = str(r.get("turn_id"))
         g = turns.setdefault(
             tid,
