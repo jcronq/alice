@@ -23,6 +23,7 @@ import json
 import sys
 from typing import Optional, Sequence
 
+from .sm.cli import add_sm_subparser, cmd_sm
 from .task_store import (
     InvalidState,
     InvalidTransition,
@@ -398,6 +399,12 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["blocks", "follows", "supersedes"],
         help="Edge kind. Default: blocks.",
     )
+
+    # ---- sm — DB-primary state-machine verbs (issue #825). Replaces
+    # the ``[SM] <verb>`` comment convention on GitHub. All writes
+    # route through :mod:`alice_forge.sm.store`; the handlers live in
+    # :mod:`alice_forge.sm.cli` so this parser stays navigable.
+    add_sm_subparser(sub)
 
     return p
 
@@ -812,6 +819,7 @@ _HANDLERS = {
     "reindex": _cmd_reindex,
     "db": _cmd_db,
     "deps": _cmd_deps,
+    "sm": cmd_sm,
 }
 
 

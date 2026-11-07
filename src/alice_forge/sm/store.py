@@ -383,6 +383,129 @@ def amend(
     return int(cur.lastrowid) if cur.lastrowid is not None else 0
 
 
+def unblock_to_prior(
+    *,
+    conn: sqlite3.Connection,
+    item_id: str,
+    actor: str,
+    reason: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> int:
+    """Restore an item from ``sm:blocked`` back to its prior state.
+
+    Reads the ``transitions`` tail to find the most-recent row whose
+    ``to_state = sm:blocked`` — the ``from_state`` on that row is the
+    state the item was in before it got blocked, and that's where we
+    put it back.
+
+    Why this bypasses :func:`transition`'s edge check: the
+    :mod:`alice_forge.sm.transitions` table encodes BLOCKED → BLOCKED
+    only (an :class:`EventTransition` placeholder so the I-1
+    completeness check passes). Every real unblock target varies per
+    item, so the dispatcher / CLI compute it from history. This
+    function is the sanctioned write path for that "variable target"
+    edge; direct ``INSERT INTO transitions`` from a caller would
+    bypass actor-trust and the atomic ``state_machine`` update that
+    the write choke point owes callers.
+
+    :param conn: RW SQLite connection (``PRAGMA foreign_keys = ON``).
+    :param item_id: Item surrogate. Must currently be in ``sm:blocked``.
+    :param actor: Author of the unblock. Must be in
+        :data:`ALLOWED_ACTORS`.
+    :param reason: Free-form reason, persisted to ``transitions.reason``.
+    :param now: Timestamp override.
+
+    :returns: ``transition_id`` of the newly-inserted row.
+    :raises ActorNotTrustedError: ``actor`` outside
+        :data:`ALLOWED_ACTORS`.
+    :raises ItemNotFoundError: No ``state_machine`` row for ``item_id``.
+    :raises IllegalTransitionError: Item is not currently in
+        ``sm:blocked``, or there is no prior ``to=sm:blocked``
+        transition in history to restore from.
+    """
+    if actor not in ALLOWED_ACTORS:
+        raise ActorNotTrustedError(
+            f"actor {actor!r} not in ALLOWED_ACTORS "
+            f"(allowed={sorted(ALLOWED_ACTORS)!r})"
+        )
+
+    row = conn.execute(
+        "SELECT state FROM state_machine WHERE item_id = ?",
+        (item_id,),
+    ).fetchone()
+    if row is None:
+        raise ItemNotFoundError(
+            f"no state_machine row for item_id={item_id!r} — seed it first"
+        )
+    current_label = row[0]
+    current = SMState.from_label(current_label)
+    if current is not SMState.BLOCKED:
+        raise IllegalTransitionError(
+            f"unblock requires item {item_id!r} to be in sm:blocked, "
+            f"got {current_label!r}",
+            from_state=current,
+            to_state=None,
+        )
+
+    prior_row = conn.execute(
+        """
+        SELECT from_state FROM transitions
+        WHERE item_id = ? AND to_state = ?
+        ORDER BY transition_id DESC
+        LIMIT 1
+        """,
+        (item_id, SMState.BLOCKED.label),
+    ).fetchone()
+    if prior_row is None or prior_row[0] is None:
+        raise IllegalTransitionError(
+            f"no prior transition into sm:blocked for item {item_id!r} — "
+            f"cannot infer restore target",
+            from_state=SMState.BLOCKED,
+            to_state=None,
+        )
+    prior = SMState.from_label(prior_row[0])
+    if prior is None:
+        raise IllegalTransitionError(
+            f"prior state {prior_row[0]!r} for item {item_id!r} is not a "
+            f"recognised SMState",
+            from_state=SMState.BLOCKED,
+            to_state=None,
+        )
+
+    ts = _utc_iso(now)
+    with conn:
+        cur = conn.execute(
+            """
+            INSERT INTO transitions (
+                item_id, from_state, to_state, actor, reason,
+                ts, source, source_ref
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item_id,
+                SMState.BLOCKED.label,
+                prior.label,
+                actor,
+                reason,
+                ts,
+                "sm-store-unblock",
+                None,
+            ),
+        )
+        transition_id = int(cur.lastrowid) if cur.lastrowid is not None else 0
+        conn.execute(
+            """
+            UPDATE state_machine
+               SET state = ?,
+                   entered_at = ?,
+                   last_transition_id = ?
+             WHERE item_id = ?
+            """,
+            (prior.label, ts, transition_id, item_id),
+        )
+    return transition_id
+
+
 def record_dependency(
     *,
     conn: sqlite3.Connection,
