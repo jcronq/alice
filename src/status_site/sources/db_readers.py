@@ -39,7 +39,7 @@ import sqlite3
 from datetime import date, datetime, timezone
 from typing import Iterable, Optional
 
-from alice_state_db import DEFAULT_DB_PATH, connect
+from alice_state_db import DEFAULT_DB_PATH, connect, list_transitions
 
 log = logging.getLogger("status_site.db_readers")
 
@@ -468,3 +468,77 @@ def fetch_merged_prs_from_db(
         return [], []
 
     return items, []
+
+
+# ---------------------------------------------------------------------------
+# Item-history reader — backs the drawer + ``/history/<item_id>`` page.
+
+
+def fetch_item_history_from_db(
+    item_id: str,
+    *,
+    limit: int = 10,
+    db_path: Optional[pathlib.Path] = None,
+) -> list[dict]:
+    """Return the transition tail for one item, newest-first.
+
+    Thin wrapper over
+    :func:`alice_state_db.read_api.list_transitions` so the status-site
+    drawer and ``/history/<id>`` page share one code path with the
+    ``task db transitions --item`` CLI. Row shape matches the issue's
+    timeline-tuple:
+    ``{ts, from_state, to_state, actor, reason, source}``.
+
+    ``limit=0`` → return the full tail (used by the full-history
+    page). Any ``sqlite3.Error`` degrades to an empty list so a
+    missing DB file during first-ever-boot doesn't 500 the status
+    site.
+    """
+    path = db_path or _resolve_db_path()
+    try:
+        with connect(path) as conn:
+            if limit and limit > 0:
+                rows = list_transitions(conn, item_id=item_id, limit=limit)
+            else:
+                # Large cap approximates "no cap" — good enough for a
+                # per-item audit tail that in practice tops out well
+                # below 10k rows. SQLite handles this cheaply.
+                rows = list_transitions(conn, item_id=item_id, limit=10_000)
+    except sqlite3.Error as exc:
+        log.warning("db_readers.fetch_item_history_from_db: %r", exc)
+        return []
+
+    out: list[dict] = []
+    for r in rows:
+        out.append(
+            {
+                "ts": r.get("ts") or "",
+                "from_state": r.get("from_state"),
+                "to_state": r.get("to_state"),
+                "actor": r.get("actor") or "",
+                "reason": r.get("reason") or "",
+                "source": r.get("source") or "",
+            }
+        )
+    return out
+
+
+def item_exists_in_db(
+    item_id: str, *, db_path: Optional[pathlib.Path] = None
+) -> bool:
+    """Return whether ``items.item_id`` has a row for this id.
+
+    Used by the ``/api/pipeline-history`` endpoint to distinguish
+    "no transitions yet" (200 with empty list) from "no such item"
+    (404) — mirrors the ``/api/review`` 404 pattern.
+    """
+    path = db_path or _resolve_db_path()
+    try:
+        with connect(path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM items WHERE item_id = ?", (item_id,)
+            ).fetchone()
+            return row is not None
+    except sqlite3.Error as exc:
+        log.warning("db_readers.item_exists_in_db: %r", exc)
+        return False

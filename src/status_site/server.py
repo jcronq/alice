@@ -3024,6 +3024,50 @@ class Handler(BaseHTTPRequestHandler):
             )
         if path == "/api/events":
             return self._sse(head=head)
+        if path == "/api/pipeline-history":
+            # Item-history drawer + full-history page backend (issue #832).
+            # Read-only JOIN over ``transitions`` for one item; shape
+            # matches ``fetch_item_history_from_db``.
+            q = parse_qs(urlsplit(self.path).query)
+            item_id = (q.get("item") or [""])[0]
+            if not item_id:
+                return self._json(400, {"error": "missing item"}, head=head)
+            try:
+                limit_raw = (q.get("limit") or ["10"])[0]
+                limit = int(limit_raw) if limit_raw else 0
+            except ValueError:
+                limit = 10
+            if limit < 0:
+                limit = 10
+            # Lazy import so the server module doesn't force an
+            # alice_state_db dependency at boot — mirrors the CLI's
+            # lazy-import of the same module.
+            from status_site.sources.db_readers import (
+                fetch_item_history_from_db,
+                item_exists_in_db,
+            )
+            rows = fetch_item_history_from_db(item_id, limit=limit)
+            if not rows and not item_exists_in_db(item_id):
+                # Distinguish "no transitions yet" from "no such item" —
+                # same pattern as ``/api/review``'s 404 on unknown slug.
+                return self._json(404, {"error": "no such item"}, head=head)
+            return self._json(
+                200, {"item_id": item_id, "transitions": rows}, head=head
+            )
+        if path.startswith("/history/"):
+            # SPA shell for ``/history/<url-encoded-item-id>`` — the
+            # frontend reads ``location.pathname`` on mount and
+            # dispatches to ``ItemHistoryPage``. The server just serves
+            # ``index.html``; teaching ``_resolve`` / ``CONTENT_NAME_RE``
+            # about this path would conflate SPA routes with flat
+            # content files, which is the wrong seam.
+            try:
+                body = (STATIC_DIR / "index.html").read_bytes()
+            except OSError:
+                return self._json(404, {"error": "not found"}, head=head)
+            return self._send(
+                200, body, "text/html; charset=utf-8", head=head
+            )
         if path == "/index.md":
             index_path = self.cfg.status_dir / "index.md"
             if index_path.is_file():
