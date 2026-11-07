@@ -14,6 +14,7 @@ kwargs on :func:`alice_forge.dispatcher.run`).
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from typing import Any, Callable, Iterable
@@ -35,7 +36,22 @@ def _run_gh(args: list[str], *, timeout: int = 60) -> str:
     """Invoke ``gh`` with the given args, raise GHCommandError on failure.
 
     Returns stdout as a string. Empty stdout is returned as ``""``.
+
+    **Dry-run gate (#803).** When :envvar:`ALICE_DISPATCHER_DRY` is set
+    to ``"1"``, this function short-circuits and returns ``""`` without
+    forking ``gh``. Every ``gh_*`` helper in this module is written to
+    treat empty stdout as "no results" (empty list / ``None`` / empty
+    dict), so a dry-gated dispatcher pass is a benign no-op across the
+    board. The test suite's autouse fixture sets this env var so a
+    partially-mocked test can't accidentally shell out to real
+    ``gh`` on CI (#797 → #801 fixed four leaks by rewiring
+    monkeypatch resolution; this gate catches the remaining class).
+    Production never sets the var — a prod dispatcher with it on
+    silently makes no progress, which is the safer failure mode than
+    writing to real issues under an unexpected configuration.
     """
+    if os.environ.get("ALICE_DISPATCHER_DRY") == "1":
+        return ""
     try:
         result = subprocess.run(
             args,

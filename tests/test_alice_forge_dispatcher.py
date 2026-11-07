@@ -28,6 +28,30 @@ from alice_forge import dispatcher as sm
 
 
 @pytest.fixture(autouse=True)
+def _enable_dispatcher_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bolt the dispatcher's ``gh`` CLI shim off for every test (#803).
+
+    ``alice_forge.dispatcher.gh._run_gh`` is the single choke point every
+    ``gh_*`` helper routes through (via ``_dispatch_run_gh`` →
+    ``sys.modules["alice_forge.dispatcher"]._run_gh``). When
+    :envvar:`ALICE_DISPATCHER_DRY` is ``"1"``, ``_run_gh`` short-
+    circuits to ``""`` and the helpers' empty-stdout branches return
+    empty results — PR #801 fixed four specific gh_* fixtures that
+    were silently missing main.py; this autouse gate catches the
+    remaining ~16 that have no autouse coverage (``gh_list_stale_
+    closed_sm_issues``, ``gh_get_pr_merge_status``, ``gh_find_
+    linked_pr``, ``gh_edit_labels``, ``gh_close_issue``, …) and
+    every future ``gh_*`` helper added after this patch.
+
+    Individual tests that *want* ``_run_gh`` to produce canned stdout
+    (e.g. ``test_gh_get_pr_files_parses_payload``) monkeypatch
+    ``sm._run_gh`` directly — that replaces the function object, which
+    bypasses this env check unconditionally.
+    """
+    monkeypatch.setenv("ALICE_DISPATCHER_DRY", "1")
+
+
+@pytest.fixture(autouse=True)
 def _stub_gh_list_issue_comments(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default the gh comments fetcher to a benign empty result.
 
