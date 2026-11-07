@@ -1532,12 +1532,18 @@ function renderBoundList(id, props, rows) {
     return rows.map(sec => h("section", {key: sec.key, className: "bugs-section"},
       h("h2", null, sec.heading),
       sec.rows.length
-        ? h("ul", null, sec.rows.map(r => h("li", {key: r.id},
+        ? h("ul", null, sec.rows.map(r => h("li", {key: r.id, style: r.stale ? {borderLeft: "3px solid #d9a441", paddingLeft: ".4rem"} : null},
             h("strong", null, r.title),
             r.summary_bits && r.summary_bits.length
               ? h("em", null, ": " + r.summary_bits.join(" — "))
               : null,
             r.pricing ? h("span", {className: "fx-pill", style: {marginLeft: ".4rem"}}, r.pricing) : null,
+            r.meta || r.pr_url
+              ? h("div", {style: {opacity: .65, fontSize: ".85em"}},
+                  r.stale ? "⚠ stale · " : null,
+                  r.meta,
+                  r.pr_url ? [r.meta ? " · " : "", h("a", {key: "pr", href: r.pr_url, target: "_blank", rel: "noopener"}, "PR")] : null)
+              : null,
           )))
         : h("p", {className: "typing"}, "(none yet)"),
     ));
