@@ -486,11 +486,67 @@ def run(
         master_ci_status = _sm.gh_get_master_ci_status
 
     if list_issues is None:
-        list_issues = _sm.gh_list_sm_issues
+        # Issue #826 — wrap in the shadow/cutover resolver so each
+        # per-pass listing either (a) runs GH + DB and logs diffs
+        # [default], or (b) uses DB with GH as fail-open fallback.
+        # Tests inject their own ``list_issues=`` and bypass this.
+        from alice_forge.dispatcher.db_source import (
+            db_list_open_done_sm_issues as _db_open_done,
+            db_list_sm_issues as _db_list_sm,
+            db_list_stale_closed_sm_issues as _db_stale_closed,
+            shadow_resolve as _shadow_resolve,
+        )
+
+        def _wrap(name: str, gh_fn, db_fn):
+            def _call(r: str) -> list[dict[str, Any]]:
+                return _shadow_resolve(
+                    gh_callable=gh_fn,
+                    db_callable=db_fn,
+                    source_name=name,
+                    repo=r,
+                    log=log,
+                )
+            return _call
+
+        list_issues = _wrap(
+            "gh_list_sm_issues", _sm.gh_list_sm_issues, _db_list_sm
+        )
     if list_stale_closed is None:
-        list_stale_closed = _sm.gh_list_stale_closed_sm_issues
+        # Issue #826 — DB does not yet track GH open/closed; the DB
+        # helper returns ``[]`` and ``shadow_resolve`` falls back to
+        # the GH listing in cutover mode. Kept wired so stdout + note
+        # audit still records divergence during shadow.
+        from alice_forge.dispatcher.db_source import (
+            db_list_stale_closed_sm_issues as _db_stale_closed_only,
+            shadow_resolve as _shadow_resolve_sc,
+        )
+
+        def _list_stale_closed_wrap(r: str) -> list[dict[str, Any]]:
+            return _shadow_resolve_sc(
+                gh_callable=_sm.gh_list_stale_closed_sm_issues,
+                db_callable=_db_stale_closed_only,
+                source_name="gh_list_stale_closed_sm_issues",
+                repo=r,
+                log=log,
+            )
+
+        list_stale_closed = _list_stale_closed_wrap
     if list_open_done is None:
-        list_open_done = _sm.gh_list_open_done_sm_issues
+        from alice_forge.dispatcher.db_source import (
+            db_list_open_done_sm_issues as _db_open_done_only,
+            shadow_resolve as _shadow_resolve_od,
+        )
+
+        def _list_open_done_wrap(r: str) -> list[dict[str, Any]]:
+            return _shadow_resolve_od(
+                gh_callable=_sm.gh_list_open_done_sm_issues,
+                db_callable=_db_open_done_only,
+                source_name="gh_list_open_done_sm_issues",
+                repo=r,
+                log=log,
+            )
+
+        list_open_done = _list_open_done_wrap
     if sweeper_config is None:
         # Issue #784 — read ``sm_dispatcher.sweeper`` once per pass so
         # a mid-run config edit requires a fresh cadence to take effect
