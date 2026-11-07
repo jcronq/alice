@@ -378,9 +378,15 @@ def wake_file_age(
     """Return ``(path, age_seconds)`` for the most recent wake file.
 
     Looks under ``mind/inner/thoughts/<today>/*.md``. ``today`` defaults
-    to local-tz today (``YYYY-MM-DD``). Returns ``(None, None)`` if the
-    directory is missing, empty, or only contains today's-not-written-yet
-    files.
+    to UTC today (``YYYY-MM-DD``) — ``wake.py`` writes its summary to
+    ``<today-UTC>/`` per the prelude convention (``date -u +%Y-%m-%d``),
+    so the watchdog must query the same key. Using local time instead
+    would silently diverge after UTC midnight (local Nov 6 ~19:00 EST):
+    the watchdog looks at yesterday-UTC's dir, sees ~4h-old stale files,
+    and declares STUCK within minutes of a fresh start. Issue #785 bug 2.
+
+    Returns ``(None, None)`` if the directory is missing, empty, or only
+    contains today's-not-written-yet files.
 
     The watchdog uses this as the heartbeat: ``wake.py`` writes the
     summary file at logical-work completion. If the process is alive
@@ -388,7 +394,7 @@ def wake_file_age(
     in cleanup (the SDK socket leak), not still working.
     """
     if today is None:
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if now is None:
         now = time.time()
 

@@ -56,7 +56,7 @@ def _make_mind(
     (mind / "memory").mkdir(parents=True)
     if wake_age_seconds is not None:
         if today is None:
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         day = mind / "inner" / "thoughts" / today
         day.mkdir(parents=True)
         wake = day / "120000-wake.md"
@@ -292,6 +292,56 @@ def test_wake_file_age_returns_none_when_no_thoughts_dir(tmp_path):
     p, age = wd.wake_file_age(mind)
     assert p is None
     assert age is None
+
+
+def test_wake_file_age_default_today_is_utc(tmp_path, monkeypatch):
+    """Regression for #785 bug 2 (UTC/local skew).
+
+    ``wake.py`` writes to ``inner/thoughts/<today-UTC>/`` per the
+    prelude convention (``date -u +%Y-%m-%d``). The watchdog must
+    use the same UTC key. Pre-fix used local time; a container
+    booted after UTC midnight but before local midnight (EST: local
+    ~19:00-23:59) would skew — local-today's dir still holds
+    yesterday-UTC's old wake files, tripping a false-positive STUCK.
+    """
+    # Simulate "local Nov 6, UTC Nov 7" — the exact skew window.
+    class _FakeDT:
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return datetime(2026, 11, 6, 23, 30, 0)  # local, naive
+            return datetime(2026, 11, 7, 4, 30, 0, tzinfo=tz)  # UTC side
+
+        @classmethod
+        def strftime(cls, fmt):  # pragma: no cover — compat shim
+            return cls.now().strftime(fmt)
+
+    monkeypatch.setattr(wd, "datetime", _FakeDT)
+
+    # Only the UTC-dated dir has today's wake files. The local-dated
+    # dir has stale files from "yesterday" (which the pre-fix watchdog
+    # would wrongly read).
+    utc_today = "2026-11-07"
+    local_today = "2026-11-06"
+    utc_dir = tmp_path / "inner" / "thoughts" / utc_today
+    utc_dir.mkdir(parents=True)
+    fresh = utc_dir / "040000-wake.md"
+    fresh.write_text("fresh")
+    fresh_mtime = time.time() - 60  # 1 min old
+    os.utime(fresh, (fresh_mtime, fresh_mtime))
+
+    local_dir = tmp_path / "inner" / "thoughts" / local_today
+    local_dir.mkdir(parents=True)
+    stale = local_dir / "180000-wake.md"
+    stale.write_text("stale")
+    stale_mtime = time.time() - 5 * 3600  # 5h old → would trip STUCK
+    os.utime(stale, (stale_mtime, stale_mtime))
+
+    # ``now`` is still real time (seconds since epoch), so ``age`` uses
+    # the real clock — only the date-key defaults come from the fake.
+    p, age = wd.wake_file_age(tmp_path)
+    assert p == fresh, "watchdog must read UTC-today, not local-today"
+    assert age is not None and age < 120
 
 
 def test_wake_file_age_picks_newest(tmp_path):
@@ -620,6 +670,69 @@ def test_telemetry_event_emitted_on_intervention(tmp_path, monkeypatch):
     assert e["wake_file_age_seconds"] >= 1560
     assert e["sigterm_sent"] is True
     assert e["sigterm_sufficient"] is True
+
+
+def test_fresh_thinker_not_stuck_within_threshold(tmp_path, monkeypatch):
+    """Regression for #785 bug 2 live-site symptom.
+
+    Fresh container boot shortly after UTC midnight (EST evening):
+    thinker supervisor just started, python child has been running
+    maybe 30 seconds, and the only wake file on disk is from the
+    previous local-day sitting in ``inner/thoughts/<local-today>/``.
+    Pre-fix, the watchdog read local-today's dir, computed wake_age
+    = several hours, and declared STUCK within 3 minutes.
+
+    With the UTC fix, the wrong-dir read goes away: watchdog reads
+    ``<utc-today>/`` which is empty (or has the very recent fresh
+    wake), falls through to ``_classify_no_wake_file`` with a small
+    process age, and correctly returns WORKING.
+    """
+    # Simulate "local Nov 6, UTC Nov 7" — same skew window as the report.
+    class _FakeDT:
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return datetime(2026, 11, 6, 23, 30, 0)
+            return datetime(2026, 11, 7, 4, 30, 0, tzinfo=tz)
+
+    monkeypatch.setattr(wd, "datetime", _FakeDT)
+
+    state = _make_state_dir(tmp_path, cadence=300)
+    # Build the mind with stale wake files on local-today's side (the
+    # dir the pre-fix watchdog would read). UTC-today's dir is empty
+    # because the fresh thinker hasn't written its first file yet.
+    mind = tmp_path / "mind"
+    (mind / "memory").mkdir(parents=True)
+    local_dir = mind / "inner" / "thoughts" / "2026-11-06"
+    local_dir.mkdir(parents=True)
+    stale = local_dir / "180000-wake.md"
+    stale.write_text("stale")
+    stale_mtime = time.time() - 5 * 3600
+    os.utime(stale, (stale_mtime, stale_mtime))
+
+    lock = _make_lock(tmp_path)
+    inode = lock.stat().st_ino
+    fake_pid = 12345
+    monkeypatch.setattr(wd, "_read_proc_locks", lambda: [(fake_pid, inode)])
+    monkeypatch.setattr(wd, "_resolve_alice_child_pid", lambda pid, **kw: pid)
+    monkeypatch.setattr(wd, "_read_wchan", lambda pid: None)
+    # Freshly-started thinker: 30s of wall-clock, well under the
+    # 1560s threshold for a 300s cadence.
+    monkeypatch.setattr(wd, "_proc_age_seconds", lambda pid, now=None: 30.0)
+
+    def _bang(*_a, **_k):
+        raise AssertionError("intervene must not run for a fresh thinker")
+
+    monkeypatch.setattr(wd, "intervene", _bang)
+
+    result = wd.run_tick(
+        lock_path=lock,
+        state_dir=state,
+        mind=mind,
+        events_log=mind / "memory" / "events.jsonl",
+    )
+    assert result.decision == wd.Decision.WORKING
+    assert result.wake_file is None  # UTC-today dir is empty, correctly
 
 
 def test_run_tick_working_no_events(tmp_path, monkeypatch):
