@@ -1875,7 +1875,13 @@ function DoneTodayList({prs, asksResolved}) {
                 : h("span", {className: "fx-num"}, "#" + r.number)
             },
             {key: "title", label: "title"},
-            {key: "merged_at", label: "merged"},
+            {key: "merged_at", label: "merged", cell: r => {
+              const d = r.merged_at ? new Date(r.merged_at) : null;
+              const ok = d && !isNaN(d.getTime());
+              return h("span", {title: r.merged_at || "", style: {whiteSpace: "nowrap"}},
+                ok ? d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", hour12: false})
+                   : (r.merged_at || ""));
+            }},
           ],
           rows: prRows.map((r, i) => ({...r, __key: (r.repo || "") + "#" + (r.number || i)})),
         })
