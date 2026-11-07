@@ -493,6 +493,57 @@ def gh_find_linked_pr(
     return None
 
 
+def gh_find_open_linked_prs(
+    repo: str, issue_number: int, *, gh_bin: str = "gh"
+) -> list[int]:
+    """Return the numbers of OPEN PRs that close ``issue_number``.
+
+    Issue #784. Companion to :func:`gh_find_linked_pr`; used by the
+    Phase 1.6 sweeper to decide whether a closed-unmerged PR should
+    flip the issue to ``sm:rejected`` or wait for an in-flight
+    follow-up attempt.
+
+    Returns an empty list when no open follow-up PRs exist, the issue
+    is not referenced by any PR, or the ``gh`` payload is malformed.
+    """
+    args = [
+        gh_bin,
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "open",
+        "--search",
+        "linked:issue",
+        "--json",
+        "number,state,closingIssuesReferences",
+        "--limit",
+        "100",
+    ]
+    stdout = _dispatch_run_gh(args)
+    if not stdout.strip():
+        return []
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, list):
+        return []
+    out: list[int] = []
+    for pr in payload:
+        if (pr.get("state") or "").upper() != "OPEN":
+            continue
+        refs = pr.get("closingIssuesReferences") or []
+        for ref in refs:
+            if isinstance(ref, dict) and ref.get("number") == issue_number:
+                n = pr.get("number")
+                if isinstance(n, int):
+                    out.append(n)
+                break
+    return out
+
+
 def gh_get_pr_merge_status(
     repo: str, pr_number: int, *, gh_bin: str = "gh"
 ) -> dict[str, Any]:

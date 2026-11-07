@@ -173,3 +173,24 @@ def test_send_sets_reply_headers_and_attaches_files(tmp_path):
     assert message["References"] == "<root@example.com> <latest@example.com>"
     assert "Status: done" in message.get_body(preferencelist=("plain",)).get_content()
     assert list(message.iter_attachments())[0].get_filename() == "note.txt"
+
+
+def test_verify_inbound_table():
+    from alice_speaking.transports.gmail import verify_inbound
+
+    ok = "mx.google.com; dkim=pass header.d=example.com; spf=pass; dmarc=pass header.from=example.com"
+    assert verify_inbound([ok], "a@example.com") == (True, "dmarc_pass")
+    assert verify_inbound([], "a@example.com") == (False, "no_auth_results")
+    assert verify_inbound(["evil.com; dmarc=pass"], "a@example.com") == (
+        False,
+        "authserv_mismatch",
+    )
+    assert verify_inbound(
+        ["mx.google.com; dkim=pass header.d=example.com; dmarc=fail"], "a@example.com"
+    ) == (True, "dkim_aligned")
+    assert verify_inbound(
+        ["mx.google.com; dkim=pass header.d=evil.com; dmarc=fail"], "a@example.com"
+    ) == (False, "dkim_pass_from_misalign")
+    assert verify_inbound(
+        ["mx.google.com; spf=pass; dkim=fail; dmarc=fail"], "a@example.com"
+    ) == (False, "dkim_fail_dmarc_fail")
