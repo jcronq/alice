@@ -523,37 +523,22 @@ def fetch_item_history_from_db(
     return out
 
 
-def fetch_item_meta_from_db(
+def item_exists_in_db(
     item_id: str, *, db_path: Optional[pathlib.Path] = None
-) -> Optional[dict]:
-    """Return ``{item_id, title, state, entered_at}`` or ``None``.
+) -> bool:
+    """Return whether ``items.item_id`` has a row for this id.
 
-    Used by the ``/api/pipeline-history`` endpoint for the drawer +
-    full-history page to render title + current state alongside the
-    transition tail. ``None`` means the item has no ``items`` row —
-    the API returns 404 (mirrors ``/api/review``'s 404 on unknown
-    slug) so the caller can distinguish "no transitions yet" from
-    "no such item".
+    Used by the ``/api/pipeline-history`` endpoint to distinguish
+    "no transitions yet" (200 with empty list) from "no such item"
+    (404) — mirrors the ``/api/review`` 404 pattern.
     """
     path = db_path or _resolve_db_path()
     try:
         with connect(path) as conn:
             row = conn.execute(
-                "SELECT item_id, title FROM items WHERE item_id = ?",
-                (item_id,),
+                "SELECT 1 FROM items WHERE item_id = ?", (item_id,)
             ).fetchone()
-            if row is None:
-                return None
-            sm_row = conn.execute(
-                "SELECT state, entered_at FROM state_machine WHERE item_id = ?",
-                (item_id,),
-            ).fetchone()
-            return {
-                "item_id": row["item_id"],
-                "title": row["title"] or "",
-                "state": sm_row["state"] if sm_row else None,
-                "entered_at": sm_row["entered_at"] if sm_row else None,
-            }
+            return row is not None
     except sqlite3.Error as exc:
-        log.warning("db_readers.fetch_item_meta_from_db: %r", exc)
-        return None
+        log.warning("db_readers.item_exists_in_db: %r", exc)
+        return False
