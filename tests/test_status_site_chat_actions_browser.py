@@ -143,6 +143,18 @@ def test_reply_prefills_composer_and_sends_reply_to(page):
     assert last["reply_to"] == MID and last["text"].endswith("agreed")
 
 
+def test_message_meta_wraps_timestamp_in_time_element(page):
+    pg, _, _ = page
+    # The ``base`` fixture seeds ~40 messages; every one should render a
+    # <time> element inside its ``.msg small`` meta line, and no meta line
+    # should still carry a raw ISO fragment like "T09:00".
+    assert pg.locator(".msg small time").count() > 0
+    metas = pg.locator(".msg small").all_inner_texts()
+    assert metas, "no .msg small meta lines rendered"
+    for text in metas:
+        assert not __import__("re").search(r"T\d\d:\d\d", text), text
+
+
 def test_reply_header_jumps_to_quoted_message(page):
     pg, _, _ = page
     ref = pg.locator(f'[id="msg-{NEW}"] [data-testid="reply-ref"]')

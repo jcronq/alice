@@ -63,6 +63,19 @@ out.earliest = ux.earliestAt([
 ]);
 out.earliestNone = ux.earliestAt([{variant: "working-group", at: "2026-11-06T00:00:00+00:00"}]);
 
+// formatMessageTime — pass ``now`` explicitly for determinism. The input is
+// a fixed instant; ``now`` picks whether we render it as "today" or dated.
+const sameDayAt = "2026-11-06T15:44:29-0500";
+const sameDayNow = new Date("2026-11-06T18:00:00-0500");
+const priorDayNow = new Date("2026-11-07T10:00:00-0500");
+out.sameDay = ux.formatMessageTime(sameDayAt, sameDayNow);
+out.priorDay = ux.formatMessageTime(sameDayAt, priorDayNow);
+out.offsetHyphen = ux.formatMessageTime("2026-11-06T15:44:29-0500", sameDayNow);
+out.offsetColon = ux.formatMessageTime("2026-11-06T15:44:29-05:00", sameDayNow);
+out.emptyAt = ux.formatMessageTime("", sameDayNow);
+out.badAt = ux.formatMessageTime("not-a-date", sameDayNow);
+out.missingAt = ux.formatMessageTime(undefined, sameDayNow);
+
 globalThis.FileReader = class {
   readAsDataURL(f) { this.result = "data:image/png;base64,UE5H"; setTimeout(() => this.onload(), 0); }
 };
@@ -131,6 +144,32 @@ def test_load_older_helpers(result):
     assert result["rowKeyGroup"] == "wg:T"
     assert result["earliest"] == "2026-11-06T01:00:00+00:00"
     assert result["earliestNone"] is None
+
+
+def test_format_message_time_today_shows_clock_only(result):
+    # Same-day: a clock string with AM/PM, no ISO leakage.
+    same = result["sameDay"]
+    assert "AM" in same or "PM" in same
+    assert "T" not in same
+    assert "-05" not in same
+
+
+def test_format_message_time_prior_day_has_month_day_prefix(result):
+    import re
+
+    assert re.match(r"^[A-Za-z]{3} \d+,", result["priorDay"]), result["priorDay"]
+
+
+def test_format_message_time_offset_spellings_match(result):
+    # ``-0500`` and ``-05:00`` encode the same instant → identical output.
+    assert result["offsetHyphen"] == result["offsetColon"]
+    assert result["offsetHyphen"]  # non-empty
+
+
+def test_format_message_time_bad_input_returns_empty(result):
+    assert result["emptyAt"] == ""
+    assert result["badAt"] == ""
+    assert result["missingAt"] == ""
 
 
 def test_chat_thread_wires_infinite_scroll():
