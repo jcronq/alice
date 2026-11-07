@@ -52,6 +52,12 @@ class _StubDaemon:
     """
 
     _channel_key = staticmethod(SpeakingDaemon._channel_key)
+    # ``_posttooluse_hook`` calls ``self._record_cron_tool_result`` at
+    # the top unconditionally (issue #815) — alias it so the mid-turn
+    # tests keep exercising the drain logic without needing a cron
+    # tool in the input bundle. The method is observation-only so it's
+    # a no-op for the inputs this suite builds (``Bash``-shaped).
+    _record_cron_tool_result = SpeakingDaemon._record_cron_tool_result
 
     def __init__(self) -> None:
         self.events = _StubEvents()
