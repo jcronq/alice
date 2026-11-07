@@ -273,6 +273,8 @@ def review_item_row(item: object, *, state: str = "") -> dict:
         "art": "",
         "link": get("url", "") or "",
         "age_seconds": age_label_seconds(get("age", "")),
+        "author": get("author", "") or "",
+        "ci": get("ci", "") or "",
     }
 
 
