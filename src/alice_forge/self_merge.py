@@ -497,7 +497,11 @@ def _build_argparser() -> "argparse.ArgumentParser":  # type: ignore[name-define
             "2 when the merge is blocked, 1 on hard error."
         ),
     )
-    parser.add_argument("--repo", required=True, help="owner/name of the repo")
+    parser.add_argument(
+        "--repo",
+        required=True,
+        help="<user>/<repo> slug, e.g. jcronq/alice",
+    )
     parser.add_argument("--pr", type=int, required=True, help="PR number")
     parser.add_argument(
         "--files",
