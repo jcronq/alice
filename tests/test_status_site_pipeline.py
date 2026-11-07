@@ -514,3 +514,138 @@ def test_group_rows_by_component_row_appears_in_each_bucket():
 
 def test_group_rows_by_component_empty_input_empty_output():
     assert P.group_rows_by_component([]) == []
+
+
+# ─── issue #832: /api/pipeline-history + /history/<id> SPA shell ─────
+
+
+@pytest.fixture
+def history_site(tmp_path, monkeypatch):
+    """Spin up a status_site server pointed at a seeded alice-state.db."""
+    import http.client as _http
+    import sqlite3 as _sqlite
+    import threading as _thr
+
+    from alice_state_db.schema import apply_schema
+    from status_site.server import Config, make_server
+
+    db_path = tmp_path / "alice-state.db"
+    monkeypatch.setenv("ALICE_STATE_DB_PATH", str(db_path))
+    conn = _sqlite.connect(str(db_path))
+    apply_schema(conn)
+    conn.execute(
+        "INSERT INTO items (item_id, item_type, title) "
+        "VALUES ('gh:jcronq/alice#832', 'gh:issue', 'Drawer')"
+    )
+    conn.execute(
+        "INSERT INTO state_machine (item_id, state, entered_at) "
+        "VALUES ('gh:jcronq/alice#832', 'sm:building', '2026-11-07T12:00:00Z')"
+    )
+    conn.executemany(
+        "INSERT INTO transitions "
+        "(item_id, from_state, to_state, actor, reason, ts, source, source_ref) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("gh:jcronq/alice#832", None, "sm:selected", "jason", "picked",
+             "2026-11-07T09:00:00Z", "gh-comment", "r1"),
+            ("gh:jcronq/alice#832", "sm:selected", "sm:designing", "alice",
+             "design", "2026-11-07T10:00:00Z", "gh-comment", "r2"),
+            ("gh:jcronq/alice#832", "sm:designing", "sm:building", "alice",
+             "spawn", "2026-11-07T12:00:00Z", "gh-comment", "r3"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    status = tmp_path / "status"
+    status.mkdir()
+    cfg = Config(
+        status_dir=status,
+        surface_dir=tmp_path / "surface",
+        upload_dir=tmp_path / "up",
+        key="k",
+        port=0,
+        host="127.0.0.1",
+    )
+    srv = make_server(cfg)
+    _thr.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield cfg, srv.server_address[1]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _hreq(port, method, path):
+    import http.client as _http
+    c = _http.HTTPConnection("127.0.0.1", port, timeout=5)
+    c.request(method, path)
+    r = c.getresponse()
+    status = r.status
+    headers = dict(r.getheaders())
+    body = r.read()
+    c.close()
+    return status, headers, body
+
+
+def test_pipeline_history_endpoint_returns_transitions(history_site):
+    import json as _json
+    _, port = history_site
+    status, _, body = _hreq(
+        port, "GET",
+        "/api/pipeline-history?item=" + "gh%3Ajcronq%2Falice%23832"
+        + "&limit=10",
+    )
+    assert status == 200
+    payload = _json.loads(body)
+    assert payload["item_id"] == "gh:jcronq/alice#832"
+    assert payload["title"] == "Drawer"
+    assert payload["state"] == "sm:building"
+    assert len(payload["transitions"]) == 3
+    # Newest-first, tuple-shaped row.
+    assert payload["transitions"][0]["to_state"] == "sm:building"
+    assert set(payload["transitions"][0].keys()) == {
+        "ts", "from_state", "to_state", "actor", "reason", "source",
+    }
+
+
+def test_pipeline_history_endpoint_404_for_unknown_item(history_site):
+    _, port = history_site
+    status, _, _ = _hreq(
+        port, "GET",
+        "/api/pipeline-history?item=" + "gh%3Anope%2Fnope%231",
+    )
+    assert status == 404
+
+
+def test_pipeline_history_endpoint_400_for_missing_item_qs(history_site):
+    _, port = history_site
+    status, _, _ = _hreq(port, "GET", "/api/pipeline-history")
+    assert status == 400
+
+
+def test_history_path_serves_spa_shell(history_site):
+    """``GET /history/<url-encoded-item-id>`` serves index.html."""
+    _, port = history_site
+    status, headers, body = _hreq(
+        port, "GET",
+        "/history/" + "gh%3Ajcronq%2Falice%23832",
+    )
+    assert status == 200
+    ctype = headers.get("Content-Type", "")
+    assert ctype.startswith("text/html")
+    # Sanity-check that we got the shell, not an error page.
+    assert b"Alice" in body or b"<!doctype html" in body.lower()
+
+
+def test_history_path_shell_for_unknown_id_still_serves_html(history_site):
+    """The SPA shell is handed back for any ``/history/*`` — the JS
+    client is responsible for the API lookup + 404 rendering.
+    """
+    _, port = history_site
+    status, headers, _ = _hreq(
+        port, "GET",
+        "/history/" + "gh%3Anope%2Fnope%231",
+    )
+    assert status == 200
+    assert headers.get("Content-Type", "").startswith("text/html")

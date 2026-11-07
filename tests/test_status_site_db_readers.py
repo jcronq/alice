@@ -280,6 +280,96 @@ def test_review_queue_fetch_uses_db_by_default(seeded_db):
     assert len(prs) == 1 and prs[0].number == 803
 
 
+# ─── fetch_item_history_from_db (issue #832) ─────────────────────
+
+
+@pytest.fixture
+def seeded_db_with_transitions(tmp_path, monkeypatch):
+    """Return a seeded alice-state.db with a few transitions for one item."""
+    db_path = tmp_path / "alice-state.db"
+    monkeypatch.setenv("ALICE_STATE_DB_PATH", str(db_path))
+    conn = sqlite3.connect(str(db_path))
+    apply_schema(conn)
+    conn.execute(
+        """
+        INSERT INTO items (item_id, item_type, title)
+        VALUES ('gh:jcronq/alice#832', 'gh:issue', 'Drawer')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO state_machine (item_id, state, entered_at)
+        VALUES ('gh:jcronq/alice#832', 'sm:building', '2026-11-07T12:00:00Z')
+        """
+    )
+    conn.executemany(
+        """
+        INSERT INTO transitions
+            (item_id, from_state, to_state, actor, reason, ts, source, source_ref)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            ("gh:jcronq/alice#832", None, "sm:selected", "jason", "picked",
+             "2026-11-07T09:00:00Z", "gh-comment", "r1"),
+            ("gh:jcronq/alice#832", "sm:selected", "sm:designing", "alice",
+             "design", "2026-11-07T10:00:00Z", "gh-comment", "r2"),
+            ("gh:jcronq/alice#832", "sm:designing", "sm:building", "alice",
+             "spawn", "2026-11-07T12:00:00Z", "gh-comment", "r3"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def test_fetch_item_history_returns_newest_first_tuple_shape(
+    seeded_db_with_transitions,
+):
+    rows = R.fetch_item_history_from_db(
+        "gh:jcronq/alice#832", limit=10,
+        db_path=seeded_db_with_transitions,
+    )
+    assert len(rows) == 3
+    # Newest-first ⇒ last-inserted transition is first.
+    assert rows[0]["to_state"] == "sm:building"
+    assert rows[-1]["to_state"] == "sm:selected"
+    # Every row carries exactly the issue's timeline-tuple keys.
+    assert set(rows[0].keys()) == {
+        "ts", "from_state", "to_state", "actor", "reason", "source",
+    }
+
+
+def test_fetch_item_history_limit_zero_returns_full_tail(
+    seeded_db_with_transitions,
+):
+    rows = R.fetch_item_history_from_db(
+        "gh:jcronq/alice#832", limit=0,
+        db_path=seeded_db_with_transitions,
+    )
+    assert len(rows) == 3
+
+
+def test_fetch_item_history_missing_db_returns_empty(tmp_path):
+    rows = R.fetch_item_history_from_db(
+        "gh:x/y#1", limit=10, db_path=tmp_path / "missing.db"
+    )
+    # ``connect`` auto-creates an empty DB; the tail is simply [].
+    assert rows == []
+
+
+def test_fetch_item_meta_returns_title_state_or_none(
+    seeded_db_with_transitions,
+):
+    meta = R.fetch_item_meta_from_db(
+        "gh:jcronq/alice#832", db_path=seeded_db_with_transitions
+    )
+    assert meta["title"] == "Drawer"
+    assert meta["state"] == "sm:building"
+    assert R.fetch_item_meta_from_db(
+        "gh:nope/nope#1", db_path=seeded_db_with_transitions
+    ) is None
+
+
 def test_review_queue_fetch_respects_explicit_runner(seeded_db, monkeypatch):
     """Explicit ``runner=`` kwarg forces the subprocess path even when
     the env flag is set to db — ensures existing tests keep working.
