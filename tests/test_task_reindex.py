@@ -97,7 +97,6 @@ def test_reindex_dry_run_does_not_write(tmp_path) -> None:
     store = _seed_store(tmp_path, n=3)
 
     # Corrupt the index so the dry-run has an obvious diff to report.
-    index_before = store.index_path.read_text()
     store.index_path.write_text("")
 
     report = store.reindex(dry_run=True)

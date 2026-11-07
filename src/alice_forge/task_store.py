@@ -44,7 +44,7 @@ import re
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Optional
 
 
 log = logging.getLogger(__name__)
