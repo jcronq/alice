@@ -314,21 +314,80 @@ def _build_parser() -> argparse.ArgumentParser:
         help="How many recent transitions to include. Default 5.",
     )
 
-    # ---- db transitions <item_id> — full transition history for
-    # one item. Separate from ``db item`` so the common case (a quick
-    # peek) stays small and the full-audit path is explicit.
+    # ---- db transitions — cross-item newest-first listing (issue #832).
+    #
+    # Breaking change vs. the pre-#832 shape: ``item_id`` is no longer
+    # positional (use ``--item`` to filter), rows come back newest-first
+    # (``ORDER BY transition_id DESC``), and the default output is
+    # tabular — operators piping through ``less`` want the one-line
+    # row format, not a JSON array. ``--json`` still available for
+    # scripts. For the old "everything for one item" behaviour, use
+    # ``db history <item_id>`` below.
     db_transitions = db_sub.add_parser(
         "transitions",
-        help="Full transition history for one item_id (oldest-first).",
+        help=(
+            "Cross-item transition listing (newest-first, tabular by "
+            "default). Filter with --item / --state / --actor / --since."
+        ),
     )
     db_transitions.add_argument(
-        "item_id", help="Item surrogate id (see ``db item`` --help)."
+        "--item",
+        default=None,
+        help="Optional item_id to restrict the listing to one item.",
+    )
+    db_transitions.add_argument(
+        "--state",
+        default=None,
+        help=(
+            "Filter on the *resulting* state (to_state equality — e.g. "
+            "--state sm:done returns rows that landed on sm:done)."
+        ),
+    )
+    db_transitions.add_argument(
+        "--actor",
+        default=None,
+        help="Filter on the recorded actor.",
+    )
+    db_transitions.add_argument(
+        "--since",
+        default=None,
+        help="ISO-8601 lower bound on ts (inclusive).",
     )
     db_transitions.add_argument(
         "--limit",
         type=int,
-        default=None,
-        help="Cap on rows returned. Omit for the full audit trail.",
+        default=20,
+        help="Row cap. Default 20.",
+    )
+
+    # ---- db history <item_id> — full-audit path for one item. Absorbs
+    # the pre-#832 ``db transitions <item_id>`` behaviour (oldest-first,
+    # no cap) and additionally prints the current state_machine row at
+    # the top. Tabular default; ``--json`` for scripts.
+    db_history = db_sub.add_parser(
+        "history",
+        help=(
+            "Everything for one item: current state + full transition "
+            "history (oldest-first)."
+        ),
+    )
+    db_history.add_argument(
+        "item_id",
+        help="Item surrogate id (see ``db item`` --help).",
+    )
+
+    # ---- db deps <item_id> — read-only dependency dump. Defensive
+    # against a DB that predates the item_dependencies table (PR-10).
+    db_deps = db_sub.add_parser(
+        "deps",
+        help=(
+            "Print every item_dependencies edge touching <item_id>. "
+            "Read-only — use the top-level 'task deps' for writes."
+        ),
+    )
+    db_deps.add_argument(
+        "item_id",
+        help="Item surrogate id (see ``db item`` --help).",
     )
 
     # ---- deps — item_dependencies CRUD (issue #833). The DB must be
@@ -422,6 +481,88 @@ def _print_record(record: TaskRecord, *, as_json: bool) -> None:
         print(f"  tags: {', '.join(record.tags)}")
     if record.merge_ref:
         print(f"  merge_ref: {record.merge_ref}")
+
+
+def _fmt_transition_cell(value: object) -> str:
+    """Mirror ``task view``'s ``(none)`` → ``—`` convention for from_state."""
+    if value is None or value == "":
+        return "—"
+    return str(value)
+
+
+def _print_transitions_table(rows: list[dict]) -> None:
+    """Tabular ``ts  item_id  title  from → to  actor  reason  source``.
+
+    One row per line, columns space-padded like ``_print_index_entries``.
+    Used by ``task db transitions`` (issue #832) — the only ``db``
+    subcommand with a non-JSON default — operators pipe through ``less``.
+    """
+    if not rows:
+        print("(no transitions match)")
+        return
+    for row in rows:
+        ts = str(row.get("ts") or "")
+        item_id = str(row.get("item_id") or "")
+        title = str(row.get("title") or "")
+        actor = str(row.get("actor") or "")
+        reason = str(row.get("reason") or "")
+        source = str(row.get("source") or "")
+        arrow = (
+            f"{_fmt_transition_cell(row.get('from_state'))} → "
+            f"{_fmt_transition_cell(row.get('to_state'))}"
+        )
+        print(
+            f"{ts:25s}  {item_id:30s}  {title[:40]:40s}  "
+            f"{arrow:30s}  {actor:12s}  {reason[:40]:40s}  {source}"
+        )
+
+
+def _print_item_history(payload: dict) -> None:
+    """Tabular ``db history`` output: state line + oldest-first transitions."""
+    item = payload.get("item") or {}
+    state = payload.get("state") or {}
+    transitions = payload.get("transitions") or []
+    item_id = item.get("item_id") or "?"
+    title = item.get("title") or ""
+    print(f"# {item_id}: {title}")
+    cur_state = state.get("state") if state else None
+    entered_at = state.get("entered_at") if state else None
+    if cur_state:
+        print(
+            f"state: {cur_state}"
+            + (f"  entered_at: {entered_at}" if entered_at else "")
+        )
+    else:
+        print("state: (none)")
+    print()
+    print("## Transitions (oldest-first)")
+    if not transitions:
+        print("  (no transitions recorded)")
+        return
+    for t in transitions:
+        ts = str(t.get("ts") or "")
+        arrow = (
+            f"{_fmt_transition_cell(t.get('from_state'))} → "
+            f"{_fmt_transition_cell(t.get('to_state'))}"
+        )
+        actor = str(t.get("actor") or "")
+        reason = str(t.get("reason") or "")
+        source = str(t.get("source") or "")
+        print(f"  {ts:25s}  {arrow:30s}  {actor:12s}  {reason:40s}  {source}")
+
+
+def _print_item_deps(item_id: str, rows: list[dict]) -> None:
+    """Tabular ``db deps``: ``(none)`` when empty, one edge per line otherwise."""
+    if not rows:
+        print("(none)")
+        return
+    print(f"# {item_id} — dependency edges")
+    for r in rows:
+        kind = str(r.get("kind") or "")
+        depends_on = str(r.get("depends_on_item_id") or "")
+        owner = str(r.get("item_id") or "")
+        created_at = str(r.get("created_at") or "")
+        print(f"  {kind:11s}  {owner} -> {depends_on}  (created {created_at})")
 
 
 def _print_index_entries(entries: list[dict], *, as_json: bool) -> None:
@@ -666,10 +807,40 @@ def _cmd_db(store: TaskStore, args: argparse.Namespace) -> int:
                 return 0
 
             if args.db_command == "transitions":
-                rows = read_api.item_transitions(
-                    conn, args.item_id, limit=args.limit
+                rows = read_api.list_transitions(
+                    conn,
+                    item_id=args.item,
+                    state=args.state,
+                    actor=args.actor,
+                    since=args.since,
+                    limit=args.limit,
                 )
-                print(json.dumps(rows, sort_keys=False, default=str))
+                if args.json:
+                    print(json.dumps(rows, sort_keys=False, default=str))
+                    return 0
+                _print_transitions_table(rows)
+                return 0
+
+            if args.db_command == "history":
+                payload = read_api.item_history(conn, args.item_id)
+                if payload is None:
+                    print(
+                        f"error: item not found: {args.item_id}",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if args.json:
+                    print(json.dumps(payload, sort_keys=False, default=str))
+                    return 0
+                _print_item_history(payload)
+                return 0
+
+            if args.db_command == "deps":
+                rows = read_api.item_dependencies(conn, args.item_id)
+                if args.json:
+                    print(json.dumps(rows, sort_keys=False, default=str))
+                    return 0
+                _print_item_deps(args.item_id, rows)
                 return 0
     except ValueError as exc:
         # Raised by _parse_gh_qualifier for malformed state queries.

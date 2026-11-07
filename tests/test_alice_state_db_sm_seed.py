@@ -530,9 +530,17 @@ def test_cli_db_item_returns_detail_payload(
     assert payload["recent_transitions"][0]["to_state"] == "selected"
 
 
-def test_cli_db_transitions_returns_full_history(
+def test_cli_db_history_returns_full_history(
     mind: pathlib.Path, capsys: pytest.CaptureFixture
 ) -> None:
+    """``db history <item>`` carries the full oldest-first tail.
+
+    Issue #832 repurposed ``db transitions`` into a cross-item,
+    newest-first listing. The "everything for one item" behaviour
+    this test originally exercised moved to the new ``db history``
+    subcommand — port it here so we don't leave two tests asserting
+    contradictory shapes for the same subcommand name.
+    """
     _write_task(
         mind,
         "task-0500",
@@ -565,19 +573,25 @@ def test_cli_db_transitions_returns_full_history(
 
     exit_code = task_cli.main(
         [
+            "--json",
             "--root",
             str(mind / "inner" / "tasks"),
             "db",
             "--db-path",
             str(_db_path(mind)),
-            "transitions",
+            "history",
             "local:task-0500",
         ]
     )
     assert exit_code == 0
 
-    rows = json.loads(capsys.readouterr().out.strip())
-    assert [r["to_state"] for r in rows] == ["draft", "building", "done"]
+    payload = json.loads(capsys.readouterr().out.strip())
+    # ``db history`` returns ``{item, state, transitions}``; the tail
+    # is oldest-first.
+    assert payload["item"]["item_id"] == "local:task-0500"
+    assert [t["to_state"] for t in payload["transitions"]] == [
+        "draft", "building", "done",
+    ]
 
 
 def test_cli_db_item_missing_returns_exit_2(

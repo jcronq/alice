@@ -379,6 +379,117 @@ def item_transitions(
     return [_row_to_dict(r) for r in cur.fetchall()]
 
 
+def list_transitions(
+    conn: sqlite3.Connection,
+    *,
+    item_id: Optional[str] = None,
+    state: Optional[str] = None,
+    actor: Optional[str] = None,
+    since: Optional[str] = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Cross-item transition listing, newest-first.
+
+    Powers the ``task db transitions`` CLI (issue #832) and the
+    status-site item-history drawer. Rows are joined against
+    ``items`` so the caller sees ``title`` without a second query.
+
+    Filter semantics:
+
+    * ``item_id`` — restrict to one item's history.
+    * ``state`` — filter on the *resulting* state
+      (``to_state`` equality, so ``state='sm:done'`` returns rows
+      whose transition landed on ``sm:done``).
+    * ``actor`` — filter on the recorded actor.
+    * ``since`` — ISO-8601 lower bound on ``ts`` (inclusive).
+
+    ``limit`` is a hard cap on rows returned; default 20 matches the
+    CLI's new default.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if item_id is not None:
+        clauses.append("t.item_id = ?")
+        params.append(item_id)
+    if state is not None:
+        clauses.append("t.to_state = ?")
+        params.append(state)
+    if actor is not None:
+        clauses.append("t.actor = ?")
+        params.append(actor)
+    if since is not None:
+        clauses.append("t.ts >= ?")
+        params.append(since)
+
+    sql = (
+        "SELECT t.*, i.title AS title "
+        "FROM transitions t "
+        "LEFT JOIN items i ON i.item_id = t.item_id"
+    )
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY t.transition_id DESC LIMIT ?"
+    params.append(int(limit))
+    cur = conn.execute(sql, params)
+    return [_row_to_dict(r) for r in cur.fetchall()]
+
+
+def item_history(
+    conn: sqlite3.Connection, item_id: str
+) -> Optional[dict[str, Any]]:
+    """Return ``{item, state, transitions}`` for the full-audit CLI path.
+
+    Backs ``task db history <item_id>`` (issue #832). ``state`` is the
+    current ``state_machine`` row (or ``None`` when there is none yet).
+    ``transitions`` is the full oldest-first list from
+    :func:`item_transitions` (uncapped). Returns ``None`` when the
+    item isn't in the ``items`` table so the CLI can print a clean
+    "not found".
+    """
+    row = conn.execute(
+        "SELECT * FROM items WHERE item_id = ?", (item_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    state_row = conn.execute(
+        "SELECT * FROM state_machine WHERE item_id = ?", (item_id,)
+    ).fetchone()
+    return {
+        "item": _row_to_dict(row),
+        "state": _row_to_dict(state_row) if state_row else None,
+        "transitions": item_transitions(conn, item_id),
+    }
+
+
+def item_dependencies(
+    conn: sqlite3.Connection, item_id: str
+) -> list[dict[str, Any]]:
+    """Return every ``item_dependencies`` edge touching ``item_id``.
+
+    Backs ``task db deps`` (issue #832). Returns rows where either
+    ``item_id`` or ``depends_on_item_id`` equals the argument so the
+    operator sees both "this depends on" and "things depending on
+    this" in one shot.
+
+    Defensively wrapped in ``try/except sqlite3.OperationalError`` so
+    an older DB that predates the ``item_dependencies`` table (PR-10
+    of the SM-on-GitHub deprecation chain) returns ``[]`` instead of
+    raising — the CLI then prints ``(none)``.
+    """
+    try:
+        cur = conn.execute(
+            """
+            SELECT * FROM item_dependencies
+            WHERE item_id = ? OR depends_on_item_id = ?
+            ORDER BY kind, depends_on_item_id
+            """,
+            (item_id, item_id),
+        )
+        return [_row_to_dict(r) for r in cur.fetchall()]
+    except sqlite3.OperationalError:
+        return []
+
+
 def list_tasks(
     conn: sqlite3.Connection,
     *,
