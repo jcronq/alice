@@ -88,6 +88,7 @@ from status_site.sources import (
     pipeline as _pipeline,
     review_queue as _review_queue,
     running_now as _running_now,
+    tasks as _tasks,
     waiting_on_you as _waiting_on_you,
 )
 from status_site.sources import (
@@ -1504,6 +1505,9 @@ DONE_TODAY_END = "<!-- done-today:end -->"
 KNOWN_ISSUES_START = "<!-- known-issues:start -->"
 KNOWN_ISSUES_END = "<!-- known-issues:end -->"
 
+TRACKED_TASKS_START = "<!-- tracked-tasks:start -->"
+TRACKED_TASKS_END = "<!-- tracked-tasks:end -->"
+
 
 def _agent_name() -> str:
     """Resolve the agent's name from ``mind/personae.yml``.
@@ -1580,6 +1584,20 @@ def _known_issues_fallback(rendered: str) -> str:
     return (
         "\n## Known issues I'm on\n"
         f"{KNOWN_ISSUES_START}\n{rendered}\n{KNOWN_ISSUES_END}\n"
+    )
+
+
+def _tracked_tasks_fallback(rendered: str) -> str:
+    """Appended-section shape for the SM v2 task list (issue #780).
+
+    Lives between ``Alice's queue`` and ``Thinking queue`` so repo-less
+    todos sit next to the GH-backed pipeline without being mixed into
+    it. The marker-less fallback keeps the page serveable while the
+    one-time index.md edit that inserts the markers catches up.
+    """
+    return (
+        "\n## Tracked tasks\n"
+        f"{TRACKED_TASKS_START}\n{rendered}\n{TRACKED_TASKS_END}\n"
     )
 
 
@@ -1959,6 +1977,18 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
     def _render_known_issues() -> dict:
         return {"markdown": _known_issues.render(cfg.status_dir / "known-issues.md")}
 
+    def _render_tracked_tasks() -> dict:
+        """Live scan of the SM v2 task store (issue #780).
+
+        Scan is cheap (a few hundred tiny YAML files, max) so we skip
+        the TTL cache and read on each tick. Tasks already tracked via
+        a GitHub issue are filtered out inside :func:`scan_tasks` so
+        the GH-pipeline source stays the single owner of those rows.
+        """
+        rows = _tasks.scan_tasks(_tasks_dir(), now=time.time())
+        md = _tasks.render(rows)
+        return {"markdown": md, "rows": _tasks.typed_rows(rows)}
+
     # ── Overview tiers by who owns the next action (issue #691) ────
     # ``your_todo`` / ``in_flight`` / ``thinking_queue`` / ``system_health``
     # are the sections the reactive shell draws; the older per-source
@@ -2095,6 +2125,7 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         "ready_for_review": _render_ready_for_review,
         "waiting_on_you": _render_waiting_on_you,
         "alice_queue": _render_alice_queue,
+        "tracked_tasks": _render_tracked_tasks,
         "done_today": _render_done_today,
         "known_issues": _render_known_issues,
         "page:chat": _render_page_chat,
@@ -2113,10 +2144,14 @@ def overview_splice_sections(
 
     Order mirrors the Overview as it appears on the page:
     Running now → Ready for Review → Waiting on you → Alice's queue →
-    Done today → Known issues I'm on. Each tuple carries sentinel
-    markers, a renderer closure, and a fallback builder so the
-    append-case keeps the page serveable while the mind repo catches
-    up on the marker-insertion pass.
+    Tracked tasks → Done today → Known issues I'm on. (``## Thinking
+    queue`` is spliced separately by :func:`splice_thinking_queue`
+    directly from the hand-edit position in ``index.md``, so it slots
+    between Tracked tasks and Done today in the rendered page without
+    appearing in this list.) Each tuple carries sentinel markers, a
+    renderer closure, and a fallback builder so the append-case keeps
+    the page serveable while the mind repo catches up on the
+    marker-insertion pass.
 
     Renderers are shared with the SSE broadcaster via
     :func:`section_renderers`. The ``alice_queue`` tuple below passes
@@ -2160,6 +2195,12 @@ def overview_splice_sections(
             ALICE_QUEUE_END,
             lambda: render_alice_queue(items, now=now),
             _alice_queue_fallback,
+        ),
+        (
+            TRACKED_TASKS_START,
+            TRACKED_TASKS_END,
+            _md("tracked_tasks"),
+            _tracked_tasks_fallback,
         ),
         (
             DONE_TODAY_START,
