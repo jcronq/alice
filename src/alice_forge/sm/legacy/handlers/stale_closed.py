@@ -8,23 +8,39 @@ import os
 from alice_forge.sm.legacy.handlers._common import *  # noqa: F401, F403
 
 
-#: Env flag forcing just the Phase 1.6 sweep into dry-run mode even when
-#: the dispatcher's ``dry_run`` is False. Issue #784 ships this on by
-#: default for the first week so operators can diff old vs new labelling
-#: decisions before acting. Flip ``SM_SWEEPER_SAFE_MODE=0`` to act.
+#: Env override for the ``sweeper.rejected_dry_run`` config key, scoped
+#: to the Phase 1.6 REJECT path (issue #784). Lets an operator toggle
+#: without redeploying ``alice.config.json``. When unset, the loaded
+#: :class:`SweeperConfig` is authoritative; when set, the env wins.
+#:
+#: Semantics (reject-only): the REJECT branch (no-linked-PR + closed-
+#: unmerged) is the only path gated by this flag. The ``sm:done`` branch
+#: (merge is terminal, no ambiguity) is never gated — see the
+#: "Dry-run audit mode" section of the #784 design note.
 _SWEEPER_SAFE_MODE_ENV = "SM_SWEEPER_SAFE_MODE"
-_SWEEPER_SAFE_MODE_DEFAULT = "1"
 
 
-def _safe_mode_enabled() -> bool:
-    """Return True when the sweeper should operate in dry-run-only mode
-    regardless of the dispatcher's ``dry_run`` flag (issue #784).
+def _safe_mode_enabled(
+    config: "SweeperConfig | None" = None,
+) -> bool:
+    """Return True when the Phase 1.6 REJECT path should dry-run even if
+    the dispatcher's ``dry_run`` flag is False (issue #784).
 
-    Reads :data:`_SWEEPER_SAFE_MODE_ENV` at call time so an operator can
-    flip it between runs without a restart.
+    Env var :envvar:`SM_SWEEPER_SAFE_MODE` wins when set (any of
+    ``0/false/no/off/empty`` disables, anything else enables). When
+    unset, falls back to ``config.rejected_dry_run``; when that too is
+    absent (``config is None``), defaults to True so a missing config
+    section does not accidentally flip to live-write.
+
+    Read lazily per call so an operator can toggle between cadences
+    without restarting the dispatcher.
     """
-    raw = (os.environ.get(_SWEEPER_SAFE_MODE_ENV, _SWEEPER_SAFE_MODE_DEFAULT) or "").strip().lower()
-    return raw not in {"0", "false", "no", "off", ""}
+    raw = os.environ.get(_SWEEPER_SAFE_MODE_ENV)
+    if raw is not None:
+        return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+    if config is None:
+        return True
+    return bool(config.rejected_dry_run)
 
 
 def _process_stale_closed(
@@ -40,6 +56,7 @@ def _process_stale_closed(
     dry_run: bool,
     log: Callable[[str], None],
     find_open_linked_prs: "Callable[[str, int], list[int]] | None" = None,
+    sweeper_config: "SweeperConfig | None" = None,
 ) -> None:
     """Phase 1.6 sweep: route a closed issue with a non-terminal ``sm:*``
     label to its correct terminal state.
@@ -218,8 +235,12 @@ def _process_stale_closed(
             return
 
     body = render_transition_comment(stale_label, target_label, reason)
-    safe_mode = _safe_mode_enabled()
-    if dry_run or safe_mode:
+    is_reject_path = target_label == REJECTED_SM_LABEL
+    # Issue #784 — safe-mode ONLY gates the REJECT path. The merged-PR
+    # branch is unambiguous (merge is terminal) and must apply live
+    # even while the operator is auditing REJECT decisions.
+    reject_dry_run = is_reject_path and _safe_mode_enabled(sweeper_config)
+    if dry_run or reject_dry_run:
         mode = "DRY-RUN" if dry_run else "SAFE-MODE"
         log(
             f"[sm-dispatcher] {mode} would sweep #{number}: "
@@ -227,6 +248,11 @@ def _process_stale_closed(
         )
         report.swept += 1
         report.transitions.append((number, stale_label, target_label))
+        if reject_dry_run and not dry_run:
+            # Pure safe-mode suppression (not dispatcher-wide dry-run):
+            # audit how many flips would have happened before the
+            # operator enables live writes.
+            report.sweep_would_reject += 1
         return
     try:
         edit_labels(

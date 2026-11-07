@@ -93,6 +93,13 @@ class RunReport:
     # the sweeper holds for another cadence instead.
     sweep_merged_pr_legacy_would_reject: int = 0
     sweep_wait_followup_in_flight: int = 0
+    # Issue #784 — count of REJECT sweep decisions that were suppressed
+    # by :envvar:`SM_SWEEPER_SAFE_MODE` / the
+    # ``sweeper.rejected_dry_run`` config key. Lets the operator see at
+    # a glance how many flips the sweeper would have made so they can
+    # audit the delta before enabling live writes. Only the REJECT path
+    # is gated — merged-PR sweeps are terminal and always applied.
+    sweep_would_reject: int = 0
 
 
 @dataclass(frozen=True)
