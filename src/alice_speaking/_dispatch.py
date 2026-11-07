@@ -1005,6 +1005,9 @@ async def handle_surface(ctx: DaemonContext, event: "SurfaceEvent") -> None:
     is_chat_turn = _is_chat_surface(body)
     if is_chat_turn:
         ctx.turn_runner.begin_chat_status(turn_id)
+        m = re.search(r"^message_at:\s*(\S+)\s*$", body.split("\n---", 1)[0], re.M)
+        if m and ctx.turn_runner.chat_status is not None:
+            ctx.turn_runner.chat_status.read(m.group(1))
     try:
         # Surface turns don't have a single inbound recipient; the
         # ``outbound_recipient`` is informational only. Quiet hours
