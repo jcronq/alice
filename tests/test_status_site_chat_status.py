@@ -296,3 +296,20 @@ def test_handle_surface_skips_status_for_non_chat_surface(tmp_path):
 
     assert seen and seen[0][1] is False
     assert not cs.status_path(tmp_path / "status").exists()
+
+
+def test_handle_surface_emits_read_row_and_groups_ignore_it(tmp_path):
+    from types import SimpleNamespace
+
+    from alice_speaking._dispatch import handle_surface
+
+    p = tmp_path / "c.md"
+    p.write_text("---\ntype: status-chat\nmessage_at: 2026-11-06T13:00:00-05:00\n---\n\nhi\n")
+    ctx = _surface_ctx(tmp_path / "status", [])
+    asyncio.run(handle_surface(ctx, SimpleNamespace(path=p)))
+
+    rows = _rows(tmp_path / "status")
+    assert [r["kind"] for r in rows] == ["turn_start", "read", "turn_end"]
+    assert rows[1]["event"] == "read" and rows[1]["read_at"]
+    assert cs.read_message_ats(rows) == {"2026-11-06T13:00:00-05:00"}
+    assert len(cs.build_groups(rows)) == 1

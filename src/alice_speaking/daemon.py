@@ -58,6 +58,7 @@ from . import _dispatch as _dispatch_module
 from . import auto_fix as auto_fix_module
 from . import factory as factory_module
 from . import tools as tools_module
+from . import worker_markers as worker_markers_module
 from . import worker_report as worker_report_module
 from .domain import principals as principals_module
 from .domain import session_state
@@ -1511,6 +1512,20 @@ class SpeakingDaemon:
         # cortex-memory/research/2026-05-19-dispatched-inflight-speaking-wiring.md
         # and PR #262 (write path).
         auto_fix_module.record_auto_fix_inflight(instructions, handle)
+
+        # Issue #789 PR 1: persistent worker-dispatch marker so the
+        # memory worker's derive pass can materialise a row in
+        # ``workers`` even if the daemon restarts before the sub-agent
+        # finishes. Best-effort; a failed write is logged, not raised.
+        # ``started_at`` is omitted — the helper fills a UTC now.
+        try:
+            worker_markers_module.write_dispatch_marker(
+                getattr(self.cfg, "mind_dir", None),
+                bg_id=handle,
+                description=description,
+            )
+        except Exception:  # noqa: BLE001 — never block dispatch on this
+            log.exception("worker dispatch marker write failed for %s", handle)
         # Issue #375: also record an SM v2 task entry so the
         # ``inner/tasks/`` state machine has producers wired to real
         # workflows. The intake call cascades draft → selected →
