@@ -1893,6 +1893,7 @@ function YourTodoBoard({data, nowMs}) {
       h(MarkdownZone, {markdown: d.external_todos_md})));
   }
   const failedAll = [].concat(failed.prs || [], failed.design_review || []);
+  return h("div", {className: "your-todo", "data-board": "your-todo"},
     groups.length
       ? groups
       : h("p", {style: MUTED, "data-testid": "nothing-waiting"}, "(nothing waiting on you — 👋)"),
