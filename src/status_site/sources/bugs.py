@@ -215,9 +215,7 @@ def build_envelopes(status_dir: Path) -> list[dict]:
                         "markdown": (
                             "# In-game bug reports\n\n"
                             "Every /bug report that reaches me from the "
-                            "game. Click one for the full state at the "
-                            "moment of reporting — location, flags, "
-                            "inventory, last 20 messages."
+                            "game, grouped by status."
                         ),
                     },
                 ),
