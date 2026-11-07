@@ -170,6 +170,29 @@ h2.sec-heading {
 .tier-heading .tier-stamp[data-fresh="amber"] { color: var(--color-warn); }
 .tier-heading .tier-stamp[data-fresh="red"] { color: var(--color-alert, #c0392b); }
 .age-pill { font-variant-numeric: tabular-nums; }
+/* Issue #832 — pipeline row expand drawer. A ▸/▾ toggle in the leading
+ * column opens a drawer row below with the item's transition tail. The
+ * drawer cell spans the full table so the timeline FxTable can fit; the
+ * surrounding row gets a subtle bg so the drawer reads as a sub-record
+ * rather than a sibling row. */
+.pipeline-row-toggle {
+  background: transparent; border: none; cursor: pointer;
+  padding: 0 .2em; color: var(--color-fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+.pipeline-row-toggle:hover { color: var(--color-ok); }
+.pipeline-row-drawer > td {
+  background: var(--color-bg-subtle, rgba(0,0,0,0.03));
+  padding: .5rem .75rem !important;
+}
+.pipeline-row-drawer .fx-tbl { margin: 0; }
+.pipeline-row-drawer p { margin: 0; color: var(--color-fg-muted); }
+.pipeline-row-drawer .drawer-see-all {
+  margin-top: .4rem; font-size: .85rem;
+}
+.item-history-page h1 { margin: .4rem 0 .2rem; }
+.item-history-page .meta { color: var(--color-fg-muted); font-size: .9rem; margin: 0 0 1rem; }
+.item-history-page .back { font-size: .85rem; }
 .age-pill-warn, .age-pill-alert {
   padding: 0 .4em; border-radius: 4px; color: #fff; font-weight: 600;
 }
@@ -1893,6 +1916,16 @@ function YourTodoBoard({data, nowMs}) {
       h(MarkdownZone, {markdown: d.external_todos_md})));
   }
   const failedAll = [].concat(failed.prs || [], failed.design_review || []);
+  // Issue #832 fix-forward: the ``return h("div", …,`` wrapper for this
+  // board was accidentally dropped in #718 (commit e313922), which left
+  // the function body with a stray ``)`` on its last line. Chrome / V8,
+  // Safari / JavaScriptCore, and Firefox / SpiderMonkey all refuse to
+  // parse the ``<script type="module">`` as a result, so the page sits
+  // on "Loading Alice…" indefinitely. Restoring the wrapper restores
+  // the board. Safari's dev console is the one that surfaces the
+  // generic ``SyntaxError: Unexpected token ")"`` without a line
+  // number, which is why the regression looked Safari-specific.
+  return h("div", {className: "your-todo", "data-board": "your-todo"},
     groups.length
       ? groups
       : h("p", {style: MUTED, "data-testid": "nothing-waiting"}, "(nothing waiting on you — 👋)"),
@@ -1967,6 +2000,169 @@ function SystemHealthBoard({data, nowMs}) {
         : h("p", {style: MUTED}, "(no poller data yet)")),
   );
 }
+// Issue #832 — item_id surrogate for a pipeline-issue row.
+// Rows carry ``repo`` + ``number``; the SM v2 substrate keys items as
+// ``gh:<repo>#<number>`` (see ``alice_state_db.sm_seed.gh_issue_id``).
+// ``/`` and ``#`` in the id need ``encodeURIComponent`` when they ride
+// in a path segment (``/history/<id>``) — the server unquote()s them
+// back; the fragment ``#`` never reaches it, which is exactly why
+// encoding matters.
+function pipelineRowItemId(r) {
+  if (!r) return "";
+  const repo = r.repo || "";
+  const num = r.number;
+  if (!repo || num == null) return "";
+  return "gh:" + repo + "#" + num;
+}
+
+// Columns shared by the drawer FxTable + the full ItemHistoryPage
+// timeline. Both render ``from_state → to_state`` with ``—`` for the
+// null-from case so the convention matches ``task view`` on the CLI.
+function historyTimelineColumns() {
+  return [
+    {key: "ts", label: "when", nowrap: true, cell: r => {
+      const d = r.ts ? new Date(r.ts) : null;
+      const ok = d && !isNaN(d.getTime());
+      return h("span", {title: r.ts || "", style: {whiteSpace: "nowrap"}},
+        ok
+          ? d.toLocaleString([], {month: "short", day: "2-digit",
+              hour: "2-digit", minute: "2-digit", hour12: false})
+          : (r.ts || ""));
+    }},
+    {key: "transition", label: "transition", nowrap: true, cell: r =>
+      (r.from_state || "—") + " → " + (r.to_state || "—")},
+    {key: "actor", label: "actor", nowrap: true, cell: r => r.actor || ""},
+    {key: "reason", label: "reason", cell: r => r.reason || ""},
+    {key: "source", label: "source", nowrap: true, cell: r => r.source || ""},
+  ];
+}
+
+// Lazily fetch /api/pipeline-history for one item on demand. ``load``
+// is idempotent: calling it twice returns the same promise. Shared by
+// the drawer (first-expand) and the full page (first-mount).
+function useItemHistoryFetch(itemId, {limit, enabled}) {
+  const [state, setState] = useState({loading: true});
+  useEffect(() => {
+    if (!enabled || !itemId) return;
+    let cancelled = false;
+    setState({loading: true});
+    (async () => {
+      try {
+        const qs = limit
+          ? ("?item=" + encodeURIComponent(itemId) + "&limit=" + limit)
+          : ("?item=" + encodeURIComponent(itemId) + "&limit=0");
+        const r = await fetch("/api/pipeline-history" + qs);
+        const payload = await r.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!r.ok) {
+          setState({error: payload.error || ("HTTP " + r.status)});
+          return;
+        }
+        setState({loading: false, payload});
+      } catch (e) {
+        if (!cancelled) setState({error: String(e && e.message || e)});
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [itemId, limit, enabled]);
+  return state;
+}
+
+function PipelineRowDrawer({itemId}) {
+  const state = useItemHistoryFetch(itemId, {limit: 10, enabled: true});
+  if (state.loading) return h("p", null, "(loading…)");
+  if (state.error) return h("p", null, "(couldn't load history: " + state.error + ")");
+  const transitions = (state.payload && state.payload.transitions) || [];
+  if (!transitions.length) {
+    return h(React.Fragment, null,
+      h("p", null, "(no transitions yet)"),
+      h("p", {className: "drawer-see-all"},
+        h("a", {
+          href: "/history/" + encodeURIComponent(itemId),
+          target: "_blank", rel: "noopener",
+        }, "see all →")),
+    );
+  }
+  return h(React.Fragment, null,
+    h(FxTable, {
+      columns: historyTimelineColumns(),
+      rows: transitions.map((t, i) => ({...t, __key: i})),
+    }),
+    h("p", {className: "drawer-see-all"},
+      h("a", {
+        href: "/history/" + encodeURIComponent(itemId),
+        target: "_blank", rel: "noopener",
+      }, "see all →")),
+  );
+}
+
+// Custom table that owns per-row expand state for the drawer. Keeps
+// FxTable generic — only the pipeline board needs this affordance.
+function PipelineIssuesTable({rows}) {
+  const [expanded, setExpanded] = useState(() => new Set());
+  const toggle = (key) => setExpanded(prev => {
+    const next = new Set(prev);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    return next;
+  });
+  return h("div", {className: "fx-tbl"},
+    h("table", null,
+      h("thead", null,
+        h("tr", null,
+          h("th", {style: {width: "1.5em"}}, ""),
+          h("th", null, "state"),
+          h("th", {style: {textAlign: "right"}}, "#"),
+          h("th", null, "title"),
+          h("th", null, "art"),
+          h("th", {style: {textAlign: "right"}}, "age"),
+        ),
+      ),
+      h("tbody", null,
+        rows.flatMap((r) => {
+          const key = r.__key || ((r.repo || "") + "#" + r.number);
+          const itemId = pipelineRowItemId(r);
+          const isOpen = expanded.has(key);
+          const canExpand = !!itemId;
+          const trigger = canExpand
+            ? h("button", {
+                type: "button",
+                className: "pipeline-row-toggle",
+                onClick: () => toggle(key),
+                "aria-label": isOpen ? "collapse history" : "expand history",
+                "aria-expanded": isOpen,
+              }, isOpen ? "▾" : "▸")
+            : h("span", {className: "pipeline-row-toggle", "aria-hidden": "true"}, "·");
+          const main = h("tr", {key},
+            h("td", {className: "fx-nowrap"}, trigger),
+            h("td", {className: "fx-nowrap"}, h(SmStatePill, {state: r.state})),
+            h("td", {className: "fx-nowrap", "data-col": "number",
+                     style: {textAlign: "right", fontVariantNumeric: "tabular-nums"}},
+              r.link
+                ? h("a", {href: r.link, target: "_blank", rel: "noopener",
+                    style: {fontVariantNumeric: "tabular-nums"}}, "#" + r.number)
+                : h("span", {className: "fx-num"}, "#" + r.number)),
+            h("td", {"data-col": "title"},
+              r.link
+                ? h("a", {href: r.link, target: "_blank", rel: "noopener"}, r.title || "")
+                : (r.title || "")),
+            h("td", {className: "fx-nowrap"}, r.art || "—"),
+            h("td", {className: "fx-nowrap",
+                     style: {textAlign: "right", fontVariantNumeric: "tabular-nums"}},
+              h(AgePill, {ageSec: r.age_seconds})),
+          );
+          if (!isOpen || !canExpand) return [main];
+          const drawer = h("tr", {key: key + "-drawer", className: "pipeline-row-drawer"},
+            h("td", {colSpan: 6},
+              h(PipelineRowDrawer, {itemId}),
+            ),
+          );
+          return [main, drawer];
+        }),
+      ),
+    ),
+  );
+}
+
 function PipelineBoard({pipeline, pipelineByComponent, surfaces, tasks}) {
   const issues = pipeline || [];
   const byComponent = pipelineByComponent || [];
@@ -1977,22 +2173,6 @@ function PipelineBoard({pipeline, pipelineByComponent, surfaces, tasks}) {
       "(queue clear)");
   }
   const ageCell = r => h(AgePill, {ageSec: r.age_seconds});
-  const issueColumns = [
-    {key: "state", nowrap: true, label: "state", cell: r => h(SmStatePill, {state: r.state})},
-    {key: "number", nowrap: true, label: "#", numeric: true, cell: r =>
-      r.link
-        ? h("a", {href: r.link, target: "_blank", rel: "noopener",
-            style: {fontVariantNumeric: "tabular-nums"}}, "#" + r.number)
-        : h("span", {className: "fx-num"}, "#" + r.number)
-    },
-    {key: "title", label: "title", cell: r =>
-      r.link
-        ? h("a", {href: r.link, target: "_blank", rel: "noopener"}, r.title || "")
-        : (r.title || "")
-    },
-    {key: "art", nowrap: true, label: "art", cell: r => r.art || "—"},
-    {key: "age_seconds", nowrap: true, label: "age", numeric: true, cell: ageCell},
-  ];
   const groups = [];
   if (issues.length) {
     // Issue #821: when the server supplies pre-bucketed groups,
@@ -2009,8 +2189,7 @@ function PipelineBoard({pipeline, pipelineByComponent, surfaces, tasks}) {
             title: "▸ " + String(g.component || "").toUpperCase(),
             count: g.count,
           },
-            h(FxTable, {
-              columns: issueColumns,
+            h(PipelineIssuesTable, {
               rows: (g.rows || []).map(r => ({...r, __key: (r.repo || "") + "#" + r.number})),
             })
           )
@@ -2018,8 +2197,7 @@ function PipelineBoard({pipeline, pipelineByComponent, surfaces, tasks}) {
       ));
     } else {
       groups.push(h(PipelineGroup, {key: "pipeline", title: "In SM pipeline", count: issues.length},
-        h(FxTable, {
-          columns: issueColumns,
+        h(PipelineIssuesTable, {
           rows: issues.map(r => ({...r, __key: (r.repo || "") + "#" + r.number})),
         })));
     }
@@ -2438,7 +2616,90 @@ function ConfigGear() {
   );
 }
 
+// ── 10b. /history/<id> page (issue #832) ─────────────────────────
+// Full item-history page: real URL (not hash-based) so "see all →"
+// from the drawer is a shareable, reload-safe deep link. The server
+// serves ``index.html`` for any ``/history/*`` path (SPA shell) and
+// this component reads ``location.pathname`` on mount, decodes the
+// remainder, and fetches the full transition tail.
+function ItemHistoryPage({itemId}) {
+  const data = useItemHistoryFetch(itemId, {limit: 0, enabled: true});
+  const back = h("p", {className: "back"},
+    h("a", {href: "/"}, "← back to Overview"));
+  if (!itemId) {
+    return h("div", {className: "item-history-page"},
+      back,
+      h("p", {style: {color: "var(--color-bad)"}},
+        "No item_id in URL. Expected /history/<item-id>."));
+  }
+  if (data.loading) {
+    return h("div", {className: "item-history-page"},
+      back, h("p", null, "(loading…)"));
+  }
+  if (data.error) {
+    return h("div", {className: "item-history-page"},
+      back,
+      h("h1", null, itemId),
+      h("p", {style: {color: "var(--color-bad)"}},
+        "Could not load history: " + data.error));
+  }
+  const p = data.payload || {};
+  const transitions = p.transitions || [];
+  return h("div", {className: "item-history-page"},
+    back,
+    h("h1", null, p.title || itemId),
+    h("p", {className: "meta"},
+      h("code", null, itemId),
+      " · ",
+      p.state
+        ? h(SmStatePill, {state: p.state})
+        : h("span", null, "(no state)"),
+      p.entered_at
+        ? h("span", null, " · entered " + p.entered_at)
+        : null,
+    ),
+    h("h2", null, "Transitions"),
+    transitions.length
+      ? h(FxTable, {
+          columns: historyTimelineColumns(),
+          rows: transitions.map((t, i) => ({...t, __key: i})),
+        })
+      : h("p", {style: MUTED}, "(no transitions recorded)"),
+  );
+}
+
+// ``/history/<url-encoded-item-id>`` → decode remainder. The ``#``
+// fragment never reaches the frontend from the server (strict HTTP
+// spec), so ``location.pathname`` is the only place it matters
+// and ``decodeURIComponent`` is enough to recover ``gh:owner/repo#N``.
+function historyPathItemId() {
+  const p = location.pathname || "";
+  if (!p.startsWith("/history/")) return null;
+  const rest = p.slice("/history/".length);
+  if (!rest) return "";
+  try { return decodeURIComponent(rest); }
+  catch (e) { return rest; }
+}
+
 // ── 11. app ───────────────────────────────────────────────────────
+// Issue #832 — SPA route for ``/history/<id>`` is handled by a
+// completely separate component (``HistoryRoot``) mounted in place
+// of the main ``App``. Doing the switch outside the hook body keeps
+// us on the right side of the Rules of Hooks and avoids opening the
+// SSE connection / event stream reducer when the user just wants a
+// focused, read-only deep-link view.
+function HistoryRoot({itemId}) {
+  return h(React.Fragment, null,
+    h("header", null,
+      h("b", null, "Alice"),
+      h("span", {className: "spacer"}),
+    ),
+    h("main", null,
+      h(ItemHistoryPage, {itemId}),
+    ),
+  );
+}
+
 function App() {
   const [state, dispatch] = useReducer(reducer, INITIAL);
   useEventStream(dispatch);
@@ -2520,6 +2781,14 @@ function App() {
   );
 }
 
-createRoot(document.getElementById("root")).render(h(App));
+// Pick which root to mount based on pathname before any hooks run.
+// ``/history/<id>`` deep-links go to the focused view; everything
+// else gets the normal dashboard shell.
+const _historyItemId = historyPathItemId();
+createRoot(document.getElementById("root")).render(
+  _historyItemId !== null
+    ? h(HistoryRoot, {itemId: _historyItemId})
+    : h(App),
+);
 </script>
 </body></html>
