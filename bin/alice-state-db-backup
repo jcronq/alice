@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# alice-state-db-backup — one snapshot of alice-state.db to the NAS.
+#
+# Thin shim around `python -m alice_state_db.backup`. See
+# src/alice_state_db/backup.py for the full behaviour: VACUUM INTO,
+# sha256, rsync upload, remote verify, retention rotation, and a
+# backup-note drop for the memory worker.
+#
+# Usage:
+#   alice-state-db-backup                         # defaults from env
+#   alice-state-db-backup --source /path/to/alice-state.db
+#   alice-state-db-backup --dest cronqj@10.20.30.14:/mnt/pool0/backups/alice-state-db/
+#   alice-state-db-backup --retention '{"daily":7,"weekly":4,"monthly":12}'
+#
+# Singleton enforcement is external — the s6 supervisor (or cron
+# entry) wraps each invocation in `flock -n` so overlapping hourly
+# cadences cannot collide on the NAS directory.
+set -u
+
+VENV_PY="${VENV_PY:-/opt/alice-venv/bin/python}"
+ALICE_SRC="${ALICE_SRC:-/home/alice/alice/src}"
+
+if [ ! -x "$VENV_PY" ]; then
+    echo "[alice-state-db-backup] venv python missing at $VENV_PY" >&2
+    exit 2
+fi
+
+export PYTHONPATH="$ALICE_SRC"
+export PYTHONUNBUFFERED=1
+exec "$VENV_PY" -m alice_state_db.backup "$@"

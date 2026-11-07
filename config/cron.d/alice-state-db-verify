@@ -1,0 +1,8 @@
+# alice-state-db-verify — monthly restore-sanity check.
+#
+# Install on aimax1 under /home/cronqj/crontab.d/ or /etc/cron.d/.
+#
+# Runs at 04:17 on the 1st of each month — off-peak, out of the
+# way of the hourly backup chain. See docs/ops/restore-state-db.md
+# for the behaviour.
+17 4 1 * * cronqj flock -n /var/lock/alice-state-db-verify.lock /home/cronqj/dev/alice/runtime/bin/alice-state-db-verify >> /var/log/alice-state-db-verify.log 2>&1

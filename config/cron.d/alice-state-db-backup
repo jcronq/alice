@@ -1,0 +1,13 @@
+# alice-state-db-backup — hourly NAS snapshot of alice-state.db.
+#
+# Install on aimax1 under /home/cronqj/crontab.d/ (per the user's
+# flock-wrapped crontab.d convention) or drop into /etc/cron.d/ on
+# a system crontab.
+#
+# The :07 past-the-hour offset is cosmetic; it just keeps the
+# backup off the top-of-hour cron rush where memory-worker and
+# other hourly jobs cluster.
+#
+# Logs to /var/log/alice-state-db-backup.log — rotate with your
+# existing logrotate config.
+7 * * * * cronqj flock -n /var/lock/alice-state-db-backup.lock /home/cronqj/dev/alice/runtime/bin/alice-state-db-backup >> /var/log/alice-state-db-backup.log 2>&1
