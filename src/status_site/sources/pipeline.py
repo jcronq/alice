@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from alice_forge.review_queue_renderer import _coerce_repos, _load_config, gh
+from status_site.sources import db_readers as _db_readers
 
 log = logging.getLogger("status_site.pipeline")
 
@@ -48,6 +49,7 @@ DEFAULT_REPOS_SM = ["jcronq/alice"]
 
 #: Pipeline order (also the display group order).
 PIPELINE_STATES: tuple[str, ...] = (
+    "draft",
     "selected",
     "designing",
     "design_review",
@@ -64,7 +66,6 @@ _STATE_RANK = {s: i for i, s in enumerate(PIPELINE_STATES)}
 #: dispatcher failures (bug #342) don't vanish from the queue.
 EXCLUDED_LABELS: frozenset[str] = frozenset(
     {
-        "sm:draft",
         "sm:done",
         "sm:closed",
         "sm:rejected",
@@ -121,10 +122,15 @@ def classify_issue(issue: dict) -> tuple[str, str] | None:
         for lbl in labels
         if lbl.startswith("sm:") and lbl[len("sm:"):] in _STATE_RANK
     ]
+    art = next((lb[len("art:"):] for lb in sorted(labels) if lb.startswith("art:")), "")
     if not states:
+        # Untriaged (issue #695): explicit sm:draft, or no sm:* label at
+        # all but an art:* label (an intentionally-filed work item).
+        has_sm = any(lb.startswith("sm:") for lb in labels)
+        if "sm:draft" in labels or (not has_sm and art):
+            return "draft", art
         return None
     state = max(states, key=_STATE_RANK.__getitem__)
-    art = next((l[len("art:"):] for l in sorted(labels) if l.startswith("art:")), "")
     return state, art
 
 
@@ -144,7 +150,17 @@ def fetch_issues(
     ``updated_at`` (raw ISO-8601 from ``updatedAt``) so the review-note
     synthesis step (:func:`ensure_review_notes`) can run off the same
     fetch without re-querying.
+
+    Source selection: the ``STATUS_SITE_READ_FROM`` env flag picks
+    between ``db`` (default; reads ``alice-state.db``) and ``gh``
+    (the pre-#790 subprocess path). ``runner`` is still honoured when
+    set — explicit test wiring overrides the flag so the subprocess
+    path can be exercised regardless of the env default (see
+    issue #790 Step 3).
     """
+    if runner is None and _db_readers.read_from() == _db_readers.MODE_DB:
+        return _db_readers.fetch_issues_from_db(repos)
+
     rows: list[dict] = []
     failed: list[str] = []
     for repo in repos:
@@ -273,6 +289,8 @@ def review_item_row(item: object, *, state: str = "") -> dict:
         "art": "",
         "link": get("url", "") or "",
         "age_seconds": age_label_seconds(get("age", "")),
+        "author": get("author", "") or "",
+        "ci": get("ci", "") or "",
     }
 
 

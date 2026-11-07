@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import http.client
 import os
-import re
 import threading
 from pathlib import Path
 
@@ -196,7 +195,7 @@ def test_renders_header_and_intro_paragraph(tmp_path):
     write_bug(status, 1, status="open", title="t")
     out, _ = render_bugs_md(status)
     assert out.startswith("# In-game bug reports\n")
-    assert "Click one for the full state" in out
+    assert "Click one for the full state" not in out
 
 
 def test_ignores_non_bug_files(tmp_path):
@@ -498,7 +497,11 @@ def test_bugs_a2ui_pipeline_populated_once_priced(tmp_path):
     status.mkdir()
     (status / "bug-1.md").write_text(
         "---\nreport_id: 1\ntitle: priced\nstatus: fixed\n"
-        "estimate_usd: 0.25\nactual_usd: 0.40\n---\n# bug-1\n"
+        "estimate_usd: 0.10\nactual_usd: 0.10\n---\n# bug-1\n"
+    )
+    (status / "bug-2.md").write_text(
+        "---\nreport_id: 2\ntitle: priced2\nstatus: fixed\n"
+        "estimate_usd: 0.15\nactual_usd: 0.30\n---\n# bug-2\n"
     )
     payload = bugs_page.render(status)
     pipeline = next(
@@ -509,4 +512,23 @@ def test_bugs_a2ui_pipeline_populated_once_priced(tmp_path):
         "estimate": "$0.25",
         "actual": "$0.40",
         "delta": "$0.15",
+        "count": 2,
+        "overrun": False,
     }
+
+
+def test_bugs_a2ui_pipeline_hidden_for_single_priced_bug(tmp_path):
+    from status_site.sources import bugs as bugs_page
+
+    status = tmp_path / "status"
+    status.mkdir()
+    (status / "bug-1.md").write_text(
+        "---\nreport_id: 1\ntitle: priced\nstatus: fixed\n"
+        "estimate_usd: 0.25\nactual_usd: 0.40\n---\n# bug-1\n"
+    )
+    payload = bugs_page.render(status)
+    pipeline = next(
+        e for e in payload["a2ui"]
+        if e["type"] == "updateDataModel" and e["path"] == "/pipeline"
+    )
+    assert pipeline["value"] is None

@@ -92,9 +92,6 @@ def main() -> int:
     mouths_w, mouths_h, mouths_px = encode(src_dir / "mouths.bmp", "mouths")
 
     # Sanity: spec says 108x36 face, 136x8 eyes, 204x8 mouths.
-    expected = {(face_w, face_h): (108, 36),
-                (eyes_w, eyes_h): (136, 8),
-                (mouths_w, mouths_h): (204, 8)}
     actual = {(face_w, face_h), (eyes_w, eyes_h), (mouths_w, mouths_h)}
     want = {(108, 36), (136, 8), (204, 8)}
     if actual != want:
