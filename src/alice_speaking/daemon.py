@@ -56,8 +56,10 @@ from core.kernel import KernelSpec, make_kernel
 from claude_agent_sdk import HookMatcher
 from . import _dispatch as _dispatch_module
 from . import auto_fix as auto_fix_module
+from . import cron_hook as cron_hook_module
 from . import factory as factory_module
 from . import tools as tools_module
+from . import worker_markers as worker_markers_module
 from . import worker_report as worker_report_module
 from .domain import principals as principals_module
 from .domain import session_state
@@ -109,6 +111,11 @@ from .transports.cli import CLIEvent
 from .transports.discord import DiscordEvent
 from .transports.gmail import GmailEvent
 from .transports.signal import SignalEvent
+from .transports.modern_mud import (
+    DEFAULT_KEY_PATH as DEFAULT_MODERN_MUD_KEY_PATH,
+    ModernMudTransport,
+    load_key as load_modern_mud_key,
+)
 from .transports.viewer_chat import ViewerChatEvent
 from .transports.ws import resolve_token as resolve_ws_token
 
@@ -389,6 +396,26 @@ class SpeakingDaemon:
                 principal_display_name=cfg.viewer_chat_principal_display_name,
             )
 
+        # Modern-mud transport — opt-in: built only when the shared key
+        # file exists and a callback URL + admin ids are configured.
+        self.modern_mud_transport: Optional[ModernMudTransport] = None
+        _mm_key = load_modern_mud_key(
+            os.environ.get("ALICE_MODERN_MUD_KEY_FILE", DEFAULT_MODERN_MUD_KEY_PATH)
+        )
+        _mm_callback = os.environ.get("ALICE_MODERN_MUD_CALLBACK_URL", "").strip()
+        _mm_admins = {
+            a.strip()
+            for a in os.environ.get("ALICE_MODERN_MUD_ADMIN_IDS", "").split(",")
+            if a.strip()
+        }
+        if _mm_key and _mm_callback and _mm_admins:
+            self.modern_mud_transport = ModernMudTransport(
+                key=_mm_key,
+                admin_user_ids=_mm_admins,
+                callback_url=_mm_callback,
+                port=int(os.environ.get("ALICE_MODERN_MUD_PORT", "8182")),
+            )
+
         # WS gateway transport — token-authenticated WebSocket front
         # for the CLI session protocol, so off-host clients (the iOS
         # app, browser tools) can hold a session without going through
@@ -486,6 +513,7 @@ class SpeakingDaemon:
                 self.a2a_transport,
                 self.viewer_chat_transport,
                 self.ws_transport,
+                self.modern_mud_transport,
             ),
             surface_watcher=self._surface_watcher,
             emergency_watcher=self._emergency_watcher,
@@ -507,6 +535,7 @@ class SpeakingDaemon:
                 "a2a": self.a2a_transport,
                 "viewer-chat": self.viewer_chat_transport,
                 "ws": self.ws_transport,
+                "modern-mud": self.modern_mud_transport,
             }.get(name),
             address_book=self.address_book,
             events=self.events,
@@ -571,6 +600,7 @@ class SpeakingDaemon:
                 "a2a": self.a2a_transport,
                 "viewer-chat": self.viewer_chat_transport,
                 "ws": self.ws_transport,
+                "modern-mud": self.modern_mud_transport,
             }.get(name),
             system_prompt=self._system_prompt,
             # Plan 06 Phase 3: model.yml's speaking.model wins over
@@ -1101,6 +1131,10 @@ class SpeakingDaemon:
                 await _stop_with_timeout(
                     "a2a_transport", self.a2a_transport.stop
                 )
+            if self.modern_mud_transport is not None:
+                await _stop_with_timeout(
+                    "modern_mud_transport", self.modern_mud_transport.stop
+                )
             if self.viewer_chat_transport is not None:
                 await _stop_with_timeout(
                     "viewer_chat_transport", self.viewer_chat_transport.stop
@@ -1388,12 +1422,30 @@ class SpeakingDaemon:
         working), the next round of the model sees a synthesised user
         block describing what showed up.
 
+        Also piggy-backs on every call to mirror CronCreate /
+        CronDelete / ScheduleWakeup outcomes into the on-disk schedule
+        state so the status-site's Schedules panel sees them (#815).
+        The mirror is defensive — exceptions are swallowed inside
+        :func:`cron_hook.record_cron_tool_outcome` so a broken sidecar
+        can't regress the mid-turn drain or Task interception.
+
         Stops draining once Alice has replied on the channel for this
         turn (``_current_turn_replied`` set by ``_send_message``).
         Drained-but-too-late messages would land in context that the
         model can't act on; better to let them queue as the next turn
         from the user's POV. (Alice's design call.)
         """
+        # Cron sidecar mirror — fire regardless of channel / reply
+        # state. Even a wakeup fired from an idle self-tick should
+        # update active-crons.json.
+        cron_tool_name = input_data.get("tool_name") or ""
+        if cron_tool_name in cron_hook_module.CRON_TOOL_NAMES:
+            cron_hook_module.record_cron_tool_outcome(
+                tool_name=cron_tool_name,
+                tool_input=input_data.get("tool_input") or {},
+                tool_response=input_data.get("tool_response"),
+            )
+
         if self._current_reply_channel is None:
             return {}
         if self._current_turn_replied:
@@ -1479,6 +1531,20 @@ class SpeakingDaemon:
         # cortex-memory/research/2026-05-19-dispatched-inflight-speaking-wiring.md
         # and PR #262 (write path).
         auto_fix_module.record_auto_fix_inflight(instructions, handle)
+
+        # Issue #789 PR 1: persistent worker-dispatch marker so the
+        # memory worker's derive pass can materialise a row in
+        # ``workers`` even if the daemon restarts before the sub-agent
+        # finishes. Best-effort; a failed write is logged, not raised.
+        # ``started_at`` is omitted — the helper fills a UTC now.
+        try:
+            worker_markers_module.write_dispatch_marker(
+                getattr(self.cfg, "mind_dir", None),
+                bg_id=handle,
+                description=description,
+            )
+        except Exception:  # noqa: BLE001 — never block dispatch on this
+            log.exception("worker dispatch marker write failed for %s", handle)
         # Issue #375: also record an SM v2 task entry so the
         # ``inner/tasks/`` state machine has producers wired to real
         # workflows. The intake call cascades draft → selected →
@@ -1635,10 +1701,10 @@ class SpeakingDaemon:
         # to drop attachments to queue. CLI + viewer-chat are
         # always-bypass (operator is at a UI waiting).
         bypass_quiet = (
-            channel.transport in ("cli", "a2a", "viewer-chat")
+            channel.transport in ("cli", "a2a", "viewer-chat", "modern-mud")
             or emergency
             or self._current_turn_kind
-            in ("signal", "discord", "gmail", "cli", "a2a", "viewer-chat")
+            in ("signal", "discord", "gmail", "cli", "a2a", "viewer-chat", "modern-mud")
             or bool(attachments)
         )
 

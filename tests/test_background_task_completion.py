@@ -222,7 +222,16 @@ def test_well_formed_report_does_not_emit_pending_verify(tmp_path) -> None:
     kinds = [k for k, _ in ctx.events.emitted]
     assert "background_task_pending_verify" not in kinds
     assert "REPORT CHECK FAILED" not in ctx.run_turn_calls[0]["prompt"]
-    assert not (tmp_path / "inner" / "notes").exists()
+    # issue #789 PR 1: the worker-completed marker is always written,
+    # so ``inner/notes/`` exists even on the happy path. The assertion
+    # is that no pending-verify ``.md`` note was dropped.
+    notes_dir = tmp_path / "inner" / "notes"
+    pending_md = (
+        list(notes_dir.glob("*pending-verify*.md"))
+        if notes_dir.is_dir()
+        else []
+    )
+    assert pending_md == []
 
 
 def test_missing_report_writes_pending_verify_note(tmp_path) -> None:
@@ -329,4 +338,14 @@ def test_error_event_skips_pending_verify(tmp_path) -> None:
 
     kinds = [k for k, _ in ctx.events.emitted]
     assert "background_task_pending_verify" not in kinds
-    assert not (tmp_path / "inner" / "notes").exists()
+    # issue #789 PR 1: even on error the worker-completed marker is
+    # still written (outcome=error) so the DB has a terminal row;
+    # ``inner/notes/`` therefore exists. Only the pending-verify
+    # ``.md`` must be absent.
+    notes_dir = tmp_path / "inner" / "notes"
+    pending_md = (
+        list(notes_dir.glob("*pending-verify*.md"))
+        if notes_dir.is_dir()
+        else []
+    )
+    assert pending_md == []

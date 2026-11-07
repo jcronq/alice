@@ -171,6 +171,58 @@ class TaskRecord:
         return out
 
 
+@dataclass
+class ReindexReport:
+    """Result of a :meth:`TaskStore.reindex` call.
+
+    Reported on both dry-run and committing paths so operators can
+    diff the before/after without having to grep ``index.jsonl``.
+    """
+
+    scanned: int
+    written: int
+    errors: list[dict[str, Any]]
+    added: list[str]
+    removed: list[str]
+    changed: list[str]
+    before_count: int
+    after_count: int
+    dry_run: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scanned": self.scanned,
+            "written": self.written,
+            "errors": list(self.errors),
+            "added": list(self.added),
+            "removed": list(self.removed),
+            "changed": list(self.changed),
+            "before_count": self.before_count,
+            "after_count": self.after_count,
+            "dry_run": self.dry_run,
+        }
+
+
+def _index_entry_from_record(record: "TaskRecord") -> dict[str, Any]:
+    """Shape of a single ``index.jsonl`` row written by reindex.
+
+    Per #781: id, title, status, actor, artifact_type, created,
+    updated, tags. Kept as a free function so callers that want to
+    build the canonical row shape (e.g. a future ``_append_index``
+    unification) have one reference.
+    """
+    return {
+        "id": record.id,
+        "title": record.title,
+        "status": record.status,
+        "actor": record.actor,
+        "artifact_type": record.artifact_type,
+        "created": record.created,
+        "updated": record.updated,
+        "tags": list(record.tags),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Time + ids
 
@@ -600,6 +652,111 @@ class TaskStore:
         }
         with open(self.index_path, "a") as fh:
             fh.write(json.dumps(entry) + "\n")
+
+    # ------------------------------------------------------------------
+    # Reindex / fsck (issue #781)
+
+    def reindex(self, *, dry_run: bool = False) -> ReindexReport:
+        """Walk ``task-*/task.yaml`` and rebuild ``index.jsonl`` from
+        scratch.
+
+        Rationale: creation/update code paths keep ``index.jsonl`` in
+        sync, but out-of-band mutations (hand-edits, migrations, crashed
+        wakes, the hand-written task-0001 preamble) leave the index
+        trailing reality. #781 observed 608/912 tasks indexed — a ~33%
+        miss rate. This routine is the authoritative resync.
+
+        Behaviour:
+
+        * Walks every ``task-NNNN/`` under :attr:`root` and tries to
+          load ``task.yaml``. Each successful record contributes one
+          index entry with ``id``, ``title``, ``status``, ``actor``,
+          ``artifact_type``, ``created``, ``updated``, ``tags``.
+        * Malformed / missing ``task.yaml`` is recorded as an error in
+          the returned report AND emitted to stderr — never silently
+          dropped. Operators decide what to do with the orphan
+          directory; this routine does NOT rename or delete anything.
+        * ``dry_run=True`` returns the full before/after diff without
+          touching ``index.jsonl``.
+        * ``dry_run=False`` writes the new index atomically (tempfile
+          + ``os.rename`` within the tasks dir) while holding the
+          same ``fcntl.flock`` as ``create``/``update`` — concurrent
+          CLI calls queue cleanly.
+        """
+        # Collect current index snapshot under the lock so a concurrent
+        # ``update`` can't race us into a stale baseline.
+        with self._locked():
+            before_entries = list(self.iter_index())
+            before_by_id = {e.get("id"): e for e in before_entries if e.get("id")}
+
+            new_entries: list[dict[str, Any]] = []
+            errors: list[dict[str, Any]] = []
+
+            if self.root.is_dir():
+                task_dirs = sorted(
+                    child
+                    for child in self.root.iterdir()
+                    if child.is_dir() and _TASK_ID_RE.match(child.name)
+                )
+            else:
+                task_dirs = []
+
+            for task_dir in task_dirs:
+                task_id = task_dir.name
+                yaml_path = task_dir / "task.yaml"
+                if not yaml_path.is_file():
+                    errors.append(
+                        {
+                            "id": task_id,
+                            "path": str(yaml_path),
+                            "reason": "missing task.yaml",
+                        }
+                    )
+                    continue
+                try:
+                    data = _parse_yaml_lenient(yaml_path.read_text())
+                    record = _record_from_dict(data)
+                except Exception as exc:  # noqa: BLE001 — surface every failure
+                    errors.append(
+                        {
+                            "id": task_id,
+                            "path": str(yaml_path),
+                            "reason": f"malformed task.yaml: {exc}",
+                        }
+                    )
+                    continue
+                new_entries.append(_index_entry_from_record(record))
+
+            # Diff vs. prior index for the dry-run report.
+            new_by_id = {e["id"]: e for e in new_entries}
+            added_ids = sorted(set(new_by_id) - set(before_by_id))
+            removed_ids = sorted(set(before_by_id) - set(new_by_id))
+            changed_ids: list[str] = []
+            for tid in sorted(set(before_by_id) & set(new_by_id)):
+                if before_by_id[tid] != new_by_id[tid]:
+                    changed_ids.append(tid)
+
+            report = ReindexReport(
+                scanned=len(task_dirs),
+                written=len(new_entries),
+                errors=errors,
+                added=added_ids,
+                removed=removed_ids,
+                changed=changed_ids,
+                before_count=len(before_entries),
+                after_count=len(new_entries),
+                dry_run=dry_run,
+            )
+
+            if not dry_run:
+                body = (
+                    "\n".join(json.dumps(e) for e in new_entries) + "\n"
+                    if new_entries
+                    else ""
+                )
+                self._atomic_write_text(self.index_path, body)
+
+        return report
 
     def _rewrite_index_replacing(self, record: TaskRecord) -> None:
         """Re-emit index.jsonl with ``record``'s entry refreshed.

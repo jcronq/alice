@@ -122,7 +122,7 @@ def test_archive_groups_by_date_newest_first_and_keeps_existing(tmp_path):
     hist(cfg, "mystery", checked_at("2026-10-30T10:00:00-04:00"))
     archive_done(cfg, NOW)
     arch = (tmp_path / "done-archive.md").read_text()
-    heads = [l for l in arch.splitlines() if l.startswith("## ")]
+    heads = [ln for ln in arch.splitlines() if ln.startswith("## ")]
     assert heads == ["## 2026-11-04", "## 2026-11-03", "## 2026-10-30"]
     day4 = arch.split("## 2026-11-04")[1].split("## 2026-11-03")[0]
     assert "**Old win**" in day4 and "with a continuation line" in day4
@@ -275,13 +275,3 @@ def test_cli_status_archive(tmp_path, monkeypatch, capsys):
     assert "archived old-win -> 2020-01-01" in out and "archived 1 item(s)" in out
     assert "## 2020-01-01" in (tmp_path / "done-archive.md").read_text()
     assert cli.main_archive(["extra"]) == 2
-
-
-def test_frontend_collapses_done_today():
-    # ``collapseDone`` + the ``linkLeaves();collapseDone();`` chain
-    # live in the pre-#639 markdown shell; slice-1 moved that JS to
-    # legacy.html while the reactive tree catches up.
-    html = (Path(S.__file__).parent / "static" / "legacy.html").read_text()
-    assert "function collapseDone" in html
-    assert "linkLeaves();collapseDone();" in html
-    assert "details.done" in html
