@@ -67,8 +67,12 @@ def read_from(default: str = MODE_DB) -> str:
 def _resolve_db_path() -> pathlib.Path:
     """Resolve the DB path (env override or canonical default).
 
-    The override (``ALICE_STATE_DB_PATH``) stays implementation-detail
-    scope — tests use it, operators generally don't.
+    The override (``ALICE_STATE_DB_PATH``) is used by tests and by the
+    ``status-site`` container itself — ``sandbox/docker-compose.yml``
+    sets it to ``/srv/state/alice-state.db`` because ``Path.home()``
+    doesn't resolve usefully inside that bare-UID alpine image. Other
+    operators generally don't set it; the canonical default suffices
+    whenever ``$HOME/alice-mind/inner/state/`` exists.
     """
     raw = os.environ.get("ALICE_STATE_DB_PATH")
     if raw:

@@ -56,6 +56,7 @@ Content (mind dir, never committed; host `…/mind/inner/`, container `/srv/*`):
 | `inner/status-uploads/<thread>/` | `UPLOAD_DIR` | Attachments, `YYYYmmdd-HHMMSS-<n>-<name>`, dir mode 0700 |
 | `inner/surface/` | `SURFACE_DIR` | Where `status-reply` / `status-chat` surfaces land. Also scanned at request time for the **Alice's queue** section on `/index.md` — flat `*.md` files are the "pending my attention" list; resolved surfaces move to `.handled/<date>/` and drop out naturally. The server splices the rendered list into `index.md` between `<!-- alice-queue:start -->` / `<!-- alice-queue:end -->` sentinels; if the markers aren't present the section is appended to the served body (nothing is written to disk). |
 | `inner/status-server/key` | `KEY_FILE` | Shared reply key (single line) |
+| `inner/state/` | `ALICE_STATE_DB_PATH` | `alice-state.db` (+ `-wal`/`-shm` WAL sidecars) — read-only access for the Overview DB-backed pipeline/review-queue/done-today readers (#814); written by the memory worker inside the `alice` container, never by status-site |
 
 Other env: `PORT` (8095), `HOST` (0.0.0.0), `UPLOAD_DIR_ALIAS` (the upload dir as
 Speaking sees it, used in surface paths), `PUBLIC_URL`, `MAX_UPLOAD_BYTES` (25 MB).

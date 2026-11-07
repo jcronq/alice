@@ -238,6 +238,7 @@ services:
       STATUS_DIR: /srv/status
       SURFACE_DIR: /srv/surface
       UPLOAD_DIR: /srv/uploads
+      ALICE_STATE_DB_PATH: /srv/state/alice-state.db
       KEY_FILE: /srv/config/key
       PORT: "8095"
       # Where Speaking (inside `alice`) sees UPLOAD_DIR; surfaces list these paths.
@@ -250,6 +251,7 @@ services:
       - ${ALICE_MIND:-${HOME}/alice-mind}/inner/status:/srv/status
       - ${ALICE_MIND:-${HOME}/alice-mind}/inner/surface:/srv/surface
       - ${ALICE_MIND:-${HOME}/alice-mind}/inner/status-uploads:/srv/uploads
+      - ${ALICE_MIND:-${HOME}/alice-mind}/inner/state:/srv/state
       # Holds only `key` (the shared reply key; never committed).
       - ${ALICE_MIND:-${HOME}/alice-mind}/inner/status-server:/srv/config:ro
     healthcheck:
