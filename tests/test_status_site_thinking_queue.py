@@ -179,7 +179,10 @@ def test_http_index_md_is_spliced(tmp_path, monkeypatch):
 
 def test_poller_dedupes_multi_label_issues():
     both = {"number": 7, "title": "t", "labels": [{"name": "sm:designing"}, {"name": "sm:blocked"}], "updatedAt": "x"}
-    fetch = lambda label: [both] if label in ("sm:designing", "sm:blocked") else []
+
+    def fetch(label):
+        return [both] if label in ("sm:designing", "sm:blocked") else []
+
     items = P.collect(fetch)
     assert [i["number"] for i in items] == [7]
     assert items[0]["labels"] == ["sm:designing", "sm:blocked"]

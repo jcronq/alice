@@ -8,13 +8,11 @@ modules so each file stays focused on one axis.
 from __future__ import annotations
 
 import asyncio
-import pathlib
 import types
 
-import pytest
 
 from alice_speaking import slash_commands
-from alice_speaking.slash_commands import Response, SLICE1_VERBS
+from alice_speaking.slash_commands import SLICE1_VERBS
 
 
 def _ctx(cfg):

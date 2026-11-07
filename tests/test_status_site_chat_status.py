@@ -32,7 +32,7 @@ def _write_chat(cfg, *rows):
 
 
 def _rows(status_dir):
-    return [json.loads(l) for l in cs.status_path(status_dir).read_text().splitlines()]
+    return [json.loads(ln) for ln in cs.status_path(status_dir).read_text().splitlines()]
 
 
 def _thread(cfg):
