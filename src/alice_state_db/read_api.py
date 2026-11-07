@@ -298,6 +298,87 @@ def list_events(
     return [_row_to_dict(r) for r in cur.fetchall()]
 
 
+# ---------------------------------------------------------------------------
+# SM v2 substrate readers (issue #790 Step 1)
+
+
+def item_detail(
+    conn: sqlite3.Connection,
+    item_id: str,
+    *,
+    transition_limit: int = 5,
+) -> Optional[dict[str, Any]]:
+    """Return an item + its current state + recent transitions + refs.
+
+    Powers ``task db item <item_id>``. Returns ``None`` when no row
+    matches so the CLI can print a clean ``not found`` without
+    crashing on empty queries. Transitions are returned newest-first
+    and capped at ``transition_limit`` (default matches the #790
+    spec's "last 5"); callers that want the full history use
+    :func:`item_transitions`.
+    """
+    row = conn.execute(
+        "SELECT * FROM items WHERE item_id = ?", (item_id,)
+    ).fetchone()
+    if row is None:
+        return None
+
+    item = _row_to_dict(row)
+
+    state_row = conn.execute(
+        "SELECT * FROM state_machine WHERE item_id = ?", (item_id,)
+    ).fetchone()
+    item["state"] = _row_to_dict(state_row) if state_row else None
+
+    tr_rows = conn.execute(
+        """
+        SELECT * FROM transitions
+        WHERE item_id = ?
+        ORDER BY transition_id DESC
+        LIMIT ?
+        """,
+        (item_id, int(transition_limit)),
+    ).fetchall()
+    item["recent_transitions"] = [_row_to_dict(r) for r in tr_rows]
+
+    ref_rows = conn.execute(
+        """
+        SELECT * FROM item_external_refs
+        WHERE item_id = ?
+        ORDER BY ref_type, ref_target_item_id
+        """,
+        (item_id,),
+    ).fetchall()
+    item["external_refs"] = [_row_to_dict(r) for r in ref_rows]
+
+    return item
+
+
+def item_transitions(
+    conn: sqlite3.Connection,
+    item_id: str,
+    *,
+    limit: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    """Full transition history for ``item_id``, oldest-first.
+
+    Oldest-first so the output reads as a timeline when piped through
+    a table formatter. ``limit`` caps the oldest end implicitly via
+    SQL ``LIMIT``; callers typically omit it and let the UI truncate.
+    """
+    sql = """
+        SELECT * FROM transitions
+        WHERE item_id = ?
+        ORDER BY transition_id ASC
+    """
+    params: list[Any] = [item_id]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    cur = conn.execute(sql, params)
+    return [_row_to_dict(r) for r in cur.fetchall()]
+
+
 def list_tasks(
     conn: sqlite3.Connection,
     *,

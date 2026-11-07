@@ -271,6 +271,24 @@ def main() -> int:
             errors=[{"kind": "derive", "path": str(mind), "reason": str(exc)}]
         )
 
+    # Phase 7 (#790 Step 1): SM v2 substrate seed — items +
+    # state_machine + transitions + amendments from the GH mirror
+    # and inner/tasks/. Runs AFTER ``derive_tasks_workers_events``
+    # so the task-level rows are fresh; the seed queries the same
+    # DB file and shares its WAL. Mirror-only mode (no live-gh
+    # fetcher wired in Step 1 — that moves in Step 2) keeps the
+    # memory-worker tick off the GH rate-limit budget.
+    try:
+        from alice_state_db import sm_seed as _sm_seed_mod
+
+        sm_seed_report = _sm_seed_mod.derive_sm_seed(mind)
+    except Exception as exc:  # noqa: BLE001 — telemetry-only path
+        from alice_state_db.sm_seed import SmSeedReport as _SmSeedReport
+
+        sm_seed_report = _SmSeedReport(
+            errors=[{"kind": "sm_seed", "path": str(mind), "reason": str(exc)}]
+        )
+
     # Heartbeat phase: precedence is the heaviest stage that actually
     # ran (D > C > B). ``stage_d.ran`` is True iff a pair was selected
     # this cycle — null-result outcomes still count, because Stage D
@@ -300,6 +318,7 @@ def main() -> int:
         stage_d_ran=bool(synth.ran),
         **{f"task_reindex_{k}": v for k, v in reindex_result.items()},
         **{f"state_db_{k}": v for k, v in state_db_report.to_dict().items()},
+        **{f"sm_seed_{k}": v for k, v in sm_seed_report.to_dict().items()},
     )
 
     return 0

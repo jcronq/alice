@@ -288,6 +288,48 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Row cap. Default 20.",
     )
 
+    # ---- db item <item_id> — one item + current SM state + last few
+    # transitions + external refs. The item_id is the human-readable
+    # surrogate written by the #790 seeder: ``gh:jcronq/alice#790``
+    # or ``local:task-0760``.
+    db_item = db_sub.add_parser(
+        "item",
+        help=(
+            "Print an item + its state + last 5 transitions + "
+            "external refs. SM v2 (#790)."
+        ),
+    )
+    db_item.add_argument(
+        "item_id",
+        help=(
+            "Item surrogate id — ``gh:jcronq/alice#790`` for GH "
+            "issues, ``local:task-0760`` for local tasks."
+        ),
+    )
+    db_item.add_argument(
+        "--transition-limit",
+        type=int,
+        default=5,
+        help="How many recent transitions to include. Default 5.",
+    )
+
+    # ---- db transitions <item_id> — full transition history for
+    # one item. Separate from ``db item`` so the common case (a quick
+    # peek) stays small and the full-audit path is explicit.
+    db_transitions = db_sub.add_parser(
+        "transitions",
+        help="Full transition history for one item_id (oldest-first).",
+    )
+    db_transitions.add_argument(
+        "item_id", help="Item surrogate id (see ``db item`` --help)."
+    )
+    db_transitions.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Cap on rows returned. Omit for the full audit trail.",
+    )
+
     return p
 
 
@@ -528,6 +570,28 @@ def _cmd_db(store: TaskStore, args: argparse.Namespace) -> int:
                     type=args.type,
                     since=args.since,
                     limit=args.limit,
+                )
+                print(json.dumps(rows, sort_keys=False, default=str))
+                return 0
+
+            if args.db_command == "item":
+                payload = read_api.item_detail(
+                    conn,
+                    args.item_id,
+                    transition_limit=args.transition_limit,
+                )
+                if payload is None:
+                    print(
+                        f"error: item not found: {args.item_id}",
+                        file=sys.stderr,
+                    )
+                    return 2
+                print(json.dumps(payload, sort_keys=False, default=str))
+                return 0
+
+            if args.db_command == "transitions":
+                rows = read_api.item_transitions(
+                    conn, args.item_id, limit=args.limit
                 )
                 print(json.dumps(rows, sort_keys=False, default=str))
                 return 0
