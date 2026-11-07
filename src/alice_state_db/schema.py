@@ -241,6 +241,38 @@ DDL_AMENDMENTS_INDEX = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Component bucketing for the status-site pipeline board (issue #821)
+#
+# Every open GH issue that lands on the Alice pipeline carries zero or
+# more component buckets — the first segment under ``src/`` for each
+# file its linked PR touches. Issues with no linked PR go in the
+# ``pre-build`` bucket. Infra paths (``sandbox/*``, ``Dockerfile*``,
+# ``.github/*``) collapse to the ``infra`` bucket; non-src, non-infra
+# paths (docs, README) collapse to ``misc``.
+#
+# Rows are also written per PR (keyed on the PR's item_id) so the
+# aggregation from PR → issue can run as a plain JOIN rather than
+# re-walking file lists. ``source`` keys the origin of the row:
+# ``pr-files`` for a per-PR row, ``issue-derived`` for the aggregate
+# row on the issue, and ``pre-build`` for the no-PR sentinel.
+
+DDL_ITEM_COMPONENTS = """
+CREATE TABLE IF NOT EXISTS item_components (
+    item_id    TEXT NOT NULL,
+    component  TEXT NOT NULL,
+    source     TEXT,
+    updated_at TEXT,
+    PRIMARY KEY (item_id, component),
+    FOREIGN KEY (item_id) REFERENCES items(item_id) ON DELETE CASCADE
+);
+"""
+
+DDL_ITEM_COMPONENTS_INDEX = [
+    "CREATE INDEX IF NOT EXISTS idx_item_components_component ON item_components(component);",
+]
+
+
 def apply_schema(conn: sqlite3.Connection) -> None:
     """Create the PR 1 tables + indexes idempotently.
 
@@ -286,6 +318,9 @@ def apply_schema(conn: sqlite3.Connection) -> None:
         conn.execute(stmt)
     conn.execute(DDL_AMENDMENTS)
     for stmt in DDL_AMENDMENTS_INDEX:
+        conn.execute(stmt)
+    conn.execute(DDL_ITEM_COMPONENTS)
+    for stmt in DDL_ITEM_COMPONENTS_INDEX:
         conn.execute(stmt)
 
     conn.commit()

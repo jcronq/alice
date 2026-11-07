@@ -166,3 +166,80 @@ def test_fallback_to_gh_when_flag_flipped(seeded_from_poll, monkeypatch):
     # Fake returned [], so the result is empty — distinct from the DB
     # reader's seeded answer.
     assert rows == []
+
+
+# ─── issue #821: components propagate through the full pipeline ─────
+
+
+def _mk_curl_output_shim(status, etag, body):
+    return _mk_curl_output(status, etag, body)
+
+
+def _integration_runner(cmd):
+    """Extended runner that serves per-PR file lists for the component
+    bucketing path (issue #821). Adds a file-list payload for PR #803."""
+    import re as _re
+
+    url = cmd[-1]
+    base = url.split("?", 1)[0]
+    m = _re.search(r"/pulls/(\d+)/files$", base)
+    if m:
+        number = int(m.group(1))
+        files = (
+            [
+                {"filename": "src/status_site/sources/pipeline.py"},
+                {"filename": "src/status_site/static/index.html"},
+            ]
+            if number == 803
+            else []
+        )
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=_mk_curl_output(200, f'"files-{number}"', json.dumps(files)),
+            stderr="",
+        )
+    # fall through to the existing runner
+    return _runner(cmd)
+
+
+@pytest.fixture
+def seeded_with_components(tmp_path, monkeypatch):
+    mind = tmp_path / "alice-mind"
+    (mind / "inner" / "state").mkdir(parents=True)
+    db_path = mind / "inner" / "state" / "alice-state.db"
+    monkeypatch.setenv("ALICE_STATE_DB_PATH", str(db_path))
+    monkeypatch.setenv("STATUS_SITE_READ_FROM", "db")
+    monkeypatch.setenv(
+        "ALICE_GH_RATE_LIMIT_BACKOFF_PATH",
+        str(mind / "inner" / "state" / "gh-rate-limit-backoff.json"),
+    )
+    report = GP.derive_gh_poll(
+        mind,
+        db_path=db_path,
+        repos=["jcronq/alice"],
+        env={},
+        runner=_integration_runner,
+    )
+    assert report.status == "ok", report.errors
+    return db_path
+
+
+def test_components_flow_from_poller_to_group_by_component(
+    seeded_with_components,
+):
+    """Poller writes components → db reader returns them → the renderer
+    groups by component. This pins the wire shape across the boundary."""
+    rows, _ = P.fetch_issues(["jcronq/alice"])
+    # Issue #790 is linked from PR #803 (Closes #790) in the fixture
+    # response, so it inherits status_site.
+    row_790 = next(r for r in rows if r["number"] == 790)
+    assert "status_site" in (row_790.get("components") or [])
+    # Issue #802 has no PR closing it → pre-build.
+    row_802 = next(r for r in rows if r["number"] == 802)
+    assert (row_802.get("components") or []) == ["pre-build"]
+
+    groups = P.group_rows_by_component(P.issue_rows(rows, now=1_800_000_000.0))
+    comps = {g["component"] for g in groups}
+    assert "status_site" in comps
+    assert "pre-build" in comps

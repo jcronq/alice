@@ -405,3 +405,331 @@ def test_derive_gh_poll_is_idempotent(mind):
 def _row_count(db_path: pathlib.Path, table: str) -> int:
     with sqlite3.connect(str(db_path)) as conn:
         return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+
+# ─── issue #821: component bucketing ─────────────────────────────────
+
+
+def _mock_pr_files(number: int) -> list[dict]:
+    """Return a canned file list for one PR.
+
+    #803 touches a single component (``status_site``); #803's alternate
+    is used for the multi-component case.
+    """
+    if number == 803:
+        return [
+            {"filename": "src/status_site/sources/pipeline.py"},
+            {"filename": "src/status_site/static/index.html"},
+        ]
+    if number == 802:
+        return [
+            {"filename": "src/alice_forge/dispatcher/main.py"},
+            {"filename": "src/alice_state_db/schema.py"},
+            {"filename": "sandbox/Dockerfile"},
+        ]
+    return []
+
+
+def _runner_for_components(issues=None, prs=None):
+    """Runner that serves issues + prs + per-PR file lists."""
+    issues_body = json.dumps(issues if issues is not None else _mock_issues_response())
+    prs_body = json.dumps(prs if prs is not None else _mock_prs_response())
+
+    def run(cmd):
+        url = cmd[-1]
+        # Per-PR files endpoint: ``/pulls/<N>/files``
+        if "/pulls/" in url and url.rstrip("?").split("?", 1)[0].endswith("/files"):
+            import re as _re
+
+            m = _re.search(r"/pulls/(\d+)/files", url)
+            number = int(m.group(1)) if m else 0
+            body = json.dumps(_mock_pr_files(number))
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, f'"files-{number}"', body), stderr=""
+            )
+        if "/issues" in url and "/pulls" not in url:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, '"etag-issues"', issues_body), stderr=""
+            )
+        if "/pulls" in url:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, '"etag-prs"', prs_body), stderr=""
+            )
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=_mk_curl_output(200, None, "[]"), stderr=""
+        )
+
+    return run
+
+
+def test_derive_gh_poll_fetches_pr_files_and_writes_components(mind):
+    """Poll a repo whose single open PR touches ``status_site``.
+
+    After one pass the PR's ``item_components`` row set equals the
+    components the file list implies, and the linked issue inherits
+    the same set via ``derive_issue_components``.
+    """
+    # Both #790 and #802 issues come back open; both PRs link back
+    # via ``Closes #<N>`` so their components fan out to the issues.
+    runner = _runner_for_components()
+    db_path = mind / "inner" / "state" / "alice-state.db"
+    report = P.derive_gh_poll(
+        mind,
+        db_path=db_path,
+        repos=["jcronq/alice"],
+        env={},
+        runner=runner,
+    )
+    assert report.status == "ok", report.errors
+    assert report.pr_files_fetched == 2
+    assert report.component_rows_inserted > 0
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        # PR #803 touches only ``status_site``.
+        pr_803 = {
+            r["component"]
+            for r in conn.execute(
+                "SELECT component FROM item_components WHERE item_id = ?",
+                ("gh:pr:jcronq/alice#803",),
+            ).fetchall()
+        }
+        assert pr_803 == {"status_site"}
+        # PR #802 touches multiple components, including infra.
+        pr_802 = {
+            r["component"]
+            for r in conn.execute(
+                "SELECT component FROM item_components WHERE item_id = ?",
+                ("gh:pr:jcronq/alice#802",),
+            ).fetchall()
+        }
+        assert pr_802 == {"alice_forge", "alice_state_db", "infra"}
+
+        # Issue #790 is linked from PR #802 (Closes #790) so inherits
+        # that PR's component set.
+        iss_790 = {
+            r["component"]
+            for r in conn.execute(
+                "SELECT component FROM item_components WHERE item_id = ?",
+                ("gh:jcronq/alice#790",),
+            ).fetchall()
+        }
+        assert iss_790 == {"alice_forge", "alice_state_db", "infra"}
+
+        # Issue #802 has no PR closing it in the canned fixtures,
+        # so it lands in the ``pre-build`` bucket.
+        iss_802 = {
+            r["component"]
+            for r in conn.execute(
+                "SELECT component FROM item_components WHERE item_id = ?",
+                ("gh:jcronq/alice#802",),
+            ).fetchall()
+        }
+        assert iss_802 == {"pre-build"}
+
+
+def test_derive_gh_poll_component_rows_are_idempotent(mind):
+    """Re-running the poll inserts zero additional component rows."""
+    runner = _runner_for_components()
+    db_path = mind / "inner" / "state" / "alice-state.db"
+    cache_path = mind / "inner" / "state" / "gh-poll-etags.json"
+
+    r1 = P.derive_gh_poll(
+        mind,
+        db_path=db_path,
+        repos=["jcronq/alice"],
+        etag_cache_path=cache_path,
+        env={},
+        runner=runner,
+    )
+    first_count = _row_count(db_path, "item_components")
+    first_inserted = r1.component_rows_inserted
+    assert first_inserted > 0
+
+    r2 = P.derive_gh_poll(
+        mind,
+        db_path=db_path,
+        repos=["jcronq/alice"],
+        etag_cache_path=cache_path,
+        env={},
+        runner=runner,
+    )
+    assert r2.status == "ok"
+    assert r2.component_rows_inserted == 0
+    assert r2.component_rows_deleted == 0
+    assert _row_count(db_path, "item_components") == first_count
+
+
+def test_derive_gh_poll_pre_build_bucket_for_issue_without_pr(mind):
+    """An open issue with no linked PR lands in the ``pre-build`` bucket."""
+    # Serve one issue (#790) and zero PRs.
+    runner = _runner_for_components(
+        issues=_mock_issues_response(1),  # just #790
+        prs=[],
+    )
+    db_path = mind / "inner" / "state" / "alice-state.db"
+    P.derive_gh_poll(
+        mind,
+        db_path=db_path,
+        repos=["jcronq/alice"],
+        env={},
+        runner=runner,
+    )
+
+    with sqlite3.connect(str(db_path)) as conn:
+        comps = {
+            r[0]
+            for r in conn.execute(
+                "SELECT component FROM item_components WHERE item_id = ?",
+                ("gh:jcronq/alice#790",),
+            ).fetchall()
+        }
+    assert comps == {"pre-build"}
+
+
+def test_derive_gh_poll_pr_files_304_leaves_rows(mind):
+    """A 304 on the PR files endpoint preserves the prior component rows."""
+    runner = _runner_for_components()
+    db_path = mind / "inner" / "state" / "alice-state.db"
+    cache_path = mind / "inner" / "state" / "gh-poll-etags.json"
+
+    # First pass seeds the DB + caches ETags for every PR files call.
+    P.derive_gh_poll(
+        mind,
+        db_path=db_path,
+        repos=["jcronq/alice"],
+        etag_cache_path=cache_path,
+        env={},
+        runner=runner,
+    )
+
+    # Second pass: every PR files call returns 304, the issue/pulls
+    # endpoints still return 200 with the same payload so item_external
+    # refs get re-upserted and the derivation step runs again.
+    def runner_304(cmd):
+        url = cmd[-1]
+        if "/pulls/" in url and url.rstrip("?").split("?", 1)[0].endswith("/files"):
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(304, None, ""), stderr=""
+            )
+        if "/issues" in url and "/pulls" not in url:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=_mk_curl_output(
+                    200, '"etag-issues"', json.dumps(_mock_issues_response())
+                ),
+                stderr="",
+            )
+        if "/pulls" in url:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=_mk_curl_output(
+                    200, '"etag-prs"', json.dumps(_mock_prs_response())
+                ),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=_mk_curl_output(200, None, "[]"), stderr=""
+        )
+
+    r2 = P.derive_gh_poll(
+        mind,
+        db_path=db_path,
+        repos=["jcronq/alice"],
+        etag_cache_path=cache_path,
+        env={},
+        runner=runner_304,
+    )
+    assert r2.status == "ok"
+    # No file list refetched, so no deltas on the PR side.
+    assert r2.pr_files_fetched == 0
+    with sqlite3.connect(str(db_path)) as conn:
+        comps = {
+            r[0]
+            for r in conn.execute(
+                "SELECT component FROM item_components WHERE item_id = ?",
+                ("gh:pr:jcronq/alice#803",),
+            ).fetchall()
+        }
+    assert comps == {"status_site"}
+
+
+def test_derive_issue_components_reflects_updated_pr_file_list(mind):
+    """When a PR's file list changes, the linked issue picks up the delta."""
+    db_path = mind / "inner" / "state" / "alice-state.db"
+    cache_path = mind / "inner" / "state" / "gh-poll-etags.json"
+
+    # First pass: #803's files are what _mock_pr_files returns.
+    P.derive_gh_poll(
+        mind,
+        db_path=db_path,
+        repos=["jcronq/alice"],
+        etag_cache_path=cache_path,
+        env={},
+        runner=_runner_for_components(),
+    )
+
+    # Second pass: #803 now touches alice_speaking + status_site.
+    def runner(cmd):
+        url = cmd[-1]
+        if "/pulls/803/files" in url:
+            body = json.dumps(
+                [
+                    {"filename": "src/status_site/sources/pipeline.py"},
+                    {"filename": "src/alice_speaking/daemon.py"},
+                ]
+            )
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, '"files-803-v2"', body), stderr=""
+            )
+        if "/pulls/802/files" in url:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(304, None, ""), stderr=""
+            )
+        if "/issues" in url and "/pulls" not in url:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=_mk_curl_output(
+                    200, '"etag-issues"', json.dumps(_mock_issues_response())
+                ),
+                stderr="",
+            )
+        if "/pulls" in url:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=_mk_curl_output(
+                    200, '"etag-prs"', json.dumps(_mock_prs_response())
+                ),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=_mk_curl_output(200, None, "[]"), stderr=""
+        )
+
+    r2 = P.derive_gh_poll(
+        mind,
+        db_path=db_path,
+        repos=["jcronq/alice"],
+        etag_cache_path=cache_path,
+        env={},
+        runner=runner,
+    )
+    assert r2.status == "ok"
+    # PR #803 originally touched {status_site}; it now touches
+    # {status_site, alice_speaking}. Row delta is one insertion
+    # (alice_speaking); the existing status_site row stays.
+    assert r2.component_rows_inserted >= 1
+
+    with sqlite3.connect(str(db_path)) as conn:
+        pr_803 = {
+            r[0]
+            for r in conn.execute(
+                "SELECT component FROM item_components WHERE item_id = ?",
+                ("gh:pr:jcronq/alice#803",),
+            ).fetchall()
+        }
+    assert pr_803 == {"status_site", "alice_speaking"}

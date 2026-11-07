@@ -181,6 +181,10 @@ def fetch_issues_from_db(
     # don't have to carry a separate ``repo`` column. ``item_id LIKE
     # 'gh:jcronq/alice#%'`` is cheap under the ``idx_items_type``
     # filter.
+    #
+    # Component buckets (issue #821): a LEFT JOIN against
+    # ``item_components`` returns zero-or-many rows per issue, which
+    # we fold into a ``components: list[str]`` column as we iterate.
     try:
         with connect(path) as conn:
             cur = conn.execute(
@@ -189,13 +193,16 @@ def fetch_issues_from_db(
                     i.item_id,
                     i.title,
                     i.updated_at,
-                    sm.state
+                    sm.state,
+                    ic.component
                 FROM items i
                 JOIN state_machine sm ON sm.item_id = i.item_id
+                LEFT JOIN item_components ic ON ic.item_id = i.item_id
                 WHERE i.item_type = 'gh:issue'
-                ORDER BY i.updated_at DESC
+                ORDER BY i.updated_at DESC, i.item_id, ic.component
                 """
             )
+            by_id: dict[tuple[str, int], dict] = {}
             for row in cur.fetchall():
                 parsed = _item_id_to_repo_number(row["item_id"])
                 if parsed is None:
@@ -211,9 +218,11 @@ def fetch_issues_from_db(
                     state_raw = state_raw[len("sm:") :]
                 if state_raw not in _STATE_RANK:
                     continue
-                updated_at = str(row["updated_at"] or "")
-                rows.append(
-                    {
+                key = (repo, number)
+                existing = by_id.get(key)
+                if existing is None:
+                    updated_at = str(row["updated_at"] or "")
+                    existing = {
                         "repo": repo,
                         "number": number,
                         "title": str(row["title"] or ""),
@@ -223,8 +232,17 @@ def fetch_issues_from_db(
                         "updated_epoch": _parse_iso_epoch(updated_at),
                         "updated_at": updated_at,
                         "body": "",
+                        "components": [],
                     }
-                )
+                    by_id[key] = existing
+                    rows.append(existing)
+                comp = row["component"]
+                if comp and comp not in existing["components"]:
+                    existing["components"].append(comp)
+            # Sort each row's component list for stability — the SQL
+            # ORDER BY is best-effort; dedup can reorder.
+            for r in rows:
+                r["components"].sort()
     except sqlite3.Error as exc:
         log.warning("db_readers.fetch_issues_from_db: %r", exc)
         return [], []

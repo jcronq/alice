@@ -440,3 +440,77 @@ def test_your_todo_omits_review_slug_when_note_missing(tmp_path, monkeypatch):
     )
     data = section_renderers(cfg)["your_todo"]()
     assert all("review_slug" not in r for r in data["design_review"])
+
+
+# ─── issue #821: group by component ───────────────────────────────────
+
+
+def test_issue_rows_propagates_components():
+    """``issue_rows`` carries ``components`` through to the widget row."""
+    cached = [
+        {
+            "repo": "jcronq/alice",
+            "number": 790,
+            "title": "design",
+            "state": "selected",
+            "art": "code",
+            "url": "https://github.com/jcronq/alice/issues/790",
+            "updated_epoch": NOW - 3600,
+            "components": ["status_site", "alice_forge"],
+        },
+        {
+            "repo": "jcronq/alice",
+            "number": 802,
+            "title": "pre",
+            "state": "selected",
+            "art": "code",
+            "url": "https://github.com/jcronq/alice/issues/802",
+            "updated_epoch": NOW - 60,
+            # missing components → renderer defaults to pre-build
+        },
+    ]
+    rows = P.issue_rows(cached, now=NOW)
+    assert rows[0]["components"] == ["alice_forge", "status_site"]
+    assert rows[1]["components"] == []
+
+
+def test_group_rows_by_component_sorts_by_count_desc():
+    """Buckets are sorted by count desc, then name asc for stability."""
+    rows = [
+        {"number": 1, "components": ["alice_forge"]},
+        {"number": 2, "components": ["alice_forge", "status_site"]},
+        {"number": 3, "components": ["status_site"]},
+        {"number": 4, "components": ["alice_forge"]},
+    ]
+    groups = P.group_rows_by_component(rows)
+    assert [g["component"] for g in groups] == ["alice_forge", "status_site"]
+    assert groups[0]["count"] == 3  # #1, #2, #4
+    assert groups[1]["count"] == 2  # #2, #3
+
+
+def test_group_rows_by_component_pre_build_bucket_for_empty_components():
+    """A row with no components lands in the ``pre-build`` bucket."""
+    rows = [
+        {"number": 1, "components": []},
+        {"number": 2, "components": None},
+        {"number": 3},
+    ]
+    groups = P.group_rows_by_component(rows)
+    assert len(groups) == 1
+    assert groups[0]["component"] == "pre-build"
+    assert groups[0]["count"] == 3
+
+
+def test_group_rows_by_component_row_appears_in_each_bucket():
+    """A row with multiple components shows up in each of its buckets."""
+    rows = [
+        {"number": 1, "components": ["alice_forge", "status_site"]},
+    ]
+    groups = P.group_rows_by_component(rows)
+    assert sorted(g["component"] for g in groups) == ["alice_forge", "status_site"]
+    for g in groups:
+        assert [r["number"] for r in g["rows"]] == [1]
+
+
+def test_group_rows_by_component_empty_input_empty_output():
+    assert P.group_rows_by_component([]) == []
