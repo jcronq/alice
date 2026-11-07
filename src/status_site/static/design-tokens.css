@@ -250,6 +250,33 @@
   text-decoration: underline;
 }
 
+/* Mobile: stack table rows as cards (title on top, meta line below). */
+.fx-tbl td[data-col="number"],
+.fx-tbl td[data-col="age_seconds"],
+.fx-tbl td[data-col="age"] {
+  white-space: nowrap;
+}
+@media (max-width: 37.5rem) {
+  .fx-tbl table, .fx-tbl tbody { display: block; }
+  .fx-tbl thead { display: none; }
+  .fx-tbl tr {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 var(--dash-pad-sm);
+    padding: var(--dash-pad-xs) 0;
+    border-bottom: 1px solid var(--color-border-line);
+  }
+  .fx-tbl td {
+    border-bottom: 0;
+    padding: 2px 0;
+    text-align: left !important;
+  }
+  .fx-tbl td[data-col="title"] {
+    order: -1;
+    flex: 1 0 100%;
+  }
+}
+
 /* Pills --------------------------------------------------------------- */
 .fx-pill {
   display: inline-block;
@@ -463,6 +490,10 @@ li.fx-now {
 .a2ui-textarea {
   width: 100%;
   min-height: 3.4rem;
+  max-height: 12rem;
+  overflow-y: auto;
+  resize: vertical;
+  box-sizing: border-box;
   padding: var(--dash-pad-sm);
   font: inherit;
   color: var(--color-fg);
@@ -566,6 +597,7 @@ li.fx-now {
   font-size: .72rem;
   margin-top: .15rem;
 }
+.a2ui-list.a2ui-chat-thread .msg.jason small { opacity: 1; }  /* #733: full-contrast meta on green bubble */
 /* Message permalinks + hover actions + reactions (#668). */
 .a2ui-list.a2ui-chat-thread { padding-top: calc(var(--dash-pad-sm) + 1.6rem); }
 .a2ui-list.a2ui-chat-thread .msg { position: relative; flex-shrink: 0; }
@@ -621,9 +653,9 @@ li.fx-now {
  * flip per bubble type because jason bubbles use --color-ok as
  * BACKGROUND and the accent would be invisible there. */
 .a2ui-list.a2ui-chat-thread .msg .msg-reply-ref {
-  display: flex;
-  align-items: center;
-  gap: .3rem;
+  display: block;
+  box-sizing: border-box;
+  min-width: 0;
   max-width: 100%;
   margin: 0 0 .35rem;
   padding: .25rem .5rem;
@@ -642,6 +674,7 @@ li.fx-now {
 }
 .a2ui-list.a2ui-chat-thread .msg .msg-reply-ref::before {
   content: "↪";
+  margin-right: .3rem;
   opacity: .9;
   text-decoration: none;
   font-weight: normal;
