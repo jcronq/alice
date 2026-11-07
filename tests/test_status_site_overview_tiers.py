@@ -172,7 +172,7 @@ def test_in_flight_payload_is_alice_owned_only(tmp_path, monkeypatch):
     _seed(cfg)
     cfg.surface_dir.mkdir()
     (cfg.surface_dir / "2026-11-06T10-00-00-one.md").write_text(
-        "---\ntype: status-chat\nsource: status-site\n---\nbody\n"
+        "---\ntype: note\nsource: alice\n---\nbody\n"
     )
     data = section_renderers(cfg)["in_flight"]()
     assert [r["number"] for r in data["pipeline"]] == [60]
@@ -226,6 +226,20 @@ def test_new_sections_arrive_in_the_snapshot(tmp_path, monkeypatch):
     assert {"running_now", "waiting_on_you", "alice_queue"} <= set(sections)
 
 
+def test_in_flight_surfaces_exclude_status_chat(tmp_path, monkeypatch):
+    monkeypatch.setenv("ALICE_MIND", str(tmp_path / "nomind"))
+    cfg = _cfg(tmp_path)
+    _seed(cfg)
+    cfg.surface_dir.mkdir(parents=True, exist_ok=True)
+    for slug, typ in (("a-chat", "status-chat"), ("b-note", "note")):
+        (cfg.surface_dir / f"{slug}.md").write_text(
+            f"---\ntype: {typ}\ncreated: 2026-11-06T09:00:00-0500\n---\nhello\n"
+        )
+    surfaces = section_renderers(cfg)["in_flight"]()["surfaces"]
+    assert "status-chat" not in {s["type"] for s in surfaces}
+    assert "note" in {s["type"] for s in surfaces}
+
+
 # ─── static shell ──────────────────────────────────────────────────
 
 
@@ -237,6 +251,18 @@ def test_shell_tiers_are_ordered_and_widgets_renamed():
     order = [html.index(f'id: "{t}"') for t in ("top", "middle", "bottom", "thinking", "health")]
     assert order == sorted(order)
     assert 'sections: ["your_todo"]' in html and 'sections: ["in_flight"]' in html
+
+
+def test_shell_collapses_empty_chrome_and_has_age_pill():
+    html = (STATIC / "index.html").read_text()
+    assert "(nothing waiting on you — 👋)" in html
+    assert "function AgePill(" in html
+    for cls in ("age-pill-warn", "age-pill-alert", "tier-stamp"):
+        assert cls in html
+    assert "(none)" not in html
+    assert "deploy info unavailable" in html
+    for gone in ('your_todo: "Your TODO"', "Alice's active work\"", 'done_today: "Done today"'):
+        assert gone not in html
 
 
 # ─── browser ───────────────────────────────────────────────────────

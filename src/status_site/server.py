@@ -2079,7 +2079,11 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         owner = _pipeline.split_by_owner(
             _pipeline.issue_rows(pipe.get("issues") or [], now=now)
         )
-        surfaces = _surface_rows(scan_surfaces(cfg.surface_dir), now)
+        # status-chat messages live on the Chat tab, not as tracked work.
+        surfaces = _surface_rows(
+            [it for it in scan_surfaces(cfg.surface_dir) if it.get("type") != "status-chat"],
+            now,
+        )
         tasks = _pipeline.scan_tasks(_tasks_dir(), now=now)
         n = len(running["rows"]) + len(owner["alice"]) + len(surfaces) + len(tasks)
         return {
