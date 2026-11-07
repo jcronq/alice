@@ -548,6 +548,7 @@ li.fx-now {
   font-size: .72rem;
   margin-top: .15rem;
 }
+.a2ui-list.a2ui-chat-thread .msg.jason small { opacity: 1; }  /* #733: full-contrast meta on green bubble */
 /* Message permalinks + hover actions + reactions (#668). */
 .a2ui-list.a2ui-chat-thread { padding-top: calc(var(--dash-pad-sm) + 1.6rem); }
 .a2ui-list.a2ui-chat-thread .msg { position: relative; flex-shrink: 0; }
