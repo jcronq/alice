@@ -56,6 +56,7 @@ from core.kernel import KernelSpec, make_kernel
 from claude_agent_sdk import HookMatcher
 from . import _dispatch as _dispatch_module
 from . import auto_fix as auto_fix_module
+from . import cron_hook as cron_hook_module
 from . import factory as factory_module
 from . import tools as tools_module
 from . import worker_markers as worker_markers_module
@@ -1421,12 +1422,30 @@ class SpeakingDaemon:
         working), the next round of the model sees a synthesised user
         block describing what showed up.
 
+        Also piggy-backs on every call to mirror CronCreate /
+        CronDelete / ScheduleWakeup outcomes into the on-disk schedule
+        state so the status-site's Schedules panel sees them (#815).
+        The mirror is defensive — exceptions are swallowed inside
+        :func:`cron_hook.record_cron_tool_outcome` so a broken sidecar
+        can't regress the mid-turn drain or Task interception.
+
         Stops draining once Alice has replied on the channel for this
         turn (``_current_turn_replied`` set by ``_send_message``).
         Drained-but-too-late messages would land in context that the
         model can't act on; better to let them queue as the next turn
         from the user's POV. (Alice's design call.)
         """
+        # Cron sidecar mirror — fire regardless of channel / reply
+        # state. Even a wakeup fired from an idle self-tick should
+        # update active-crons.json.
+        cron_tool_name = input_data.get("tool_name") or ""
+        if cron_tool_name in cron_hook_module.CRON_TOOL_NAMES:
+            cron_hook_module.record_cron_tool_outcome(
+                tool_name=cron_tool_name,
+                tool_input=input_data.get("tool_input") or {},
+                tool_response=input_data.get("tool_response"),
+            )
+
         if self._current_reply_channel is None:
             return {}
         if self._current_turn_replied:

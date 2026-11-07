@@ -31,6 +31,7 @@ Module layout:
 
 from __future__ import annotations
 
+from .gh_poll import PollReport, derive_gh_poll
 from .read_api import (
     DEFAULT_DB_PATH,
     WorkerRow,
@@ -55,10 +56,12 @@ from .sm_seed import (
 
 __all__ = [
     "DEFAULT_DB_PATH",
+    "PollReport",
     "SmSeedReport",
     "WorkerRow",
     "apply_schema",
     "connect",
+    "derive_gh_poll",
     "derive_sm_seed",
     "events_for_issue",
     "events_for_task",

@@ -54,7 +54,7 @@ def test_classify_includes_each_pipeline_state():
 
 
 @pytest.mark.parametrize(
-    "excluded", ["sm:draft", "sm:done", "sm:closed", "sm:rejected"]
+    "excluded", ["sm:done", "sm:closed", "sm:rejected"]
 )
 def test_classify_excludes_terminal_even_with_stale_active_label(excluded):
     # ``sm:blocked`` is intentionally NOT in this list — the pipeline
@@ -62,6 +62,13 @@ def test_classify_excludes_terminal_even_with_stale_active_label(excluded):
     # don't vanish from the queue. See ``EXCLUDED_LABELS`` in
     # ``status_site.sources.pipeline``.
     assert P.classify_issue(_issue(1, "sm:building", excluded)) is None
+
+
+def test_classify_untriaged():
+    assert P.classify_issue(_issue(1, "sm:draft", "art:code")) == ("draft", "code")
+    assert P.classify_issue(_issue(1, "art:code")) == ("draft", "code")
+    assert P.classify_issue(_issue(1, "bug")) is None
+    assert P.classify_issue(_issue(1, "sm:done", "art:code")) is None
 
 
 def test_classify_ignores_non_sm_issue_and_picks_most_advanced():
@@ -77,10 +84,14 @@ def test_fetch_sorts_by_pipeline_order_then_number():
         _issue(2, "sm:designing"),
         _issue(7, "sm:draft"),
         _issue(8),
+        _issue(10, "art:code"),
+        _issue(11, "sm:done", "art:code"),
     ]
     rows, failed = P.fetch_issues(["jcronq/alice"], runner=_runner({"jcronq/alice": issues}))
     assert failed == []
     assert [(r["state"], r["number"]) for r in rows] == [
+        ("draft", 7),
+        ("draft", 10),
         ("selected", 3),
         ("designing", 2),
         ("designing", 9),

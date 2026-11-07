@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Alice — status</title>
 <!--
   Reactive status-site shell (#639 + #651).
@@ -193,7 +193,25 @@ details.fx-group:first-child { margin-top: 0; }
   font-variant-numeric: tabular-nums;
 }
 .fx-big .of { color: var(--color-fg-muted); font-size: var(--dash-font-size-caption); }
-.a2ui-chat-thread { max-height: calc(100vh - 14rem); overflow-y: auto; overflow-anchor: none; }
+.a2ui-chat-thread { max-height: calc(100vh - 14rem); overflow-y: auto; overflow-anchor: none; padding-bottom: 3rem; }
+@supports (height: 100dvh) {
+  .a2ui-chat-thread { max-height: calc(100dvh - 14rem); }
+}
+@media (max-width: 600px) {
+  /* Header wraps to several rows on phones: reserve more room so the
+     composer (Attach/Send) is never pushed below the viewport (#711). */
+  .a2ui-chat-thread { max-height: calc(100vh - 22rem); }
+  @supports (height: 100dvh) {
+    .a2ui-chat-thread { max-height: calc(100dvh - 22rem); }
+  }
+  .a2ui-composer {
+    position: sticky;
+    bottom: 0;
+    z-index: 5;
+    background: var(--color-bg);
+    padding-bottom: calc(.4rem + env(safe-area-inset-bottom, 0px));
+  }
+}
 .chat-loading-older {
   position: sticky;
   top: 0;
@@ -669,7 +687,9 @@ function FxTable({columns, rows, rowClass}) {
           return h("td", {
             key: c.key,
             "data-col": c.key,
-            style: c.numeric ? {textAlign: "right", fontVariantNumeric: "tabular-nums"} : null,
+            style: c.numeric
+              ? {textAlign: "right", fontVariantNumeric: "tabular-nums", ...(c.nowrap ? {whiteSpace: "nowrap"} : null)}
+              : (c.nowrap ? {whiteSpace: "nowrap"} : null),
           }, cell == null ? "" : cell);
         })
       );
@@ -856,6 +876,11 @@ function renderA2uiComponent(id, surface, local, setLocal) {
         autoCapitalize: "off",
         spellCheck: false,
         value: current,
+        ref: el => {
+          if (!el) return;
+          el.style.height = "auto";
+          el.style.height = el.scrollHeight + 2 + "px";
+        },
         onChange: e => setLocal(s => ({
           ...s,
           textareas: {...s.textareas, [id]: e.target.value},
@@ -1297,6 +1322,20 @@ function renderChatMessages(rows, overrides) {
   });
 }
 
+// Single formatter for chat timestamps: time-only for today, date + time
+// otherwise; full ISO kept in title and <time datetime>.
+function chatTime(at) {
+  if (!at) return null;
+  const d = new Date(at);
+  if (Number.isNaN(d.getTime())) return at;
+  const sameDay = d.toDateString() === new Date().toDateString();
+  const label = sameDay
+    ? d.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"})
+    : d.toLocaleDateString([], {month: "short", day: "numeric"}) + ", " +
+      d.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+  return h("time", {dateTime: d.toISOString(), title: at}, label);
+}
+
 function ChatMessage({m, reactions, quoted}) {
   const [picker, setPicker] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -1343,8 +1382,6 @@ function ChatMessage({m, reactions, quoted}) {
           setTimeout(() => setCopied(false), 1500);
         }
       }, {key: "link"}),
-      btn("more-menu", "⋯", "More actions — coming soon", undefined,
-        {key: "menu", disabled: true}),
       picker ? h("div", {className: "msg-picker", key: "picker", "data-testid": "react-picker"},
         MORE_REACTS.map(e => btn("react-btn", e, "React " + e, () => react(e),
           {key: e, "data-emoji": e}))) : null,
@@ -1381,7 +1418,8 @@ function ChatMessage({m, reactions, quoted}) {
         onClick: () => react(r.emoji),
       }, r.emoji + " " + r.count))) : null,
     h("small", null,
-      (m.from === "jason" ? "You" : "Alice") + " · " + (m.at || ""),
+      (m.from === "jason" ? "You" : "Alice") + " · ",
+      chatTime(m.at),
       statusIcon ? " · " : null,
       statusIcon,
     ),
@@ -1413,7 +1451,7 @@ function WorkingGroup({group}) {
         "data-testid": "working-step",
       }, st.label)),
     ),
-    h("small", null, "Alice · " + (group.at || "")),
+    h("small", null, "Alice · ", chatTime(group.at)),
   );
 }
 
@@ -1585,6 +1623,20 @@ async function runA2uiAction(id, props, surface, local, setLocal) {
   });
 }
 
+// Render `[text](https://url)` inline markdown links as <a> elements.
+function renderInlineLinks(s) {
+  const out = [];
+  const re = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
+  let last = 0, m, i = 0;
+  while ((m = re.exec(s)) !== null) {
+    if (m.index > last) out.push(s.slice(last, m.index));
+    out.push(h("a", {key: "l" + i++, href: m[2], target: "_blank", rel: "noopener"}, m[1]));
+    last = re.lastIndex;
+  }
+  if (last < s.length) out.push(s.slice(last));
+  return out;
+}
+
 function renderBoundList(id, props, rows) {
   const variant = props.variant || "";
   if (variant === "bugs-sections") {
@@ -1597,12 +1649,7 @@ function renderBoundList(id, props, rows) {
         ? h("ul", null, sec.rows.map(r => h("li", {key: r.id, style: r.stale ? {borderLeft: "3px solid #d9a441", paddingLeft: ".4rem"} : null},
             h("strong", null, r.title),
             r.summary_bits && r.summary_bits.length
-              ? h("em", null, ": ", r.summary_bits.map((b, i) => {
-                  const m = /^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/.exec(b);
-                  return h(React.Fragment, {key: i},
-                    i ? " — " : null,
-                    m ? h("a", {href: m[2], target: "_blank", rel: "noopener"}, m[1]) : b);
-                }))
+              ? h("em", null, ": ", ...renderInlineLinks(r.summary_bits.join(" — ")))
               : null,
             r.pricing ? h("span", {className: "fx-pill", style: {marginLeft: ".4rem"}}, r.pricing) : null,
             r.meta || r.pr_url
@@ -1757,8 +1804,9 @@ function ReviewLinkTable({rows, limit}) {
             r.link ? h(React.Fragment, null,
               " ",
               h("a", {href: r.link, target: "_blank", rel: "noopener",
-                      className: "fx-secondary", style: {marginLeft: "0.4em"}},
-                "(gh)")) : null,
+                      className: "fx-secondary", style: {marginLeft: "0.4em"},
+                      title: "Open on GitHub", "aria-label": "Open on GitHub"},
+                "↗")) : null,
           );
         }
         return r.link
@@ -1895,8 +1943,8 @@ function PipelineBoard({pipeline, surfaces, tasks}) {
     groups.push(h(PipelineGroup, {key: "pipeline", title: "In SM pipeline", count: issues.length},
       h(FxTable, {
         columns: [
-          {key: "state", label: "state", cell: r => h(SmStatePill, {state: r.state})},
-          {key: "number", label: "#", numeric: true, cell: r =>
+          {key: "state", nowrap: true, label: "state", cell: r => h(SmStatePill, {state: r.state})},
+          {key: "number", nowrap: true, label: "#", numeric: true, cell: r =>
             r.link
               ? h("a", {href: r.link, target: "_blank", rel: "noopener",
                   style: {fontVariantNumeric: "tabular-nums"}}, "#" + r.number)
@@ -1907,8 +1955,8 @@ function PipelineBoard({pipeline, surfaces, tasks}) {
               ? h("a", {href: r.link, target: "_blank", rel: "noopener"}, r.title || "")
               : (r.title || "")
           },
-          {key: "art", label: "art", cell: r => r.art || "—"},
-          {key: "age_seconds", label: "age", numeric: true, cell: ageCell},
+          {key: "art", nowrap: true, label: "art", cell: r => r.art || "—"},
+          {key: "age_seconds", nowrap: true, label: "age", numeric: true, cell: ageCell},
         ],
         rows: issues.map(r => ({...r, __key: (r.repo || "") + "#" + r.number})),
       })));
@@ -2281,6 +2329,8 @@ function ConfigGear() {
       className: "hdr cfg-gear",
       onClick: () => setOpen(x => !x),
       title: "Settings",
+      "aria-label": "Settings",
+      "aria-haspopup": "true",
       "aria-expanded": open,
     },
       // Inline SVG for a consistent, large, crisp gear across
@@ -2376,7 +2426,7 @@ function App() {
   return h(React.Fragment, null,
     h("header", null,
       h("b", null, "Alice"),
-      h("nav", {className: "nav-tabs"},
+      h("nav", {className: "nav-tabs", "aria-label": "Primary"},
         h("a", {href: "#", title: "Overview"}, "Overview"),
         h(NavTabs),
       ),
