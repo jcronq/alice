@@ -148,6 +148,14 @@ TRANSITIONS: Mapping[
     SMState.DESIGNING: {
         Verbs.DESIGN_READY: TransitionTo(SMState.DESIGN_REVIEW),
         Verbs.CONTINUE: SelfLoop(),
+        # PR-4 (#827): the thinking shim writes this when the per-issue
+        # kernel exits non-zero or produces no design doc. Mirrors
+        # NEEDS_STUDY → BLOCKED via ``study-blocked``; distinct trigger
+        # so the audit trail disambiguates "agent chose to block" from
+        # "shim-side failure routed the item to blocked".
+        "thinking-design-failed": EventTransition(
+            SMState.BLOCKED, trigger="thinking-design-failed"
+        ),
     },
     SMState.DESIGN_REVIEW: {
         Verbs.DESIGN_APPROVED: TransitionTo(SMState.DESIGNED),

@@ -501,12 +501,14 @@ THINKING_PHASE_PER_ISSUE_DESIGN = "per_issue_design"
 PYTHON_BIN_PREFERRED = "/opt/alice-venv/bin/python"
 PYTHON_BIN_FALLBACK = "python3"
 
-# Dotted module path of the thinking-mode entrypoint. The real
-# PhaseRunner-driven dispatch lives at :mod:`alice_thinking.cli.perissue`
-# (sub-issue 3 of #149). The legacy placeholder at
-# :mod:`alice_forge.thinking_shim` is retained for tests but no longer
-# the live entrypoint.
-THINKING_SHIM_MODULE = "alice_thinking.cli.perissue"
+# Dotted module path of the thinking-mode entrypoint. PR-4 of #823
+# (#827) promotes :mod:`alice_forge.thinking_shim` from placeholder to
+# the real per-issue entrypoint — it delegates the kernel drive to
+# :mod:`alice_thinking.cli.perissue` and then writes the SM transition
+# directly via :mod:`alice_forge.sm.store`, replacing the long-lived
+# agent-posted ``[SM] design-ready`` comment path. The perissue module
+# remains the kernel-drive implementation (imported, not launched).
+THINKING_SHIM_MODULE = "alice_forge.thinking_shim"
 
 # ---------------------------------------------------------------------------
 # Issue #184 — per-issue speaking-agent spawn (SM v2 build phase)
