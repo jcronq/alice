@@ -136,7 +136,11 @@ def test_render_index_md_missing_file(tmp_path):
 # ------------------------------------------------------------------ http
 
 
-def test_http_index_md_is_spliced(tmp_path):
+def test_http_index_md_is_spliced(tmp_path, monkeypatch):
+    # Point ALICE_MIND at an empty scratch dir so the live-scan sources
+    # (tracked_tasks / alice_queue) don't leak real task content (any
+    # of which may contain "stale") into the spliced output.
+    monkeypatch.setenv("ALICE_MIND", str(tmp_path / "nomind"))
     status = tmp_path / "status"
     status.mkdir()
     (tmp_path / "key").write_text("k")
