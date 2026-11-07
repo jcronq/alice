@@ -1699,8 +1699,9 @@ function ReviewLinkTable({rows, limit}) {
             r.link ? h(React.Fragment, null,
               " ",
               h("a", {href: r.link, target: "_blank", rel: "noopener",
-                      className: "fx-secondary", style: {marginLeft: "0.4em"}},
-                "(gh)")) : null,
+                      className: "fx-secondary", style: {marginLeft: "0.4em"},
+                      title: "Open on GitHub", "aria-label": "Open on GitHub"},
+                "↗")) : null,
           );
         }
         return r.link
