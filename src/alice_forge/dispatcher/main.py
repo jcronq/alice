@@ -8,35 +8,6 @@ from __future__ import annotations
 import sys as _sys
 
 from alice_forge.sm.legacy.handlers._common import *  # noqa: F401, F403
-
-# Issue #797 — resolve ``gh_*`` helpers through the parent dispatcher
-# package's namespace at call time instead of binding them locally via
-# the ``_common`` star-import above. The autouse test fixtures (and any
-# runtime operator who wants to mock a CLI call) monkey-patch attributes
-# on :mod:`alice_forge.dispatcher`; a star-imported local binding is a
-# *second* copy of the name that the monkey-patch can't reach, which is
-# how real ``gh`` calls leaked through the dispatcher test suite and
-# contributed to GitHub rate-limit exhaustion. Looking the attribute up
-# through ``sys.modules["alice_forge.dispatcher"]`` at call time — the
-# same trick :func:`alice_forge.dispatcher.gh._run_gh_via_parent` uses
-# for ``_run_gh`` — gives tests a single patch target.
-#
-# A plain ``import alice_forge.dispatcher as _sm`` at module top would
-# work too, but main.py is imported *from* ``dispatcher/__init__.py``
-# while the package is still partially initialised, so we defer the
-# attribute lookup to call time via :func:`_sm_pkg`.
-def _sm_pkg():
-    """Return the fully-initialised :mod:`alice_forge.dispatcher` module."""
-    return _sys.modules["alice_forge.dispatcher"]
-
-
-# Sentinel distinct from ``None`` so :func:`run` can distinguish "caller
-# left the arg at its default, resolve through the parent package" from
-# "caller explicitly passed ``None`` to disable this hook". Every ``gh_*``
-# default on :func:`run` uses this sentinel.
-_USE_PROD_DEFAULT: Any = object()
-
-
 from alice_forge.sm.ledger import EmittedLedger, load_or_migrate
 from alice_forge.sm.states import SMState
 from alice_forge.sm.enforcement import (
@@ -68,6 +39,34 @@ from alice_forge.sm.legacy.handlers.stale_closed import _process_stale_closed
 # ``looks_like_rate_limit`` observation so sibling processes defer
 # their next fan-out until the jittered window elapses.
 from alice_forge.rate_limit import observe_gh_error as _observe_gh_rate_limit
+
+
+# Issue #797 — resolve ``gh_*`` helpers through the parent dispatcher
+# package's namespace at call time instead of binding them locally via
+# the ``_common`` star-import above. The autouse test fixtures (and any
+# runtime operator who wants to mock a CLI call) monkey-patch attributes
+# on :mod:`alice_forge.dispatcher`; a star-imported local binding is a
+# *second* copy of the name that the monkey-patch can't reach, which is
+# how real ``gh`` calls leaked through the dispatcher test suite and
+# contributed to GitHub rate-limit exhaustion. Looking the attribute up
+# through ``sys.modules["alice_forge.dispatcher"]`` at call time — the
+# same trick :func:`alice_forge.dispatcher.gh._run_gh_via_parent` uses
+# for ``_run_gh`` — gives tests a single patch target.
+#
+# A plain ``import alice_forge.dispatcher as _sm`` at module top would
+# work too, but main.py is imported *from* ``dispatcher/__init__.py``
+# while the package is still partially initialised, so we defer the
+# attribute lookup to call time via :func:`_sm_pkg`.
+def _sm_pkg():
+    """Return the fully-initialised :mod:`alice_forge.dispatcher` module."""
+    return _sys.modules["alice_forge.dispatcher"]
+
+
+# Sentinel distinct from ``None`` so :func:`run` can distinguish "caller
+# left the arg at its default, resolve through the parent package" from
+# "caller explicitly passed ``None`` to disable this hook". Every ``gh_*``
+# default on :func:`run` uses this sentinel.
+_USE_PROD_DEFAULT: Any = object()
 
 
 def _save_ledger_best_effort(
