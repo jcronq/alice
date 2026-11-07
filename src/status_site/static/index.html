@@ -49,6 +49,7 @@ header a, header button.hdr {
   font-size: .85rem;
   cursor: pointer;
 }
+header a.on { color: var(--color-bg); background: var(--color-ok); border-color: var(--color-ok); }
 header a:hover, header button.hdr:hover {
   color: var(--color-ok); border-color: var(--color-ok);
 }
@@ -2022,12 +2023,19 @@ function NavTabs() {
     return () => { cancelled = true; };
   }, []);
   const search = location.search;
+  const route = useHashRoute();
+  const current = route.route === "review" ? "review-" + route.slug : route.route;
   return pages.map(p => {
     const hashRoute = A2UI_SLUGS.has(p.slug);
     const href = hashRoute
       ? ("#" + p.slug)
       : ("legacy.html" + (search ? search + "&" : "?") + "p=" + encodeURIComponent(p.slug));
-    return h("a", {key: p.slug, href, title: p.title}, p.title);
+    const active = p.slug === current;
+    return h("a", {
+      key: p.slug, href, title: p.title,
+      className: active ? "on" : null,
+      "aria-current": active ? "page" : null,
+    }, p.title);
   });
 }
 
