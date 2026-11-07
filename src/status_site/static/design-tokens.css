@@ -490,6 +490,10 @@ li.fx-now {
 .a2ui-textarea {
   width: 100%;
   min-height: 3.4rem;
+  max-height: 12rem;
+  overflow-y: auto;
+  resize: vertical;
+  box-sizing: border-box;
   padding: var(--dash-pad-sm);
   font: inherit;
   color: var(--color-fg);
