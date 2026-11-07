@@ -26,7 +26,6 @@ import pytest
 from alice_bug_fix_dispatcher import frontmatter as fm
 from alice_bug_fix_dispatcher.main import (
     DispatcherConfig,
-    TickReport,
     _extract_captured_state,
     _extract_pr_url_from_result,
     _extract_report_text,

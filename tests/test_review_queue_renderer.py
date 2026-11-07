@@ -256,7 +256,7 @@ def test_fetch_pr_review_filters_draft() -> None:
     key = (
         "pr", "list", "--repo", "jcronq/alice",
         "--state", "open",
-        "--json", "number,title,isDraft,reviewDecision,createdAt,url",
+        "--json", "number,title,isDraft,reviewDecision,createdAt,url,author,statusCheckRollup",
     )
     runner = _fake_run({key: (0, json.dumps([draft_row, ready_row]), "")})
     items, failed = rqr.fetch_pr_review(["jcronq/alice"], runner=runner, now=NOW)
@@ -298,7 +298,7 @@ def test_fetch_pr_review_filters_non_required() -> None:
     key = (
         "pr", "list", "--repo", "jcronq/alice",
         "--state", "open",
-        "--json", "number,title,isDraft,reviewDecision,createdAt,url",
+        "--json", "number,title,isDraft,reviewDecision,createdAt,url,author,statusCheckRollup",
     )
     runner = _fake_run({key: (0, json.dumps(rows), "")})
     items, failed = rqr.fetch_pr_review(["jcronq/alice"], runner=runner, now=NOW)
