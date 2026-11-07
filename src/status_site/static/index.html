@@ -2133,6 +2133,45 @@ function applyWidth() {
 }
 applyWidth();
 
+// ── Overview "new task" badge (#714) ──────────────────────────────
+// Ids of every item in the your_todo snapshot; the badge counts ids not
+// in localStorage ``last-seen-your-todo-ids``. Cleared once the user is
+// on Overview AND the your_todo board has scrolled into view.
+const SEEN_KEY = "last-seen-your-todo-ids";
+function todoIds(d) {
+  d = d || {};
+  const ids = [];
+  (d.prs || []).forEach(r => ids.push("pr:" + (r.repo || "") + "#" + r.number));
+  (d.design_review || []).forEach(r => ids.push("dr:" + (r.repo || "") + "#" + r.number));
+  (d.attention_reacts || []).forEach((r, i) => ids.push("ar:" + (r.at || i)));
+  (d.rows || []).forEach((r, i) => ids.push("ask:" + (r.id || r.slug || r.title || r.text || i)));
+  return ids;
+}
+function useTodoBadge(data, onOverview) {
+  const ids = todoIds(data);
+  const sig = ids.join("|");
+  const [seen, setSeen] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(SEEN_KEY) || "[]"); } catch (e) { return []; }
+  });
+  const markSeen = () => {
+    try { localStorage.setItem(SEEN_KEY, JSON.stringify(ids)); } catch (e) {}
+    setSeen(ids);
+  };
+  useEffect(() => {
+    if (!onOverview || !ids.length || typeof IntersectionObserver === "undefined") return;
+    const el = document.querySelector('[data-board="your-todo"]');
+    if (!el) return;
+    const io = new IntersectionObserver(es => {
+      if (es.some(e => e.isIntersecting)) markSeen();
+    });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [onOverview, sig]);
+  if (!data) return 0;
+  const seenSet = new Set(seen);
+  return ids.filter(i => !seenSet.has(i)).length;
+}
+
 function ConfigGear({legacyHref}) {
   const [open, setOpen] = useState(false);
   const [theme, setTheme] = useState(() => localStorage.getItem("alice-theme") || "system");
@@ -2211,6 +2250,7 @@ function App() {
   usePingReviewSlug(route === "review" ? slug : null);
 
   const legacyHref = "legacy.html" + location.search;
+  const newTodo = useTodoBadge(state.sections.your_todo, route === "overview");
   let statusClass = "sse-status";
   let statusLabel = "connecting…";
   if (state.fallback) { statusClass += " fallback"; statusLabel = "fallback: /index.md"; }
@@ -2253,7 +2293,13 @@ function App() {
     h("header", null,
       h("b", null, "Alice"),
       h("nav", {className: "nav-tabs"},
-        h("a", {href: "#", title: "Overview"}, "Overview"),
+        h("a", {
+          href: "#", title: "Overview",
+          className: route === "overview" ? "on" : null,
+        }, "Overview",
+          newTodo > 0 ? h("span", {
+            className: "nav-badge", "aria-label": newTodo + " new items waiting on you",
+          }, " (" + newTodo + ")") : null),
         h(NavTabs),
       ),
       h("span", {className: "spacer"}),
