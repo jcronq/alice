@@ -800,6 +800,7 @@ function renderA2uiComponent(id, surface, local, setLocal) {
       const ta = h("textarea", {
         className: "a2ui-textarea",
         placeholder: props.placeholder || "",
+        "aria-label": props.ariaLabel || props.placeholder || "Message Alice",
         value: current,
         onChange: e => setLocal(s => ({
           ...s,
@@ -1198,6 +1199,9 @@ function ChatThread({rows}) {
     h("div", {
       ref,
       className: "a2ui-list a2ui-chat-thread",
+      role: "log",
+      "aria-live": "polite",
+      "aria-label": "Chat transcript",
       onScroll,
     },
       loadingOlder ? h("div", {
