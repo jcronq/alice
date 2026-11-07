@@ -528,6 +528,7 @@ li.fx-now {
   border-radius: 10px;
   font-size: .92rem;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   line-height: 1.4;
 }
 .a2ui-list.a2ui-chat-thread .msg.jason {
