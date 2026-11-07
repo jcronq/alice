@@ -2318,6 +2318,8 @@ function ConfigGear() {
       className: "hdr cfg-gear",
       onClick: () => setOpen(x => !x),
       title: "Settings",
+      "aria-label": "Settings",
+      "aria-haspopup": "true",
       "aria-expanded": open,
     },
       // Inline SVG for a consistent, large, crisp gear across
