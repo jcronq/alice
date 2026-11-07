@@ -78,6 +78,26 @@ class PRItem:
     title: str
     url: str
     age: str
+    author: str = ""
+    ci: str = ""  # "success" | "failure" | "pending" | "" (no checks)
+
+
+def _ci_state(rollup: object) -> str:
+    """Collapse a ``statusCheckRollup`` list into one coarse state."""
+    if not isinstance(rollup, list) or not rollup:
+        return ""
+    states = [
+        str(c.get("conclusion") or c.get("state") or c.get("status") or "").upper()
+        for c in rollup
+        if isinstance(c, dict)
+    ]
+    bad = ("FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE", "ACTION_REQUIRED")
+    wait = ("", "PENDING", "QUEUED", "IN_PROGRESS", "EXPECTED", "WAITING")
+    if any(v in bad for v in states):
+        return "failure"
+    if any(v in wait for v in states):
+        return "pending"
+    return "success"
 
 
 def _default_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess:
@@ -184,6 +204,8 @@ def fetch_design_review_issues(
                     title=str(row.get("title", "")).strip(),
                     url=str(row.get("url", "")),
                     age=age_str(row["createdAt"], now=now),
+                    author=str((row.get("author") or {}).get("login", "")),
+                    ci=_ci_state(row.get("statusCheckRollup")),
                 )
             )
     return items, failed
@@ -216,7 +238,7 @@ def fetch_pr_review(
                     "--state",
                     "open",
                     "--json",
-                    "number,title,isDraft,reviewDecision,createdAt,url",
+                    "number,title,isDraft,reviewDecision,createdAt,url,author,statusCheckRollup",
                 ],
                 runner=runner,
             )
