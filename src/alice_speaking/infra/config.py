@@ -200,6 +200,19 @@ class Config:
     gmail_smtp_port: int = 465
     gmail_mailbox: str = "INBOX"
     gmail_poll_seconds: float = 30.0
+    # Fail-closed SPF/DKIM/DMARC verification (issue #682 / PR #740).
+    # ``gmail_require_verified`` mirrors the ``GMAIL_REQUIRE_VERIFIED``
+    # env var the transport already reads at ctor time — keeping it on
+    # ``Config`` makes it discoverable alongside the other gmail_* fields
+    # and gives ``load()`` one place to apply the truthy-string parsing.
+    gmail_require_verified: bool = True
+    gmail_trusted_authserv_id: str = "mx.google.com"
+    # Limited-trust tool gate on Gmail turns (issue #682).
+    # ``gmail_limited_trust`` toggles the ``_pretooluse_hook`` deny path
+    # for sensitive tools; ``gmail_limited_trust_allowed_tools`` removes
+    # tool names from the sensitive set (comma-separated env override).
+    gmail_limited_trust: bool = True
+    gmail_limited_trust_allowed_tools: tuple[str, ...] = ()
 
     # API-key auth mode. When ``anthropic_base_url`` or ``anthropic_api_key``
     # is set, core.auth picks "api" mode and routes the CLI through
@@ -401,6 +414,37 @@ def load() -> Config:
         )
     except ValueError:
         gmail_poll_seconds = 30.0
+    gmail_require_verified_raw = (
+        from_any("GMAIL_REQUIRE_VERIFIED", "1") or "1"
+    ).strip().lower()
+    gmail_require_verified = gmail_require_verified_raw not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }
+    gmail_trusted_authserv_id = (
+        from_any("GMAIL_TRUSTED_AUTHSERV_ID", "mx.google.com") or "mx.google.com"
+    ).strip().lower()
+    gmail_limited_trust_raw = (
+        from_any("GMAIL_LIMITED_TRUST", "1") or "1"
+    ).strip().lower()
+    gmail_limited_trust = gmail_limited_trust_raw not in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }
+    gmail_limited_trust_allowed_tools = tuple(
+        name
+        for name in (
+            part.strip()
+            for part in (from_any("GMAIL_LIMITED_TRUST_ALLOWED_TOOLS", "") or "").split(",")
+        )
+        if name
+    )
 
     viewer_chat_enabled_raw = (
         from_any("ALICE_VIEWER_CHAT_ENABLED", "1") or "1"
@@ -501,6 +545,10 @@ def load() -> Config:
         gmail_smtp_port=gmail_smtp_port,
         gmail_mailbox=gmail_mailbox,
         gmail_poll_seconds=gmail_poll_seconds,
+        gmail_require_verified=gmail_require_verified,
+        gmail_trusted_authserv_id=gmail_trusted_authserv_id,
+        gmail_limited_trust=gmail_limited_trust,
+        gmail_limited_trust_allowed_tools=gmail_limited_trust_allowed_tools,
         viewer_chat_enabled=viewer_chat_enabled,
         viewer_chat_host=viewer_chat_host,
         viewer_chat_port=viewer_chat_port,
