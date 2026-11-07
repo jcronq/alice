@@ -330,6 +330,75 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Cap on rows returned. Omit for the full audit trail.",
     )
 
+    # ---- deps — item_dependencies CRUD (issue #833). The DB must be
+    # present; the three subcommands are thin wrappers over
+    # :mod:`alice_state_db.dependencies`. Edge kinds:
+    # ``blocks`` | ``follows`` | ``supersedes``.
+    pdeps = sub.add_parser(
+        "deps",
+        help=(
+            "Manage item_dependencies (blocks/follows/supersedes). "
+            "Writes to alice-state.db. Issue #833."
+        ),
+    )
+    pdeps.add_argument(
+        "--db-path",
+        default=None,
+        help=(
+            "Override alice-state.db path. Default: "
+            "$ALICE_MIND_DIR/inner/state/alice-state.db, else "
+            "~/alice-mind/inner/state/alice-state.db."
+        ),
+    )
+    deps_sub = pdeps.add_subparsers(dest="deps_command", required=True)
+
+    deps_add = deps_sub.add_parser(
+        "add", help="Add a dependency edge. Idempotent, cycle-checked."
+    )
+    deps_add.add_argument(
+        "item_id",
+        help="The dependent item (e.g. gh:jcronq/alice#833).",
+    )
+    deps_add.add_argument(
+        "depends_on_item_id",
+        help="The prerequisite item (e.g. gh:jcronq/alice#823).",
+    )
+    deps_add.add_argument(
+        "--kind",
+        default="blocks",
+        choices=["blocks", "follows", "supersedes"],
+        help="Edge kind. Default: blocks.",
+    )
+
+    deps_list = deps_sub.add_parser(
+        "list", help="List direct prerequisites of an item."
+    )
+    deps_list.add_argument(
+        "item_id", help="The dependent item."
+    )
+    deps_list.add_argument(
+        "--kind",
+        default="blocks",
+        choices=["blocks", "follows", "supersedes"],
+        help="Edge kind to filter. Default: blocks.",
+    )
+
+    deps_remove = deps_sub.add_parser(
+        "remove", help="Remove a dependency edge. Idempotent."
+    )
+    deps_remove.add_argument(
+        "item_id", help="The dependent item."
+    )
+    deps_remove.add_argument(
+        "depends_on_item_id", help="The prerequisite item."
+    )
+    deps_remove.add_argument(
+        "--kind",
+        default="blocks",
+        choices=["blocks", "follows", "supersedes"],
+        help="Edge kind. Default: blocks.",
+    )
+
     return p
 
 
@@ -605,6 +674,135 @@ def _cmd_db(store: TaskStore, args: argparse.Namespace) -> int:
     return 5
 
 
+def _cmd_deps(store: TaskStore, args: argparse.Namespace) -> int:
+    """Dispatch ``task deps add|list|remove`` (issue #833).
+
+    Thin wrapper over :mod:`alice_state_db.dependencies`. The store
+    arg is unused — kept in the signature so the dispatcher table
+    can call this uniformly with the other handlers. The DB path
+    resolves exactly like ``task db``'s ``--db-path`` override.
+    """
+    try:
+        from alice_state_db import (
+            DependencyError,
+            add_dependency,
+            blockers_for,
+            connect,
+            remove_dependency,
+        )
+    except ImportError as exc:  # pragma: no cover
+        print(
+            f"error: alice_state_db not importable ({exc}) — rebuild the "
+            "container or add src/alice_state_db to PYTHONPATH.",
+            file=sys.stderr,
+        )
+        return 5
+
+    db_path = args.db_path or None
+    # Open RW for every ``deps`` subcommand so ``apply_schema`` runs and
+    # the ``item_dependencies`` table exists even on a DB that pre-dates
+    # this PR. ``list`` doesn't modify anything but the table-creation
+    # side-effect of ``apply_schema`` is what makes the first-ever
+    # ``task deps list`` call usable on a brown-field container (the
+    # alternative — ``read_only=True`` — would raise "no such table"
+    # until the memory worker's derive pass next ran).
+    try:
+        with connect(db_path=db_path, read_only=False) as conn:
+            from alice_state_db import apply_schema
+
+            apply_schema(conn)
+
+            if args.deps_command == "add":
+                try:
+                    add_dependency(
+                        conn,
+                        args.item_id,
+                        args.depends_on_item_id,
+                        kind=args.kind,
+                    )
+                except DependencyError as exc:
+                    print(f"error: {exc}", file=sys.stderr)
+                    return 7
+                if args.json:
+                    print(
+                        json.dumps(
+                            {
+                                "item_id": args.item_id,
+                                "depends_on_item_id": args.depends_on_item_id,
+                                "kind": args.kind,
+                                "status": "added",
+                            }
+                        )
+                    )
+                else:
+                    print(
+                        f"added: {args.item_id} -> "
+                        f"{args.depends_on_item_id} (kind={args.kind})"
+                    )
+                return 0
+
+            if args.deps_command == "list":
+                prereqs = blockers_for(conn, args.item_id, kind=args.kind)
+                if args.json:
+                    print(
+                        json.dumps(
+                            {
+                                "item_id": args.item_id,
+                                "kind": args.kind,
+                                "depends_on": prereqs,
+                            }
+                        )
+                    )
+                    return 0
+                if not prereqs:
+                    print(
+                        f"(no {args.kind} dependencies for {args.item_id})"
+                    )
+                    return 0
+                print(f"{args.item_id} {args.kind}:")
+                for prereq in prereqs:
+                    print(f"  depends on {prereq}")
+                return 0
+
+            if args.deps_command == "remove":
+                remove_dependency(
+                    conn,
+                    args.item_id,
+                    args.depends_on_item_id,
+                    kind=args.kind,
+                )
+                if args.json:
+                    print(
+                        json.dumps(
+                            {
+                                "item_id": args.item_id,
+                                "depends_on_item_id": args.depends_on_item_id,
+                                "kind": args.kind,
+                                "status": "removed",
+                            }
+                        )
+                    )
+                else:
+                    print(
+                        f"removed: {args.item_id} -> "
+                        f"{args.depends_on_item_id} (kind={args.kind})"
+                    )
+                return 0
+    except DependencyError as exc:
+        # Defensive: _validate_kind raises inside remove/add. argparse's
+        # choices filter should catch unknown kinds first, but if a
+        # caller patches the CLI we still surface a clean error.
+        print(f"error: {exc}", file=sys.stderr)
+        return 7
+
+    # argparse enforces deps_command is required, so this is unreachable.
+    print(
+        f"error: unknown deps subcommand {args.deps_command!r}",
+        file=sys.stderr,
+    )
+    return 5
+
+
 _HANDLERS = {
     "create": _cmd_create,
     "update": _cmd_update,
@@ -613,6 +811,7 @@ _HANDLERS = {
     "close": _cmd_close,
     "reindex": _cmd_reindex,
     "db": _cmd_db,
+    "deps": _cmd_deps,
 }
 
 

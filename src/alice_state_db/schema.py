@@ -273,6 +273,48 @@ DDL_ITEM_COMPONENTS_INDEX = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Item dependencies (issue #833 — PR-10 of the SM-on-GitHub deprecation chain)
+#
+# ``item_dependencies`` records inter-item edges so the dispatcher can gate
+# a ``sm:selected`` → ``sm:designing/sm:building`` transition while any
+# ``kind='blocks'`` prerequisite is still non-terminal. Three kinds:
+#
+#   * ``blocks``     — hard gate; dispatcher refuses to fire actioning
+#                      on the item while any prerequisite is non-terminal.
+#   * ``follows``    — ordering hint; no gating, used by status-site
+#                      renderers to show "after X" context lines.
+#   * ``supersedes`` — self-explanatory; a landing transition to
+#                      ``sm:done`` on the superseding item cascades the
+#                      superseded prerequisite to ``sm:rejected``
+#                      (handled in the store layer, not here).
+#
+# The composite PK makes the add path idempotent — ``INSERT OR IGNORE``
+# turns a double-write into a no-op. FK CASCADE on ``items(item_id)``
+# keeps orphan rows from surviving an item delete. The reverse-lookup
+# index on ``depends_on_item_id`` powers the ``blockers_for`` /
+# ``is_ready`` graph walk, which needs "who depends on X" for cycle
+# detection and for the dispatcher-side "which blocker just cleared"
+# response once we grow that pass.
+
+DDL_ITEM_DEPENDENCIES = """
+CREATE TABLE IF NOT EXISTS item_dependencies (
+    item_id             TEXT NOT NULL,
+    depends_on_item_id  TEXT NOT NULL,
+    kind                TEXT NOT NULL,
+    created_at          TEXT,
+    PRIMARY KEY (item_id, depends_on_item_id, kind),
+    FOREIGN KEY (item_id) REFERENCES items(item_id) ON DELETE CASCADE,
+    FOREIGN KEY (depends_on_item_id) REFERENCES items(item_id) ON DELETE CASCADE
+);
+"""
+
+DDL_ITEM_DEPENDENCIES_INDEX = [
+    "CREATE INDEX IF NOT EXISTS idx_item_deps_depends_on ON item_dependencies(depends_on_item_id);",
+    "CREATE INDEX IF NOT EXISTS idx_item_deps_kind ON item_dependencies(kind);",
+]
+
+
 def apply_schema(conn: sqlite3.Connection) -> None:
     """Create the PR 1 tables + indexes idempotently.
 
@@ -321,6 +363,11 @@ def apply_schema(conn: sqlite3.Connection) -> None:
         conn.execute(stmt)
     conn.execute(DDL_ITEM_COMPONENTS)
     for stmt in DDL_ITEM_COMPONENTS_INDEX:
+        conn.execute(stmt)
+
+    # Issue #833 — item_dependencies. Additive, no backfill required.
+    conn.execute(DDL_ITEM_DEPENDENCIES)
+    for stmt in DDL_ITEM_DEPENDENCIES_INDEX:
         conn.execute(stmt)
 
     conn.commit()
