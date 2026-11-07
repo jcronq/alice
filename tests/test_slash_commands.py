@@ -8,13 +8,11 @@ modules so each file stays focused on one axis.
 from __future__ import annotations
 
 import asyncio
-import pathlib
 import types
 
-import pytest
 
 from alice_speaking import slash_commands
-from alice_speaking.slash_commands import Response, SLICE1_VERBS
+from alice_speaking.slash_commands import SLICE1_VERBS
 
 
 def _ctx(cfg):
@@ -234,3 +232,18 @@ def test_recall_formats_top_three(monkeypatch, cfg):
     assert "note-one" in response.reply_text
     assert "note-three" in response.reply_text
     assert "note-four" not in response.reply_text  # capped at 3
+
+
+def test_skill_shortcut_rewrites_inbound(cfg):
+    ctx = _ctx(cfg)
+    response = asyncio.run(slash_commands.handle("/food two eggs", "jason", ctx))
+    assert response is not None
+    assert response.reply_text is None
+    assert response.rewritten_text == "Use the log-meal skill: two eggs"
+
+
+def test_skill_shortcut_requires_argument(cfg):
+    ctx = _ctx(cfg)
+    response = asyncio.run(slash_commands.handle("/log", "jason", ctx))
+    assert response is not None
+    assert "usage" in response.reply_text

@@ -232,12 +232,23 @@ def build_envelopes(status_dir: Path) -> list[dict]:
         section_rows.append({"key": key, "heading": heading, "rows": rows})
 
     totals = sum_pricing(buckets)
-    if totals["estimate"] > 0 or totals["actual"] > 0:
+    priced = sum(
+        1
+        for items in buckets.values()
+        for b in items
+        if (b.get("estimate_usd") or b.get("actual_usd") or "").strip()
+        not in ("", "null", "None")
+    )
+    # Hide when the footer would just repeat a single row's pill.
+    if priced > 1 and (totals["estimate"] > 0 or totals["actual"] > 0):
         delta = totals["actual"] - totals["estimate"]
         pipeline: dict | None = {
             "estimate": format_usd_local(totals["estimate"]),
             "actual": format_usd_local(totals["actual"]),
             "delta": format_usd_local(delta),
+            "count": priced,
+            "overrun": totals["estimate"] > 0
+            and totals["actual"] > 2 * totals["estimate"],
         }
     else:
         pipeline = None
