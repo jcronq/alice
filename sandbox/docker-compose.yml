@@ -243,6 +243,14 @@ services:
       # Where Speaking (inside `alice`) sees UPLOAD_DIR; surfaces list these paths.
       UPLOAD_DIR_ALIAS: /home/alice/alice-mind/inner/status-uploads
       PUBLIC_URL: "${ALICE_STATUS_PUBLIC_URL:-http://10.20.30.177:8095}"
+      # DB-backed Overview readers (#814) query alice-state.db. The file
+      # ships at ~/alice-mind/inner/state/alice-state.db on the host and
+      # is bind-mounted read-only below at /srv/state. Point db_readers
+      # at it explicitly — otherwise alice_state_db.DEFAULT_DB_PATH falls
+      # through to Path.home()/alice-mind/... which doesn't resolve
+      # inside this image (no alice-mind under /root, and the status
+      # service never has a real HOME anyway). See issue #849.
+      ALICE_STATE_DB_PATH: /srv/state/alice-state.db
     ports:
       - "8095:8095"
     volumes:
@@ -252,6 +260,13 @@ services:
       - ${ALICE_MIND:-${HOME}/alice-mind}/inner/status-uploads:/srv/uploads
       # Holds only `key` (the shared reply key; never committed).
       - ${ALICE_MIND:-${HOME}/alice-mind}/inner/status-server:/srv/config:ro
+      # alice-state.db + WAL/SHM siblings — readers only, writers live
+      # inside the `alice` container (memory worker's gh_poll derive
+      # pass). Mounting the whole state/ directory (not just the .db
+      # file) so SQLite can read the -wal and -shm sidecars WAL mode
+      # requires; a file-level bind would leave the sidecars invisible.
+      # Read-only on this side: the status-site is strictly a consumer.
+      - ${ALICE_MIND:-${HOME}/alice-mind}/inner/state:/srv/state:ro
     healthcheck:
       test:
         - "CMD"
