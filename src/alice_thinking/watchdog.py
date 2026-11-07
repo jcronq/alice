@@ -56,7 +56,7 @@ import signal
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 
@@ -222,6 +222,139 @@ def _proc_alive(pid: int) -> bool:
     return pathlib.Path(f"/proc/{pid}").exists()
 
 
+def _read_proc_status(pid: int) -> dict[str, str]:
+    """Parse ``/proc/<pid>/status`` into a flat dict. Returns ``{}`` on any
+    read failure — missing /proc entries just drop out of the subsequent
+    descendant walk rather than raising.
+    """
+    try:
+        text = pathlib.Path(f"/proc/{pid}/status").read_text()
+    except OSError:
+        return {}
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        out[key.strip()] = val.strip()
+    return out
+
+
+def _list_proc_pids() -> list[int]:
+    """Enumerate all numeric ``/proc/<pid>/`` entries."""
+    out: list[int] = []
+    try:
+        for entry in pathlib.Path("/proc").iterdir():
+            name = entry.name
+            if name.isdigit():
+                try:
+                    out.append(int(name))
+                except ValueError:
+                    continue
+    except OSError:
+        return out
+    return out
+
+
+def _parse_status_ppid(info: dict[str, str]) -> Optional[int]:
+    try:
+        return int(info.get("PPid", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_status_euid(info: dict[str, str]) -> Optional[int]:
+    """``Uid:`` line is ``real\\teffective\\tsaved\\tfsuid``. We care about
+    the effective uid — that's what ``kill(2)`` checks."""
+    parts = info.get("Uid", "").split()
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+def _resolve_alice_child_pid(
+    wrapper_pid: int,
+    *,
+    our_euid: Optional[int] = None,
+    proc_status=None,
+    list_pids=None,
+) -> Optional[int]:
+    """Walk ``/proc`` from ``wrapper_pid`` and return the first descendant
+    whose effective uid matches ours.
+
+    The s6 supervisor launches each wake as::
+
+        flock -n /state/worker/thinking.lock s6-setuidgid alice /usr/local/bin/alice-think
+
+    ``/proc/locks`` reports the ``flock`` parent (root-owned), but the
+    python process we actually need to SIGTERM lives further down the
+    subtree after ``s6-setuidgid`` drops to uid=alice. Signalling the
+    root parent from the alice-uid watchdog raises EPERM on every tick.
+
+    Resolution strategy:
+
+    * If the wrapper itself is already alice-owned, return it unchanged.
+    * Otherwise BFS the /proc tree from ``wrapper_pid``. Return the
+      first descendant whose effective uid equals ``our_euid``.
+    * If the wrapper's own /proc entry is missing (orphaned, race) or
+      no alice-owned descendant exists (wrapper dying alone), return
+      ``None`` so the caller can log a warning instead of signalling
+      root.
+
+    ``proc_status`` and ``list_pids`` are test seams.
+    """
+    if our_euid is None:
+        our_euid = os.geteuid()
+    if proc_status is None:
+        proc_status = _read_proc_status
+    if list_pids is None:
+        list_pids = _list_proc_pids
+
+    wrapper_info = proc_status(wrapper_pid)
+    if not wrapper_info:
+        # /proc/<wrapper_pid> missing — wrapper vanished between the lock
+        # read and now. Don't try to kill a PID we can't even inspect.
+        return None
+    wrapper_euid = _parse_status_euid(wrapper_info)
+    if wrapper_euid == our_euid:
+        return wrapper_pid
+
+    # Build (pid → ppid) and (pid → euid) maps in one scan so BFS doesn't
+    # re-read /proc for every candidate.
+    children_by_parent: dict[int, list[int]] = {}
+    euids: dict[int, int] = {}
+    for p in list_pids():
+        if p == wrapper_pid:
+            continue
+        info = proc_status(p)
+        if not info:
+            continue
+        ppid = _parse_status_ppid(info)
+        euid = _parse_status_euid(info)
+        if ppid is not None:
+            children_by_parent.setdefault(ppid, []).append(p)
+        if euid is not None:
+            euids[p] = euid
+
+    frontier = [wrapper_pid]
+    visited = {wrapper_pid}
+    while frontier:
+        next_frontier: list[int] = []
+        for current in frontier:
+            for child in children_by_parent.get(current, []):
+                if child in visited:
+                    continue
+                visited.add(child)
+                if euids.get(child) == our_euid:
+                    return child
+                next_frontier.append(child)
+        frontier = next_frontier
+    return None
+
+
 def _read_wchan(pid: int) -> Optional[str]:
     """Read ``/proc/<pid>/wchan`` — the kernel function the task is
     sleeping in. ``ep_poll`` is the leak signature for the SDK socket
@@ -245,9 +378,15 @@ def wake_file_age(
     """Return ``(path, age_seconds)`` for the most recent wake file.
 
     Looks under ``mind/inner/thoughts/<today>/*.md``. ``today`` defaults
-    to local-tz today (``YYYY-MM-DD``). Returns ``(None, None)`` if the
-    directory is missing, empty, or only contains today's-not-written-yet
-    files.
+    to UTC today (``YYYY-MM-DD``) — ``wake.py`` writes its summary to
+    ``<today-UTC>/`` per the prelude convention (``date -u +%Y-%m-%d``),
+    so the watchdog must query the same key. Using local time instead
+    would silently diverge after UTC midnight (local Nov 6 ~19:00 EST):
+    the watchdog looks at yesterday-UTC's dir, sees ~4h-old stale files,
+    and declares STUCK within minutes of a fresh start. Issue #785 bug 2.
+
+    Returns ``(None, None)`` if the directory is missing, empty, or only
+    contains today's-not-written-yet files.
 
     The watchdog uses this as the heartbeat: ``wake.py`` writes the
     summary file at logical-work completion. If the process is alive
@@ -255,7 +394,7 @@ def wake_file_age(
     in cleanup (the SDK socket leak), not still working.
     """
     if today is None:
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if now is None:
         now = time.time()
 
@@ -548,7 +687,26 @@ def run_tick(
     if now is None:
         now = time.time()
 
-    pid = find_thinker_pid(lock_path)
+    raw_pid = find_thinker_pid(lock_path)
+    # The /proc/locks holder is the root-owned flock wrapper; walk the
+    # subtree to the alice-owned python descendant we can actually
+    # SIGTERM from this (uid=alice) watchdog. See issue #785 bug 1.
+    if raw_pid is not None:
+        pid = _resolve_alice_child_pid(raw_pid)
+        if pid is None:
+            # Wrapper exists but no alice-owned descendant — either the
+            # python child already exited (wrapper hasn't reaped yet)
+            # or the subtree is somehow orphaned. Don't try to signal
+            # root; treat as "no actionable process" and let the next
+            # tick re-evaluate.
+            print(
+                f"alice-thinker-watchdog: wrapper pid {raw_pid} has no "
+                f"alice-owned descendant; skipping tick",
+                file=sys.stderr,
+            )
+    else:
+        pid = None
+
     lock_exists = lock_path.exists()
     cadence = current_cadence_seconds(state_dir)
     threshold = stale_threshold_seconds(cadence)
@@ -564,6 +722,8 @@ def run_tick(
         wake_file_age_seconds=wake_age,
         wchan=_read_wchan(pid) if pid is not None else None,
     )
+    if raw_pid is not None and raw_pid != pid:
+        state.extra["wrapper_pid"] = raw_pid
 
     if decision == Decision.STUCK and pid is not None:
         timeline = intervene(pid)

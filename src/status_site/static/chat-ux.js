@@ -160,3 +160,22 @@ export function reactionsSignature(reactions) {
       .filter(([, users]) => users.length),
   );
 }
+
+// Safe mini-markdown for chat bodies (issue #734): HTML-escapes first, then
+// applies code spans, **bold**, "- " bullets and linkifies http(s) URLs,
+// ``?p=`` paths and ``#NNN`` issue refs. Returns an HTML string.
+export function chatTextToHtml(text, repo = "jcronq/alice") {
+  const esc = s => s.replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+  const inline = seg => esc(seg)
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/https?:\/\/[^\s<]+[^\s<.,;:!?)\]]/g,
+      u => '<a href="' + u + '" target="_blank" rel="noopener">' + u + "</a>")
+    .replace(/(^|[\s(])(\?p=[\w.\-]+)/g, '$1<a href="$2">$2</a>')
+    .replace(/(^|[\s(])#(\d+)\b/g,
+      (_, p, n) => p + '<a href="https://github.com/' + repo + "/issues/" + n +
+        '" target="_blank" rel="noopener">#' + n + "</a>");
+  return String(text || "").replace(/^([-*]) /gm, "• ").split(/(`[^`\n]+`)/)
+    .map(part => /^`[^`\n]+`$/.test(part)
+      ? "<code>" + esc(part.slice(1, -1)) + "</code>" : inline(part))
+    .join("");
+}
