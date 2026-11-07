@@ -88,6 +88,7 @@ from status_site.sources import (
     pipeline as _pipeline,
     review_queue as _review_queue,
     running_now as _running_now,
+    schedules as _schedules,
     tasks as _tasks,
     waiting_on_you as _waiting_on_you,
 )
@@ -1974,6 +1975,25 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
     def _render_known_issues() -> dict:
         return {"markdown": _known_issues.render(cfg.status_dir / "known-issues.md")}
 
+    def _render_schedules() -> dict:
+        """Active scheduled jobs (issue #810, Phase 1).
+
+        Reads ``~/alice-mind/inner/state/active-crons.json`` inline on
+        each tick — the file is tiny (a handful of jobs at most) so we
+        skip the TTL poller. Missing / unreadable file degrades to an
+        empty list; the frontend widget renders a "no scheduled jobs"
+        placeholder. Never blocks the main Overview render path.
+        """
+        try:
+            jobs = _schedules.read_jobs(_schedules.active_crons_path())
+        except Exception as e:  # noqa: BLE001 — never poison Overview
+            print(f"status_site: schedules read failed: {e!r}", flush=True)
+            jobs = []
+        return {
+            "markdown": _schedules.render(jobs),
+            "jobs": _schedules.typed_rows(jobs),
+        }
+
     def _render_tracked_tasks() -> dict:
         """Live scan of the SM v2 task store (issue #780).
 
@@ -2125,6 +2145,7 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         "tracked_tasks": _render_tracked_tasks,
         "done_today": _render_done_today,
         "known_issues": _render_known_issues,
+        "schedules": _render_schedules,
         "page:chat": _render_page_chat,
         "page:bugs": _render_page_bugs,
         "page:review": _render_page_review,
