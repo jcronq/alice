@@ -146,6 +146,7 @@ packages = [
     "src/alice_forge",
     "src/alice_pricing",
     "src/alice_speaking",
+    "src/alice_state_db",
     "src/alice_thinking",
     "src/status_site",
     "src/viewer",

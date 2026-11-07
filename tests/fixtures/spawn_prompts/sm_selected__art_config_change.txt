@@ -10,6 +10,8 @@ Example issue body that the worker reads.
 
 Your task: implement the change described above. Read the relevant code first, write a focused diff, run tests, and open a PR.
 
+Effort: MEDIUM (ship + verify). Build to spec, add tests covering the spec's test plan, run the targeted suite, open the PR, and verify the CI delta before self-merging.
+
 ## Constraint: read-project-profile-first
 Before starting, read ``PROJECT_PROFILE.md`` at the top of the repo you're working in. It tells you how to run tests, where the daemon lives, how to deploy, and which invariants are non-negotiable. If the file doesn't exist, write a one-sentence note at the end of your SM transition comment flagging the gap and proceed with best judgement.
 

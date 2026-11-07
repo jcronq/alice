@@ -60,7 +60,20 @@ SLICE1_VERBS: tuple[tuple[str, str], ...] = (
     ("q", "/q <msg> — queue as low-priority note for the next idle tick"),
     ("recall", "/recall <query> — top-3 vault matches via the cue runner"),
     ("remember", "/remember <text> — write a manual idea note to inner/notes/"),
+    ("food", "/food <text> — run the log-meal skill on <text>"),
+    ("workout", "/workout <text> — run the log-workout skill on <text>"),
+    ("weight", "/weight <text> — run the update-weight skill on <text>"),
+    ("log", "/log <text> — run the log-journal skill on <text>"),
 )
+
+# Skill shortcuts: verb -> skill name. They bypass intent classification by
+# rewriting the inbound to name the skill explicitly, then run the normal turn.
+_SKILL_SHORTCUTS: dict[str, str] = {
+    "food": "log-meal",
+    "workout": "log-workout",
+    "weight": "update-weight",
+    "log": "log-journal",
+}
 
 # Fast lookup for recognition. Values are intentionally unused — the
 # handler dispatches by verb inside _dispatch_known_verb.
@@ -190,6 +203,13 @@ async def _dispatch_known_verb(
         return await _handle_recall(argument, ctx)
     if verb == "remember":
         return _handle_remember(argument, ctx)
+    if verb in _SKILL_SHORTCUTS:
+        content = argument.strip()
+        if not content:
+            return Response(reply_text=f"/{verb}: usage — /{verb} <text>")
+        return Response(
+            rewritten_text=f"Use the {_SKILL_SHORTCUTS[verb]} skill: {content}"
+        )
     # Not reachable — _KNOWN_VERBS gates on the same set — but keep a
     # safe default so a future partial-add can't crash the ingest path.
     return Response(reply_text=f"Unknown slash command: /{verb}")
