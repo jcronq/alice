@@ -1857,8 +1857,18 @@ function YourTodoBoard({data, nowMs}) {
       h(ReviewLinkTable, {rows: prs}), warn(failed.prs)));
   }
   if (design.length) {
+    // Issue #718: split auditor-filed ``[status-site:*]`` findings from
+    // other design reviews; auditor sub-group starts collapsed when
+    // other items present.
+    const isAud = r => /^\s*\[status-site:/i.test(r.title || "");
+    const aud = design.filter(isAud), other = design.filter(r => !isAud(r));
     groups.push(h(PipelineGroup, {key: "design", title: "Design review", count: design.length},
-      h(ReviewLinkTable, {rows: design}), warn(failed.design_review)));
+      h(React.Fragment, null,
+        other.length ? h(PipelineGroup, {key: "design-other", title: "Design / feature", count: other.length},
+          h(ReviewLinkTable, {rows: other, limit: 5})) : null,
+        aud.length ? h(PipelineGroup, {key: "design-aud", title: "Status-site auditor findings", count: aud.length, open: !other.length},
+          h(ReviewLinkTable, {rows: aud})) : null),
+      warn(failed.design_review)));
   }
   if (attn.length) {
     groups.push(h(PipelineGroup, {key: "attn", title: "Attention reacts", count: attn.length},
@@ -1883,7 +1893,6 @@ function YourTodoBoard({data, nowMs}) {
       h(MarkdownZone, {markdown: d.external_todos_md})));
   }
   const failedAll = [].concat(failed.prs || [], failed.design_review || []);
-  return h("div", {className: "your-todo", "data-board": "your-todo"},
     groups.length
       ? groups
       : h("p", {style: MUTED, "data-testid": "nothing-waiting"}, "(nothing waiting on you — 👋)"),
