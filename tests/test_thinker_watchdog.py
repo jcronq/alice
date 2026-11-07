@@ -15,10 +15,11 @@ Spec: ``docs/designs/thinker-watchdog.md`` plus the design note
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import signal
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import pytest
@@ -115,6 +116,171 @@ def test_find_thinker_pid_handles_malformed_lines(tmp_path):
         f"2: FLOCK  ADVISORY  WRITE 4242 fd:00:{inode} 0 EOF\n"
     )
     assert wd.find_thinker_pid(lock, locks_text=text) == 4242
+
+
+# ---------- _resolve_alice_child_pid ----------
+
+
+def _uid_line(euid: int) -> str:
+    """Synthesize a ``/proc/<pid>/status`` ``Uid:`` field."""
+    return f"{euid}\t{euid}\t{euid}\t{euid}"
+
+
+def test_resolve_alice_child_pid_returns_wrapper_if_already_alice(monkeypatch):
+    """Wrapper itself runs as alice (e.g. s6 service drops privs
+    earlier in the chain) — no descendant walk needed."""
+    procs = {100: {"PPid": "1", "Uid": _uid_line(1000)}}
+    monkeypatch.setattr(wd, "_read_proc_status", lambda pid: procs.get(pid, {}))
+    monkeypatch.setattr(wd, "_list_proc_pids", lambda: list(procs))
+    assert wd._resolve_alice_child_pid(100, our_euid=1000) == 100
+
+
+def test_resolve_alice_child_pid_walks_to_alice_descendant(monkeypatch):
+    """Realistic s6 chain: root flock → alice-owned python. The
+    watchdog must signal the python, not the root wrapper."""
+    procs = {
+        100: {"PPid": "1", "Uid": _uid_line(0)},        # flock, root
+        200: {"PPid": "100", "Uid": _uid_line(1000)},   # python, alice
+    }
+    monkeypatch.setattr(wd, "_read_proc_status", lambda pid: procs.get(pid, {}))
+    monkeypatch.setattr(wd, "_list_proc_pids", lambda: list(procs))
+    assert wd._resolve_alice_child_pid(100, our_euid=1000) == 200
+
+
+def test_resolve_alice_child_pid_walks_multi_hop(monkeypatch):
+    """flock(root) → s6-setuidgid(root exec'd into alice) → alice-think
+    → timeout → python. BFS must traverse multiple generations when
+    the direct children are still root-owned (e.g. intermediate shims)."""
+    procs = {
+        100: {"PPid": "1", "Uid": _uid_line(0)},         # flock, root
+        200: {"PPid": "100", "Uid": _uid_line(0)},       # shim, root
+        300: {"PPid": "200", "Uid": _uid_line(1000)},    # python, alice
+    }
+    monkeypatch.setattr(wd, "_read_proc_status", lambda pid: procs.get(pid, {}))
+    monkeypatch.setattr(wd, "_list_proc_pids", lambda: list(procs))
+    assert wd._resolve_alice_child_pid(100, our_euid=1000) == 300
+
+
+def test_resolve_alice_child_pid_none_when_no_alice_descendant(monkeypatch):
+    """Orphan root wrapper (python already exited) — refuse to signal
+    root; return None and let the caller log a warning."""
+    procs = {100: {"PPid": "1", "Uid": _uid_line(0)}}
+    monkeypatch.setattr(wd, "_read_proc_status", lambda pid: procs.get(pid, {}))
+    monkeypatch.setattr(wd, "_list_proc_pids", lambda: list(procs))
+    assert wd._resolve_alice_child_pid(100, our_euid=1000) is None
+
+
+def test_resolve_alice_child_pid_none_when_wrapper_gone(monkeypatch):
+    """Race: /proc/<wrapper_pid> vanished between the lock read and
+    the resolver — return None rather than fall through to signalling
+    a stale PID."""
+    monkeypatch.setattr(wd, "_read_proc_status", lambda pid: {})
+    monkeypatch.setattr(wd, "_list_proc_pids", lambda: [])
+    assert wd._resolve_alice_child_pid(100, our_euid=1000) is None
+
+
+def test_resolve_alice_child_pid_ignores_siblings(monkeypatch):
+    """Other alice processes elsewhere on the system must NOT match —
+    the resolver only returns descendants of the specific wrapper."""
+    procs = {
+        100: {"PPid": "1", "Uid": _uid_line(0)},         # our wrapper
+        200: {"PPid": "100", "Uid": _uid_line(1000)},    # our target
+        500: {"PPid": "1", "Uid": _uid_line(1000)},      # sibling alice proc
+        600: {"PPid": "500", "Uid": _uid_line(1000)},    # sibling's child
+    }
+    monkeypatch.setattr(wd, "_read_proc_status", lambda pid: procs.get(pid, {}))
+    monkeypatch.setattr(wd, "_list_proc_pids", lambda: list(procs))
+    assert wd._resolve_alice_child_pid(100, our_euid=1000) == 200
+
+
+def test_run_tick_resolves_pid_before_intervention(tmp_path, monkeypatch):
+    """End-to-end wiring: /proc/locks reports the root wrapper, but
+    run_tick substitutes the alice-owned descendant before any
+    intervention or logging reads /proc/<pid>/wchan."""
+    today = "2026-05-08"
+    state = _make_state_dir(tmp_path, cadence=300)
+    mind = _make_mind(tmp_path, today=today, wake_age_seconds=1700)
+    lock = _make_lock(tmp_path)
+    inode = lock.stat().st_ino
+    wrapper_pid = 100
+    child_pid = 200
+    procs = {
+        wrapper_pid: {"PPid": "1", "Uid": _uid_line(0)},
+        child_pid: {"PPid": str(wrapper_pid), "Uid": _uid_line(1000)},
+    }
+    monkeypatch.setattr(wd, "_read_proc_locks", lambda: [(wrapper_pid, inode)])
+    monkeypatch.setattr(wd, "_read_proc_status", lambda pid: procs.get(pid, {}))
+    monkeypatch.setattr(wd, "_list_proc_pids", lambda: list(procs))
+    monkeypatch.setattr(wd, "_read_wchan", lambda pid: "ep_poll" if pid == child_pid else None)
+    captured: dict[str, int] = {}
+
+    def fake_intervene(pid, **kw):  # noqa: ARG001
+        captured["pid"] = pid
+        return {
+            "sigterm_sent": True,
+            "sigterm_sufficient": True,
+            "sigkill_sent": False,
+            "elapsed_seconds": 0.1,
+            "exited": True,
+        }
+
+    monkeypatch.setattr(wd, "intervene", fake_intervene)
+
+    # Force the resolver's "our" euid to 1000 regardless of the test
+    # runner's actual uid (CI containers run as root, local dev may
+    # vary) — the resolver's job is "match my euid", so freezing it
+    # keeps the test deterministic.
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+
+    result = wd.run_tick(
+        lock_path=lock,
+        state_dir=state,
+        mind=mind,
+        events_log=mind / "memory" / "events.jsonl",
+        today=today,
+    )
+    assert result.decision == wd.Decision.STUCK
+    assert result.pid == child_pid  # resolved, not the root wrapper
+    assert captured["pid"] == child_pid
+    assert result.extra.get("wrapper_pid") == wrapper_pid
+
+
+def test_run_tick_no_alice_descendant_does_not_intervene(tmp_path, monkeypatch):
+    """When the wrapper is live but no alice-owned child exists, the
+    watchdog must NOT try to intervene (kill root → EPERM, pollutes
+    logs). The tick logs a warning and classifies as idle."""
+    today = "2026-05-08"
+    state = _make_state_dir(tmp_path, cadence=300)
+    # Wake file is stale — pre-fix, this would trip STUCK and SIGTERM
+    # the root wrapper.
+    mind = _make_mind(tmp_path, today=today, wake_age_seconds=1700)
+    lock = _make_lock(tmp_path)
+    inode = lock.stat().st_ino
+    wrapper_pid = 100
+    procs = {wrapper_pid: {"PPid": "1", "Uid": _uid_line(0)}}
+    monkeypatch.setattr(wd, "_read_proc_locks", lambda: [(wrapper_pid, inode)])
+    monkeypatch.setattr(wd, "_read_proc_status", lambda pid: procs.get(pid, {}))
+    monkeypatch.setattr(wd, "_list_proc_pids", lambda: list(procs))
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    called = {"n": 0}
+
+    def _bang(*_a, **_k):
+        called["n"] += 1
+        raise AssertionError("intervene must not run without alice-owned child")
+
+    monkeypatch.setattr(wd, "intervene", _bang)
+
+    result = wd.run_tick(
+        lock_path=lock,
+        state_dir=state,
+        mind=mind,
+        events_log=mind / "memory" / "events.jsonl",
+        today=today,
+    )
+    # pid resolved to None → ORPHAN_LOCK (lock exists, no live holder
+    # we can act on). Intervention is skipped.
+    assert result.pid is None
+    assert called["n"] == 0
 
 
 # ---------- wake_file_age ----------
@@ -408,6 +574,10 @@ def test_telemetry_event_emitted_on_intervention(tmp_path, monkeypatch):
 
     # Synthesize /proc/locks to claim our fake_pid holds the lock.
     monkeypatch.setattr(wd, "_read_proc_locks", lambda: [(fake_pid, inode)])
+    # Bypass the alice-descendant resolver — the fake pid has no /proc
+    # entry, so the real resolver would return None. The existing
+    # telemetry schema contract is independent of pid resolution.
+    monkeypatch.setattr(wd, "_resolve_alice_child_pid", lambda pid, **kw: pid)
     # /proc/<pid>/wchan reads — simulate the SDK epoll leak signature.
     monkeypatch.setattr(wd, "_read_wchan", lambda pid: "ep_poll")
 
@@ -459,6 +629,7 @@ def test_run_tick_working_no_events(tmp_path, monkeypatch):
     lock = _make_lock(tmp_path)
     inode = lock.stat().st_ino
     monkeypatch.setattr(wd, "_read_proc_locks", lambda: [(99999, inode)])
+    monkeypatch.setattr(wd, "_resolve_alice_child_pid", lambda pid, **kw: pid)
     monkeypatch.setattr(wd, "_read_wchan", lambda pid: "do_select")
 
     events_log = mind / "memory" / "events.jsonl"
