@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Alice — status</title>
 <!--
   Reactive status-site shell (#639 + #651).
@@ -79,6 +79,66 @@ header a:hover, header button.hdr:hover {
  * user picks Wide. */
 main { max-width: 62rem; margin: 0 auto; padding: 1rem 1.5rem 4rem; }
 html[data-width="wide"] main { max-width: min(1400px, 95vw); }
+/* Issue #810: Schedules side panel. On desktop (>=1024px) it's a
+ * fixed-position persistent panel on the right edge. On mobile it
+ * collapses to an accordion slotted inside main (see .schedules-mobile
+ * below). Width budget is 280px + small gutter so the main column at
+ * `wide` setting still has room without running into the panel. */
+@media (min-width: 1024px) {
+  .schedules-panel {
+    position: fixed;
+    top: 4rem;
+    right: 1rem;
+    width: 280px;
+    max-height: calc(100vh - 6rem);
+    overflow-y: auto;
+    border: 1px solid var(--color-border-line);
+    border-radius: 8px;
+    background: var(--color-bg);
+    padding: .6rem .8rem;
+    z-index: 5;
+    box-shadow: 0 2px 10px rgba(0,0,0,.06);
+  }
+  .schedules-mobile { display: none; }
+}
+@media (max-width: 1023px) {
+  .schedules-panel { display: none; }
+  .schedules-mobile { margin: 1.4rem 0 0; }
+  .schedules-mobile > summary {
+    cursor: pointer; font-weight: 600; color: var(--color-fg-muted);
+    padding: .3rem 0; border-bottom: 1px solid var(--color-border-line);
+  }
+}
+.schedules-panel h3 {
+  margin: 0 0 .5rem; font-size: .95rem;
+  border-bottom: 1px solid var(--color-border-line);
+  padding-bottom: .3rem;
+  display: flex; justify-content: space-between; align-items: baseline; gap: .4rem;
+}
+.schedules-panel .sched-empty, .schedules-mobile .sched-empty {
+  color: var(--color-fg-muted); font-size: .85rem; font-style: italic;
+}
+.schedules-panel ul, .schedules-mobile ul { list-style: none; padding: 0; margin: 0; }
+.schedules-panel li, .schedules-mobile li {
+  padding: .4rem 0;
+  border-bottom: 1px dashed var(--color-border-line);
+  font-size: .85rem;
+}
+.schedules-panel li:last-child, .schedules-mobile li:last-child { border-bottom: none; }
+.sched-id { font-weight: 600; font-family: var(--font-mono, ui-monospace, monospace); }
+.sched-row { display: flex; justify-content: space-between; gap: .4rem; }
+.sched-sched { color: var(--color-fg-muted); font-size: .8rem; }
+.sched-desc {
+  margin: .15rem 0 0;
+  color: var(--color-fg-muted);
+  font-size: .78rem;
+  white-space: normal; word-break: break-word;
+}
+.sched-next { color: var(--color-ok); font-size: .8rem; font-variant-numeric: tabular-nums; }
+.sched-next.sched-overdue { color: var(--color-warn); }
+.sched-last { color: var(--color-fg-muted); font-size: .75rem; }
+.sched-badge { font-size: .85rem; margin-right: .2rem; }
+.sched-updated { color: var(--color-fg-muted); font-size: .72rem; font-weight: normal; }
 main:has(.a2ui-chat-page) { max-width: 56rem; padding: 1rem 1rem 1.5rem; }
 html[data-width="wide"] main:has(.a2ui-chat-page) { max-width: min(1200px, 95vw); }
 /* Tighter main gutters on phones give the chat thread more horizontal
@@ -133,7 +193,25 @@ details.fx-group:first-child { margin-top: 0; }
   font-variant-numeric: tabular-nums;
 }
 .fx-big .of { color: var(--color-fg-muted); font-size: var(--dash-font-size-caption); }
-.a2ui-chat-thread { max-height: calc(100vh - 14rem); overflow-y: auto; overflow-anchor: none; }
+.a2ui-chat-thread { max-height: calc(100vh - 14rem); overflow-y: auto; overflow-anchor: none; padding-bottom: 3rem; }
+@supports (height: 100dvh) {
+  .a2ui-chat-thread { max-height: calc(100dvh - 14rem); }
+}
+@media (max-width: 600px) {
+  /* Header wraps to several rows on phones: reserve more room so the
+     composer (Attach/Send) is never pushed below the viewport (#711). */
+  .a2ui-chat-thread { max-height: calc(100vh - 22rem); }
+  @supports (height: 100dvh) {
+    .a2ui-chat-thread { max-height: calc(100dvh - 22rem); }
+  }
+  .a2ui-composer {
+    position: sticky;
+    bottom: 0;
+    z-index: 5;
+    background: var(--color-bg);
+    padding-bottom: calc(.4rem + env(safe-area-inset-bottom, 0px));
+  }
+}
 .chat-loading-older {
   position: sticky;
   top: 0;
@@ -608,7 +686,10 @@ function FxTable({columns, rows, rowClass}) {
           const cell = c.cell ? c.cell(row) : row[c.key];
           return h("td", {
             key: c.key,
-            style: c.numeric ? {textAlign: "right", fontVariantNumeric: "tabular-nums"} : null,
+            "data-col": c.key,
+            style: c.numeric
+              ? {textAlign: "right", fontVariantNumeric: "tabular-nums", ...(c.nowrap ? {whiteSpace: "nowrap"} : null)}
+              : (c.nowrap ? {whiteSpace: "nowrap"} : null),
           }, cell == null ? "" : cell);
         })
       );
@@ -791,7 +872,15 @@ function renderA2uiComponent(id, surface, local, setLocal) {
         className: "a2ui-textarea",
         placeholder: props.placeholder || "",
         "aria-label": props.ariaLabel || props.placeholder || "Message Alice",
+        autoCorrect: "off",
+        autoCapitalize: "off",
+        spellCheck: false,
         value: current,
+        ref: el => {
+          if (!el) return;
+          el.style.height = "auto";
+          el.style.height = el.scrollHeight + 2 + "px";
+        },
         onChange: e => setLocal(s => ({
           ...s,
           textareas: {...s.textareas, [id]: e.target.value},
@@ -1233,6 +1322,20 @@ function renderChatMessages(rows, overrides) {
   });
 }
 
+// Single formatter for chat timestamps: time-only for today, date + time
+// otherwise; full ISO kept in title and <time datetime>.
+function chatTime(at) {
+  if (!at) return null;
+  const d = new Date(at);
+  if (Number.isNaN(d.getTime())) return at;
+  const sameDay = d.toDateString() === new Date().toDateString();
+  const label = sameDay
+    ? d.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"})
+    : d.toLocaleDateString([], {month: "short", day: "numeric"}) + ", " +
+      d.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+  return h("time", {dateTime: d.toISOString(), title: at}, label);
+}
+
 function ChatMessage({m, reactions, quoted}) {
   const [picker, setPicker] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -1279,8 +1382,6 @@ function ChatMessage({m, reactions, quoted}) {
           setTimeout(() => setCopied(false), 1500);
         }
       }, {key: "link"}),
-      btn("more-menu", "⋯", "More actions — coming soon", undefined,
-        {key: "menu", disabled: true}),
       picker ? h("div", {className: "msg-picker", key: "picker", "data-testid": "react-picker"},
         MORE_REACTS.map(e => btn("react-btn", e, "React " + e, () => react(e),
           {key: e, "data-emoji": e}))) : null,
@@ -1317,7 +1418,8 @@ function ChatMessage({m, reactions, quoted}) {
         onClick: () => react(r.emoji),
       }, r.emoji + " " + r.count))) : null,
     h("small", null,
-      (m.from === "jason" ? "You" : "Alice") + " · " + (m.at || ""),
+      (m.from === "jason" ? "You" : "Alice") + " · ",
+      chatTime(m.at),
       statusIcon ? " · " : null,
       statusIcon,
     ),
@@ -1349,7 +1451,7 @@ function WorkingGroup({group}) {
         "data-testid": "working-step",
       }, st.label)),
     ),
-    h("small", null, "Alice · " + (group.at || "")),
+    h("small", null, "Alice · ", chatTime(group.at)),
   );
 }
 
@@ -1521,6 +1623,20 @@ async function runA2uiAction(id, props, surface, local, setLocal) {
   });
 }
 
+// Render `[text](https://url)` inline markdown links as <a> elements.
+function renderInlineLinks(s) {
+  const out = [];
+  const re = /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g;
+  let last = 0, m, i = 0;
+  while ((m = re.exec(s)) !== null) {
+    if (m.index > last) out.push(s.slice(last, m.index));
+    out.push(h("a", {key: "l" + i++, href: m[2], target: "_blank", rel: "noopener"}, m[1]));
+    last = re.lastIndex;
+  }
+  if (last < s.length) out.push(s.slice(last));
+  return out;
+}
+
 function renderBoundList(id, props, rows) {
   const variant = props.variant || "";
   if (variant === "bugs-sections") {
@@ -1533,12 +1649,7 @@ function renderBoundList(id, props, rows) {
         ? h("ul", null, sec.rows.map(r => h("li", {key: r.id, style: r.stale ? {borderLeft: "3px solid #d9a441", paddingLeft: ".4rem"} : null},
             h("strong", null, r.title),
             r.summary_bits && r.summary_bits.length
-              ? h("em", null, ": ", r.summary_bits.map((b, i) => {
-                  const m = /^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/.exec(b);
-                  return h(React.Fragment, {key: i},
-                    i ? " — " : null,
-                    m ? h("a", {href: m[2], target: "_blank", rel: "noopener"}, m[1]) : b);
-                }))
+              ? h("em", null, ": ", ...renderInlineLinks(r.summary_bits.join(" — ")))
               : null,
             r.pricing ? h("span", {className: "fx-pill", style: {marginLeft: ".4rem"}}, r.pricing) : null,
             r.meta || r.pr_url
@@ -1693,8 +1804,9 @@ function ReviewLinkTable({rows, limit}) {
             r.link ? h(React.Fragment, null,
               " ",
               h("a", {href: r.link, target: "_blank", rel: "noopener",
-                      className: "fx-secondary", style: {marginLeft: "0.4em"}},
-                "(gh)")) : null,
+                      className: "fx-secondary", style: {marginLeft: "0.4em"},
+                      title: "Open on GitHub", "aria-label": "Open on GitHub"},
+                "↗")) : null,
           );
         }
         return r.link
@@ -1730,9 +1842,11 @@ function YourTodoBoard({data, nowMs}) {
     h(PipelineGroup, {title: "PRs ready for review", count: prs.length},
       prs.length ? h(ReviewLinkTable, {rows: prs}) : none("(no PRs awaiting review)"),
       warn(failed.prs)),
-    h(PipelineGroup, {title: "Design review", count: design.length},
-      design.length ? h(ReviewLinkTable, {rows: design, limit: 5}) : none("(no designs awaiting review)"),
-      warn(failed.design_review)),
+    (design.length || (failed.design_review && failed.design_review.length))
+      ? h(PipelineGroup, {title: "Design review", count: design.length},
+          design.length ? h(ReviewLinkTable, {rows: design, limit: 5}) : null,
+          warn(failed.design_review))
+      : null,
     attn.length
       ? h(PipelineGroup, {title: "Attention reacts", count: attn.length},
           h(FxTable, {
@@ -1744,19 +1858,23 @@ function YourTodoBoard({data, nowMs}) {
             rows: attn.map((r, i) => ({...r, __key: (r.at || "") + i})),
           }))
       : null,
-    h(PipelineGroup, {title: "Asks", count: (d.rows || []).length},
-      h(WaitingTable, {rows: d.rows, handZoneMd: d.your_todo_md, nowMs})),
-    h(PipelineGroup, {title: "External TODOs", count: d.external_todos_md ? 1 : 0},
-      d.external_todos_md
-        ? h(MarkdownZone, {markdown: d.external_todos_md})
-        : none("(none listed — edit external-todos.md in the status dir)")),
+    ((d.rows || []).length || d.your_todo_md)
+      ? h(PipelineGroup, {title: "Asks", count: (d.rows || []).length},
+          h(WaitingTable, {rows: d.rows, handZoneMd: d.your_todo_md, nowMs}))
+      : null,
+    d.external_todos_md
+      ? h(PipelineGroup, {title: "External TODOs", count: 1},
+          h(MarkdownZone, {markdown: d.external_todos_md}))
+      : null,
   );
 }
 function InFlightBoard({data, nowMs}) {
   const d = data || {};
   return h("div", {className: "in-flight", "data-board": "in-flight"},
-    h(PipelineGroup, {title: "Running now", count: (d.running || []).length},
-      h(RunningNowBoard, {rows: d.running, nowMs})),
+    (d.running || []).length
+      ? h(PipelineGroup, {title: "Running now", count: d.running.length},
+          h(RunningNowBoard, {rows: d.running, nowMs}))
+      : null,
     h(PipelineBoard, {pipeline: d.pipeline, surfaces: d.surfaces, tasks: d.tasks}),
   );
 }
@@ -1825,8 +1943,8 @@ function PipelineBoard({pipeline, surfaces, tasks}) {
     groups.push(h(PipelineGroup, {key: "pipeline", title: "In SM pipeline", count: issues.length},
       h(FxTable, {
         columns: [
-          {key: "state", label: "state", cell: r => h(SmStatePill, {state: r.state})},
-          {key: "number", label: "#", numeric: true, cell: r =>
+          {key: "state", nowrap: true, label: "state", cell: r => h(SmStatePill, {state: r.state})},
+          {key: "number", nowrap: true, label: "#", numeric: true, cell: r =>
             r.link
               ? h("a", {href: r.link, target: "_blank", rel: "noopener",
                   style: {fontVariantNumeric: "tabular-nums"}}, "#" + r.number)
@@ -1837,8 +1955,8 @@ function PipelineBoard({pipeline, surfaces, tasks}) {
               ? h("a", {href: r.link, target: "_blank", rel: "noopener"}, r.title || "")
               : (r.title || "")
           },
-          {key: "art", label: "art", cell: r => r.art || "—"},
-          {key: "age_seconds", label: "age", numeric: true, cell: ageCell},
+          {key: "art", nowrap: true, label: "art", cell: r => r.art || "—"},
+          {key: "age_seconds", nowrap: true, label: "age", numeric: true, cell: ageCell},
         ],
         rows: issues.map(r => ({...r, __key: (r.repo || "") + "#" + r.number})),
       })));
@@ -1929,6 +2047,91 @@ function DoneTodayList({prs, asksResolved}) {
         showAll ? "show fewer" : "show all (" + hidden + " more)")
     : null;
   return h(React.Fragment, null, prsBlock, asksBlock, toggle);
+}
+
+// ── 8b. Schedules panel (issue #810) ──────────────────────────────
+// Read-only view of Alice's active scheduled jobs. Phase 1 scope: no
+// cancel / inspect — just name, schedule summary, countdown to next
+// fire, and last-run status. Prompts live on Speaking only and never
+// enter the SSE payload (sources/schedules.py strips them on read).
+function schedOutcomeBadge(outcome) {
+  if (outcome === "ok") return "✅";
+  if (outcome === "error" || outcome === "err") return "⚠️";
+  return "⏸";
+}
+function liveCountdown(nextAt, nowMs) {
+  // Server already emits a "next_run_label" ("in 5m") computed at the
+  // tick time. To keep the UI feeling live between SSE ticks we
+  // recompute it from the ISO next_run_at whenever we have it, so the
+  // countdown ticks every second via nowMs. Falls back to the server
+  // label when the ISO is missing / unparseable.
+  if (!nextAt) return "";
+  const t = Date.parse(nextAt);
+  if (!isFinite(t)) return "";
+  const dt = Math.floor((t - nowMs) / 1000);
+  if (dt <= 0) return "overdue";
+  if (dt < 60) return "in " + dt + "s";
+  const m = Math.floor(dt / 60);
+  if (m < 60) return "in " + m + "m";
+  const hr = Math.floor(m / 60);
+  if (hr < 24) return "in " + hr + "h";
+  return "in " + Math.floor(hr / 24) + "d";
+}
+function SchedulesBody({jobs, nowMs}) {
+  if (!jobs || !jobs.length) {
+    return h("p", {className: "sched-empty"}, "No scheduled jobs.");
+  }
+  return h("ul", null, jobs.map(job => {
+    const nextLabel = liveCountdown(job.next_run_at, nowMs) ||
+      job.next_run_label || "";
+    const overdue = nextLabel === "overdue";
+    return h("li", {key: job.id},
+      h("div", {className: "sched-row"},
+        h("span", null,
+          h("span", {className: "sched-badge",
+                     title: "last run: " + (job.last_run_outcome || "never")},
+            schedOutcomeBadge(job.last_run_outcome)),
+          h("span", {className: "sched-id"}, job.id),
+        ),
+        h("span", {
+          className: "sched-next" + (overdue ? " sched-overdue" : ""),
+          title: job.next_run_at || "",
+        }, nextLabel),
+      ),
+      h("div", {className: "sched-sched"},
+        job.schedule_summary || job.cron || "(no schedule)",
+      ),
+      job.description
+        ? h("div", {className: "sched-desc"}, job.description)
+        : null,
+      job.last_run_label
+        ? h("div", {className: "sched-last"},
+            "last ran " + job.last_run_label)
+        : null,
+    );
+  }));
+}
+function SchedulesPanel({data, nowMs, ts}) {
+  const jobs = (data && data.jobs) || [];
+  const count = jobs.length;
+  const stamp = stampText(ts, nowMs);
+  const header = h("h3", null,
+    h("span", null, "Schedules", count ? " (" + count + ")" : ""),
+    stamp ? h("span", {className: "sched-updated"}, stamp) : null,
+  );
+  // Rendered twice with different wrappers so CSS media queries pick
+  // one or the other. Keeping the body component shared means a bug
+  // fix touches one place.
+  return h(React.Fragment, null,
+    h("aside", {className: "schedules-panel", "aria-label": "Alice's scheduled jobs"},
+      header,
+      h(SchedulesBody, {jobs, nowMs}),
+    ),
+    h("details", {className: "schedules-mobile"},
+      h("summary", null, "Schedules", count ? " (" + count + ")" : ""),
+      h(SchedulesBody, {jobs, nowMs}),
+    ),
+  );
 }
 
 // ── 9. section router ─────────────────────────────────────────────
@@ -2126,6 +2329,8 @@ function ConfigGear() {
       className: "hdr cfg-gear",
       onClick: () => setOpen(x => !x),
       title: "Settings",
+      "aria-label": "Settings",
+      "aria-haspopup": "true",
       "aria-expanded": open,
     },
       // Inline SVG for a consistent, large, crisp gear across
@@ -2180,6 +2385,7 @@ function App() {
   // routes mount ``A2uiSurface`` with the matching ``page:<slug>``
   // section payload the broadcaster is already streaming.
   let content;
+  let schedulesPanel = null;
   if (route === "overview") {
     const sections = TIERS
       .filter(t => t.sections.some(n => state.sections[n]))
@@ -2193,6 +2399,19 @@ function App() {
     content = sections.length
       ? sections
       : h("div", {className: "notice"}, "Waiting for the first snapshot…");
+    // Issue #810: render schedules panel alongside Overview. Component
+    // self-handles the empty state so we always mount it once the
+    // snapshot has landed — otherwise the fixed panel would pop in
+    // after a cron fires rather than greeting the user with
+    // "No scheduled jobs."
+    if (state.sections.schedules !== undefined) {
+      schedulesPanel = h(SchedulesPanel, {
+        key: "schedules",
+        data: state.sections.schedules,
+        ts: parseTs(state.ts.schedules),
+        nowMs,
+      });
+    }
   } else {
     const key = route === "review" ? "page:review" : ("page:" + route);
     const payload = state.sections[key];
@@ -2207,7 +2426,7 @@ function App() {
   return h(React.Fragment, null,
     h("header", null,
       h("b", null, "Alice"),
-      h("nav", {className: "nav-tabs"},
+      h("nav", {className: "nav-tabs", "aria-label": "Primary"},
         h("a", {href: "#", title: "Overview"}, "Overview"),
         h(NavTabs),
       ),
@@ -2219,6 +2438,10 @@ function App() {
       !KEY && h("div", {className: "notice err"},
         "No key — open the link Alice sent once to install it."),
       content,
+      // Mobile accordion slot — the panel's media queries hide the
+      // desktop aside here and vice versa in the fixed-position
+      // sidebar below.
+      schedulesPanel,
     ),
   );
 }
