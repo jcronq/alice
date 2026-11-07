@@ -39,6 +39,20 @@ header {
   display: flex; gap: .6rem; align-items: center; flex-wrap: wrap;
 }
 header b { font-size: 1.05rem; }
+/* Tab pills form one horizontally scrollable strip so the header stays
+ * on a single row on narrow screens (live badge + gear stay put). */
+.nav-tabs {
+  display: flex; gap: .6rem; align-items: center;
+  min-width: 0; overflow-x: auto; white-space: nowrap;
+  scrollbar-width: none;
+}
+.nav-tabs::-webkit-scrollbar { display: none; }
+.nav-tabs a { flex: 0 0 auto; }
+@media (max-width: 600px) {
+  header { flex-wrap: nowrap; }
+  header > * { flex-shrink: 0; }
+  header > .nav-tabs { flex-shrink: 1; }
+}
 header a, header button.hdr {
   color: var(--color-fg-muted);
   background: transparent;
@@ -2233,8 +2247,10 @@ function App() {
   return h(React.Fragment, null,
     h("header", null,
       h("b", null, "Alice"),
-      h("a", {href: "#", title: "Overview"}, "Overview"),
-      h(NavTabs),
+      h("nav", {className: "nav-tabs"},
+        h("a", {href: "#", title: "Overview"}, "Overview"),
+        h(NavTabs),
+      ),
       h("span", {className: "spacer"}),
       h("span", {className: statusClass}, statusLabel),
       h(ConfigGear, {legacyHref}),
