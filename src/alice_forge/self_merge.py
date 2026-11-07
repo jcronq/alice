@@ -53,8 +53,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable, Optional
 
 
@@ -481,6 +483,47 @@ def decide_self_merge(
 
 
 # ---------------------------------------------------------------------------
+# PR → item linking (#828, PR-5)
+# ---------------------------------------------------------------------------
+
+
+def record_pr_item_ref(
+    *,
+    conn: sqlite3.Connection,
+    repo: str,
+    pr_body: str | None,
+    pr_url: str,
+    actor: str = "speaking",
+    now: datetime | None = None,
+) -> str | None:
+    """Extract ``Closes item-<N>``, resolve to the canonical item_id,
+    and record it via :func:`alice_forge.sm.store.record_pr_ref`.
+
+    Returns the canonical item_id written, or ``None`` if the PR body
+    had no ``Closes item-<N>`` line (logged as a warning — every
+    worker-authored PR body should carry one post-PR-5, so a miss is
+    a signal the prompt template drifted, not an expected path).
+    Best-effort: this must never be the reason a PR fails to merge,
+    so callers should not let an exception here abort the merge flow.
+    """
+    from watchers.github import extract_closes_item_ref
+    from alice_state_db.sm_seed import gh_issue_id
+    from alice_forge.sm import store
+
+    extracted = extract_closes_item_ref(pr_body, pr_url)
+    if extracted is None:
+        log.warning("no `Closes item-<N>` line in PR body for %s", pr_url)
+        return None
+    alias, _ = extracted
+    n = int(alias.removeprefix("item-"))
+    item_id = gh_issue_id(repo, n)
+    store.record_pr_ref(
+        conn=conn, item_id=item_id, pr_url=pr_url, actor=actor, now=now
+    )
+    return item_id
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -532,6 +575,35 @@ def _build_argparser() -> "argparse.ArgumentParser":  # type: ignore[name-define
         action="store_true",
         help="Disable auto-apply of findings (sets auto_apply_findings=False).",
     )
+    # --- PR → item linking (#828, PR-5) ---------------------------
+    # Invocable today so the plumbing can be exercised from scripts
+    # even though the runtime caller (speaking-shim PhaseRunner) is
+    # still a stub. When all three flags are supplied, the merge
+    # decision still runs — the ref recording is additive and errors
+    # inside it are swallowed so they can never block a merge.
+    parser.add_argument(
+        "--record-item-ref-db",
+        default=None,
+        help=(
+            "Path to alice-state.db. When set, extract `Closes "
+            "item-<N>` from --pr-body-file and record a gh:pr "
+            "reference row in item_external_refs before deciding "
+            "the merge."
+        ),
+    )
+    parser.add_argument(
+        "--pr-url",
+        default=None,
+        help="Full PR URL (required with --record-item-ref-db).",
+    )
+    parser.add_argument(
+        "--pr-body-file",
+        default=None,
+        help=(
+            "Path to a file containing the PR body, or `-` to read "
+            "from stdin (required with --record-item-ref-db)."
+        ),
+    )
     return parser
 
 
@@ -557,6 +629,49 @@ def main(argv: list[str] | None = None) -> int:
         auto_apply_findings=not args.no_auto_apply,
         review_timeout_seconds=args.timeout,
     )
+    # --- PR → item linking side-effect (#828, PR-5) ---------------
+    # Best-effort: an exception here must never abort merge
+    # decisioning, so the whole block is wrapped. Missing flags are
+    # silently ignored; present-but-partial flags log + continue.
+    if args.record_item_ref_db:
+        try:
+            if not args.pr_url or not args.pr_body_file:
+                log.warning(
+                    "--record-item-ref-db requires --pr-url and --pr-body-file; "
+                    "skipping item-ref record for repo=%s pr=%s",
+                    args.repo,
+                    args.pr,
+                )
+            else:
+                import sys as _sys
+                from alice_state_db.schema import apply_schema
+
+                if args.pr_body_file == "-":
+                    pr_body = _sys.stdin.read()
+                else:
+                    with open(args.pr_body_file, "r", encoding="utf-8") as fh:
+                        pr_body = fh.read()
+                _ref_conn = sqlite3.connect(args.record_item_ref_db)
+                try:
+                    _ref_conn.execute("PRAGMA foreign_keys = ON")
+                    apply_schema(_ref_conn)
+                    recorded = record_pr_item_ref(
+                        conn=_ref_conn,
+                        repo=args.repo,
+                        pr_body=pr_body,
+                        pr_url=args.pr_url,
+                        actor="speaking",
+                    )
+                finally:
+                    _ref_conn.close()
+                print(json.dumps({"item_id": recorded}), flush=True)
+        except Exception as exc:  # noqa: BLE001 — never abort merge
+            log.exception(
+                "record-item-ref failed for repo=%s pr_url=%s: %s",
+                args.repo,
+                args.pr_url,
+                exc,
+            )
     try:
         decision = decide_self_merge(
             repo=args.repo,
