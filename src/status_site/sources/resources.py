@@ -120,9 +120,20 @@ def _connect(db_path: Optional[Path] = None):
     Exposed as a function so tests can monkeypatch the whole import.
     Production callers use it with ``with _connect() as conn:``; tests
     can return a lightweight CM wrapping a hand-built sqlite3 handle.
+
+    When ``db_path`` is None, honor ``ALICE_STATE_DB_PATH`` (the same
+    env var ``db_readers._resolve_db_path`` checks) before falling
+    through to ``DEFAULT_DB_PATH``. Without this the status-site
+    container reads from ``/root/alice-mind/inner/state/alice-state.db``
+    (an empty fallback) instead of ``/srv/state/alice-state.db``.
     """
     from alice_state_db.read_api import connect
 
+    if db_path is None:
+        import os
+        env = os.environ.get("ALICE_STATE_DB_PATH")
+        if env:
+            db_path = Path(env)
     return connect(db_path=db_path)
 
 
