@@ -1,0 +1,28 @@
+#!/command/with-contenv bash
+# alice-resource-sampler — long-running python loop that writes
+# ``resource_samples`` + ``token_usage`` rows into alice-state.db for
+# the status-site Resources page (issue #860).
+#
+# One tick every PS_INTERVAL seconds (30 s default) for /proc-matched
+# process rows; one tick every TOKEN_INTERVAL seconds (60 s default)
+# for new Claude Code transcript turns. Errors inside a tick are
+# logged to stderr but never crash the loop — the s6 restart cost is
+# cheap, and a silent sampler is worse than a noisy one.
+#
+# Runs as alice. Has access to /proc (ps -eo), /host-claude/projects
+# (RO mount of the host's ~/.claude/projects), and
+# /home/alice/alice-mind/inner/state/alice-state.db (rw).
+set -e
+
+# Stagger startup so sampler, thinker, and memory-worker don't all
+# wake up in lockstep on container boot. 60 s offset chosen to land
+# after init-state-perms so the DB file + its parent dir are present
+# and owned by alice.
+sleep 60 &
+wait $! 2>/dev/null || true
+
+export ALICE_STATE_DB="${ALICE_STATE_DB:-/home/alice/alice-mind/inner/state/alice-state.db}"
+export ALICE_CLAUDE_PROJECTS_DIR="${ALICE_CLAUDE_PROJECTS_DIR:-/host-claude/projects}"
+export ALICE_RESOURCE_LOG="${ALICE_RESOURCE_LOG:-INFO}"
+
+exec s6-setuidgid alice python3 -m alice_resources.sampler

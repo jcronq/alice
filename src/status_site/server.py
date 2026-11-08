@@ -3064,6 +3064,21 @@ class Handler(BaseHTTPRequestHandler):
                 mtime=mtime if mtime > 0 else None,
                 head=head,
             )
+        if path == "/resources.md":
+            # Issue #860 — rendered live from alice-state.db's
+            # ``resource_samples`` + ``token_usage`` tables. Lazy
+            # import so a missing alice_state_db at boot doesn't
+            # break the whole server (same pattern as
+            # ``/api/pipeline-history`` below).
+            from status_site.sources.resources import render_resources_md
+
+            body = render_resources_md()
+            return self._send(
+                200,
+                body.encode("utf-8"),
+                "text/markdown; charset=utf-8",
+                head=head,
+            )
         if path == "/api/surfaces":
             items = scan_surfaces(self.cfg.surface_dir)
             return self._json(
