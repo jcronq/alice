@@ -95,6 +95,7 @@ from status_site.sources import (
 from status_site.sources import (
     bugs as _bugs_page,
     chat as _chat_page,
+    resources as _resources_page,
     review as _review_page,
 )
 from status_site.sources.bugs import (
@@ -2183,6 +2184,9 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
     def _render_page_review() -> dict:
         return _review_page.render(cfg)
 
+    def _render_page_resources() -> dict:
+        return _resources_page.render(cfg)
+
     # Preserve Overview order; the SSE client iterates this dict to
     # draw sections top-to-bottom. Page sections live alongside
     # Overview sections in the same snapshot — the client only mounts
@@ -2204,6 +2208,7 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         "page:chat": _render_page_chat,
         "page:bugs": _render_page_bugs,
         "page:review": _render_page_review,
+        "page:resources": _render_page_resources,
     }
 
 
