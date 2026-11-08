@@ -38,9 +38,8 @@ import json
 import pathlib
 import sys
 import time
-from typing import Any
+from typing import Any, Optional
 
-from alice_state_db import derive as alice_state_db_derive
 from core.events import EventLogger
 
 from . import (
@@ -219,7 +218,21 @@ def main() -> int:
     # writer raising leaves the note in the inbox for the next
     # tick's retry. Stage B operates on ``mind`` directly (the
     # vault root), not on ``--state-dir``.
-    drain = stage_b.run(mind, journal_path=journal_path)
+    #
+    # Issue #853: Stage B/C/D + thalamus used to be unguarded, so a
+    # raise from any of them killed the whole wake. The DB-refresh
+    # phases that used to follow (phases 6/7/8) never ran. Those
+    # three are now in the dedicated alice-gh-poll service so a wake
+    # death no longer starves the status-site, but the wrap below
+    # also keeps the memory-worker's own stats emit intact — easier
+    # for operators to correlate a Stage D wedge with a specific
+    # stage's error marker.
+    try:
+        drain = stage_b.run(mind, journal_path=journal_path)
+        stage_b_error: Optional[str] = None
+    except Exception as exc:  # noqa: BLE001 — telemetry-only path
+        drain = stage_b.DrainReport(errors=1)
+        stage_b_error = f"{type(exc).__name__}: {exc}"
 
     # Phase 2b: Thalamus intake drain. Same 30-min cadence as the
     # inner/notes drain above. Applies the coalescing / aggregation
@@ -230,17 +243,34 @@ def main() -> int:
     # the Phase 1 scaffold yet). See
     # ``research/2026-06-02-thalamus-relay-layer.md`` §2.4 and
     # ``research/2026-08-07-agent-home-automation-integration-architecture.md`` §2.2.
-    thalamus_report = thalamus.run(mind)
+    try:
+        thalamus_report = thalamus.run(mind)
+        thalamus_error: Optional[str] = None
+    except Exception as exc:  # noqa: BLE001 — telemetry-only path
+        thalamus_report = thalamus.ThalamusReport(errors=1)
+        thalamus_error = f"{type(exc).__name__}: {exc}"
 
     # Phase 3: Stage C vault grooming. UNION trigger over structural
     # debt + decay + orphan + broken-link signals; incremental cap
     # per category keeps wake budget bounded.
-    groom = stage_c.run(mind, journal_path=journal_path)
+    try:
+        groom = stage_c.run(mind, journal_path=journal_path)
+        stage_c_error: Optional[str] = None
+    except Exception as exc:  # noqa: BLE001 — telemetry-only path
+        groom = stage_c.StageCReport()
+        stage_c_error = f"{type(exc).__name__}: {exc}"
 
     # Phase 4: Stage D recombination. Runs after Stage C so any
     # atomize/dedupe that touched a research note this cycle is
     # already reflected in the candidate set's frontmatter timestamps.
-    synth = stage_d.run(mind, journal_path=journal_path)
+    try:
+        synth = stage_d.run(mind, journal_path=journal_path)
+        stage_d_error: Optional[str] = None
+    except Exception as exc:  # noqa: BLE001 — telemetry-only path
+        synth = stage_d.StageDReport(
+            skipped_reason=f"exception: {type(exc).__name__}: {exc}"
+        )
+        stage_d_error = f"{type(exc).__name__}: {exc}"
 
     # Phase 5: SM v2 task-index fsck / reindex (#781). The task store's
     # ``index.jsonl`` drifts whenever a task.yaml is written by a
@@ -255,74 +285,14 @@ def main() -> int:
         cfg=cfg,
     )
 
-    # Phase 6 (#789 PR 1): derive tasks + workers + events into
-    # ``inner/state/alice-state.db``. Runs after the reindex so the
-    # task index is current before the SQLite snapshot is written.
-    # Swallows derive-level errors so a pathological event line or
-    # permission snag can't take the memory-worker wake with it —
-    # the report is surfaced in the heartbeat event so operators
-    # can see the error count without reading logs.
-    try:
-        state_db_report = alice_state_db_derive.derive_tasks_workers_events(
-            mind
-        )
-    except Exception as exc:  # noqa: BLE001 — telemetry-only path
-        state_db_report = alice_state_db_derive.DeriveReport(
-            errors=[{"kind": "derive", "path": str(mind), "reason": str(exc)}]
-        )
-
-    # Phase 7 (#790 Step 1): SM v2 substrate seed — items +
-    # state_machine + transitions + amendments from the GH mirror
-    # and inner/tasks/. Runs AFTER ``derive_tasks_workers_events``
-    # so the task-level rows are fresh; the seed queries the same
-    # DB file and shares its WAL. Mirror-only mode (no live-gh
-    # fetcher wired in Step 1 — that moves in Step 2) keeps the
-    # memory-worker tick off the GH rate-limit budget.
-    try:
-        from alice_state_db import sm_seed as _sm_seed_mod
-
-        sm_seed_report = _sm_seed_mod.derive_sm_seed(mind)
-    except Exception as exc:  # noqa: BLE001 — telemetry-only path
-        from alice_state_db.sm_seed import SmSeedReport as _SmSeedReport
-
-        sm_seed_report = _SmSeedReport(
-            errors=[{"kind": "sm_seed", "path": str(mind), "reason": str(exc)}]
-        )
-
-    # Phase 8 (#790 Step 2): live GH poll into alice-state.db —
-    # ETag-aware, shared-backoff-aware, idempotent. The memory-worker
-    # 30-min cadence is the floor refresh rate; a dedicated 90-s s6
-    # timer is a sandbox-config follow-up. Any 4xx / 5xx surfaces in
-    # the heartbeat as ``gh_poll_error_count``; rate-limit hits are
-    # recorded and the shared backoff ripples out to every other
-    # gh-caller. Disabled by setting
-    # ``memory_worker.gh_poll_enabled = false`` in alice.config.json
-    # (default: enabled).
-    if cfg.get("gh_poll_enabled", True):
-        try:
-            from alice_state_db import gh_poll as _gh_poll_mod
-
-            configured_repos = cfg.get("gh_poll_repos") or None
-            gh_poll_report = _gh_poll_mod.derive_gh_poll(
-                mind, repos=configured_repos
-            )
-        except Exception as exc:  # noqa: BLE001 — telemetry-only path
-            from alice_state_db.gh_poll import PollReport as _PollReport
-
-            gh_poll_report = _PollReport(
-                status="error",
-                errors=[
-                    {
-                        "kind": "gh_poll",
-                        "path": str(mind),
-                        "reason": str(exc),
-                    }
-                ],
-            )
-    else:
-        from alice_state_db.gh_poll import PollReport as _PollReport
-
-        gh_poll_report = _PollReport(status="disabled")
+    # Phases 6/7/8 (state_db derive, sm_seed, gh_poll) were lifted out
+    # of this wake and into the dedicated ``alice-gh-poll`` s6 service
+    # (issue #853). They had been running at the end of the wake, so a
+    # Stage D decay pre-pass that overran the memory-worker's outer
+    # ``timeout --kill-after=60 600`` wrapper SIGKILLed the wake before
+    # any of them ran — the status-site Overview went blank because
+    # ``derive_runs`` had zero rows. See
+    # :mod:`alice_state_db.gh_poll_wake` for the new dispatcher.
 
     # Heartbeat phase: precedence is the heaviest stage that actually
     # ran (D > C > B). ``stage_d.ran`` is True iff a pair was selected
@@ -346,15 +316,16 @@ def main() -> int:
         ),
         **report.to_dict(),
         **{f"stage_b_{k}": v for k, v in drain.to_dict().items()},
+        stage_b_error=stage_b_error,
         **{f"thalamus_{k}": v for k, v in thalamus_report.to_dict().items()},
+        thalamus_error=thalamus_error,
         **{f"stage_c_{k}": v for k, v in groom.to_dict().items()},
         stage_c_ran=bool(groom.ran),
+        stage_c_error=stage_c_error,
         **{f"stage_d_{k}": v for k, v in synth.to_dict().items()},
         stage_d_ran=bool(synth.ran),
+        stage_d_error=stage_d_error,
         **{f"task_reindex_{k}": v for k, v in reindex_result.items()},
-        **{f"state_db_{k}": v for k, v in state_db_report.to_dict().items()},
-        **{f"sm_seed_{k}": v for k, v in sm_seed_report.to_dict().items()},
-        **{f"gh_poll_{k}": v for k, v in gh_poll_report.to_dict().items()},
     )
 
     return 0

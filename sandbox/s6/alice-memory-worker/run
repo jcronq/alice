@@ -82,7 +82,14 @@ while true; do
         # Foreground on purpose: bash defers the trap until the wake
         # returns, so the cadence tick completes rather than being
         # SIGKILLed by s6.
-        flock -n "$LOCK" s6-setuidgid alice /usr/local/bin/alice-memory-worker-wake || true
+        # redirfd (execline) opens fd 2 after the privilege drop so the
+        # log file is owned by alice; shell `2>>` would open it as the
+        # supervising root shell. Without this, SIGTERM/SIGKILL from the
+        # outer `timeout` guard in alice-memory-worker-wake silently
+        # eats the wake's traceback, so a Stage D pre-pass wedge looks
+        # identical to a healthy fast tick (issue #853).
+        flock -n "$LOCK" s6-setuidgid alice redirfd -a 2 /state/worker/memory-worker-stderr.log \
+            /usr/local/bin/alice-memory-worker-wake || true
         end_ts=$(date +%s)
         elapsed=$(( end_ts - start_ts ))
         remainder=$(( cadence - elapsed ))

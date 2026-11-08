@@ -81,21 +81,38 @@ def connect(
     callers are expected to apply the schema themselves, same as
     :func:`derive.derive_tasks_workers_events`.
 
+    Schema upsert on every RO open (issue #853): historically
+    ``apply_schema`` was only called when ``read_only=True AND not
+    path.exists()``. That meant a reader opening an existing DB
+    stamped with an older schema silently saw whatever tables that
+    file had — a readers would hit ``OperationalError: no such
+    table`` on the first query after a schema bump. Now
+    ``apply_schema`` runs on every RO open via a separate RW handle
+    opened BEFORE the RO ``mode=ro`` connection is created, because
+    ``apply_schema`` writes (sets WAL, creates tables) which a
+    ``mode=ro`` handle cannot do.
+
     The returned connection has ``row_factory=sqlite3.Row`` so the
     helpers below can use dict-style access.
     """
     path = pathlib.Path(db_path or DEFAULT_DB_PATH)
-    if read_only and not path.exists():
-        # Create an empty DB so RO callers get the shape they expect
-        # even on first-ever-run. Cheaper than raising + catching.
+    if read_only:
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Run apply_schema on a scratch RW handle. All DDL inside
+        # apply_schema uses CREATE ... IF NOT EXISTS, so two concurrent
+        # callers racing on this line is harmless: whoever lands second
+        # either no-ops or hits a "table already exists" OperationalError
+        # that we swallow.
         tmp = sqlite3.connect(str(path))
         try:
             apply_schema(tmp)
+        except sqlite3.OperationalError:
+            # Concurrent apply_schema race: all statements are
+            # CREATE ... IF NOT EXISTS, so another writer's pass
+            # already covers us.
+            pass
         finally:
             tmp.close()
-
-    if read_only:
         uri = f"file:{path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
     else:

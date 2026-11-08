@@ -22,11 +22,19 @@ ALICE_SRC="${ALICE_SRC:-/home/alice/alice/src}"
 
 # Outer timeout. Same rationale as alice-think — the Python interpreter
 # can block indefinitely in post-return cleanup; this caps the whole
-# process so the supervisor's flock doesn't get held forever. 600s
-# default (half of alice-think's 1200) because the memory worker's
-# Phase 1 body is a journal replay that completes in milliseconds;
-# raised in later phases once Stage D's LLM call lands.
-WAKE_TIMEOUT="${WAKE_TIMEOUT:-600}"
+# process so the supervisor's flock doesn't get held forever.
+#
+# NOTE (issue #853): 1500s is a PATCH, not the fix. At current vault
+# size (~10.8k markdown files) Stage D's decay pre-pass
+# (_iter_decay_candidates in alice_thinking/memory_worker/stage_d.py)
+# routinely pegs CPU >600s, and the old 600s cap SIGTERMed the wake
+# before phases 6/7/8 (state_db derive, sm_seed, gh_poll) ever ran.
+# Those three phases are now decoupled into the alice-gh-poll s6
+# service, so a wake timeout no longer starves gh_poll. The vault
+# will keep growing, so this will eventually re-exhaust; the real
+# answer is the decoupled service (shipped in the same PR) plus
+# future work on Stage D's O(n) decay scan.
+WAKE_TIMEOUT="${WAKE_TIMEOUT:-1500}"
 WAKE_KILL_GRACE="${WAKE_KILL_GRACE:-60}"
 
 if [ ! -x "$VENV_PY" ]; then

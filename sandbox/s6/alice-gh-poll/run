@@ -1,0 +1,65 @@
+#!/command/with-contenv bash
+# alice-gh-poll — timer loop that runs the dedicated GitHub-poll tick:
+# derive_tasks_workers_events + derive_sm_seed + derive_gh_poll into
+# ~/alice-mind/inner/state/alice-state.db.
+#
+# Issue #853: these three phases used to ride on the memory-worker's
+# 30-min wake at the end of a Stage B/C/D sweep. On large vaults the
+# Stage D decay pre-pass can exceed the memory-worker's outer timeout
+# cap, SIGKILLing the wake before phases 6/7/8 ran. The status-site
+# Overview went blank because ``derive_runs`` had zero rows despite
+# the DB file existing. This service decouples the three refresh
+# phases from the vault grooming so a Stage D runtime regression
+# can't starve the status-site.
+#
+# Singleton via ``flock -n`` so a slow tick can't double-fire.
+#
+# Cadence is read from alice.config.json ``gh_poll.poll_interval_seconds``
+# on each cycle (live reconfig, no restart needed). Default: 90s,
+# floor 60s — same floor as alice-sm-dispatcher so we don't burn the
+# GH rate-limit budget on a config typo.
+set -e
+
+LOCK=/state/worker/gh-poll.lock
+CONFIG_JSON=/home/alice/alice-mind/config/alice.config.json
+DEFAULT_INTERVAL=90
+
+mkdir -p "$(dirname "$LOCK")"
+touch "$LOCK"
+chown alice:alice "$LOCK" || true
+
+# Stagger startup so this doesn't collide with memory-worker (90s),
+# thinker (60s), and sm-dispatcher (45s). 60s lands after
+# sm-dispatcher but before memory-worker, giving a quiescent window
+# for the first tick's SQLite write.
+sleep 60
+
+while true; do
+    interval="$DEFAULT_INTERVAL"
+    if [ -f "$CONFIG_JSON" ] && command -v jq >/dev/null 2>&1; then
+        v=$(jq -r '.gh_poll.poll_interval_seconds // empty' "$CONFIG_JSON" 2>/dev/null || true)
+        case "$v" in
+            ''|*[!0-9]*) ;;
+            *) interval="$v" ;;
+        esac
+    fi
+    if [ "$interval" -lt 60 ]; then
+        # Polling faster than once a minute would burn GH rate limit
+        # and the secondary-rate-limit thresholds for not much win —
+        # same floor as alice-sm-dispatcher and alice-gh-watcher.
+        interval=60
+    fi
+
+    start_ts=$(date +%s)
+    # redirfd (execline) opens fd 2 after the privilege drop so the log
+    # file is owned by alice; shell `2>>` would open it as the
+    # supervising root shell.
+    flock -n "$LOCK" s6-setuidgid alice redirfd -a 2 /state/worker/gh-poll-stderr.log \
+        /usr/local/bin/alice-gh-poll || true
+    end_ts=$(date +%s)
+    elapsed=$(( end_ts - start_ts ))
+    remainder=$(( interval - elapsed ))
+    if [ "$remainder" -gt 0 ]; then
+        sleep "$remainder"
+    fi
+done
