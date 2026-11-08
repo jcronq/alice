@@ -315,6 +315,68 @@ DDL_ITEM_DEPENDENCIES_INDEX = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Resource sampling for the status-site Resources page (issue #860).
+#
+# Two append-only tables written by the ``alice-resource-sampler`` s6
+# service running inside the ``alice`` container. The status-site
+# Resources renderer joins them against ``workers`` by ``bg_id`` so
+# Jason can see what every background build is burning.
+#
+# * ``resource_samples`` — one row per matched process per sample tick
+#   (default 30 s). ``cpu_pct`` sums the process's own + any child CPU
+#   share rolled up by the sampler; ``rss_mb`` is RSS at sample time.
+#   ``bg_id`` is nullable because not every matched process can be
+#   correlated back to a worker (speaking / thinking / cozylobe are
+#   long-lived services with no bg_id).
+# * ``token_usage`` — one row per assistant turn in a Claude Code
+#   transcript, keyed by (session_path, turn_index) for idempotency.
+#   The sampler scans ``~/.claude/projects/**/<session>.jsonl`` on a
+#   slower cadence (default 60 s) and ``INSERT OR IGNORE``s new rows.
+#
+# Both tables are intentionally thin — all aggregation happens at the
+# chart layer in ``status_site/sources/resources.py``. The retention
+# policy is owned by a separate pruner (future work); the sampler just
+# appends.
+
+DDL_RESOURCE_SAMPLES = """
+CREATE TABLE IF NOT EXISTS resource_samples (
+    ts            TEXT NOT NULL,
+    bg_id         TEXT,
+    pid           INTEGER,
+    cmd_tag       TEXT,
+    cpu_pct       REAL,
+    rss_mb        REAL,
+    source        TEXT DEFAULT 'ps'
+);
+"""
+
+DDL_RESOURCE_SAMPLES_INDEX = [
+    "CREATE INDEX IF NOT EXISTS resource_samples_ts ON resource_samples(ts);",
+    "CREATE INDEX IF NOT EXISTS resource_samples_bg ON resource_samples(bg_id, ts);",
+]
+
+DDL_TOKEN_USAGE = """
+CREATE TABLE IF NOT EXISTS token_usage (
+    ts                     TEXT NOT NULL,
+    bg_id                  TEXT,
+    session_path           TEXT NOT NULL,
+    turn_index             INTEGER,
+    model                  TEXT,
+    input_tokens           INTEGER DEFAULT 0,
+    output_tokens          INTEGER DEFAULT 0,
+    cache_creation_tokens  INTEGER DEFAULT 0,
+    cache_read_tokens      INTEGER DEFAULT 0,
+    UNIQUE(session_path, turn_index)
+);
+"""
+
+DDL_TOKEN_USAGE_INDEX = [
+    "CREATE INDEX IF NOT EXISTS token_usage_ts ON token_usage(ts);",
+    "CREATE INDEX IF NOT EXISTS token_usage_bg ON token_usage(bg_id, ts);",
+]
+
+
 def apply_schema(conn: sqlite3.Connection) -> None:
     """Create the PR 1 tables + indexes idempotently.
 
@@ -368,6 +430,14 @@ def apply_schema(conn: sqlite3.Connection) -> None:
     # Issue #833 — item_dependencies. Additive, no backfill required.
     conn.execute(DDL_ITEM_DEPENDENCIES)
     for stmt in DDL_ITEM_DEPENDENCIES_INDEX:
+        conn.execute(stmt)
+
+    # Issue #860 — resource_samples + token_usage. Additive, append-only.
+    conn.execute(DDL_RESOURCE_SAMPLES)
+    for stmt in DDL_RESOURCE_SAMPLES_INDEX:
+        conn.execute(stmt)
+    conn.execute(DDL_TOKEN_USAGE)
+    for stmt in DDL_TOKEN_USAGE_INDEX:
         conn.execute(stmt)
 
     conn.commit()

@@ -145,6 +145,7 @@ packages = [
     "src/alice_bug_fix_dispatcher",
     "src/alice_forge",
     "src/alice_pricing",
+    "src/alice_resources",
     "src/alice_speaking",
     "src/alice_state_db",
     "src/alice_thinking",

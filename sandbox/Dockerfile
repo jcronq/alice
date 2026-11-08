@@ -188,6 +188,7 @@ COPY sandbox/s6/alice-logrotate/        /etc/s6-overlay/s6-rc.d/alice-logrotate/
 COPY sandbox/s6/alice-memory-worker/    /etc/s6-overlay/s6-rc.d/alice-memory-worker/
 COPY sandbox/s6/alice-reload-watcher/   /etc/s6-overlay/s6-rc.d/alice-reload-watcher/
 COPY sandbox/s6/alice-repo-autopull/    /etc/s6-overlay/s6-rc.d/alice-repo-autopull/
+COPY sandbox/s6/alice-resource-sampler/ /etc/s6-overlay/s6-rc.d/alice-resource-sampler/
 COPY sandbox/s6/alice-sm-dispatcher/    /etc/s6-overlay/s6-rc.d/alice-sm-dispatcher/
 COPY sandbox/s6/alice-speaking/         /etc/s6-overlay/s6-rc.d/alice-speaking/
 COPY sandbox/s6/alice-thinking-queue/ /etc/s6-overlay/s6-rc.d/alice-thinking-queue/
@@ -219,6 +220,7 @@ COPY sandbox/s6/user/contents.d/alice-logrotate                 /etc/s6-overlay/
 COPY sandbox/s6/user/contents.d/alice-memory-worker             /etc/s6-overlay/s6-rc.d/user/contents.d/alice-memory-worker
 COPY sandbox/s6/user/contents.d/alice-reload-watcher            /etc/s6-overlay/s6-rc.d/user/contents.d/alice-reload-watcher
 COPY sandbox/s6/user/contents.d/alice-repo-autopull             /etc/s6-overlay/s6-rc.d/user/contents.d/alice-repo-autopull
+COPY sandbox/s6/user/contents.d/alice-resource-sampler          /etc/s6-overlay/s6-rc.d/user/contents.d/alice-resource-sampler
 COPY sandbox/s6/user/contents.d/alice-sm-dispatcher             /etc/s6-overlay/s6-rc.d/user/contents.d/alice-sm-dispatcher
 COPY sandbox/s6/user/contents.d/alice-speaking                  /etc/s6-overlay/s6-rc.d/user/contents.d/alice-speaking
 COPY sandbox/s6/user/contents.d/alice-thinking-queue /etc/s6-overlay/s6-rc.d/user/contents.d/alice-thinking-queue
