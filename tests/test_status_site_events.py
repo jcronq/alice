@@ -447,14 +447,18 @@ def test_snapshot_includes_a2ui_page_sections(site):
             resp, lambda e: isinstance(e, dict) and e.get("type") == "snapshot"
         )
         secs = snap["sections"]
-        for name in ("page:chat", "page:bugs", "page:review"):
+        for name in ("page:chat", "page:bugs", "page:review", "page:resources"):
             assert name in secs, f"missing {name} in snapshot"
             assert "a2ui" in secs[name], f"{name} payload missing a2ui key"
             assert isinstance(secs[name]["a2ui"], list)
-        # Chat & bugs always emit their surface shape; review stays
-        # empty until /api/review sets the active slug.
+        # Chat, bugs & resources always emit their surface shape; review
+        # stays empty until /api/review sets the active slug. Resources
+        # emits even without a live state DB — render_resources_md's
+        # error path still produces a non-empty markdown body, so the
+        # surface envelope list is still populated.
         assert len(secs["page:chat"]["a2ui"]) >= 1
         assert len(secs["page:bugs"]["a2ui"]) >= 1
+        assert len(secs["page:resources"]["a2ui"]) >= 1
         assert secs["page:review"]["a2ui"] == []
     finally:
         conn.close()

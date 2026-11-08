@@ -2517,16 +2517,18 @@ function Tier({tier, summary, ts, nowMs, children}) {
 }
 
 // ── 9b. hash routing (#651) ──────────────────────────────────────
-// ``#chat`` / ``#bugs`` / ``#review-<slug>`` pick which A2UI surface
-// the shell mounts. Anything else falls through to the Overview
-// board (``#``, ``#overview``, no hash at all). ``useHashRoute``
-// returns ``{route, slug}`` where route is "overview" | "chat" |
-// "bugs" | "review" and slug is only set for review.
+// ``#chat`` / ``#bugs`` / ``#resources`` / ``#review-<slug>`` pick
+// which A2UI surface the shell mounts. Anything else falls through
+// to the Overview board (``#``, ``#overview``, no hash at all).
+// ``useHashRoute`` returns ``{route, slug}`` where route is
+// "overview" | "chat" | "bugs" | "resources" | "review" and slug is
+// only set for review.
 function parseHash(raw) {
   const h = (raw || "").replace(/^#/, "");
   if (!h || h === "overview" || h === "index") return {route: "overview", slug: null};
   if (h === "chat" || parseMessageHash(h)) return {route: "chat", slug: null};
   if (h === "bugs") return {route: "bugs", slug: null};
+  if (h === "resources") return {route: "resources", slug: null};
   if (h.startsWith("review-")) return {route: "review", slug: h.slice("review-".length)};
   return {route: "overview", slug: null};
 }

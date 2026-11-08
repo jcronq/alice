@@ -1,5 +1,15 @@
 """Resources page — what every background worker is burning.
 
+Two entry points:
+
+* :func:`render_resources_md` — legacy markdown body, still used by
+  ``/resources.md`` for the plaintext route.
+* :func:`render` (``page:resources`` A2UI section) — wraps the same
+  markdown in a surface envelope so the reactive shell's generic
+  ``A2uiSurface`` component mounts it when the hash route lands on
+  ``#resources`` (otherwise the nav tab silently falls through to
+  Overview — see parseHash in ``static/index.html``).
+
 Three sections, rendered live from ``alice-state.db`` on each request:
 
 1. **Snapshot** — top 20 processes by current CPU% (and separately by
@@ -27,6 +37,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
 
+from status_site.a2ui import (
+    component,
+    create_surface,
+    update_components,
+)
 from status_site.sources.common import staleness_footer
 
 log = logging.getLogger("status_site.resources")
@@ -501,3 +516,60 @@ def render_resources_md(
         "\n",
     ]
     return "".join(out)
+
+
+# ─── A2UI surface (page:resources, issue #861 fix) ──────────────────
+
+SURFACE_ID = "resources"
+
+
+def build_envelopes(
+    *,
+    db_path: Optional[Path] = None,
+    now: Optional[datetime] = None,
+) -> list[dict]:
+    """Wrap :func:`render_resources_md` in an A2UI surface envelope list.
+
+    The shell's generic :class:`A2uiSurface` renderer mounts whichever
+    ``page:<slug>`` payload matches the current hash route; without
+    this envelope list the ``#resources`` tab has nothing to mount
+    and the route silently falls through to Overview.
+
+    Shape mirrors ``sources/bugs.build_envelopes``: a ``createSurface``
+    opener followed by an ``updateComponents`` with a ``root`` list
+    whose single child is a ``text`` component carrying the markdown
+    body in ``props.markdown`` — same prop the chat/bugs surfaces
+    already use for prose blocks.
+    """
+    md = render_resources_md(db_path=db_path, now=now)
+    return [
+        create_surface(SURFACE_ID, data={}),
+        update_components(
+            SURFACE_ID,
+            [
+                component(
+                    "root",
+                    "list",
+                    props={"variant": "resources-page"},
+                    children=["body"],
+                ),
+                component(
+                    "body",
+                    "text",
+                    props={"markdown": md},
+                ),
+            ],
+        ),
+    ]
+
+
+def render(cfg=None) -> dict:  # noqa: ARG001 — cfg accepted for section-renderer uniformity
+    """Section renderer for ``page:resources``. Emits ``{"a2ui": [...]}``.
+
+    ``cfg`` is accepted (and ignored) so the server-side section
+    registration can call this with the same ``cfg``-threading pattern
+    the other ``page:<slug>`` renderers use — there's nothing in
+    :class:`status_site.server.Config` the resources renderer needs
+    beyond the default state-DB path, which :func:`_connect` resolves.
+    """
+    return {"a2ui": build_envelopes()}

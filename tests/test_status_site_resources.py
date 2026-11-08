@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -10,12 +11,15 @@ from pathlib import Path
 from alice_state_db.schema import apply_schema
 from status_site.sources import resources as R
 from status_site.sources.resources import (
+    SURFACE_ID,
     SnapshotRow,
     TimelineBucket,
     TokenTotal,
+    build_envelopes,
     fetch_snapshot,
     fetch_timeline,
     fetch_token_totals,
+    render,
     render_resources_md,
     render_snapshot_table,
     render_timeline_svg,
@@ -199,6 +203,55 @@ class _ConnCM:
             self._conn.close()
 
 
+# ─── A2UI surface (page:resources) ─────────────────────────────────
+
+
+def test_build_envelopes_returns_resources_surface(monkeypatch):
+    """The A2UI envelope list uses surface id ``resources`` and carries
+    the markdown body on a ``text`` component so the shell's generic
+    A2uiSurface renderer mounts it on the ``#resources`` route.
+    """
+    monkeypatch.setattr(
+        R, "render_resources_md",
+        lambda db_path=None, now=None: "# Resources\n\nhello body\n",
+    )
+    envs = build_envelopes()
+    assert isinstance(envs, list) and len(envs) >= 2
+    # createSurface opens the right surface id.
+    create = envs[0]
+    assert create["type"] == "createSurface"
+    assert create["surfaceId"] == SURFACE_ID == "resources"
+    # updateComponents carries a root list and a text node with the body.
+    update = next(e for e in envs if e["type"] == "updateComponents")
+    assert update["surfaceId"] == "resources"
+    comps = {c["id"]: c for c in update["components"]}
+    assert "root" in comps and comps["root"]["type"] == "list"
+    # Body text carries a non-empty markdown prop.
+    body = comps.get("body")
+    assert body is not None, "body component missing"
+    assert body["type"] == "text"
+    assert body["props"]["markdown"].strip().startswith("# Resources")
+    assert "hello body" in body["props"]["markdown"]
+
+
+def test_render_wraps_envelopes_in_a2ui_payload(monkeypatch):
+    """``render()`` wraps :func:`build_envelopes` in the ``{"a2ui": […]}``
+    section-payload shape the broadcaster expects.
+    """
+    monkeypatch.setattr(
+        R, "render_resources_md",
+        lambda db_path=None, now=None: "# Resources\n\nx\n",
+    )
+    out = render(cfg=None)
+    assert isinstance(out, dict)
+    assert "a2ui" in out
+    assert isinstance(out["a2ui"], list)
+    # Same envelope list as build_envelopes (not a snapshot — must
+    # carry the full createSurface + updateComponents pair).
+    types = [e["type"] for e in out["a2ui"]]
+    assert "createSurface" in types and "updateComponents" in types
+
+
 def test_render_resources_md_end_to_end(tmp_path, monkeypatch):
     conn = _seed_db(tmp_path / "state.db")
     conn.execute(
@@ -228,3 +281,24 @@ def test_render_resources_md_end_to_end(tmp_path, monkeypatch):
     assert len(out.encode("utf-8")) < 50 * 1024
     # Staleness footer present.
     assert "last_rendered" in out
+
+
+# ─── route wiring (static/index.html parseHash) ────────────────────
+
+
+def test_parse_hash_whitelists_resources_route():
+    """``parseHash`` in ``static/index.html`` must send the literal
+    ``resources`` hash to the resources route — otherwise the nav tab
+    silently falls through to the Overview board (the PR #861 bug).
+    The check is a regex over the shipped HTML so a future refactor
+    that drops the branch fails this test instead of regressing
+    silently on the live site.
+    """
+    html = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "status_site" / "static" / "index.html"
+    ).read_text()
+    assert re.search(
+        r'h\s*===\s*"resources"\s*\)\s*return\s*\{\s*route:\s*"resources"',
+        html,
+    ), "parseHash branch for #resources hash is missing"
