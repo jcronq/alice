@@ -545,15 +545,66 @@ const INITIAL = {
   sections: {}, ts: {},
   connected: false, error: null,
 };
+// Issue #858 — guard against transient-empty snapshots clobbering a
+// known-good section. A snapshot that returns ``pipeline: []`` after
+// the user already saw 8 items is almost always a source hiccup
+// (DB lock, post-restart warm-up); the UI should keep the prior
+// payload rather than paint the Overview blank.
+//
+// Returns true when the section payload carries something the
+// renderer would actually show. The first-ever snapshot path is
+// preserved because ``sectionIsMeaningful(undefined)`` is false, so
+// the merge rule ("accept incoming if it is meaningful OR prior is
+// not") accepts an empty incoming section when there is no prior.
+function sectionIsMeaningful(section) {
+  if (!section || typeof section !== "object") return false;
+  // in_flight meaningful if any of pipeline / pipeline_by_component /
+  // running has rows.
+  if (Array.isArray(section.pipeline) && section.pipeline.length) return true;
+  if (Array.isArray(section.pipeline_by_component) && section.pipeline_by_component.length) return true;
+  if (Array.isArray(section.running) && section.running.length) return true;
+  // Non-empty markdown or rows counts as meaningful for the
+  // markdown-first sections (waiting_on_you, your_todo, etc).
+  if (typeof section.markdown === "string" && section.markdown.trim()) {
+    // Treat the known "nothing here" sentinels as NOT meaningful so a
+    // genuine empty state can still replace a prior empty state and
+    // not get stuck on a stale payload.
+    const md = section.markdown.trim();
+    if (md !== "*(queue clear)*" &&
+        md !== "*(nothing in flight)*" &&
+        md !== "*(thinking queue unavailable or empty)*") {
+      return true;
+    }
+  }
+  if (Array.isArray(section.rows) && section.rows.length) return true;
+  // Any known populated-collection key beyond the above counts too.
+  for (const k of ["prs", "design_review", "attention_reacts", "surfaces", "tasks", "a2ui", "deploy", "pollers"]) {
+    if (Array.isArray(section[k]) && section[k].length) return true;
+  }
+  return false;
+}
 function reducer(state, event) {
   switch (event.type) {
     case "snapshot": {
-      const next = {};
-      for (const k of Object.keys(event.sections || {})) next[k] = event.ts;
+      const incoming = event.sections || {};
+      const merged = {...state.sections};
+      const nextTs = {...state.ts};
+      for (const [k, v] of Object.entries(incoming)) {
+        const prior = state.sections[k];
+        // Accept the incoming payload when it carries content, OR
+        // when the prior state had nothing meaningful either (first
+        // snapshot, or a legitimately-empty follow-up). Otherwise
+        // keep the prior section + prior ts so a transient DB hiccup
+        // doesn't wipe the Overview.
+        if (sectionIsMeaningful(v) || !sectionIsMeaningful(prior)) {
+          merged[k] = v;
+          nextTs[k] = event.ts;
+        }
+      }
       return {
         ...state,
-        sections: event.sections || {},
-        ts: {...state.ts, ...next},
+        sections: merged,
+        ts: nextTs,
         connected: true, error: null,
       };
     }

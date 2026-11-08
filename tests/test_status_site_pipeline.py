@@ -648,3 +648,154 @@ def test_history_path_shell_for_unknown_id_still_serves_html(history_site):
     )
     assert status == 200
     assert headers.get("Content-Type", "").startswith("text/html")
+
+
+# ─── #858: transient-empty guard in _poll_pipeline_once ────────────
+
+
+def _poll_cfg(tmp_path):
+    cfg = Config(
+        status_dir=tmp_path / "status",
+        surface_dir=tmp_path / "surface",
+        upload_dir=tmp_path / "up",
+        key="k",
+        port=0,
+        host="127.0.0.1",
+    )
+    cfg.status_dir.mkdir(parents=True, exist_ok=True)
+    cfg.surface_dir.mkdir(parents=True, exist_ok=True)
+    return cfg
+
+
+def test_poll_pipeline_once_writes_cache_on_fresh_fetch(tmp_path, monkeypatch):
+    cfg = _poll_cfg(tmp_path)
+    pollers = OverviewPollers(cfg, pipeline_poll=0.01)
+    rows = [{"repo": "jcronq/alice", "number": 1, "state": "selected", "title": "t"}]
+    calls = []
+
+    def fake_fetch(repos):
+        calls.append(repos)
+        return rows, []
+
+    monkeypatch.setattr(P, "repos_sm_from_config", lambda: ["jcronq/alice"])
+    monkeypatch.setattr(P, "fetch_issues", fake_fetch)
+    monkeypatch.setattr(P, "ensure_review_notes", lambda *a, **kw: {"written": [], "deleted": []})
+
+    pollers._poll_pipeline_once()
+    cached = pollers.get("pipeline")
+    assert cached == {"issues": rows, "failed": []}
+    assert len(calls) == 1
+
+
+def test_poll_pipeline_once_empty_without_prior_writes_empty(tmp_path, monkeypatch):
+    cfg = _poll_cfg(tmp_path)
+    pollers = OverviewPollers(cfg, pipeline_poll=0.01)
+
+    def fake_fetch(repos):
+        return [], []
+
+    monkeypatch.setattr(P, "repos_sm_from_config", lambda: ["jcronq/alice"])
+    monkeypatch.setattr(P, "fetch_issues", fake_fetch)
+    monkeypatch.setattr(P, "ensure_review_notes", lambda *a, **kw: {"written": [], "deleted": []})
+
+    # No prior cache entry — the first poll must still write (even if
+    # empty) so renderers get the empty-marker payload and don't
+    # loop forever waiting for data.
+    pollers._poll_pipeline_once()
+    cached = pollers.get("pipeline")
+    assert cached == {"issues": [], "failed": []}
+
+
+def test_poll_pipeline_once_transient_empty_after_full_keeps_prior(
+    tmp_path, monkeypatch
+):
+    """Regression guard for #858.
+
+    When ``fetch_issues`` returns ``([], [])`` (sqlite3.Error swallowed
+    inside the DB reader) and the prior cache already held issues, the
+    poller must re-fetch once; if that corroborating fetch is also
+    empty, the cache is left untouched so the Overview doesn't blank.
+    """
+    cfg = _poll_cfg(tmp_path)
+    pollers = OverviewPollers(cfg, pipeline_poll=0.01)
+    rows = [
+        {"repo": "jcronq/alice", "number": i, "state": "selected", "title": f"t{i}"}
+        for i in range(1, 9)
+    ]
+    pollers._set("pipeline", {"issues": rows, "failed": []})
+
+    calls = []
+
+    def fake_fetch(repos):
+        calls.append(repos)
+        return [], []  # always empty — transient DB hiccup
+
+    monkeypatch.setattr(P, "repos_sm_from_config", lambda: ["jcronq/alice"])
+    monkeypatch.setattr(P, "fetch_issues", fake_fetch)
+    note_calls = []
+    monkeypatch.setattr(
+        P,
+        "ensure_review_notes",
+        lambda rows, notes_dir: note_calls.append(list(rows)) or {"written": [], "deleted": []},
+    )
+
+    pollers._poll_pipeline_once()
+    # Corroborating fetch was performed.
+    assert len(calls) == 2, "transient-empty guard should re-fetch once"
+    # Prior cache kept intact.
+    cached = pollers.get("pipeline")
+    assert cached is not None
+    assert cached["issues"] == rows, "transient empty wiped the prior cache (#858)"
+    # Review-note sync operated on the prior rows, not on empty.
+    assert note_calls == [rows]
+
+
+def test_poll_pipeline_once_transient_empty_recovers_on_recheck(
+    tmp_path, monkeypatch
+):
+    """If the first fetch is a false-empty but the re-fetch succeeds,
+    the cache advances to the new rows."""
+    cfg = _poll_cfg(tmp_path)
+    pollers = OverviewPollers(cfg, pipeline_poll=0.01)
+    prior = [{"repo": "jcronq/alice", "number": 1, "state": "selected", "title": "t"}]
+    pollers._set("pipeline", {"issues": prior, "failed": []})
+
+    fresh = [
+        {"repo": "jcronq/alice", "number": 1, "state": "building", "title": "t"},
+        {"repo": "jcronq/alice", "number": 2, "state": "selected", "title": "u"},
+    ]
+    calls = []
+
+    def fake_fetch(repos):
+        calls.append(repos)
+        return ([], []) if len(calls) == 1 else (fresh, [])
+
+    monkeypatch.setattr(P, "repos_sm_from_config", lambda: ["jcronq/alice"])
+    monkeypatch.setattr(P, "fetch_issues", fake_fetch)
+    monkeypatch.setattr(P, "ensure_review_notes", lambda *a, **kw: {"written": [], "deleted": []})
+
+    pollers._poll_pipeline_once()
+    assert len(calls) == 2
+    cached = pollers.get("pipeline")
+    assert cached["issues"] == fresh
+
+
+def test_poll_pipeline_once_fetch_exception_leaves_prior_cache(
+    tmp_path, monkeypatch
+):
+    """``fetch_issues`` raising a real exception also preserves the
+    prior cache — the outer ``except`` branch must not update."""
+    cfg = _poll_cfg(tmp_path)
+    pollers = OverviewPollers(cfg, pipeline_poll=0.01)
+    prior = [{"repo": "jcronq/alice", "number": 1, "state": "selected", "title": "t"}]
+    pollers._set("pipeline", {"issues": prior, "failed": []})
+
+    def boom(repos):
+        raise RuntimeError("gh timed out")
+
+    monkeypatch.setattr(P, "repos_sm_from_config", lambda: ["jcronq/alice"])
+    monkeypatch.setattr(P, "fetch_issues", boom)
+
+    pollers._poll_pipeline_once()
+    cached = pollers.get("pipeline")
+    assert cached == {"issues": prior, "failed": []}
