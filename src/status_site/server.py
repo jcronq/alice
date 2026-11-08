@@ -1745,28 +1745,75 @@ class OverviewPollers:
                 print(f"status_site: done_today poll failed: {e!r}", flush=True)
             self.stop.wait(self._done_today_poll)
 
-    def _loop_pipeline(self) -> None:
-        while not self.stop.is_set():
-            try:
-                repos = _pipeline.repos_sm_from_config()
+    def _poll_pipeline_once(self) -> None:
+        """One iteration of the pipeline poll.
+
+        Extracted from :meth:`_loop_pipeline` so the transient-empty
+        guard (issue #858) is testable without driving the full loop.
+        Writes the pipeline cache entry, runs the review-note sync,
+        and swallows the usual per-source exceptions.
+        """
+        try:
+            repos = _pipeline.repos_sm_from_config()
+            issues, failed = _pipeline.fetch_issues(repos)
+            # Issue #858 — source-side guard against transient-empty
+            # fetches overwriting a known-good cache. The DB reader
+            # swallows ``sqlite3.Error`` and returns ``([], [])`` on
+            # a locked / mid-write database; that transient empty
+            # then reached the SSE snapshot and wiped the Overview.
+            # If the fetch returned no issues BUT the prior cache
+            # held some, re-check once before trusting the empty.
+            prior = self.get("pipeline") or {}
+            prior_issues = prior.get("issues") or []
+            if not issues and prior_issues:
+                print(
+                    "status_site: pipeline poll returned empty with "
+                    f"non-empty prior ({len(prior_issues)} issues); "
+                    "re-fetching once before trusting the empty",
+                    flush=True,
+                )
                 issues, failed = _pipeline.fetch_issues(repos)
-                self._set("pipeline", {"issues": issues, "failed": failed})
-                # Issue #719: synthesise review notes for every open
-                # ``sm:design_review`` + ``art:code`` issue so the
-                # Review tab has something to render. Isolate failures
-                # so a bad disk write doesn't stop the pipeline cache
-                # from updating.
-                try:
-                    _pipeline.ensure_review_notes(
-                        issues, self.cfg.status_dir / "notes"
-                    )
-                except Exception as e:  # noqa: BLE001
+                if not issues:
+                    # Still empty on the corroborating fetch — keep
+                    # the prior cache instead of painting the UI
+                    # blank. ensure_review_notes runs on the
+                    # prior-known-good rows so stale notes aren't
+                    # swept out from under the Review tab.
                     print(
-                        f"status_site: ensure_review_notes failed: {e!r}",
+                        "status_site: pipeline corroborating fetch "
+                        "also empty; keeping prior cache",
                         flush=True,
                     )
+                    issues_for_notes = prior_issues
+                else:
+                    self._set(
+                        "pipeline",
+                        {"issues": issues, "failed": failed},
+                    )
+                    issues_for_notes = issues
+            else:
+                self._set("pipeline", {"issues": issues, "failed": failed})
+                issues_for_notes = issues
+            # Issue #719: synthesise review notes for every open
+            # ``sm:design_review`` + ``art:code`` issue so the
+            # Review tab has something to render. Isolate failures
+            # so a bad disk write doesn't stop the pipeline cache
+            # from updating.
+            try:
+                _pipeline.ensure_review_notes(
+                    issues_for_notes, self.cfg.status_dir / "notes"
+                )
             except Exception as e:  # noqa: BLE001
-                print(f"status_site: pipeline poll failed: {e!r}", flush=True)
+                print(
+                    f"status_site: ensure_review_notes failed: {e!r}",
+                    flush=True,
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"status_site: pipeline poll failed: {e!r}", flush=True)
+
+    def _loop_pipeline(self) -> None:
+        while not self.stop.is_set():
+            self._poll_pipeline_once()
             self.stop.wait(self._pipeline_poll)
 
     def start(self) -> None:
