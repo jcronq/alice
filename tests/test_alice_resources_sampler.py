@@ -10,11 +10,9 @@ import json
 import sqlite3
 from pathlib import Path
 
-import pytest
 
 from alice_resources import sampler
 from alice_resources.sampler import (
-    PsRow,
     bg_id_for_args,
     bg_id_for_cwd,
     parse_ps_output,

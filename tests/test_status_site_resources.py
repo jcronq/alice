@@ -6,7 +6,6 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import pytest
 
 from alice_state_db.schema import apply_schema
 from status_site.sources import resources as R
