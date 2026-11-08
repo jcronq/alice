@@ -648,3 +648,80 @@ def test_history_path_shell_for_unknown_id_still_serves_html(history_site):
     )
     assert status == 200
     assert headers.get("Content-Type", "").startswith("text/html")
+
+
+# ─── issue #858: OverviewPollers._pipeline_tick hold-on-failure ─────
+
+
+def test_pipeline_tick_holds_cache_when_fetch_fails_empty(tmp_path, monkeypatch):
+    """Three ticks against ``_pipeline_tick`` prove the hold-on-failure
+    contract: a failed+empty poll keeps prior cached issues; a
+    legitimately-empty-but-not-failed poll clears them.
+    """
+    import status_site.server as S
+
+    monkeypatch.setenv("ALICE_MIND", str(tmp_path / "mind"))
+    status = tmp_path / "status"
+    (status / "notes").mkdir(parents=True)
+    cfg = Config(
+        status_dir=status,
+        surface_dir=tmp_path / "surface",
+        upload_dir=tmp_path / "up",
+        key="k",
+        port=0,
+        host="127.0.0.1",
+    )
+    pollers = OverviewPollers(cfg)
+
+    # Stub out the config-reading helper so no real config file is needed.
+    monkeypatch.setattr(S._pipeline, "repos_sm_from_config", lambda: ["jcronq/alice"])
+    # Prevent note synthesis from doing real disk sweeps we don't care about.
+    monkeypatch.setattr(S._pipeline, "ensure_review_notes", lambda *a, **kw: None)
+
+    good_row = {
+        "repo": "jcronq/alice",
+        "number": 790,
+        "title": "live one",
+        "url": "https://github.com/jcronq/alice/issues/790",
+        "state": "selected",
+        "art": "code",
+        "updated_epoch": None,
+        "updated_at": "2026-11-07T10:00:00Z",
+        "body": "",
+        "components": [],
+    }
+
+    calls: list[tuple] = []
+    script = iter([
+        ([good_row], []),         # tick 1: healthy
+        ([], ["<db>"]),           # tick 2: failed + empty → hold
+        ([], []),                 # tick 3: genuinely empty → clear
+    ])
+
+    def _fake_fetch(repos):
+        calls.append(tuple(repos))
+        return next(script)
+
+    monkeypatch.setattr(S._pipeline, "fetch_issues", _fake_fetch)
+
+    # Tick 1 — healthy fetch populates the cache.
+    pollers._pipeline_tick()
+    cached = pollers.get("pipeline")
+    assert cached == {"issues": [good_row], "failed": []}
+
+    # Tick 2 — transient failure + empty issues. Cache MUST still
+    # return tick 1's issues (held).
+    pollers._pipeline_tick()
+    cached = pollers.get("pipeline")
+    assert cached["issues"] == [good_row], "held the known-good cache"
+    assert cached["failed"] == []  # still tick 1's cached value, untouched
+
+    # Tick 3 — fetch comes back genuinely empty with no failure.
+    # Cache clears to the empty-but-ok state.
+    pollers._pipeline_tick()
+    cached = pollers.get("pipeline")
+    assert cached == {"issues": [], "failed": []}
+
+    # Sanity: fetch_issues fired once per tick, same repo set each time.
+    assert len(calls) == 3
+    assert all(c == ("jcronq/alice",) for c in calls)

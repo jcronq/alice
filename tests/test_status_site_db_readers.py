@@ -140,6 +140,27 @@ def test_fetch_issues_from_db_missing_file_degrades_gracefully(tmp_path):
     assert rows == [] and failed == []
 
 
+def test_fetch_issues_from_db_sqlite_error_populates_failed(
+    seeded_db, monkeypatch
+):
+    """Issue #858: a transient ``sqlite3.Error`` during the SELECT must
+    surface as a non-empty ``failed`` list, distinct from
+    "genuinely-empty pipeline". The exact sentinel string is an
+    implementation detail — callers only care about truthiness.
+    """
+    import contextlib as _ctx
+
+    @_ctx.contextmanager
+    def _boom(*args, **kwargs):  # mimics connect()'s contextmanager shape
+        raise sqlite3.OperationalError("database is locked")
+        yield  # pragma: no cover — unreachable
+
+    monkeypatch.setattr(R, "connect", _boom)
+    rows, failed = R.fetch_issues_from_db(["jcronq/alice"])
+    assert rows == []
+    assert failed, "sqlite3.Error must surface a truthy failed list"
+
+
 def test_fetch_issues_from_db_includes_components_column(seeded_db):
     """Each row carries a ``components`` list drawn from ``item_components``."""
     import sqlite3
