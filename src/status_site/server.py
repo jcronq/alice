@@ -1745,26 +1745,57 @@ class OverviewPollers:
                 print(f"status_site: done_today poll failed: {e!r}", flush=True)
             self.stop.wait(self._done_today_poll)
 
+    def _pipeline_tick(self) -> None:
+        """Run one pipeline poll, with issue #858 hold-on-failure logic.
+
+        Extracted from ``_loop_pipeline`` so the tick-level behaviour
+        can be exercised deterministically in tests — the outer loop
+        is purely timing/stop-event plumbing.
+        """
+        repos = _pipeline.repos_sm_from_config()
+        issues, failed = _pipeline.fetch_issues(repos)
+        # Issue #858: when the fetch failed AND came back empty, hold
+        # the last-known-good cached issues instead of blanking every
+        # consumer of ``pollers.get("pipeline")`` (SSE, /index.md,
+        # _render_in_flight, _render_your_todo). Strictly additive:
+        # when ``failed`` is empty the behaviour is identical to
+        # before, including the "pipeline really did clear" case where
+        # ``issues == []`` with ``failed == []``.
+        prev_value = self.get("pipeline")
+        prev_issues = (
+            prev_value.get("issues")
+            if isinstance(prev_value, dict)
+            else None
+        ) or []
+        if failed and not issues and prev_issues:
+            print(
+                f"status_site: pipeline poll: {failed!r} failed, "
+                f"keeping {len(prev_issues)} cached issue(s)",
+                flush=True,
+            )
+            return
+        self._set("pipeline", {"issues": issues, "failed": failed})
+        # Issue #719: synthesise review notes for every open
+        # ``sm:design_review`` + ``art:code`` issue so the Review tab
+        # has something to render. Isolate failures so a bad disk
+        # write doesn't stop the pipeline cache from updating. Gated
+        # behind the same "actually updated the cache" guard as _set
+        # (#858) so a transient empty-and-failed poll doesn't sweep
+        # every synthesised note off disk.
+        try:
+            _pipeline.ensure_review_notes(
+                issues, self.cfg.status_dir / "notes"
+            )
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"status_site: ensure_review_notes failed: {e!r}",
+                flush=True,
+            )
+
     def _loop_pipeline(self) -> None:
         while not self.stop.is_set():
             try:
-                repos = _pipeline.repos_sm_from_config()
-                issues, failed = _pipeline.fetch_issues(repos)
-                self._set("pipeline", {"issues": issues, "failed": failed})
-                # Issue #719: synthesise review notes for every open
-                # ``sm:design_review`` + ``art:code`` issue so the
-                # Review tab has something to render. Isolate failures
-                # so a bad disk write doesn't stop the pipeline cache
-                # from updating.
-                try:
-                    _pipeline.ensure_review_notes(
-                        issues, self.cfg.status_dir / "notes"
-                    )
-                except Exception as e:  # noqa: BLE001
-                    print(
-                        f"status_site: ensure_review_notes failed: {e!r}",
-                        flush=True,
-                    )
+                self._pipeline_tick()
             except Exception as e:  # noqa: BLE001
                 print(f"status_site: pipeline poll failed: {e!r}", flush=True)
             self.stop.wait(self._pipeline_poll)

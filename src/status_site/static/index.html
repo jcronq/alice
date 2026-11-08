@@ -539,31 +539,55 @@ function makeSseParser(onMessage) {
 }
 
 // ── 4. reducer ────────────────────────────────────────────────────
-// snapshot replaces every section + stamps its ts; section.update
-// replaces one. ts is used by freshness tiles to tint by age.
+// snapshot merges sections per-key (issue #858): an incoming empty
+// section payload never clobbers a prior meaningful one, so a
+// tab-switch-driven reconnect that happens to land on a transiently-
+// empty pipeline poll doesn't blank the UI. section.update follows the
+// same rule. ts is used by freshness tiles to tint by age — a kept
+// prior section keeps its old ts so freshness doesn't claim it's fresh.
 const INITIAL = {
   sections: {}, ts: {},
   connected: false, error: null,
 };
+// A section payload is "meaningful" if any of its array-valued fields
+// (pipeline/rows/prs/tasks/surfaces/running/jobs/a2ui/...) is non-empty.
+// Sections with no array fields at all (pure markdown/string payloads)
+// always return false here, which keeps the merge rule a no-op for them —
+// they never suffered from this bug and should keep updating live.
+function sectionIsMeaningful(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  return Object.values(payload).some(v => Array.isArray(v) && v.length > 0);
+}
 function reducer(state, event) {
   switch (event.type) {
     case "snapshot": {
-      const next = {};
-      for (const k of Object.keys(event.sections || {})) next[k] = event.ts;
-      return {
-        ...state,
-        sections: event.sections || {},
-        ts: {...state.ts, ...next},
-        connected: true, error: null,
-      };
+      const incoming = event.sections || {};
+      const sections = {...state.sections};
+      const ts = {...state.ts};
+      for (const [k, v] of Object.entries(incoming)) {
+        const prior = state.sections[k];
+        if (sectionIsMeaningful(v) || !sectionIsMeaningful(prior)) {
+          sections[k] = v;
+          ts[k] = event.ts;
+        }
+        // else: incoming is empty and prior was meaningful — keep prior,
+        // including its old ts, so freshness tiles don't claim it's fresh.
+      }
+      return {...state, sections, ts, connected: true, error: null};
     }
-    case "section.update":
+    case "section.update": {
       if (!event.name) return state;
+      const prior = state.sections[event.name];
+      const incoming = event.data || {};
+      if (!sectionIsMeaningful(incoming) && sectionIsMeaningful(prior)) {
+        return state;   // drop the transient-empty delta
+      }
       return {
         ...state,
-        sections: {...state.sections, [event.name]: event.data || {}},
+        sections: {...state.sections, [event.name]: incoming},
         ts: {...state.ts, [event.name]: event.ts},
       };
+    }
     case "__status":
       return {
         ...state,

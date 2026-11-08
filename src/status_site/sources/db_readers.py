@@ -245,7 +245,13 @@ def fetch_issues_from_db(
                 r["components"].sort()
     except sqlite3.Error as exc:
         log.warning("db_readers.fetch_issues_from_db: %r", exc)
-        return [], []
+        # Issue #858: surface the failure distinctly from "genuinely
+        # empty" so OverviewPollers can hold the last-known-good cache
+        # instead of clobbering it with the transient empty. The exact
+        # sentinel is an implementation detail; callers only need
+        # truthiness. "<db>" mirrors the repo-string shape the GH-mode
+        # sibling path in ``pipeline.fetch_issues`` puts here.
+        return [], ["<db>"]
 
     rows.sort(key=lambda r: (_STATE_RANK[r["state"]], r["repo"], r["number"]))
     return rows, []
