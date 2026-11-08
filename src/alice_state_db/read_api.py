@@ -97,22 +97,45 @@ def connect(
     """
     path = pathlib.Path(db_path or DEFAULT_DB_PATH)
     if read_only:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        # Create the parent dir if we can — on a read-only bind-mount
+        # (e.g. status-site has /srv/state mounted RO) mkdir fails
+        # with OSError; swallow it because a RO reader can't create
+        # state anyway.
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
         # Run apply_schema on a scratch RW handle. All DDL inside
         # apply_schema uses CREATE ... IF NOT EXISTS, so two concurrent
         # callers racing on this line is harmless: whoever lands second
         # either no-ops or hits a "table already exists" OperationalError
         # that we swallow.
-        tmp = sqlite3.connect(str(path))
+        #
+        # Issue #855: when the DB file lives on a read-only bind-mount
+        # (status-site reader has /srv/state mounted RO even though
+        # the writer side owns it RW), opening the file RW raises
+        # OperationalError("unable to open database file"). The RO
+        # mount is proof a writer-side process owns the schema, so
+        # we skip the upsert and open RO directly — the whole point
+        # of the schema upsert is to catch stale on-disk schemas, and
+        # a RO reader by construction can't be the one that stamped
+        # it anyway.
         try:
-            apply_schema(tmp)
+            tmp = sqlite3.connect(str(path))
         except sqlite3.OperationalError:
-            # Concurrent apply_schema race: all statements are
-            # CREATE ... IF NOT EXISTS, so another writer's pass
-            # already covers us.
-            pass
-        finally:
-            tmp.close()
+            # RO mount (or otherwise-unwritable path). Skip the
+            # schema upsert — the writer side owns stamping.
+            tmp = None
+        if tmp is not None:
+            try:
+                apply_schema(tmp)
+            except sqlite3.OperationalError:
+                # Concurrent apply_schema race: all statements are
+                # CREATE ... IF NOT EXISTS, so another writer's pass
+                # already covers us.
+                pass
+            finally:
+                tmp.close()
         uri = f"file:{path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
     else:

@@ -157,3 +157,61 @@ def test_connect_rw_mode_also_works(tmp_path: pathlib.Path) -> None:
         conn.execute("INSERT INTO probe VALUES (1)")
         conn.commit()
     assert db.is_file()
+
+
+def test_connect_ro_on_readonly_mount_degrades_gracefully(
+    tmp_path: pathlib.Path,
+    monkeypatch,
+) -> None:
+    """Issue #855: RO-mount scenario (alice-status has ``/srv/state``
+    bind-mounted read-only) must not break reads.
+
+    Repro: the status-site container opens ``alice-state.db`` for
+    read via :func:`connect`, but the mount is read-only. The PR #854
+    schema-upsert path opened a scratch RW handle BEFORE the RO one;
+    on a RO mount that scratch open raises
+    ``OperationalError("unable to open database file")`` and takes
+    the Overview with it.
+
+    Fix: swallow the RW-open failure and fall straight through to the
+    ``mode=ro`` open — the writer side owns the schema stamp anyway.
+
+    Simulated here by monkeypatching ``sqlite3.connect`` for the first
+    (RW) open to raise ``OperationalError`` the same way a RO mount
+    would, while leaving the subsequent URI-mode RO open untouched.
+    """
+    # First seed a fully-schema'd DB from a real writer-side open so
+    # the RO reader has something to query.
+    db = tmp_path / "alice-state.db"
+    with read_api.connect(db, read_only=False) as conn:
+        from alice_state_db.schema import apply_schema
+
+        apply_schema(conn)
+
+    original = sqlite3.connect
+    calls: List[str] = []
+
+    def _simulated_ro_mount_connect(dsn, *args, **kwargs):
+        calls.append(str(dsn))
+        # The RW scratch open is `sqlite3.connect(str(path))` — no
+        # ``file:`` prefix, no ``uri=True``. The RO open uses
+        # ``file:...?mode=ro`` with ``uri=True``. Only the former
+        # fails on a RO mount.
+        if not kwargs.get("uri") and "mode=ro" not in str(dsn):
+            raise sqlite3.OperationalError("unable to open database file")
+        return original(dsn, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", _simulated_ro_mount_connect)
+
+    with read_api.connect(db) as conn:
+        # The reader must open successfully and be able to query a
+        # table the writer-side ``apply_schema`` created.
+        row = conn.execute(
+            "SELECT COUNT(*) FROM items"
+        ).fetchone()
+    assert row[0] == 0
+    # Sanity: both the RW probe (which raised) and the RO URI open ran.
+    assert any("mode=ro" in c for c in calls), (
+        "RO URI open never happened — the RW failure should fall through, "
+        f"not short-circuit. calls={calls!r}"
+    )
