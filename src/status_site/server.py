@@ -1013,6 +1013,21 @@ def parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
     return data, body
 
 
+def _render_frontmatter(fm: dict[str, str], body: str) -> str:
+    """Round-trip helper for :func:`parse_frontmatter`.
+
+    Writes each ``(key, value)`` pair back as ``key: value`` lines
+    between ``---`` fences, followed by the body verbatim. Key order
+    is iteration order of ``fm`` (dict preserves insertion order on
+    3.7+). Values are written raw (no quoting); callers that need
+    quoted or complex values should serialize them into the string
+    before passing in. Plain scalar values round-trip cleanly: parse →
+    mutate → render → parse again yields an equivalent dict.
+    """
+    lines = [f"{k}: {v}" for k, v in fm.items()]
+    return "---\n" + "\n".join(lines) + "\n---\n" + body
+
+
 def parse_depends_on(value: str) -> list[str]:
     """``depends_on: [a, b]`` / ``a, b`` frontmatter value -> deduped safe slugs."""
     out: list[str] = []
@@ -1126,6 +1141,7 @@ def collect_bugs(status_dir: Path) -> tuple[dict[str, list[dict]], float]:
                 "updated_ts": st.st_mtime,
                 "estimate_usd": estimate_usd,
                 "actual_usd": actual_usd,
+                "approved_at": (fm.get("approved_at") or "").strip(),
                 "depends_on": parse_depends_on(fm.get("depends_on", "")),
             }
         )
@@ -1135,10 +1151,19 @@ def collect_bugs(status_dir: Path) -> tuple[dict[str, list[dict]], float]:
     # Review section): a draft PR is the hand-off from worker back to
     # him, so it deserves its own heading above the still-cooking
     # workers.
+    #
+    # Once Jason clicks Approve, ``handle_bug_action`` stamps
+    # ``approved_at`` into the bug's frontmatter — from that moment on
+    # the tile stays in ``in-progress`` (with a Chat steering button)
+    # instead of flipping back to ``waiting-on-review`` on the next
+    # ``collect_bugs`` pass. The tile only leaves ``in-progress`` once
+    # Speaking rewrites ``status:`` to ``fixed`` / ``wontfix`` /
+    # ``dispatch-failed`` after acting on GitHub.
     ready = []
     cooking = []
     for b in buckets["in-progress"]:
-        (ready if b.get("pr_url") else cooking).append(b)
+        is_pending_review = b.get("pr_url") and not b.get("approved_at")
+        (ready if is_pending_review else cooking).append(b)
     buckets["waiting-on-review"] = ready
     buckets["in-progress"] = cooking
     for key in buckets:
@@ -2900,6 +2925,25 @@ def handle_bug_action(cfg: Config, d: dict) -> dict:
             n += 1
             dest = cfg.surface_dir / fname.replace(".md", f"-{n}.md")
         os.rename(tmp, dest)
+
+        # Approve additionally stamps ``approved_at`` into the bug file
+        # so ``collect_bugs`` stops promoting it back to
+        # ``waiting-on-review`` on the next pass. Reject leaves the
+        # file untouched — the surface alone tells Speaking to bounce
+        # the PR. Done under the same ``cfg.lock`` as the surface
+        # write so a reader can't race onto a torn frontmatter.
+        if action == "approve":
+            bug_path = cfg.status_dir / f"bug-{report_id}.md"
+            try:
+                bug_text = bug_path.read_text(errors="replace")
+            except OSError:
+                bug_text = None
+            if bug_text is not None:
+                fm, body = parse_frontmatter(bug_text)
+                fm["approved_at"] = datetime.now(timezone.utc).isoformat(
+                    timespec="seconds"
+                )
+                bug_path.write_text(_render_frontmatter(fm, body))
 
     return {"ok": True, "action": action, "report_id": report_id}
 
