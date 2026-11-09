@@ -195,11 +195,22 @@ def test_first_frame_is_snapshot_with_every_section(site):
             "alice_queue",
             "done_today",
             "known_issues",
+            # Issue #868: carved out of in_flight so stalled work
+            # doesn't pretend an agent is on it right now.
+            "in_flight",
+            "blocked",
         }
         assert expected <= set(snap["sections"].keys())
         # Each section carries markdown.
         for name in expected:
             assert "markdown" in snap["sections"][name]
+        # With no blocked rows, the section renders the empty-state
+        # markdown — proves the renderer is wired even on the empty
+        # path.
+        assert snap["sections"]["blocked"]["markdown"] == "*(nothing blocked)*"
+        assert snap["sections"]["blocked"]["rows"] == []
+        # And the "in flight" tier is empty too in this fixture.
+        assert snap["sections"]["in_flight"]["pipeline"] == []
         # The hand-zone text we wrote is in waiting_on_you.
         assert "hand zone initial" in snap["sections"]["waiting_on_you"]["markdown"]
     finally:

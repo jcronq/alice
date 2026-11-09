@@ -176,6 +176,53 @@ def test_render_markdown_minimal():
     assert P.render_markdown([{}, {}], [], [{}]).startswith("2 items in pipeline")
 
 
+# ─── partition_by_state_bucket (issue #868) ────────────────────────
+
+
+def test_partition_by_state_bucket_routes_each_state_to_right_bucket():
+    """Carve the pipeline by *liveness*: in-flight vs blocked vs queued
+    vs everything else. Jason's mental model: "in flight means there's
+    an actual agent working it right now" — ``building`` / ``reviewing``
+    only. ``blocked`` is stalled; ``selected`` / ``designed`` are queued."""
+    rows = [
+        {"state": "building", "number": 1},
+        {"state": "reviewing", "number": 2},
+        {"state": "blocked", "number": 3},
+        {"state": "selected", "number": 4},
+        {"state": "designed", "number": 5},
+        {"state": "draft", "number": 6},
+        {"state": "designing", "number": 7},
+        {"state": "design_review", "number": 8},
+        {"state": "", "number": 9},
+    ]
+    buckets = P.partition_by_state_bucket(rows)
+    assert [r["number"] for r in buckets["in_flight"]] == [1, 2]
+    assert [r["number"] for r in buckets["blocked"]] == [3]
+    assert [r["number"] for r in buckets["queued"]] == [4, 5]
+    assert [r["number"] for r in buckets["other"]] == [6, 7, 8, 9]
+
+
+def test_partition_by_state_bucket_preserves_input_order_inside_bucket():
+    rows = [
+        {"state": "reviewing", "n": 2},
+        {"state": "building", "n": 1},
+        {"state": "reviewing", "n": 3},
+    ]
+    buckets = P.partition_by_state_bucket(rows)
+    assert [r["n"] for r in buckets["in_flight"]] == [2, 1, 3]
+
+
+def test_partition_by_state_bucket_empty_input_returns_empty_buckets():
+    buckets = P.partition_by_state_bucket([])
+    assert buckets == {"in_flight": [], "blocked": [], "queued": [], "other": []}
+
+
+def test_partition_state_constants_are_disjoint():
+    assert not (P.INFLIGHT_STATES & P.BLOCKED_STATES)
+    assert not (P.INFLIGHT_STATES & P.QUEUED_STATES)
+    assert not (P.BLOCKED_STATES & P.QUEUED_STATES)
+
+
 # ─── integration through the broadcaster ───────────────────────────
 
 
@@ -237,6 +284,103 @@ def test_alice_queue_without_pollers_still_renders(tmp_path, monkeypatch):
     assert data["markdown"] == "*(queue clear)*"
 
 
+# ─── in_flight vs blocked carve-out (issue #868) ───────────────────
+
+
+def _mk_cfg_with_pipeline_states(tmp_path, states, monkeypatch):
+    """Spin up a Config whose pollers cache has one issue per listed state.
+
+    Returns the Config with ``pollers`` populated. Surfaces/tasks dirs
+    exist but are empty — the carve-out tests focus on pipeline rows.
+    """
+    monkeypatch.setenv("ALICE_MIND", str(tmp_path / "mind"))
+    (tmp_path / "status").mkdir()
+    (tmp_path / "surface").mkdir()
+    cfg = Config(
+        status_dir=tmp_path / "status",
+        surface_dir=tmp_path / "surface",
+        upload_dir=tmp_path / "up",
+        key="k",
+        port=0,
+        host="127.0.0.1",
+    )
+    cfg.pollers = OverviewPollers(cfg)
+    issues = [_issue(100 + i, f"sm:{s}", "art:code") for i, s in enumerate(states)]
+    rows, failed = P.fetch_issues(["jcronq/alice"], runner=_runner({"jcronq/alice": issues}))
+    cfg.pollers._set("pipeline", {"issues": rows, "failed": failed})
+    return cfg
+
+
+def test_section_factory_registers_blocked_section(tmp_path, monkeypatch):
+    """``blocked`` is a first-class section alongside ``in_flight``."""
+    cfg = _mk_cfg_with_pipeline_states(tmp_path, [], monkeypatch)
+    renderers = section_renderers(cfg)
+    assert "blocked" in renderers
+    assert "in_flight" in renderers
+
+
+def test_render_blocked_renders_blocked_rows_only(tmp_path, monkeypatch):
+    """Feeding a mix of states: only ``blocked`` appears in the payload."""
+    cfg = _mk_cfg_with_pipeline_states(
+        tmp_path, ["building", "reviewing", "blocked", "selected"], monkeypatch
+    )
+    data = section_renderers(cfg)["blocked"]()
+    assert data["markdown"] == "1 blocked"
+    assert [r["state"] for r in data["rows"]] == ["blocked"]
+    assert data["pipeline_failed"] == []
+    # Row carries the standard shape: repo, number, title, link, age.
+    row = data["rows"][0]
+    assert row["repo"] == "jcronq/alice"
+    assert row["number"] and row["link"] and row["title"]
+
+
+def test_render_blocked_empty_state(tmp_path, monkeypatch):
+    """No blocked rows → placeholder markdown + empty rows list."""
+    cfg = _mk_cfg_with_pipeline_states(
+        tmp_path, ["building", "reviewing"], monkeypatch
+    )
+    data = section_renderers(cfg)["blocked"]()
+    assert data["markdown"] == "*(nothing blocked)*"
+    assert data["rows"] == []
+
+
+def test_render_in_flight_excludes_blocked_and_queued(tmp_path, monkeypatch):
+    """Regression: a blocked row must NOT appear in ``in_flight.pipeline``.
+
+    This is the whole point of issue #868 — Jason's "In flight" tier
+    stopped meaning "an agent is working this" once ``sm:blocked`` rows
+    started piling up there.
+    """
+    cfg = _mk_cfg_with_pipeline_states(
+        tmp_path,
+        ["building", "reviewing", "blocked", "selected", "designed"],
+        monkeypatch,
+    )
+    data = section_renderers(cfg)["in_flight"]()
+    states = sorted(r["state"] for r in data["pipeline"])
+    assert states == ["building", "reviewing"]
+    assert "blocked" not in {r["state"] for r in data["pipeline"]}
+    # ``n`` count only counts in-flight pipeline rows (plus running /
+    # surfaces / tasks — none in this fixture).
+    assert data["markdown"] == "2 in flight"
+    # pipeline_by_component is derived from the in-flight subset too.
+    comp_states = {r["state"] for g in data["pipeline_by_component"] for r in g["rows"]}
+    assert comp_states <= {"building", "reviewing"}
+
+
+def test_render_in_flight_nothing_when_only_blocked_or_queued(tmp_path, monkeypatch):
+    """If everything is blocked or queued, in-flight tier reads empty."""
+    cfg = _mk_cfg_with_pipeline_states(
+        tmp_path, ["blocked", "selected", "designed"], monkeypatch
+    )
+    data = section_renderers(cfg)["in_flight"]()
+    assert data["pipeline"] == []
+    assert data["markdown"] == "*(nothing in flight)*"
+    # But the blocked tier picks it up.
+    blocked = section_renderers(cfg)["blocked"]()
+    assert [r["state"] for r in blocked["rows"]] == ["blocked"]
+
+
 # ─── static assets ─────────────────────────────────────────────────
 
 
@@ -249,6 +393,16 @@ def test_shell_uses_pipeline_board_and_state_pills_are_distinct():
         assert heading in html
     for cls in ("sm-designing", "sm-building", "sm-reviewing"):
         assert f".fx-pill.{cls}" in css
+
+
+def test_shell_defines_blocked_tier_and_board():
+    """Issue #868: the client shell separates ``blocked`` from ``in_flight``."""
+    static = Path(__file__).resolve().parent.parent / "src" / "status_site" / "static"
+    html = (static / "index.html").read_text()
+    # Tier wired in TIERS config and section renderer dispatch.
+    assert 'id: "blocked"' in html
+    assert 'sections: ["blocked"]' in html
+    assert "BlockedBoard" in html
 
 
 # ─── review-note synthesis (issue #719) ─────────────────────────────

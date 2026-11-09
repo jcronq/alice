@@ -498,7 +498,8 @@ applyTheme();
 // thinking's queue and system health.
 const TIERS = [
   {id: "top", title: "Waiting on you", hint: "your next action", sections: ["your_todo"]},
-  {id: "middle", title: "In flight", hint: "Alice's active work — nothing needed from you", sections: ["in_flight"]},
+  {id: "middle", title: "In flight", hint: "agent actively working right now", sections: ["in_flight"]},
+  {id: "blocked", title: "Blocked", hint: "stalled, needs manual unblock", sections: ["blocked"]},
   {id: "bottom", title: "Recent", hint: "already handled", sections: ["done_today"]},
   {id: "thinking", title: "Thinking queue", aside: true, sections: ["thinking_queue"]},
   {id: "health", title: "System health", aside: true, sections: ["system_health"]},
@@ -2004,6 +2005,22 @@ function InFlightBoard({data, nowMs}) {
     }),
   );
 }
+// Blocked tier (issue #868): pipeline-shaped rows sitting on
+// ``sm:blocked`` — stalled, needs a manual unblock. Keeps the shape
+// of PipelineIssuesTable so sorting/pills carry over, but has no
+// surfaces/tasks/running subgroups (those aren't blocked work).
+function BlockedBoard({data}) {
+  const d = data || {};
+  const rows = d.rows || [];
+  if (!rows.length) {
+    return h("p", {style: {color: "var(--color-fg-muted)", margin: 0}},
+      "(nothing blocked)");
+  }
+  return h(PipelineGroup, {title: "Blocked", count: rows.length},
+    h(PipelineIssuesTable, {
+      rows: rows.map(r => ({...r, __key: (r.repo || "") + "#" + r.number})),
+    }));
+}
 function ThinkingQueueBoard({data}) {
   const d = data || {};
   if (!d.rows || !d.rows.length) {
@@ -2447,6 +2464,8 @@ function SectionTile({name, data, ts, nowMs}) {
     inner = h(YourTodoBoard, {data, nowMs});
   } else if (name === "in_flight") {
     inner = h(InFlightBoard, {data, nowMs});
+  } else if (name === "blocked") {
+    inner = h(BlockedBoard, {data});
   } else if (name === "done_today") {
     inner = h(DoneTodayList, {
       prs: data && data.prs,

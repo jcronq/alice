@@ -60,6 +60,22 @@ PIPELINE_STATES: tuple[str, ...] = (
 )
 _STATE_RANK = {s: i for i, s in enumerate(PIPELINE_STATES)}
 
+#: States where an agent is actively doing something *right now*
+#: (Overview "In flight" tier). Jason's mental model: in-flight means
+#: there is live work on the item. ``building`` and ``reviewing`` are
+#: the only states that satisfy that today — ``selected`` / ``designed``
+#: are queued, ``blocked`` is stalled waiting on a manual unblock.
+INFLIGHT_STATES: frozenset[str] = frozenset({"building", "reviewing"})
+
+#: Blocked work — stalled, needs a manual unblock. Visible, but not
+#: "in flight" (see :data:`INFLIGHT_STATES`).
+BLOCKED_STATES: frozenset[str] = frozenset({"blocked"})
+
+#: Queued work — waiting for an agent to pick it up (nothing is
+#: running yet). Separated out so the Overview can render a queue tier
+#: without conflating it with live work.
+QUEUED_STATES: frozenset[str] = frozenset({"selected", "designed"})
+
 #: An issue carrying any of these is out of the active pipeline even if
 #: a stale intermediate label is still attached. ``sm:blocked`` is
 #: deliberately NOT excluded — Jason wants blocked work visible so
@@ -268,6 +284,42 @@ def sort_rows(rows: Sequence[dict]) -> list[dict]:
         )
 
     return sorted(rows, key=key)
+
+
+def partition_by_state_bucket(rows: Sequence[dict]) -> dict[str, list[dict]]:
+    """Carve pipeline rows into ``in_flight`` / ``blocked`` / ``queued`` / ``other``.
+
+    - ``in_flight`` → rows whose ``state`` is in :data:`INFLIGHT_STATES`
+      (``building`` or ``reviewing``). These are items with an agent
+      actively working them.
+    - ``blocked`` → rows in :data:`BLOCKED_STATES` (``blocked``). Stalled,
+      needs manual unblock — visible but outside the in-flight tier.
+    - ``queued`` → rows in :data:`QUEUED_STATES` (``selected`` /
+      ``designed``). Waiting for an agent to pick them up.
+    - ``other`` → everything else (draft / designing / design_review /
+      unknown). Kept so callers can still find a row if they look.
+
+    Pure function. Row order inside each bucket is preserved from the
+    input — callers that want a particular order should :func:`sort_rows`
+    afterward.
+    """
+    out: dict[str, list[dict]] = {
+        "in_flight": [],
+        "blocked": [],
+        "queued": [],
+        "other": [],
+    }
+    for r in rows:
+        state = str(r.get("state") or "")
+        if state in INFLIGHT_STATES:
+            out["in_flight"].append(r)
+        elif state in BLOCKED_STATES:
+            out["blocked"].append(r)
+        elif state in QUEUED_STATES:
+            out["queued"].append(r)
+        else:
+            out["other"].append(r)
+    return out
 
 
 def split_by_owner(issues: Sequence[dict]) -> dict[str, list[dict]]:
