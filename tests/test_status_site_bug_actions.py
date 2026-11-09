@@ -16,7 +16,7 @@ from __future__ import annotations
 import http.client
 import json
 import threading
-from datetime import datetime, timezone
+from datetime import datetime
 
 import pytest
 
