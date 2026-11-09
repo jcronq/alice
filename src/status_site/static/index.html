@@ -900,7 +900,7 @@ function applyDataModel(data, pointer, value) {
 // the switch maps each to the existing POST endpoint + payload shape
 // so ``handle_chat`` / ``handle_review_action`` on the server stay
 // untouched — A2UI only describes the UI around them.
-async function dispatchA2uiAction(kind, {text, slug, files, replyTo}) {
+async function dispatchA2uiAction(kind, {text, slug, files, replyTo, reportId}) {
   if (!KEY) return {ok: false, error: "no key"};
   if (kind === "chat.send") {
     const r = await fetch("/api/chat", {
@@ -924,6 +924,32 @@ async function dispatchA2uiAction(kind, {text, slug, files, replyTo}) {
     });
     const j = await r.json().catch(() => ({}));
     return {ok: r.ok, status: r.status, error: j.error};
+  }
+  if (kind === "bug.approve" || kind === "bug.deny") {
+    // "Deny" in the UI maps to the backend verb ``reject`` so the
+    // dropped surface type (``status-bug-reject``) matches the SM
+    // vocabulary the rest of the codebase uses.
+    const action = kind === "bug.approve" ? "approve" : "reject";
+    const r = await fetch("/api/bug-action", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({key: KEY, report_id: reportId, action, notes: text || ""}),
+    });
+    const j = await r.json().catch(() => ({}));
+    return {ok: r.ok, status: r.status, error: j.error};
+  }
+  if (kind === "bug.chat") {
+    // Pure client-side: jump to the Chat tab with the composer
+    // pre-seeded to ``bug-<N>: `` so Jason can just type what he
+    // wants to say about this specific bug. Reuses the existing
+    // ``chatReplyStore`` wiring that the Chat tab's composer
+    // subscribes to (same hook message replies use), so no new
+    // server endpoint or store is needed.
+    try {
+      chatReplyStore.request({at: "", quote: "bug-" + reportId + ": ", preview: "bug-" + reportId});
+    } catch (_e) { /* store not yet live — fall through to nav */ }
+    if (location.hash !== "#chat") location.hash = "#chat";
+    return {ok: true};
   }
   return {ok: false, error: "unknown action: " + kind};
 }
@@ -1729,6 +1755,62 @@ async function runA2uiAction(id, props, surface, local, setLocal) {
   });
 }
 
+// Inline action strip (Approve / Deny / Chat) rendered on each
+// ``waiting-on-review`` bug tile (#TBD). Lives inside ``renderBoundList``
+// for the ``bugs-sections`` variant so the tile itself carries the
+// buttons — Jason can act without leaving the Bugs page.
+//
+// Each descriptor is ``{key, label, action, variant, report_id}``
+// shaped on the server (``sources.bugs._row_actions``). Click calls
+// ``dispatchA2uiAction`` directly with the per-row ``reportId``, so
+// we don't need to thread anything through the surface-level
+// ``local``/``runA2uiAction`` state machine that powers Chat +
+// per-item Review.
+function BugTileActions({actions}) {
+  const [busy, setBusy] = useState({});
+  const [status, setStatus] = useState({});
+  const onClick = async (a) => {
+    if (busy[a.key]) return;
+    let notes = "";
+    // Deny needs a reason so Speaking has something concrete to
+    // bounce back to the dispatcher; cancel aborts the whole thing.
+    if (a.action === "bug.deny") {
+      notes = window.prompt("Deny bug-" + a.report_id + " — why? (notes get posted on the PR)") || "";
+      if (!notes.trim()) return;
+    } else if (a.action === "bug.approve") {
+      // Approve is one click; a confirm() would make Jason do 2 taps
+      // on mobile, and the action is reversible by closing the merged
+      // PR via Deny on the next tile state. Keep the UX tight.
+    }
+    setBusy(s => ({...s, [a.key]: true}));
+    setStatus(s => ({...s, [a.key]: ""}));
+    const res = await dispatchA2uiAction(a.action, {
+      text: notes,
+      reportId: a.report_id,
+    });
+    setBusy(s => ({...s, [a.key]: false}));
+    setStatus(s => ({...s, [a.key]: res.ok
+      ? (a.action === "bug.chat" ? "" : "sent")
+      : ("Error: " + (res.error || res.status || "unknown"))}));
+  };
+  return h("div", {className: "a2ui-btn-row bug-tile-actions"},
+    actions.map(a => {
+      const variant = a.variant ? " a2ui-btn-" + String(a.variant).replace(/[^a-z0-9-]/gi, "") : "";
+      const label = busy[a.key] ? "…" : a.label;
+      const s = status[a.key] || "";
+      return h(React.Fragment, {key: a.key},
+        h("button", {
+          className: "a2ui-btn" + variant,
+          "data-testid": "bug-action-" + a.key + "-" + a.report_id,
+          disabled: busy[a.key] || !KEY,
+          onClick: () => onClick(a),
+        }, label),
+        s ? h("span", {className: "sse-status" + (s.startsWith("Error") ? " off" : "")}, s) : null,
+      );
+    }),
+  );
+}
+
 // Render `[text](https://url)` inline markdown links as <a> elements.
 function renderInlineLinks(s) {
   const out = [];
@@ -1763,6 +1845,13 @@ function renderBoundList(id, props, rows) {
                   r.stale ? "⚠ stale · " : null,
                   r.meta,
                   r.pr_url ? [r.meta ? " · " : "", h("a", {key: "pr", href: r.pr_url, target: "_blank", rel: "noopener"}, "PR")] : null)
+              : null,
+            // Inline Approve / Deny / Chat strip for waiting-on-review
+            // rows. The server flags each row with a non-empty
+            // ``actions`` list; other buckets omit it so no strip
+            // renders on Open / Fixed / Won't-fix / etc.
+            r.actions && r.actions.length
+              ? h(BugTileActions, {key: "acts", actions: r.actions})
               : null,
           )))
         : h("p", {className: "typing"}, "(none yet)"),

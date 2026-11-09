@@ -31,6 +31,12 @@ Stdlib-only (runs on a bare ``python:3.12-alpine`` image). Routes:
                                           auth): drops a ``type: status-review-<action>``
                                           surface into SURFACE_DIR. The server never calls
                                           ``gh``; Speaking executes the GitHub side.
+    POST /api/bug-action                  Approve / Deny a ``waiting-on-review`` bug tile
+                                          (shared-key auth, body ``{report_id, action, notes}``):
+                                          drops a ``type: status-bug-<action>`` surface into
+                                          SURFACE_DIR so Speaking merges or bounces the PR.
+                                          ``action`` is ``approve`` or ``reject`` (the "Deny"
+                                          button maps to ``reject`` to match SM vocabulary).
     POST /api/chat/react                  Add / remove an emoji reaction on a chat message (shared-key
                                           auth, body ``{at, emoji, action}``): appends to the
                                           ``.chat-reactions.jsonl`` sidecar, merged into ``GET /api/chat``
@@ -180,6 +186,31 @@ CHAT_SPEAKING_FOOTER = (
 
 REVIEW_SLUG_MAX = 60
 REVIEW_ACTIONS = ("approve", "modify", "reject")
+
+# Actions Jason can take on a ``waiting-on-review`` bug tile. ``approve``
+# means "merge the draft PR + close the bug"; ``reject`` means "bounce
+# the bug back to in-progress for rework" (the ``deny`` label in the UI
+# maps to this verb to match the existing SM vocabulary used by
+# ``REVIEW_ACTIONS``).
+BUG_ACTIONS = ("approve", "reject")
+
+BUG_SPEAKING_FOOTERS = {
+    "approve": (
+        "For Speaking: Jason APPROVED this bug-fix from the status site's Bugs "
+        "page ({url}?p=bugs, key-authenticated). Execute: merge the draft PR "
+        "({pr_url}) — mark ready for review, wait for CI SUCCESS, then merge. "
+        "Update ``bug-{report_id}.md`` frontmatter ``status: fixed``. Include "
+        "his notes in the merge comment if he gave any."
+    ),
+    "reject": (
+        "For Speaking: Jason DENIED this bug-fix (Bugs page, {url}?p=bugs). "
+        "Execute: close the draft PR ({pr_url}) without merging, post his "
+        "notes as a comment on it, then move ``bug-{report_id}.md`` back to "
+        "``status: in-progress`` with ``pr_url:`` cleared so the dispatcher "
+        "can re-queue (or so you can hand it off with context). Include his "
+        "notes for the next worker."
+    ),
+}
 
 REVIEW_SPEAKING_FOOTERS = {
     "approve": (
@@ -2754,6 +2785,125 @@ def _post_review_to_gh(
     return {"posted": True, "error": None}
 
 
+def read_bug(status_dir: Path, report_id: int) -> dict | None:
+    """One bug's frontmatter projection, or ``None`` if the file is missing.
+
+    Mirrors :func:`read_review` for ``waiting-on-review`` bugs — each
+    tile has a ``bug-<N>.md`` detail file with ``status`` / ``pr_url``
+    frontmatter already produced by the dispatcher. We re-read it on
+    every action so stale on-disk edits don't ship wrong semantics
+    (pr_url may have been cleared by a concurrent writer).
+    """
+    try:
+        rid = int(report_id)
+    except (TypeError, ValueError):
+        return None
+    p = status_dir / f"bug-{rid}.md"
+    try:
+        text = p.read_text(errors="replace")[:200_000]
+    except OSError:
+        return None
+    fm, body = parse_frontmatter(text)
+    title = (fm.get("title") or "").strip() or _bug_title_from_heading(body, rid)
+    return {
+        "report_id": rid,
+        "title": title,
+        "status": (fm.get("status") or "").strip().lower(),
+        "pr_url": (fm.get("pr_url") or "").strip(),
+        "repo": (fm.get("repo") or "").strip(),
+        "summary": (fm.get("summary") or "").strip(),
+    }
+
+
+def render_bug_action_surface(
+    cfg: Config, *, action: str, bug: dict, notes: str
+) -> str:
+    """Build the ``type: status-bug-<action>`` surface document.
+
+    Mirrors :func:`render_review_surface`: a Speaking-targeted markdown
+    note carrying the action + context + Jason's optional notes. The
+    footer tells Speaking exactly what to execute on GitHub.
+    """
+    report_id = bug["report_id"]
+    pr_url = bug.get("pr_url") or "(none)"
+    footer = BUG_SPEAKING_FOOTERS[action].format(
+        url=cfg.public_url, report_id=report_id, pr_url=pr_url
+    )
+    return f"""---
+priority: action
+type: status-bug-{action}
+reply_expected: false
+created: {time.strftime("%Y-%m-%d")}
+detail: status-bug-{report_id}
+source: status-site
+page: bugs
+report_id: {report_id}
+pr_url: {bug.get("pr_url", "")}
+action: {action}
+---
+
+# Jason chose to {action.upper()} a bug-fix on the Bugs page
+
+Item: bug-{report_id} — {bug.get("title") or ""}
+PR: {pr_url}
+
+His notes:
+{notes or "(no notes)"}
+
+---
+{footer}
+"""
+
+
+def handle_bug_action(cfg: Config, d: dict) -> dict:
+    """Validate one Approve / Deny click on a waiting-on-review bug tile.
+
+    Mirrors :func:`handle_review_action`: key-authed, writes a Speaking
+    surface into ``SURFACE_DIR``. The bug file itself is left alone —
+    the item stays in ``waiting-on-review`` until Speaking merges /
+    rejects on GitHub and updates the bug's frontmatter. Only bugs
+    with a ``pr_url`` (i.e. actually in the waiting-on-review bucket)
+    are actionable; anything else is a 400 so a stale client can't
+    approve a bug that's no longer waiting.
+    """
+    if not isinstance(d, dict):
+        raise ReplyError(400, "bad json")
+    if not hmac.compare_digest(str(d.get("key", "")).encode(), cfg.key.encode()):
+        raise ReplyError(403, "bad key")
+    action = str(d.get("action", "")).lower()
+    if action not in BUG_ACTIONS:
+        raise ReplyError(400, "bad action")
+    raw_id = d.get("report_id")
+    try:
+        report_id = int(raw_id)
+    except (TypeError, ValueError):
+        raise ReplyError(400, "bad report_id") from None
+    bug = read_bug(cfg.status_dir, report_id)
+    if bug is None:
+        raise ReplyError(404, "no such bug")
+    if not bug.get("pr_url"):
+        raise ReplyError(400, "bug is not waiting on review")
+    notes = str(d.get("notes", "")).strip()[:MAX_TEXT]
+
+    doc = render_bug_action_surface(cfg, action=action, bug=bug, notes=notes)
+    with cfg.lock:
+        cfg.surface_dir.mkdir(parents=True, exist_ok=True)
+        fname = (
+            f"{time.strftime('%Y-%m-%dT%H-%M-%S')}-status-bug-{action}-"
+            f"{report_id}.md"
+        )
+        tmp = cfg.surface_dir / f".tmp-bug-{os.getpid()}-{time.time_ns()}"
+        tmp.write_text(doc)
+        dest = cfg.surface_dir / fname
+        n = 1
+        while dest.exists():
+            n += 1
+            dest = cfg.surface_dir / fname.replace(".md", f"-{n}.md")
+        os.rename(tmp, dest)
+
+    return {"ok": True, "action": action, "report_id": report_id}
+
+
 def handle_review_action(cfg: Config, d: dict) -> dict:
     """Validate one Approve / Modify / Reject click and drop its surface.
 
@@ -3242,6 +3392,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/chat/react": handle_chat_react,
             "/api/waiting-order": handle_waiting_order,
             "/api/review-action": handle_review_action,
+            "/api/bug-action": handle_bug_action,
         }
         fn = handlers.get(route)
         if fn is None:
