@@ -530,6 +530,20 @@ li.fx-now {
   background: transparent;
   color: var(--color-ok);
 }
+/* Chat-variant button (tertiary action on waiting-on-review bug tiles).
+ * Visually matches .a2ui-btn-modify so the tile reads as "approve / deny
+ * / chat" with the chat action as the muted third option. */
+.a2ui-btn-chat {
+  background: transparent;
+  color: var(--color-ok);
+}
+/* Inline action strip on each waiting-on-review bug tile. The flex wrap
+ * keeps the three buttons on one row on desktop and lets them stack on
+ * narrow screens without overflowing the tile. */
+.bug-tile-actions {
+  margin-top: var(--dash-gap-xs);
+  flex-wrap: wrap;
+}
 .a2ui-pill {
   display: inline-block;
   padding: 0 .55rem;

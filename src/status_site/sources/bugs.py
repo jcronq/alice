@@ -104,6 +104,49 @@ def format_pricing_segment(estimate_usd: str, actual_usd: str) -> str:
 
 STALE_REVIEW_DAYS = 3
 
+# Inline action controls rendered on each ``waiting-on-review`` tile.
+# Each entry is ``(key, label, action, variant)`` where:
+#   * ``key`` is a stable slug used in React keys and the aria-label.
+#   * ``label`` is the user-visible button text.
+#   * ``action`` is the ``dispatchA2uiAction`` kind the client switches
+#     on to wire the click (``bug.approve`` / ``bug.deny`` / ``bug.chat``).
+#   * ``variant`` picks the button style — matches the existing
+#     ``.a2ui-btn-approve`` / ``.a2ui-btn-reject`` CSS so these tiles
+#     feel identical to the per-item Review page buttons.
+#
+# "Deny" is the user-visible label; the backend verb is ``reject`` so
+# the surface type (``status-bug-reject``) stays aligned with the SM
+# vocabulary the rest of the codebase already uses.
+WAITING_REVIEW_ACTIONS: tuple[tuple[str, str, str, str], ...] = (
+    ("approve", "Approve", "bug.approve", "approve"),
+    ("deny", "Deny", "bug.deny", "reject"),
+    ("chat", "Chat", "bug.chat", "chat"),
+)
+
+
+def _row_actions(bucket_key: str, report_id: int) -> list[dict]:
+    """Inline action-button descriptors for one row.
+
+    Only populated for the ``waiting-on-review`` bucket — every other
+    bucket returns ``[]`` so the client's row renderer stays bucket-
+    unaware (it just renders whatever ``actions`` the server hands it).
+    ``report_id`` rides each descriptor so the client's dispatcher can
+    POST ``/api/bug-action`` with the right target without the page
+    needing surface-level state.
+    """
+    if bucket_key != "waiting-on-review":
+        return []
+    return [
+        {
+            "key": key,
+            "label": label,
+            "action": action,
+            "variant": variant,
+            "report_id": report_id,
+        }
+        for key, label, action, variant in WAITING_REVIEW_ACTIONS
+    ]
+
 
 def _age(seconds: float) -> str:
     seconds = max(0, int(seconds))
@@ -172,6 +215,7 @@ def _bug_row(bucket_key: str, prefix: str, bug: dict) -> dict:
         "pr_url": pr_url,
         "pricing": pricing_segment,
         "depends_on": bug.get("depends_on") or [],
+        "actions": _row_actions(bucket_key, bug["report_id"]),
     }
 
 
