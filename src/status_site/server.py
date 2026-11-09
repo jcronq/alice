@@ -2127,26 +2127,56 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         owner = _pipeline.split_by_owner(
             _pipeline.issue_rows(pipe.get("issues") or [], now=now)
         )
+        # Jason's mental model: "in flight" means an agent is working it
+        # *right now*. Carve out the active subset so stalled (blocked)
+        # and queued (selected / designed) items don't inflate the tier.
+        # The separate Blocked tier renders ``owner["alice"]``'s blocked
+        # bucket via :func:`_render_blocked`.
+        buckets = _pipeline.partition_by_state_bucket(owner["alice"])
+        inflight_pipeline = buckets["in_flight"]
         # status-chat messages live on the Chat tab, not as tracked work.
         surfaces = _surface_rows(
             [it for it in scan_surfaces(cfg.surface_dir) if it.get("type") != "status-chat"],
             now,
         )
         tasks = _pipeline.scan_tasks(_tasks_dir(), now=now)
-        n = len(running["rows"]) + len(owner["alice"]) + len(surfaces) + len(tasks)
-        # Group the Alice-owned pipeline rows by src/ component bucket
+        n = len(running["rows"]) + len(inflight_pipeline) + len(surfaces) + len(tasks)
+        # Group the in-flight pipeline rows by src/ component bucket
         # (issue #821). ``pipeline`` stays on the payload for any
         # legacy consumer; the frontend prefers ``pipeline_by_component``
         # when present.
-        pipeline_by_component = _pipeline.group_rows_by_component(owner["alice"])
+        pipeline_by_component = _pipeline.group_rows_by_component(inflight_pipeline)
         return {
             "markdown": f"{n} in flight" if n else "*(nothing in flight)*",
             "running": running["rows"],
-            "pipeline": owner["alice"],
+            "pipeline": inflight_pipeline,
             "pipeline_by_component": pipeline_by_component,
             "surfaces": surfaces,
             "tasks": tasks,
             "pipeline_failed": list(pipe.get("failed") or []),
+        }
+
+    def _render_blocked() -> dict:
+        """Stalled pipeline rows — needs a manual unblock (issue #868).
+
+        Separated from ``in_flight`` because ``sm:blocked`` items have
+        no agent actively working them; leaving them in the "In flight"
+        tier made Jason think the dispatcher was alive when it wasn't.
+        Running/surfaces/tasks are orthogonal — only pipeline rows
+        appear here.
+        """
+        now = time.time()
+        pipe = (pollers.get("pipeline") if pollers else None) or {}
+        owner = _pipeline.split_by_owner(
+            _pipeline.issue_rows(pipe.get("issues") or [], now=now)
+        )
+        blocked_rows = _pipeline.partition_by_state_bucket(owner["alice"])["blocked"]
+        n = len(blocked_rows)
+        return {
+            "markdown": f"{n} blocked" if n else "*(nothing blocked)*",
+            "rows": blocked_rows,
+            "pipeline_failed": list(pipe.get("failed") or []),
+            "fetched_at": (pollers.fetched_at() if pollers else {}).get("pipeline"),
         }
 
     def _render_thinking_queue() -> dict:
@@ -2195,6 +2225,7 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
     return {
         "your_todo": _render_your_todo,
         "in_flight": _render_in_flight,
+        "blocked": _render_blocked,
         "thinking_queue": _render_thinking_queue,
         "system_health": _render_system_health,
         "running_now": _render_running_now,
