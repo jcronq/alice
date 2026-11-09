@@ -35,7 +35,6 @@ react. A stuck run eventually finishes via the runner's own
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import time
@@ -48,7 +47,6 @@ from ._agui import (
     RunError,
     RunFinished,
     RunStarted,
-    parse_run_agent_input,
 )
 
 
@@ -182,7 +180,6 @@ class AGUIRouter:
     # AgentContext — exposed to the runner via a thin adapter.
 
     def _make_context(self, state: _RunState) -> AgentContext:
-        router = self
         default_timeout = self._default_tool_timeout
 
         class _Ctx:

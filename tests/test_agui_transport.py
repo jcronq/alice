@@ -26,9 +26,7 @@ import httpx
 import pytest
 
 from alice_speaking.transports._agui import (
-    EventType,
     RunAgentInput,
-    RunFinished,
     RunStarted,
     TextMessageContent,
     TextMessageEnd,
@@ -41,7 +39,6 @@ from alice_speaking.transports._agui import (
 from alice_speaking.transports._agui_router import (
     AGUIRouter,
     AgentContext,
-    ToolCallResult,
 )
 from alice_speaking.transports.modern_mud import (
     KEY_HEADER,
@@ -200,7 +197,7 @@ def test_router_emits_run_started_and_finished():
             collected.append(line)
 
     asyncio.run(go())
-    types = [json.loads(l[6:])["type"] for l in collected]
+    types = [json.loads(ln[6:])["type"] for ln in collected]
     assert types == ["RUN_STARTED", "RUN_FINISHED"]
 
 
@@ -217,7 +214,7 @@ def test_router_run_error_on_runner_exception():
             collected.append(line)
 
     asyncio.run(go())
-    types = [json.loads(l[6:])["type"] for l in collected]
+    types = [json.loads(ln[6:])["type"] for ln in collected]
     assert types == ["RUN_STARTED", "RUN_ERROR"]
     err_payload = json.loads(collected[-1][6:])
     assert "fire" in err_payload["message"]
@@ -265,7 +262,7 @@ def test_router_resolve_tool_call_wakes_runner():
             collected.append(line)
 
     asyncio.run(go())
-    types = [json.loads(l[6:])["type"] for l in collected]
+    types = [json.loads(ln[6:])["type"] for ln in collected]
     assert types == [
         "RUN_STARTED",
         "TOOL_CALL_START",
