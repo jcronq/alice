@@ -42,9 +42,11 @@ import httpx
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+from ._agui import parse_run_agent_input
+from ._agui_router import AGUIRouter, AgentRunner, echo_runner
 from .base import (
     Capabilities,
     ChannelRef,
@@ -122,6 +124,7 @@ class ModernMudTransport:
         port: int = 8182,
         inbox_size: int = 64,
         callback_sender: CallbackSender = _httpx_post,
+        agui_runner: Optional[AgentRunner] = None,
     ) -> None:
         self._key = key
         self._admin_user_ids = set(admin_user_ids)
@@ -136,6 +139,13 @@ class ModernMudTransport:
         self._pending: dict[str, list[str]] = {}
         self._uvicorn_server: Optional[uvicorn.Server] = None
         self._server_task: Optional[asyncio.Task] = None
+        # AG-UI router for /alice/run + /alice/tool-result. The runner
+        # is injectable so production can wire the real LLM-driven
+        # loop while tests pin a scripted sequence (see
+        # ``tests/test_modern_mud_agui.py``). ``echo_runner`` is only
+        # a smoke-test stand-in; real traffic needs an injected
+        # runner.
+        self._agui_router = AGUIRouter(runner=agui_runner or echo_runner)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -275,7 +285,15 @@ class ModernMudTransport:
 
     def _build_app(self) -> Starlette:
         return Starlette(
-            routes=[Route("/api/modern-mud/turn", self._http_turn, methods=["POST"])]
+            routes=[
+                Route("/api/modern-mud/turn", self._http_turn, methods=["POST"]),
+                Route("/alice/run", self._http_alice_run, methods=["POST"]),
+                Route(
+                    "/alice/tool-result",
+                    self._http_alice_tool_result,
+                    methods=["POST"],
+                ),
+            ]
         )
 
     def _authorized(self, request: Request) -> bool:
@@ -320,6 +338,79 @@ class ModernMudTransport:
         except asyncio.QueueFull:
             return JSONResponse({"error": "queue full"}, status_code=503)
         return JSONResponse({"turn_id": turn_id}, status_code=202)
+
+    # ------------------------------------------------------------------
+    # /alice/run + /alice/tool-result — AG-UI companion endpoints.
+    #
+    # Same shared-key gate as /api/modern-mud/turn — the private host
+    # boundary is the first layer, HMAC on the companion POSTs is the
+    # second. Admin-gating of ``user_id`` happens on the game-server
+    # side (modern-mud's /Alice command handler already checks it)
+    # before any of these endpoints is ever called; keeping that gate
+    # off the daemon lets non-admin tests exercise the flow.
+
+    async def _http_alice_run(self, request: Request) -> Response:
+        if not self._authorized(request):
+            return JSONResponse({"error": "invalid key"}, status_code=401)
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            return JSONResponse({"error": "expected JSON body"}, status_code=400)
+        try:
+            input = parse_run_agent_input(payload)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        headers = {
+            # Starlette sets Content-Type for us from ``media_type``.
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable nginx buffering
+            "Connection": "keep-alive",
+        }
+        return StreamingResponse(
+            self._agui_router.iter_sse(input),
+            media_type="text/event-stream",
+            headers=headers,
+        )
+
+    async def _http_alice_tool_result(self, request: Request) -> Response:
+        if not self._authorized(request):
+            return JSONResponse({"error": "invalid key"}, status_code=401)
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            return JSONResponse({"error": "expected JSON body"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse(
+                {"error": "expected JSON object"}, status_code=400
+            )
+        thread_id = payload.get("threadId")
+        run_id = payload.get("runId")
+        tool_call_id = payload.get("toolCallId")
+        if not isinstance(thread_id, str) or not thread_id:
+            return JSONResponse({"error": "threadId required"}, status_code=400)
+        if not isinstance(run_id, str) or not run_id:
+            return JSONResponse({"error": "runId required"}, status_code=400)
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            return JSONResponse(
+                {"error": "toolCallId required"}, status_code=400
+            )
+        content = payload.get("content", "")
+        error = payload.get("error")
+        if error is not None and not isinstance(error, str):
+            error = str(error)
+        delivered = self._agui_router.resolve_tool_call(
+            thread_id=thread_id,
+            run_id=run_id,
+            tool_call_id=tool_call_id,
+            content=content,
+            error=error,
+        )
+        if not delivered:
+            return JSONResponse(
+                {"ok": False, "reason": "no pending tool call"},
+                status_code=404,
+            )
+        return JSONResponse({"ok": True})
 
 
 __all__ = [
