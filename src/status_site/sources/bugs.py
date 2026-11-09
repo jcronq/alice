@@ -123,18 +123,34 @@ WAITING_REVIEW_ACTIONS: tuple[tuple[str, str, str, str], ...] = (
     ("chat", "Chat", "bug.chat", "chat"),
 )
 
+# In-progress tiles — including both not-yet-promoted bugs (no PR yet)
+# and already-approved bugs (approved_at stamped) — get a single Chat
+# steering button and nothing else. Jason's call: once he's approved
+# the fix, the next click he should want is "nudge the worker", not
+# "approve again" or "deny the thing I just approved".
+IN_PROGRESS_ACTIONS: tuple[tuple[str, str, str, str], ...] = (
+    ("chat", "Chat", "bug.chat", "chat"),
+)
+
 
 def _row_actions(bucket_key: str, report_id: int) -> list[dict]:
     """Inline action-button descriptors for one row.
 
-    Only populated for the ``waiting-on-review`` bucket — every other
-    bucket returns ``[]`` so the client's row renderer stays bucket-
-    unaware (it just renders whatever ``actions`` the server hands it).
-    ``report_id`` rides each descriptor so the client's dispatcher can
-    POST ``/api/bug-action`` with the right target without the page
-    needing surface-level state.
+    * ``waiting-on-review`` → Approve / Deny / Chat (full triple).
+    * ``in-progress`` → Chat only (steering, no approve/deny).
+    * every other bucket → ``[]`` so no strip renders.
+
+    The client's row renderer stays bucket-unaware — it just renders
+    whatever ``actions`` the server hands it. ``report_id`` rides each
+    descriptor so the client's dispatcher can POST ``/api/bug-action``
+    with the right target without the page needing surface-level
+    state.
     """
-    if bucket_key != "waiting-on-review":
+    if bucket_key == "waiting-on-review":
+        action_set = WAITING_REVIEW_ACTIONS
+    elif bucket_key == "in-progress":
+        action_set = IN_PROGRESS_ACTIONS
+    else:
         return []
     return [
         {
@@ -144,7 +160,7 @@ def _row_actions(bucket_key: str, report_id: int) -> list[dict]:
             "variant": variant,
             "report_id": report_id,
         }
-        for key, label, action, variant in WAITING_REVIEW_ACTIONS
+        for key, label, action, variant in action_set
     ]
 
 

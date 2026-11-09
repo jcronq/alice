@@ -16,10 +16,11 @@ from __future__ import annotations
 import http.client
 import json
 import threading
+from datetime import datetime
 
 import pytest
 
-from status_site.server import Config, make_server
+from status_site.server import Config, collect_bugs, make_server, parse_frontmatter
 
 KEY = "bug-key-abc"
 
@@ -32,8 +33,14 @@ def write_bug(
     title="give-cakes",
     summary="worker working",
     pr_url="https://github.com/jcronq/modern-mud/pull/42",
+    approved_at=None,
 ):
-    """Write a bug-<N>.md with a draft PR so it lands in waiting-on-review."""
+    """Write a bug-<N>.md with a draft PR so it lands in waiting-on-review.
+
+    ``approved_at`` (optional ISO-8601 string) stamps the frontmatter
+    so ``collect_bugs`` stops promoting the tile back out of
+    ``in-progress`` — Jason has already clicked Approve.
+    """
     fm_lines = [
         "---",
         f"report_id: {report_id}",
@@ -43,6 +50,8 @@ def write_bug(
     ]
     if pr_url:
         fm_lines.append(f"pr_url: {pr_url}")
+    if approved_at:
+        fm_lines.append(f"approved_at: {approved_at}")
     fm_lines.append("---")
     fm_lines.append("")
     fm_lines.append(f"# bug-{report_id} — {title}")
@@ -248,7 +257,148 @@ def test_waiting_on_review_rows_carry_action_descriptors(tmp_path):
     # (Approve, Modify, Reject) trio in cadence.
     assert [a["label"] for a in wor_row["actions"]] == ["Approve", "Deny", "Chat"]
 
-    # Every other bucket's rows have empty ``actions``.
-    for key in ("open", "in-progress", "fixed", "wontfix", "dispatch-failed"):
+    # Every other bucket's rows (that aren't in-progress) have empty
+    # ``actions``. The in-progress bucket now gets a Chat-only strip —
+    # its specific shape is asserted by
+    # ``test_in_progress_rows_carry_chat_only`` below.
+    for key in ("open", "fixed", "wontfix", "dispatch-failed"):
         for row in by_key[key]["rows"]:
             assert row["actions"] == [], f"{key} row should not carry actions"
+
+
+# ---------------------------------------------------------------- approved_at round-trip
+
+
+def test_approve_writes_approved_at_to_frontmatter(site):
+    """Clicking Approve stamps ``approved_at`` into the bug file so
+    ``collect_bugs`` stops promoting the tile back to waiting-on-review.
+
+    The timestamp is ISO-8601 UTC and round-trips cleanly through
+    ``parse_frontmatter`` — all other frontmatter fields and the body
+    are preserved verbatim.
+    """
+    cfg, port = site
+    write_bug(cfg.status_dir, 42)
+    before = (cfg.status_dir / "bug-42.md").read_text()
+    fm_before, body_before = parse_frontmatter(before)
+    assert "approved_at" not in fm_before
+
+    status, body = act(port, key=KEY, report_id=42, action="approve")
+    assert status == 200 and body["ok"]
+
+    after = (cfg.status_dir / "bug-42.md").read_text()
+    fm_after, body_after = parse_frontmatter(after)
+    # Approve stamped it.
+    assert "approved_at" in fm_after
+    # ISO-8601 UTC — parseable back to a timezone-aware datetime.
+    ts = datetime.fromisoformat(fm_after["approved_at"].replace("Z", "+00:00"))
+    assert ts.tzinfo is not None
+    # Every other frontmatter field preserved verbatim.
+    for key, value in fm_before.items():
+        assert fm_after[key] == value, f"field {key} mutated by approve"
+    # Body preserved verbatim.
+    assert body_after == body_before
+
+
+def test_reject_does_not_write_approved_at(site):
+    """Deny leaves the bug file untouched — only the surface is written.
+
+    The tile stays in ``waiting-on-review`` until Speaking bounces the
+    PR on GitHub and rewrites ``status``; stamping ``approved_at`` on
+    reject would silently flip it into the chat-only in-progress strip.
+    """
+    cfg, port = site
+    write_bug(cfg.status_dir, 7)
+    before = (cfg.status_dir / "bug-7.md").read_text()
+
+    status, body = act(
+        port, key=KEY, report_id=7, action="reject", notes="lint fails on tests/"
+    )
+    assert status == 200
+
+    after = (cfg.status_dir / "bug-7.md").read_text()
+    # Byte-for-byte identical — reject is a pure surface drop.
+    assert after == before
+    fm_after, _ = parse_frontmatter(after)
+    assert "approved_at" not in fm_after
+
+
+# ---------------------------------------------------------------- collect_bugs promotion
+
+
+def test_collect_bugs_keeps_approved_in_progress(tmp_path):
+    """An ``in-progress`` bug with ``pr_url`` AND ``approved_at`` stays
+    in the ``in-progress`` bucket — it does NOT flip back to
+    ``waiting-on-review`` after Jason has already approved.
+    """
+    status = tmp_path / "status"
+    status.mkdir()
+    write_bug(
+        status,
+        42,
+        status="in-progress",
+        approved_at="2026-11-09T12:34:56+00:00",
+    )
+
+    buckets, _ = collect_bugs(status)
+    in_progress_ids = [b["report_id"] for b in buckets["in-progress"]]
+    waiting_ids = [b["report_id"] for b in buckets["waiting-on-review"]]
+    assert 42 in in_progress_ids
+    assert 42 not in waiting_ids
+    # The approved_at timestamp is projected onto the bucket dict so
+    # downstream renderers (and the frontend) can see it.
+    bug = next(b for b in buckets["in-progress"] if b["report_id"] == 42)
+    assert bug["approved_at"] == "2026-11-09T12:34:56+00:00"
+
+
+def test_collect_bugs_promotes_unapproved_pr_bug_to_waiting_on_review(tmp_path):
+    """Existing behaviour unchanged: ``in-progress`` + ``pr_url`` with
+    NO ``approved_at`` still gets promoted into ``waiting-on-review``.
+    """
+    status = tmp_path / "status"
+    status.mkdir()
+    write_bug(status, 99, status="in-progress")  # pr_url set by default, no approved_at
+
+    buckets, _ = collect_bugs(status)
+    in_progress_ids = [b["report_id"] for b in buckets["in-progress"]]
+    waiting_ids = [b["report_id"] for b in buckets["waiting-on-review"]]
+    assert 99 in waiting_ids
+    assert 99 not in in_progress_ids
+
+
+# ---------------------------------------------------------------- _row_actions shape
+
+
+def test_row_actions_in_progress_is_chat_only():
+    """``_row_actions`` returns a single Chat descriptor for in-progress.
+
+    After approve demotes a tile to in-progress, the only steering
+    surface Jason gets is Chat — no approve/deny on in-progress rows.
+    """
+    from status_site.sources.bugs import _row_actions
+
+    actions = _row_actions("in-progress", 42)
+    assert len(actions) == 1
+    (chat,) = actions
+    assert chat["action"] == "bug.chat"
+    assert chat["label"] == "Chat"
+    assert chat["variant"] == "chat"
+    assert chat["report_id"] == 42
+
+
+def test_row_actions_waiting_on_review_is_triple():
+    """Existing waiting-on-review behaviour unchanged: approve/deny/chat."""
+    from status_site.sources.bugs import _row_actions
+
+    actions = _row_actions("waiting-on-review", 7)
+    assert [a["action"] for a in actions] == ["bug.approve", "bug.deny", "bug.chat"]
+    assert [a["label"] for a in actions] == ["Approve", "Deny", "Chat"]
+    assert all(a["report_id"] == 7 for a in actions)
+
+
+def test_row_actions_other_buckets_are_empty():
+    """Every other bucket still returns ``[]`` — no action strip."""
+    from status_site.sources.bugs import _row_actions
+
+    for bucket in ("open", "fixed", "wontfix", "dispatch-failed"):
+        assert _row_actions(bucket, 1) == []
