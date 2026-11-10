@@ -233,12 +233,13 @@ details.fx-group:first-child { margin-top: 0; }
   .a2ui-chat-thread { max-height: calc(100dvh - 14rem); }
 }
 @media (max-width: 600px) {
-  /* Header wraps to several rows on phones: reserve more room so the
-     composer (Attach/Send) is never pushed below the viewport (#711). */
-  .a2ui-chat-thread { max-height: calc(100vh - 22rem); }
-  @supports (height: 100dvh) {
-    .a2ui-chat-thread { max-height: calc(100dvh - 22rem); }
-  }
+  /* On phones, the parent .a2ui-chat-page flex column (height: 100dvh -
+     5rem) owns the layout: let the thread grow to fill remaining space
+     via flex:1, and keep the composer sticky so a soft keyboard can
+     still push it up without clipping (#711). The old max-height cap
+     (22rem) over-reserved ~270 CSS px on an iPhone viewport and left a
+     large dead band below the Send button. */
+  .a2ui-chat-thread { max-height: none; min-height: 0; }
   .a2ui-composer {
     position: sticky;
     bottom: 0;
