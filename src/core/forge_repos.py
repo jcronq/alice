@@ -59,8 +59,14 @@ def _valid(slugs: Any) -> tuple[str, ...]:
     out: list[str] = []
     for s in slugs:
         s = str(s).strip()
-        if _SLUG_RE.match(s) and s not in out:
-            out.append(s)
+        if not _SLUG_RE.match(s):
+            continue
+        owner, _, name = s.partition("/")
+        if owner in (".", "..") or name in (".", ".."):
+            continue
+        if s in out:
+            continue
+        out.append(s)
     return tuple(out)
 
 
