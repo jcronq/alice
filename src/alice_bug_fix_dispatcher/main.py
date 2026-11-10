@@ -54,7 +54,7 @@ At the end of each tick the ``<!-- bug-review -->`` block under
 
 from __future__ import annotations
 
-from core.forge_repos import bug_fix_repo as _bug_fix_repo
+from core.forge_repos import bug_fix_repo as _bug_fix_repo, bug_fix_trusted_reporters as _bug_fix_trusted_reporters
 import argparse
 import contextlib
 import datetime as _dt
@@ -104,7 +104,7 @@ DEFAULT_WORKER_PROMPT_TEMPLATE = pathlib.Path(
 DEFAULT_STALL_HOURS = 2
 DEFAULT_REPO = _bug_fix_repo()
 DEFAULT_INDEX_PATH = pathlib.Path("/home/alice/alice-mind/inner/status/index.md")
-DEFAULT_TRUSTED_REPORTERS: tuple[str, ...] = ("cronqj",)
+DEFAULT_TRUSTED_REPORTERS: tuple[str, ...] = _bug_fix_trusted_reporters()
 WAITING_HEADING_RE = re.compile(r"^##\s+Waiting on you\s*$", re.M | re.I)
 BUG_REVIEW_START = "<!-- bug-review -->"
 BUG_REVIEW_END = "<!-- /bug-review -->"
