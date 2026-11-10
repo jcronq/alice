@@ -63,13 +63,25 @@ services:
       # the speaking daemon's local RPC. See legacy-3svc.yml for the
       # macOS/virtiofs caveat that drove this off /tmp.
       ALICE_CLI_SOCKET: "/state/alice.sock"
-      # s6-overlay's default 3-second graceperiod is far too short for the
-      # speaking/thinker drain on shutdown. 1800000 ms = 30 min, matching
-      # stop_grace_period above so docker doesn't SIGKILL out from under
-      # s6's drain. A wake older than that is a hung wake the watchdog
-      # should have surfaced; force-kill is fine at that point.
+      # Two different s6-overlay timers, and only one of them is a drain:
+      #
+      #   S6_SERVICES_GRACETIME — how long `s6-rc -da change` may take to
+      #   bring the longruns down. This is what protects an in-flight
+      #   Claude turn / thinker wake on SIGTERM. 1800000 ms = 30 min,
+      #   matching stop_grace_period above so docker doesn't SIGKILL out
+      #   from under the drain. A wake older than that is a hung wake the
+      #   watchdog should have surfaced; force-kill is fine at that point.
+      #
+      #   S6_KILL_GRACETIME — AFTER every service has stopped,
+      #   s6-linux-init-shutdownd sends any straggler a TERM, then sleeps
+      #   this long unconditionally (even with zero processes left) before
+      #   KILL + exit; s6-linux-init also caps it at 300000. Setting it to
+      #   30 min made every `docker stop`/restart/recreate sit idle for a
+      #   fixed 5 minutes with Alice already fully down (2026-11-06 and
+      #   2026-11-07, both exactly ~5m06s after the last service stopped).
+      #   Keep it a few seconds: nothing we run outlives its s6 service.
       S6_SERVICES_GRACETIME: "${S6_SERVICES_GRACETIME:-1800000}"
-      S6_KILL_GRACETIME: "${S6_KILL_GRACETIME:-1800000}"
+      S6_KILL_GRACETIME: "${S6_KILL_GRACETIME:-5000}"
       # GitHub PAT for the gh CLI (and git-over-https via gh's credential
       # helper). Sourced from alice.env by bin/_alice-env.sh, so adding
       # GH_TOKEN=ghp_... to alice.env then bouncing the container is
