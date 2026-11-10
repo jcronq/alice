@@ -13,7 +13,7 @@ file for no readability win.
 
 from __future__ import annotations
 
-from core.forge_repos import primary_repo as _primary_repo
+from core.forge_repos import primary_repo as _primary_repo, trusted_authors as _trusted_authors
 import datetime as dt
 import json
 import os
@@ -50,7 +50,7 @@ RECENT_ISSUE_LIMIT = 50
 # v0 author whitelist. Bot identities (the eventual ``alice-bot`` GitHub
 # App) land in a later phase — until then only Jason can drop tasks into
 # Alice's lane.
-TRUSTED_AUTHORS: frozenset[str] = frozenset({"jcronq"})
+TRUSTED_AUTHORS: frozenset[str] = _trusted_authors()
 
 # Strict ``sm:*`` allow-list. A typo like ``sm:building-pleaserun`` must
 # be skipped rather than fuzzy-matched into ``sm:building`` — drift in

@@ -21,12 +21,13 @@ import re
 from dataclasses import dataclass
 
 from alice_forge.sm.transitions import Verbs
+from core.forge_repos import trusted_authors as _trusted_authors
 
 # Reuse v1's trust set so the cutover doesn't change who can drive
 # transitions. The dispatcher imports TRUSTED_AUTHORS from the v1
 # constants module until Phase 4 retires v1; then we can promote
 # the set into a v3-native constant.
-TRUSTED_AUTHORS_DEFAULT: frozenset[str] = frozenset({"jcronq", "alice"})
+TRUSTED_AUTHORS_DEFAULT: frozenset[str] = _trusted_authors() | {"alice"}
 
 PREFIX = "[SM]"
 
