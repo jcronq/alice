@@ -107,12 +107,16 @@ model_list:
 
   # Ollama on the host (`ollama pull qwen3:14b`). Reached directly via
   # host.docker.internal:11434; no need to front it with `fm serve`.
-  # Qwen3 emits a reasoning trace by default; prefix a prompt with
-  # /no_think to skip it.
+  # Qwen3 emits a hidden reasoning trace by default, and those tokens count
+  # against max_tokens: with max_tokens=100 the reply came back EMPTY
+  # (finish_reason=length). Call sites with small token caps (correction
+  # cascade: 100, face caption: 64) can't pass a per-request flag, so thinking
+  # is turned off here for every caller. Remove `think` to get reasoning back.
   - model_name: ollama-local
     litellm_params:
       model: ollama_chat/qwen3:14b
       api_base: http://host.docker.internal:11434
+      think: false
 
 litellm_settings:
   # Silently strip params the backend doesn't accept (e.g. response_format
