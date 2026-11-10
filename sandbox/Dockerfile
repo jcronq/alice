@@ -1,3 +1,29 @@
+# libsignal JNI for arm64. signal-cli's JVM tarball (the only arm64 build
+# upstream ships) bundles libsignal-client natives for x86_64 Linux only, so
+# on aarch64 it dies with "no signal_jni in java.library.path". Build the
+# matching libsignal_jni.so from source here and copy it into base.
+# LIBSIGNAL_VERSION MUST equal the libsignal-client-<ver>.jar bundled in the
+# signal-cli release (check /opt/signal-cli-*/lib after a SIGNAL_CLI_VERSION
+# bump: 0.14.5 -> 0.94.4). amd64 uses the GraalVM native build, which carries
+# its own natives, so this stage is a no-op there (empty /out).
+FROM debian:trixie-slim AS libsignal-jni
+ARG LIBSIGNAL_VERSION=0.94.4
+ARG TARGETARCH
+ENV DEBIAN_FRONTEND=noninteractive
+RUN mkdir /out \
+    && if [ "${TARGETARCH}" = "arm64" ]; then \
+         apt-get update && apt-get install -y --no-install-recommends \
+             ca-certificates curl git build-essential clang libclang-dev cmake \
+             protobuf-compiler libprotobuf-dev pkg-config \
+         && rm -rf /var/lib/apt/lists/* \
+         && curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none \
+         && export PATH=/root/.cargo/bin:$PATH \
+         && git clone --depth 1 --branch "v${LIBSIGNAL_VERSION}" https://github.com/signalapp/libsignal /src \
+         && cd /src && cargo build --release -p libsignal-jni \
+         && cp target/release/libsignal_jni.so /out/ \
+         && rm -rf /src /root/.cargo /root/.rustup; \
+       fi
+
 FROM debian:trixie-slim AS base
 
 # Single-container fold of sandbox/worker/Dockerfile + sandbox/daemon/Dockerfile
@@ -71,6 +97,10 @@ RUN apt-get update \
          *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
        esac \
     && rm -rf /var/lib/apt/lists/*
+
+# arm64 only (empty on amd64): libsignal_jni.so on the default JVM
+# java.library.path so signal-cli can load it.
+COPY --from=libsignal-jni /out/ /usr/lib/jni/
 
 RUN npm install -g @anthropic-ai/claude-code@latest
 

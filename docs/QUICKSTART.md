@@ -44,7 +44,7 @@ repo). Edit `IDENTITY.md`, `CLAUDE.md`, `USER.md` to taste.
 ## Register Signal
 
 ```bash
-signal-cli -a "$(. ~/.config/alice/alice.env; echo "$SIGNAL_ACCOUNT")" link -n "Alice"
+signal-cli link -n "Alice"
 ```
 
 This prints a QR code. Open Signal on your phone → Settings → Linked
