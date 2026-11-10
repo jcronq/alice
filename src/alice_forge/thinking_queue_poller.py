@@ -9,6 +9,7 @@ Needs an authenticated ``gh`` CLI, same as ``gh_state_mirror``.
 
 from __future__ import annotations
 
+from core.forge_repos import primary_repo as _primary_repo
 import json
 import os
 import subprocess
@@ -17,7 +18,7 @@ import tempfile
 import time
 from pathlib import Path
 
-REPO = "jcronq/alice"
+REPO = _primary_repo()
 LABELS = (
     "sm:designing",
     "sm:needs_study",

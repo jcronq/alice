@@ -48,6 +48,7 @@ the kernel, the state DB, or the vault.
 
 from __future__ import annotations
 
+from core.forge_repos import primary_repo as _primary_repo
 import argparse
 import pathlib
 import re
@@ -80,7 +81,7 @@ from alice_thinking.runtime import PhaseRunner
 #: Paired with the issue number parsed out of ``prompt.txt`` to form
 #: the ``items.item_id`` surrogate — matches the convention seeded by
 #: :func:`alice_state_db.sm_seed.gh_issue_id` (``f"gh:{repo}#{number}"``).
-REPO = "jcronq/alice"
+REPO = _primary_repo()
 
 #: Pattern matching the ``Issue: #<N>`` header rendered by
 #: :func:`alice_forge.dispatcher.spawn.compose_thinking_spawn_prompt`.

@@ -23,6 +23,7 @@ Issue:  #622.
 
 from __future__ import annotations
 
+from core.forge_repos import forge_repos as _forge_repos, primary_repo as _primary_repo
 import argparse
 import json
 import logging
@@ -41,8 +42,8 @@ ALICE_MIND = os.environ.get("ALICE_MIND", os.path.expanduser("~/alice-mind"))
 CONFIG_PATH = Path(ALICE_MIND) / "config" / "alice.config.json"
 DEFAULT_STATUS_INDEX = Path(ALICE_MIND) / "inner" / "status" / "index.md"
 
-DEFAULT_REPOS_PR = ["jcronq/alice", "jcronq/modern-mud"]
-DEFAULT_REPOS_DESIGN_REVIEW = ["jcronq/alice"]
+DEFAULT_REPOS_PR = list(_forge_repos())
+DEFAULT_REPOS_DESIGN_REVIEW = [_primary_repo()]
 DEFAULT_POLL_INTERVAL = 300
 POLL_INTERVAL_FLOOR = 60
 

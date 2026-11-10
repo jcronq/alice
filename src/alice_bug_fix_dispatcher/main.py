@@ -54,6 +54,7 @@ At the end of each tick the ``<!-- bug-review -->`` block under
 
 from __future__ import annotations
 
+from core.forge_repos import bug_fix_repo as _bug_fix_repo
 import argparse
 import contextlib
 import datetime as _dt
@@ -101,7 +102,7 @@ DEFAULT_WORKER_PROMPT_TEMPLATE = pathlib.Path(
     "/home/alice/alice-mind/cortex-memory/reference/mud-bug-fix-worker-prompt.md"
 )
 DEFAULT_STALL_HOURS = 2
-DEFAULT_REPO = "jcronq/modern-mud"
+DEFAULT_REPO = _bug_fix_repo()
 DEFAULT_INDEX_PATH = pathlib.Path("/home/alice/alice-mind/inner/status/index.md")
 DEFAULT_TRUSTED_REPORTERS: tuple[str, ...] = ("cronqj",)
 WAITING_HEADING_RE = re.compile(r"^##\s+Waiting on you\s*$", re.M | re.I)

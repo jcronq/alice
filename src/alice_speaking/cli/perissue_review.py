@@ -24,6 +24,7 @@ the sub-agent posting directly. Reasons:
 
 from __future__ import annotations
 
+from core.forge_repos import primary_repo as _primary_repo
 import argparse
 import asyncio
 from dataclasses import replace
@@ -251,8 +252,8 @@ def main(
     )
     parser.add_argument(
         "--repo",
-        default="jcronq/alice",
-        help="GitHub repo for the verdict comment (default: jcronq/alice)",
+        default=_primary_repo(),
+        help="GitHub repo for the verdict comment (default: configured primary repo)",
     )
     parser.add_argument(
         "--mind",

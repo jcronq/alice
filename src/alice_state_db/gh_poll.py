@@ -44,6 +44,7 @@ change, out of scope for the code-only PR).
 
 from __future__ import annotations
 
+from core.forge_repos import primary_repo as _primary_repo
 import dataclasses
 import json
 import logging
@@ -74,7 +75,7 @@ from .sm_seed import (
 
 log = logging.getLogger(__name__)
 
-DEFAULT_REPOS = ("jcronq/alice",)
+DEFAULT_REPOS = (_primary_repo(),)
 DEFAULT_CADENCE_S = 90
 
 #: Default path for the per-repo per-endpoint ETag cache. Lives under

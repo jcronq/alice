@@ -27,10 +27,11 @@ runtime swaps the inline constant for a vault-load + cache.
 
 from __future__ import annotations
 
+from core.forge_repos import primary_repo as _primary_repo
 import enum
 import pathlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from core.kernel import KernelSpec
@@ -89,7 +90,7 @@ BUILD_AGENT_TOOL_ALLOWLIST: tuple[str, ...] = (
 SWE_BASELINE_PRACTICES = """\
 ## SWE practices baseline
 
-You are opening a draft PR against `jcronq/alice`. Operate as a real
+You are opening a draft PR against `__REPO__`. Operate as a real
 engineer would:
 
 - **Branch off `master`.** `git checkout -b feat/<slug>-<N> master`.
@@ -157,7 +158,7 @@ class BuildPromptInputs:
     issue_number: int
     issue_body: str
     design_note_text: str
-    repo: str = "jcronq/alice"
+    repo: str = field(default_factory=_primary_repo)
 
 
 def compose_build_prompt(
@@ -195,7 +196,7 @@ def compose_build_prompt(
         "",
         inputs.design_note_text.strip(),
         "",
-        swe_baseline.strip(),
+        swe_baseline.replace("__REPO__", inputs.repo).strip(),
         "",
         (
             f"When the draft PR is open, end your turn with a single "
