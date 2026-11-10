@@ -44,8 +44,14 @@ repo). Edit `IDENTITY.md`, `CLAUDE.md`, `USER.md` to taste.
 ## Register Signal
 
 ```bash
-signal-cli link -n "Alice"
+docker exec -it -u alice alice signal-cli link -n "Alice"
 ```
+
+Run it as the `alice` user (`-u alice`): the Signal daemon reads
+`/home/alice/.local/share/signal-cli`, so a link made as root is stored under
+root's home and never seen (and is lost when the container is recreated).
+Then set `SIGNAL_ACCOUNT=+1…` in `alice.env`; without it the speaking daemon
+logs "signal disabled (no SIGNAL_ACCOUNT)".
 
 This prints a QR code. Open Signal on your phone → Settings → Linked
 Devices → Link New Device → scan the QR. signal-cli's registration state
