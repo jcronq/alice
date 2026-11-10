@@ -596,6 +596,7 @@ li.fx-now {
    * bubble rather than push its width past the 88% cap on mobile (#805). */
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   line-height: 1.4;
 }
 .a2ui-list.a2ui-chat-thread .msg.jason {
