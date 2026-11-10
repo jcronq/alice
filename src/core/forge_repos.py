@@ -5,7 +5,11 @@ in a dozen modules. This module is the single, stdlib-only resolver.
 
 Resolution order (first hit wins), per value:
 
-1. Environment variable (see below).
+1. Environment variable (see below), falling back to the same key in
+   ``alice.env`` (``$ALICE_CONFIG``, default ``~/.config/alice/alice.env``).
+   The file fallback matters because the daemons parse ``alice.env`` into
+   a private dict rather than exporting it, and compose does not forward
+   these keys, so the env var alone is often absent inside the container.
 2. ``<mind>/config/alice.config.json`` -> ``"forge"`` block.
 3. Nothing: raise :class:`ForgeNotConfigured`. There is deliberately no
    built-in default, so a fork never silently targets someone else's repos.
@@ -60,6 +64,29 @@ def _valid(slugs: Any) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _env(name: str) -> str:
+    """``os.environ[name]``, else ``name`` from ``alice.env``, else ``""``."""
+    val = os.environ.get(name, "")
+    if val:
+        return val
+    path = Path(
+        os.environ.get("ALICE_CONFIG")
+        or os.path.expanduser("~/.config/alice/alice.env")
+    )
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return ""
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == name:
+            return value.strip().strip('"').strip("'")
+    return ""
+
+
 def _forge_block(mind: Optional[os.PathLike] = None) -> dict:
     base = Path(mind) if mind else Path(
         os.environ.get("ALICE_MIND", os.path.expanduser("~/alice-mind"))
@@ -73,7 +100,7 @@ def _forge_block(mind: Optional[os.PathLike] = None) -> dict:
 
 
 def forge_repos(mind: Optional[os.PathLike] = None) -> tuple[str, ...]:
-    env = _valid(os.environ.get("ALICE_FORGE_REPOS", ""))
+    env = _valid(_env("ALICE_FORGE_REPOS"))
     if env:
         return env
     cfg = _valid(_forge_block(mind).get("repos"))
@@ -83,14 +110,14 @@ def forge_repos(mind: Optional[os.PathLike] = None) -> tuple[str, ...]:
 
 
 def primary_repo(mind: Optional[os.PathLike] = None) -> str:
-    env = _valid(os.environ.get("ALICE_FORGE_REPO", ""))
+    env = _valid(_env("ALICE_FORGE_REPO"))
     if env:
         return env[0]
     block = _forge_block(mind)
     cfg = _valid(block.get("primary"))
     if cfg:
         return cfg[0]
-    env_list = _valid(os.environ.get("ALICE_FORGE_REPOS", ""))
+    env_list = _valid(_env("ALICE_FORGE_REPOS"))
     if env_list:
         return env_list[0]
     cfg_list = _valid(block.get("repos"))
@@ -100,7 +127,7 @@ def primary_repo(mind: Optional[os.PathLike] = None) -> str:
 
 
 def bug_fix_repo(mind: Optional[os.PathLike] = None) -> str:
-    env = _valid(os.environ.get("ALICE_BUG_FIX_REPO", ""))
+    env = _valid(_env("ALICE_BUG_FIX_REPO"))
     if env:
         return env[0]
     cfg = _valid(_forge_block(mind).get("bug_fix_repo"))

@@ -15,7 +15,7 @@ The forge dispatcher, reconcilers, pollers, status site, viewer and the per-issu
 
 Resolution order, per value (first hit wins):
 
-1. Environment variable (set in `~/.config/alice/alice.env`).
+1. Environment variable, or the same key in `alice.env` (`$ALICE_CONFIG`, default `~/.config/alice/alice.env`). The resolver reads the file itself, so the key works even though compose doesn't forward it into the container.
 2. The `"forge"` block of `<mind>/config/alice.config.json`.
 
 | Value | Env var | `forge` key |
