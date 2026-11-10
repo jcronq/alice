@@ -9,6 +9,7 @@ or a GITHUB_TOKEN env var).
 Tracked repos: cozyhem-engine, alice (configurable).
 """
 
+from core.forge_repos import forge_repos as _forge_repos
 import json
 import os
 import subprocess
@@ -18,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # ─── Config ───────────────────────────────────────────────────────────
-REPOS = ["jcronq/cozyhem-engine", "jcronq/alice"]
+REPOS = list(_forge_repos())
 ALICE_MIND = os.environ.get("ALICE_MIND", os.path.expanduser("~/alice-mind"))
 GH_STATE_DIR = Path(ALICE_MIND) / "cortex-memory" / "gh-state"
 LOG_FILE = Path(ALICE_MIND) / "inner" / "state" / "gh-state-mirror.log"

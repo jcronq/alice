@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from core.forge_repos import primary_repo as _primary_repo
 import asyncio
 import datetime as dt
 import json
 import os
+
 import pathlib
 import time
 from typing import Any
@@ -371,7 +373,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
                 trace = sources.sm_spawn_trace_events(
                     spawn_dir,
                     match.start_ts,
-                    repo=os.environ.get("ALICE_SM_REPO", "jcronq/alice"),
+                    repo=os.environ.get("ALICE_SM_REPO") or _primary_repo(),
                     issue_number=issue_number,
                     fetch_timeline=sources.fetch_issue_timeline_cached,
                 )

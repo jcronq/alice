@@ -15,6 +15,7 @@ next scan and records the ``moved`` events; nothing here touches the history fil
 
 from __future__ import annotations
 
+from core.forge_repos import primary_repo as _primary_repo
 import argparse
 import difflib
 import json
@@ -41,7 +42,7 @@ DONE_SECTION = "done today"
 WAITING_SECTION = "waiting on you"
 POINTER_PREFIX = "Reply needed: "
 GH_TIMEOUT = 10
-DEFAULT_REPO = "jcronq/alice"
+DEFAULT_REPO = _primary_repo()
 
 _PR_URL_RE = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
 _BARE_PR_RE = re.compile(r"(?<![\w/&#])#(\d+)\b")

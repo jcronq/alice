@@ -30,6 +30,7 @@ are idempotent against ``updatedAt`` — same stamp → no rewrite.
 
 from __future__ import annotations
 
+from core.forge_repos import primary_repo as _primary_repo
 import logging
 import os
 import subprocess
@@ -45,7 +46,7 @@ log = logging.getLogger("status_site.pipeline")
 
 SOURCE_NAME = "gh-sm-pipeline"
 
-DEFAULT_REPOS_SM = ["jcronq/alice"]
+DEFAULT_REPOS_SM = [_primary_repo()]
 
 #: Pipeline order (also the display group order).
 PIPELINE_STATES: tuple[str, ...] = (

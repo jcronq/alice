@@ -13,6 +13,7 @@ file for no readability win.
 
 from __future__ import annotations
 
+from core.forge_repos import primary_repo as _primary_repo
 import datetime as dt
 import json
 import os
@@ -26,7 +27,7 @@ from typing import Any, Callable
 # Defaults + constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_REPO = "jcronq/alice"
+DEFAULT_REPO = _primary_repo()
 DEFAULT_STATE_DIR = pathlib.Path("/state/worker")
 DEFAULT_STATE_FILE = "sm-dispatcher-state.json"
 

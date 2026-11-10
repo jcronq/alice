@@ -19,6 +19,7 @@ same parse-resolve-dispatch logic so they stay testable.
 
 from __future__ import annotations
 
+from core.forge_repos import primary_repo as _primary_repo
 import argparse
 import asyncio
 from dataclasses import replace
@@ -286,8 +287,8 @@ def main(
     )
     parser.add_argument(
         "--repo",
-        default="jcronq/alice",
-        help="GitHub repo for the audit comment (default: jcronq/alice)",
+        default=_primary_repo(),
+        help="GitHub repo for the audit comment (default: configured primary repo)",
     )
     parser.add_argument(
         "--cwd",

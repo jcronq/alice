@@ -70,6 +70,7 @@ write; the reconciler relies on that lock and adds no second layer.
 
 from __future__ import annotations
 
+from core.forge_repos import forge_repos as _forge_repos
 import argparse
 import json
 import logging
@@ -100,7 +101,7 @@ log = logging.getLogger(__name__)
 #: Default repos to reconcile. Override with ``GH_RECONCILER_REPOS``
 #: (comma-separated ``owner/name`` list). Matches the substrate the
 #: SM v2 dispatcher already polls.
-DEFAULT_REPOS: tuple[str, ...] = ("jcronq/cozyhem-engine", "jcronq/alice")
+DEFAULT_REPOS: tuple[str, ...] = _forge_repos()
 
 #: Default lookback window in days. 14 catches label changes on
 #: month-old issues without scanning all-time. Override with
@@ -669,7 +670,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--repos",
         help="Comma-separated <user>/<repo> list. Default: GH_RECONCILER_REPOS env "
-        "or the built-in default (jcronq/cozyhem-engine,jcronq/alice).",
+        "or the configured default (ALICE_FORGE_REPOS / alice.config.json forge.repos).",
     )
     parser.add_argument(
         "--lookback-days",

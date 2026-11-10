@@ -53,6 +53,7 @@ Anything else is a 404: dotfiles (``.replies.jsonl``, ``.item-state.json``, ``.c
 
 from __future__ import annotations
 
+from core.forge_repos import primary_repo as _primary_repo
 import base64
 import binascii
 import hmac
@@ -801,7 +802,7 @@ def handle_reply(cfg: Config, d: dict) -> dict:
 THINKING_QUEUE_START = "<!-- thinking-queue:start -->"
 THINKING_QUEUE_END = "<!-- thinking-queue:end -->"
 THINKING_QUEUE_CACHE = ".thinking-queue.json"
-THINKING_QUEUE_REPO = "jcronq/alice"
+THINKING_QUEUE_REPO = _primary_repo()
 THINKING_QUEUE_CAP = 15
 # Cache older than this is treated as unavailable (poller cadence is ~60s).
 THINKING_QUEUE_STALE_SECONDS = 600

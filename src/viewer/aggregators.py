@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from core.forge_repos import primary_repo as _primary_repo
 import time
+
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
@@ -239,7 +241,7 @@ def _finished_sm_to_run(fs: _sources.FinishedSmSpawn) -> Run:
         outbound=None,
         error=None,
         detail_url=(
-            f"https://github.com/jcronq/alice/issues/{fs.issue_number}"
+            f"https://github.com/{_primary_repo()}/issues/{fs.issue_number}"
         ),
         events=[],
     )
@@ -269,7 +271,7 @@ def _live_sm_to_run(job: _sources.RunningJob) -> Run:
         outbound=None,
         error=None,
         detail_url=(
-            f"https://github.com/jcronq/alice/issues/{issue_number}"
+            f"https://github.com/{_primary_repo()}/issues/{issue_number}"
         ),
         events=[],
     )

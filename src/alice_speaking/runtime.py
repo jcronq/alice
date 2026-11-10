@@ -27,10 +27,11 @@ runtime swaps the inline constant for a vault-load + cache.
 
 from __future__ import annotations
 
+from core.forge_repos import primary_repo as _primary_repo
 import enum
 import pathlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from core.kernel import KernelSpec
@@ -157,7 +158,7 @@ class BuildPromptInputs:
     issue_number: int
     issue_body: str
     design_note_text: str
-    repo: str = "jcronq/alice"
+    repo: str = field(default_factory=_primary_repo)
 
 
 def compose_build_prompt(
