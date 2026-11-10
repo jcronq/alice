@@ -11,11 +11,13 @@ a ~15s TTL, so we refresh every 10s.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import json
 import logging
 import os
 import pathlib
+import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Optional
 
@@ -27,6 +29,16 @@ log = logging.getLogger(__name__)
 # signal-cli's message length cap (approximate). Match the bash bridge.
 _CHUNK_LIMIT = 4000
 _TYPING_REFRESH_SECONDS = 10
+
+# -- Note-to-Self loop guards (see SignalRPC._allow_self_note) ----------------
+# Alice sends replies to the same account she receives Note-to-Self on, so a
+# naive "accept our own sync'd messages" would let her answer herself forever.
+# Every guard below is independent; any one of them drops the message.
+_SELF_SENT_TS_MEMORY = 512         # timestamps of our own sends to remember
+_SELF_SENT_TEXT_MEMORY = 64        # recent outbound self-texts to remember
+_SELF_SENT_TEXT_WINDOW_S = 120.0   # how long an outbound text counts as "ours"
+_SELF_RATE_LIMIT = 5               # max accepted self-notes ...
+_SELF_RATE_WINDOW_S = 60.0         # ... per this many seconds (circuit breaker)
 
 # Where signal-cli stores attachment files. Inside the worker container
 # the host's signal-cli data dir is bind-mounted at /host-home/.local/share/...
@@ -63,6 +75,9 @@ class SignalEnvelope:
     source: str
     body: str
     attachments: list[Attachment] = field(default_factory=list)
+    # True when this came from a Note-to-Self sync (sentMessage to our own
+    # account) rather than a normal dataMessage from another account.
+    from_self_sync: bool = False
 
 
 class SignalRPC:
@@ -72,9 +87,24 @@ class SignalRPC:
         account: str,
         log_path: pathlib.Path,
         offset_path: pathlib.Path,
+        note_to_self: bool = False,
     ) -> None:
         self.api = api.rstrip("/")
         self.account = account
+        self.note_to_self = note_to_self
+        # Loop-guard state (only used when note_to_self is on).
+        self._sent_ts: collections.deque[int] = collections.deque(
+            maxlen=_SELF_SENT_TS_MEMORY
+        )
+        self._sent_texts: collections.deque[tuple[float, str]] = collections.deque(
+            maxlen=_SELF_SENT_TEXT_MEMORY
+        )
+        self._seen_self_ts: collections.deque[int] = collections.deque(
+            maxlen=_SELF_SENT_TS_MEMORY
+        )
+        self._accepted_at: collections.deque[float] = collections.deque(
+            maxlen=_SELF_RATE_LIMIT
+        )
         self.log_path = log_path
         self.offset_path = offset_path
         self._http = httpx.AsyncClient(
@@ -135,7 +165,7 @@ class SignalRPC:
             }
             if attachments and i == 1:
                 params["attachments"] = list(attachments)
-            await self._rpc(
+            resp = await self._rpc(
                 "send",
                 params,
                 # ``speaking-`` prefix lets the outbound-capture proxy
@@ -143,6 +173,8 @@ class SignalRPC:
                 # automations/scripts sharing the account.
                 request_id=f"speaking-send-{i}",
             )
+            if self.note_to_self and _same_account(recipient, self.account):
+                self._remember_self_send(payload, resp)
 
     async def send_typing(self, recipient: str) -> None:
         try:
@@ -201,9 +233,62 @@ class SignalRPC:
         via the offset file."""
         offset = self._load_offset()
         async for line in self._tail_from(offset):
-            env = _parse_envelope(line)
-            if env is not None:
-                yield env
+            env = _parse_envelope(
+                line, account=self.account if self.note_to_self else None
+            )
+            if env is None:
+                continue
+            if env.from_self_sync and not self._allow_self_note(env):
+                continue
+            yield env
+
+    # -- Note-to-Self loop guards ----------------------------------------------
+
+    def _remember_self_send(self, payload: str, resp: Any) -> None:
+        """Record an outbound message addressed to our own account so its
+        echo (if signal-cli ever syncs it back) is recognised and dropped."""
+        self._sent_texts.append((time.monotonic(), payload))
+        result = resp.get("result") if isinstance(resp, dict) else None
+        ts = result.get("timestamp") if isinstance(result, dict) else None
+        if isinstance(ts, int):
+            self._sent_ts.append(ts)
+
+    def _allow_self_note(self, env: SignalEnvelope, *, now: Optional[float] = None) -> bool:
+        """Decide whether a Note-to-Self sync is a real message from the owner.
+
+        Drops (never accepts) when ANY of these hold, in order:
+          1. its timestamp is one we got back from our own ``send`` RPC;
+          2. its text equals something we sent to ourselves within the
+             last ``_SELF_SENT_TEXT_WINDOW_S`` seconds (covers the race
+             where the echo is tailed before ``send`` returns);
+          3. we already accepted this timestamp (replayed log / duplicate);
+          4. more than ``_SELF_RATE_LIMIT`` self-notes were accepted in the
+             last ``_SELF_RATE_WINDOW_S`` seconds (circuit breaker: if a
+             loop slips past 1-3, it is capped instead of runaway).
+        """
+        now = time.monotonic() if now is None else now
+        if env.timestamp in self._sent_ts:
+            log.info("note-to-self: dropping echo of our own send (ts=%s)", env.timestamp)
+            return False
+        for sent_at, text in self._sent_texts:
+            if now - sent_at <= _SELF_SENT_TEXT_WINDOW_S and text == env.body:
+                log.info("note-to-self: dropping echo of our own text (ts=%s)", env.timestamp)
+                return False
+        if env.timestamp in self._seen_self_ts:
+            log.info("note-to-self: dropping duplicate (ts=%s)", env.timestamp)
+            return False
+        while self._accepted_at and now - self._accepted_at[0] > _SELF_RATE_WINDOW_S:
+            self._accepted_at.popleft()
+        if len(self._accepted_at) >= _SELF_RATE_LIMIT:
+            log.warning(
+                "note-to-self: rate limit hit (%d in %.0fs); dropping ts=%s — "
+                "possible reply loop",
+                _SELF_RATE_LIMIT, _SELF_RATE_WINDOW_S, env.timestamp,
+            )
+            return False
+        self._accepted_at.append(now)
+        self._seen_self_ts.append(env.timestamp)
+        return True
 
     # -- internals -------------------------------------------------------------
 
@@ -301,7 +386,11 @@ def _chunk(text: str, limit: int) -> list[str]:
     return parts
 
 
-def _parse_envelope(line: str) -> Optional[SignalEnvelope]:
+def _same_account(a: str, b: str) -> bool:
+    return bool(a) and bool(b) and a.strip() == b.strip()
+
+
+def _parse_envelope(line: str, *, account: Optional[str] = None) -> Optional[SignalEnvelope]:
     """Parse one signal-cli log line into an envelope.
 
     Returns ``None`` for non-message lines (typing receipts, sync messages
@@ -309,6 +398,13 @@ def _parse_envelope(line: str) -> Optional[SignalEnvelope]:
     it has a source, a timestamp, and EITHER text body OR at least one
     attachment — image-only messages are valid inbound; we don't drop
     them just because the body is empty.
+
+    When ``account`` is given (Note-to-Self enabled) one extra shape is
+    accepted: a ``syncMessage.sentMessage`` that the owner sent from another
+    device of OUR account to OUR account. Everything else in
+    ``syncMessage`` (sent to someone else, group sends, read receipts,
+    contacts) is still ignored. The result is flagged ``from_self_sync`` so
+    the caller applies the loop guards.
     """
     if not line.startswith("{"):
         return None
@@ -318,9 +414,16 @@ def _parse_envelope(line: str) -> Optional[SignalEnvelope]:
         return None
     env = data.get("envelope") or {}
     data_msg = env.get("dataMessage") or {}
-    body = data_msg.get("message") or ""
     source = env.get("source") or env.get("sourceNumber")
     ts = env.get("timestamp")
+    from_self_sync = False
+    if not data_msg and account:
+        sent = (env.get("syncMessage") or {}).get("sentMessage")
+        if sent and _is_note_to_self(env, sent, account):
+            data_msg = sent
+            ts = sent.get("timestamp", ts)
+            from_self_sync = True
+    body = data_msg.get("message") or ""
     attachments = _parse_attachments(data_msg.get("attachments") or [])
     if not source or ts is None:
         return None
@@ -332,7 +435,27 @@ def _parse_envelope(line: str) -> Optional[SignalEnvelope]:
         source=str(source),
         body=str(body),
         attachments=attachments,
+        from_self_sync=from_self_sync,
     )
+
+
+def _is_note_to_self(env: dict, sent: dict, account: str) -> bool:
+    """True only for a 1:1 message from our own account to our own account.
+
+    Strict on purpose: the envelope source AND the sentMessage destination
+    must both be our account, it must not be a group message, and when both
+    UUIDs are present they must agree.
+    """
+    source = env.get("sourceNumber") or env.get("source")
+    dest = sent.get("destinationNumber") or sent.get("destination")
+    if not (_same_account(str(source or ""), account) and _same_account(str(dest or ""), account)):
+        return False
+    if sent.get("groupInfo") or sent.get("groupV2"):
+        return False
+    src_uuid, dest_uuid = env.get("sourceUuid"), sent.get("destinationUuid")
+    if src_uuid and dest_uuid and src_uuid != dest_uuid:
+        return False
+    return True
 
 
 def _parse_attachments(raw: list) -> list[Attachment]:
