@@ -566,12 +566,13 @@ li.fx-now {
   .a2ui-list.a2ui-chat-page { height: calc(100dvh - 8rem); }
 }
 /* Mobile: chat has no h1 above it, so 8rem over-reserves. Tighten to
- * match the actual header footprint (~75px) and reclaim thread rows
- * (#805). */
+ * match the actual header footprint — status bar (~40px) + nav row
+ * (~45px) + main top padding (8px) ≈ 6rem. 5rem used to over-flow by
+ * one line on iPhone (#805). */
 @media (max-width: 600px) {
-  .a2ui-list.a2ui-chat-page { height: calc(100vh - 5rem); min-height: 18rem; }
+  .a2ui-list.a2ui-chat-page { height: calc(100vh - 6rem); min-height: 18rem; }
   @supports (height: 100dvh) {
-    .a2ui-list.a2ui-chat-page { height: calc(100dvh - 5rem); }
+    .a2ui-list.a2ui-chat-page { height: calc(100dvh - 6rem); }
   }
 }
 .a2ui-list.a2ui-chat-thread {
