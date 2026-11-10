@@ -32,6 +32,11 @@ This interactive tool will:
    `~/.config/alice/alice.env`.
 3. Print next-step commands.
 
+   Before starting Alice, set the GitHub repos she should target (there is no
+   default): add `ALICE_FORGE_REPOS`, `ALICE_FORGE_REPO` and `ALICE_BUG_FIX_REPO`
+   to `alice.env`, or a `"forge"` block to `config/alice.config.json`. See
+   [alice_forge](components/alice_forge.md#configuring-which-github-repos-alice-targets).
+
 If you picked the scaffold, `<repo>/data/alice-mind/` is now a local git
 repo (and the parent `data/` directory is gitignored from the runtime
 repo). Edit `IDENTITY.md`, `CLAUDE.md`, `USER.md` to taste.
