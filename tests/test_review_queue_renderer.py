@@ -232,6 +232,83 @@ def test_render_section_design_items() -> None:
     assert expected in body
 
 
+# ─── fetch_design_review_issues ───────────────────────────────────────
+
+
+def _design_key(repo: str) -> tuple[str, ...]:
+    return (
+        "issue", "list",
+        "--repo", repo,
+        "--label", "sm:design_review",
+        "--state", "open",
+        "--json", "number,title,url,createdAt,author",
+    )
+
+
+def test_fetch_design_review_issues_does_not_crash() -> None:
+    """Regression for #817: constructing a ``DesignItem`` from a real
+    ``gh issue list`` row (which includes ``author``) must not raise.
+    Before the fix the ``DesignItem`` frozen dataclass rejected the
+    ``author``/``ci`` kwargs the fetcher was already passing.
+    """
+    row = {
+        "number": 123,
+        "title": "design something",
+        "url": "https://github.com/jcronq/alice/issues/123",
+        "createdAt": (NOW - timedelta(hours=4)).isoformat().replace("+00:00", "Z"),
+        "author": {"login": "someuser"},
+    }
+    runner = _fake_run({_design_key("jcronq/alice"): (0, json.dumps([row]), "")})
+
+    items, failed = rqr.fetch_design_review_issues(
+        ["jcronq/alice"], runner=runner, now=NOW
+    )
+
+    assert failed == []
+    assert isinstance(items, list)
+    assert len(items) == 1
+    assert isinstance(items[0], rqr.DesignItem)
+
+
+def test_fetch_design_review_issues_populates_author() -> None:
+    """``--json ...,author`` threads through to ``DesignItem.author``,
+    so the gh field addition is end-to-end verified."""
+    row = {
+        "number": 42,
+        "title": "look at this",
+        "url": "https://github.com/jcronq/alice/issues/42",
+        "createdAt": (NOW - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+        "author": {"login": "someuser"},
+    }
+    runner = _fake_run({_design_key("jcronq/alice"): (0, json.dumps([row]), "")})
+
+    items, _failed = rqr.fetch_design_review_issues(
+        ["jcronq/alice"], runner=runner, now=NOW
+    )
+
+    assert items[0].author == "someuser"
+
+
+def test_fetch_design_review_issues_ci_is_blank() -> None:
+    """``gh issue list`` has no ``statusCheckRollup`` concept, so the
+    ``ci`` field on a ``DesignItem`` is always the empty string even
+    when the row carries no such key."""
+    row = {
+        "number": 7,
+        "title": "no ci here",
+        "url": "https://github.com/jcronq/alice/issues/7",
+        "createdAt": (NOW - timedelta(hours=2)).isoformat().replace("+00:00", "Z"),
+        "author": {"login": "someuser"},
+    }
+    runner = _fake_run({_design_key("jcronq/alice"): (0, json.dumps([row]), "")})
+
+    items, _failed = rqr.fetch_design_review_issues(
+        ["jcronq/alice"], runner=runner, now=NOW
+    )
+
+    assert items[0].ci == ""
+
+
 # ─── fetch_pr_review filters ──────────────────────────────────────────
 
 

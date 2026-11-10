@@ -68,6 +68,8 @@ class DesignItem:
     title: str
     url: str
     age: str
+    author: str = ""
+    ci: str = ""  # always "" for issues — gh has no CI concept here
 
 
 @dataclass(frozen=True)
@@ -189,7 +191,7 @@ def fetch_design_review_issues(
                     "--state",
                     "open",
                     "--json",
-                    "number,title,url,createdAt",
+                    "number,title,url,createdAt,author",
                 ],
                 runner=runner,
             )
