@@ -215,6 +215,8 @@ class GmailTransport:
         inbox_size: int = 64,
         imap_factory: Callable[..., imaplib.IMAP4_SSL] = imaplib.IMAP4_SSL,
         smtp_factory: Callable[..., smtplib.SMTP_SSL] = smtplib.SMTP_SSL,
+        require_verified_sender: Optional[bool] = None,
+        trusted_authserv_id: Optional[str] = None,
     ) -> None:
         self._address = _normalize_email(address)
         if not self._address or not app_password:
@@ -230,9 +232,19 @@ class GmailTransport:
         self._imap_factory = imap_factory
         self._smtp_factory = smtp_factory
         self._stopping = asyncio.Event()
-        self._require_verified = os.environ.get("GMAIL_REQUIRE_VERIFIED", "1") != "0"
+        # Fail-closed sender verification. Prefer ctor params (daemon
+        # threads cfg values in); fall back to the raw env read so
+        # tests / tools constructing the transport without cfg still
+        # honor GMAIL_REQUIRE_VERIFIED / GMAIL_TRUSTED_AUTHSERV_ID.
+        if require_verified_sender is None:
+            require_verified_sender = (
+                os.environ.get("GMAIL_REQUIRE_VERIFIED", "1") != "0"
+            )
+        self._require_verified = require_verified_sender
         self._authserv_id = (
-            os.environ.get("GMAIL_TRUSTED_AUTHSERV_ID") or "mx.google.com"
+            trusted_authserv_id
+            or os.environ.get("GMAIL_TRUSTED_AUTHSERV_ID")
+            or "mx.google.com"
         )
 
     async def start(self) -> None:
@@ -276,6 +288,24 @@ class GmailTransport:
                                 inbound.principal.native_id,
                                 reason,
                             )
+                            # Durable telemetry for spike detection — a
+                            # run of ``gmail_inbound_dropped`` events in
+                            # events.jsonl signals attempted spoofing or
+                            # a verification regression. Fire before
+                            # marking \Seen so the drop is always
+                            # recorded, even if IMAP write below fails.
+                            emit = getattr(getattr(ctx, "events", None), "emit", None)
+                            if emit is not None:
+                                try:
+                                    emit(
+                                        "gmail_inbound_dropped",
+                                        reason=reason,
+                                        native_id=inbound.principal.native_id,
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    log.exception(
+                                        "gmail drop telemetry emit failed"
+                                    )
                             await asyncio.to_thread(self._mark_seen, uid)
                             continue
                     inbound.principal = Principal(
