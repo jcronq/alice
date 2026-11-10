@@ -86,21 +86,33 @@ model_list:
   # the container via host.docker.internal. $0 backend, no imputed cost.
   # The `pcc` model (Private Cloud Compute) is deliberately not mapped:
   # it sends prompts to Apple's servers.
+  #
+  # Two `fm serve` quirks are handled here (both verified against a
+  # throwaway proxy):
+  #   - It rejects requests whose Host header isn't localhost/127.0.0.1
+  #     with 403 "Cross-site requests are not allowed", so Host is pinned.
+  #   - It streams (SSE) unless the body says `"stream": false`, and
+  #     LiteLLM omits the field on non-streaming calls, so it is forced.
+  #     Consequence: this model is NON-STREAMING ONLY; a client that sends
+  #     stream=true gets an empty response.
   - model_name: apple-fm
     litellm_params:
       model: openai/system
       api_base: http://host.docker.internal:1976/v1
       api_key: dummy
+      extra_headers:
+        Host: localhost:1976
+      extra_body:
+        stream: false
 
-  # Ollama on the host, fronted by the same `fm serve` by starting it
-  # with `--model-provider http://localhost:11434/v1`. Replace the model
-  # below with whatever `ollama list` shows once one is pulled (see
-  # docs); the entry 404s until then.
-  # - model_name: ollama-local
-  #   litellm_params:
-  #     model: openai/qwen3:14b
-  #     api_base: http://host.docker.internal:1976/v1
-  #     api_key: dummy
+  # Ollama on the host (`ollama pull qwen3:14b`). Reached directly via
+  # host.docker.internal:11434; no need to front it with `fm serve`.
+  # Qwen3 emits a reasoning trace by default; prefix a prompt with
+  # /no_think to skip it.
+  - model_name: ollama-local
+    litellm_params:
+      model: ollama_chat/qwen3:14b
+      api_base: http://host.docker.internal:11434
 
 litellm_settings:
   # Silently strip params the backend doesn't accept (e.g. response_format
