@@ -670,7 +670,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--repos",
         help="Comma-separated <user>/<repo> list. Default: GH_RECONCILER_REPOS env "
-        "or the configured default (ALICE_FORGE_REPOS / alice.config.json forge.repos).",
+        "or the configured repos (ALICE_FORGE_REPOS / alice.config.json forge.repos).",
     )
     parser.add_argument(
         "--lookback-days",

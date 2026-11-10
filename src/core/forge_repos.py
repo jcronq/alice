@@ -7,7 +7,8 @@ Resolution order (first hit wins), per value:
 
 1. Environment variable (see below).
 2. ``<mind>/config/alice.config.json`` -> ``"forge"`` block.
-3. Built-in upstream default (preserves legacy behaviour).
+3. Nothing: raise :class:`ForgeNotConfigured`. There is deliberately no
+   built-in default, so a fork never silently targets someone else's repos.
 
 ======================  ===========================  ==================
 Value                   Env var                      ``forge`` key
@@ -31,11 +32,19 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-UPSTREAM_REPOS: tuple[str, ...] = ("jcronq/cozyhem-engine", "jcronq/alice")
-UPSTREAM_PRIMARY = "jcronq/alice"
-UPSTREAM_BUG_FIX_REPO = "jcronq/modern-mud"
+class ForgeNotConfigured(RuntimeError):
+    """Raised when a forge repo setting has no env var or config value."""
+
 
 _SLUG_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
+
+
+def _missing(what: str, env: str, key: str) -> ForgeNotConfigured:
+    return ForgeNotConfigured(
+        f"{what} is not configured. Set {env} in alice.env, or add "
+        f'"forge": {{"{key}": ...}} to <mind>/config/alice.config.json '
+        "(see core/forge_repos.py)."
+    )
 
 
 def _valid(slugs: Any) -> tuple[str, ...]:
@@ -68,7 +77,9 @@ def forge_repos(mind: Optional[os.PathLike] = None) -> tuple[str, ...]:
     if env:
         return env
     cfg = _valid(_forge_block(mind).get("repos"))
-    return cfg or UPSTREAM_REPOS
+    if cfg:
+        return cfg
+    raise _missing("Forge repo list", "ALICE_FORGE_REPOS", "repos")
 
 
 def primary_repo(mind: Optional[os.PathLike] = None) -> str:
@@ -83,7 +94,9 @@ def primary_repo(mind: Optional[os.PathLike] = None) -> str:
     if env_list:
         return env_list[0]
     cfg_list = _valid(block.get("repos"))
-    return cfg_list[0] if cfg_list else UPSTREAM_PRIMARY
+    if cfg_list:
+        return cfg_list[0]
+    raise _missing("Primary forge repo", "ALICE_FORGE_REPO", "primary")
 
 
 def bug_fix_repo(mind: Optional[os.PathLike] = None) -> str:
@@ -91,4 +104,6 @@ def bug_fix_repo(mind: Optional[os.PathLike] = None) -> str:
     if env:
         return env[0]
     cfg = _valid(_forge_block(mind).get("bug_fix_repo"))
-    return cfg[0] if cfg else UPSTREAM_BUG_FIX_REPO
+    if cfg:
+        return cfg[0]
+    raise _missing("Bug-fix repo", "ALICE_BUG_FIX_REPO", "bug_fix_repo")

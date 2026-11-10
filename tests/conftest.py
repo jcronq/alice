@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import os
 import pathlib
 
 import pytest
+
+# Forge repo slugs have no built-in default (fail-loud); give the suite a
+# fixed set *before* modules that resolve them at import time are loaded.
+os.environ.setdefault("ALICE_FORGE_REPOS", "jcronq/cozyhem-engine,jcronq/alice")
+os.environ.setdefault("ALICE_FORGE_REPO", "jcronq/alice")
+os.environ.setdefault("ALICE_BUG_FIX_REPO", "jcronq/modern-mud")
 
 from alice_speaking.infra.config import Config, SPEAKING_DEFAULTS
 from alice_speaking.domain.principals import (

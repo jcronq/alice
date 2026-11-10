@@ -17,10 +17,10 @@ def _cfg(tmp_path, forge):
     return tmp_path
 
 
-def test_defaults_when_nothing_configured(tmp_path):
-    assert fr.forge_repos(tmp_path) == fr.UPSTREAM_REPOS
-    assert fr.primary_repo(tmp_path) == "jcronq/alice"
-    assert fr.bug_fix_repo(tmp_path) == "jcronq/modern-mud"
+def test_unconfigured_fails_loud(tmp_path):
+    for fn in (fr.forge_repos, fr.primary_repo, fr.bug_fix_repo):
+        with pytest.raises(fr.ForgeNotConfigured):
+            fn(tmp_path)
 
 
 def test_config_block(tmp_path):
@@ -41,9 +41,13 @@ def test_env_beats_config(tmp_path, monkeypatch):
 def test_invalid_entries_ignored(tmp_path, monkeypatch):
     monkeypatch.setenv("ALICE_FORGE_REPOS", "bad, ok/repo, ../x")
     assert fr.forge_repos(tmp_path) == ("ok/repo",)
+    monkeypatch.setenv("ALICE_FORGE_REPOS", "bad")
+    with pytest.raises(fr.ForgeNotConfigured):
+        fr.forge_repos(tmp_path)
 
 
 def test_malformed_config_falls_back(tmp_path):
     (tmp_path / "config").mkdir()
     (tmp_path / "config" / "alice.config.json").write_text("{nope")
-    assert fr.primary_repo(tmp_path) == "jcronq/alice"
+    with pytest.raises(fr.ForgeNotConfigured):
+        fr.primary_repo(tmp_path)

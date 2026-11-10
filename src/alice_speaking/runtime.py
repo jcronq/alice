@@ -90,7 +90,7 @@ BUILD_AGENT_TOOL_ALLOWLIST: tuple[str, ...] = (
 SWE_BASELINE_PRACTICES = """\
 ## SWE practices baseline
 
-You are opening a draft PR against `jcronq/alice`. Operate as a real
+You are opening a draft PR against `__REPO__`. Operate as a real
 engineer would:
 
 - **Branch off `master`.** `git checkout -b feat/<slug>-<N> master`.
@@ -196,7 +196,7 @@ def compose_build_prompt(
         "",
         inputs.design_note_text.strip(),
         "",
-        swe_baseline.strip(),
+        swe_baseline.replace("__REPO__", inputs.repo).strip(),
         "",
         (
             f"When the draft PR is open, end your turn with a single "
