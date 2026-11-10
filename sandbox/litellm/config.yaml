@@ -80,6 +80,28 @@ model_list:
       input_cost_per_token: 0.0000001
       output_cost_per_token: 0.0000001
 
+  # Apple's on-device Foundation Model, served by the macOS `fm` CLI on
+  # the host: `fm serve --port 1976`. Runs on the Mac's Neural Engine /
+  # GPU, so it only exists while that host process is up. Reached from
+  # the container via host.docker.internal. $0 backend, no imputed cost.
+  # The `pcc` model (Private Cloud Compute) is deliberately not mapped:
+  # it sends prompts to Apple's servers.
+  - model_name: apple-fm
+    litellm_params:
+      model: openai/system
+      api_base: http://host.docker.internal:1976/v1
+      api_key: dummy
+
+  # Ollama on the host, fronted by the same `fm serve` by starting it
+  # with `--model-provider http://localhost:11434/v1`. Replace the model
+  # below with whatever `ollama list` shows once one is pulled (see
+  # docs); the entry 404s until then.
+  # - model_name: ollama-local
+  #   litellm_params:
+  #     model: openai/qwen3:14b
+  #     api_base: http://host.docker.internal:1976/v1
+  #     api_key: dummy
+
 litellm_settings:
   # Silently strip params the backend doesn't accept (e.g. response_format
   # on older Qwen builds). Call sites can stay backend-agnostic.
