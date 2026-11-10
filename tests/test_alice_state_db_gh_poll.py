@@ -733,3 +733,149 @@ def test_derive_issue_components_reflects_updated_pr_file_list(mind):
             ).fetchall()
         }
     assert pr_803 == {"status_site", "alice_speaking"}
+
+
+# ─── reconcile_stale_open_prs — merged PR transition ──────────────────
+
+
+def test_derive_gh_poll_reconciles_merged_prs_that_dropped_off_open_list(mind):
+    """A PR previously at ``pr:open`` that no longer appears in the
+    ``?state=open`` list gets fetched individually and transitions to
+    ``pr:merged`` (plus a cached merged_at amendment). Mirrors the
+    staleness that showed up on the Overview after PRs #868-#873 landed
+    but their sm rows never advanced past pr:open."""
+
+    db_path = mind / "inner" / "state" / "alice-state.db"
+
+    # Pass 1: open-list contains both PRs. Seeds sm rows at pr:open.
+    def runner_open(cmd):
+        url = cmd[-1]
+        if "/issues" in url and "/pulls" not in url:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, "e1", "[]"), stderr=""
+            )
+        if url.endswith("/pulls?state=open&per_page=100&sort=updated&direction=desc"):
+            prs = [
+                {
+                    "number": 900,
+                    "title": "will merge",
+                    "created_at": "2026-11-09T09:00:00Z",
+                    "updated_at": "2026-11-09T10:00:00Z",
+                    "user": {"login": "jcronq"},
+                    "body": "",
+                    "state": "open",
+                    "merged_at": None,
+                    "draft": False,
+                },
+                {
+                    "number": 901,
+                    "title": "stays open",
+                    "created_at": "2026-11-09T09:00:00Z",
+                    "updated_at": "2026-11-09T10:00:00Z",
+                    "user": {"login": "jcronq"},
+                    "body": "",
+                    "state": "open",
+                    "merged_at": None,
+                    "draft": False,
+                },
+            ]
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, "eprs-1", json.dumps(prs)), stderr=""
+            )
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=_mk_curl_output(200, None, "[]"), stderr=""
+        )
+
+    P.derive_gh_poll(
+        mind,
+        db_path=db_path,
+        repos=["jcronq/alice"],
+        env={},
+        runner=runner_open,
+    )
+
+    # Confirm both sm rows at pr:open after pass 1.
+    with sqlite3.connect(str(db_path)) as conn:
+        states = dict(
+            conn.execute(
+                "SELECT item_id, state FROM state_machine WHERE item_id LIKE 'gh:pr:%'"
+            ).fetchall()
+        )
+    assert states == {
+        "gh:pr:jcronq/alice#900": "pr:open",
+        "gh:pr:jcronq/alice#901": "pr:open",
+    }
+
+    # Clear etag cache so pass 2 doesn't short-circuit on 304.
+    (mind / "inner" / "state" / "gh-poll-etags.json").unlink()
+
+    # Pass 2: #900 merged, only #901 is in the open list. The
+    # reconciler must fetch /pulls/900 and transition it to pr:merged.
+    def runner_merged(cmd):
+        url = cmd[-1]
+        if "/issues" in url and "/pulls" not in url:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, "e2", "[]"), stderr=""
+            )
+        if url.endswith("/pulls?state=open&per_page=100&sort=updated&direction=desc"):
+            prs = [
+                {
+                    "number": 901,
+                    "title": "stays open",
+                    "created_at": "2026-11-09T09:00:00Z",
+                    "updated_at": "2026-11-09T10:00:00Z",
+                    "user": {"login": "jcronq"},
+                    "body": "",
+                    "state": "open",
+                    "merged_at": None,
+                    "draft": False,
+                },
+            ]
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, "eprs-2", json.dumps(prs)), stderr=""
+            )
+        if url.endswith("/pulls/900"):
+            pr = {
+                "number": 900,
+                "title": "will merge",
+                "created_at": "2026-11-09T09:00:00Z",
+                "updated_at": "2026-11-09T11:00:00Z",
+                "user": {"login": "jcronq"},
+                "body": "",
+                "state": "closed",
+                "merged_at": "2026-11-09T10:30:00Z",
+                "draft": False,
+            }
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=_mk_curl_output(200, None, json.dumps(pr)), stderr=""
+            )
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=_mk_curl_output(200, None, "[]"), stderr=""
+        )
+
+    report = P.derive_gh_poll(
+        mind,
+        db_path=db_path,
+        repos=["jcronq/alice"],
+        env={},
+        runner=runner_merged,
+    )
+    assert report.status == "ok", report.errors
+    assert report.stale_prs_reconciled == 1
+
+    with sqlite3.connect(str(db_path)) as conn:
+        states = dict(
+            conn.execute(
+                "SELECT item_id, state FROM state_machine WHERE item_id LIKE 'gh:pr:%'"
+            ).fetchall()
+        )
+        merged_amendment = conn.execute(
+            "SELECT body FROM amendments WHERE item_id = ? AND source = 'pr-merged-at'",
+            ("gh:pr:jcronq/alice#900",),
+        ).fetchone()
+    assert states == {
+        "gh:pr:jcronq/alice#900": "pr:merged",
+        "gh:pr:jcronq/alice#901": "pr:open",
+    }
+    assert merged_amendment is not None
+    assert merged_amendment[0] == "2026-11-09T10:30:00Z"

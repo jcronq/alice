@@ -126,6 +126,11 @@ class PollReport:
     repos_polled: int = 0
     issues_seen: int = 0
     prs_seen: int = 0
+    # Count of pr:open/pr:draft sm rows that fell off the open-PR list
+    # this tick and were re-checked individually via /pulls/<N> to
+    # transition them to pr:merged / pr:closed. Separate counter so
+    # the "normal" prs_seen stays bounded by the open-list page size.
+    stale_prs_reconciled: int = 0
     items_upserted: int = 0
     states_upserted: int = 0
     transitions_inserted: int = 0
@@ -149,6 +154,7 @@ class PollReport:
             "repos_polled": self.repos_polled,
             "issues_seen": self.issues_seen,
             "prs_seen": self.prs_seen,
+            "stale_prs_reconciled": self.stale_prs_reconciled,
             "items_upserted": self.items_upserted,
             "states_upserted": self.states_upserted,
             "transitions_inserted": self.transitions_inserted,
@@ -792,6 +798,131 @@ def poll_repo_prs(
     return result.etag or etag
 
 
+def reconcile_stale_open_prs(
+    conn: sqlite3.Connection,
+    repo: str,
+    *,
+    seen_open_numbers: set[int],
+    token: Optional[str],
+    runner: Runner,
+    report: PollReport,
+) -> None:
+    """Catch merged/closed PRs the open-list fetch no longer returns.
+
+    :func:`poll_repo_prs` only queries ``/pulls?state=open`` to keep the
+    normal tick bounded — but once a PR is merged it drops off that
+    list forever. Without a reconciliation step the ``state_machine``
+    rows for just-merged PRs stay at ``pr:open`` indefinitely, which is
+    exactly the staleness the status-site Overview surfaced as
+    "inaccurate" (#TBD).
+
+    Approach: find every sm row this repo still has at ``pr:open`` or
+    ``pr:draft`` whose number is NOT in ``seen_open_numbers``, then
+    hit ``/repos/<r>/pulls/<N>`` once per stale row and upsert the
+    resolved state (``pr:merged`` / ``pr:closed`` / still ``pr:open``
+    if we were wrong). Bounded by the delta since last tick — normally
+    a handful of rows, so the GH-call cost stays tiny.
+    """
+    rows = conn.execute(
+        """
+        SELECT item_id
+        FROM state_machine
+        WHERE state IN ('pr:open', 'pr:draft')
+          AND item_id LIKE ?
+        """,
+        (f"gh:pr:{repo}#%",),
+    ).fetchall()
+
+    prefix = f"gh:pr:{repo}#"
+    for (item_id,) in rows:
+        try:
+            number = int(item_id[len(prefix):])
+        except (ValueError, IndexError):
+            continue
+        if number in seen_open_numbers:
+            continue
+
+        url = f"https://api.github.com/repos/{repo}/pulls/{number}"
+        report.http_calls += 1
+        try:
+            result = fetch_github(url, token=token, runner=runner)
+        except GHPollError as exc:
+            if exc.looks_like_rate_limit:
+                raise
+            report.errors.append(
+                {
+                    "kind": "stale_pr_fetch",
+                    "path": f"{repo}#{number}",
+                    "reason": str(exc),
+                }
+            )
+            continue
+
+        if result.status != 200 or result.body is None:
+            report.errors.append(
+                {
+                    "kind": "stale_pr_fetch",
+                    "path": f"{repo}#{number}",
+                    "reason": f"status={result.status}",
+                }
+            )
+            continue
+
+        try:
+            pr = json.loads(result.body)
+        except json.JSONDecodeError as exc:
+            report.errors.append(
+                {
+                    "kind": "stale_pr_json",
+                    "path": f"{repo}#{number}",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            continue
+
+        if not isinstance(pr, dict):
+            continue
+
+        pr_state = pr.get("state")
+        merged_at = pr.get("merged_at")
+        if pr_state == "closed":
+            resolved = "pr:merged" if merged_at else "pr:closed"
+        elif pr.get("draft"):
+            resolved = "pr:draft"
+        else:
+            resolved = "pr:open"
+
+        updated_at = pr.get("updated_at") if isinstance(
+            pr.get("updated_at"), str
+        ) else None
+
+        _upsert_state(
+            conn,
+            _SeedShim(report),  # type: ignore[arg-type]
+            item_id=item_id,
+            state=resolved,
+            entered_at=updated_at,
+        )
+
+        # Mirror poll_repo_prs: cache merged_at as an amendment so
+        # done_today readers can see when the PR landed.
+        if merged_at and isinstance(merged_at, str):
+            user = pr.get("user") if isinstance(pr.get("user"), dict) else {}
+            author = user.get("login") if isinstance(
+                user.get("login"), str
+            ) else None
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO amendments
+                    (item_id, author, body, ts, source, source_ref)
+                VALUES (?, ?, ?, ?, 'pr-merged-at', ?)
+                """,
+                (item_id, author, merged_at, merged_at, f"{item_id}@{merged_at}"),
+            )
+
+        report.stale_prs_reconciled += 1
+
+
 # ---------------------------------------------------------------------------
 # Component sync (issue #821) — PR file list → ``item_components``.
 
@@ -1151,6 +1282,59 @@ def derive_gh_poll(
 
                 if new_etag:
                     cache[key] = new_etag
+
+            # Merged-PR reconciliation — poll_repo_prs only fetches
+            # ``?state=open`` so merged PRs would stay at ``pr:open``
+            # forever otherwise. Run before component sync so any PR
+            # we just transitioned to pr:merged has its components
+            # trimmed cleanly. Skipped on rate-limit (same reason as
+            # component sync below).
+            if not rate_limited:
+                seen_open_numbers = {n for _, n, _ in seen_open_prs}
+                try:
+                    reconcile_stale_open_prs(
+                        conn,
+                        repo,
+                        seen_open_numbers=seen_open_numbers,
+                        token=token,
+                        runner=runner,
+                        report=report,
+                    )
+                except GHPollError as exc:
+                    if exc.looks_like_rate_limit:
+                        report.rate_limit_hits += 1
+                        try:
+                            observe_gh_error(exc, path=backoff_path)
+                        except Exception as inner:  # noqa: BLE001
+                            report.errors.append(
+                                {
+                                    "kind": "backoff_write",
+                                    "path": str(backoff_path),
+                                    "reason": f"{type(inner).__name__}: {inner}",
+                                }
+                            )
+                        report.status = "rate_limited"
+                        rate_limited = True
+                        conn.commit()
+                        _record_run(
+                            db_path,
+                            started_at,
+                            _utc_now_iso(),
+                            report.status,
+                            report,
+                        )
+                        _write_etag_cache(etag_cache_path, cache)
+                        report.duration_ms = int(
+                            (time.monotonic() - started_mono) * 1000
+                        )
+                        return report
+                    report.errors.append(
+                        {
+                            "kind": "reconcile_stale_prs_error",
+                            "path": repo,
+                            "reason": str(exc),
+                        }
+                    )
 
             # Component sync (issue #821) — skipped on rate-limit
             # since the early-return above exits before we reach
