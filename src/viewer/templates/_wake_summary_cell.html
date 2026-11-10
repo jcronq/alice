@@ -1,14 +1,29 @@
-{# Wake-summary cell. When the summary is the "summarising…" placeholder
-   (Haiku call still pending in background), the rendered span polls
-   /api/wakes/<id>/summary every 3s and swaps itself in once the real
-   summary lands. The polling response (the "real" branch below) omits
-   hx attributes so polling stops naturally on the swap.
+{# Wake-summary cell. Three render modes:
+   - "summarising…" prefix: Haiku call already in flight (auto_schedule
+     path) — poll /api/wakes/<id>/summary every 3s and swap in the real
+     summary once it lands.
+   - "(no summary…" prefix: JIT default — no Haiku call fired. Render a
+     "summarize" action that triggers one on demand. One Haiku call per
+     click, not per page view.
+   - Anything else: a real cached summary — render inline.
    Required context: w (Wake), summary (str). #}
 {% if summary.startswith("summarising") %}
 <span class="wake-summary-pending"
       hx-get="/api/wakes/{{ w.wake_id }}/summary"
       hx-trigger="every 3s"
       hx-swap="outerHTML">{{ summary }}</span>
+{% elif summary.startswith("(no summary") %}
+<span class="wake-summary-jit">
+  {{ summary }}
+  <button type="button"
+          class="wake-summary-btn"
+          hx-get="/api/wakes/{{ w.wake_id }}/summary?generate=1"
+          hx-target="closest .wake-summary-jit"
+          hx-swap="outerHTML"
+          title="Generate a one-sentence Haiku summary for this wake">
+    summarize
+  </button>
+</span>
 {% else %}
 <span>{{ summary }}</span>
 {% endif %}
