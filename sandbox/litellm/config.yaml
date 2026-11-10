@@ -80,6 +80,44 @@ model_list:
       input_cost_per_token: 0.0000001
       output_cost_per_token: 0.0000001
 
+  # Apple's on-device Foundation Model, served by the macOS `fm` CLI on
+  # the host: `fm serve --port 1976`. Runs on the Mac's Neural Engine /
+  # GPU, so it only exists while that host process is up. Reached from
+  # the container via host.docker.internal. $0 backend, no imputed cost.
+  # The `pcc` model (Private Cloud Compute) is deliberately not mapped:
+  # it sends prompts to Apple's servers.
+  #
+  # Two `fm serve` quirks are handled here (both verified against a
+  # throwaway proxy):
+  #   - It rejects requests whose Host header isn't localhost/127.0.0.1
+  #     with 403 "Cross-site requests are not allowed", so Host is pinned.
+  #   - It streams (SSE) unless the body says `"stream": false`, and
+  #     LiteLLM omits the field on non-streaming calls, so it is forced.
+  #     Consequence: this model is NON-STREAMING ONLY; a client that sends
+  #     stream=true gets an empty response.
+  - model_name: apple-fm
+    litellm_params:
+      model: openai/system
+      api_base: http://host.docker.internal:1976/v1
+      api_key: dummy
+      extra_headers:
+        Host: localhost:1976
+      extra_body:
+        stream: false
+
+  # Ollama on the host (`ollama pull qwen3:14b`). Reached directly via
+  # host.docker.internal:11434; no need to front it with `fm serve`.
+  # Qwen3 emits a hidden reasoning trace by default, and those tokens count
+  # against max_tokens: with max_tokens=100 the reply came back EMPTY
+  # (finish_reason=length). Call sites with small token caps (correction
+  # cascade: 100, face caption: 64) can't pass a per-request flag, so thinking
+  # is turned off here for every caller. Remove `think` to get reasoning back.
+  - model_name: ollama-local
+    litellm_params:
+      model: ollama_chat/qwen3:14b
+      api_base: http://host.docker.internal:11434
+      think: false
+
 litellm_settings:
   # Silently strip params the backend doesn't accept (e.g. response_format
   # on older Qwen builds). Call sites can stay backend-agnostic.
