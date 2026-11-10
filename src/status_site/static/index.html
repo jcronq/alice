@@ -443,7 +443,7 @@ import {
   HIGHLIGHT_MS, imageFilesFromClipboard, isNearBottom, isNearTop,
   messageAnchorId, MORE_REACTS, parseMessageHash, permalinkFor, QUICK_REACTS,
   quoteForReply, reactionsSignature, readAsBase64, replyPreview,
-  shouldSubmitOnKey, summarizeReactions, validateAttachment,
+  rowMatchesPending, shouldSubmitOnKey, summarizeReactions, validateAttachment,
 } from "./chat-ux.js";
 const h = React.createElement;
 
@@ -901,7 +901,7 @@ function applyDataModel(data, pointer, value) {
 // the switch maps each to the existing POST endpoint + payload shape
 // so ``handle_chat`` / ``handle_review_action`` on the server stay
 // untouched — A2UI only describes the UI around them.
-async function dispatchA2uiAction(kind, {text, slug, files, replyTo, reportId}) {
+async function dispatchA2uiAction(kind, {text, slug, files, replyTo, clientMessageId, reportId}) {
   if (!KEY) return {ok: false, error: "no key"};
   if (kind === "chat.send") {
     const r = await fetch("/api/chat", {
@@ -911,6 +911,7 @@ async function dispatchA2uiAction(kind, {text, slug, files, replyTo, reportId}) 
         key: KEY, text,
         files: (files || []).map(f => ({name: f.name, data: f.data})),
         ...(replyTo ? {reply_to: replyTo} : {}),
+        ...(clientMessageId ? {client_message_id: clientMessageId} : {}),
       }),
     });
     const j = await r.json().catch(() => ({}));
@@ -1651,8 +1652,10 @@ const chatPendingStore = {
     const next = this.pending.map(p => {
       if (p.status === "delivered") return p;
       const match = tail.find(r =>
-        (r.text || "") === (p.text || "") &&
-        ((r.files && r.files.length) || 0) === ((p.files && p.files.length) || 0),
+        r.client_message_id && p._client_id
+          ? r.client_message_id === p._client_id
+          : (r.text || "") === (p.text || "") &&
+            ((r.files && r.files.length) || 0) === ((p.files && p.files.length) || 0),
       );
       if (!match) return p;
       changed = true;
@@ -1682,11 +1685,7 @@ const chatPendingStore = {
 // the pending bubble as the single rendered message with its own
 // status transitions.
 function serverRowMatchesPending(row, pending) {
-  if (row.from !== "jason") return false;
-  return pending.some(p =>
-    (row.text || "") === (p.text || "") &&
-    ((row.files && row.files.length) || 0) === ((p.files && p.files.length) || 0),
-  );
+  return rowMatchesPending(row, pending);
 }
 
 async function runA2uiAction(id, props, surface, local, setLocal) {
@@ -1734,6 +1733,7 @@ async function runA2uiAction(id, props, surface, local, setLocal) {
     files,
     slug: surface.data && surface.data.slug,
     replyTo,
+    clientMessageId: clientId,
   });
   if (clientId) {
     if (res.ok) chatPendingStore.setStatus(clientId, "sent");
