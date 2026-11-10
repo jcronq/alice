@@ -304,12 +304,23 @@ def group_sm_runs(paths: Paths, now_ts: float | None = None) -> list[Run]:
     return runs
 
 
-def summarize_wake(w: Wake, run_summary_module=None) -> str:
+def summarize_wake(
+    w: Wake, run_summary_module=None, *, auto_schedule: bool = False
+) -> str:
     """Compact one-line label for a thinking wake row.
 
     Running wakes get ``running…`` (no point summarizing a moving
-    target). Ended wakes prefer the Haiku-generated cached summary; on
-    cache miss, schedule one and return a fallback for this render.
+    target). Ended wakes prefer the Haiku-generated cached summary.
+
+    JIT policy (default): on cache miss, return the deterministic
+    fallback and do NOT fire a Haiku call. The template renders a
+    "summarize" action the user can click to generate on demand — this
+    keeps a casual timeline refresh from burning Haiku tokens on dozens
+    of rows the user never reads in detail.
+
+    Set ``auto_schedule=True`` (e.g. from the explicit summarize
+    endpoint) to restore the old fire-and-forget behavior for this one
+    row.
     """
     if w.end_ts is None:
         return "running…"
@@ -318,23 +329,26 @@ def summarize_wake(w: Wake, run_summary_module=None) -> str:
         cached = run_summary_module.read(w.wake_id)
         if cached:
             return cached
-        # Fire-and-forget — fills cache for the next render.
-        try:
-            run_summary_module.schedule(w.wake_id, w.events)
-        except Exception:  # noqa: BLE001
-            pass
+        if auto_schedule:
+            try:
+                run_summary_module.schedule(w.wake_id, w.events)
+            except Exception:  # noqa: BLE001
+                pass
 
-    # Fallback while the Haiku summary is being generated. Used to
-    # leak Alice's raw thinking block, which (a) reads as her internal
-    # monologue ("Let me start by understanding the current state…")
-    # rather than a summary, and (b) can be confusing once the real
-    # summary lands and replaces it. Now we say "summarising…" with a
-    # tool fingerprint when one's available — concrete enough to give
-    # the operator a hint, neutral enough not to be mistaken for the
-    # actual summary.
+    # Fallback label for a row whose Haiku summary isn't cached yet.
+    # The template keys off the "summarising…" prefix to auto-poll for
+    # the real summary — reserve that prefix for the explicit
+    # auto_schedule path so a plain timeline render shows a stable
+    # fingerprint and a click-to-summarize action instead of a
+    # polling placeholder. Both branches include the tool list so the
+    # operator has something concrete without burning a Haiku call.
+    if auto_schedule:
+        if w.tools:
+            return f"summarising… (used {', '.join(w.tools[:5])})"
+        return "summarising…"
     if w.tools:
-        return f"summarising… (used {', '.join(w.tools[:5])})"
-    return "summarising…"
+        return f"(no summary · used {', '.join(w.tools[:5])})"
+    return "(no summary)"
 
 
 def summarize_turn(t: Turn) -> str:

@@ -276,7 +276,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def timeline(
-        request: Request, limit: int = 50, hemisphere: str | None = None
+        request: Request, limit: int = 20, hemisphere: str | None = None
     ):
         """Timeline of *runs* — one row per thinking wake or speaking turn.
 
@@ -312,7 +312,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
     async def timeline_page(
         request: Request,
         offset: int = 0,
-        limit: int = 50,
+        limit: int = 20,
         hemisphere: str | None = None,
     ):
         """HTML partial for one page of timeline rows + (optionally) a
@@ -443,7 +443,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         )
 
     @app.get("/wakes", response_class=HTMLResponse)
-    async def wakes_index(request: Request, limit: int = 50):
+    async def wakes_index(request: Request, limit: int = 20):
         from . import run_summary
 
         p: Paths = app.state.paths
@@ -471,7 +471,7 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         )
 
     @app.get("/wakes/page", response_class=HTMLResponse)
-    async def wakes_page(request: Request, offset: int = 0, limit: int = 50):
+    async def wakes_page(request: Request, offset: int = 0, limit: int = 20):
         """HTML partial for one page of wake rows + (optionally) a new
         infinite-scroll sentinel. Called by HTMX when the previous
         sentinel scrolls into view."""
@@ -499,11 +499,20 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         )
 
     @app.get("/api/wakes/{wake_id}/summary", response_class=HTMLResponse)
-    async def wake_summary_cell(request: Request, wake_id: str):
-        """HTMX poll target for the per-row 'summarising…' fallback.
-        Returns the same summary cell partial — when the Haiku call
-        has filled the cache, the response omits the polling
-        attributes so the swap stops the poll naturally."""
+    async def wake_summary_cell(
+        request: Request, wake_id: str, generate: int = 0
+    ):
+        """HTMX target for the per-row summary cell.
+
+        Two uses:
+        - ``generate=1`` — fire the Haiku call for this wake (JIT: the
+          user clicked "summarize"). Returns a polling cell so the row
+          swaps in the real summary once the call completes.
+        - ``generate=0`` (default) — pure read, no side effect. The
+          auto-poll path from a ``summarising…`` cell uses this; the
+          response omits polling attrs once the cache is warm so the
+          swap stops the poll naturally.
+        """
         from . import run_summary
 
         p: Paths = app.state.paths
@@ -512,7 +521,12 @@ def create_app(paths: Paths | None = None) -> FastAPI:
         wake = next((w for w in wakes if w.wake_id == wake_id), None)
         if wake is None:
             return HTMLResponse("<span>(unknown wake)</span>")
-        summary = aggregators.summarize_wake(wake, run_summary) or ""
+        summary = (
+            aggregators.summarize_wake(
+                wake, run_summary, auto_schedule=bool(generate)
+            )
+            or ""
+        )
         return templates.TemplateResponse(
             request,
             "_wake_summary_cell.html",
