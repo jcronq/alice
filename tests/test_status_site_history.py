@@ -283,6 +283,95 @@ def test_api_history_shape(site):
     }
 
 
+def test_api_history_shape_for_waiting_on_you_item(tmp_path):
+    """Slice-1 (#881): /api/history returns the full {events, thread, extra}
+    shape for a "Waiting on you" entry — the same shape that already works
+    for items in other sections. Frontend ``WaitingThreadModal`` relies on
+    this parity to render the per-item timeline.
+
+    Spins up its own fixture (not the module-scoped ``site``) because the
+    slug and section wording matter for the assertion.
+    """
+    st = tmp_path / "status"
+    (st / "threads").mkdir(parents=True)
+    (st / "item-extra").mkdir()
+    (st / "index.md").write_text(
+        "## Waiting on you\n\n"
+        "- [ ] **Bambu X2D**: current LAN access code\n"
+        "- [ ] **PFL: close out NAM arbitration**: phone Randy Sosa\n"
+    )
+    # Pre-seed a thread message as if Jason had posted via /api/reply.
+    (st / "threads" / "bambu-x2d.jsonl").write_text(
+        json.dumps(
+            {
+                "from": "jason",
+                "at": "2026-11-16T10:00:00-05:00",
+                "text": "found it: 12345",
+            }
+        )
+        + "\n"
+    )
+    # Pre-seed an extra event as if a watcher dropped it there.
+    (st / "item-extra" / "bambu-x2d.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "commit",
+                "sha": "deadbeefcafe",
+                "at": "2026-11-15T09:00:00-05:00",
+                "subject": "cozyhem: expose bambu access-code form",
+            }
+        )
+        + "\n"
+    )
+    H.Tracker(st).step(at="2026-11-16T09:00:00-05:00")
+
+    cfg = Config(
+        status_dir=st,
+        surface_dir=tmp_path / "s",
+        upload_dir=tmp_path / "u",
+        key="k",
+        port=0,
+        host="127.0.0.1",
+    )
+    srv = make_server(cfg)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        _, port = None, srv.server_address[1]
+        # Simple leaf slug.
+        code, body = get(port, "/api/history?slug=bambu-x2d")
+        assert code == 200
+        d = json.loads(body)
+        assert set(d) == {"slug", "events", "thread", "extra"}
+        assert d["slug"] == "bambu-x2d"
+        # "appeared" event mentions the Waiting-on-you section exactly.
+        assert d["events"][0]["type"] == "appeared"
+        assert d["events"][0]["section"] == "Waiting on you"
+        assert d["events"][0]["title"] == "Bambu X2D"
+        # Thread is round-tripped.
+        assert d["thread"] == [
+            {
+                "from": "jason",
+                "at": "2026-11-16T10:00:00-05:00",
+                "text": "found it: 12345",
+            }
+        ]
+        # Extra survives too.
+        assert d["extra"][0]["sha"] == "deadbeefcafe"
+
+        # Title with a colon inside the bold span — history.py's
+        # title_slug strips trailing ``:.`` but keeps interior colons;
+        # the frontend ``titleSlug`` in index.html mirrors this.
+        code, body = get(port, "/api/history?slug=pfl-close-out-nam-arbitration")
+        assert code == 200
+        d = json.loads(body)
+        assert d["slug"] == "pfl-close-out-nam-arbitration"
+        assert d["events"][0]["section"] == "Waiting on you"
+        assert d["events"][0]["title"] == "PFL: close out NAM arbitration"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def test_api_history_slug_sanitized(site):
     st, port = site
     (st.parent / "secret.jsonl").write_text('{"leak": true}\n')
@@ -418,6 +507,9 @@ def test_api_item_state_and_bug_deps(site):
     status_code, body = get(port, "/api/item-state")
     assert status_code == 200
     data = json.loads(body)
-    assert data["wave-b"] == {"checked": False, "depends_on": ["wave-a", "wave-c", "extra"]}
+    assert data["wave-b"] == {
+        "checked": False,
+        "depends_on": ["wave-a", "wave-c", "extra"],
+    }
     status_code, body = get(port, "/bugs.md")
     assert b"<!--deps: wave-a, bug4-->" in body
