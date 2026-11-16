@@ -67,8 +67,11 @@ def test_ingest_empty_and_none(cfg):
     assert not cfg.upload_dir.exists()
 
 
-def test_ingest_rejects_over_10mb(cfg):
-    cfg.max_upload = 25 * 1024 * 1024
+def test_ingest_rejects_over_max_per_file(cfg):
+    # Make cfg.max_upload comfortably above MAX_PER_FILE so the module-
+    # level cap is the binding constraint (what this test is asserting
+    # about).
+    cfg.max_upload = MAX_PER_FILE * 2
     big = b64(b"x" * (MAX_PER_FILE + 1))
     with pytest.raises(ReplyError) as e:
         ingest_attachments(cfg, [{"name": "a.png", "data": big}], "s")
