@@ -23,8 +23,10 @@ import json
 import logging
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +55,26 @@ def _default_url() -> str:
 DEFAULT_URL: str = _default_url()
 
 
+#: Status-site shared key path inside the alice container. The key
+#: unlocks ``focused_within_s`` in the GET response for observability;
+#: without it the response still carries ``focused`` and the
+#: suppression gate works, just less chatty in logs.
+_KEY_PATH = Path(
+    os.environ.get(
+        "ALICE_STATUS_KEY_FILE",
+        "/home/alice/alice-mind/inner/status-server/key",
+    )
+)
+
+
+def _load_key() -> str | None:
+    try:
+        key = _KEY_PATH.read_text().strip()
+    except OSError:
+        return None
+    return key or None
+
+
 @dataclass(frozen=True)
 class PresenceReading:
     """Normalised view of ``GET /api/presence/status``.
@@ -76,16 +98,24 @@ def check_focused(
     *,
     timeout: float = DEFAULT_TIMEOUT_S,
     opener: urllib.request.OpenerDirector | None = None,
+    key: str | None = None,
 ) -> PresenceReading:
     """Return the current presence reading. Never raises.
 
     ``url`` defaults to ``$ALICE_PRESENCE_URL`` (resolved at call
-    time) when not supplied. The ``opener`` hook is only for tests
-    — real callers pass neither and we use
-    ``urllib.request.urlopen`` directly.
+    time) when not supplied. ``key`` defaults to the status-site
+    shared key file inside the container; passing the key unlocks
+    the detailed response shape with ``focused_within_s``. The
+    ``opener`` hook is only for tests — real callers pass neither
+    and we use ``urllib.request.urlopen`` directly.
     """
     if url is None:
         url = _default_url()
+    if key is None:
+        key = _load_key()
+    if key:
+        sep = "&" if urllib.parse.urlparse(url).query else "?"
+        url = f"{url}{sep}k={urllib.parse.quote(key, safe='')}"
     try:
         req = urllib.request.Request(url, method="GET")
         if opener is None:

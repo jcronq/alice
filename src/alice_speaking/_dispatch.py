@@ -1001,20 +1001,24 @@ async def handle_surface(ctx: DaemonContext, event: "SurfaceEvent") -> None:
     )
     error: Optional[str] = None
     prev_kind = ctx._current_turn_kind
-    ctx._current_turn_kind = "surface"
-    is_chat_turn = _is_chat_surface(body)
     # Presence-aware Signal suppression needs to distinguish status-chat
     # from every other surface turn — ``_current_turn_kind`` stays
-    # ``"surface"`` so the quiet-hours policy is unchanged. The chat sub-
-    # flag is reset in ``finally`` alongside the kind.
+    # ``"surface"`` so the quiet-hours policy is unchanged. The chat
+    # sub-flag is captured and restored around the whole handler so a
+    # setup failure (begin_chat_status, re.search) can't leak the flag
+    # into subsequent turns (review finding #2, max-effort pass).
     prev_is_chat = getattr(ctx, "_current_turn_is_status_chat", False)
-    ctx._current_turn_is_status_chat = is_chat_turn
-    if is_chat_turn:
-        ctx.turn_runner.begin_chat_status(turn_id)
-        m = re.search(r"^message_at:\s*(\S+)\s*$", body.split("\n---", 1)[0], re.M)
-        if m and ctx.turn_runner.chat_status is not None:
-            ctx.turn_runner.chat_status.read(m.group(1))
+    is_chat_turn = _is_chat_surface(body)
+    ctx._current_turn_kind = "surface"
     try:
+        ctx._current_turn_is_status_chat = is_chat_turn
+        if is_chat_turn:
+            ctx.turn_runner.begin_chat_status(turn_id)
+            m = re.search(
+                r"^message_at:\s*(\S+)\s*$", body.split("\n---", 1)[0], re.M
+            )
+            if m and ctx.turn_runner.chat_status is not None:
+                ctx.turn_runner.chat_status.read(m.group(1))
         # Surface turns don't have a single inbound recipient; the
         # ``outbound_recipient`` is informational only. Quiet hours
         # apply here — Alice's own thoughts wait for morning.

@@ -322,32 +322,42 @@ class PresenceState:
                 self._last_focused_at = None
         return t
 
-    def snapshot(self, now: float | None = None) -> dict[str, object]:
+    def snapshot(
+        self, now: float | None = None, *, detailed: bool = False
+    ) -> dict[str, object]:
         """Public shape for ``GET /api/presence/status``.
 
-        Deliberately minimal: ``focused`` + a bounded ``window_s``.
-        ``last_presence_at`` is NOT returned — that would be
-        laptop-activity telemetry over an unauthenticated endpoint
-        (review finding #2). ``focused_within_s`` stays for
-        observability on alice-speaking's side (it only reads this
-        endpoint from the sibling container) and is ``None`` when
-        no heartbeat has ever landed.
+        Always returns ``focused`` + bounded ``window_s`` — that is
+        what alice-speaking's suppression gate actually needs.
+        When ``detailed=True`` (shared-key callers only — the
+        in-container alice-speaking passes the key), the response
+        also carries ``focused_within_s`` for log observability.
+        Unauthenticated LAN callers get neither
+        ``focused_within_s`` nor the stamp itself — seconds-since-
+        blur would still reveal Jason's at-keyboard pattern on an
+        otherwise-authenticated status site (review finding #5,
+        max-effort pass; see also #2 for why the stamp was dropped
+        in round 1).
         """
         t = time.time() if now is None else now
         with self._lock:
             last = self._last_focused_at
         if last is None:
-            return {
+            snap: dict[str, object] = {
                 "focused": False,
-                "focused_within_s": None,
                 "window_s": PRESENCE_WINDOW_S,
             }
+            if detailed:
+                snap["focused_within_s"] = None
+            return snap
         delta = max(0.0, t - last)
-        return {
+        snap = {
             "focused": delta < PRESENCE_WINDOW_S,
-            "focused_within_s": round(delta, 3),
             "window_s": PRESENCE_WINDOW_S,
         }
+        if detailed:
+            snap["focused_within_s"] = round(delta, 3)
+        return snap
 
 
 @dataclass
@@ -3106,8 +3116,10 @@ def handle_presence(cfg: Config, d: dict) -> dict:
     """Record a presence heartbeat.
 
     Body: ``{"key": "<shared>", "focused": bool}``.
-    Always returns the current snapshot so the client can sanity-check
-    that its ``focused=true`` advanced the stamp as expected.
+    Returns the detailed snapshot — the caller already proved
+    knowledge of the key via the body, so adding ``focused_within_s``
+    to the response is no new exposure and helps the client
+    sanity-check that its heartbeat advanced the stamp as expected.
     """
     if not isinstance(d, dict):
         raise ReplyError(400, "bad json")
@@ -3117,7 +3129,7 @@ def handle_presence(cfg: Config, d: dict) -> dict:
     if not isinstance(focused_raw, bool):
         raise ReplyError(400, "bad focused")
     cfg.presence.record(focused=focused_raw)
-    snap = cfg.presence.snapshot()
+    snap = cfg.presence.snapshot(detailed=True)
     snap["ok"] = True
     return snap
 
@@ -3352,10 +3364,22 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/item-state":
             return self._json(200, read_item_state(self.cfg.status_dir), head=head)
         if path == "/api/presence/status":
-            # No auth: LAN-only, no PII in the shape (bool + seconds
-            # since last heartbeat + ISO ts). alice-speaking reads
-            # this just before a status-chat Signal reply.
-            return self._json(200, self.cfg.presence.snapshot(), head=head)
+            # No auth needed for the minimal ``{focused, window_s}``
+            # shape — LAN-only endpoint, same trust surface as the
+            # rest of the site. The shared key unlocks
+            # ``focused_within_s`` for alice-speaking's log line,
+            # which would otherwise leak seconds-since-blur on an
+            # unauth GET. See docs/designs/slice-presence-aware-notifs.md.
+            q = parse_qs(urlsplit(self.path).query)
+            key = (q.get("k") or [""])[0]
+            detailed = bool(key) and hmac.compare_digest(
+                key.encode(), self.cfg.key.encode()
+            )
+            return self._json(
+                200,
+                self.cfg.presence.snapshot(detailed=detailed),
+                head=head,
+            )
         if path == "/api/chat":
             q = parse_qs(urlsplit(self.path).query)
             before = (q.get("before") or [None])[0]

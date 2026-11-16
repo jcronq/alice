@@ -145,6 +145,59 @@ def test_check_focused_rejects_bool_as_number_for_within_s():
     assert r.focused_within_s is None
 
 
+class _KeyCapturingOpener:
+    """Captures the final URL the opener was called with, so we can
+    assert the shared-key query param was appended."""
+
+    def __init__(self, resp: _FakeResp):
+        self._resp = resp
+        self.last_url: str | None = None
+
+    def open(self, req, timeout=None):
+        self.last_url = getattr(req, "full_url", str(req.get_full_url()))
+        return self._resp
+
+
+def test_check_focused_appends_shared_key_when_provided():
+    body = json.dumps({"focused": True, "focused_within_s": 1.0}).encode()
+    op = _KeyCapturingOpener(_FakeResp(200, body))
+    presence_mod.check_focused(
+        url="http://example/api/presence/status",
+        opener=op,
+        key="sekret!/key",
+    )
+    assert op.last_url is not None
+    assert "?k=sekret%21%2Fkey" in op.last_url
+
+
+def test_check_focused_respects_existing_query_string():
+    body = json.dumps({"focused": True}).encode()
+    op = _KeyCapturingOpener(_FakeResp(200, body))
+    presence_mod.check_focused(
+        url="http://example/api/presence/status?v=1",
+        opener=op,
+        key="abc",
+    )
+    assert op.last_url is not None
+    assert op.last_url.endswith("?v=1&k=abc")
+
+
+def test_check_focused_without_key_sends_no_query_param(tmp_path, monkeypatch):
+    # Point the key loader at a non-existent file so _load_key
+    # returns None; ``check_focused`` must then GET without ``?k=``.
+    monkeypatch.setenv("ALICE_STATUS_KEY_FILE", str(tmp_path / "missing"))
+    # Reload the module so it rebinds the key path env var.
+    import importlib
+
+    importlib.reload(presence_mod)
+    body = json.dumps({"focused": False}).encode()
+    op = _KeyCapturingOpener(_FakeResp(200, body))
+    presence_mod.check_focused(
+        url="http://example/api/presence/status", opener=op
+    )
+    assert op.last_url == "http://example/api/presence/status"
+
+
 # ─── _send_message suppression ─────────────────────────────────────────
 
 

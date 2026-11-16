@@ -30,9 +30,15 @@ KEY = "presence-key-xyz"
 # ─── unit: PresenceState ───────────────────────────────────────────────
 
 
-def test_presence_state_snapshot_empty():
+def test_presence_state_snapshot_empty_default_minimal():
     p = PresenceState()
     snap = p.snapshot()
+    assert snap == {"focused": False, "window_s": PRESENCE_WINDOW_S}
+
+
+def test_presence_state_snapshot_empty_detailed_includes_within_s():
+    p = PresenceState()
+    snap = p.snapshot(detailed=True)
     assert snap == {
         "focused": False,
         "focused_within_s": None,
@@ -41,32 +47,42 @@ def test_presence_state_snapshot_empty():
 
 
 def test_presence_state_snapshot_shape_omits_last_presence_at():
-    # Review finding #2: ``last_presence_at`` would be laptop-activity
-    # telemetry on an unauthenticated endpoint. The snapshot must not
-    # leak it even after a real heartbeat.
+    # Review finding #2 (round 1): ``last_presence_at`` would be
+    # laptop-activity telemetry on an unauth endpoint. Never leak it
+    # even with ``detailed=True``.
+    p = PresenceState()
+    p.record(focused=True, now=1000.0)
+    for snap in (p.snapshot(now=1000.5), p.snapshot(now=1000.5, detailed=True)):
+        assert "last_presence_at" not in snap
+
+
+def test_presence_state_minimal_snapshot_omits_focused_within_s():
+    # Review finding #5 (max pass): seconds-since-blur is still
+    # activity info; keep it behind the shared-key gate.
     p = PresenceState()
     p.record(focused=True, now=1000.0)
     snap = p.snapshot(now=1000.5)
-    assert "last_presence_at" not in snap
+    assert "focused_within_s" not in snap
+    assert snap["focused"] is True
 
 
-def test_presence_state_records_focused_true_updates_stamp():
+def test_presence_state_detailed_snapshot_has_focused_within_s():
     p = PresenceState()
     p.record(focused=True, now=1000.0)
-    snap = p.snapshot(now=1001.5)
+    snap = p.snapshot(now=1001.5, detailed=True)
     assert snap["focused"] is True
     assert snap["focused_within_s"] == 1.5
 
 
 def test_presence_state_records_focused_false_clears_stamp():
-    # Review finding #1: ``focused=false`` is the blur signal from
-    # the browser. The server MUST invalidate the stamp — otherwise
-    # a tab the user just closed still looks focused until the 45 s
-    # window ages out.
+    # Review finding #1 (round 1): ``focused=false`` is the blur
+    # signal from the browser. The server MUST invalidate the stamp
+    # — otherwise a tab the user just closed still looks focused
+    # until the 45 s window ages out.
     p = PresenceState()
     p.record(focused=True, now=1000.0)
     p.record(focused=False, now=1001.0)
-    snap = p.snapshot(now=1002.0)
+    snap = p.snapshot(now=1002.0, detailed=True)
     assert snap["focused"] is False
     assert snap["focused_within_s"] is None
 
@@ -85,7 +101,7 @@ def test_presence_state_negative_delta_clamped():
     # produce a negative focused_within_s — treat as 0.
     p = PresenceState()
     p.record(focused=True, now=1000.0)
-    snap = p.snapshot(now=999.0)
+    snap = p.snapshot(now=999.0, detailed=True)
     assert snap["focused_within_s"] == 0.0
     assert snap["focused"] is True
 
@@ -133,10 +149,34 @@ def test_get_status_empty(site):
     assert status == 200
     data = json.loads(body)
     assert data["focused"] is False
-    assert data["focused_within_s"] is None
     assert data["window_s"] == PRESENCE_WINDOW_S
     # No laptop-activity telemetry on the unauth endpoint.
     assert "last_presence_at" not in data
+    assert "focused_within_s" not in data
+
+
+def test_get_status_with_key_unlocks_focused_within_s(site):
+    cfg, port = site
+    # Record a heartbeat so focused_within_s is non-null.
+    cfg.presence.record(focused=True)
+    status, body = _req(port, "GET", f"/api/presence/status?k={KEY}")
+    assert status == 200
+    data = json.loads(body)
+    assert data["focused"] is True
+    assert "focused_within_s" in data
+    assert isinstance(data["focused_within_s"], (int, float))
+
+
+def test_get_status_wrong_key_falls_back_to_minimal(site):
+    cfg, port = site
+    cfg.presence.record(focused=True)
+    status, body = _req(port, "GET", "/api/presence/status?k=wrong")
+    assert status == 200
+    data = json.loads(body)
+    assert data["focused"] is True
+    # Wrong key: no secondary field. Still 200 — the minimal shape
+    # is the always-available LAN read.
+    assert "focused_within_s" not in data
 
 
 def test_post_presence_happy_path(site):
@@ -148,13 +188,16 @@ def test_post_presence_happy_path(site):
     data = json.loads(body)
     assert data["ok"] is True
     assert data["focused"] is True
+    # POST returns the detailed snapshot — caller already proved
+    # knowledge of the key via the body; no new exposure.
     assert data["focused_within_s"] is not None
     assert data["focused_within_s"] < 1.0
-    # And the GET sees the same state.
+    # And the GET sees the same state (minimal shape).
     status2, body2 = _req(port, "GET", "/api/presence/status")
     assert status2 == 200
     data2 = json.loads(body2)
     assert data2["focused"] is True
+    assert "focused_within_s" not in data2
 
 
 def test_post_presence_rejects_bad_key(site):
@@ -180,7 +223,7 @@ def test_post_presence_false_clears_stamp(site):
     # Focus, then blur.
     _req(port, "POST", "/api/presence", body={"key": KEY, "focused": True})
     _req(port, "POST", "/api/presence", body={"key": KEY, "focused": False})
-    status, body = _req(port, "GET", "/api/presence/status")
+    status, body = _req(port, "GET", f"/api/presence/status?k={KEY}")
     data = json.loads(body)
     assert data["focused"] is False
     assert data["focused_within_s"] is None
@@ -213,7 +256,7 @@ def test_presence_state_ages_out(site):
     cfg, port = site
     # Manually jam a stale stamp.
     cfg.presence.record(focused=True, now=time.time() - PRESENCE_WINDOW_S - 5)
-    status, body = _req(port, "GET", "/api/presence/status")
+    status, body = _req(port, "GET", f"/api/presence/status?k={KEY}")
     data = json.loads(body)
     assert data["focused"] is False
     assert data["focused_within_s"] is not None

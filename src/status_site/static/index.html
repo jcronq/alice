@@ -543,7 +543,6 @@ const KEY = localStorage.getItem("alice-key") || "";
 // until the 45 s window aged out (review finding #1).
 const PRESENCE_INTERVAL_MS = 20000; // < server window (45s) with slack
 let _presenceTimer = null;
-let _lastPresenceSent = null; // dedup consecutive identical states
 function _presenceFocused() {
   return document.visibilityState === "visible" && document.hasFocus();
 }
@@ -551,8 +550,7 @@ function _sendPresence(focused) {
   if (!KEY) return;
   const payload = JSON.stringify({key: KEY, focused: !!focused});
   // ``keepalive: true`` lets the request outlive the page on
-  // unload / pagehide / blur-just-before-close. Dedup on the
-  // transition only to keep the heartbeat the one steady stream.
+  // unload / pagehide / blur-just-before-close.
   try {
     fetch("/api/presence", {
       method: "POST",
@@ -561,7 +559,6 @@ function _sendPresence(focused) {
       keepalive: true,
     }).catch(() => {});
   } catch (_) { /* swallow — presence is best-effort */ }
-  _lastPresenceSent = focused;
 }
 function _presenceTick() {
   _sendPresence(_presenceFocused());

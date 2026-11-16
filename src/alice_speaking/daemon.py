@@ -1734,7 +1734,14 @@ class SpeakingDaemon:
             # presence module is stdlib-only.
             from .infra import presence as _presence_mod
 
-            reading = _presence_mod.check_focused()
+            # The presence module uses stdlib ``urllib.request`` under
+            # the hood (one blocking syscall with a 1 s cap). Run it
+            # on the default thread executor so a hung status-site
+            # container can't stall the whole event loop — the daemon
+            # would otherwise freeze every other turn + watcher for
+            # up to ``DEFAULT_TIMEOUT_S`` per status-chat reply
+            # (review finding #1, max-effort pass).
+            reading = await asyncio.to_thread(_presence_mod.check_focused)
             if reading.focused:
                 self.events.emit(
                     "signal_suppressed_presence",
