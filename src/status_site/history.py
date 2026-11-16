@@ -488,8 +488,6 @@ def migrate_stale_slugs(
     if not d.is_dir():
         return 0
     pairs = _page_title_slug_pairs(d)
-    if not pairs:
-        return 0
     renamed = 0
     for old, new in pairs:
         if not old or not new or old == new:
@@ -502,6 +500,46 @@ def migrate_stale_slugs(
             dst = sub_path / f"{new}.jsonl"
             if _rename_one(src, dst):
                 renamed += 1
+    # Tombstone pass: items whose page entry was deleted still carry
+    # a legacy-slug key in ``.item-state.json`` and in any orphan
+    # ``item-history/<legacy>.jsonl`` file. Pair those up by walking
+    # ``item-history/`` and testing each legacy stem against
+    # :func:`legacy_title_slug` ⇆ :func:`title_slug` on the state
+    # file's recorded titles.
+    state_path = d / STATE_FILE
+    tombstone_pairs: list[tuple[str, str]] = []
+    try:
+        raw = json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        raw = None
+    if isinstance(raw, dict) and isinstance(raw.get("items"), dict):
+        items = raw["items"]
+        for legacy, rec in list(items.items()):
+            if not isinstance(rec, dict):
+                continue
+            title = rec.get("title") or rec.get("last_title")
+            if not isinstance(title, str) or not title:
+                continue
+            new = title_slug(title)
+            if not new or new == legacy:
+                continue
+            # Only rename if the state key actually matches the
+            # legacy algorithm — don't touch keys that already
+            # correspond to the new algorithm but have drift.
+            if legacy_title_slug(title) != legacy:
+                continue
+            tombstone_pairs.append((legacy, new))
+    for old, new in tombstone_pairs:
+        for sub in subdirs:
+            sub_path = d / sub
+            if not sub_path.is_dir():
+                continue
+            src = sub_path / f"{old}.jsonl"
+            dst = sub_path / f"{new}.jsonl"
+            if _rename_one(src, dst):
+                renamed += 1
+    if renamed or tombstone_pairs:
+        pairs = pairs + tombstone_pairs
     if renamed:
         # A state-file tombstone under the old slug keeps the tracker
         # from treating the next scan's ``new`` slug as a brand-new

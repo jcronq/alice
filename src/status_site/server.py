@@ -2884,11 +2884,15 @@ WOY_DISMISSED_FILE = ".woy-dismissed.jsonl"
 WOY_DISMISSED_MAX = 1000
 # Max characters we accept in a /api/woy-steer text payload.
 WOY_STEER_MAX = 2000
-# Matches ``github.com/<owner>/<repo>/pull/<N>`` anywhere inside a
-# title/body. Owner/repo charset mirrors GitHub's; we keep it narrow
-# so a typo can't get coerced into a merge.
+# Matches ``[scheme://]github.com/<owner>/<repo>/pull/<N>`` anchored
+# at either a word boundary or an http(s) scheme. We require the
+# scheme or a non-word char preceding ``github.com`` so that
+# ``evilgithub.com/x/y/pull/1`` does NOT match, and we stop the
+# path with ``(?![A-Za-z0-9._/-])`` so ``…/pull/12345broken`` won't
+# be truncated to ``pull/12345``. Owner/repo charset mirrors GitHub.
 _PULL_URL_RE = re.compile(
-    r"github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/(\d+)"
+    r"(?:^|(?<=[^A-Za-z0-9._-]))(?:https?://)?github\.com"
+    r"/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/(\d+)(?![A-Za-z0-9_])"
 )
 
 
@@ -2918,6 +2922,82 @@ def _run_gh_pr_merge(repo: str, number: int) -> subprocess.CompletedProcess:
     )
 
 
+def _run_gh_pr_status(repo: str, number: int) -> subprocess.CompletedProcess:
+    """Fetch a PR's rolled-up status check conclusion. Used to gate
+    ``gh pr merge --squash`` so we don't merge a red PR on a repo
+    (like ``jcronq/alice``) that has no required-checks protection.
+    See ``feedback_gh_auto_merge_no_ci_gate_on_alice``.
+    """
+    return subprocess.run(
+        [
+            "gh",
+            "pr",
+            "view",
+            str(number),
+            "--repo",
+            repo,
+            "--json",
+            "statusCheckRollup,mergeStateStatus",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+def _check_pr_ci_green(
+    repo: str,
+    number: int,
+    *,
+    runner: Callable[[str, int], subprocess.CompletedProcess] | None = None,
+) -> tuple[bool, str | None]:
+    """Return ``(green, reason_if_not_green)``.
+
+    Green iff every ``statusCheckRollup`` entry concludes SUCCESS (or
+    NEUTRAL / SKIPPED, which GitHub treats as non-blocking). A pending
+    IN_PROGRESS / QUEUED check is treated as not-green so Accept
+    doesn't silently merge mid-run. An empty rollup is treated as
+    green (the PR has no checks at all).
+    """
+    try:
+        res = (runner or _run_gh_pr_status)(repo, number)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"status probe failed: {e!r}"
+    if res.returncode != 0:
+        err = (res.stderr or res.stdout or "").strip()[:200]
+        return False, err or f"gh returncode={res.returncode}"
+    try:
+        body = json.loads(res.stdout or "{}")
+    except ValueError:
+        return False, "gh status returned non-JSON"
+    rollup = body.get("statusCheckRollup") or []
+    if not isinstance(rollup, list):
+        return False, "unexpected statusCheckRollup shape"
+    red: list[str] = []
+    pending: list[str] = []
+    for entry in rollup:
+        if not isinstance(entry, dict):
+            continue
+        # CheckRun carries ``conclusion`` + ``status``; StatusContext carries ``state``.
+        conclusion = str(entry.get("conclusion") or "").upper()
+        state = str(entry.get("state") or "").upper()
+        status_ = str(entry.get("status") or "").upper()
+        name = str(entry.get("name") or entry.get("context") or "check")
+        verdict = conclusion or state
+        if status_ and status_ not in ("COMPLETED",) and not conclusion:
+            pending.append(name)
+            continue
+        if verdict in ("", "SUCCESS", "NEUTRAL", "SKIPPED"):
+            continue
+        red.append(f"{name}:{verdict}")
+    if red:
+        return False, "red checks: " + ", ".join(red[:4])
+    if pending:
+        return False, "pending checks: " + ", ".join(pending[:4])
+    return True, None
+
+
 def _detect_pr(text: str) -> tuple[str, int] | None:
     """Return ``(owner_slash_repo, number)`` if ``text`` names a PR, else None.
 
@@ -2933,34 +3013,50 @@ def _detect_pr(text: str) -> tuple[str, int] | None:
     return f"{owner}/{repo}", num
 
 
-def _find_waiting_item(status_dir: Path, slug: str) -> dict | None:
-    """Scan ``status_dir`` pages for a WoY-section item with ``slug``.
+# Pages/sections we treat as "Waiting on you" lookup scope. We used to
+# scan every ``*.md`` under STATUS_DIR, which meant an identical title
+# in ``done-today.md`` could win over the actual WoY item and steer
+# Accept to the wrong PR. Restrict to the two places WoY items live.
+_WOY_LOOKUP_PAGES = ("waiting-on-you", "index")
+_WOY_INDEX_SECTIONS = ("Waiting on you", "waiting on you")
 
-    Returns ``{"slug", "title", "text", "page", "section"}`` or
-    ``None``. ``text`` is the item's description tail (same field
-    ``Tracker`` stores). We don't restrict to one page because a
-    bold-titled item might live in ``waiting-on-you.md`` *or* in
-    ``index.md`` under ``## Waiting on you``.
+
+def _find_waiting_item(status_dir: Path, slug: str) -> dict | None:
+    """Scan the WoY pages for an item with ``slug``.
+
+    Restricted to ``waiting-on-you.md`` and ``index.md``'s
+    ``## Waiting on you`` section. ``waiting-on-you.md`` wins on tie:
+    it's the hand-maintained source. Returns
+    ``{"slug", "title", "text", "page", "section"}`` or ``None``.
     """
     s = safe_slug(slug)
     if not s:
         return None
-    for p in sorted(Path(status_dir).glob("*.md")):
-        if p.name.startswith("."):
+    for stem in _WOY_LOOKUP_PAGES:
+        p = Path(status_dir) / f"{stem}.md"
+        if not p.is_file():
             continue
         try:
             md = p.read_text(errors="replace")
         except OSError:
             continue
         for it in parse_page(md, p.stem):
-            if it.slug == s:
-                return {
-                    "slug": it.slug,
-                    "title": it.title,
-                    "text": it.text,
-                    "page": it.page,
-                    "section": it.section,
-                }
+            if it.slug != s:
+                continue
+            # On index.md, only accept items that live under the
+            # Waiting-on-you section — an identical title in Done-today
+            # must not steer Accept to the wrong PR.
+            if stem == "index":
+                section = (it.section or "").strip()
+                if section not in _WOY_INDEX_SECTIONS:
+                    continue
+            return {
+                "slug": it.slug,
+                "title": it.title,
+                "text": it.text,
+                "page": it.page,
+                "section": it.section,
+            }
     return None
 
 
@@ -2999,9 +3095,10 @@ def _append_woy_dismissed(status_dir: Path, *, slug: str, action: str) -> None:
 
 
 def _iter_hand_zone_items(md: str):
-    """Yield ``(indent, title_slug, raw_line)`` for each top-level
-    bold-titled list item in ``md``. Honors ``_FENCE_RE`` + ``_LIST_RE``
-    + ``_BOLD_RE`` the same way the dismissal filter does.
+    """Yield ``(indent, slug, raw_line, title)`` tuples for each
+    top-level bold-titled list item in ``md`` — one tuple per matching
+    bullet in source order. Honors ``_FENCE_RE`` + ``_LIST_RE`` +
+    ``_BOLD_RE`` the same way the dismissal filter does.
     """
     in_fence = False
     for raw in md.splitlines():
@@ -3081,10 +3178,21 @@ def filter_dismissed_hand_zone(md: str, dismissed: set[str]) -> str:
                 out.append(raw)
             blank = False
             continue
-        # Non-list line. If it's unindented after a blank, any skip
-        # ends and the line goes through.
-        if indent == 0 and blank:
-            skip_indent = None
+        # Non-list line. An unindented paragraph / heading / HTML
+        # block always terminates the skip — headings in particular
+        # (``## Next section``) are section delimiters and must not
+        # be eaten just because they lack a preceding blank line.
+        # Anything indented beyond the skipped marker is a
+        # continuation of the dismissed item and stays dropped.
+        if indent <= (skip_indent if skip_indent is not None else 0) and skip_indent is not None:
+            # Heading lines (``#…``) and other non-list block-starts
+            # at indent 0 always end the skip; a HEAD_RE check keeps
+            # us conservative in case Jason writes a paragraph that
+            # happens to be unindented.
+            if indent == 0:
+                skip_indent = None
+            elif blank:
+                skip_indent = None
         if skip_indent is None:
             out.append(raw)
         blank = False
@@ -3188,9 +3296,24 @@ def handle_woy_action(cfg: "Config", d: dict) -> dict:
     thread_message: str
     dismissed = False
 
-    with cfg.lock:
-        if action == "accept" and is_pr and pr_ref is not None:
-            repo, number = pr_ref
+    # Subprocess shell-outs (gh pr view / gh pr merge) run OUTSIDE
+    # cfg.lock: a 60-second gh call must not stall every other
+    # handler. We acquire cfg.lock only for the final thread +
+    # dismissal file writes.
+    if action == "accept" and is_pr and pr_ref is not None:
+        repo, number = pr_ref
+        # CI gate: ``jcronq/alice`` has no required checks, so a bare
+        # ``gh pr merge --squash`` would land broken code if Jason
+        # clicked Accept on a red PR. Probe the rollup first and
+        # refuse to merge if anything's red or still running.
+        status_runner = getattr(cfg, "_gh_pr_status_runner", None)
+        green, status_reason = _check_pr_ci_green(
+            repo, number, runner=status_runner
+        )
+        if not green:
+            merged = False
+            merge_error = status_reason or "CI not green"
+        else:
             runner = getattr(cfg, "_gh_pr_merge_runner", None) or _run_gh_pr_merge
             try:
                 result = runner(repo, number)
@@ -3210,6 +3333,7 @@ def handle_woy_action(cfg: "Config", d: dict) -> dict:
                     merge_error = (
                         err or f"gh returncode={result.returncode}"
                     )
+        with cfg.lock:
             if merged is True:
                 append_thread(
                     cfg,
@@ -3238,8 +3362,9 @@ def handle_woy_action(cfg: "Config", d: dict) -> dict:
                 )
                 # Keep the item visible on the list so Jason can retry.
                 dismissed = False
-        else:
-            thread_message = "Accepted" if action == "accept" else "Rejected"
+    else:
+        thread_message = "Accepted" if action == "accept" else "Rejected"
+        with cfg.lock:
             append_thread(
                 cfg,
                 slug,

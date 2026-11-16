@@ -106,6 +106,37 @@ def test_migrate_stale_slugs_handles_state_rename(tmp_path):
     assert old not in state["items"]
 
 
+def test_migrate_stale_slugs_rekeys_state_tombstones(tmp_path):
+    """Tombstone pass: items the hand-zone no longer carries but
+    which still live in ``.item-state.json`` get their legacy slug
+    rekeyed and their history file renamed.
+    """
+    d = tmp_path / "status"
+    d.mkdir()
+    # No bold-titled WoY item on any page — forces the tombstone
+    # path (page-scan yields no pairs).
+    (d / "index.md").write_text("## Today\n")
+    (d / "item-history").mkdir()
+    title = "Old PR ([#99](https://example.com/x/y/pull/99))"
+    legacy = legacy_title_slug(title)
+    new = title_slug(title)
+    assert legacy != new
+    (d / "item-history" / f"{legacy}.jsonl").write_text('{"type":"appeared"}\n')
+    (d / ".item-state.json").write_text(
+        json.dumps({
+            "items": {
+                legacy: {"title": title, "gone": True, "page": "index"},
+            }
+        })
+    )
+    n = migrate_stale_slugs(d)
+    assert n == 1
+    assert (d / "item-history" / f"{new}.jsonl").exists()
+    state = json.loads((d / ".item-state.json").read_text())
+    assert new in state["items"]
+    assert legacy not in state["items"]
+
+
 def test_migrate_stale_slugs_preserves_dest_when_both_exist(tmp_path):
     d = tmp_path / "status"
     d.mkdir()
@@ -139,6 +170,19 @@ def test_needs_approval_slugs_flags_pr_urls_only():
 def test_needs_approval_slugs_empty_zone_returns_empty_list():
     assert S.needs_approval_slugs("") == []
     assert S.needs_approval_slugs("No list items at all.") == []
+
+
+def test_detect_pr_rejects_lookalike_domain():
+    # ``evilgithub.com`` should NOT match; only real github.com prefixed
+    # at a word boundary.
+    assert S._detect_pr("evilgithub.com/attacker/repo/pull/7") is None
+    assert S._detect_pr("see jcronq/alice#55 https://github.com/jcronq/alice/pull/9") == ("jcronq/alice", 9)
+    # Scheme-prefixed form with surrounding text also matches.
+    assert S._detect_pr("cf. https://github.com/a/b/pull/12 for context") == ("a/b", 12)
+    # Trailing digit-adjacent characters don't truncate the number.
+    assert S._detect_pr("https://github.com/a/b/pull/12345broken") is None
+    # No pull marker at all: no match.
+    assert S._detect_pr("https://github.com/a/b/issues/12") is None
 
 
 # ---------------------------------------------------------------- dismissal
@@ -243,17 +287,75 @@ def test_handle_woy_action_accept_non_pr_dismisses(tmp_path):
     assert out["thread_message"] == "Accepted"
 
 
+def _green_status():
+    import subprocess
+    return subprocess.CompletedProcess(
+        args=[], returncode=0,
+        stdout=json.dumps({"statusCheckRollup": [{"conclusion": "SUCCESS", "name": "build"}]}),
+        stderr="",
+    )
+
+
+def _red_status():
+    import subprocess
+    return subprocess.CompletedProcess(
+        args=[], returncode=0,
+        stdout=json.dumps({"statusCheckRollup": [{"conclusion": "FAILURE", "name": "tests"}]}),
+        stderr="",
+    )
+
+
 def test_handle_woy_action_accept_pr_calls_runner_and_merges(tmp_path):
     md = _pr_md("Draft PR", "https://github.com/jcronq/alice/pull/641")
     import subprocess
     ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="merged\n", stderr="")
     cfg = _mk_cfg(tmp_path, md=md, merge_result=ok)
+    cfg._gh_pr_status_runner = lambda repo, number: _green_status()
     slug = title_slug("Draft PR (https://github.com/jcronq/alice/pull/641)")
     out = S.handle_woy_action(cfg, {"key": "k", "slug": slug, "action": "accept"})
     assert out["is_pr"] is True
     assert out["merged"] is True
     assert out["dismissed"] is True
     assert "Accepted — merged" in out["thread_message"]
+
+
+def test_handle_woy_action_accept_pr_refuses_merge_on_red_ci(tmp_path):
+    md = _pr_md("Draft PR", "https://github.com/jcronq/alice/pull/641")
+    cfg = _mk_cfg(tmp_path, md=md)
+    # Merge runner MUST NOT be called when CI is red.
+    merge_calls: list[tuple[str, int]] = []
+    cfg._gh_pr_status_runner = lambda repo, number: _red_status()
+    cfg._gh_pr_merge_runner = lambda repo, number: (
+        merge_calls.append((repo, number))
+        or _green_status()  # would return "success" if called — must not be
+    )
+    slug = title_slug("Draft PR (https://github.com/jcronq/alice/pull/641)")
+    out = S.handle_woy_action(cfg, {"key": "k", "slug": slug, "action": "accept"})
+    assert out["merged"] is False
+    assert out["dismissed"] is False
+    assert merge_calls == []  # merge never attempted
+    assert "red checks" in (out.get("error") or "")
+
+
+def test_handle_woy_action_accept_pr_refuses_merge_on_pending_ci(tmp_path):
+    import subprocess
+    md = _pr_md("Draft PR", "https://github.com/jcronq/alice/pull/641")
+    cfg = _mk_cfg(tmp_path, md=md)
+    pending = subprocess.CompletedProcess(
+        args=[], returncode=0,
+        stdout=json.dumps({"statusCheckRollup": [{"status": "IN_PROGRESS", "name": "tests"}]}),
+        stderr="",
+    )
+    merge_calls: list[tuple[str, int]] = []
+    cfg._gh_pr_status_runner = lambda repo, number: pending
+    cfg._gh_pr_merge_runner = lambda repo, number: (
+        merge_calls.append((repo, number))
+        or subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    )
+    slug = title_slug("Draft PR (https://github.com/jcronq/alice/pull/641)")
+    out = S.handle_woy_action(cfg, {"key": "k", "slug": slug, "action": "accept"})
+    assert merge_calls == []
+    assert "pending" in (out.get("error") or "")
 
 
 def test_handle_woy_action_accept_pr_leaves_item_on_merge_failure(tmp_path):
@@ -263,6 +365,7 @@ def test_handle_woy_action_accept_pr_leaves_item_on_merge_failure(tmp_path):
         args=[], returncode=1, stdout="", stderr="branch protection blocked\n"
     )
     cfg = _mk_cfg(tmp_path, md=md, merge_result=fail)
+    cfg._gh_pr_status_runner = lambda repo, number: _green_status()
     slug = title_slug("Draft PR (https://github.com/jcronq/alice/pull/641)")
     out = S.handle_woy_action(cfg, {"key": "k", "slug": slug, "action": "accept"})
     assert out["merged"] is False
@@ -270,6 +373,45 @@ def test_handle_woy_action_accept_pr_leaves_item_on_merge_failure(tmp_path):
     assert "Accept failed" in out["thread_message"]
     # Dismissal file NOT written.
     assert not (cfg.status_dir / S.WOY_DISMISSED_FILE).exists()
+
+
+def test_find_waiting_item_restricts_to_woy_pages(tmp_path):
+    d = tmp_path / "status"
+    d.mkdir()
+    # Identical title in Done-today (NOT WoY) and in WoY.
+    (d / "done-today.md").write_text(
+        "## Merged\n- [x] **Ship Slice 2** finished\n"
+    )
+    (d / "waiting-on-you.md").write_text(
+        "- [ ] **Ship Slice 2** approve the PR\n"
+    )
+    item = S._find_waiting_item(d, "ship-slice-2")
+    assert item is not None
+    assert item["page"] == "waiting-on-you"
+
+
+def test_find_waiting_item_ignores_non_woy_section_on_index(tmp_path):
+    d = tmp_path / "status"
+    d.mkdir()
+    (d / "index.md").write_text(
+        "## Done today\n- [x] **Ship Slice 2** merged\n"
+        "## Waiting on you\n- [ ] **Open PR** needs review\n"
+    )
+    assert S._find_waiting_item(d, "ship-slice-2") is None
+    assert S._find_waiting_item(d, "open-pr") is not None
+
+
+def test_filter_dismissed_hand_zone_preserves_headings_after_dismissed(tmp_path):
+    md = (
+        "## WoY\n"
+        "- [ ] **Alpha task** body\n"
+        "## Next section\n"
+        "- [ ] **Beta task** body\n"
+    )
+    out = S.filter_dismissed_hand_zone(md, {"alpha-task"})
+    assert "## Next section" in out
+    assert "Alpha task" not in out
+    assert "Beta task" in out
 
 
 # ---------------------------------------------------------------- handle_woy_steer
@@ -308,6 +450,30 @@ def test_handle_woy_steer_does_not_dismiss(tmp_path):
     S.handle_woy_steer(cfg, {"key": "k", "slug": "steerable", "text": "nudge"})
     # No dismissal file — item still rendered.
     assert not (cfg.status_dir / S.WOY_DISMISSED_FILE).exists()
+
+
+def test_handle_woy_action_releases_lock_during_subprocess(tmp_path):
+    """Regression test for the lock-held-around-subprocess finding —
+    we assert cfg.lock is NOT held when the merge runner is invoked.
+    """
+    import subprocess
+    md = _pr_md("Draft PR", "https://github.com/jcronq/alice/pull/9")
+    cfg = _mk_cfg(tmp_path, md=md)
+    cfg._gh_pr_status_runner = lambda repo, number: _green_status()
+    seen_lock_held: list[bool] = []
+
+    def _probe_runner(repo, number):
+        # Try non-blocking acquire; if it succeeds the lock was free.
+        got = cfg.lock.acquire(blocking=False)
+        seen_lock_held.append(not got)
+        if got:
+            cfg.lock.release()
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="ok", stderr="")
+    cfg._gh_pr_merge_runner = _probe_runner
+    slug = title_slug("Draft PR (https://github.com/jcronq/alice/pull/9)")
+    out = S.handle_woy_action(cfg, {"key": "k", "slug": slug, "action": "accept"})
+    assert out["merged"] is True
+    assert seen_lock_held == [False]
 
 
 # ---------------------------------------------------------------- read_woy_dismissed

@@ -449,6 +449,16 @@ details.fx-group:first-child { margin-top: 0; }
   text-transform: uppercase;
   color: var(--color-fg-muted);
 }
+.woy-needs-approval ul { list-style: none; margin: 0; padding: 0; }
+.woy-needs-approval li {
+  display: flex; gap: .55rem; align-items: center;
+  margin: .2rem 0; padding: .05rem 0;
+}
+.woy-approval-label {
+  flex: 1; font-size: .92rem; cursor: pointer;
+  border-bottom: 1px dashed var(--color-fg-muted);
+}
+.woy-approval-label:hover { color: var(--color-ok); border-bottom-color: var(--color-ok); }
 .woy-row-actions {
   display: inline-flex; gap: .3rem; margin-left: .55rem;
   vertical-align: middle;
@@ -2247,7 +2257,7 @@ function ExpandedCard({title, slug, externalLink, isPr, onClose, onDismissed}) {
       }
       setAction({pending: null, done: {verb, at: Date.now(), merged: body.merged, msg: body.thread_message}, error: null});
       setRefresh(n => n + 1);
-      if (body.dismissed && typeof onDismissed === "function") onDismissed(slug);
+      if (body.dismissed && typeof onDismissed === "function") onDismissed(slug, verb, body.merged);
     } catch (e) {
       setAction({pending: null, done: null, error: String(e && e.message || e)});
     }
@@ -2393,7 +2403,18 @@ function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs}) {
     }
     const anchor = document.createElement("div");
     anchor.className = "woy-expand-anchor";
-    li.parentNode.insertBefore(anchor, li.nextSibling);
+    // Chip-row rows (data-woy-slug on <li>) live inside the
+    // ``.woy-needs-approval`` subsection; the inline expand attaches
+    // to the subsection's parent (zone) so it doesn't fight the chip
+    // list layout. Markdown-zone bullets attach next to the <li>.
+    const chipLi = li.closest && li.closest(".woy-needs-approval");
+    if (chipLi) {
+      const after = chipLi;
+      if (after.nextSibling) after.parentNode.insertBefore(anchor, after.nextSibling);
+      else after.parentNode.appendChild(anchor);
+    } else {
+      li.parentNode.insertBefore(anchor, li.nextSibling);
+    }
     li.classList.add("woy-active");
     anchorRef.current = anchor;
     const isPr = approvalSet.has(slug);
@@ -2411,7 +2432,8 @@ function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs}) {
   };
   const onHandZoneClick = e => {
     // Find the <strong> (title) ancestor of the click, or an explicit
-    // action-button click on an approval-pill row.
+    // action-button click on an approval-pill row, or a chip-row
+    // label click (needs-approval subsection).
     const btn = e.target.closest && e.target.closest("button[data-woy-action]");
     if (btn) {
       const verb = btn.getAttribute("data-woy-action");
@@ -2421,6 +2443,23 @@ function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs}) {
       e.stopPropagation();
       if (rowDone[slug]) return;
       runRowAction(slug, verb, btn);
+      return;
+    }
+    const label = e.target.closest && e.target.closest(".woy-approval-label");
+    if (label) {
+      const chipLi = label.closest && label.closest("li[data-woy-slug]");
+      if (chipLi) {
+        const slug = chipLi.getAttribute("data-woy-slug");
+        const title = (label.textContent || "").trim();
+        if (!slug) return;
+        e.preventDefault();
+        if (active && active.slug === slug) {
+          closeExpand();
+          return;
+        }
+        if (active) closeExpand();
+        openSlug(chipLi, title, slug, null);
+      }
       return;
     }
     let node = e.target;
@@ -2462,69 +2501,78 @@ function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs}) {
       if (btn) { btn.disabled = false; btn.textContent = verb === "accept" ? "Accept" : "Reject"; }
     }
   };
-  // Post-render DOM pass: tag each hand-zone <li> whose slug is in
-  // ``needs_approval_slugs`` with an inline button pair and the
-  // ``woy-approval`` class, then physically move those <li>s into a
-  // sibling <ul class="woy-needs-approval"> prepended under the
-  // zone. Re-runs on every render so a Tracker tick that drops the
-  // row collapses the DOM state too.
+  // Post-render DOM pass: for each hand-zone <li> whose slug is in
+  // ``needs_approval_slugs``, append an inline Accept/Reject chip
+  // pair (next to the title) AND prepend a lightweight
+  // "Needs your approval" chip-list that mirrors the titles.
+  //
+  // Historical note: Slice-2 draft #1 physically MOVED the matching
+  // <li>s into the subsection. That broke on every ``nowMs`` tick —
+  // React's dangerouslySetInnerHTML doesn't re-write the hand-zone
+  // DOM when ``handZoneMd`` is unchanged, so the destroyed nodes
+  // were never replaced. We now leave the original <li>s in place
+  // and build the subsection by cloning titles into a sibling list.
   useLayoutEffect(() => {
     const zone = zoneRef.current;
     if (!zone) return;
-    // 1) Remove any prior needs-approval sibling (idempotent).
-    const prior = zone.querySelector(".woy-needs-approval");
+    // 1) Remove any prior subsection + chips (idempotent).
+    const prior = zone.querySelector(":scope > .woy-needs-approval");
     if (prior && prior.parentNode) prior.parentNode.removeChild(prior);
-    // 2) Strip prior inline actions so we don't double-append after
-    // re-render.
     zone.querySelectorAll(".woy-row-actions").forEach(n => n.parentNode && n.parentNode.removeChild(n));
     if (!approvalSet.size) return;
-    const approvalWrap = document.createElement("div");
-    approvalWrap.className = "woy-needs-approval";
+    const subsection = document.createElement("div");
+    subsection.className = "woy-needs-approval";
     const head = document.createElement("h4");
     head.className = "woy-needs-approval-head";
     head.textContent = "Needs your approval";
-    approvalWrap.appendChild(head);
+    subsection.appendChild(head);
     const ul = document.createElement("ul");
-    approvalWrap.appendChild(ul);
+    subsection.appendChild(ul);
+    const makeChipRow = (slug, titleText) => {
+      const li = document.createElement("li");
+      li.setAttribute("data-woy-slug", slug);
+      const label = document.createElement("span");
+      label.className = "woy-approval-label";
+      label.textContent = titleText;
+      li.appendChild(label);
+      const span = document.createElement("span");
+      span.className = "woy-row-actions";
+      const done = rowDone[slug];
+      const bAccept = document.createElement("button");
+      bAccept.type = "button";
+      bAccept.setAttribute("data-woy-action", "accept");
+      bAccept.setAttribute("data-woy-slug", slug);
+      bAccept.textContent = done && done.verb === "accept"
+        ? "Accepted " + ageString(new Date(done.at).toISOString(), nowMs || Date.now())
+        : "Accept";
+      if (done) bAccept.disabled = true;
+      const bReject = document.createElement("button");
+      bReject.type = "button";
+      bReject.className = "reject";
+      bReject.setAttribute("data-woy-action", "reject");
+      bReject.setAttribute("data-woy-slug", slug);
+      bReject.textContent = done && done.verb === "reject"
+        ? "Rejected " + ageString(new Date(done.at).toISOString(), nowMs || Date.now())
+        : "Reject";
+      if (done) bReject.disabled = true;
+      span.appendChild(bAccept);
+      span.appendChild(bReject);
+      li.appendChild(span);
+      return li;
+    };
     let found = false;
     zone.querySelectorAll("li").forEach(li => {
       const strong = li.querySelector(":scope > strong, :scope > p > strong");
       if (!strong) return;
-      const slug = titleSlug(strong.textContent || "");
+      const title = (strong.textContent || "").trim();
+      const slug = titleSlug(title);
       if (!slug || !approvalSet.has(slug)) return;
       found = true;
-      // Append inline action chips if not already present.
-      if (!li.querySelector(":scope .woy-row-actions")) {
-        const span = document.createElement("span");
-        span.className = "woy-row-actions";
-        const done = rowDone[slug];
-        const bAccept = document.createElement("button");
-        bAccept.type = "button";
-        bAccept.setAttribute("data-woy-action", "accept");
-        bAccept.setAttribute("data-woy-slug", slug);
-        bAccept.textContent = done && done.verb === "accept"
-          ? "Accepted " + ageString(new Date(done.at).toISOString(), nowMs || Date.now())
-          : "Accept";
-        if (done) bAccept.disabled = true;
-        const bReject = document.createElement("button");
-        bReject.type = "button";
-        bReject.className = "reject";
-        bReject.setAttribute("data-woy-action", "reject");
-        bReject.setAttribute("data-woy-slug", slug);
-        bReject.textContent = done && done.verb === "reject"
-          ? "Rejected " + ageString(new Date(done.at).toISOString(), nowMs || Date.now())
-          : "Reject";
-        if (done) bReject.disabled = true;
-        span.appendChild(bAccept);
-        span.appendChild(bReject);
-        // Insert after the <strong>: visual chip to the right of the title.
-        if (strong.nextSibling) strong.parentNode.insertBefore(span, strong.nextSibling);
-        else strong.parentNode.appendChild(span);
-      }
-      ul.appendChild(li);
+      // Append the chip row to the subsection (one per source li).
+      ul.appendChild(makeChipRow(slug, title));
     });
     if (found) {
-      zone.insertBefore(approvalWrap, zone.firstChild);
+      zone.insertBefore(subsection, zone.firstChild);
     }
   }, [handZoneMd, approvalSet, rowDone, nowMs]);
   // When a slug disappears from the server payload, clear its rowDone
@@ -2587,7 +2635,7 @@ function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs}) {
         externalLink: active.externalLink,
         isPr: active.isPr,
         onClose: closeExpand,
-        onDismissed: s => setRowDone(prev => ({...prev, [s]: {verb: "accept", at: Date.now()}})),
+        onDismissed: (s, verb, merged) => setRowDone(prev => ({...prev, [s]: {verb: verb || "accept", at: Date.now(), merged}})),
       }),
       anchorRef.current,
     ) : null,
