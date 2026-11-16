@@ -488,6 +488,13 @@ details.fx-group:first-child { margin-top: 0; }
   display: inline-block; margin-bottom: .6rem; font-size: .85rem;
   color: var(--color-ok);
 }
+.woy-external-link {
+  display: inline-block; margin-bottom: .6rem; margin-left: .6rem;
+  font-size: .82rem; color: var(--color-fg-muted);
+  text-decoration: none; padding: .15rem .45rem;
+  border: 1px solid var(--color-border-line); border-radius: 3px;
+}
+.woy-external-link:hover { color: var(--color-fg); border-color: var(--color-fg-muted); }
 </style>
 </head><body>
 <div id="root">Loading Alice…</div>
@@ -2068,7 +2075,7 @@ function mergeHistoryRows(payload) {
 // /api/reply. Deliberately minimal — slice-2 is where Approve / Reject
 // buttons and expandable detail cards land, so we don't preempt their
 // layout here.
-function WaitingThreadModal({title, slug, onClose}) {
+function WaitingThreadModal({title, slug, externalLink, onClose}) {
   const [data, setData] = useState({loading: true});
   const [pages, setPages] = useState([]);
   const [reply, setReply] = useState("");
@@ -2151,6 +2158,7 @@ function WaitingThreadModal({title, slug, onClose}) {
         }, "×"),
       ),
       hasDetail ? h("a", {className: "woy-detail-link", href: "#" + slug}, "Open detail page →") : null,
+      externalLink ? h("a", {className: "woy-external-link", href: externalLink, target: "_blank", rel: "noopener noreferrer"}, "View on GitHub →") : null,
       data.loading ? h("p", {style: MUTED}, "Loading…")
         : data.error ? h("p", {style: {color: "var(--color-bad)"}}, "Could not load: " + data.error)
           : rows.length
@@ -2186,10 +2194,11 @@ function WaitingTable({rows, handZoneMd, nowMs}) {
   const onHandZoneClick = e => {
     // Walk up from the click target to the first <strong> inside a
     // <li>; the bold is the item title (matches history.py's parse).
-    // Any anchor click inside the title still wins — we don't preempt
-    // Jason's existing GitHub links (that's slice 2/3 territory).
+    // A click on an <a> INSIDE the title still opens the modal —
+    // Jason's rule: the title's job is to open the item, not leave
+    // the site. The GitHub URL embedded in the title surfaces as a
+    // "View on GitHub" link inside the modal instead.
     let node = e.target;
-    if (!node || node.tagName === "A") return;
     while (node && node !== e.currentTarget && node.tagName !== "STRONG") {
       node = node.parentNode;
     }
@@ -2199,8 +2208,10 @@ function WaitingTable({rows, handZoneMd, nowMs}) {
     const title = (node.textContent || "").trim();
     const slug = titleSlug(title);
     if (!slug) return;
+    const innerAnchor = node.querySelector && node.querySelector("a[href]");
+    const externalLink = innerAnchor ? innerAnchor.getAttribute("href") : null;
     e.preventDefault();
-    setActive({slug, title});
+    setActive({slug, title, externalLink});
   };
   const table = safe.length
     ? h(FxTable, {
@@ -2221,6 +2232,7 @@ function WaitingTable({rows, handZoneMd, nowMs}) {
     active ? h(WaitingThreadModal, {
       title: active.title,
       slug: active.slug,
+      externalLink: active.externalLink,
       onClose: () => setActive(null),
     }) : null,
   );
