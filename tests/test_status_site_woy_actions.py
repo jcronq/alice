@@ -14,7 +14,6 @@ Covers the pieces status-site.py grew in Slice-2 (#881 follow-up):
 from __future__ import annotations
 
 import json
-import os
 import threading
 from pathlib import Path
 
