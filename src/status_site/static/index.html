@@ -1720,26 +1720,49 @@ const chatPendingStore = {
     this._emit();
   },
   reconcile(serverRows) {
-    // When the server echoes a pending message, upgrade its status to
-    // "delivered" and inherit the server's at / attachment URLs so
-    // inline images render. The server row itself is hidden by
-    // serverRowMatchesPending in the merge below.
+    // When the server echoes a pending message, upgrade its status
+    // along the sending -> sent -> delivered -> read rung and inherit
+    // the server's at / attachment URLs so inline images render. The
+    // server row itself is hidden by serverRowMatchesPending in the
+    // merge below. We DON'T early-return at "delivered" so that a
+    // later server-side status upgrade (e.g. "read" after Alice
+    // opens the surface) still propagates to the pending bubble.
+    const rungs = {sending: 0, sent: 1, delivered: 2, read: 3};
     let changed = false;
     const tail = serverRows.slice(-20).filter(r => r.from === "jason");
     const next = this.pending.map(p => {
-      if (p.status === "delivered") return p;
+      if (p.status === "read") return p;
       const match = tail.find(r =>
         (r.text || "") === (p.text || "") &&
         ((r.files && r.files.length) || 0) === ((p.files && p.files.length) || 0),
       );
       if (!match) return p;
+      const serverRung = rungs[match.status] ?? -1;
+      const curRung = rungs[p.status] ?? -1;
+      // Promote to "delivered" on the first echo even if the server
+      // hasn't marked status yet; take the server's status when it
+      // sits higher on the rung.
+      const nextStatus = serverRung > curRung
+        ? match.status
+        : (curRung < rungs.delivered ? "delivered" : p.status);
+      const nextAt = match.at || p.at;
+      const nextAttachments = match.attachments || p.attachments;
+      const nextFiles = match.files || p.files;
+      if (
+        nextStatus === p.status &&
+        nextAt === p.at &&
+        nextAttachments === p.attachments &&
+        nextFiles === p.files
+      ) {
+        return p;
+      }
       changed = true;
       return {
         ...p,
-        status: "delivered",
-        at: match.at || p.at,
-        attachments: match.attachments || p.attachments,
-        files: match.files || p.files,
+        status: nextStatus,
+        at: nextAt,
+        attachments: nextAttachments,
+        files: nextFiles,
       };
     });
     if (changed) {
