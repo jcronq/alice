@@ -51,17 +51,23 @@ mechanism, so it is NEVER affected by this slice.
 ```
 POST /api/presence
      body: {"key": "<shared>", "focused": bool}
-     returns 200 {"ok": true, "focused_within_s": 0}
+     returns 200 {"ok": true, "focused": bool,
+                  "focused_within_s": float|null, "window_s": 45}
      - shared-key auth, same pattern as every other POST
-     - only `focused=true` updates `last_presence_at`;
-       `focused=false` is logged but does not advance the stamp
-       (so a stale `focused=true` can still age out naturally)
+     - focused=true stamps the current time
+     - focused=false CLEARS the stamp (so a closed/blurred tab
+       stops reading as focused immediately, not after 45 s)
 
 GET  /api/presence/status
-     returns 200 {"focused": bool, "focused_within_s": float|null,
-                  "last_presence_at": iso|null, "window_s": 45}
-     - no auth — read-only, no PII, status-site is LAN-only anyway
-     - `focused_within_s` is null when there's never been a heartbeat
+     unauth : 200 {"focused": bool, "window_s": 45}
+     ?k=<key>: 200 {"focused": bool, "window_s": 45,
+                    "focused_within_s": float|null}
+     - minimal shape is the always-available LAN read; no auth
+       because the bool alone is what the suppression gate reads
+     - focused_within_s is key-gated — it's seconds-since-blur,
+       i.e. activity telemetry — so a shared-WiFi guest can't poll
+       Jason's at-keyboard pattern; alice-speaking has the key in
+       the sibling container and loads it from the mounted key file
 ```
 
 ### Failure modes (fail OPEN)
@@ -100,12 +106,17 @@ away.
 - `src/status_site/static/index.html` — small `presence.js`-style
   block that heartbeats and reacts to visibility transitions.
 - `src/alice_speaking/infra/presence.py` — new
-  `check_presence_focused(url, timeout=1.0)` helper (stdlib
-  urllib). Fails open; never raises.
+  `check_focused(url, timeout=1.0, key=…)` helper (stdlib
+  urllib). Fails open; never raises. Reads the shared key from
+  the mounted status-server key file so the GET can unlock
+  `focused_within_s` for the log line.
 - `src/alice_speaking/daemon.py` — new `_current_turn_is_status_chat`
-  attribute; `_send_message` consults it + presence check.
+  attribute; `_send_message` runs the check via
+  `asyncio.to_thread(check_focused)` so a hung status-site can't
+  stall the whole event loop.
 - `src/alice_speaking/_dispatch.py` — `handle_surface` sets the flag
-  on chat turns and resets it in `finally`.
+  on chat turns INSIDE the try block and resets it in `finally` so
+  a setup failure can't leak the flag across turns.
 
 ## Reload
 
