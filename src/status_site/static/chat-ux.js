@@ -2,7 +2,7 @@
 // access at module load, so node can import this file directly in tests.
 
 export const MAX_FILES = 5;
-export const MAX_PER_FILE = 10 * 1024 * 1024;
+export const MAX_PER_FILE = 100 * 1024 * 1024;
 export const ACCEPT = "image/*,application/pdf,text/plain,application/zip,application/x-tar,application/gzip,application/x-gzip,.tar,.tar.gz,.tgz,.gz";
 export const STICK_THRESHOLD_PX = 40;
 

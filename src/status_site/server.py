@@ -146,7 +146,7 @@ CONTENT_TYPES = {
 }
 
 MAX_FILES = 5
-MAX_PER_FILE = 10 * 1024 * 1024
+MAX_PER_FILE = 100 * 1024 * 1024
 MIME_ALLOWLIST = (
     "image/*",
     "text/*",
@@ -279,7 +279,7 @@ class Config:
     # Upload dir as seen by Speaking (the surface lists paths she can Read).
     upload_dir_alias: str = ""
     public_url: str = "http://10.20.30.177:8095"
-    max_upload: int = 25 * 1024 * 1024
+    max_upload: int = 100 * 1024 * 1024
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     # Set at boot by ``main()`` after ``make_server``. Holds the
     # background TTL-cache + pollers for the expensive overview
