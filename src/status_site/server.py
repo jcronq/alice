@@ -153,6 +153,7 @@ MIME_ALLOWLIST = (
     "application/pdf",
     "application/json",
     "application/zip",
+    "application/x-tar",
 )
 MAX_TEXT = 8000
 MAX_ITEM = 500

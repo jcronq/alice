@@ -3,7 +3,7 @@
 
 export const MAX_FILES = 5;
 export const MAX_PER_FILE = 10 * 1024 * 1024;
-export const ACCEPT = "image/*,application/pdf,text/plain";
+export const ACCEPT = "image/*,application/pdf,text/plain,application/zip,application/x-tar,.tar,.tar.gz,.tgz";
 export const STICK_THRESHOLD_PX = 40;
 
 const IMAGE_EXT = {
