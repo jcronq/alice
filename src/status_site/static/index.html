@@ -424,36 +424,96 @@ details.fx-group:first-child { margin-top: 0; }
 }
 .a2ui-reply-chip button { background: transparent; border: 0; cursor: pointer; color: var(--color-fg-muted); }
 
-/* Slice-1 (#881): per-item thread modal for Waiting-on-you entries.
- * Clicking a bold title in the hand-maintained zone opens this panel;
- * it fetches /api/history for the item's slug and shows event timeline +
- * thread + a reply composer. Styled as a side-sheet overlay so Jason's
- * phone keeps the Overview visible underneath. */
+/* Slice-2 (#881 follow-up): inline expand for Waiting-on-you entries.
+ * Clicking a bold title in the hand-maintained zone expands the row
+ * in place with timeline + Accept/Reject/Steer + reply. The expanded
+ * block renders into a sibling ``<div class="woy-expand">`` placed
+ * immediately after the clicked ``<li>`` so the surrounding list stays
+ * visible above and below. No modal, no scrim. */
 .woy-click strong { cursor: pointer; border-bottom: 1px dashed var(--color-fg-muted); }
 .woy-click strong:hover { color: var(--color-ok); border-bottom-color: var(--color-ok); }
-.woy-modal-scrim {
-  position: fixed; inset: 0; z-index: 10;
-  background: rgba(0, 0, 0, .35);
-  display: flex; justify-content: flex-end;
+.woy-click li.woy-active > strong,
+.woy-click li.woy-active > p > strong { color: var(--color-ok); border-bottom-color: var(--color-ok); }
+.woy-needs-approval {
+  margin: .25rem 0 .55rem 0;
+  padding: .35rem .5rem .4rem .5rem;
+  border-left: 3px solid var(--color-ok);
+  background: var(--color-bg);
+  border-radius: 4px;
 }
-.woy-modal {
+.woy-needs-approval-head {
+  margin: 0 0 .25rem 0;
+  font-size: .78rem;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--color-fg-muted);
+}
+.woy-row-actions {
+  display: inline-flex; gap: .3rem; margin-left: .55rem;
+  vertical-align: middle;
+}
+.woy-row-actions button {
+  background: transparent; color: var(--color-ok);
+  border: 1px solid var(--color-ok); border-radius: 999px;
+  padding: .05rem .55rem; font: inherit; font-size: .78rem;
+  cursor: pointer; line-height: 1.25;
+}
+.woy-row-actions button.reject { color: var(--color-bad); border-color: var(--color-bad); }
+.woy-row-actions button:hover { background: var(--color-panel); }
+.woy-row-actions button:disabled {
+  cursor: default; opacity: .65;
+  color: var(--color-fg-muted); border-color: var(--color-border-line);
+  background: transparent;
+}
+.woy-expand {
+  margin: .35rem 0 .75rem 1.2rem;
+  padding: .7rem .85rem .85rem .85rem;
   background: var(--color-panel);
-  color: var(--color-fg);
-  width: min(560px, 100%);
-  max-width: 100%;
-  height: 100%;
-  overflow-y: auto;
-  padding: 1rem 1.1rem;
-  border-left: 1px solid var(--color-border-line);
-  box-shadow: -4px 0 18px rgba(0, 0, 0, .25);
+  border: 1px solid var(--color-border-line);
+  border-left: 3px solid var(--color-ok);
+  border-radius: 6px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .08);
 }
-.woy-modal-head { display: flex; align-items: center; gap: .5rem; margin-bottom: .6rem; }
-.woy-modal-head h2 { margin: 0; font-size: 1.05rem; flex: 1; line-height: 1.3; }
-.woy-modal-close {
+.woy-expand-head { display: flex; align-items: center; gap: .5rem; margin-bottom: .5rem; }
+.woy-expand-head h4 { margin: 0; font-size: .95rem; flex: 1; line-height: 1.3; font-weight: 600; }
+.woy-expand-close {
   background: transparent; border: 0; cursor: pointer; color: var(--color-fg-muted);
-  font-size: 1.4rem; line-height: 1; padding: .1rem .3rem;
+  font-size: 1.2rem; line-height: 1; padding: .1rem .35rem;
 }
-.woy-modal-close:hover { color: var(--color-fg); }
+.woy-expand-close:hover { color: var(--color-fg); }
+.woy-actions-bar {
+  display: flex; flex-wrap: wrap; gap: .4rem; align-items: center;
+  margin: .3rem 0 .55rem 0;
+}
+.woy-actions-bar button {
+  background: var(--color-ok); color: var(--color-bg);
+  border: 0; border-radius: 6px; padding: .3rem .8rem;
+  cursor: pointer; font: inherit; font-size: .88rem;
+}
+.woy-actions-bar button.reject {
+  background: var(--color-bad);
+}
+.woy-actions-bar button:disabled { opacity: .55; cursor: not-allowed; }
+.woy-steer {
+  display: flex; gap: .4rem; align-items: center;
+  margin: .25rem 0 .5rem 0;
+}
+.woy-steer input {
+  flex: 1; min-width: 0;
+  padding: .3rem .5rem;
+  background: var(--color-bg); color: var(--color-fg);
+  border: 1px solid var(--color-border-line); border-radius: 6px;
+  font: inherit;
+}
+.woy-steer button {
+  background: transparent; color: var(--color-fg);
+  border: 1px solid var(--color-border-line); border-radius: 6px;
+  padding: .3rem .8rem; cursor: pointer; font: inherit; font-size: .88rem;
+}
+.woy-steer button:disabled { opacity: .55; cursor: not-allowed; }
+.woy-action-status { font-size: .8rem; color: var(--color-fg-muted); }
+.woy-action-status.err { color: var(--color-bad); }
 .woy-timeline { list-style: none; margin: 0; padding: 0 0 0 .8rem; border-left: 2px solid var(--color-border-line); }
 .woy-timeline li {
   position: relative; padding: .35rem 0 .35rem .9rem;
@@ -503,6 +563,7 @@ details.fx-group:first-child { margin-top: 0; }
 {
   "imports": {
     "react": "https://esm.sh/react@18.3.1",
+    "react-dom": "https://esm.sh/react-dom@18.3.1",
     "react-dom/client": "https://esm.sh/react-dom@18.3.1/client"
   }
 }
@@ -510,6 +571,7 @@ details.fx-group:first-child { margin-top: 0; }
 <script type="module">
 import React, {useEffect, useLayoutEffect, useReducer, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
+import {createPortal} from "react-dom";
 import {
   ACCEPT, CHAT_PAGE_SIZE, attachmentName, chatTextToHtml, chatRowKey, earliestAt,
   HIGHLIGHT_MS, imageFilesFromClipboard, isNearBottom, isNearTop,
@@ -2093,18 +2155,21 @@ function mergeHistoryRows(payload) {
   return rows;
 }
 
-// Thread modal for a Waiting-on-you item. Open on click of a bold
-// title; fetches /api/history and lets Jason post a reply via
-// /api/reply. Deliberately minimal — slice-2 is where Approve / Reject
-// buttons and expandable detail cards land, so we don't preempt their
-// layout here.
-function WaitingThreadModal({title, slug, externalLink, onClose}) {
+// Slice-2 (#881 follow-up): inline-expand card for a Waiting-on-you
+// item. Replaces the side-sheet modal. Rendered via ``createPortal``
+// into a ``<div class="woy-expand">`` that WaitingTable inserts
+// immediately after the clicked ``<li>`` so the surrounding list stays
+// visible. Carries timeline + Accept/Reject/Steer + reply composer.
+function ExpandedCard({title, slug, externalLink, isPr, onClose, onDismissed}) {
   const [data, setData] = useState({loading: true});
   const [pages, setPages] = useState([]);
   const [reply, setReply] = useState("");
   const [sending, setSending] = useState(false);
   const [status, setStatus] = useState({});
   const [refresh, setRefresh] = useState(0);
+  const [action, setAction] = useState({pending: null, done: null, error: null});
+  const [steerText, setSteerText] = useState("");
+  const [steering, setSteering] = useState(false);
   useEffect(() => {
     let cancelled = false;
     setData({loading: true});
@@ -2135,7 +2200,8 @@ function WaitingThreadModal({title, slug, externalLink, onClose}) {
     })();
     return () => { cancelled = true; };
   }, [slug]);
-  // Esc closes the modal, matching legacy #596.
+  // Esc collapses the row (keeps the spatial model of "expanded row"
+  // consistent with the modal's dismissal verb from Slice-1).
   useEffect(() => {
     const onKey = e => { if (e.key === "Escape") onClose(); };
     window.addEventListener("keydown", onKey);
@@ -2165,62 +2231,198 @@ function WaitingThreadModal({title, slug, externalLink, onClose}) {
       setSending(false);
     }
   };
+  const runAction = async verb => {
+    if (action.pending || action.done || !KEY) return;
+    setAction({pending: verb, done: null, error: null});
+    try {
+      const r = await fetch("/api/woy-action", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({key: KEY, slug, action: verb}),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || !body.ok) {
+        setAction({pending: null, done: null, error: body.error || ("HTTP " + r.status)});
+        return;
+      }
+      setAction({pending: null, done: {verb, at: Date.now(), merged: body.merged, msg: body.thread_message}, error: null});
+      setRefresh(n => n + 1);
+      if (body.dismissed && typeof onDismissed === "function") onDismissed(slug);
+    } catch (e) {
+      setAction({pending: null, done: null, error: String(e && e.message || e)});
+    }
+  };
+  const sendSteer = async () => {
+    const text = steerText.trim();
+    if (!text || steering || !KEY) return;
+    setSteering(true);
+    try {
+      const r = await fetch("/api/woy-steer", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({key: KEY, slug, text}),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || !body.ok) {
+        setStatus({err: "Steer failed: " + (body.error || ("HTTP " + r.status))});
+      } else {
+        setSteerText("");
+        setStatus({ok: "steer sent"});
+        setRefresh(n => n + 1);
+      }
+    } catch (e) {
+      setStatus({err: String(e && e.message || e)});
+    } finally {
+      setSteering(false);
+    }
+  };
+  const acceptLabel = () => {
+    if (action.done && action.done.verb === "accept") {
+      return "Accepted " + ageString(new Date(action.done.at).toISOString(), Date.now());
+    }
+    if (action.pending === "accept") return "Accepting…";
+    return isPr ? "Accept (merge)" : "Accept";
+  };
+  const rejectLabel = () => {
+    if (action.done && action.done.verb === "reject") {
+      return "Rejected " + ageString(new Date(action.done.at).toISOString(), Date.now());
+    }
+    if (action.pending === "reject") return "Rejecting…";
+    return "Reject";
+  };
   const hasDetail = pages.some(p => (p && p.slug === slug) || p === slug);
   const rows = data.payload ? mergeHistoryRows(data.payload) : [];
-  return h("div", {
-    className: "woy-modal-scrim",
-    onClick: e => { if (e.target === e.currentTarget) onClose(); },
-  },
-    h("div", {className: "woy-modal", role: "dialog", "aria-label": "Thread for " + title},
-      h("div", {className: "woy-modal-head"},
-        h("h2", null, title),
-        h("button", {
-          className: "woy-modal-close",
-          "aria-label": "Close",
-          onClick: onClose,
-        }, "×"),
-      ),
-      hasDetail ? h("a", {className: "woy-detail-link", href: "#" + slug}, "Open detail page →") : null,
-      externalLink ? h("a", {className: "woy-external-link", href: externalLink, target: "_blank", rel: "noopener noreferrer"}, "View on GitHub →") : null,
-      data.loading ? h("p", {style: MUTED}, "Loading…")
-        : data.error ? h("p", {style: {color: "var(--color-bad)"}}, "Could not load: " + data.error)
-          : rows.length
-            ? h("ol", {className: "woy-timeline"}, rows.map((r, i) =>
-                h("li", {key: i, className: r.kind || ""},
-                  h("time", null, formatTimelineTime(r.at)),
-                  r.label)))
-            : h("p", {style: MUTED}, "No history yet. Reply below to start a thread."),
-      h("div", {className: "woy-reply"},
-        h("textarea", {
-          value: reply,
-          onChange: e => setReply(e.target.value),
-          placeholder: KEY ? "Reply to " + title : "Set the key (?k=…) to reply.",
-          disabled: !KEY || sending,
-          onKeyDown: e => {
-            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); }
-          },
-        }),
-        h("div", {className: "woy-reply-row"},
-          h("button", {onClick: send, disabled: !KEY || sending || !reply.trim()},
-            sending ? "Sending…" : "Send"),
-          status.err ? h("span", {className: "woy-reply-status err"}, status.err) : null,
-          status.ok ? h("span", {className: "woy-reply-status"}, status.ok) : null,
-        ),
+  const buttonsDisabled = !KEY || !!action.pending || !!action.done;
+  return h("div", {className: "woy-expand", role: "region", "aria-label": "Thread for " + title},
+    h("div", {className: "woy-expand-head"},
+      h("h4", null, title),
+      h("button", {
+        className: "woy-expand-close",
+        "aria-label": "Collapse",
+        onClick: onClose,
+      }, "×"),
+    ),
+    h("div", {className: "woy-actions-bar"},
+      h("button", {
+        onClick: () => runAction("accept"),
+        disabled: buttonsDisabled,
+        title: isPr ? "Merge this PR (gh pr merge --squash)" : "Accept and dismiss",
+      }, acceptLabel()),
+      h("button", {
+        className: "reject",
+        onClick: () => runAction("reject"),
+        disabled: buttonsDisabled,
+      }, rejectLabel()),
+      action.error ? h("span", {className: "woy-action-status err"}, action.error) : null,
+      action.done && action.done.merged === false ? h("span", {className: "woy-action-status err"}, "merge failed") : null,
+      action.done && action.done.merged === true ? h("span", {className: "woy-action-status"}, "merged") : null,
+    ),
+    h("div", {className: "woy-steer"},
+      h("input", {
+        type: "text",
+        value: steerText,
+        onChange: e => setSteerText(e.target.value),
+        placeholder: KEY ? "Steer: nudge the agent working on this…" : "Set the key (?k=…) to steer.",
+        disabled: !KEY || steering,
+        onKeyDown: e => {
+          if (e.key === "Enter") { e.preventDefault(); sendSteer(); }
+        },
+      }),
+      h("button", {onClick: sendSteer, disabled: !KEY || steering || !steerText.trim()},
+        steering ? "Sending…" : "Steer"),
+    ),
+    hasDetail ? h("a", {className: "woy-detail-link", href: "#" + slug}, "Open detail page →") : null,
+    externalLink ? h("a", {className: "woy-external-link", href: externalLink, target: "_blank", rel: "noopener noreferrer"}, "View on GitHub →") : null,
+    data.loading ? h("p", {style: MUTED}, "Loading…")
+      : data.error ? h("p", {style: {color: "var(--color-bad)"}}, "Could not load: " + data.error)
+        : rows.length
+          ? h("ol", {className: "woy-timeline"}, rows.map((r, i) =>
+              h("li", {key: i, className: r.kind || ""},
+                h("time", null, formatTimelineTime(r.at)),
+                r.label)))
+          : h("p", {style: MUTED}, "No history yet. Reply below to start a thread."),
+    h("div", {className: "woy-reply"},
+      h("textarea", {
+        value: reply,
+        onChange: e => setReply(e.target.value),
+        placeholder: KEY ? "Reply to " + title : "Set the key (?k=…) to reply.",
+        disabled: !KEY || sending,
+        onKeyDown: e => {
+          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); }
+        },
+      }),
+      h("div", {className: "woy-reply-row"},
+        h("button", {onClick: send, disabled: !KEY || sending || !reply.trim()},
+          sending ? "Sending…" : "Send"),
+        status.err ? h("span", {className: "woy-reply-status err"}, status.err) : null,
+        status.ok ? h("span", {className: "woy-reply-status"}, status.ok) : null,
       ),
     ),
   );
 }
 
-function WaitingTable({rows, handZoneMd, nowMs}) {
+function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs}) {
   const safe = rows || [];
-  const [active, setActive] = useState(null); // {slug, title} | null
+  const approvalSet = React.useMemo(() => new Set(needsApprovalSlugs || []), [needsApprovalSlugs]);
+  const zoneRef = useRef(null);
+  const [active, setActive] = useState(null); // {slug, title, externalLink, isPr, anchorNode} | null
+  // Per-slug {verb, at} for rows Jason has just Accepted/Rejected from
+  // the collapsed-row buttons. Lets the inline pill flip to
+  // "Accepted Ns ago" before the next Tracker tick removes the row.
+  const [rowDone, setRowDone] = useState({});
+  // The anchor <div class="woy-expand"> physically lives in the hand-md
+  // DOM, not in React's tree. We create one on open, insertAfter the
+  // clicked <li>, portal <ExpandedCard> into it, and remove it on close
+  // or when WaitingTable unmounts.
+  const anchorRef = useRef(null);
+  // Hoisted by Jason's rule from Slice-1: clicking an <a> inside a bold
+  // title should NOT leave the site. We use capture-phase to catch it
+  // before the browser follows the link.
+  const onCapturingClick = e => {
+    const a = e.target.closest && e.target.closest("a[href]");
+    if (!a) return;
+    const strong = a.closest && a.closest("strong");
+    if (!strong) return;
+    e.preventDefault();
+  };
+  const openSlug = (li, title, slug, externalLink) => {
+    if (!li || !slug) return;
+    // Remove any prior anchor before placing a new one.
+    if (anchorRef.current && anchorRef.current.parentNode) {
+      anchorRef.current.parentNode.removeChild(anchorRef.current);
+    }
+    const anchor = document.createElement("div");
+    anchor.className = "woy-expand-anchor";
+    li.parentNode.insertBefore(anchor, li.nextSibling);
+    li.classList.add("woy-active");
+    anchorRef.current = anchor;
+    const isPr = approvalSet.has(slug);
+    setActive({slug, title, externalLink, isPr, li});
+  };
+  const closeExpand = () => {
+    if (anchorRef.current && anchorRef.current.parentNode) {
+      anchorRef.current.parentNode.removeChild(anchorRef.current);
+    }
+    anchorRef.current = null;
+    if (active && active.li && active.li.classList) {
+      active.li.classList.remove("woy-active");
+    }
+    setActive(null);
+  };
   const onHandZoneClick = e => {
-    // Walk up from the click target to the first <strong> inside a
-    // <li>; the bold is the item title (matches history.py's parse).
-    // A click on an <a> INSIDE the title still opens the modal —
-    // Jason's rule: the title's job is to open the item, not leave
-    // the site. The GitHub URL embedded in the title surfaces as a
-    // "View on GitHub" link inside the modal instead.
+    // Find the <strong> (title) ancestor of the click, or an explicit
+    // action-button click on an approval-pill row.
+    const btn = e.target.closest && e.target.closest("button[data-woy-action]");
+    if (btn) {
+      const verb = btn.getAttribute("data-woy-action");
+      const slug = btn.getAttribute("data-woy-slug");
+      if (!verb || !slug) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (rowDone[slug]) return;
+      runRowAction(slug, verb, btn);
+      return;
+    }
     let node = e.target;
     while (node && node !== e.currentTarget && node.tagName !== "STRONG") {
       node = node.parentNode;
@@ -2234,8 +2436,130 @@ function WaitingTable({rows, handZoneMd, nowMs}) {
     const innerAnchor = node.querySelector && node.querySelector("a[href]");
     const externalLink = innerAnchor ? innerAnchor.getAttribute("href") : null;
     e.preventDefault();
-    setActive({slug, title, externalLink});
+    if (active && active.slug === slug) {
+      closeExpand();
+      return;
+    }
+    if (active) closeExpand();
+    openSlug(li, title, slug, externalLink);
   };
+  const runRowAction = async (slug, verb, btn) => {
+    if (!KEY) return;
+    if (btn) { btn.disabled = true; btn.textContent = verb === "accept" ? "Accepting…" : "Rejecting…"; }
+    try {
+      const r = await fetch("/api/woy-action", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({key: KEY, slug, action: verb}),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || !body.ok) {
+        if (btn) { btn.disabled = false; btn.textContent = verb === "accept" ? "Accept" : "Reject"; }
+        return;
+      }
+      setRowDone(prev => ({...prev, [slug]: {verb, at: Date.now(), merged: body.merged}}));
+    } catch (e) {
+      if (btn) { btn.disabled = false; btn.textContent = verb === "accept" ? "Accept" : "Reject"; }
+    }
+  };
+  // Post-render DOM pass: tag each hand-zone <li> whose slug is in
+  // ``needs_approval_slugs`` with an inline button pair and the
+  // ``woy-approval`` class, then physically move those <li>s into a
+  // sibling <ul class="woy-needs-approval"> prepended under the
+  // zone. Re-runs on every render so a Tracker tick that drops the
+  // row collapses the DOM state too.
+  useLayoutEffect(() => {
+    const zone = zoneRef.current;
+    if (!zone) return;
+    // 1) Remove any prior needs-approval sibling (idempotent).
+    const prior = zone.querySelector(".woy-needs-approval");
+    if (prior && prior.parentNode) prior.parentNode.removeChild(prior);
+    // 2) Strip prior inline actions so we don't double-append after
+    // re-render.
+    zone.querySelectorAll(".woy-row-actions").forEach(n => n.parentNode && n.parentNode.removeChild(n));
+    if (!approvalSet.size) return;
+    const approvalWrap = document.createElement("div");
+    approvalWrap.className = "woy-needs-approval";
+    const head = document.createElement("h4");
+    head.className = "woy-needs-approval-head";
+    head.textContent = "Needs your approval";
+    approvalWrap.appendChild(head);
+    const ul = document.createElement("ul");
+    approvalWrap.appendChild(ul);
+    let found = false;
+    zone.querySelectorAll("li").forEach(li => {
+      const strong = li.querySelector(":scope > strong, :scope > p > strong");
+      if (!strong) return;
+      const slug = titleSlug(strong.textContent || "");
+      if (!slug || !approvalSet.has(slug)) return;
+      found = true;
+      // Append inline action chips if not already present.
+      if (!li.querySelector(":scope .woy-row-actions")) {
+        const span = document.createElement("span");
+        span.className = "woy-row-actions";
+        const done = rowDone[slug];
+        const bAccept = document.createElement("button");
+        bAccept.type = "button";
+        bAccept.setAttribute("data-woy-action", "accept");
+        bAccept.setAttribute("data-woy-slug", slug);
+        bAccept.textContent = done && done.verb === "accept"
+          ? "Accepted " + ageString(new Date(done.at).toISOString(), nowMs || Date.now())
+          : "Accept";
+        if (done) bAccept.disabled = true;
+        const bReject = document.createElement("button");
+        bReject.type = "button";
+        bReject.className = "reject";
+        bReject.setAttribute("data-woy-action", "reject");
+        bReject.setAttribute("data-woy-slug", slug);
+        bReject.textContent = done && done.verb === "reject"
+          ? "Rejected " + ageString(new Date(done.at).toISOString(), nowMs || Date.now())
+          : "Reject";
+        if (done) bReject.disabled = true;
+        span.appendChild(bAccept);
+        span.appendChild(bReject);
+        // Insert after the <strong>: visual chip to the right of the title.
+        if (strong.nextSibling) strong.parentNode.insertBefore(span, strong.nextSibling);
+        else strong.parentNode.appendChild(span);
+      }
+      ul.appendChild(li);
+    });
+    if (found) {
+      zone.insertBefore(approvalWrap, zone.firstChild);
+    }
+  }, [handZoneMd, approvalSet, rowDone, nowMs]);
+  // When a slug disappears from the server payload, clear its rowDone
+  // state too so a future render-under-the-same-slug starts fresh.
+  useEffect(() => {
+    const live = new Set();
+    if (zoneRef.current) {
+      zoneRef.current.querySelectorAll("li").forEach(li => {
+        const strong = li.querySelector(":scope > strong, :scope > p > strong");
+        if (strong) {
+          const s = titleSlug(strong.textContent || "");
+          if (s) live.add(s);
+        }
+      });
+    }
+    setRowDone(prev => {
+      let changed = false;
+      const next = {...prev};
+      for (const s of Object.keys(next)) {
+        if (!live.has(s)) { delete next[s]; changed = true; }
+      }
+      return changed ? next : prev;
+    });
+    // Also close the expand if its slug is no longer in the DOM.
+    if (active && !live.has(active.slug)) closeExpand();
+  }, [handZoneMd]);
+  // Cleanup on unmount: anchor node + list class.
+  useEffect(() => {
+    return () => {
+      if (anchorRef.current && anchorRef.current.parentNode) {
+        anchorRef.current.parentNode.removeChild(anchorRef.current);
+      }
+      anchorRef.current = null;
+    };
+  }, []);
   const table = safe.length
     ? h(FxTable, {
         columns: [
@@ -2249,15 +2573,24 @@ function WaitingTable({rows, handZoneMd, nowMs}) {
     : h("p", {style: {color: "var(--color-fg-muted)", margin: 0}},
         "(nothing waiting on you)");
   return h(React.Fragment, null,
-    handZoneMd ? h("div", {className: "woy-click", onClick: onHandZoneClick},
-      h(MarkdownZone, {markdown: handZoneMd})) : null,
+    handZoneMd ? h("div", {
+      className: "woy-click",
+      ref: zoneRef,
+      onClick: onHandZoneClick,
+      onClickCapture: onCapturingClick,
+    }, h(MarkdownZone, {markdown: handZoneMd})) : null,
     table,
-    active ? h(WaitingThreadModal, {
-      title: active.title,
-      slug: active.slug,
-      externalLink: active.externalLink,
-      onClose: () => setActive(null),
-    }) : null,
+    active && anchorRef.current ? createPortal(
+      h(ExpandedCard, {
+        title: active.title,
+        slug: active.slug,
+        externalLink: active.externalLink,
+        isPr: active.isPr,
+        onClose: closeExpand,
+        onDismissed: s => setRowDone(prev => ({...prev, [s]: {verb: "accept", at: Date.now()}})),
+      }),
+      anchorRef.current,
+    ) : null,
   );
 }
 
@@ -2372,7 +2705,12 @@ function YourTodoBoard({data, nowMs}) {
   }
   if (hasAsks) {
     groups.push(h(PipelineGroup, {key: "asks", title: "Asks", count: (d.rows || []).length},
-      h(WaitingTable, {rows: d.rows, handZoneMd: d.your_todo_md, nowMs})));
+      h(WaitingTable, {
+        rows: d.rows,
+        handZoneMd: d.your_todo_md,
+        needsApprovalSlugs: d.needs_approval_slugs || [],
+        nowMs,
+      })));
   }
   if (d.external_todos_md) {
     groups.push(h(PipelineGroup, {key: "ext", title: "External TODOs", count: 1},
