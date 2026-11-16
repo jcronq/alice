@@ -295,10 +295,13 @@ class PresenceState:
     """Thread-safe last-heartbeat tracker.
 
     Lives on :class:`Config` (``cfg.presence``) so handlers, tests
-    and future readers share one source of truth. Only
-    ``focused=true`` heartbeats advance ``last_presence_at``; a
-    ``focused=false`` is observed but does not reset the stamp — a
-    stale ``focused=true`` can still age out naturally.
+    and future readers share one source of truth. ``focused=true``
+    heartbeats advance the stamp; ``focused=false`` CLEARS it. The
+    browser sends ``focused=false`` on ``blur`` / page unload /
+    ``visibilitychange``-to-hidden; without that invalidation, a
+    tab the user closed would still appear focused until the 45 s
+    window aged out and a status-chat reply in that gap would be
+    wrongly suppressed (review finding #1).
     """
 
     def __init__(self) -> None:
@@ -306,18 +309,29 @@ class PresenceState:
         self._last_focused_at: float | None = None
 
     def record(self, *, focused: bool, now: float | None = None) -> float:
-        """Update the stamp if ``focused`` is True. Returns ``now``."""
+        """``focused=True`` stamps now; ``focused=False`` clears.
+
+        Returns the timestamp the call observed, mostly for test
+        determinism.
+        """
         t = time.time() if now is None else now
-        if focused:
-            with self._lock:
+        with self._lock:
+            if focused:
                 self._last_focused_at = t
+            else:
+                self._last_focused_at = None
         return t
 
     def snapshot(self, now: float | None = None) -> dict[str, object]:
         """Public shape for ``GET /api/presence/status``.
 
-        ``focused_within_s`` is ``None`` when there's never been a
-        heartbeat (clients should treat that as "not focused").
+        Deliberately minimal: ``focused`` + a bounded ``window_s``.
+        ``last_presence_at`` is NOT returned — that would be
+        laptop-activity telemetry over an unauthenticated endpoint
+        (review finding #2). ``focused_within_s`` stays for
+        observability on alice-speaking's side (it only reads this
+        endpoint from the sibling container) and is ``None`` when
+        no heartbeat has ever landed.
         """
         t = time.time() if now is None else now
         with self._lock:
@@ -326,16 +340,12 @@ class PresenceState:
             return {
                 "focused": False,
                 "focused_within_s": None,
-                "last_presence_at": None,
                 "window_s": PRESENCE_WINDOW_S,
             }
         delta = max(0.0, t - last)
         return {
             "focused": delta < PRESENCE_WINDOW_S,
             "focused_within_s": round(delta, 3),
-            "last_presence_at": datetime.fromtimestamp(
-                last, tz=timezone.utc
-            ).isoformat(),
             "window_s": PRESENCE_WINDOW_S,
         }
 

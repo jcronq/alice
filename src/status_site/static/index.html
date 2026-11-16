@@ -535,38 +535,55 @@ const KEY = localStorage.getItem("alice-key") || "";
 // can skip the Signal ping on a status-chat reply while Jason is
 // looking at the page. No-op when the shared key isn't loaded yet.
 // See docs/designs/slice-presence-aware-notifs.md.
+//
+// Every transition emits a POST: focused → stamp refreshes, blurred /
+// hidden / pagehide → stamp clears immediately so the server stops
+// reporting focused=true for a closed or backgrounded tab. Without
+// the clear, a tab the user just closed would still look focused
+// until the 45 s window aged out (review finding #1).
 const PRESENCE_INTERVAL_MS = 20000; // < server window (45s) with slack
 let _presenceTimer = null;
+let _lastPresenceSent = null; // dedup consecutive identical states
 function _presenceFocused() {
   return document.visibilityState === "visible" && document.hasFocus();
 }
 function _sendPresence(focused) {
   if (!KEY) return;
-  // keepalive so a tab close still delivers the last heartbeat
-  // (helpful for the focused→blur transition on tab-close).
+  const payload = JSON.stringify({key: KEY, focused: !!focused});
+  // ``keepalive: true`` lets the request outlive the page on
+  // unload / pagehide / blur-just-before-close. Dedup on the
+  // transition only to keep the heartbeat the one steady stream.
   try {
     fetch("/api/presence", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({key: KEY, focused: !!focused}),
+      body: payload,
       keepalive: true,
     }).catch(() => {});
   } catch (_) { /* swallow — presence is best-effort */ }
+  _lastPresenceSent = focused;
 }
 function _presenceTick() {
   _sendPresence(_presenceFocused());
 }
 function _restartPresenceTimer() {
+  const focused = _presenceFocused();
+  // Always report the transition — the server treats focused=false
+  // as "clear the stamp now," not "ignore."
+  _sendPresence(focused);
   if (_presenceTimer != null) clearInterval(_presenceTimer);
   _presenceTimer = null;
-  if (_presenceFocused()) {
-    _presenceTick();
+  if (focused) {
     _presenceTimer = setInterval(_presenceTick, PRESENCE_INTERVAL_MS);
   }
 }
 document.addEventListener("visibilitychange", _restartPresenceTimer);
 window.addEventListener("focus", _restartPresenceTimer);
 window.addEventListener("blur", _restartPresenceTimer);
+// pagehide is the modern-browser successor to unload and fires
+// reliably on tab-close / navigation / back-forward cache. Force a
+// clearing POST so the server ages the stamp immediately.
+window.addEventListener("pagehide", () => _sendPresence(false));
 // Fire once at load so the initial state is known without waiting.
 _restartPresenceTimer();
 

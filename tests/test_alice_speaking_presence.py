@@ -117,6 +117,34 @@ def test_check_focused_missing_within_s_normalises_to_none():
     assert r.focused_within_s is None
 
 
+def test_check_focused_requires_strict_true_rejects_truthy_strings():
+    # Review finding #6: a malformed server returning truthy non-
+    # bool (e.g. the literal string "false", or 1, or "yes") must
+    # NOT be read as focused — that would be fail-closed, the
+    # opposite of our invariant.
+    for payload in (
+        {"focused": "false"},  # truthy string
+        {"focused": "yes"},
+        {"focused": 1},
+        {"focused": "true"},
+        {"focused": [1]},
+    ):
+        body = json.dumps(payload).encode()
+        op = _FakeOpener(resp=_FakeResp(200, body))
+        r = presence_mod.check_focused(opener=op)
+        assert r.focused is False, f"should reject {payload!r}"
+
+
+def test_check_focused_rejects_bool_as_number_for_within_s():
+    # ``isinstance(True, int)`` is True — guard against a server that
+    # accidentally serialises a bool where a number is expected.
+    body = json.dumps({"focused": True, "focused_within_s": True}).encode()
+    op = _FakeOpener(resp=_FakeResp(200, body))
+    r = presence_mod.check_focused(opener=op)
+    assert r.focused is True
+    assert r.focused_within_s is None
+
+
 # ─── _send_message suppression ─────────────────────────────────────────
 
 

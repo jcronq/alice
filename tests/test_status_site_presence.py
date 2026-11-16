@@ -36,9 +36,18 @@ def test_presence_state_snapshot_empty():
     assert snap == {
         "focused": False,
         "focused_within_s": None,
-        "last_presence_at": None,
         "window_s": PRESENCE_WINDOW_S,
     }
+
+
+def test_presence_state_snapshot_shape_omits_last_presence_at():
+    # Review finding #2: ``last_presence_at`` would be laptop-activity
+    # telemetry on an unauthenticated endpoint. The snapshot must not
+    # leak it even after a real heartbeat.
+    p = PresenceState()
+    p.record(focused=True, now=1000.0)
+    snap = p.snapshot(now=1000.5)
+    assert "last_presence_at" not in snap
 
 
 def test_presence_state_records_focused_true_updates_stamp():
@@ -47,18 +56,19 @@ def test_presence_state_records_focused_true_updates_stamp():
     snap = p.snapshot(now=1001.5)
     assert snap["focused"] is True
     assert snap["focused_within_s"] == 1.5
-    assert isinstance(snap["last_presence_at"], str)
 
 
-def test_presence_state_records_focused_false_does_not_update_stamp():
+def test_presence_state_records_focused_false_clears_stamp():
+    # Review finding #1: ``focused=false`` is the blur signal from
+    # the browser. The server MUST invalidate the stamp — otherwise
+    # a tab the user just closed still looks focused until the 45 s
+    # window ages out.
     p = PresenceState()
     p.record(focused=True, now=1000.0)
-    p.record(focused=False, now=1100.0)
-    # The focused=false heartbeat MUST NOT advance the stamp — if it
-    # did, a blur tick followed by refocus 44s later would appear as
-    # "focused 44s ago" instead of 44s + stale window.
+    p.record(focused=False, now=1001.0)
     snap = p.snapshot(now=1002.0)
-    assert snap["focused_within_s"] == 2.0
+    assert snap["focused"] is False
+    assert snap["focused_within_s"] is None
 
 
 def test_presence_state_window_boundary():
@@ -124,8 +134,9 @@ def test_get_status_empty(site):
     data = json.loads(body)
     assert data["focused"] is False
     assert data["focused_within_s"] is None
-    assert data["last_presence_at"] is None
     assert data["window_s"] == PRESENCE_WINDOW_S
+    # No laptop-activity telemetry on the unauth endpoint.
+    assert "last_presence_at" not in data
 
 
 def test_post_presence_happy_path(site):
@@ -164,14 +175,15 @@ def test_post_presence_rejects_bad_focused(site):
     assert b"bad focused" in body
 
 
-def test_post_presence_false_does_not_record(site):
+def test_post_presence_false_clears_stamp(site):
     cfg, port = site
-    # No heartbeat yet.
+    # Focus, then blur.
+    _req(port, "POST", "/api/presence", body={"key": KEY, "focused": True})
     _req(port, "POST", "/api/presence", body={"key": KEY, "focused": False})
     status, body = _req(port, "GET", "/api/presence/status")
     data = json.loads(body)
     assert data["focused"] is False
-    assert data["last_presence_at"] is None
+    assert data["focused_within_s"] is None
 
 
 def test_post_presence_rejects_malformed_json(site):

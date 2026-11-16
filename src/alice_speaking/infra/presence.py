@@ -111,8 +111,15 @@ def check_focused(
 
     if not isinstance(data, dict):
         return PresenceReading.not_focused(error="bad shape")
-    focused = bool(data.get("focused"))
-    within = data.get("focused_within_s")
-    if not isinstance(within, (int, float)):
+    # Strict ``is True`` — reject the fail-closed corner where a
+    # malformed server returns ``"focused": "false"`` (truthy string)
+    # or any other non-bool truthy value (review finding #6). Also
+    # excludes ``bool`` masquerading as ``int`` below because
+    # ``isinstance(True, int)`` would otherwise slip through.
+    focused = data.get("focused") is True
+    within_raw = data.get("focused_within_s")
+    if isinstance(within_raw, bool) or not isinstance(within_raw, (int, float)):
         within = None
+    else:
+        within = float(within_raw)
     return PresenceReading(focused=focused, focused_within_s=within)
