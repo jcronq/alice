@@ -423,6 +423,71 @@ details.fx-group:first-child { margin-top: 0; }
   border-radius: 4px;
 }
 .a2ui-reply-chip button { background: transparent; border: 0; cursor: pointer; color: var(--color-fg-muted); }
+
+/* Slice-1 (#881): per-item thread modal for Waiting-on-you entries.
+ * Clicking a bold title in the hand-maintained zone opens this panel;
+ * it fetches /api/history for the item's slug and shows event timeline +
+ * thread + a reply composer. Styled as a side-sheet overlay so Jason's
+ * phone keeps the Overview visible underneath. */
+.woy-click strong { cursor: pointer; border-bottom: 1px dashed var(--color-fg-muted); }
+.woy-click strong:hover { color: var(--color-ok); border-bottom-color: var(--color-ok); }
+.woy-modal-scrim {
+  position: fixed; inset: 0; z-index: 10;
+  background: rgba(0, 0, 0, .35);
+  display: flex; justify-content: flex-end;
+}
+.woy-modal {
+  background: var(--color-panel);
+  color: var(--color-fg);
+  width: min(560px, 100%);
+  max-width: 100%;
+  height: 100%;
+  overflow-y: auto;
+  padding: 1rem 1.1rem;
+  border-left: 1px solid var(--color-border-line);
+  box-shadow: -4px 0 18px rgba(0, 0, 0, .25);
+}
+.woy-modal-head { display: flex; align-items: center; gap: .5rem; margin-bottom: .6rem; }
+.woy-modal-head h2 { margin: 0; font-size: 1.05rem; flex: 1; line-height: 1.3; }
+.woy-modal-close {
+  background: transparent; border: 0; cursor: pointer; color: var(--color-fg-muted);
+  font-size: 1.4rem; line-height: 1; padding: .1rem .3rem;
+}
+.woy-modal-close:hover { color: var(--color-fg); }
+.woy-timeline { list-style: none; margin: 0; padding: 0 0 0 .8rem; border-left: 2px solid var(--color-border-line); }
+.woy-timeline li {
+  position: relative; padding: .35rem 0 .35rem .9rem;
+  font-size: .9rem; line-height: 1.4;
+}
+.woy-timeline li:before {
+  content: ''; position: absolute; left: -.5rem; top: .72rem;
+  width: .55rem; height: .55rem; border-radius: 50%;
+  background: var(--color-panel); border: 2px solid var(--color-border-line);
+}
+.woy-timeline li.ev-jason:before { background: var(--color-ok); border-color: var(--color-ok); }
+.woy-timeline li.ev-alice:before { border-color: var(--color-ok); }
+.woy-timeline li.ev-checked:before { background: var(--color-ok); border-color: var(--color-ok); }
+.woy-timeline time { display: block; color: var(--color-fg-muted); font-size: .72rem; }
+.woy-reply { margin-top: 1rem; }
+.woy-reply textarea {
+  width: 100%; min-height: 4rem; padding: .4rem .55rem;
+  background: var(--color-bg); color: var(--color-fg);
+  border: 1px solid var(--color-border-line); border-radius: 6px;
+  font: inherit; resize: vertical;
+}
+.woy-reply-row { display: flex; gap: .5rem; align-items: center; margin-top: .4rem; }
+.woy-reply-row button {
+  background: var(--color-ok); color: var(--color-bg);
+  border: 0; border-radius: 6px; padding: .35rem .9rem;
+  cursor: pointer; font: inherit;
+}
+.woy-reply-row button:disabled { opacity: .6; cursor: not-allowed; }
+.woy-reply-status { font-size: .82rem; color: var(--color-fg-muted); }
+.woy-reply-status.err { color: var(--color-bad); }
+.woy-detail-link {
+  display: inline-block; margin-bottom: .6rem; font-size: .85rem;
+  color: var(--color-ok);
+}
 </style>
 </head><body>
 <div id="root">Loading Alice…</div>
@@ -710,6 +775,9 @@ function freshnessFromTs(ts, nowMs) {
   if (ageSec < 900) return "amber";
   return "red";
 }
+// Format "age" text. Past 24h we switch from "Nh Mm" to "Nd" (floored
+// integer days) — Jason prefers reading "3d" over "72h" for anything
+// that's been sitting around for more than a day.
 function stampText(ts, nowMs) {
   if (!ts) return "no update yet";
   const sec = Math.max(0, Math.floor((nowMs - ts) / 1000));
@@ -717,6 +785,7 @@ function stampText(ts, nowMs) {
   const min = Math.floor(sec / 60);
   if (min < 60) return "updated " + min + "m ago";
   const hr = Math.floor(min / 60);
+  if (hr >= 24) return "updated " + Math.floor(hr / 24) + "d ago";
   const rm = min % 60;
   return "updated " + hr + "h" + (rm ? " " + rm + "m" : "") + " ago";
 }
@@ -728,6 +797,7 @@ function ageString(createdIso, nowMs) {
   const min = Math.floor(sec / 60);
   if (min < 60) return min + "m";
   const hr = Math.floor(min / 60);
+  if (hr >= 24) return Math.floor(hr / 24) + "d";
   const rm = min % 60;
   return hr + "h" + (rm ? " " + rm + "m" : "");
 }
@@ -737,6 +807,7 @@ function ageStringSeconds(ageSec) {
   const m = Math.floor(s / 60);
   if (m < 60) return m + "m";
   const hr = Math.floor(m / 60);
+  if (hr >= 24) return Math.floor(hr / 24) + "d";
   const rm = m % 60;
   return hr + "h" + (rm ? " " + rm + "m" : "");
 }
@@ -1935,8 +2006,202 @@ function RunningNowBoard({rows, nowMs}) {
   });
 }
 
+// Slice-1 (#881) — frontend slug of a bold item title, matching
+// ``history.py::title_slug`` so item-history/<slug>.jsonl and
+// threads/<slug>.jsonl line up with what the server wrote.
+function titleSlug(title) {
+  const trimmed = String(title || "").trim().replace(/[:.]+$/, "");
+  return trimmed.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+}
+
+function formatTimelineTime(iso) {
+  if (!iso) return "";
+  const d = new Date(String(iso).replace(/([+-]\d\d)(\d\d)$/, "$1:$2"));
+  if (isNaN(d.getTime())) return String(iso);
+  return d.toLocaleString([], {month: "short", day: "numeric", hour: "numeric", minute: "2-digit"});
+}
+
+// Chronological [{at, kind, label}] from the /api/history payload.
+// Mirrors the legacy modal (#596) style but trimmed to what Slice-1
+// needs: event line, thread message, commit/extra blurb.
+function mergeHistoryRows(payload) {
+  const rows = [];
+  for (const e of (payload && payload.events) || []) {
+    let label = e.type || "event";
+    if (e.type === "appeared") {
+      label = e.seeded ? "Already tracked" : "Added";
+      if (e.section) label += " · " + e.section;
+    } else if (e.type === "checked") label = "Checked off";
+    else if (e.type === "unchecked") label = "Unchecked";
+    else if (e.type === "text_changed") label = "Text changed";
+    else if (e.type === "moved") {
+      const to = e.to && (e.to.section || e.to.page) ? (e.to.section || e.to.page) : "elsewhere";
+      label = "Moved → " + to;
+    } else if (e.type === "removed") label = "Removed";
+    rows.push({at: e.at, kind: "ev-" + e.type, label});
+  }
+  for (const m of (payload && payload.thread) || []) {
+    const who = m.from === "jason" ? "You" : (m.from || "Alice");
+    rows.push({
+      at: m.at,
+      kind: m.from === "jason" ? "ev-jason" : "ev-alice",
+      label: who + ": " + (m.text || ""),
+    });
+  }
+  for (const x of (payload && payload.extra) || []) {
+    const label = x.sha
+      ? (x.merge ? "Merged " : "Commit ") + String(x.sha).slice(0, 10) + ": " + (x.subject || "")
+      : (x.text || x.subject || JSON.stringify(x));
+    rows.push({at: x.at, kind: "ev-extra", label});
+  }
+  rows.forEach((r, i) => (r._i = i));
+  rows.sort((a, b) => {
+    const ta = a.at ? Date.parse(a.at) : 0;
+    const tb = b.at ? Date.parse(b.at) : 0;
+    return (isFinite(ta) ? ta : 0) - (isFinite(tb) ? tb : 0) || a._i - b._i;
+  });
+  return rows;
+}
+
+// Thread modal for a Waiting-on-you item. Open on click of a bold
+// title; fetches /api/history and lets Jason post a reply via
+// /api/reply. Deliberately minimal — slice-2 is where Approve / Reject
+// buttons and expandable detail cards land, so we don't preempt their
+// layout here.
+function WaitingThreadModal({title, slug, onClose}) {
+  const [data, setData] = useState({loading: true});
+  const [pages, setPages] = useState([]);
+  const [reply, setReply] = useState("");
+  const [sending, setSending] = useState(false);
+  const [status, setStatus] = useState({});
+  const [refresh, setRefresh] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    setData({loading: true});
+    (async () => {
+      try {
+        const r = await fetch("/api/history?slug=" + encodeURIComponent(slug));
+        const body = await r.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!r.ok) setData({error: body.error || ("HTTP " + r.status)});
+        else setData({payload: body});
+      } catch (e) {
+        if (!cancelled) setData({error: String(e && e.message || e)});
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [slug, refresh]);
+  // Detail-page probe so the "Open detail page →" link only renders
+  // for items that actually have a dedicated page under STATUS_DIR.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch("/api/pages");
+        if (!r.ok) return;
+        const body = await r.json().catch(() => []);
+        if (!cancelled && Array.isArray(body)) setPages(body);
+      } catch (e) { /* pages lookup is best-effort */ }
+    })();
+    return () => { cancelled = true; };
+  }, [slug]);
+  // Esc closes the modal, matching legacy #596.
+  useEffect(() => {
+    const onKey = e => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  const send = async () => {
+    const text = reply.trim();
+    if (!text || sending || !KEY) return;
+    setSending(true);
+    setStatus({});
+    try {
+      const r = await fetch("/api/reply", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({key: KEY, item: title, thread: slug, page: "index", text}),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) setStatus({err: body.error || ("HTTP " + r.status)});
+      else {
+        setReply("");
+        setStatus({ok: "sent"});
+        setRefresh(n => n + 1);
+      }
+    } catch (e) {
+      setStatus({err: String(e && e.message || e)});
+    } finally {
+      setSending(false);
+    }
+  };
+  const hasDetail = pages.some(p => (p && p.slug === slug) || p === slug);
+  const rows = data.payload ? mergeHistoryRows(data.payload) : [];
+  return h("div", {
+    className: "woy-modal-scrim",
+    onClick: e => { if (e.target === e.currentTarget) onClose(); },
+  },
+    h("div", {className: "woy-modal", role: "dialog", "aria-label": "Thread for " + title},
+      h("div", {className: "woy-modal-head"},
+        h("h2", null, title),
+        h("button", {
+          className: "woy-modal-close",
+          "aria-label": "Close",
+          onClick: onClose,
+        }, "×"),
+      ),
+      hasDetail ? h("a", {className: "woy-detail-link", href: "#" + slug}, "Open detail page →") : null,
+      data.loading ? h("p", {style: MUTED}, "Loading…")
+        : data.error ? h("p", {style: {color: "var(--color-bad)"}}, "Could not load: " + data.error)
+          : rows.length
+            ? h("ol", {className: "woy-timeline"}, rows.map((r, i) =>
+                h("li", {key: i, className: r.kind || ""},
+                  h("time", null, formatTimelineTime(r.at)),
+                  r.label)))
+            : h("p", {style: MUTED}, "No history yet. Reply below to start a thread."),
+      h("div", {className: "woy-reply"},
+        h("textarea", {
+          value: reply,
+          onChange: e => setReply(e.target.value),
+          placeholder: KEY ? "Reply to " + title : "Set the key (?k=…) to reply.",
+          disabled: !KEY || sending,
+          onKeyDown: e => {
+            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); }
+          },
+        }),
+        h("div", {className: "woy-reply-row"},
+          h("button", {onClick: send, disabled: !KEY || sending || !reply.trim()},
+            sending ? "Sending…" : "Send"),
+          status.err ? h("span", {className: "woy-reply-status err"}, status.err) : null,
+          status.ok ? h("span", {className: "woy-reply-status"}, status.ok) : null,
+        ),
+      ),
+    ),
+  );
+}
+
 function WaitingTable({rows, handZoneMd, nowMs}) {
   const safe = rows || [];
+  const [active, setActive] = useState(null); // {slug, title} | null
+  const onHandZoneClick = e => {
+    // Walk up from the click target to the first <strong> inside a
+    // <li>; the bold is the item title (matches history.py's parse).
+    // Any anchor click inside the title still wins — we don't preempt
+    // Jason's existing GitHub links (that's slice 2/3 territory).
+    let node = e.target;
+    if (!node || node.tagName === "A") return;
+    while (node && node !== e.currentTarget && node.tagName !== "STRONG") {
+      node = node.parentNode;
+    }
+    if (!node || node.tagName !== "STRONG") return;
+    const li = node.closest && node.closest("li");
+    if (!li) return;
+    const title = (node.textContent || "").trim();
+    const slug = titleSlug(title);
+    if (!slug) return;
+    e.preventDefault();
+    setActive({slug, title});
+  };
   const table = safe.length
     ? h(FxTable, {
         columns: [
@@ -1950,8 +2215,14 @@ function WaitingTable({rows, handZoneMd, nowMs}) {
     : h("p", {style: {color: "var(--color-fg-muted)", margin: 0}},
         "(nothing waiting on you)");
   return h(React.Fragment, null,
-    handZoneMd ? h(MarkdownZone, {markdown: handZoneMd}) : null,
+    handZoneMd ? h("div", {className: "woy-click", onClick: onHandZoneClick},
+      h(MarkdownZone, {markdown: handZoneMd})) : null,
     table,
+    active ? h(WaitingThreadModal, {
+      title: active.title,
+      slug: active.slug,
+      onClose: () => setActive(null),
+    }) : null,
   );
 }
 
