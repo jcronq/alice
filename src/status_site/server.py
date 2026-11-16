@@ -45,6 +45,15 @@ Stdlib-only (runs on a bare ``python:3.12-alpine`` image). Routes:
                                           ``UPLOAD_DIR/chat/<date>/``, same rules as /api/reply) and drops a
                                           ``type: status-chat`` surface into SURFACE_DIR
                                           (no thread/item context — just the message).
+    POST /api/presence                    Browser presence heartbeat (shared-key auth, body
+                                          ``{key, focused: bool}``). Only ``focused=true``
+                                          advances ``last_presence_at``; alice-speaking reads
+                                          the GET below to decide whether to suppress a Signal
+                                          ping on a status-chat reply. See
+                                          docs/designs/slice-presence-aware-notifs.md.
+    GET  /api/presence/status             {focused, focused_within_s, last_presence_at, window_s}
+                                          — no auth (LAN-only). ``focused`` is True when the
+                                          most recent heartbeat is within PRESENCE_WINDOW_S.
 
 Anything else is a 404: dotfiles (``.replies.jsonl``, ``.item-state.json``, ``.chat.jsonl``,
 ``.chat-reactions.jsonl``, ``.waiting-order.json``),
@@ -268,6 +277,69 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
+# ─── Presence (slice-presence-aware-notifs) ────────────────────────────
+#
+# A tiny shared-key heartbeat. The browser tab POSTs ``focused=true``
+# on an interval while visible + focused; alice-speaking reads the GET
+# just before a status-chat Signal reply to decide whether to suppress
+# the Signal ping. See docs/designs/slice-presence-aware-notifs.md.
+#
+# Width of the "still here" window. 20 s client cadence + jitter + one
+# dropped tick fits under 45 s with margin; tighter false-negatives on
+# brief laptop sleeps, wider risks suppressing a ping Jason wants after
+# he walked away.
+PRESENCE_WINDOW_S: float = 45.0
+
+
+class PresenceState:
+    """Thread-safe last-heartbeat tracker.
+
+    Lives on :class:`Config` (``cfg.presence``) so handlers, tests
+    and future readers share one source of truth. Only
+    ``focused=true`` heartbeats advance ``last_presence_at``; a
+    ``focused=false`` is observed but does not reset the stamp — a
+    stale ``focused=true`` can still age out naturally.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last_focused_at: float | None = None
+
+    def record(self, *, focused: bool, now: float | None = None) -> float:
+        """Update the stamp if ``focused`` is True. Returns ``now``."""
+        t = time.time() if now is None else now
+        if focused:
+            with self._lock:
+                self._last_focused_at = t
+        return t
+
+    def snapshot(self, now: float | None = None) -> dict[str, object]:
+        """Public shape for ``GET /api/presence/status``.
+
+        ``focused_within_s`` is ``None`` when there's never been a
+        heartbeat (clients should treat that as "not focused").
+        """
+        t = time.time() if now is None else now
+        with self._lock:
+            last = self._last_focused_at
+        if last is None:
+            return {
+                "focused": False,
+                "focused_within_s": None,
+                "last_presence_at": None,
+                "window_s": PRESENCE_WINDOW_S,
+            }
+        delta = max(0.0, t - last)
+        return {
+            "focused": delta < PRESENCE_WINDOW_S,
+            "focused_within_s": round(delta, 3),
+            "last_presence_at": datetime.fromtimestamp(
+                last, tz=timezone.utc
+            ).isoformat(),
+            "window_s": PRESENCE_WINDOW_S,
+        }
+
+
 @dataclass
 class Config:
     status_dir: Path
@@ -301,6 +373,14 @@ class Config:
     # lands on his screen within a second; slow enough that the render
     # doesn't dominate CPU on an idle box.
     sse_tick_seconds: float = DEFAULT_TICK_SECONDS
+    # Browser-tab presence tracker (slice-presence-aware-notifs). The
+    # tab heartbeats POST /api/presence; alice-speaking consults the
+    # GET just before a status-chat Signal reply to decide whether to
+    # suppress the ping. In-memory on purpose — this is best-effort
+    # presence, not durable state; losing it on a restart is fine.
+    presence: PresenceState = field(
+        default_factory=PresenceState, repr=False
+    )
 
     @property
     def threads_dir(self) -> Path:
@@ -3012,6 +3092,26 @@ def list_pages(cfg: Config) -> list[str]:
     )
 
 
+def handle_presence(cfg: Config, d: dict) -> dict:
+    """Record a presence heartbeat.
+
+    Body: ``{"key": "<shared>", "focused": bool}``.
+    Always returns the current snapshot so the client can sanity-check
+    that its ``focused=true`` advanced the stamp as expected.
+    """
+    if not isinstance(d, dict):
+        raise ReplyError(400, "bad json")
+    if not hmac.compare_digest(str(d.get("key", "")).encode(), cfg.key.encode()):
+        raise ReplyError(403, "bad key")
+    focused_raw = d.get("focused", False)
+    if not isinstance(focused_raw, bool):
+        raise ReplyError(400, "bad focused")
+    cfg.presence.record(focused=focused_raw)
+    snap = cfg.presence.snapshot()
+    snap["ok"] = True
+    return snap
+
+
 def handle_page_visibility(cfg: Config, d: dict) -> dict:
     """Dismiss or restore a nav tab: sets/clears "hidden" on its pages.json entry."""
     if not isinstance(d, dict):
@@ -3241,6 +3341,11 @@ class Handler(BaseHTTPRequestHandler):
             )
         if path == "/api/item-state":
             return self._json(200, read_item_state(self.cfg.status_dir), head=head)
+        if path == "/api/presence/status":
+            # No auth: LAN-only, no PII in the shape (bool + seconds
+            # since last heartbeat + ISO ts). alice-speaking reads
+            # this just before a status-chat Signal reply.
+            return self._json(200, self.cfg.presence.snapshot(), head=head)
         if path == "/api/chat":
             q = parse_qs(urlsplit(self.path).query)
             before = (q.get("before") or [None])[0]
@@ -3441,6 +3546,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/waiting-order": handle_waiting_order,
             "/api/review-action": handle_review_action,
             "/api/bug-action": handle_bug_action,
+            "/api/presence": handle_presence,
         }
         fn = handlers.get(route)
         if fn is None:

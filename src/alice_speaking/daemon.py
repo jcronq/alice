@@ -263,6 +263,14 @@ class SpeakingDaemon:
         # an answer); surface turns honor (Alice-initiated thoughts wait
         # for morning).
         self._current_turn_kind: Optional[str] = None
+        # Status-chat sub-kind flag (slice-presence-aware-notifs).
+        # ``_current_turn_kind == "surface"`` covers both status-chat
+        # replies and every other surface turn; this flag narrows to
+        # just the chat-tab surfaces so ``_send_message`` can suppress
+        # the Signal ping when Jason has the status-site tab focused.
+        # Set in ``handle_surface`` when ``_is_chat_surface(body)`` is
+        # True, reset in ``finally``.
+        self._current_turn_is_status_chat: bool = False
         # Reply channel for the current turn — set by handlers at entry,
         # cleared in finally. _send_message uses this when Alice picks
         # recipient='self' to dispatch back over the originating
@@ -1707,6 +1715,54 @@ class SpeakingDaemon:
             in ("signal", "discord", "gmail", "cli", "a2a", "viewer-chat", "modern-mud")
             or bool(attachments)
         )
+
+        # Presence-aware suppression (slice-presence-aware-notifs).
+        # Status-chat surfaces drop an in-app chat message regardless
+        # of what happens here; the Signal ping is the redundant arm
+        # when Jason is sitting on the status-site tab. Only suppress
+        # when: current turn is a status-chat surface AND outbound is
+        # Signal AND the browser tab heartbeated within its window.
+        # Emergency / non-status-chat / non-signal are never
+        # suppressed. The presence check fails open — any error means
+        # "send normally." See docs/designs/slice-presence-aware-notifs.md.
+        if (
+            not emergency
+            and channel.transport == "signal"
+            and self._current_turn_is_status_chat
+        ):
+            # Lazy import keeps the module-load graph small; the
+            # presence module is stdlib-only.
+            from .infra import presence as _presence_mod
+
+            reading = _presence_mod.check_focused()
+            if reading.focused:
+                self.events.emit(
+                    "signal_suppressed_presence",
+                    recipient=channel.address,
+                    text_len=len(text),
+                    focused_within_s=reading.focused_within_s,
+                )
+                log.info(
+                    "suppressed-signal-ping: status-chat reply, "
+                    "status-site tab focused %.1fs ago",
+                    reading.focused_within_s or 0.0,
+                )
+                # Treat as a successful user reply — the chat tab
+                # already shows Alice's text. Skip the Signal RPC but
+                # still flip the did-send / replied flags so the turn
+                # doesn't fire a ``missed_reply`` event.
+                self._turn_last_outbound = text
+                self._turn_did_send = True
+                self._current_turn_replied = True
+                return
+            if reading.error:
+                # Fail-open path. Emit so we can see if presence is
+                # flaky in production.
+                self.events.emit(
+                    "signal_suppress_check_failed",
+                    recipient=channel.address,
+                    reason=reading.error,
+                )
 
         async with self.face.speaking():
             await self._dispatch_outbound(

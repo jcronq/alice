@@ -529,6 +529,47 @@ if (kParam) {
   history.replaceState(null, "", url.pathname + (url.search ? "?" + url.search : "") + url.hash);
 }
 const KEY = localStorage.getItem("alice-key") || "";
+
+// ── 0b. presence heartbeat (slice-presence-aware-notifs) ─────────
+// Tell the server whenever this tab is visible AND focused, so Alice
+// can skip the Signal ping on a status-chat reply while Jason is
+// looking at the page. No-op when the shared key isn't loaded yet.
+// See docs/designs/slice-presence-aware-notifs.md.
+const PRESENCE_INTERVAL_MS = 20000; // < server window (45s) with slack
+let _presenceTimer = null;
+function _presenceFocused() {
+  return document.visibilityState === "visible" && document.hasFocus();
+}
+function _sendPresence(focused) {
+  if (!KEY) return;
+  // keepalive so a tab close still delivers the last heartbeat
+  // (helpful for the focused→blur transition on tab-close).
+  try {
+    fetch("/api/presence", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({key: KEY, focused: !!focused}),
+      keepalive: true,
+    }).catch(() => {});
+  } catch (_) { /* swallow — presence is best-effort */ }
+}
+function _presenceTick() {
+  _sendPresence(_presenceFocused());
+}
+function _restartPresenceTimer() {
+  if (_presenceTimer != null) clearInterval(_presenceTimer);
+  _presenceTimer = null;
+  if (_presenceFocused()) {
+    _presenceTick();
+    _presenceTimer = setInterval(_presenceTick, PRESENCE_INTERVAL_MS);
+  }
+}
+document.addEventListener("visibilitychange", _restartPresenceTimer);
+window.addEventListener("focus", _restartPresenceTimer);
+window.addEventListener("blur", _restartPresenceTimer);
+// Fire once at load so the initial state is known without waiting.
+_restartPresenceTimer();
+
 // Pre-#651 ``?p=<slug>`` URLs are translated to the new ``#<slug>``
 // hash route once so bookmarks and surface notes keep working.
 const PAGE_PARAM = new URLSearchParams(location.search).get("p");
