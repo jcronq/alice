@@ -804,10 +804,18 @@ def render_surface(
     text: str,
     prior: list[dict],
     files: list[dict],
+    effort: str | None = None,
 ) -> str:
     slug = slugify(item, 40) or "item"
     history = "\n".join(f"  {m.get('from')}: {m.get('text')}" for m in prior)
     attached = "\n".join(f"  {x['path']} ({x['bytes']} bytes)" for x in files)
+    # Slice-effort: when Jason has picked an explicit effort level for
+    # this item, prepend an ``effort=<level>`` header line as the very
+    # first body line so Alice sees it before any other content. Her
+    # own internal guess is suppressed when this line is present
+    # (precedence rule: Jason > Alice). We omit the line entirely when
+    # effort is unset so absence stays unambiguous.
+    effort_line = f"effort={effort}\n\n" if effort else ""
     return f"""---
 priority: action
 type: status-reply
@@ -819,7 +827,7 @@ page: {page}
 thread: {tid}
 ---
 
-# Jason replied on the status page
+{effort_line}# Jason replied on the status page
 
 Item: {item}
 Thread: {tid}
@@ -870,8 +878,19 @@ def handle_reply(cfg: Config, d: dict) -> dict:
             },
         )
 
+        # Slice-effort: thread id is derived from the UI slug (see
+        # ``thread_id``) and is exactly what ``/api/effort`` keys on,
+        # so a direct lookup here attaches Jason's pick to the surface.
+        effort_level = read_woy_effort(cfg.status_dir).get(tid)
         doc = render_surface(
-            cfg, item=item, tid=tid, page=page, text=text, prior=prior, files=files
+            cfg,
+            item=item,
+            tid=tid,
+            page=page,
+            text=text,
+            prior=prior,
+            files=files,
+            effort=effort_level,
         )
         cfg.surface_dir.mkdir(parents=True, exist_ok=True)
         fname = f"{time.strftime('%Y-%m-%dT%H-%M-%S')}-status-reply-{slugify(item, 40) or 'item'}.md"
@@ -2984,6 +3003,26 @@ WOY_DISMISSED_FILE = ".woy-dismissed.jsonl"
 WOY_DISMISSED_MAX = 1000
 # Max characters we accept in a /api/woy-steer text payload.
 WOY_STEER_MAX = 2000
+
+# ---------------------------------------------------------------- effort level
+#
+# Slice-effort. Jason picks how much rigor each item deserves — Spike
+# (quickest), Prototype, Solid, Autonomous — and the pick travels with
+# the item into Alice's turn context as an ``effort=<level>`` header
+# line in the reply surface. Precedence: Jason's pick overrides Alice's
+# own guess (an internal guess she may have made before he touched the
+# picker), so the UI treats this field as authoritative when set.
+#
+# Storage mirrors ``.woy-dismissed.jsonl``: append-only JSONL in
+# ``cfg.status_dir`` with ``{slug, level, ts}`` per line. Last write
+# wins on load. Empty / missing / unknown level clears the item back
+# to "unset" (no header line emitted to Alice — absence means she can
+# guess).
+WOY_EFFORT_LEVELS = ("spike", "prototype", "solid", "autonomous")
+WOY_EFFORT_FILE = ".woy-effort.jsonl"
+# Defensive bound for the on-disk log read per request. Each slug keeps
+# only its newest entry in memory, so the cap just limits the IO size.
+WOY_EFFORT_MAX = 5000
 # Matches ``[scheme://]github.com/<owner>/<repo>/pull/<N>`` anchored
 # at either a word boundary or an http(s) scheme. We require the
 # scheme or a non-word char preceding ``github.com`` so that
@@ -3191,6 +3230,49 @@ def _append_woy_dismissed(status_dir: Path, *, slug: str, action: str) -> None:
     status_dir.mkdir(parents=True, exist_ok=True)
     rec = {"slug": slug, "action": action, "ts": now_iso()}
     with open(status_dir / WOY_DISMISSED_FILE, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def read_woy_effort(status_dir: Path) -> dict[str, str]:
+    """Load effort levels keyed by slug from ``.woy-effort.jsonl``.
+
+    Append-only JSONL; each entry is at minimum ``{slug, level, ts}``.
+    Later lines win so Jason can change his mind — there is no
+    separate "clear" verb, we just append ``level=""`` and drop the
+    slug on load. Malformed lines are skipped so a bad write can't
+    poison the whole load. Missing file → ``{}``.
+    """
+    p = Path(status_dir) / WOY_EFFORT_FILE
+    try:
+        lines = p.read_text(errors="replace").splitlines()
+    except OSError:
+        return {}
+    out: dict[str, str] = {}
+    for line in lines[-WOY_EFFORT_MAX:]:
+        try:
+            v = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(v, dict):
+            continue
+        s = safe_slug(v.get("slug"))
+        if not s:
+            continue
+        level = str(v.get("level") or "").strip().lower()
+        if level in WOY_EFFORT_LEVELS:
+            out[s] = level
+        else:
+            # Explicit clear (``level=""`` or anything out of band)
+            # drops the slug — Alice goes back to guessing.
+            out.pop(s, None)
+    return out
+
+
+def _append_woy_effort(status_dir: Path, *, slug: str, level: str) -> None:
+    """Append one effort-pick record. ``level`` of ``""`` clears the slug."""
+    status_dir.mkdir(parents=True, exist_ok=True)
+    rec = {"slug": slug, "level": level, "ts": now_iso()}
+    with open(status_dir / WOY_EFFORT_FILE, "a") as f:
         f.write(json.dumps(rec) + "\n")
 
 
@@ -3527,6 +3609,43 @@ def handle_woy_steer(cfg: "Config", d: dict) -> dict:
             },
         )
     return {"ok": True, "slug": slug, "action": "steer"}
+
+
+def handle_effort_action(cfg: "Config", d: dict) -> dict:
+    """Persist Jason's effort pick for a Waiting-on-you item.
+
+    Body: ``{key, slug, level}`` where ``level`` is one of
+    :data:`WOY_EFFORT_LEVELS` or the empty string / ``null`` to clear
+    the slug back to "unset" (Alice resumes her own guess).
+
+    Precedence rule is server-silent: this endpoint just records the
+    pick. The precedence ("Jason > Alice's guess") is enforced in
+    :func:`render_surface`, which prepends ``effort=<level>`` only
+    when the slug has a level set, suppressing whatever internal
+    guess Alice might otherwise have reached for.
+    """
+    if not isinstance(d, dict):
+        raise ReplyError(400, "bad json")
+    if not hmac.compare_digest(str(d.get("key", "")).encode(), cfg.key.encode()):
+        raise ReplyError(403, "bad key")
+    slug_raw = str(d.get("slug", ""))
+    slug = safe_slug(slug_raw)
+    if not slug:
+        raise ReplyError(400, "bad slug")
+    # Accept "" / None / absent as the clear verb; anything else must
+    # be one of WOY_EFFORT_LEVELS. We treat an unknown level as a
+    # client bug rather than silently clearing — easier to notice.
+    raw_level = d.get("level", "")
+    if raw_level is None:
+        level = ""
+    else:
+        level = str(raw_level).strip().lower()
+    if level and level not in WOY_EFFORT_LEVELS:
+        raise ReplyError(400, "bad level")
+
+    with cfg.lock:
+        _append_woy_effort(cfg.status_dir, slug=slug, level=level)
+    return {"ok": True, "slug": slug, "level": level}
 
 
 def read_bug(status_dir: Path, report_id: int) -> dict | None:
@@ -3970,6 +4089,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, review, head=head)
         if path == "/api/pages":
             return self._json(200, list_pages(self.cfg), head=head)
+        if path == "/api/effort":
+            # Read-only companion to the POST handler. Returns the
+            # whole slug→level map; the UI picks its slug out client-
+            # side. No key required — the levels themselves are
+            # non-sensitive, same trust surface as /api/pages.
+            return self._json(
+                200, read_woy_effort(self.cfg.status_dir), head=head
+            )
         if path == "/api/threads":
             return self._json(200, read_threads(self.cfg), head=head)
         if path == "/api/waiting-order":
@@ -4197,6 +4324,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/bug-action": handle_bug_action,
             "/api/woy-action": handle_woy_action,
             "/api/woy-steer": handle_woy_steer,
+            "/api/effort": handle_effort_action,
             "/api/presence": handle_presence,
         }
         fn = handlers.get(route)

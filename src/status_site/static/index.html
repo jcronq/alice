@@ -524,6 +524,47 @@ details.fx-group:first-child { margin-top: 0; }
 .woy-steer button:disabled { opacity: .55; cursor: not-allowed; }
 .woy-action-status { font-size: .8rem; color: var(--color-fg-muted); }
 .woy-action-status.err { color: var(--color-bad); }
+/* Slice-effort: 4-segment effort-level picker in the expanded card.
+ * Matches .woy-actions-bar sizing so the two bars line up visually.
+ * Segments are plain buttons tinted with --color-ok when selected;
+ * the keyboard-shortcut hint and the "set effort" unset chip share
+ * the muted palette so they recede until Jason acts. */
+.woy-effort-bar {
+  display: flex; flex-wrap: wrap; gap: .4rem; align-items: center;
+  margin: .25rem 0 .55rem 0;
+}
+.woy-effort-label {
+  font-size: .78rem; color: var(--color-fg-muted);
+  letter-spacing: .04em; text-transform: uppercase;
+}
+.woy-effort-picker {
+  display: inline-flex; border: 1px solid var(--color-border-line);
+  border-radius: 999px; overflow: hidden;
+}
+.woy-effort-picker button {
+  background: transparent; color: var(--color-fg);
+  border: 0; border-right: 1px solid var(--color-border-line);
+  padding: .3rem .7rem; cursor: pointer; font: inherit; font-size: .85rem;
+  line-height: 1.2; min-width: 4.5rem;
+}
+.woy-effort-picker button:last-child { border-right: 0; }
+.woy-effort-picker button:hover { background: var(--color-panel); }
+.woy-effort-picker button.selected {
+  background: var(--color-ok); color: var(--color-bg);
+}
+.woy-effort-picker button.selected .woy-effort-key { color: var(--color-bg); opacity: .8; }
+.woy-effort-picker button:disabled { opacity: .55; cursor: not-allowed; }
+.woy-effort-key {
+  font-size: .7rem; color: var(--color-fg-muted); margin-left: .35rem;
+  font-variant-numeric: tabular-nums;
+}
+.woy-effort-hint {
+  font-size: .78rem; color: var(--color-fg-muted); font-style: italic;
+  padding: .2rem .6rem; border: 1px dashed var(--color-border-line);
+  border-radius: 999px;
+}
+.woy-effort-saving { font-size: .78rem; color: var(--color-fg-muted); }
+.woy-effort-err { font-size: .78rem; color: var(--color-bad); }
 .woy-timeline { list-style: none; margin: 0; padding: 0 0 0 .8rem; border-left: 2px solid var(--color-border-line); }
 .woy-timeline li {
   position: relative; padding: .35rem 0 .35rem .9rem;
@@ -2220,6 +2261,17 @@ function mergeHistoryRows(payload) {
   return rows;
 }
 
+// Slice-effort: the 4-segment picker in ExpandedCard reads from this
+// table. Order is load-bearing — the keyboard shortcuts 1/2/3/4 map
+// to segments 0/1/2/3 — and the levels must match the server-side
+// ``WOY_EFFORT_LEVELS`` tuple exactly.
+const EFFORT_SEGMENTS = [
+  {level: "spike", label: "Spike", title: "Spike — quickest; one-off probe"},
+  {level: "prototype", label: "Prototype", title: "Prototype — happy path, no polish"},
+  {level: "solid", label: "Solid", title: "Solid — tested, reviewed, shippable"},
+  {level: "autonomous", label: "Autonomous", title: "Autonomous — full gate, self-merged"},
+];
+
 // Slice-2 (#881 follow-up): inline-expand card for a Waiting-on-you
 // item. Replaces the side-sheet modal. Rendered via ``createPortal``
 // into a ``<div class="woy-expand">`` that WaitingTable inserts
@@ -2235,6 +2287,13 @@ function ExpandedCard({title, slug, externalLink, isPr, onClose, onDismissed}) {
   const [action, setAction] = useState({pending: null, done: null, error: null});
   const [steerText, setSteerText] = useState("");
   const [steering, setSteering] = useState(false);
+  // Slice-effort: picker state for this item. ``level`` is one of
+  // WOY_EFFORT_LEVELS or "" (unset). ``savingLevel`` tracks the
+  // in-flight pick so the clicked segment can show a spinner-style
+  // label without blocking the other segments from re-click.
+  const [effortLevel, setEffortLevel] = useState("");
+  const [effortSaving, setEffortSaving] = useState(null);
+  const [effortError, setEffortError] = useState(null);
   useEffect(() => {
     let cancelled = false;
     setData({loading: true});
@@ -2272,6 +2331,79 @@ function ExpandedCard({title, slug, externalLink, isPr, onClose, onDismissed}) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
+  // Slice-effort: fetch any existing effort pick for this slug when
+  // the card opens, and after a successful POST. Best-effort — if
+  // /api/effort is unreachable we just show the unset chip.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch("/api/effort");
+        if (!r.ok) return;
+        const body = await r.json().catch(() => ({}));
+        if (cancelled) return;
+        const v = (body && typeof body === "object" ? body[slug] : "") || "";
+        setEffortLevel(v);
+      } catch (_) { /* effort lookup is best-effort */ }
+    })();
+    return () => { cancelled = true; };
+  }, [slug, refresh]);
+  const pickEffort = async level => {
+    if (!KEY) return;
+    if (effortSaving !== null) return;
+    const next = level === effortLevel ? "" : level;
+    setEffortSaving(next || "clear");
+    setEffortError(null);
+    const prior = effortLevel;
+    // Optimistic — snap the pill so the keyboard-shortcut feels
+    // instant. Rollback on failure.
+    setEffortLevel(next);
+    try {
+      const r = await fetch("/api/effort", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({key: KEY, slug, level: next}),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || !body.ok) {
+        setEffortLevel(prior);
+        setEffortError(body.error || ("HTTP " + r.status));
+      }
+    } catch (e) {
+      setEffortLevel(prior);
+      setEffortError(String(e && e.message || e));
+    } finally {
+      setEffortSaving(null);
+    }
+  };
+  // Slice-effort: 1/2/3/4 map to Spike/Prototype/Solid/Autonomous
+  // while the expanded card is on screen. We gate on focus so Jason
+  // can still type ``1`` into the Steer input or reply composer; the
+  // guard is ``activeElement`` tagName, which also skips the key when
+  // a native select / contenteditable is up. Dep list includes
+  // ``pickEffort`` so each render rewires against fresh
+  // ``effortLevel`` state — stale closures would silently toggle
+  // against last-render's level.
+  useEffect(() => {
+    const EFFORT_KEYS = {
+      "1": "spike",
+      "2": "prototype",
+      "3": "solid",
+      "4": "autonomous",
+    };
+    const onKey = e => {
+      if (!(e.key in EFFORT_KEYS)) return;
+      if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+      const active = document.activeElement;
+      const tag = (active && active.tagName) || "";
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (active && active.isContentEditable) return;
+      e.preventDefault();
+      pickEffort(EFFORT_KEYS[e.key]);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [slug, pickEffort]);
   const send = async () => {
     const text = reply.trim();
     if (!text || sending || !KEY) return;
@@ -2395,6 +2527,25 @@ function ExpandedCard({title, slug, externalLink, isPr, onClose, onDismissed}) {
       }),
       h("button", {onClick: sendSteer, disabled: !KEY || steering || !steerText.trim()},
         steering ? "Sending…" : "Steer"),
+    ),
+    // Slice-effort: 4-segment picker + unset-hint chip. Rendered
+    // whether or not a KEY is present so Jason can see the current
+    // state even on a read-only tab; buttons disable without a key.
+    h("div", {className: "woy-effort-bar", role: "group", "aria-label": "Effort level"},
+      h("span", {className: "woy-effort-label"}, "Effort"),
+      h("div", {className: "woy-effort-picker"},
+        EFFORT_SEGMENTS.map((seg, i) => h("button", {
+          key: seg.level,
+          className: effortLevel === seg.level ? "selected" : null,
+          "data-level": seg.level,
+          onClick: () => pickEffort(seg.level),
+          disabled: !KEY || effortSaving !== null,
+          title: KEY ? seg.title + " (press " + (i + 1) + ")" : "Set the key (?k=…) to pick effort.",
+        }, seg.label, h("span", {className: "woy-effort-key"}, String(i + 1))))
+      ),
+      !effortLevel ? h("span", {className: "woy-effort-hint"}, "Set effort →") : null,
+      effortSaving ? h("span", {className: "woy-effort-saving"}, "Saving…") : null,
+      effortError ? h("span", {className: "woy-effort-err"}, effortError) : null,
     ),
     hasDetail ? h("a", {className: "woy-detail-link", href: "#" + slug}, "Open detail page →") : null,
     externalLink ? h("a", {className: "woy-external-link", href: externalLink, target: "_blank", rel: "noopener noreferrer"}, "View on GitHub →") : null,
