@@ -93,10 +93,15 @@ from status_site.history import (
     HISTORY_DIR,
     STATE_FILE,
     Tracker,
+    _BOLD_RE,
+    _FENCE_RE,
+    _LIST_RE,
+    migrate_stale_slugs,
     parse_page,
     read_history,
     read_jsonl,
     safe_slug,
+    title_slug as _title_slug,
 )
 from status_site.sources import (
     done_today as _done_today,
@@ -2116,18 +2121,51 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         ]
 
     def _render_waiting_on_you() -> dict:
-        hand_zone_md = _waiting_on_you.read_hand_zone(
+        # Slice-2: strip dismissed slugs from BOTH the hand-zone and
+        # the structured asks. Dismissal is a server-side overlay —
+        # ``waiting-on-you.md`` on disk is Jason's content and stays
+        # untouched (see docs/designs/slice2-inline-expand.md).
+        dismissed = read_woy_dismissed(cfg.status_dir)
+        hand_zone_raw = _waiting_on_you.read_hand_zone(
             cfg.status_dir / "waiting-on-you.md"
         )
-        rows = _ask_rows()
-        md = _waiting_on_you.render(
-            cfg.status_dir / "waiting-on-you.md",
-            asks_path=_asks_path(cfg.status_dir),
+        hand_zone_md = (
+            filter_dismissed_hand_zone(hand_zone_raw, dismissed)
+            if dismissed else hand_zone_raw
         )
+        rows = _ask_rows()
+        if dismissed:
+            rows = filter_dismissed_asks(rows, dismissed)
+        # Re-render the combined markdown blob from the filtered hand
+        # zone + a filtered ask list so Overview's splice stays
+        # consistent with what the React widget shows.
+        asks = _read_asks(_asks_path(cfg.status_dir))
+        pending = _waiting_on_you.unresolved_asks(asks)
+        if dismissed:
+            pending = filter_dismissed_asks(pending, dismissed)
+        structured = _waiting_on_you.render_structured(pending)
+        parts: list[str] = []
+        if hand_zone_md:
+            parts.append(hand_zone_md)
+        if structured:
+            parts.append(structured)
+        if not parts:
+            parts.append("*(nothing waiting on you)*")
+        body = "\n\n".join(parts)
+        md = body + "\n\n" + _waiting_on_you.staleness_footer(
+            _waiting_on_you.SOURCE_NAME
+        )
+        # ``needs_approval_slugs`` lists the hand-zone bold-title
+        # slugs the server considers one-click-actionable — today
+        # that's "contains a github.com PR URL" (see ``_detect_pr``).
+        # The client renders those under a "Needs your approval"
+        # subheader with inline Accept/Reject buttons.
+        needs_approval = needs_approval_slugs(hand_zone_md)
         return {
             "markdown": md,
             "hand_zone_md": hand_zone_md,
             "rows": rows,
+            "needs_approval_slugs": needs_approval,
         }
 
     def _render_alice_queue() -> dict:
@@ -2248,9 +2286,21 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
                 if slug in existing_slugs:
                     row["review_slug"] = slug
         ask_rows = _ask_rows()
-        your_todo_md = _waiting_on_you.read_hand_zone(
+        # Slice-2: apply the server-side dismissal overlay to the
+        # Overview "Your todo" payload too — otherwise Accept/Reject
+        # from the WoY widget on Overview wouldn't take effect until
+        # a second render pass.
+        dismissed = read_woy_dismissed(cfg.status_dir)
+        your_todo_md_raw = _waiting_on_you.read_hand_zone(
             cfg.status_dir / "waiting-on-you.md"
         )
+        your_todo_md = (
+            filter_dismissed_hand_zone(your_todo_md_raw, dismissed)
+            if dismissed else your_todo_md_raw
+        )
+        if dismissed:
+            ask_rows = filter_dismissed_asks(ask_rows, dismissed)
+        needs_approval = needs_approval_slugs(your_todo_md)
         external_todos_md = _waiting_on_you.read_hand_zone(
             cfg.status_dir / "external-todos.md"
         )
@@ -2272,6 +2322,7 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
             "attention_reacts": attention_reacts,
             "rows": ask_rows,
             "your_todo_md": your_todo_md,
+            "needs_approval_slugs": needs_approval,
             "external_todos_md": external_todos_md,
             "counts": counts,
             "failed": {
@@ -2912,6 +2963,570 @@ def _post_review_to_gh(
         err = (result.stderr or result.stdout or "").strip()[:500]
         return {"posted": False, "error": f"gh returncode={result.returncode}: {err}"}
     return {"posted": True, "error": None}
+
+
+# ---------------------------------------------------------------- WoY actions
+#
+# Slice-2 (#881 follow-up). Jason wanted one-click Accept / Reject on
+# every item under "Waiting on you". The server does the work the
+# frontend can't do safely from the browser: for PR items it shells out
+# to ``gh pr merge --squash``; for non-PR items it just records the
+# action. In every case it appends a thread message and enqueues a
+# dismissal in ``.woy-dismissed.jsonl`` so the next ``/index.md`` render
+# drops the item from the Waiting-on-you list. Jason's ``index.md`` is
+# never rewritten — the file stays his authored content; dismissal is
+# a server-side in-memory overlay.
+
+WOY_ACTIONS = ("accept", "reject")
+WOY_DISMISSED_FILE = ".woy-dismissed.jsonl"
+# Max dismissal records read from the on-disk log per render. The server
+# only cares about ``slug``; the cap is just a defensive bound.
+WOY_DISMISSED_MAX = 1000
+# Max characters we accept in a /api/woy-steer text payload.
+WOY_STEER_MAX = 2000
+# Matches ``[scheme://]github.com/<owner>/<repo>/pull/<N>`` anchored
+# at either a word boundary or an http(s) scheme. We require the
+# scheme or a non-word char preceding ``github.com`` so that
+# ``evilgithub.com/x/y/pull/1`` does NOT match, and we stop the
+# path with ``(?![A-Za-z0-9._/-])`` so ``…/pull/12345broken`` won't
+# be truncated to ``pull/12345``. Owner/repo charset mirrors GitHub.
+_PULL_URL_RE = re.compile(
+    r"(?:^|(?<=[^A-Za-z0-9._-]))(?:https?://)?github\.com"
+    r"/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/pull/(\d+)(?![A-Za-z0-9_])"
+)
+
+
+# Callable shape for dependency injection in tests.
+_GhPrMergeRunner = Callable[[str, int], subprocess.CompletedProcess]
+
+
+def _run_gh_pr_merge(repo: str, number: int) -> subprocess.CompletedProcess:
+    """Default ``gh pr merge --squash`` invoker used by
+    :func:`handle_woy_action`. Tests patch this via ``cfg._gh_pr_merge_runner``
+    to avoid actually merging anything.
+    """
+    return subprocess.run(
+        [
+            "gh",
+            "pr",
+            "merge",
+            str(number),
+            "--repo",
+            repo,
+            "--squash",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+
+def _run_gh_pr_status(repo: str, number: int) -> subprocess.CompletedProcess:
+    """Fetch a PR's rolled-up status check conclusion. Used to gate
+    ``gh pr merge --squash`` so we don't merge a red PR on a repo
+    (like ``jcronq/alice``) that has no required-checks protection.
+    See ``feedback_gh_auto_merge_no_ci_gate_on_alice``.
+    """
+    return subprocess.run(
+        [
+            "gh",
+            "pr",
+            "view",
+            str(number),
+            "--repo",
+            repo,
+            "--json",
+            "statusCheckRollup,mergeStateStatus",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+def _check_pr_ci_green(
+    repo: str,
+    number: int,
+    *,
+    runner: Callable[[str, int], subprocess.CompletedProcess] | None = None,
+) -> tuple[bool, str | None]:
+    """Return ``(green, reason_if_not_green)``.
+
+    Green iff every ``statusCheckRollup`` entry concludes SUCCESS (or
+    NEUTRAL / SKIPPED, which GitHub treats as non-blocking). A pending
+    IN_PROGRESS / QUEUED check is treated as not-green so Accept
+    doesn't silently merge mid-run. An empty rollup is treated as
+    green (the PR has no checks at all).
+    """
+    try:
+        res = (runner or _run_gh_pr_status)(repo, number)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"status probe failed: {e!r}"
+    if res.returncode != 0:
+        err = (res.stderr or res.stdout or "").strip()[:200]
+        return False, err or f"gh returncode={res.returncode}"
+    try:
+        body = json.loads(res.stdout or "{}")
+    except ValueError:
+        return False, "gh status returned non-JSON"
+    rollup = body.get("statusCheckRollup") or []
+    if not isinstance(rollup, list):
+        return False, "unexpected statusCheckRollup shape"
+    red: list[str] = []
+    pending: list[str] = []
+    for entry in rollup:
+        if not isinstance(entry, dict):
+            continue
+        # CheckRun carries ``conclusion`` + ``status``; StatusContext carries ``state``.
+        conclusion = str(entry.get("conclusion") or "").upper()
+        state = str(entry.get("state") or "").upper()
+        status_ = str(entry.get("status") or "").upper()
+        name = str(entry.get("name") or entry.get("context") or "check")
+        verdict = conclusion or state
+        if status_ and status_ not in ("COMPLETED",) and not conclusion:
+            pending.append(name)
+            continue
+        if verdict in ("", "SUCCESS", "NEUTRAL", "SKIPPED"):
+            continue
+        red.append(f"{name}:{verdict}")
+    if red:
+        return False, "red checks: " + ", ".join(red[:4])
+    if pending:
+        return False, "pending checks: " + ", ".join(pending[:4])
+    return True, None
+
+
+def _detect_pr(text: str) -> tuple[str, int] | None:
+    """Return ``(owner_slash_repo, number)`` if ``text`` names a PR, else None.
+
+    We only trust the full URL form — a bare ``#NNN`` is ambiguous
+    between issue and PR, and we don't want to silently merge the wrong
+    thing. The PR URL may live in the bold title or the description
+    tail, so callers concatenate both before calling.
+    """
+    m = _PULL_URL_RE.search(text or "")
+    if not m:
+        return None
+    owner, repo, num = m.group(1), m.group(2), int(m.group(3))
+    return f"{owner}/{repo}", num
+
+
+# Pages/sections we treat as "Waiting on you" lookup scope. We used to
+# scan every ``*.md`` under STATUS_DIR, which meant an identical title
+# in ``done-today.md`` could win over the actual WoY item and steer
+# Accept to the wrong PR. Restrict to the two places WoY items live.
+_WOY_LOOKUP_PAGES = ("waiting-on-you", "index")
+_WOY_INDEX_SECTIONS = ("Waiting on you", "waiting on you")
+
+
+def _find_waiting_item(status_dir: Path, slug: str) -> dict | None:
+    """Scan the WoY pages for an item with ``slug``.
+
+    Restricted to ``waiting-on-you.md`` and ``index.md``'s
+    ``## Waiting on you`` section. ``waiting-on-you.md`` wins on tie:
+    it's the hand-maintained source. Returns
+    ``{"slug", "title", "text", "page", "section"}`` or ``None``.
+    """
+    s = safe_slug(slug)
+    if not s:
+        return None
+    for stem in _WOY_LOOKUP_PAGES:
+        p = Path(status_dir) / f"{stem}.md"
+        if not p.is_file():
+            continue
+        try:
+            md = p.read_text(errors="replace")
+        except OSError:
+            continue
+        for it in parse_page(md, p.stem):
+            if it.slug != s:
+                continue
+            # On index.md, only accept items that live under the
+            # Waiting-on-you section — an identical title in Done-today
+            # must not steer Accept to the wrong PR.
+            if stem == "index":
+                section = (it.section or "").strip()
+                if section not in _WOY_INDEX_SECTIONS:
+                    continue
+            return {
+                "slug": it.slug,
+                "title": it.title,
+                "text": it.text,
+                "page": it.page,
+                "section": it.section,
+            }
+    return None
+
+
+def read_woy_dismissed(status_dir: Path) -> set[str]:
+    """Load the set of dismissed slugs from ``.woy-dismissed.jsonl``.
+
+    Append-only JSONL; each entry is at minimum ``{slug, action, ts}``.
+    Malformed lines are skipped so a bad write can't poison the whole
+    render. Returns an empty set when the file is missing, which is
+    the common case on a fresh checkout.
+    """
+    p = Path(status_dir) / WOY_DISMISSED_FILE
+    try:
+        lines = p.read_text(errors="replace").splitlines()
+    except OSError:
+        return set()
+    out: set[str] = set()
+    for line in lines[-WOY_DISMISSED_MAX:]:
+        try:
+            v = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(v, dict):
+            continue
+        s = safe_slug(v.get("slug"))
+        if s:
+            out.add(s)
+    return out
+
+
+def _append_woy_dismissed(status_dir: Path, *, slug: str, action: str) -> None:
+    status_dir.mkdir(parents=True, exist_ok=True)
+    rec = {"slug": slug, "action": action, "ts": now_iso()}
+    with open(status_dir / WOY_DISMISSED_FILE, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def _iter_hand_zone_items(md: str):
+    """Yield ``(indent, slug, raw_line, title)`` tuples for each
+    top-level bold-titled list item in ``md`` — one tuple per matching
+    bullet in source order. Honors ``_FENCE_RE`` + ``_LIST_RE`` +
+    ``_BOLD_RE`` the same way the dismissal filter does.
+    """
+    in_fence = False
+    for raw in md.splitlines():
+        line = raw.expandtabs(4)
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if not line.strip():
+            continue
+        m = _LIST_RE.match(line)
+        if not m:
+            continue
+        indent = len(line) - len(line.lstrip())
+        body = m.group(5)
+        bold = _BOLD_RE.search(body)
+        if not bold:
+            continue
+        title = re.sub(r"\s+", " ", bold.group("t")).strip()
+        slug = _title_slug(title)
+        if slug:
+            yield indent, slug, raw, title
+
+
+def filter_dismissed_hand_zone(md: str, dismissed: set[str]) -> str:
+    """Drop top-level list items whose bold-title slug is dismissed.
+
+    Walks ``md`` line-by-line (mirroring the tracker's parse rules for
+    list-items + code fences). When a list marker opens an item whose
+    first bold span slugifies into ``dismissed``, that line and every
+    continuation line (more-indented, or a lazy right-after) is
+    skipped until a new list item at the same or shallower indent — or
+    an unindented paragraph after a blank line — resumes emission.
+    Non-list context (headings, prose, code fences) is passed through
+    verbatim.
+    """
+    if not md or not dismissed:
+        return md
+    out: list[str] = []
+    skip_indent: int | None = None  # the marker indent of the item being skipped
+    in_fence = False
+    blank = False
+    for raw in md.splitlines():
+        line = raw.expandtabs(4)
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            out.append(raw)
+            skip_indent = None
+            blank = False
+            continue
+        if in_fence:
+            out.append(raw)
+            continue
+        if not line.strip():
+            out.append(raw)
+            blank = True
+            continue
+        indent = len(line) - len(line.lstrip())
+        m = _LIST_RE.match(line)
+        if m:
+            # A new list item. If it's at shallower-or-equal indent to
+            # the skipped parent, the skip ends (possibly entering a
+            # fresh skip if this item itself is dismissed).
+            if skip_indent is not None and indent <= skip_indent:
+                skip_indent = None
+            # Does this item carry a dismissed bold title?
+            body = m.group(5)
+            bold = _BOLD_RE.search(body)
+            if bold:
+                title = re.sub(r"\s+", " ", bold.group("t")).strip()
+                if _title_slug(title) in dismissed:
+                    skip_indent = indent
+                    blank = False
+                    continue
+            if skip_indent is None:
+                out.append(raw)
+            blank = False
+            continue
+        # Non-list line. An unindented paragraph / heading / HTML
+        # block always terminates the skip — headings in particular
+        # (``## Next section``) are section delimiters and must not
+        # be eaten just because they lack a preceding blank line.
+        # Anything indented beyond the skipped marker is a
+        # continuation of the dismissed item and stays dropped.
+        if indent <= (skip_indent if skip_indent is not None else 0) and skip_indent is not None:
+            # Heading lines (``#…``) and other non-list block-starts
+            # at indent 0 always end the skip; a HEAD_RE check keeps
+            # us conservative in case Jason writes a paragraph that
+            # happens to be unindented.
+            if indent == 0:
+                skip_indent = None
+            elif blank:
+                skip_indent = None
+        if skip_indent is None:
+            out.append(raw)
+        blank = False
+    # Preserve a trailing newline when the input had one.
+    tail = "\n" if md.endswith("\n") else ""
+    return "\n".join(out) + tail
+
+
+def filter_dismissed_asks(
+    rows: list[dict], dismissed: set[str]
+) -> list[dict]:
+    """Drop asks whose bold-title slug (or ``id``) matches a dismissal.
+
+    Asks are rendered as ``- [ ] <text>`` lines, so we compute the
+    slug off their text the same way the tracker does for bold items:
+    strip a leading ``**Title**`` wrapper if present, else slug the
+    whole line.
+    """
+    if not rows or not dismissed:
+        return rows
+    kept: list[dict] = []
+    for r in rows:
+        if safe_slug(r.get("id") or "") in dismissed:
+            continue
+        text = str(r.get("text") or "").strip()
+        bold = _BOLD_RE.search(text)
+        head = bold.group("t") if bold else text
+        if head and _title_slug(head) in dismissed:
+            continue
+        kept.append(r)
+    return kept
+
+
+def needs_approval_slugs(hand_zone_md: str) -> list[str]:
+    """Return the slugs of hand-zone items the server flags as one-click
+    actionable — today "the title contains a github.com PR URL".
+
+    The list is ordered the same way the items appear in the markdown,
+    deduped. An empty hand-zone yields ``[]`` so callers can treat the
+    field as always-present on the sections payload.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    if not hand_zone_md:
+        return out
+    for _indent, slug, _raw, title in _iter_hand_zone_items(hand_zone_md):
+        # We only mark PR-shaped items. Non-PR items keep the
+        # expand-to-reply UX but no inline Accept/Reject on the row.
+        if _detect_pr(title) is None:
+            continue
+        if slug in seen:
+            continue
+        seen.add(slug)
+        out.append(slug)
+    return out
+
+
+def handle_woy_action(cfg: "Config", d: dict) -> dict:
+    """Validate one Accept / Reject click on a Waiting-on-you item.
+
+    Body: ``{key, slug, action}`` where ``action`` is ``accept`` /
+    ``reject``. Behaviour by type:
+
+    - **Accept + PR item**: shell out to ``gh pr merge <N> --repo
+      <owner/repo> --squash``. Success posts "Accepted — merged" to
+      the item's thread and enqueues dismissal. Failure posts
+      "Accept failed — <stderr>" and leaves the item visible.
+    - **Accept + non-PR item**: posts "Accepted" and enqueues dismissal.
+    - **Reject (any item)**: posts "Rejected" and enqueues dismissal.
+
+    Returns ``{"ok": True, "slug", "action", "dismissed": bool,
+    "merged": bool | None, "thread_message": str}`` or raises
+    :class:`ReplyError` on client errors.
+    """
+    if not isinstance(d, dict):
+        raise ReplyError(400, "bad json")
+    if not hmac.compare_digest(str(d.get("key", "")).encode(), cfg.key.encode()):
+        raise ReplyError(403, "bad key")
+    action = str(d.get("action", "")).lower()
+    if action not in WOY_ACTIONS:
+        raise ReplyError(400, "bad action")
+    slug_raw = str(d.get("slug", ""))
+    slug = safe_slug(slug_raw)
+    if not slug:
+        raise ReplyError(400, "bad slug")
+
+    item = _find_waiting_item(cfg.status_dir, slug)
+    # ``item`` may be None when a page has been edited since the client
+    # fetched the slug. We still want Reject to work (Jason's intent is
+    # "get this off my list"); Accept-on-PR needs the title/body to
+    # find the merge target, so we fail cleanly there.
+    is_pr = False
+    pr_ref: tuple[str, int] | None = None
+    if item is not None:
+        probe = f"{item.get('title') or ''} {item.get('text') or ''}"
+        pr_ref = _detect_pr(probe)
+        is_pr = pr_ref is not None
+
+    merged: bool | None = None
+    merge_error: str | None = None
+    thread_message: str
+    dismissed = False
+
+    # Subprocess shell-outs (gh pr view / gh pr merge) run OUTSIDE
+    # cfg.lock: a 60-second gh call must not stall every other
+    # handler. We acquire cfg.lock only for the final thread +
+    # dismissal file writes.
+    if action == "accept" and is_pr and pr_ref is not None:
+        repo, number = pr_ref
+        # CI gate: ``jcronq/alice`` has no required checks, so a bare
+        # ``gh pr merge --squash`` would land broken code if Jason
+        # clicked Accept on a red PR. Probe the rollup first and
+        # refuse to merge if anything's red or still running.
+        status_runner = getattr(cfg, "_gh_pr_status_runner", None)
+        green, status_reason = _check_pr_ci_green(
+            repo, number, runner=status_runner
+        )
+        if not green:
+            merged = False
+            merge_error = status_reason or "CI not green"
+        else:
+            runner = getattr(cfg, "_gh_pr_merge_runner", None) or _run_gh_pr_merge
+            try:
+                result = runner(repo, number)
+            except (OSError, subprocess.SubprocessError) as e:
+                merged = False
+                merge_error = f"gh invocation failed: {e!r}"
+            else:
+                if result.returncode == 0:
+                    merged = True
+                    stdout = (result.stdout or "").strip()[:200]
+                    thread_message = (
+                        "Accepted — merged" + (f" ({stdout})" if stdout else "")
+                    )
+                else:
+                    merged = False
+                    err = (result.stderr or result.stdout or "").strip()[:500]
+                    merge_error = (
+                        err or f"gh returncode={result.returncode}"
+                    )
+        with cfg.lock:
+            if merged is True:
+                append_thread(
+                    cfg,
+                    slug,
+                    {
+                        "from": "alice",
+                        "at": now_iso(),
+                        "text": thread_message,
+                        "action": "accept",
+                    },
+                )
+                _append_woy_dismissed(cfg.status_dir, slug=slug, action=action)
+                dismissed = True
+            else:
+                thread_message = f"Accept failed — {merge_error or 'unknown error'}"
+                append_thread(
+                    cfg,
+                    slug,
+                    {
+                        "from": "alice",
+                        "at": now_iso(),
+                        "text": thread_message,
+                        "action": "accept",
+                        "ok": False,
+                    },
+                )
+                # Keep the item visible on the list so Jason can retry.
+                dismissed = False
+    else:
+        thread_message = "Accepted" if action == "accept" else "Rejected"
+        with cfg.lock:
+            append_thread(
+                cfg,
+                slug,
+                {
+                    "from": "alice",
+                    "at": now_iso(),
+                    "text": thread_message,
+                    "action": action,
+                },
+            )
+            _append_woy_dismissed(cfg.status_dir, slug=slug, action=action)
+            dismissed = True
+
+    resp: dict = {
+        "ok": True,
+        "slug": slug,
+        "action": action,
+        "dismissed": dismissed,
+        "thread_message": thread_message,
+        "is_pr": is_pr,
+    }
+    if merged is not None:
+        resp["merged"] = merged
+    if merge_error:
+        resp["error"] = merge_error
+    return resp
+
+
+def handle_woy_steer(cfg: "Config", d: dict) -> dict:
+    """Append a steering note to a WoY item's thread. Non-dismissing.
+
+    Body: ``{key, slug, text}``. The steer appears in the item's
+    timeline as ``Steer: <text>`` from Jason. The dispatcher wiring
+    that reads these and nudges an in-flight bg-task lives in
+    alice-mind; this endpoint is the stable landing pad.
+    """
+    if not isinstance(d, dict):
+        raise ReplyError(400, "bad json")
+    if not hmac.compare_digest(str(d.get("key", "")).encode(), cfg.key.encode()):
+        raise ReplyError(403, "bad key")
+    slug_raw = str(d.get("slug", ""))
+    slug = safe_slug(slug_raw)
+    if not slug:
+        raise ReplyError(400, "bad slug")
+    text = str(d.get("text") or "").strip()
+    if not text:
+        raise ReplyError(400, "empty text")
+    if len(text) > WOY_STEER_MAX:
+        raise ReplyError(413, f"text over {WOY_STEER_MAX} chars")
+
+    with cfg.lock:
+        append_thread(
+            cfg,
+            slug,
+            {
+                "from": "jason",
+                "at": now_iso(),
+                "text": f"Steer: {text}",
+                "action": "steer",
+            },
+        )
+    return {"ok": True, "slug": slug, "action": "steer"}
 
 
 def read_bug(status_dir: Path, report_id: int) -> dict | None:
@@ -3580,6 +4195,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/waiting-order": handle_waiting_order,
             "/api/review-action": handle_review_action,
             "/api/bug-action": handle_bug_action,
+            "/api/woy-action": handle_woy_action,
+            "/api/woy-steer": handle_woy_steer,
             "/api/presence": handle_presence,
         }
         fn = handlers.get(route)
@@ -3615,6 +4232,24 @@ def make_server(cfg: Config) -> ThreadingHTTPServer:
 def main() -> None:
     cfg = Config.from_env()
     srv = make_server(cfg)
+    # Slice-2: rename ``item-history/`` and ``threads/`` files that
+    # were written under the pre-fix ``title_slug`` algorithm (which
+    # kept raw ``[text](url)`` inside the slug). Idempotent: a clean
+    # checkout renames nothing. Runs before the tracker thread so a
+    # scan can't race the rename.
+    if os.environ.get("SLUG_MIGRATE_ON_BOOT", "1") != "0":
+        try:
+            n = migrate_stale_slugs(cfg.status_dir)
+            if n:
+                print(
+                    f"status_site: slug-migrate renamed {n} file(s)",
+                    flush=True,
+                )
+        except Exception as e:  # never let a migration bug block boot
+            print(
+                f"status_site: slug-migrate failed: {e!r}",
+                flush=True,
+            )
     if os.environ.get("ITEM_HISTORY", "1") != "0":
         Tracker(cfg.status_dir, cfg.lock).start(
             float(os.environ.get("ITEM_HISTORY_INTERVAL", "10"))

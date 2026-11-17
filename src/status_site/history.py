@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -40,6 +41,12 @@ _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 _BOLD_RE = re.compile(r"(?P<pre>\[|~~)?\*\*(?P<t>[^*]+?)\*\*(?P<post>\]\([^)]*\)|~~)?")
 # ``<!--deps: slug-a, slug-b-->`` on a bullet: items this one waits on. Hidden by marked.js.
 _DEPS_RE = re.compile(r"<!--\s*deps:(.*?)-->", re.S)
+# Inline markdown link ``[text](url)`` → the visible text. We strip these
+# from a bold title before slugifying so the backend sees what the
+# frontend's ``strong.textContent`` sees (the rendered link text, no URL).
+# Covers only the common ``[text](url)`` form — reference-style links
+# don't appear in WoY titles today.
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
 
 
 def slugify(text: str, limit: int = 60) -> str:
@@ -47,8 +54,38 @@ def slugify(text: str, limit: int = 60) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:limit]
 
 
+def _strip_md_links(text: str) -> str:
+    """Reduce every ``[visible](url)`` to just ``visible``.
+
+    Mirrors what marked.js renders into the DOM: a bold title wrapping
+    a link becomes ``<strong>…<a>visible</a>…</strong>``, and
+    ``strong.textContent`` yields only ``visible``. Slugging the raw
+    markdown would smear the URL into the slug; slugging the stripped
+    form stays in sync with the frontend's ``titleSlug`` (which reads
+    ``textContent``). Slice-2 fix for the mismatch Slice-1 surfaced
+    (title like ``**foo ([#641](URL))**`` → frontend slug ``foo-641``,
+    backend slug used to carry the URL).
+    """
+    return _MD_LINK_RE.sub(r"\1", text)
+
+
 def title_slug(title: str) -> str:
-    """Frontend leaf slug: bold text with trailing ':' / '.' dropped, then slugified."""
+    """Frontend leaf slug: bold text with inline ``[text](url)`` links
+    collapsed to their visible text, trailing ``:``/``.`` dropped, then
+    slugified. Mirrors ``static/index.html::titleSlug`` so
+    ``item-history/<slug>.jsonl`` and ``threads/<slug>.jsonl`` line up
+    with what the frontend writes when it opens the WoY thread row."""
+    stripped = _strip_md_links(title.strip())
+    return slugify(re.sub(r"[:.]+$", "", stripped.strip()))
+
+
+def legacy_title_slug(title: str) -> str:
+    """The pre-Slice-2 ``title_slug`` — kept only so
+    :func:`migrate_stale_slugs` can detect ``item-history`` / ``threads``
+    files written under the old algorithm and rename them in-place.
+
+    Do not call this from anywhere else; new writes go through
+    :func:`title_slug`."""
     return slugify(re.sub(r"[:.]+$", "", title.strip()))
 
 
@@ -356,3 +393,180 @@ def read_history(status_dir: Path, slug: object) -> dict | None:
         "thread": read_jsonl(d / "threads" / f"{s}.jsonl"),
         "extra": read_jsonl(d / "item-extra" / f"{s}.jsonl"),
     }
+
+
+# ---------------------------------------------------------------- migration
+
+
+def _page_title_slug_pairs(status_dir: Path) -> list[tuple[str, str]]:
+    """Scan every top-level ``*.md`` in ``status_dir`` and return
+    ``[(legacy_slug, new_slug)]`` pairs for bold titles whose slug
+    actually differs between the old and new algorithms. Pages with
+    no mismatches contribute nothing.
+    """
+    pairs: list[tuple[str, str]] = []
+    for p in sorted(status_dir.glob("*.md")):
+        if p.name.startswith("."):
+            continue
+        try:
+            md = p.read_text(errors="replace")
+        except OSError:
+            continue
+        # We use parse_page to walk the same grammar the tracker uses;
+        # it already does the hard work of ignoring fences, section
+        # headings, and untitled items.
+        for it in parse_page(md, p.stem):
+            # ``it.title`` is the raw bold text — including any inline
+            # ``[text](url)`` the title wraps. Compare both slugs; only
+            # mismatches matter for migration.
+            new = it.slug
+            old = legacy_title_slug(it.title)
+            if old and old != new:
+                pairs.append((old, new))
+    # Dedupe while preserving first-seen order; pages scanned in sorted
+    # order so the choice is deterministic.
+    seen: set[tuple[str, str]] = set()
+    uniq: list[tuple[str, str]] = []
+    for pair in pairs:
+        if pair in seen:
+            continue
+        seen.add(pair)
+        uniq.append(pair)
+    return uniq
+
+
+def _log_stderr(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def _rename_one(source: Path, dest: Path, *, log=_log_stderr) -> bool:
+    """Rename ``source`` → ``dest`` if ``source`` exists and ``dest``
+    does not, logging the outcome. Returns True on an actual rename.
+
+    When both exist, the old file stays (nothing lost) and a warning
+    is logged so the operator can merge by hand if they care. When
+    neither exists, nothing happens. When only ``source`` exists, the
+    rename is atomic (``os.rename`` on the same filesystem).
+    """
+    try:
+        if not source.exists():
+            return False
+        if dest.exists():
+            log(
+                f"status_site: migrate-slug SKIP {source.parent.name}/"
+                f"{source.name} (new slug file {dest.name} already present)"
+            )
+            return False
+        os.rename(source, dest)
+        log(
+            f"status_site: migrate-slug {source.parent.name}/{source.name} → "
+            f"{dest.name}"
+        )
+        return True
+    except OSError as e:
+        log(
+            f"status_site: migrate-slug FAIL {source.parent.name}/{source.name}"
+            f" → {dest.name}: {e!r}"
+        )
+        return False
+
+
+def migrate_stale_slugs(
+    status_dir: Path, *, subdirs: tuple[str, ...] = (HISTORY_DIR, "threads", "item-extra")
+) -> int:
+    """One-shot rename of ``<legacy_slug>.jsonl`` → ``<new_slug>.jsonl``
+    for every titled item whose old and new slugs disagree.
+
+    Idempotent: running it twice on a fresh checkout is a no-op because
+    the second pass finds no source files. Called from
+    :func:`status_site.server.main` at process start so Slice-2 picks
+    up history that Slice-1 wrote under the pre-fix slug.
+
+    Returns the number of files actually renamed (useful in tests).
+    """
+    d = Path(status_dir)
+    if not d.is_dir():
+        return 0
+    pairs = _page_title_slug_pairs(d)
+    renamed = 0
+    for old, new in pairs:
+        if not old or not new or old == new:
+            continue
+        for sub in subdirs:
+            sub_path = d / sub
+            if not sub_path.is_dir():
+                continue
+            src = sub_path / f"{old}.jsonl"
+            dst = sub_path / f"{new}.jsonl"
+            if _rename_one(src, dst):
+                renamed += 1
+    # Tombstone pass: items whose page entry was deleted still carry
+    # a legacy-slug key in ``.item-state.json`` and in any orphan
+    # ``item-history/<legacy>.jsonl`` file. Pair those up by walking
+    # ``item-history/`` and testing each legacy stem against
+    # :func:`legacy_title_slug` ⇆ :func:`title_slug` on the state
+    # file's recorded titles.
+    state_path = d / STATE_FILE
+    tombstone_pairs: list[tuple[str, str]] = []
+    try:
+        raw = json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        raw = None
+    if isinstance(raw, dict) and isinstance(raw.get("items"), dict):
+        items = raw["items"]
+        for legacy, rec in list(items.items()):
+            if not isinstance(rec, dict):
+                continue
+            title = rec.get("title") or rec.get("last_title")
+            if not isinstance(title, str) or not title:
+                continue
+            new = title_slug(title)
+            if not new or new == legacy:
+                continue
+            # Only rename if the state key actually matches the
+            # legacy algorithm — don't touch keys that already
+            # correspond to the new algorithm but have drift.
+            if legacy_title_slug(title) != legacy:
+                continue
+            tombstone_pairs.append((legacy, new))
+    for old, new in tombstone_pairs:
+        for sub in subdirs:
+            sub_path = d / sub
+            if not sub_path.is_dir():
+                continue
+            src = sub_path / f"{old}.jsonl"
+            dst = sub_path / f"{new}.jsonl"
+            if _rename_one(src, dst):
+                renamed += 1
+    if renamed or tombstone_pairs:
+        pairs = pairs + tombstone_pairs
+    if renamed:
+        # A state-file tombstone under the old slug keeps the tracker
+        # from treating the next scan's ``new`` slug as a brand-new
+        # item (which would fire an ``appeared`` event and bust the
+        # timeline). Load, rekey old→new, write back under cfg.lock
+        # equivalent (one-shot startup, no writers racing yet).
+        state_path = d / STATE_FILE
+        try:
+            raw = json.loads(state_path.read_text())
+        except (OSError, ValueError):
+            raw = None
+        if isinstance(raw, dict) and isinstance(raw.get("items"), dict):
+            items = raw["items"]
+            mutated = False
+            for old, new in pairs:
+                if old in items and new not in items:
+                    items[new] = items.pop(old)
+                    mutated = True
+            if mutated:
+                try:
+                    tmp = state_path.with_name(
+                        f".item-state.{os.getpid()}.migrate.tmp"
+                    )
+                    tmp.write_text(json.dumps(raw, indent=0))
+                    os.replace(tmp, state_path)
+                except OSError as e:
+                    _log_stderr(
+                        f"status_site: migrate-slug state rewrite failed: {e!r}"
+                    )
+    return renamed
