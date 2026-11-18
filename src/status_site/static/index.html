@@ -3713,10 +3713,18 @@ function todoCountSuffix(d) {
 // ux/overview-title-badge) the browser tab title. Shared with
 // todoCountSuffix so the two cannot drift. Returns 0 for empty /
 // missing payloads so the caller can test ``n > 0`` cleanly.
+//
+// Buckets included: PRs ready for review, design-review items,
+// attention-reacts, Jason-authored asks (``rows``), kind=woy SM
+// tasks (PR #900 — these render as Accept/Reject chips) and
+// Alice-authored review-TODOs. Keep the buckets aligned with the
+// tiles ``YourTodoBoard`` actually renders — bug fix 2026-11-18
+// after the header showed "(1)" while 7 kind=woy chips were visible.
 function waitingOnYouCount(d) {
   d = d || {};
   return (d.prs || []).length + (d.design_review || []).length +
-    (d.attention_reacts || []).length + (d.rows || []).length;
+    (d.attention_reacts || []).length + (d.rows || []).length +
+    (d.woy_tasks || []).length + (d.review_todos || []).length;
 }
 
 // Pure helper: compose the browser ``document.title`` from the base
