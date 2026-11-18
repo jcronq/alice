@@ -3627,10 +3627,28 @@ function SectionTile({name, data, ts, nowMs}) {
 
 // Issue #715: "Waiting on you (N)" counts PRs + designs + attention reacts + asks.
 function todoCountSuffix(d) {
-  d = d || {};
-  const n = (d.prs || []).length + (d.design_review || []).length +
-    (d.attention_reacts || []).length + (d.rows || []).length;
+  const n = waitingOnYouCount(d);
   return n ? " (" + n + ")" : "";
+}
+
+// Pure helper: the count of unresolved Waiting-on-you items the shell
+// surfaces in the tier heading, the (?) button area, and (PR
+// ux/overview-title-badge) the browser tab title. Shared with
+// todoCountSuffix so the two cannot drift. Returns 0 for empty /
+// missing payloads so the caller can test ``n > 0`` cleanly.
+function waitingOnYouCount(d) {
+  d = d || {};
+  return (d.prs || []).length + (d.design_review || []).length +
+    (d.attention_reacts || []).length + (d.rows || []).length;
+}
+
+// Pure helper: compose the browser ``document.title`` from the base
+// label and the unresolved count. Reference pattern: agent-ui-testing
+// README.md ("a count badge on the TODOs tab and ``(N)`` in the
+// browser tab title"). The badge is prepended so it stays visible when
+// the browser truncates the tab label.
+function titleWithBadge(base, n) {
+  return n > 0 ? "(" + n + ") " + base : base;
 }
 
 // A tier groups the section tiles that share an owner of the next
@@ -3924,6 +3942,16 @@ function App() {
   const nowMs = useNowTick(10000);
   const {route, slug} = useHashRoute();
   usePingReviewSlug(route === "review" ? slug : null);
+
+  // PR ux/overview-title-badge: mirror the Waiting-on-you count into
+  // ``document.title`` so it shows in the browser tab strip the same
+  // way the agent-ui-testing reference does (README.md: "a count badge
+  // on the TODOs tab and `(N)` in the browser tab title"). Prepended
+  // so the badge stays visible when tab labels truncate.
+  const waitingN = waitingOnYouCount(state.sections.your_todo);
+  useEffect(() => {
+    document.title = titleWithBadge("Alice — status", waitingN);
+  }, [waitingN]);
 
   let statusClass = "sse-status";
   let statusLabel = "connecting…";
