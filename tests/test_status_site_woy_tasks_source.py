@@ -145,12 +145,14 @@ def test_slug_to_task_id_finds_snoozed_task(store, _now_epoch):
     assert wt.slug_to_task_id(store.root, "call-randy-sosa-at-nam") == t.id
 
 
-def test_typed_rows_strips_internal_fields(store, _now_epoch):
+def test_typed_rows_strips_volatile_fields(store, _now_epoch):
     _seed_woy(store)
     rows = wt.scan_woy_tasks(store.root, now=_now_epoch)
     typed = wt.typed_rows(rows)
     assert typed[0]["slug"] == "call-randy-sosa-at-nam"
-    assert "created_epoch" not in typed[0]
+    # ``age_seconds`` is intentionally OUT of the typed shape so a
+    # section.update doesn't fire every tick as time drifts.
+    assert "age_seconds" not in typed[0]
     assert "accept_descriptors" in typed[0]
-    # ``age_seconds`` becomes a plain float.
-    assert isinstance(typed[0]["age_seconds"], float)
+    # ``created_epoch`` is stable across ticks → dict-equality holds.
+    assert isinstance(typed[0]["created_epoch"], float)
