@@ -108,6 +108,7 @@ from status_site.sources import (
     known_issues as _known_issues,
     pipeline as _pipeline,
     review_queue as _review_queue,
+    review_todos as _review_todos,
     running_now as _running_now,
     schedules as _schedules,
     tasks as _tasks,
@@ -2163,9 +2164,18 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         if dismissed:
             pending = filter_dismissed_asks(pending, dismissed)
         structured = _waiting_on_you.render_structured(pending)
+        # Slice review-TODO: splice an Alice-authored "Review" sub-
+        # list under the hand zone so vault writes + outbound drafts
+        # bubble up for Jason to confirm. Rendered as top-level
+        # bullets with the ``**Review changes: <title>**`` headline
+        # the existing dismissal filter already understands.
+        review_todo_rows = _review_todos.read_rows(dismissed=dismissed)
+        review_md = _review_todos.render_markdown(review_todo_rows)
         parts: list[str] = []
         if hand_zone_md:
             parts.append(hand_zone_md)
+        if review_md:
+            parts.append(review_md)
         if structured:
             parts.append(structured)
         if not parts:
@@ -2185,6 +2195,7 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
             "hand_zone_md": hand_zone_md,
             "rows": rows,
             "needs_approval_slugs": needs_approval,
+            "review_todos": review_todo_rows,
         }
 
     def _render_alice_queue() -> dict:
@@ -2319,10 +2330,33 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         )
         if dismissed:
             ask_rows = filter_dismissed_asks(ask_rows, dismissed)
-        needs_approval = needs_approval_slugs(your_todo_md)
         external_todos_md = _waiting_on_you.read_hand_zone(
             cfg.status_dir / "external-todos.md"
         )
+        # Slice review-TODO: pick up Alice-authored vault writes +
+        # outbound drafts from inner/state/review-todos.jsonl. Rows
+        # render as a "Review" bucket under WoY; the markdown gets
+        # spliced into ``your_todo_md`` under the hand-zone so the
+        # existing Asks widget renders it through the same path as
+        # Jason's longer-form asks. The ``.woy-dismissed.jsonl``
+        # overlay filters by slug on click-through; the N-day
+        # expiry in ``core.review_todos`` auto-drops stale rows.
+        # Memory-worker writes never land here because the emit side
+        # is only called from Alice-authored code paths (see
+        # ``core.review_todos``).
+        review_todo_rows = _review_todos.read_rows(dismissed=dismissed)
+        review_md = _review_todos.render_markdown(review_todo_rows)
+        if review_md:
+            # Splice into the hand-zone blob so the ``Asks`` React
+            # group renders review items alongside Jason's own
+            # bullets. Keeping the top-level ``- **…**`` marker
+            # structure means Slice-2's slug-based dismissal filter
+            # already applies: dismissing a review-TODO slug removes
+            # exactly its bullet.
+            your_todo_md = (
+                f"{your_todo_md}\n\n{review_md}" if your_todo_md else review_md
+            )
+        needs_approval = needs_approval_slugs(your_todo_md)
         # Attention-reacts (👀 ⚠️ 👎 ❓) wait on #683; the key is the
         # contract so the widget lights up as soon as it is populated.
         attention_reacts: list[dict] = []
@@ -2332,6 +2366,7 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
             "attention_reacts": len(attention_reacts),
             "asks": len(ask_rows) + (1 if your_todo_md else 0),
             "external": 1 if external_todos_md else 0,
+            "review_todos": len(review_todo_rows),
         }
         total = sum(counts.values())
         return {
@@ -2343,6 +2378,7 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
             "your_todo_md": your_todo_md,
             "needs_approval_slugs": needs_approval,
             "external_todos_md": external_todos_md,
+            "review_todos": review_todo_rows,
             "counts": counts,
             "failed": {
                 "prs": list(review.get("pr_failed") or []),
@@ -3611,6 +3647,46 @@ def handle_woy_steer(cfg: "Config", d: dict) -> dict:
     return {"ok": True, "slug": slug, "action": "steer"}
 
 
+def handle_review_todo_click(cfg: "Config", d: dict) -> dict:
+    """Slice review-TODO: record a click-through as a dismissal.
+
+    Body: ``{key, slug}``. The frontend fires this when Jason opens
+    the ``target`` of a review-TODO (vault file / PR / email draft
+    URL). We write the slug into ``.woy-dismissed.jsonl`` so the next
+    render drops the row and record a thread entry so the timeline
+    shows ``Reviewed — opened <target>``. Response includes the slug
+    + ``{dismissed: True}``.
+
+    Opening the target itself is the frontend's job (``target_blank``
+    link next to the title); this endpoint is the backend
+    acknowledgement. We intentionally do not require the target in
+    the request — slug-only matches Slice-2's dismissal contract.
+    """
+    if not isinstance(d, dict):
+        raise ReplyError(400, "bad json")
+    if not hmac.compare_digest(str(d.get("key", "")).encode(), cfg.key.encode()):
+        raise ReplyError(403, "bad key")
+    slug_raw = str(d.get("slug", ""))
+    slug = safe_slug(slug_raw)
+    if not slug:
+        raise ReplyError(400, "bad slug")
+    with cfg.lock:
+        append_thread(
+            cfg,
+            slug,
+            {
+                "from": "jason",
+                "at": now_iso(),
+                "text": "Reviewed — opened target",
+                "action": "review-todo-click",
+            },
+        )
+        _append_woy_dismissed(
+            cfg.status_dir, slug=slug, action="review-todo-click"
+        )
+    return {"ok": True, "slug": slug, "dismissed": True}
+
+
 def handle_effort_action(cfg: "Config", d: dict) -> dict:
     """Persist Jason's effort pick for a Waiting-on-you item.
 
@@ -4324,6 +4400,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/bug-action": handle_bug_action,
             "/api/woy-action": handle_woy_action,
             "/api/woy-steer": handle_woy_steer,
+            "/api/review-todo-click": handle_review_todo_click,
             "/api/effort": handle_effort_action,
             "/api/presence": handle_presence,
         }
