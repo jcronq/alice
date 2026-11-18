@@ -3651,9 +3651,15 @@ function SchedulesBody({jobs, nowMs}) {
 function SchedulesPanel({data, nowMs, ts}) {
   const jobs = (data && data.jobs) || [];
   const count = jobs.length;
+  // Hide entirely when there's nothing to show. A persistent panel
+  // that reads "No scheduled jobs." adds noise without information —
+  // Jason flagged the empty floating top-right panel on every
+  // Overview as orphan UI (bug fix 2026-11-18). The panel re-appears
+  // the moment ``sources/schedules.py`` emits a job row.
+  if (!count) return null;
   const stamp = stampText(ts, nowMs);
   const header = h("h3", null,
-    h("span", null, "Schedules", count ? " (" + count + ")" : ""),
+    h("span", null, "Schedules", " (" + count + ")"),
     stamp ? h("span", {className: "sched-updated"}, stamp) : null,
   );
   // Rendered twice with different wrappers so CSS media queries pick
@@ -3665,7 +3671,7 @@ function SchedulesPanel({data, nowMs, ts}) {
       h(SchedulesBody, {jobs, nowMs}),
     ),
     h("details", {className: "schedules-mobile"},
-      h("summary", null, "Schedules", count ? " (" + count + ")" : ""),
+      h("summary", null, "Schedules", " (" + count + ")"),
       h(SchedulesBody, {jobs, nowMs}),
     ),
   );
