@@ -133,6 +133,26 @@ class LivenessScan:
     worktrees: tuple[Worktree, ...]
     active_spawn_issues: frozenset[str]
 
+    @property
+    def is_observable(self) -> bool:
+        """True iff this scan can plausibly see worker signals.
+
+        The status-site renderer deploys inside a container that may
+        not have ``git worktree list`` output or
+        ``/state/worker/sm-*-spawns/`` bind-mounted; in that case
+        every row looks not-live purely because the scan can't *see*
+        anything. We treat such scans as uninformative and fall back
+        to the label-only partition rather than demoting every
+        in-flight row to blocked.
+
+        A scan counts as observable when it has at least one worktree
+        OR at least one active spawn directory. ``ps_output`` alone
+        isn't enough — it's non-empty on every host but reliably
+        omits worker processes when the renderer runs in a sandboxed
+        PID namespace.
+        """
+        return bool(self.worktrees) or bool(self.active_spawn_issues)
+
     @classmethod
     def collect(
         cls,

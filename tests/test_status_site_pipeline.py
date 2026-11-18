@@ -1141,9 +1141,20 @@ def test_partition_by_state_bucket_with_scan_mixes_live_and_stale():
 def test_partition_by_state_bucket_with_scan_does_not_mutate_input():
     """The caller's row dicts must be left untouched — the scan
     shallow-copies demoted rows before stamping ``blocked_reason``."""
+    from status_site.sources.running_now import Worktree
+
     row = {"state": "building", "number": 999}
     original = dict(row)
-    buckets = P.partition_by_state_bucket([row], liveness_scan=P_live.LivenessScan.empty())
+    # Need an *observable* scan (has at least one worktree) to trigger
+    # the demotion path — an empty scan now falls back to label-only
+    # partition for sandbox safety, see test_partition_with_
+    # unobservable_scan_falls_back_to_label_only.
+    scan = P_live.LivenessScan(
+        ps_output="",
+        worktrees=(Worktree(path="/wt", branch="feat/42-unrelated"),),
+        active_spawn_issues=frozenset(),
+    )
+    buckets = P.partition_by_state_bucket([row], liveness_scan=scan)
     assert row == original  # input dict is unchanged
     assert buckets["blocked"][0] is not row  # demoted copy, not same object
     assert buckets["blocked"][0]["blocked_reason"].startswith("worker vanished")
@@ -1238,3 +1249,96 @@ def test_render_in_flight_demotes_rows_with_no_live_signal(tmp_path, monkeypatch
     # The demoted row carries its reason for the UI.
     ghost = next(r for r in blocked["rows"] if r["number"] == 999)
     assert ghost["blocked_reason"].startswith("worker vanished — ")
+
+
+# ─── sandbox-safety: unobservable scan is not a kill switch ─────────
+#
+# The alice-status container currently has no bind mounts for
+# ``/state/worker`` or the host repo, so ``LivenessScan.collect()``
+# produces an empty scan. Without this guard, every in-flight row
+# demotes to blocked purely because the renderer can't see — the
+# opposite of the slice 2b intent. See
+# :meth:`LivenessScan.is_observable`.
+
+
+def test_livenessscan_is_observable_true_when_worktree_present():
+    from status_site.sources.running_now import Worktree
+
+    scan = P_live.LivenessScan(
+        ps_output="",
+        worktrees=(Worktree(path="/wt", branch="feat/1-x"),),
+        active_spawn_issues=frozenset(),
+    )
+    assert scan.is_observable
+
+
+def test_livenessscan_is_observable_true_when_spawn_issue_present():
+    scan = P_live.LivenessScan(
+        ps_output="",
+        worktrees=(),
+        active_spawn_issues=frozenset({"858"}),
+    )
+    assert scan.is_observable
+
+
+def test_livenessscan_is_observable_false_on_empty_scan():
+    """An empty scan is uninformative — probably means the renderer
+    can't see worker signals (sandboxed container with no bind
+    mounts), not that every worker is dead."""
+    assert not P_live.LivenessScan.empty().is_observable
+
+
+def test_livenessscan_is_observable_false_when_only_ps_output_present():
+    """Non-empty ``ps`` alone is not evidence: inside the alice-status
+    container ``ps aux`` lists container-local processes only, which
+    won't include worker processes from the sibling ``alice``
+    container. So require a worktree or spawn-dir signal too."""
+    scan = P_live.LivenessScan(
+        ps_output="some 1 0.0 0.0 /sbin/init\nalice 2 0.1 0.2 python -m status_site",
+        worktrees=(),
+        active_spawn_issues=frozenset(),
+    )
+    assert not scan.is_observable
+
+
+def test_partition_with_unobservable_scan_falls_back_to_label_only():
+    """When the scan has nothing to see, every ``sm:building`` /
+    ``sm:reviewing`` row stays in ``in_flight`` — slice 2b degrades
+    to the pre-slice behaviour rather than wiping the tier."""
+    rows = [
+        {"state": "building", "number": 1},
+        {"state": "reviewing", "number": 2},
+        {"state": "blocked", "number": 3},
+    ]
+    buckets = P.partition_by_state_bucket(
+        rows, liveness_scan=P_live.LivenessScan.empty()
+    )
+    # Both in-flight rows pass through — no demotion happened.
+    assert [r["number"] for r in buckets["in_flight"]] == [1, 2]
+    assert [r["number"] for r in buckets["blocked"]] == [3]
+    for r in buckets["in_flight"]:
+        assert "blocked_reason" not in r
+    # The sm:blocked row is untouched (never carried a reason).
+    assert "blocked_reason" not in buckets["blocked"][0]
+
+
+def test_partition_with_observable_scan_still_demotes_ghosts():
+    """Regression pin: once the scan has ANY signal, slice 2b kicks
+    back in and demotes rows with no matching evidence. Otherwise
+    the sandbox-safety fallback would silently keep ghosts alive
+    forever once a single worktree exists."""
+    from status_site.sources.running_now import Worktree
+
+    rows = [
+        {"state": "building", "number": 10},  # no signal → demote
+        {"state": "building", "number": 20},  # worktree match → in_flight
+    ]
+    scan = P_live.LivenessScan(
+        ps_output="",
+        worktrees=(Worktree(path="/wt", branch="feat/20-x"),),
+        active_spawn_issues=frozenset(),
+    )
+    buckets = P.partition_by_state_bucket(rows, liveness_scan=scan)
+    assert [r["number"] for r in buckets["in_flight"]] == [20]
+    assert [r["number"] for r in buckets["blocked"]] == [10]
+    assert buckets["blocked"][0]["blocked_reason"].startswith("worker vanished")
