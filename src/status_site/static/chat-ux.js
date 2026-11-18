@@ -134,6 +134,28 @@ export function replyPreview(msg, limit = REPLY_PREVIEW_CHARS) {
   return text.length > limit ? text.slice(0, limit - 1).trimEnd() + "…" : text;
 }
 
+// When Jason's client sends a reply, it both sets ``reply_to`` AND prepends
+// the original message as ``> ``-prefixed lines in the body — so the bubble
+// ends up double-rendering the quote next to our own "In reply to: …" header.
+// Peel off that leading ``> `` block (plus the blank separator line) so the
+// renderer can hide it behind a toggle and lead with the new content.
+//
+// Returns ``{quoted, rest}``: ``quoted`` is the raw leading quote block
+// (``null`` when the body does not start with one), ``rest`` is the body
+// with that block and its separator blank line removed. A line counts as
+// quoted when it starts with ``> `` or is a bare ``>``.
+export function stripLeadingQuoteBlock(text) {
+  const src = String(text || "");
+  const lines = src.split("\n");
+  let i = 0;
+  while (i < lines.length && (lines[i].startsWith("> ") || lines[i] === ">")) i++;
+  if (i === 0) return {quoted: null, rest: src};
+  const quoted = lines.slice(0, i).join("\n");
+  let j = i;
+  if (j < lines.length && lines[j].trim() === "") j++;
+  return {quoted, rest: lines.slice(j).join("\n")};
+}
+
 // ``> ``-quoted text block (text only) that pre-fills the composer on Reply.
 export function quoteForReply(msg, limit = REPLY_QUOTE_CHARS) {
   let text = String((msg && msg.text) || "").trim();
