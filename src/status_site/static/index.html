@@ -678,7 +678,8 @@ import {
   HIGHLIGHT_MS, imageFilesFromClipboard, isNearBottom, isNearTop,
   messageAnchorId, MORE_REACTS, parseMessageHash, permalinkFor, QUICK_REACTS,
   quoteForReply, reactionsSignature, readAsBase64, replyPreview,
-  shouldSubmitOnKey, summarizeReactions, validateAttachment,
+  shouldSubmitOnKey, stripLeadingQuoteBlock, summarizeReactions,
+  validateAttachment,
 } from "./chat-ux.js";
 const h = React.createElement;
 
@@ -1768,6 +1769,15 @@ function chatTime(at) {
 function ChatMessage({m, reactions, quoted}) {
   const [picker, setPicker] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [showQuoted, setShowQuoted] = useState(false);
+  // Replies from Jason's client both set `reply_to` AND prepend the
+  // quoted original as `> `-prefixed lines in the body. Peel that
+  // leading block off so the renderer can collapse it behind a toggle
+  // and lead with the new content; standalone markdown blockquotes
+  // (no `reply_to`) still render verbatim.
+  const splitBody = m.reply_to && m.text ? stripLeadingQuoteBlock(m.text) : null;
+  const quotedRaw = splitBody && splitBody.quoted !== null ? splitBody.quoted : null;
+  const bodyText = quotedRaw !== null ? splitBody.rest : m.text;
   // Prefer the richer `attachments` shape (name, url) over the
   // legacy `files` name-only shape so historical messages still
   // render with a filename if the url isn't present.
@@ -1827,7 +1837,15 @@ function ChatMessage({m, reactions, quoted}) {
         jumpToMessage(m.reply_to);
       },
     }, "In reply to: " + ((quoted && replyPreview(quoted)) || "an earlier message")) : null,
-    m.text ? h("span", {dangerouslySetInnerHTML: {__html: chatTextToHtml(m.text)}}) : null,
+    quotedRaw !== null ? h("button", {
+      type: "button", className: "msg-quote-toggle", "data-testid": "quote-toggle",
+      "aria-expanded": showQuoted ? "true" : "false",
+      onClick: () => setShowQuoted(v => !v),
+    }, showQuoted ? "▾ Hide quoted" : "▸ Show quoted") : null,
+    quotedRaw !== null && showQuoted
+      ? h("pre", {className: "msg-quoted-raw", "data-testid": "quoted-raw"}, quotedRaw)
+      : null,
+    bodyText ? h("span", {dangerouslySetInnerHTML: {__html: chatTextToHtml(bodyText)}}) : null,
     ...atts.map((a, j) => {
       const name = a.name || "";
       const url = a.url;

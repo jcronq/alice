@@ -67,6 +67,19 @@ globalThis.FileReader = class {
   readAsDataURL(f) { this.result = "data:image/png;base64,UE5H"; setTimeout(() => this.onload(), 0); }
 };
 out.b64 = await ux.readAsBase64({});
+
+// stripLeadingQuoteBlock — collapses the ``> ``-prefixed block a replying
+// client prepends to the body (double-render fix).
+out.quoteStripBasic = ux.stripLeadingQuoteBlock(
+  "> previous line one\n> previous line two\n\nmy new reply");
+out.quoteStripNoQuote = ux.stripLeadingQuoteBlock("hello world\n> still me");
+out.quoteStripEmptyLine = ux.stripLeadingQuoteBlock(
+  "> previous line\n>\n> more previous\n\nnew content");
+out.quoteStripNoSeparator = ux.stripLeadingQuoteBlock(
+  "> previous line\nimmediate new content");
+out.quoteStripAllQuoted = ux.stripLeadingQuoteBlock("> only a quote\n> and more");
+out.quoteStripEmpty = ux.stripLeadingQuoteBlock("");
+out.quoteStripNull = ux.stripLeadingQuoteBlock(null);
 console.log(JSON.stringify(out));
 """
 
@@ -140,3 +153,56 @@ def test_chat_thread_wires_infinite_scroll():
     assert "loadingRef" in body and "isNearTop" in body
     assert "loading older" in body
     assert "useLayoutEffect" in body and "anchor" in body
+
+
+def test_strip_leading_quote_block_peels_reply_prefix(result):
+    # (a) leading `> ` block + blank separator → stripped; new content returned.
+    assert result["quoteStripBasic"] == {
+        "quoted": "> previous line one\n> previous line two",
+        "rest": "my new reply",
+    }
+
+
+def test_strip_leading_quote_block_no_quote_is_passthrough(result):
+    # Body does not start with a `> ` block → unchanged, quoted is null even
+    # though a `> ` line appears mid-body (standalone markdown blockquote).
+    assert result["quoteStripNoQuote"] == {
+        "quoted": None,
+        "rest": "hello world\n> still me",
+    }
+
+
+def test_strip_leading_quote_block_handles_bare_gt_and_internal_blanks(result):
+    # Bare `>` lines count as part of the block; only ONE separator blank
+    # line is consumed after the block (the client only prepends one).
+    assert result["quoteStripEmptyLine"] == {
+        "quoted": "> previous line\n>\n> more previous",
+        "rest": "new content",
+    }
+
+
+def test_strip_leading_quote_block_tolerates_missing_separator(result):
+    # No blank line between quote and new content is still a valid strip.
+    assert result["quoteStripNoSeparator"] == {
+        "quoted": "> previous line",
+        "rest": "immediate new content",
+    }
+
+
+def test_strip_leading_quote_block_all_quoted(result):
+    assert result["quoteStripAllQuoted"] == {
+        "quoted": "> only a quote\n> and more",
+        "rest": "",
+    }
+
+
+def test_strip_leading_quote_block_empty_and_null(result):
+    assert result["quoteStripEmpty"] == {"quoted": None, "rest": ""}
+    assert result["quoteStripNull"] == {"quoted": None, "rest": ""}
+
+
+def test_shell_wires_leading_quote_collapse():
+    html = (Path(STATIC_DIR) / "index.html").read_text()
+    assert "stripLeadingQuoteBlock" in html
+    assert "msg-quote-toggle" in html
+    assert "msg-quoted-raw" in html
