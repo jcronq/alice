@@ -37,7 +37,6 @@ from alice_mam import search as mam_search
 from alice_mam.acquire import (
     download_torrent_bytes,
     load_cookie_from_secrets,
-    send_to_seedbox,
     send_to_seedbox_via_rclone,
 )
 
