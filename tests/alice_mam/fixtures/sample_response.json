@@ -1,0 +1,81 @@
+{
+  "data": [
+    {
+      "id": 7781234,
+      "title": "The Twice-Dead King: Ruin",
+      "author_info": "{\"445566\":\"Nate Crowley\"}",
+      "free": true,
+      "fl_vip": false,
+      "personal_freeleech": false,
+      "my_snatched": false,
+      "seeders": 42,
+      "size": "1234567",
+      "filetype": "epub",
+      "language": 1,
+      "lang_code": "eng",
+      "dl": "AAA111FREELEECHHASH"
+    },
+    {
+      "id": 7781235,
+      "title": "The Twice-Dead King: Ruin (alt scan)",
+      "author_info": "{\"445566\":\"Nate Crowley\"}",
+      "free": false,
+      "fl_vip": false,
+      "personal_freeleech": false,
+      "my_snatched": true,
+      "seeders": 128,
+      "size": "2200000",
+      "filetype": "epub mobi",
+      "language": 1,
+      "lang_code": "eng",
+      "dl": "BBB222HIGHSEEDHASH"
+    },
+    {
+      "id": 7781236,
+      "title": "Twice-Dead King — Ruin (French)",
+      "author_info": "{\"445566\":\"Nate Crowley\"}",
+      "free": false,
+      "fl_vip": false,
+      "personal_freeleech": false,
+      "my_snatched": false,
+      "seeders": 11,
+      "size": "1500000",
+      "filetype": "epub",
+      "language": 4,
+      "lang_code": "fra",
+      "dl": "CCC333FRENCHHASH"
+    },
+    {
+      "id": 7781237,
+      "title": "The Twice-Dead King: Ruin (audiobook)",
+      "author_info": "{\"445566\":\"Nate Crowley\"}",
+      "free": false,
+      "fl_vip": false,
+      "personal_freeleech": false,
+      "my_snatched": false,
+      "seeders": 7,
+      "size": "900000000",
+      "filetype": "mp3",
+      "language": 1,
+      "lang_code": "eng",
+      "dl": "DDD444AUDIOHASH"
+    },
+    {
+      "id": 7781238,
+      "title": "Ruin — scanned (unsupported filetype)",
+      "author_info": "{\"445566\":\"Nate Crowley\"}",
+      "free": false,
+      "fl_vip": false,
+      "personal_freeleech": false,
+      "my_snatched": false,
+      "seeders": 3,
+      "size": "700000",
+      "filetype": "cbz",
+      "language": 1,
+      "lang_code": "eng",
+      "dl": "EEE555UNSUPPORTEDHASH"
+    }
+  ],
+  "total": 5,
+  "total_found": 5
+}
