@@ -41,6 +41,7 @@ from typing import Callable, Sequence
 
 from alice_forge.review_queue_renderer import _coerce_repos, _load_config, gh
 from status_site.sources import db_readers as _db_readers
+from status_site.sources.pipeline_liveness import LivenessScan, is_task_live
 
 log = logging.getLogger("status_site.pipeline")
 
@@ -287,7 +288,11 @@ def sort_rows(rows: Sequence[dict]) -> list[dict]:
     return sorted(rows, key=key)
 
 
-def partition_by_state_bucket(rows: Sequence[dict]) -> dict[str, list[dict]]:
+def partition_by_state_bucket(
+    rows: Sequence[dict],
+    *,
+    liveness_scan: LivenessScan | None = None,
+) -> dict[str, list[dict]]:
     """Carve pipeline rows into ``in_flight`` / ``blocked`` / ``queued`` / ``other``.
 
     - ``in_flight`` → rows whose ``state`` is in :data:`INFLIGHT_STATES`
@@ -300,9 +305,21 @@ def partition_by_state_bucket(rows: Sequence[dict]) -> dict[str, list[dict]]:
     - ``other`` → everything else (draft / designing / design_review /
       unknown). Kept so callers can still find a row if they look.
 
-    Pure function. Row order inside each bucket is preserved from the
-    input — callers that want a particular order should :func:`sort_rows`
-    afterward.
+    Row order inside each bucket is preserved from the input — callers
+    that want a particular order should :func:`sort_rows` afterward.
+
+    **Liveness cross-check (slice 2b):** when ``liveness_scan`` is
+    provided, every row that would land in ``in_flight`` is probed via
+    :func:`pipeline_liveness.is_task_live`. Rows with no live signal
+    are shallow-copied, annotated with
+    ``blocked_reason = "worker vanished — <evidence>"``, and routed to
+    ``blocked`` instead. Rows that *do* match a signal are passed
+    through unchanged. The original row dict is never mutated —
+    callers reusing the input list see no side-effect.
+
+    When ``liveness_scan`` is ``None`` the function reverts to the
+    label-only partition (the pre-slice-2b behaviour), so test
+    fixtures that don't mock a scan still work.
     """
     out: dict[str, list[dict]] = {
         "in_flight": [],
@@ -313,7 +330,16 @@ def partition_by_state_bucket(rows: Sequence[dict]) -> dict[str, list[dict]]:
     for r in rows:
         state = str(r.get("state") or "")
         if state in INFLIGHT_STATES:
-            out["in_flight"].append(r)
+            if liveness_scan is None:
+                out["in_flight"].append(r)
+                continue
+            live, evidence = is_task_live(r, liveness_scan)
+            if live:
+                out["in_flight"].append(r)
+            else:
+                demoted = dict(r)
+                demoted["blocked_reason"] = f"worker vanished — {evidence}"
+                out["blocked"].append(demoted)
         elif state in BLOCKED_STATES:
             out["blocked"].append(r)
         elif state in QUEUED_STATES:

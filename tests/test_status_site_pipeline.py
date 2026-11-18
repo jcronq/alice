@@ -17,6 +17,7 @@ from status_site.server import (
     section_renderers,
 )
 from status_site.sources import pipeline as P
+from status_site.sources import pipeline_liveness as P_live
 
 NOW = 1_800_000_000.0
 
@@ -287,11 +288,34 @@ def test_alice_queue_without_pollers_still_renders(tmp_path, monkeypatch):
 # ─── in_flight vs blocked carve-out (issue #868) ───────────────────
 
 
+def _patch_scan_all_live(monkeypatch, numbers):
+    """Swap :meth:`LivenessScan.collect` for one that marks every
+    ``numbers`` entry as live via a synthetic ``ps_output``.
+
+    The in_flight renderer calls ``LivenessScan.collect()`` with no
+    arguments; this fake returns a scan whose ``ps_output`` carries a
+    ``claude --issue <N>`` line per number, which makes every row
+    whose ``number`` is in ``numbers`` satisfy the process signal.
+    """
+    ps = "\n".join(f"claude --issue {n}" for n in numbers)
+    fake = P_live.LivenessScan(
+        ps_output=ps, worktrees=(), active_spawn_issues=frozenset()
+    )
+    monkeypatch.setattr(
+        P_live.LivenessScan, "collect", classmethod(lambda cls, **kw: fake)
+    )
+
+
 def _mk_cfg_with_pipeline_states(tmp_path, states, monkeypatch):
     """Spin up a Config whose pollers cache has one issue per listed state.
 
     Returns the Config with ``pollers`` populated. Surfaces/tasks dirs
     exist but are empty — the carve-out tests focus on pipeline rows.
+
+    Every issue number in the fixture is marked live so the liveness
+    cross-check (slice 2b) is a no-op for label-only tests; tests that
+    specifically exercise the liveness demotion construct their own
+    scan.
     """
     monkeypatch.setenv("ALICE_MIND", str(tmp_path / "mind"))
     (tmp_path / "status").mkdir()
@@ -308,6 +332,9 @@ def _mk_cfg_with_pipeline_states(tmp_path, states, monkeypatch):
     issues = [_issue(100 + i, f"sm:{s}", "art:code") for i, s in enumerate(states)]
     rows, failed = P.fetch_issues(["jcronq/alice"], runner=_runner({"jcronq/alice": issues}))
     cfg.pollers._set("pipeline", {"issues": rows, "failed": failed})
+    _patch_scan_all_live(
+        monkeypatch, [str(100 + i) for i, _ in enumerate(states)]
+    )
     return cfg
 
 
@@ -953,3 +980,261 @@ def test_poll_pipeline_once_fetch_exception_leaves_prior_cache(
     pollers._poll_pipeline_once()
     cached = pollers.get("pipeline")
     assert cached == {"issues": prior, "failed": []}
+
+
+# ─── liveness cross-check (slice 2b re-scoped) ──────────────────────
+#
+# Jason's core bug: the "In flight" tier reads SM labels, but labels
+# are a persistent-flag layer that lies about reality (worker dies →
+# ``sm:building`` sticks around → tier shows a ghost). The checks
+# below pin the behaviour of :func:`is_task_live` and
+# :func:`partition_by_state_bucket`'s liveness kwarg.
+
+
+def _scan_with_ps(lines, *, worktrees=(), spawn=frozenset()):
+    """Shortcut for building a :class:`LivenessScan` from a list of
+    cmdline strings."""
+    return P_live.LivenessScan(
+        ps_output="\n".join(lines),
+        worktrees=tuple(worktrees),
+        active_spawn_issues=spawn,
+    )
+
+
+def test_is_task_live_detects_matching_worktree_branch():
+    from status_site.sources.running_now import Worktree
+
+    scan = P_live.LivenessScan(
+        ps_output="",
+        worktrees=(Worktree(path="/state/worker/alice-858-wt",
+                             branch="feat/858-foo"),),
+        active_spawn_issues=frozenset(),
+    )
+    live, ev = P_live.is_task_live({"number": 858}, scan)
+    assert live and "worktree" in ev and "feat/858-foo" in ev
+
+
+def test_is_task_live_detects_matching_worktree_path_when_branch_has_no_issue():
+    from status_site.sources.running_now import Worktree
+
+    scan = P_live.LivenessScan(
+        ps_output="",
+        worktrees=(Worktree(path="/state/worker/alice-620-wt",
+                             branch="fix/some-other-name"),),
+        active_spawn_issues=frozenset(),
+    )
+    live, ev = P_live.is_task_live({"number": 620}, scan)
+    assert live and "/alice-620-wt" in ev
+
+
+def test_is_task_live_detects_matching_worker_process():
+    """A ``claude`` / ``python ... worker`` line whose argv mentions
+    the issue number is live evidence."""
+    scan = _scan_with_ps(
+        [
+            "alice 12345 0.1 0.2 /usr/bin/claude --issue 858 --continue",
+            "root  99999 0.0 0.0 /usr/sbin/sshd",  # noise — not matched
+        ]
+    )
+    live, ev = P_live.is_task_live({"number": 858}, scan)
+    assert live and ev.startswith("process ")
+
+
+def test_is_task_live_detects_matching_active_spawn():
+    scan = P_live.LivenessScan(
+        ps_output="",
+        worktrees=(),
+        active_spawn_issues=frozenset({"858"}),
+    )
+    live, ev = P_live.is_task_live({"number": 858}, scan)
+    assert live and "spawn-858" in ev
+
+
+def test_is_task_live_rejects_row_with_no_signal_anywhere():
+    scan = _scan_with_ps([])
+    live, ev = P_live.is_task_live({"number": 858}, scan)
+    assert not live and ev == "no live signal found"
+
+
+def test_is_task_live_ignores_bash_and_random_lines_with_issue_number():
+    """A random ``bash`` / editor line that happens to contain ``858``
+    must not falsely pass liveness — the probe is pinned to worker
+    runtimes (:data:`_WORKER_LINE_RE`)."""
+    scan = _scan_with_ps(
+        ["alice 12345 0.1 0.2 /bin/bash -c 'echo 858 pending'"]
+    )
+    live, _ = P_live.is_task_live({"number": 858}, scan)
+    assert not live
+
+
+def test_is_task_live_number_boundary_rejects_substring_match():
+    """``858`` must not match inside ``1858`` / ``8580`` — bounded by
+    non-digits."""
+    scan = _scan_with_ps(["alice 11 0.0 0.0 /usr/bin/claude --issue 1858"])
+    live, _ = P_live.is_task_live({"number": 858}, scan)
+    assert not live
+
+
+def test_is_task_live_handles_missing_number():
+    """A row missing ``number`` can't be probed; return the explicit
+    reason rather than silently passing or crashing."""
+    live, ev = P_live.is_task_live({"state": "building"}, _scan_with_ps([]))
+    assert not live and "no issue number" in ev
+
+
+def test_empty_scan_marks_every_row_not_live():
+    scan = P_live.LivenessScan.empty()
+    for n in (10, 858, 999):
+        live, _ = P_live.is_task_live({"number": n}, scan)
+        assert not live
+
+
+def test_partition_by_state_bucket_without_scan_is_unchanged():
+    """Backward compat: calling without ``liveness_scan`` must behave
+    exactly like the pre-slice-2b label-only partition."""
+    rows = [
+        {"state": "building", "number": 1},
+        {"state": "reviewing", "number": 2},
+        {"state": "blocked", "number": 3},
+    ]
+    buckets = P.partition_by_state_bucket(rows)
+    assert [r["number"] for r in buckets["in_flight"]] == [1, 2]
+    assert [r["number"] for r in buckets["blocked"]] == [3]
+
+
+def test_partition_by_state_bucket_with_scan_mixes_live_and_stale():
+    """Integration: 5 SM rows — 2 with a live signal, 3 without —
+    yields 2 in_flight + 3 blocked, each stale row carrying a
+    ``blocked_reason`` string. This is the whole point of slice 2b."""
+    from status_site.sources.running_now import Worktree
+
+    rows = [
+        # Live via worktree branch.
+        {"state": "building", "number": 858, "repo": "jcronq/alice",
+         "title": "wired"},
+        # Live via ps line.
+        {"state": "reviewing", "number": 620, "repo": "jcronq/alice",
+         "title": "wired2"},
+        # Three stale — no signal anywhere.
+        {"state": "building", "number": 701, "repo": "jcronq/alice"},
+        {"state": "building", "number": 702, "repo": "jcronq/alice"},
+        {"state": "reviewing", "number": 703, "repo": "jcronq/alice"},
+    ]
+    scan = P_live.LivenessScan(
+        ps_output="alice 123 0.0 0.0 /usr/bin/claude --issue 620 --continue",
+        worktrees=(
+            Worktree(path="/state/worker/alice-858-wt", branch="feat/858-foo"),
+        ),
+        active_spawn_issues=frozenset(),
+    )
+    buckets = P.partition_by_state_bucket(rows, liveness_scan=scan)
+    assert [r["number"] for r in buckets["in_flight"]] == [858, 620]
+    assert [r["number"] for r in buckets["blocked"]] == [701, 702, 703]
+    for demoted in buckets["blocked"]:
+        assert demoted["blocked_reason"].startswith("worker vanished — ")
+        assert demoted["blocked_reason"].endswith("no live signal found")
+    # Live rows pass through untouched — no ``blocked_reason`` smuggled in.
+    for r in buckets["in_flight"]:
+        assert "blocked_reason" not in r
+
+
+def test_partition_by_state_bucket_with_scan_does_not_mutate_input():
+    """The caller's row dicts must be left untouched — the scan
+    shallow-copies demoted rows before stamping ``blocked_reason``."""
+    row = {"state": "building", "number": 999}
+    original = dict(row)
+    buckets = P.partition_by_state_bucket([row], liveness_scan=P_live.LivenessScan.empty())
+    assert row == original  # input dict is unchanged
+    assert buckets["blocked"][0] is not row  # demoted copy, not same object
+    assert buckets["blocked"][0]["blocked_reason"].startswith("worker vanished")
+
+
+def test_partition_by_state_bucket_with_scan_leaves_already_blocked_rows_alone():
+    """``sm:blocked`` rows don't get re-probed; they're already blocked."""
+    rows = [{"state": "blocked", "number": 500}]
+    buckets = P.partition_by_state_bucket(
+        rows, liveness_scan=P_live.LivenessScan.empty()
+    )
+    assert buckets["blocked"] == rows
+    assert "blocked_reason" not in buckets["blocked"][0]
+
+
+def test_collect_active_spawn_issues_scans_spawn_dirs(tmp_path):
+    """The dispatcher's spawn roots: ``spawn-<N>-<ts>`` outside
+    ``.finished/`` are active; completed spawns move under
+    ``.finished/``."""
+    root_a = tmp_path / "dispatcher-spawns"
+    root_a.mkdir()
+    (root_a / "spawn-858-1794").mkdir()
+    (root_a / "spawn-620-1795").mkdir()
+    (root_a / ".finished").mkdir()
+    (root_a / ".finished" / "spawn-100-1700").mkdir()  # must NOT be counted
+
+    root_b = tmp_path / "speaking-spawns"
+    root_b.mkdir()
+    (root_b / "spawn-7-1796").mkdir()
+    (root_b / "not-a-spawn").mkdir()  # name doesn't match pattern — skipped
+
+    missing = tmp_path / "does-not-exist"  # OS error-safe
+
+    out = P_live._collect_active_spawn_issues([root_a, root_b, missing])
+    assert out == frozenset({"858", "620", "7"})
+
+
+def test_livenessscan_collect_degrades_to_empty_when_paths_missing(tmp_path, monkeypatch):
+    """Missing repo / spawn roots must produce an empty scan rather
+    than crashing the renderer."""
+    monkeypatch.setenv("GIT_REPO_DIR", str(tmp_path / "nope-repo"))
+    scan = P_live.LivenessScan.collect(
+        spawn_roots=(tmp_path / "nope-spawns",),
+    )
+    assert scan.worktrees == ()
+    assert scan.active_spawn_issues == frozenset()
+    # ps_output may be real (we ran ps on the host); that's fine — the
+    # probe stays safe because a random ps line won't match an issue
+    # number we didn't ask about.
+
+
+def test_render_in_flight_demotes_rows_with_no_live_signal(tmp_path, monkeypatch):
+    """End-to-end through the renderer: an issue tagged ``sm:building``
+    whose worker has vanished must NOT appear in the In-flight tier
+    and MUST appear in the Blocked tier with a ``blocked_reason``.
+
+    Reproduces the exact ghost-building-task failure Jason flagged:
+    SM state says "building" but there's no worker alive anywhere.
+    """
+    cfg = _mk_cfg_with_pipeline_states(
+        tmp_path, [], monkeypatch
+    )
+    # Hand-build issues bypassing _mk_cfg_with_pipeline_states' auto-live patch.
+    issues = [
+        _issue(858, "sm:building", "art:code"),  # will be marked live
+        _issue(999, "sm:building", "art:code"),  # stale (no signal)
+    ]
+    rows, failed = P.fetch_issues(
+        ["jcronq/alice"], runner=_runner({"jcronq/alice": issues})
+    )
+    cfg.pollers._set("pipeline", {"issues": rows, "failed": failed})
+
+    # Only #858 has a live signal.
+    from status_site.sources.running_now import Worktree
+    fake_scan = P_live.LivenessScan(
+        ps_output="",
+        worktrees=(Worktree(path="/tmp/alice-858-wt", branch="feat/858-x"),),
+        active_spawn_issues=frozenset(),
+    )
+    monkeypatch.setattr(
+        P_live.LivenessScan, "collect",
+        classmethod(lambda cls, **kw: fake_scan),
+    )
+
+    in_flight = section_renderers(cfg)["in_flight"]()
+    blocked = section_renderers(cfg)["blocked"]()
+
+    inflight_nums = {r["number"] for r in in_flight["pipeline"]}
+    blocked_nums = {r["number"] for r in blocked["rows"]}
+    assert 858 in inflight_nums and 999 not in inflight_nums
+    assert 999 in blocked_nums
+    # The demoted row carries its reason for the UI.
+    ghost = next(r for r in blocked["rows"] if r["number"] == 999)
+    assert ghost["blocked_reason"].startswith("worker vanished — ")
