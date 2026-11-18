@@ -251,6 +251,11 @@ services:
       # inside this image (no alice-mind under /root, and the status
       # service never has a real HOME anyway). See issue #849.
       ALICE_STATE_DB_PATH: /srv/state/alice-state.db
+      # Pin ALICE_MIND so ``_tasks_dir()`` resolves to the mounted
+      # task store (above). Without this, the resolver falls back to
+      # ``~/alice-mind`` which doesn't exist inside the alpine image
+      # — leaving Tracked-tasks and WoY-task sources silently empty.
+      ALICE_MIND: /srv/mind
     ports:
       - "8095:8095"
     volumes:
@@ -267,6 +272,12 @@ services:
       # requires; a file-level bind would leave the sidecars invisible.
       # Read-only on this side: the status-site is strictly a consumer.
       - ${ALICE_MIND:-${HOME}/alice-mind}/inner/state:/srv/state:ro
+      # SM v2 task store — read-only. Powers the Tracked-tasks tier and
+      # (slice #900) the structured ``kind=woy`` rows that drive the
+      # Waiting-on-you section. The server resolves ``_tasks_dir()``
+      # against ``ALICE_MIND``, so we bind to the canonical
+      # ``~/alice-mind/inner/tasks`` path and pin ALICE_MIND below.
+      - ${ALICE_MIND:-${HOME}/alice-mind}/inner/tasks:/srv/mind/inner/tasks:ro
     healthcheck:
       test:
         - "CMD"
