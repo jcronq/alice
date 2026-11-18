@@ -309,13 +309,21 @@ def partition_by_state_bucket(
     that want a particular order should :func:`sort_rows` afterward.
 
     **Liveness cross-check (slice 2b):** when ``liveness_scan`` is
-    provided, every row that would land in ``in_flight`` is probed via
-    :func:`pipeline_liveness.is_task_live`. Rows with no live signal
-    are shallow-copied, annotated with
+    provided *and* observable, every row that would land in
+    ``in_flight`` is probed via :func:`pipeline_liveness.is_task_live`.
+    Rows with no live signal are shallow-copied, annotated with
     ``blocked_reason = "worker vanished — <evidence>"``, and routed to
     ``blocked`` instead. Rows that *do* match a signal are passed
     through unchanged. The original row dict is never mutated —
     callers reusing the input list see no side-effect.
+
+    **Sandbox safety:** when the scan has no signals *to see*
+    (:attr:`LivenessScan.is_observable` is False — no worktrees, no
+    active spawn dirs), the renderer can't distinguish a dead worker
+    from a container that lacks the bind mounts needed to observe
+    live workers. In that case we fall back to the label-only
+    partition rather than demoting every in-flight row. See
+    :meth:`LivenessScan.is_observable`.
 
     When ``liveness_scan`` is ``None`` the function reverts to the
     label-only partition (the pre-slice-2b behaviour), so test
@@ -327,10 +335,13 @@ def partition_by_state_bucket(
         "queued": [],
         "other": [],
     }
+    scan_is_informative = (
+        liveness_scan is not None and liveness_scan.is_observable
+    )
     for r in rows:
         state = str(r.get("state") or "")
         if state in INFLIGHT_STATES:
-            if liveness_scan is None:
+            if not scan_is_informative:
                 out["in_flight"].append(r)
                 continue
             live, evidence = is_task_live(r, liveness_scan)
