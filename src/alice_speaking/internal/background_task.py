@@ -53,6 +53,18 @@ class BackgroundTaskCompleteEvent:
         principal_name: Display name of the principal who originally
             triggered the dispatch. Surfaced in the prompt for
             context and used for outbound event tagging.
+        item_slug: Status-site item slug this dispatch is in service
+            of, or ``None`` when the dispatch doesn't tie to a WoY
+            item (most generic Agent / Bash calls). When set, the
+            completion handler emits the ended-at stage-run POST so
+            the item's stage dots advance from running → terminal.
+            See :mod:`alice_speaking.stage_run_client`.
+        stage: Which stage-timeline bucket (``design`` / ``build`` /
+            ``review``) the dispatch belongs to. Only meaningful when
+            ``item_slug`` is set; ignored otherwise.
+        started_at: ISO string captured at dispatch time, echoed back
+            on the ended-at POST so the latest-run tooltip can show
+            both anchors. Empty when stage-run emission is disabled.
     """
 
     handle: str
@@ -61,6 +73,9 @@ class BackgroundTaskCompleteEvent:
     is_error: bool
     channel: Optional[ChannelRef]
     principal_name: str
+    item_slug: Optional[str] = None
+    stage: Optional[str] = None
+    started_at: str = ""
 
 
 class BackgroundTaskCompletionSource:

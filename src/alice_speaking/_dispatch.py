@@ -26,6 +26,7 @@ from core.sdk_compat import _short
 
 from . import signal_outbound
 from . import slash_commands
+from . import stage_run_client as stage_run_client_module
 from . import worker_markers as worker_markers_module
 from . import worker_report as worker_report_module
 from .domain.turn_log import new_turn
@@ -1261,6 +1262,33 @@ async def handle_background_task_complete(
             reason_count=len(report_issues),
             note_path=(str(note_path) if note_path else None),
         )
+
+    # Slice-timeline daemon wire-up: emit the ended-at stage-run POST
+    # so the item's stage dots advance from running → terminal. Mirrors
+    # the started-at POST in ``_dispatch_subagent``. Soft-fail — a
+    # stage-run write that didn't land doesn't block the completion
+    # turn or the pending-verify note. Only fires when the dispatch
+    # was tied to a WoY item at spawn time; ``item_slug is None``
+    # means the started-at was skipped too (and there's nothing to
+    # close out from the UI's perspective).
+    if event.item_slug and event.stage:
+        try:
+            stage_run_client_module.post_stage_run(
+                item_slug=event.item_slug,
+                stage=event.stage,
+                status="failed" if event.is_error else "success",
+                task_id=event.handle,
+                started_at=event.started_at,
+                ended_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                summary=_short(event.result_text or event.description, 200),
+            )
+        except Exception:  # noqa: BLE001 — soft-fail invariant
+            log.exception(
+                "stage_run ended-at POST crashed for %s (%s/%s)",
+                event.handle,
+                event.item_slug,
+                event.stage,
+            )
 
     # Issue #789 PR 1: persistent worker-completed marker. Partners
     # with :func:`alice_speaking.worker_markers.write_dispatch_marker`

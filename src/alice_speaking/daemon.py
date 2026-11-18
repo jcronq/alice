@@ -58,6 +58,7 @@ from . import _dispatch as _dispatch_module
 from . import auto_fix as auto_fix_module
 from . import cron_hook as cron_hook_module
 from . import factory as factory_module
+from . import stage_run_client as stage_run_client_module
 from . import tools as tools_module
 from . import worker_markers as worker_markers_module
 from . import worker_report as worker_report_module
@@ -1559,9 +1560,41 @@ class SpeakingDaemon:
         # workflows. The intake call cascades draft → selected →
         # building; the completion handler in _dispatch transitions
         # building → done (PR URL) or building → blocked (error).
-        auto_fix_module.record_auto_fix_task_intake(
+        auto_fix_task_id = auto_fix_module.record_auto_fix_task_intake(
             instructions, handle, title=description
         )
+
+        # Slice-timeline daemon wire-up: emit the started-at stage-run
+        # POST so the WoY expanded card's dots advance from grey to
+        # running orange. Soft-fail — if the status site is down, we
+        # log and keep dispatching. See PR #890 for the write edge and
+        # :mod:`alice_speaking.stage_run_client` for the client. Not
+        # every dispatch ties to a WoY item: when ``infer_item_slug``
+        # returns ``None``, we skip emission entirely (not a bug — the
+        # feature is item-scoped and most generic Agent calls aren't).
+        stage = stage_run_client_module.infer_stage(description, instructions)
+        item_slug = stage_run_client_module.infer_item_slug(
+            description, instructions, task_id=auto_fix_task_id
+        )
+        started_at_iso = ""
+        if item_slug:
+            started_at_iso = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            try:
+                stage_run_client_module.post_stage_run(
+                    item_slug=item_slug,
+                    stage=stage,
+                    status="running",
+                    task_id=handle,
+                    started_at=started_at_iso,
+                    summary=description[:200],
+                )
+            except Exception:  # noqa: BLE001 — soft-fail invariant
+                log.exception(
+                    "stage_run started-at POST crashed for %s (%s/%s)",
+                    handle,
+                    item_slug,
+                    stage,
+                )
 
         # Prepend the structured-report preamble so the sub-agent
         # knows exactly what shape it owes back (self-directed-agents
@@ -1631,6 +1664,9 @@ class SpeakingDaemon:
                             is_error=is_error,
                             channel=channel,
                             principal_name=principal,
+                            item_slug=item_slug,
+                            stage=stage,
+                            started_at=started_at_iso,
                         )
                     )
                 except asyncio.QueueFull:
