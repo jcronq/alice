@@ -247,7 +247,7 @@ if [ -n "$SIGNAL_ACCOUNT_VAL" ]; then
     cat <<EOF
 $step. Register Signal (once, interactive — the sandbox must be up):
       alice-up
-      docker exec -it alice signal-cli -a "$SIGNAL_ACCOUNT_VAL" link -n "Alice"
+      docker exec -it -u alice alice signal-cli link -n "Alice"
    Scan the QR code with your phone's Signal app.
 
 EOF
