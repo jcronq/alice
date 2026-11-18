@@ -48,9 +48,17 @@ log = logging.getLogger(__name__)
 SEARCH_URL: str = "https://www.myanonamouse.net/tor/js/loadSearchJSONbasic.php"
 
 #: Per-user, cookie-less download URL template. MAM issues a per-row
-#: ``dl`` hash; this URL is safe to hand off to qBit later without
-#: mounting the session cookie.
+#: ``dl`` hash when the response includes it; this URL is safe to hand
+#: off to qBit later without mounting the session cookie.
 DOWNLOAD_URL_TEMPLATE: str = "https://www.myanonamouse.net/tor/download.php/{dl}?tid={tid}"
+
+#: tid-only fallback: when the MAM search response omits the ``dl``
+#: hash (observed live for the loadSearchJSONbasic endpoint on some
+#: rows / account states), the cookied endpoint at ``?tid=`` still
+#: returns the .torrent bytes. The cookie is required for this one,
+#: so it's not safely handoff-able to Jackett — but Slice 2's acquire
+#: step holds the cookie anyway.
+DOWNLOAD_URL_TID_ONLY_TEMPLATE: str = "https://www.myanonamouse.net/tor/download.php?tid={tid}"
 
 #: MAM ``main_cat`` enum. 14 = E-Books is the default — most of
 #: Jason's requests are ebook titles.
@@ -273,17 +281,49 @@ def _parse_filetypes(raw: Any) -> list[str]:
     return out
 
 
+#: Binary size units MAM uses in the "2.0 MiB" string form.
+_SIZE_UNITS: dict[str, int] = {
+    "b": 1,
+    "kib": 1024,
+    "mib": 1024 ** 2,
+    "gib": 1024 ** 3,
+    "tib": 1024 ** 4,
+    "kb": 1000,
+    "mb": 1000 ** 2,
+    "gb": 1000 ** 3,
+    "tb": 1000 ** 4,
+}
+
+
 def _parse_int(raw: Any, default: int = 0) -> int:
-    """MAM mixes int and str-of-int for ``size``, ``seeders`` etc."""
+    """MAM mixes int and str-of-int for ``size``, ``seeders`` etc.
+
+    Also accepts the human-readable size form live MAM uses on the
+    JSON Search endpoint (``"2.0 MiB"``) — fixture had raw bytes, but
+    the live response ships formatted strings for ``size``.
+    """
     if isinstance(raw, bool):  # bool is int — reject explicitly
         return int(raw)
     if isinstance(raw, int):
         return raw
     if isinstance(raw, str):
+        s = raw.strip()
         try:
-            return int(raw.strip())
+            return int(s)
         except (ValueError, AttributeError):
-            return default
+            pass
+        # "2.0 MiB" / "550 KB" / "1.3 GiB" form
+        parts = s.split()
+        if len(parts) == 2:
+            num_s, unit_s = parts
+            unit = unit_s.lower()
+            mult = _SIZE_UNITS.get(unit)
+            if mult is not None:
+                try:
+                    return int(float(num_s) * mult)
+                except (ValueError, TypeError):
+                    return default
+        return default
     try:
         return int(raw)  # type: ignore[arg-type]
     except (TypeError, ValueError):
@@ -307,9 +347,13 @@ def _normalise_row(row: dict[str, Any]) -> Candidate | None:
     if tid <= 0:
         return None
     dl_hash = str(row.get("dl") or "").strip()
-    download_url = (
-        DOWNLOAD_URL_TEMPLATE.format(dl=dl_hash, tid=tid) if dl_hash else ""
-    )
+    if dl_hash:
+        download_url = DOWNLOAD_URL_TEMPLATE.format(dl=dl_hash, tid=tid)
+    else:
+        # Live MAM responses commonly omit ``dl``. The cookied tid-only
+        # endpoint still delivers the .torrent bytes — Slice 2's acquire
+        # path mounts the cookie anyway.
+        download_url = DOWNLOAD_URL_TID_ONLY_TEMPLATE.format(tid=tid)
     return Candidate(
         id=tid,
         title=str(row.get("title") or "").strip(),
