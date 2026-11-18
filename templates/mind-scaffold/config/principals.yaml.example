@@ -5,11 +5,19 @@
 # from the ALLOWED_SENDERS env var (legacy fallback). Authoring this
 # file lets you specify multiple channels per person, a preferred
 # channel, and the local-CLI principal.
+#
+# Slash-command ACL (issue #624): the per-verb ACL for ``/pause``,
+# ``/food``, etc. lives in ``alice_speaking.slash_commands`` — not
+# here. Principal ids in this file are matched against that registry
+# at dispatch time (jcronq / jason → every verb; katie → /ack /food
+# /log /help). Adding a ``slash_commands: all`` key here is informational
+# only; the registry is authoritative.
 
 principals:
   owner:
     display_name: Owner
     allowed: true
+    slash_commands: all        # informational — see note above
     channels:
       - transport: signal
         address: "+15555550100"     # E.164; preferred=true picked when no transport hint

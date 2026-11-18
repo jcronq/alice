@@ -120,6 +120,7 @@ from status_site.sources import (
     chat as _chat_page,
     resources as _resources_page,
     review as _review_page,
+    slash_commands as _slash_commands_page,
 )
 from status_site.sources.bugs import (
     format_pricing_segment as _format_pricing_segment,
@@ -2497,6 +2498,9 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
     def _render_page_resources() -> dict:
         return _resources_page.render(cfg)
 
+    def _render_page_slash_commands() -> dict:
+        return _slash_commands_page.render(cfg)
+
     # Preserve Overview order; the SSE client iterates this dict to
     # draw sections top-to-bottom. Page sections live alongside
     # Overview sections in the same snapshot — the client only mounts
@@ -2520,6 +2524,7 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         "page:bugs": _render_page_bugs,
         "page:review": _render_page_review,
         "page:resources": _render_page_resources,
+        "page:slash-commands": _render_page_slash_commands,
     }
 
 
@@ -4358,6 +4363,22 @@ class Handler(BaseHTTPRequestHandler):
             from status_site.sources.resources import render_resources_md
 
             body = render_resources_md()
+            return self._send(
+                200,
+                body.encode("utf-8"),
+                "text/markdown; charset=utf-8",
+                head=head,
+            )
+        if path == "/slash-commands.md":
+            # Issue #624 — reads the slash_commands registry and
+            # renders a reference page. Lazy import so an alice_speaking
+            # import failure during status-site boot doesn't crash the
+            # whole server (status-site is library-of-leaves by design).
+            from status_site.sources.slash_commands import (
+                render_slash_commands_md,
+            )
+
+            body = render_slash_commands_md()
             return self._send(
                 200,
                 body.encode("utf-8"),

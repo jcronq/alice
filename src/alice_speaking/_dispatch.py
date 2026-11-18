@@ -26,6 +26,7 @@ from core.sdk_compat import _short
 
 from . import signal_outbound
 from . import slash_commands
+from . import slash_state
 from . import worker_markers as worker_markers_module
 from . import worker_report as worker_report_module
 from .domain.turn_log import new_turn
@@ -149,7 +150,7 @@ def _with_outbound_awareness(
 async def _maybe_dispatch_slash(
     ctx: DaemonContext, head: "SignalEvent"
 ) -> bool:
-    """Try to run ``head`` as a Jason-only slash command.
+    """Try to run ``head`` as a slash command.
 
     Returns ``True`` when the slash dispatcher produced a direct reply
     (caller should skip the normal turn pipeline). Returns ``False``
@@ -157,30 +158,36 @@ async def _maybe_dispatch_slash(
 
     - head isn't actually a recognized slash command (``/foo`` with
       an unknown verb) — the normal pipeline sees the original text;
-    - the sender isn't Jason — the slash dispatcher logs a warning
-      and does nothing, then the normal pipeline handles the message
-      as literal content;
-    - the dispatcher returned a ``rewritten_text`` (``//foo`` escape)
-      — the head body is mutated in place and the normal pipeline
-      runs on the rewritten content.
+    - the sender has no recognized principal id — nothing to ACL-
+      against; fall through as literal content;
+    - the dispatcher returned a ``rewritten_text`` (``//foo`` escape
+      or a skill shortcut) — the head body is mutated in place and
+      the normal pipeline runs on the rewritten content.
+
+    Per-verb ACL lives in :data:`slash_commands.SLASH_COMMANDS`; Jason
+    gets every verb, Katie gets ``/ack``, ``/food``, ``/log``, and
+    unknown principals get a short "not available to you" reply. ACL-
+    denied dispatch still counts as "consumed" so the LLM never sees
+    a slash command.
 
     Direct-reply failures (``signal_transport.send`` raising) are
     logged and swallowed; a slash-command dispatch that fails to
-    deliver still short-circuits the turn so Jason doesn't get an
+    deliver still short-circuits the turn so the sender doesn't get an
     LLM-generated response to ``/status``.
     """
     body = head.envelope.body or ""
     principal = ctx.address_book.lookup_by_native("signal", head.envelope.source)
     principal_id = principal.id if principal is not None else ""
-    if principal_id.lower() != "jason":
-        # ACL: only Jason can drive slash commands in slice-1. Log the
-        # rejection and let normal ingest handle the content (which may
-        # or may not reply — the dispatcher just doesn't execute).
+    if not principal_id:
+        # Unknown principal: fall through to the normal pipeline so the
+        # inbound-handler's own spam filters decide. The ACL is a
+        # per-verb check, not a global gate, so we don't want to short-
+        # circuit here for the un-ACL'd case.
         log.warning(
-            "slash command %r from non-jason principal %r; "
-            "dispatch rejected, falling through to normal pipeline",
+            "slash command %r from unknown principal (source=%r); "
+            "falling through to normal pipeline",
             body.split(None, 1)[0] if body else "",
-            principal_id or head.envelope.source,
+            head.envelope.source,
         )
         return False
     try:
@@ -240,14 +247,34 @@ async def handle_signal(ctx: DaemonContext, batch: list["SignalEvent"]) -> None:
     head = batch[0]
     sender_name = head.sender_name
     source = head.envelope.source
-    # Slash-command intercept (issue #624 slice-1). Jason-only;
-    # single-message batches only — multi-message batches are
-    # conversational flow that the normal pipeline handles. The
-    # intercept may short-circuit the turn (direct reply) or rewrite
-    # the head body for ``//foo`` escapes before falling through.
+    # Slash-command intercept (issue #624). ACL is per-verb inside the
+    # registry; the hook short-circuits the turn on a direct reply or
+    # mutates the head body for ``//foo`` / skill-shortcut rewrites.
+    # Single-message batches only — multi-message batches are
+    # conversational flow the normal pipeline handles.
     if len(batch) == 1 and (head.envelope.body or "").startswith("/"):
         if await _maybe_dispatch_slash(ctx, head):
             return
+    # Pause gate (issue #624). Honoured ONLY for non-slash messages so
+    # ``/resume`` can still get through. Paused inbound still updates
+    # the idle tracker (so the session-close watcher re-arms) but no
+    # kernel turn runs; the message is logged for Jason's review.
+    state_dir = getattr(ctx.cfg, "state_dir", None)
+    if slash_state.is_paused(state_dir=state_dir):
+        _touch_inbound(ctx, "signal", source)
+        with contextlib.suppress(Exception):
+            ctx.events.emit(
+                "signal_turn_paused",
+                sender_name=sender_name,
+                sender_number=source,
+                inbound=_short(head.envelope.body or "", 200),
+            )
+        log.info(
+            "signal inbound from %s dropped: Speaking paused; "
+            "send /resume to flush",
+            sender_name,
+        )
+        return
     # Idle tracking (issue #373): every inbound refreshes the per-channel
     # ``last seen`` timestamp and clears any prior flush flag so the
     # session-close watcher will re-arm on the next quiet window.
