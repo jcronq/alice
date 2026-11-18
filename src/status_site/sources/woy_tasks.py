@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
 from status_site.history import title_slug
-from status_site.sources import tasks as _tasks
+from status_site.sources import tasks as _tasks  # noqa: F401 — kept for test parity
 
 SOURCE_NAME = "woy-tasks"
 
@@ -102,6 +102,40 @@ def _title_from(verb: Optional[str], target: Optional[str], fallback_title: str)
     return fallback_title.strip()
 
 
+def _load_task_scalars(f: Path) -> Optional[dict]:
+    """Load a task.yaml as a dict, preferring PyYAML for multi-line scalars.
+
+    ``status_site`` is nominally stdlib-only, but ``alice_forge.task_store``
+    is bind-mounted into the status-site container specifically so the WoY
+    source can round-trip the full ``context`` field (block-folded scalars
+    the minimal parser would truncate — see :mod:`status_site.sources.tasks`).
+
+    Falls back to :func:`status_site.sources.tasks._parse_task_yaml` when
+    neither PyYAML nor alice_forge.task_store is importable — the row stays
+    serviceable but a multi-line ``context`` may truncate.
+    """
+    try:
+        text = f.read_text(errors="replace")
+    except OSError:
+        return None
+    try:
+        import yaml as _yaml  # type: ignore
+    except ImportError:
+        _yaml = None  # type: ignore
+    if _yaml is not None:
+        try:
+            data = _yaml.safe_load(text)
+            if isinstance(data, dict):
+                return data
+        except Exception:  # noqa: BLE001 — fall back below
+            pass
+    # Last-resort: the minimal parser from ``sources.tasks``. Multi-line
+    # scalars (block-folded ``context`` values) truncate to the first line
+    # here; the PyYAML path above handles them correctly.
+    scalars, _tags = _tasks._parse_task_yaml(text)
+    return dict(scalars) if scalars else None
+
+
 def scan_woy_tasks(
     tasks_dir: Path, *, now: float, include_snoozed: bool = False
 ) -> list[dict]:
@@ -126,32 +160,41 @@ def scan_woy_tasks(
             continue
         f = d / "task.yaml"
         try:
-            text = f.read_text(errors="replace")
             mtime = f.stat().st_mtime
         except OSError:
             continue
-        scalars, _tags = _tasks._parse_task_yaml(text)
-        if (scalars.get("kind") or "").lower() != "woy":
+        scalars = _load_task_scalars(f)
+        if not scalars:
             continue
-        status = (scalars.get("status") or "").lower()
+        if str(scalars.get("kind") or "").lower() != "woy":
+            continue
+        status = str(scalars.get("status") or "").lower()
         if status not in WOY_VISIBLE_STATUSES:
             continue
-        snooze_until = (scalars.get("snooze_until") or "").strip() or None
+        snooze_raw = scalars.get("snooze_until")
+        snooze_until = str(snooze_raw).strip() if snooze_raw else None
+        if snooze_until == "":
+            snooze_until = None
         if not include_snoozed and _is_snoozed(snooze_until, now):
             continue
-        verb = (scalars.get("verb") or "").strip() or None
-        target = (scalars.get("target") or "").strip() or None
-        context = (scalars.get("context") or "").strip() or None
-        title_text = _title_from(verb, target, scalars.get("title") or "")
+        verb = str(scalars.get("verb") or "").strip() or None
+        target = str(scalars.get("target") or "").strip() or None
+        context = str(scalars.get("context") or "").strip() or None
+        title_text = _title_from(verb, target, str(scalars.get("title") or ""))
         slug = title_slug(title_text) if title_text else ""
         ts = (
             _parse_iso(scalars.get("created"))
             or _parse_iso(scalars.get("updated"))
             or mtime
         )
-        external_raw = (scalars.get("external") or "").strip().lower()
-        external = external_raw in {"1", "true", "yes", "y"} if external_raw else True
-        task_id = (scalars.get("id") or d.name).strip()
+        external_raw = scalars.get("external")
+        if isinstance(external_raw, bool):
+            external = external_raw
+        elif external_raw is None:
+            external = True
+        else:
+            external = str(external_raw).strip().lower() in {"1", "true", "yes", "y"}
+        task_id = str(scalars.get("id") or d.name).strip()
         row = {
             "task_id": task_id,
             "verb": verb or "",
