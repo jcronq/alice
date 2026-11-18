@@ -26,6 +26,7 @@ from status_site.server import (
     thinking_queue_rows,
 )
 from status_site.sources import pipeline as P
+from status_site.sources import pipeline_liveness as P_live
 
 STATIC = Path(__file__).resolve().parent.parent / "src" / "status_site" / "static"
 NOW = 1_800_000_000.0
@@ -173,6 +174,20 @@ def test_in_flight_payload_is_alice_owned_only(tmp_path, monkeypatch):
     cfg.surface_dir.mkdir()
     (cfg.surface_dir / "2026-11-06T10-00-00-one.md").write_text(
         "---\ntype: note\nsource: alice\n---\nbody\n"
+    )
+    # Slice 2b: the in_flight renderer liveness-probes every row. The
+    # fixture issue #60 (sm:building) isn't backed by a real worker in
+    # the sandbox, so we hand it a synthetic scan that marks it live —
+    # otherwise the ghost-demotion kicks in and the test breaks for
+    # reasons unrelated to what it's trying to pin.
+    fake_scan = P_live.LivenessScan(
+        ps_output="alice 99 0.0 0.0 /usr/bin/claude --issue 60 --continue",
+        worktrees=(),
+        active_spawn_issues=frozenset(),
+    )
+    monkeypatch.setattr(
+        P_live.LivenessScan, "collect",
+        classmethod(lambda cls, **kw: fake_scan),
     )
     data = section_renderers(cfg)["in_flight"]()
     assert [r["number"] for r in data["pipeline"]] == [60]

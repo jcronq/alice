@@ -107,6 +107,7 @@ from status_site.sources import (
     done_today as _done_today,
     known_issues as _known_issues,
     pipeline as _pipeline,
+    pipeline_liveness as _pipeline_liveness,
     review_queue as _review_queue,
     review_todos as _review_todos,
     running_now as _running_now,
@@ -2397,9 +2398,15 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         # Jason's mental model: "in flight" means an agent is working it
         # *right now*. Carve out the active subset so stalled (blocked)
         # and queued (selected / designed) items don't inflate the tier.
-        # The separate Blocked tier renders ``owner["alice"]``'s blocked
-        # bucket via :func:`_render_blocked`.
-        buckets = _pipeline.partition_by_state_bucket(owner["alice"])
+        # Slice 2b: every row that would otherwise land in in_flight gets
+        # a liveness cross-check against worktrees / ps / active spawn
+        # dirs; failures move to ``blocked`` with a ``blocked_reason``
+        # string so ghost tasks stop inflating the tier when a worker
+        # dies silently.
+        scan = _pipeline_liveness.LivenessScan.collect()
+        buckets = _pipeline.partition_by_state_bucket(
+            owner["alice"], liveness_scan=scan
+        )
         inflight_pipeline = buckets["in_flight"]
         # status-chat messages live on the Chat tab, not as tracked work.
         surfaces = _surface_rows(
@@ -2437,7 +2444,13 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         owner = _pipeline.split_by_owner(
             _pipeline.issue_rows(pipe.get("issues") or [], now=now)
         )
-        blocked_rows = _pipeline.partition_by_state_bucket(owner["alice"])["blocked"]
+        # Share the same liveness scan semantics as ``_render_in_flight``
+        # so a row demoted by the liveness check shows up here with its
+        # ``blocked_reason`` already attached.
+        scan = _pipeline_liveness.LivenessScan.collect()
+        blocked_rows = _pipeline.partition_by_state_bucket(
+            owner["alice"], liveness_scan=scan
+        )["blocked"]
         n = len(blocked_rows)
         return {
             "markdown": f"{n} blocked" if n else "*(nothing blocked)*",
