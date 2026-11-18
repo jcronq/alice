@@ -1,0 +1,3 @@
+# Visual-regression harness output. Only baselines/ is committed.
+current/
+diff/
