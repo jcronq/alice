@@ -11,8 +11,6 @@ from __future__ import annotations
 import asyncio
 import types
 
-import pytest
-
 from alice_speaking import slash_commands, slash_state
 
 
