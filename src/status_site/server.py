@@ -76,7 +76,8 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from typing import Optional
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -114,6 +115,7 @@ from status_site.sources import (
     schedules as _schedules,
     tasks as _tasks,
     waiting_on_you as _waiting_on_you,
+    woy_tasks as _woy_tasks,
 )
 from status_site.sources import (
     bugs as _bugs_page,
@@ -2155,6 +2157,27 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
             filter_dismissed_hand_zone(hand_zone_raw, dismissed)
             if dismissed else hand_zone_raw
         )
+        # ``kind=woy`` SM tasks drive the structured WoY tier. Rendered
+        # as bold-title markdown so Slice-2's chip / dismissal pipeline
+        # attaches to them, AND surfaced as ``woy_tasks`` on the
+        # payload so downstream consumers (and future shell widgets)
+        # can read the structured shape directly.
+        now_epoch = time.time()
+        woy_task_rows = _woy_tasks.scan_woy_tasks(
+            _tasks_dir(), now=now_epoch
+        )
+        # Server-side dismissal overlay: drop rows whose slug the
+        # ``.woy-dismissed.jsonl`` ledger already carries so a chip
+        # click doesn't wait for the task-store write to propagate.
+        if dismissed:
+            woy_task_rows = [
+                r for r in woy_task_rows if r.get("slug") not in dismissed
+            ]
+        woy_task_md = _woy_tasks.render_markdown(woy_task_rows)
+        if woy_task_md:
+            hand_zone_md = (
+                f"{hand_zone_md}\n\n{woy_task_md}" if hand_zone_md else woy_task_md
+            )
         rows = _ask_rows()
         if dismissed:
             rows = filter_dismissed_asks(rows, dismissed)
@@ -2190,14 +2213,20 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
         # slugs the server considers one-click-actionable — today
         # that's "contains a github.com PR URL" (see ``_detect_pr``).
         # The client renders those under a "Needs your approval"
-        # subheader with inline Accept/Reject buttons.
+        # subheader with inline Accept/Reject buttons. kind=woy task
+        # rows join that list so their chips light up too.
         needs_approval = needs_approval_slugs(hand_zone_md)
+        for r in woy_task_rows:
+            slug = r.get("slug")
+            if slug and slug not in needs_approval:
+                needs_approval.append(slug)
         return {
             "markdown": md,
             "hand_zone_md": hand_zone_md,
             "rows": rows,
             "needs_approval_slugs": needs_approval,
             "review_todos": review_todo_rows,
+            "woy_tasks": _woy_tasks.typed_rows(woy_task_rows),
         }
 
     def _render_alice_queue() -> dict:
@@ -2330,6 +2359,19 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
             filter_dismissed_hand_zone(your_todo_md_raw, dismissed)
             if dismissed else your_todo_md_raw
         )
+        # Splice in ``kind=woy`` SM tasks as bold-title bullets so the
+        # WaitingTable chip flow renders them; the structured
+        # ``woy_tasks`` row set rides on the payload too.
+        woy_task_rows = _woy_tasks.scan_woy_tasks(_tasks_dir(), now=now)
+        if dismissed:
+            woy_task_rows = [
+                r for r in woy_task_rows if r.get("slug") not in dismissed
+            ]
+        woy_task_md = _woy_tasks.render_markdown(woy_task_rows)
+        if woy_task_md:
+            your_todo_md = (
+                f"{your_todo_md}\n\n{woy_task_md}" if your_todo_md else woy_task_md
+            )
         if dismissed:
             ask_rows = filter_dismissed_asks(ask_rows, dismissed)
         external_todos_md = _waiting_on_you.read_hand_zone(
@@ -2359,6 +2401,12 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
                 f"{your_todo_md}\n\n{review_md}" if your_todo_md else review_md
             )
         needs_approval = needs_approval_slugs(your_todo_md)
+        # kind=woy task slugs join ``needs_approval`` so the Accept/
+        # Reject chip pair auto-attaches.
+        for r in woy_task_rows:
+            slug = r.get("slug")
+            if slug and slug not in needs_approval:
+                needs_approval.append(slug)
         # Attention-reacts (👀 ⚠️ 👎 ❓) wait on #683; the key is the
         # contract so the widget lights up as soon as it is populated.
         attention_reacts: list[dict] = []
@@ -2369,6 +2417,7 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
             "asks": len(ask_rows) + (1 if your_todo_md else 0),
             "external": 1 if external_todos_md else 0,
             "review_todos": len(review_todo_rows),
+            "woy_tasks": len(woy_task_rows),
         }
         total = sum(counts.values())
         return {
@@ -2381,6 +2430,7 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
             "needs_approval_slugs": needs_approval,
             "external_todos_md": external_todos_md,
             "review_todos": review_todo_rows,
+            "woy_tasks": _woy_tasks.typed_rows(woy_task_rows),
             "counts": counts,
             "failed": {
                 "prs": list(review.get("pr_failed") or []),
@@ -3610,6 +3660,19 @@ def handle_woy_action(cfg: "Config", d: dict) -> dict:
             _append_woy_dismissed(cfg.status_dir, slug=slug, action=action)
             dismissed = True
 
+    # If the slug maps to a ``kind=woy`` SM task, mirror the chip click
+    # into the task store so the structured source agrees with the
+    # dismissal overlay on the next tick. Failures here must not break
+    # the HTTP response — the dismissal is already recorded.
+    woy_task_outcome: Optional[dict] = None
+    if dismissed:
+        try:
+            woy_task_outcome = _maybe_close_woy_task(
+                slug=slug, chip_action=action, actor="jason"
+            )
+        except Exception as e:  # noqa: BLE001 — never block the response
+            woy_task_outcome = {"error": f"task mirror failed: {e!r}"}
+
     resp: dict = {
         "ok": True,
         "slug": slug,
@@ -3622,6 +3685,195 @@ def handle_woy_action(cfg: "Config", d: dict) -> dict:
         resp["merged"] = merged
     if merge_error:
         resp["error"] = merge_error
+    if woy_task_outcome:
+        resp["woy_task"] = woy_task_outcome
+    return resp
+
+
+# ------------------------------------------------------------------ WoY task actions
+#
+# The dedicated ``/api/woy/action`` endpoint handles the three
+# accept_descriptor actions attached to structured ``kind=woy`` task
+# rows: ``task-close`` / ``task-snooze`` / ``task-reject``. Lives
+# alongside the markdown-zone ``/api/woy-action`` handler above so
+# both call sites share the dismissal + thread-append plumbing.
+
+
+WOY_TASK_ACTIONS = ("task-close", "task-snooze", "task-reject")
+
+#: Default snooze window — "tomorrow 09:00 in the container-local
+#: timezone". Keeps the semantic simple: a snooze pushes the item off
+#: today's list without auto-expiring too aggressively. Jason can
+#: still call ``task snooze`` with a custom ``--until`` for anything
+#: more exotic.
+_DEFAULT_SNOOZE_HOUR = 9
+
+
+def _default_snooze_until(now: Optional[datetime] = None) -> str:
+    """ISO-8601 ``snooze_until`` for a "snooze till tomorrow 9am" click.
+
+    ``tomorrow`` is relative to the container clock; the frontend
+    chip's explanatory text should match. Returned string carries a
+    numeric timezone offset (``-05:00`` style), never ``Z`` — same
+    as the rest of the task store.
+    """
+    base = (now or datetime.now()).astimezone()
+    # "Tomorrow at 09:00 local" — if it's already past 9 am today
+    # we still roll to tomorrow (snoozing BACK to this morning is a
+    # no-op).
+    tomorrow = (base + timedelta(days=1)).replace(
+        hour=_DEFAULT_SNOOZE_HOUR, minute=0, second=0, microsecond=0
+    )
+    return tomorrow.isoformat(timespec="seconds")
+
+
+def _woy_tasks_root() -> Path:
+    return _tasks_dir()
+
+
+def _resolve_woy_slug_to_task_id(slug: str) -> Optional[str]:
+    """Walk the task store for a kind=woy task whose title slug matches."""
+    return _woy_tasks.slug_to_task_id(_woy_tasks_root(), slug)
+
+
+def _maybe_close_woy_task(
+    *, slug: str, chip_action: str, actor: str
+) -> Optional[dict]:
+    """Mirror a markdown-zone accept/reject into the task store.
+
+    Returns a dict describing what happened (task_id + outcome) when
+    the slug matched a kind=woy task; ``None`` when the slug didn't
+    resolve or chip_action wasn't accept/reject. Exceptions propagate —
+    the caller wraps them in a best-effort try/except because the
+    thread/dismissal write is already committed.
+    """
+    task_id = _resolve_woy_slug_to_task_id(slug)
+    if not task_id:
+        return None
+    outcome = {"accept": "done", "reject": "rejected"}.get(chip_action)
+    if outcome is None:
+        return {"task_id": task_id, "skipped": chip_action}
+    from alice_forge.task_store import TaskStore as _TS
+
+    store = _TS(_woy_tasks_root())
+    record = store.woy_close(
+        task_id, outcome=outcome, actor=actor, reason=f"WoY chip: {chip_action}"
+    )
+    return {"task_id": task_id, "outcome": record.status}
+
+
+def handle_woy_task_action(cfg: "Config", d: dict) -> dict:
+    """Execute a ``task-close`` / ``task-snooze`` / ``task-reject`` descriptor.
+
+    Body: ``{key, task_id, action[, until]}``. ``action`` must be one
+    of :data:`WOY_TASK_ACTIONS`; ``task-snooze`` honours an optional
+    ``until`` ISO-8601 override, otherwise defaults to tomorrow 09:00
+    local.
+
+    Authenticated against ``cfg.key`` — the shared reply key the Chat
+    tab and the ``/api/woy-action`` endpoint already use. Writes the
+    transition into the backing task AND appends a thread entry under
+    the task's WoY slug so the item timeline stays coherent.
+    """
+    if not isinstance(d, dict):
+        raise ReplyError(400, "bad json")
+    if not hmac.compare_digest(str(d.get("key", "")).encode(), cfg.key.encode()):
+        raise ReplyError(403, "bad key")
+    action = str(d.get("action", "")).lower()
+    if action not in WOY_TASK_ACTIONS:
+        raise ReplyError(400, "bad action")
+    task_id_raw = str(d.get("task_id") or "").strip()
+    if not task_id_raw:
+        raise ReplyError(400, "missing task_id")
+    # Shape guard: `task-NNNN` style ids only.
+    if not re.match(r"^task-\d{4,}$", task_id_raw):
+        raise ReplyError(400, "bad task_id")
+
+    from alice_forge.task_store import (
+        TaskNotFound as _TNF,
+        TaskStore as _TS,
+        TaskStoreError as _TSErr,
+    )
+
+    store = _TS(_woy_tasks_root())
+    try:
+        record = store.load(task_id_raw)
+    except _TNF:
+        raise ReplyError(404, "task not found")
+    if (record.kind or "").lower() != "woy":
+        raise ReplyError(409, "task is not kind=woy")
+
+    verb = (record.verb or "").strip()
+    target = (record.target or "").strip()
+    title_text = " ".join(b for b in [verb, target] if b).strip() or record.title
+    slug = _title_slug(title_text) if title_text else safe_slug(task_id_raw)
+
+    try:
+        if action == "task-close":
+            updated = store.woy_close(
+                task_id_raw, outcome="done", actor="jason",
+                reason="WoY descriptor: task-close",
+            )
+            thread_message = "Done"
+            payload_outcome = {
+                "task_id": task_id_raw, "outcome": updated.status,
+            }
+            dismiss = True
+        elif action == "task-reject":
+            updated = store.woy_close(
+                task_id_raw, outcome="rejected", actor="jason",
+                reason="WoY descriptor: task-reject",
+            )
+            thread_message = "Rejected"
+            payload_outcome = {
+                "task_id": task_id_raw, "outcome": updated.status,
+            }
+            dismiss = True
+        else:  # task-snooze
+            raw_until = str(d.get("until") or "").strip()
+            until = raw_until or _default_snooze_until()
+            updated = store.snooze(
+                task_id_raw, until=until, actor="jason",
+                reason="WoY descriptor: task-snooze",
+            )
+            thread_message = f"Snoozed until {until}"
+            payload_outcome = {
+                "task_id": task_id_raw,
+                "outcome": "snoozed",
+                "snooze_until": until,
+            }
+            # Snooze dismisses too so the item hides immediately; the
+            # next render will re-filter by snooze_until anyway, but
+            # the overlay keeps the chip from bouncing back on a
+            # fast Overview refresh before the FS write propagates.
+            dismiss = True
+    except _TSErr as exc:
+        raise ReplyError(400, str(exc))
+
+    with cfg.lock:
+        append_thread(
+            cfg,
+            slug,
+            {
+                "from": "jason",
+                "at": now_iso(),
+                "text": thread_message,
+                "action": action,
+                "task_id": task_id_raw,
+            },
+        )
+        if dismiss:
+            _append_woy_dismissed(cfg.status_dir, slug=slug, action=action)
+
+    resp = {
+        "ok": True,
+        "slug": slug,
+        "task_id": task_id_raw,
+        "action": action,
+        "dismissed": dismiss,
+        "thread_message": thread_message,
+        **payload_outcome,
+    }
     return resp
 
 
@@ -4493,6 +4745,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/review-action": handle_review_action,
             "/api/bug-action": handle_bug_action,
             "/api/woy-action": handle_woy_action,
+            "/api/woy/action": handle_woy_task_action,
             "/api/woy-steer": handle_woy_steer,
             "/api/review-todo-click": handle_review_todo_click,
             "/api/effort": handle_effort_action,

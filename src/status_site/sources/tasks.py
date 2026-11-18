@@ -242,6 +242,11 @@ def scan_tasks(
             continue
         if _has_github_backing(scalars, tags):
             continue
+        # ``kind=woy`` tasks belong in the Waiting-on-you tier
+        # (rendered by ``sources.woy_tasks``); showing them under
+        # Tracked tasks too would double-surface the same item.
+        if (scalars.get("kind") or "").lower() == "woy":
+            continue
         ts = (
             _parse_iso(scalars.get("created"))
             or _parse_iso(scalars.get("updated"))

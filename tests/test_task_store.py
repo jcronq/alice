@@ -315,3 +315,105 @@ def test_default_root_honours_alice_mind_dir(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv("TASKS_DIR", raising=False)
     monkeypatch.setenv("ALICE_MIND_DIR", str(tmp_path / "mind"))
     assert default_root() == tmp_path / "mind" / "inner" / "tasks"
+
+
+# ---------------------------------------------------------------------------
+# WoY schema extension (kind/verb/target/context/external/snooze_until)
+
+
+def test_create_with_kind_woy_serialises_optional_fields(store: TaskStore) -> None:
+    record = store.create(
+        title="Call Randy Sosa at NAM",
+        kind="woy",
+        verb="Call",
+        target="Randy Sosa at NAM",
+        context="Withdraw case 674699.",
+    )
+    assert record.kind == "woy"
+    assert record.verb == "Call"
+    assert record.target == "Randy Sosa at NAM"
+    assert record.context == "Withdraw case 674699."
+    # external defaults to True for kind=woy
+    assert record.external is True
+    # Reloading the record from disk preserves the fields.
+    reloaded = store.load(record.id)
+    assert reloaded.kind == "woy"
+    assert reloaded.verb == "Call"
+    assert reloaded.target == "Randy Sosa at NAM"
+    assert reloaded.context == "Withdraw case 674699."
+    assert reloaded.external is True
+
+
+def test_create_without_kind_leaves_fields_none(store: TaskStore) -> None:
+    """Backward-compat: old code paths (no kind) still work and task.yaml
+    stays clean of the new fields."""
+    record = store.create(title="plain task")
+    assert record.kind is None
+    assert record.verb is None
+    assert record.external is None
+    # task.yaml does NOT carry the new fields.
+    yaml_path = store.root / record.id / "task.yaml"
+    text = yaml_path.read_text()
+    for key in ("kind:", "verb:", "target:", "context:", "external:"):
+        assert key not in text, f"unexpected {key!r} in {text!r}"
+
+
+def test_woy_close_done_terminal(store: TaskStore) -> None:
+    record = store.create(
+        title="Call X", kind="woy", verb="Call", target="X", context="y"
+    )
+    closed = store.woy_close(record.id, outcome="done", actor="jason")
+    assert closed.status == "done"
+    assert closed.snooze_until is None
+    trans = store.transitions(record.id)
+    last = trans[-1]
+    assert last["from"] == "draft"
+    assert last["to"] == "done"
+    assert last.get("action") == "woy_close"
+
+
+def test_woy_close_rejected_terminal(store: TaskStore) -> None:
+    record = store.create(
+        title="x", kind="woy", verb="Call", target="X", context="y"
+    )
+    closed = store.woy_close(record.id, outcome="rejected", actor="jason")
+    assert closed.status == "rejected"
+
+
+def test_woy_close_refuses_non_woy_task(store: TaskStore) -> None:
+    record = store.create(title="code task")  # no kind
+    with pytest.raises(TaskStoreError):
+        store.woy_close(record.id, outcome="done")
+
+
+def test_woy_close_bad_outcome_raises(store: TaskStore) -> None:
+    record = store.create(title="x", kind="woy", verb="C", target="T", context="z")
+    with pytest.raises(TaskStoreError):
+        store.woy_close(record.id, outcome="in-progress")
+
+
+def test_woy_close_idempotent_on_terminal(store: TaskStore) -> None:
+    record = store.create(title="x", kind="woy", verb="C", target="T", context="z")
+    store.woy_close(record.id, outcome="done")
+    # Second call does not raise; record stays done.
+    again = store.woy_close(record.id, outcome="done")
+    assert again.status == "done"
+
+
+def test_snooze_sets_until_without_state_change(store: TaskStore) -> None:
+    record = store.create(title="x", kind="woy", verb="C", target="T", context="z")
+    snoozed = store.snooze(
+        record.id, until="2026-11-19T09:00:00-05:00", reason="till 9am"
+    )
+    assert snoozed.status == "draft"  # SM state untouched
+    assert snoozed.snooze_until == "2026-11-19T09:00:00-05:00"
+    # Clearing works by passing empty string.
+    cleared = store.snooze(record.id, until="")
+    assert cleared.snooze_until is None
+
+
+def test_snooze_refuses_terminal_task(store: TaskStore) -> None:
+    record = store.create(title="x", kind="woy", verb="C", target="T", context="z")
+    store.woy_close(record.id, outcome="done")
+    with pytest.raises(InvalidTransition):
+        store.snooze(record.id, until="2026-11-19T09:00:00-05:00")
