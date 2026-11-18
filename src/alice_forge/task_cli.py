@@ -101,6 +101,50 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Reason for the initial draft transition (logged to transitions.jsonl).",
     )
+    pc.add_argument(
+        "--kind",
+        default=None,
+        help=(
+            "Optional task kind. ``woy`` promotes the task into the "
+            "Waiting-on-you tier on the Overview (requires --verb + "
+            "--target). Free-form so new taxonomies can opt in without "
+            "touching the CLI."
+        ),
+    )
+    pc.add_argument(
+        "--verb",
+        default=None,
+        help=(
+            "Short verb for WoY items (Call / Email / Pull / Send / "
+            "Reboot / Approve / Pick). Combined with --target, this "
+            "drives the bold title Jason reads on Overview."
+        ),
+    )
+    pc.add_argument(
+        "--target",
+        default=None,
+        help=(
+            "Short target for WoY items (1–5 words, e.g. "
+            "``Randy Sosa at NAM``). Follows --verb in the bold title."
+        ),
+    )
+    pc.add_argument(
+        "--context",
+        default=None,
+        help=(
+            "1–2 sentence \"why\" for a WoY item. Renders under the "
+            "bold title; shows up in the item thread on expand."
+        ),
+    )
+    pc.add_argument(
+        "--external",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Mark the task as a user-side action (default True when "
+            "--kind woy). Use --no-external to flip."
+        ),
+    )
 
     # ---- update
     pu = sub.add_parser("update", help="Transition a task to a new status.")
@@ -142,6 +186,33 @@ def _build_parser() -> argparse.ArgumentParser:
             "What must change for unblocking. Required for any → blocked "
             "(SM v2 §Required Transition Fields)."
         ),
+    )
+
+    # ---- snooze
+    psn = sub.add_parser(
+        "snooze",
+        help=(
+            "Hide a WoY task from Overview until a given timestamp. "
+            "Clears when --until is empty."
+        ),
+    )
+    psn.add_argument("id", help="Task id (task-NNNN).")
+    psn.add_argument(
+        "--until",
+        required=True,
+        help=(
+            "ISO-8601 timestamp (``2026-11-19T09:00:00-05:00``) or "
+            "an empty string to clear a prior snooze."
+        ),
+    )
+    psn.add_argument(
+        "--actor",
+        default="speaking",
+        choices=["speaking", "thinking", "jason", "alice"],
+        help="Who is snoozing. Default: speaking.",
+    )
+    psn.add_argument(
+        "--reason", default=None, help="Optional audit reason."
     )
 
     # ---- list
@@ -599,6 +670,23 @@ def _cmd_create(store: TaskStore, args: argparse.Namespace) -> int:
         source=args.source,
         tags=tags,
         reason=args.reason,
+        kind=getattr(args, "kind", None),
+        verb=getattr(args, "verb", None),
+        target=getattr(args, "target", None),
+        context=getattr(args, "context", None),
+        external=getattr(args, "external", None),
+    )
+    _print_record(record, as_json=args.json)
+    return 0
+
+
+def _cmd_snooze(store: TaskStore, args: argparse.Namespace) -> int:
+    """Set / clear ``snooze_until`` on a task (WoY hide until)."""
+    record = store.snooze(
+        args.id,
+        until=args.until,
+        actor=args.actor,
+        reason=args.reason,
     )
     _print_record(record, as_json=args.json)
     return 0
@@ -987,6 +1075,7 @@ _HANDLERS = {
     "list": _cmd_list,
     "view": _cmd_view,
     "close": _cmd_close,
+    "snooze": _cmd_snooze,
     "reindex": _cmd_reindex,
     "db": _cmd_db,
     "deps": _cmd_deps,

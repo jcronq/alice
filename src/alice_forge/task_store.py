@@ -130,6 +130,14 @@ class TaskRecord:
 
     Optional fields default to ``None`` so we can round-trip records
     that pre-date a field addition without losing data.
+
+    Waiting-on-you (``kind=woy``) tasks add five optional scalars —
+    ``kind``, ``verb``, ``target``, ``context``, ``external`` — plus
+    an ``snooze_until`` timestamp used to temporarily hide an item
+    from the WoY tier. Records that don't carry them (every pre-woy
+    task) round-trip untouched: :meth:`to_yaml_dict` drops the fields
+    when they're ``None`` and :func:`_record_from_dict` reads them
+    out of the YAML when they're present.
     """
 
     id: str
@@ -143,6 +151,12 @@ class TaskRecord:
     tags: list[str] = field(default_factory=list)
     artifact_ref: Optional[str] = None
     merge_ref: Optional[str] = None
+    kind: Optional[str] = None
+    verb: Optional[str] = None
+    target: Optional[str] = None
+    context: Optional[str] = None
+    external: Optional[bool] = None
+    snooze_until: Optional[str] = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_yaml_dict(self) -> dict[str, Any]:
@@ -166,6 +180,18 @@ class TaskRecord:
             out["artifact_ref"] = self.artifact_ref
         if self.merge_ref is not None:
             out["merge_ref"] = self.merge_ref
+        if self.kind is not None:
+            out["kind"] = self.kind
+        if self.verb is not None:
+            out["verb"] = self.verb
+        if self.target is not None:
+            out["target"] = self.target
+        if self.context is not None:
+            out["context"] = self.context
+        if self.external is not None:
+            out["external"] = self.external
+        if self.snooze_until is not None:
+            out["snooze_until"] = self.snooze_until
         for k, v in self.extra.items():
             out.setdefault(k, v)
         return out
@@ -447,17 +473,32 @@ class TaskStore:
         tags: Optional[Iterable[str]] = None,
         reason: Optional[str] = None,
         now: Optional[str] = None,
+        kind: Optional[str] = None,
+        verb: Optional[str] = None,
+        target: Optional[str] = None,
+        context: Optional[str] = None,
+        external: Optional[bool] = None,
     ) -> TaskRecord:
         """Allocate a new ``task-NNNN/`` with status=draft.
 
         Writes task.yaml, transitions.jsonl (single ``null → draft``
         line), and appends an index.jsonl entry. Returns the loaded
         :class:`TaskRecord`.
+
+        ``kind`` opts the task into a sibling taxonomy — today only
+        ``woy`` is recognised (Waiting-on-you items; ``external`` auto
+        defaults to ``True``) but the field is free-form so future
+        slices can add their own without re-touching the store. The
+        other four scalars (``verb``, ``target``, ``context``,
+        ``external``) flow through to ``task.yaml`` when set.
         """
         if actor not in {"speaking", "thinking", "jason", "alice"}:
             raise TaskStoreError(f"invalid actor: {actor!r}")
         ts = now or _utc_now_iso()
         tags_list = sorted(set(tags or []))
+        # ``kind=woy`` items are user-side actions by default.
+        if kind == "woy" and external is None:
+            external = True
 
         with self._locked():
             task_id = self._next_id()
@@ -471,6 +512,11 @@ class TaskStore:
                 artifact_type=artifact_type,
                 source=source,
                 tags=tags_list,
+                kind=kind,
+                verb=verb,
+                target=target,
+                context=context,
+                external=external,
             )
             task_dir = self._task_dir(task_id)
             task_dir.mkdir(parents=True, exist_ok=False)
@@ -588,6 +634,120 @@ class TaskStore:
             merge_ref=merge_ref,
             now=now,
         )
+
+    def woy_close(
+        self,
+        task_id: str,
+        *,
+        outcome: str,
+        actor: str = "jason",
+        reason: Optional[str] = None,
+        now: Optional[str] = None,
+    ) -> TaskRecord:
+        """Terminal transition for a ``kind=woy`` task.
+
+        ``outcome`` is ``"done"`` (Jason completed the action) or
+        ``"rejected"`` (Jason dropped it). Bypasses the SM v2 adjacency
+        table because the WoY taxonomy has no design/build/review
+        middle — a WoY item is either open or closed. The full edge
+        still lands in ``transitions.jsonl`` for audit.
+
+        Raises :class:`TaskStoreError` if the task isn't kind=woy or is
+        already terminal; the callers (``handle_woy_action`` /
+        ``handle_woy_task_action``) treat those as idempotent no-ops.
+        """
+        if outcome not in {"done", "rejected"}:
+            raise TaskStoreError(
+                f"woy_close outcome must be 'done' or 'rejected', not {outcome!r}"
+            )
+        ts = now or _utc_now_iso()
+        with self._locked():
+            record = self.load(task_id)
+            if (record.kind or "").lower() != "woy":
+                raise TaskStoreError(
+                    f"woy_close refused: task {task_id} is not kind=woy "
+                    f"(kind={record.kind!r})"
+                )
+            if record.status in TERMINAL_STATES:
+                # Idempotent: already closed, just return the record.
+                return record
+            prior_status = record.status
+            record.status = outcome
+            record.updated = ts
+            # Clear the snooze when closing so a re-opened item (not
+            # supported today, but defensive) doesn't resurrect with
+            # a stale snooze_until.
+            record.snooze_until = None
+            self._atomic_write_text(
+                self._task_dir(task_id) / "task.yaml",
+                self._yaml_dump(record.to_yaml_dict()),
+            )
+            transition = {
+                "ts": ts,
+                "from": prior_status,
+                "to": outcome,
+                "actor": actor,
+                "reason": reason or f"WoY {outcome}",
+                "action": "woy_close",
+            }
+            with open(
+                self._task_dir(task_id) / "transitions.jsonl", "a"
+            ) as fh:
+                fh.write(json.dumps(transition) + "\n")
+            self._rewrite_index_replacing(record)
+        return record
+
+    def snooze(
+        self,
+        task_id: str,
+        *,
+        until: str,
+        actor: str = "speaking",
+        reason: Optional[str] = None,
+        now: Optional[str] = None,
+    ) -> TaskRecord:
+        """Set ``snooze_until`` on a task without a state transition.
+
+        Snoozing is purely a presentation hint — the WoY renderer hides
+        a task until ``until`` has passed, but the SM state doesn't
+        change (snoozed drafts stay draft). An audit line lands in
+        ``transitions.jsonl`` with ``from`` == ``to`` == the current
+        state so the history is still complete.
+
+        ``until`` should be an ISO-8601 string; we don't validate the
+        format here (the renderer parses it lazily) but a trailing
+        timezone offset or ``Z`` is expected. Setting ``until = ""`` /
+        ``None`` clears the snooze.
+        """
+        ts = now or _utc_now_iso()
+        with self._locked():
+            record = self.load(task_id)
+            if record.status in TERMINAL_STATES:
+                raise InvalidTransition(
+                    f"cannot snooze terminal task {task_id} "
+                    f"(status={record.status!r})"
+                )
+            record.snooze_until = until or None
+            record.updated = ts
+            self._atomic_write_text(
+                self._task_dir(task_id) / "task.yaml",
+                self._yaml_dump(record.to_yaml_dict()),
+            )
+            audit = {
+                "ts": ts,
+                "from": record.status,
+                "to": record.status,
+                "actor": actor,
+                "reason": reason or (f"Snooze until {until}" if until else "Snooze cleared"),
+                "action": "snooze",
+                "snooze_until": until or None,
+            }
+            with open(
+                self._task_dir(task_id) / "transitions.jsonl", "a"
+            ) as fh:
+                fh.write(json.dumps(audit) + "\n")
+            self._rewrite_index_replacing(record)
+        return record
 
     # ------------------------------------------------------------------
     # Internal — index + validation
@@ -794,6 +954,12 @@ def _record_from_dict(data: Mapping[str, Any]) -> TaskRecord:
     """Build a :class:`TaskRecord` from a parsed task.yaml dict.
 
     Unknown keys land in ``extra`` so we round-trip them on update.
+
+    WoY fields (``kind`` / ``verb`` / ``target`` / ``context`` /
+    ``external`` / ``snooze_until``) read through to their typed
+    slots when present; absent → ``None``. ``external`` is coerced
+    through Python's truthiness (YAML gives us real ``bool`` /
+    ``None``, but a hand-written ``"true"`` string also parses).
     """
     known = {
         "id",
@@ -807,8 +973,27 @@ def _record_from_dict(data: Mapping[str, Any]) -> TaskRecord:
         "tags",
         "artifact_ref",
         "merge_ref",
+        "kind",
+        "verb",
+        "target",
+        "context",
+        "external",
+        "snooze_until",
     }
     extra = {k: v for k, v in data.items() if k not in known}
+
+    def _opt_str(key: str) -> Optional[str]:
+        v = data.get(key)
+        return None if v is None else str(v)
+
+    external_raw = data.get("external")
+    if external_raw is None:
+        external_val: Optional[bool] = None
+    elif isinstance(external_raw, bool):
+        external_val = external_raw
+    else:
+        external_val = str(external_raw).strip().lower() in {"1", "true", "yes", "y"}
+
     return TaskRecord(
         id=str(data["id"]),
         title=str(data.get("title", "")),
@@ -821,6 +1006,12 @@ def _record_from_dict(data: Mapping[str, Any]) -> TaskRecord:
         tags=list(data.get("tags") or []),
         artifact_ref=data.get("artifact_ref"),
         merge_ref=data.get("merge_ref"),
+        kind=_opt_str("kind"),
+        verb=_opt_str("verb"),
+        target=_opt_str("target"),
+        context=_opt_str("context"),
+        external=external_val,
+        snooze_until=_opt_str("snooze_until"),
         extra=extra,
     )
 

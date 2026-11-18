@@ -130,3 +130,73 @@ def test_missing_task_exit_code(tmp_path) -> None:
         ["--root", str(tmp_path), "view", "task-0099"]
     )
     assert code == 2
+
+
+# ---------------------------------------------------------------------------
+# WoY schema extension (kind/verb/target/context)
+
+
+def test_create_woy_task_via_cli(tmp_path, capsys) -> None:
+    code = _run(
+        [
+            "--json",
+            "create",
+            "--title",
+            "Call Randy Sosa at NAM",
+            "--kind",
+            "woy",
+            "--verb",
+            "Call",
+            "--target",
+            "Randy Sosa at NAM",
+            "--context",
+            "Withdraw arbitration case 674699.",
+        ],
+        tmp_path,
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["id"] == "task-0001"
+    assert payload["kind"] == "woy"
+    assert payload["verb"] == "Call"
+    assert payload["target"] == "Randy Sosa at NAM"
+    assert payload["context"] == "Withdraw arbitration case 674699."
+    assert payload["external"] is True
+
+
+def test_cli_create_without_kind_stays_backward_compat(tmp_path, capsys) -> None:
+    code = _run(["--json", "create", "--title", "plain task"], tmp_path)
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert "kind" not in payload
+    assert "verb" not in payload
+    assert "external" not in payload
+
+
+def test_cli_snooze_sets_until(tmp_path, capsys) -> None:
+    _run(
+        [
+            "create",
+            "--title",
+            "Call X",
+            "--kind",
+            "woy",
+            "--verb",
+            "Call",
+            "--target",
+            "X",
+            "--context",
+            "y",
+        ],
+        tmp_path,
+    )
+    capsys.readouterr()
+    code = _run(
+        ["--json", "snooze", "task-0001", "--until", "2026-11-19T09:00:00-05:00"],
+        tmp_path,
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["snooze_until"] == "2026-11-19T09:00:00-05:00"
+    # Status not changed by snooze.
+    assert payload["status"] == "draft"
