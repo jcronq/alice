@@ -1,0 +1,27 @@
+{
+  "name": "status-site-react",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "React+Vite slice-1 of the AG-UI reactive status-site rewrite (#639). Build produces ../static/react-dist/, which the Python server bind-mounts and serves under /ui/.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.0.1",
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "jsdom": "^25.0.1",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.4"
+  }
+}

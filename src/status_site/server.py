@@ -89,6 +89,11 @@ from status_site._sse import (
     check_key as _sse_check_key,
     stream_events as _sse_stream_events,
 )
+from status_site._ag_ui import (
+    AgUiBroadcaster,
+    check_key as _ag_ui_check_key,
+    stream_events as _ag_ui_stream_events,
+)
 from status_site.history import (
     HISTORY_DIR,
     STATE_FILE,
@@ -150,6 +155,18 @@ STATIC_FILES = {
     "design-tokens.css",
     "chat-ux.js",
 }
+
+# Slice-1 of #639: committed Vite build output. Source lives in
+# ``src/status_site/react/`` and is rebuilt with ``npm run build``.
+# The alice-status container (python:3.12-alpine, no npm) bind-mounts
+# ``src/status_site`` read-only, so the dist bundle has to be in-tree
+# for the container to serve it.
+REACT_DIST_DIR = STATIC_DIR / "react-dist"
+# File-extension allowlist for the ``/ui/assets/…`` path. Vite emits
+# .js/.css (+ source maps we don't ship) and occasionally .svg, .png
+# for assets. Anything else should 404 — the allowlist stops a
+# traversal attempt from reaching e.g. a stray ``.env``.
+REACT_ASSET_SUFFIXES = {".js", ".css", ".map", ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".woff", ".woff2"}
 
 # Content files served from STATUS_DIR: flat names only (no '/', no leading dot).
 CONTENT_NAME_RE = re.compile(
@@ -393,6 +410,13 @@ class Config:
     # ``pollers``); tests construct a broadcaster explicitly so they
     # don't need background threads they didn't ask for.
     broadcaster: "SectionBroadcaster | None" = field(default=None, repr=False)
+    # AG-UI stream (#639, slice-1). The React+Vite shell at
+    # ``/ui/running-now`` subscribes to ``GET /events?section=…`` and
+    # reads AG-UI STATE_SNAPSHOT events. Separate from
+    # ``broadcaster`` so one lagging legacy-stream subscriber can't
+    # back-pressure the new stream and vice-versa. ``None`` → the
+    # endpoint 404s, same spin-up pattern as ``broadcaster``.
+    ag_ui: "AgUiBroadcaster | None" = field(default=None, repr=False)
     # Injectable for the heartbeat-cadence regression test (pinned at
     # 0.1s). 15s matches the connectivity-guide default and most
     # reverse-proxy idle cutoffs.
@@ -4204,6 +4228,129 @@ class Handler(BaseHTTPRequestHandler):
         # follow-up request on this socket.
         self.close_connection = True
 
+    def _ag_ui_events(self, head: bool) -> None:
+        """Serve ``GET /events?section=<name>`` — AG-UI SSE stream.
+
+        Slice-1 of #639. Scoped to one section per connection — the
+        React shell at ``/ui/running-now`` opens exactly one stream,
+        for ``running_now``. The broadcaster is attached at boot; if
+        it isn't, the endpoint 404s (same pattern as ``/api/events``).
+
+        Auth is the same ``?k=<key>`` shared-secret as the rest of the
+        site. The section allowlist is the broadcaster's registered
+        renderers — unknown names return 404 rather than opening a
+        stream that will never send a snapshot.
+        """
+        broadcaster = self.cfg.ag_ui
+        if broadcaster is None:
+            return self._json(404, {"error": "events disabled"}, head=head)
+        q = parse_qs(urlsplit(self.path).query)
+        key = (q.get("k") or [""])[0]
+        if not _ag_ui_check_key(self.cfg.key, key):
+            return self._json(403, {"error": "bad key"}, head=head)
+        section = (q.get("section") or [""])[0]
+        if not section or not broadcaster.has_section(section):
+            return self._json(404, {"error": "unknown section"}, head=head)
+        if head:
+            # Probe-friendly: same headers, no body. Lets a monitor
+            # (uptime check, test) confirm the endpoint is live
+            # without pinning a long connection.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        # Opening comment — same role as in ``_sse``: flush headers
+        # through any TLS buffer, prove the stream is alive before
+        # the first snapshot lands.
+        try:
+            self.wfile.write(b": alice-ag-ui v1\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+        try:
+            _ag_ui_stream_events(
+                self.wfile,
+                broadcaster,
+                section,
+                heartbeat_seconds=self.cfg.heartbeat_seconds,
+            )
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        self.close_connection = True
+
+    def _react_dist(self, path: str, head: bool) -> None:
+        """Serve the Vite build output under ``/ui/``.
+
+        Three cases:
+
+        * ``/ui/``, ``/ui``, ``/ui/running-now`` (and any future SPA
+          route the React shell owns) → ``react-dist/index.html``.
+        * ``/ui/assets/<file>`` → the fingerprinted bundle file. The
+          suffix allowlist stops anything not in the usual Vite
+          emission set (so a stray ``.env`` in the dist tree wouldn't
+          be reachable here even if it shipped).
+        * Anything else → 404.
+        """
+        rel = path[len("/ui"):].lstrip("/")
+        if not REACT_DIST_DIR.is_dir():
+            return self._json(404, {"error": "react bundle not built"}, head=head)
+        # SPA shell: route-like paths fall through to index.html so
+        # ``window.location.pathname`` is whatever the server received
+        # and the client-side code can decide what to render.
+        if not rel or not rel.startswith("assets/"):
+            index = REACT_DIST_DIR / "index.html"
+            if not index.is_file():
+                return self._json(404, {"error": "no bundle"}, head=head)
+            try:
+                body = index.read_bytes()
+                mtime = index.stat().st_mtime
+            except OSError:
+                return self._json(404, {"error": "no bundle"}, head=head)
+            return self._send(
+                200, body, "text/html; charset=utf-8", mtime=mtime, head=head
+            )
+        # Asset path. Normalise + sandbox: resolve relative to
+        # REACT_DIST_DIR and make sure the resolved path is still a
+        # descendant — belt-and-braces against ``..`` in ``rel``.
+        name = unquote(rel)
+        target = (REACT_DIST_DIR / name).resolve()
+        try:
+            target.relative_to(REACT_DIST_DIR.resolve())
+        except ValueError:
+            return self._json(404, {"error": "not found"}, head=head)
+        if target.suffix not in REACT_ASSET_SUFFIXES or not target.is_file():
+            return self._json(404, {"error": "not found"}, head=head)
+        try:
+            body = target.read_bytes()
+            mtime = target.stat().st_mtime
+        except OSError:
+            return self._json(404, {"error": "not found"}, head=head)
+        ctype = (
+            CONTENT_TYPES.get(target.suffix)
+            or mimetypes.guess_type(target.name)[0]
+            or "application/octet-stream"
+        )
+        if target.suffix in (".html", ".js", ".css"):
+            ctype += "; charset=utf-8"
+        # Fingerprinted names (Vite emits ``index-<hash>.js``) mean we
+        # can serve with a long cache. ``_send`` always writes
+        # ``Cache-Control: no-store`` for correctness-first; the
+        # React bundle is content-addressed, so a browser revisit
+        # still sees a 200 with fresh bytes — not a CDN win, but
+        # correct.
+        self._send(200, body, ctype, mtime=mtime, head=head)
+
     def _resolve(self, path: str) -> Path | None:
         name = unquote(path).lstrip("/") or "index.html"
         if name in STATIC_FILES:
@@ -4216,6 +4363,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _get(self, head: bool) -> None:
         path = urlsplit(self.path).path
+        # Slice-1 of #639: AG-UI SSE stream + React bundle served
+        # under /ui/. Dispatched first so the long-lived stream
+        # doesn't fall through the whole legacy /api/* ladder on
+        # every request.
+        if path == "/events":
+            return self._ag_ui_events(head=head)
+        if path == "/ui" or path.startswith("/ui/"):
+            return self._react_dist(path, head=head)
         if path == "/api/note":
             q = parse_qs(urlsplit(self.path).query)
             note = read_note(self.cfg, (q.get("slug") or [""])[0])
@@ -4597,12 +4752,24 @@ def main() -> None:
         cfg.sse_tick_seconds = float(
             os.environ.get("SSE_TICK_SECONDS", str(cfg.sse_tick_seconds))
         )
+        renderers = section_renderers(cfg)
         broadcaster = SectionBroadcaster(
-            section_renderers(cfg),
+            renderers,
             tick_seconds=cfg.sse_tick_seconds,
         )
         cfg.broadcaster = broadcaster
         broadcaster.start()
+        # Slice-1 of #639 React rewrite: section-scoped AG-UI stream
+        # for the new /ui/ shell. Same renderers so sections stay in
+        # sync between the legacy stream and the new one. Kept on its
+        # own broadcaster so a slow /ui/ subscriber can't back-pressure
+        # the legacy stream (and vice-versa).
+        ag_ui = AgUiBroadcaster(
+            renderers,
+            tick_seconds=cfg.sse_tick_seconds,
+        )
+        cfg.ag_ui = ag_ui
+        ag_ui.start()
     print(f"status_site: serving {cfg.status_dir} on {cfg.host}:{cfg.port}", flush=True)
     srv.serve_forever()
 

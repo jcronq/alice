@@ -1,0 +1,7 @@
+# React slice-1 (issue #639) — only the source + lockfile ship. The
+# built bundle goes to ../static/react-dist/ and IS checked in
+# (alice-status container has no npm; see README.md).
+node_modules/
+dist/
+*.local
+.vite/
