@@ -511,6 +511,12 @@ details.fx-group:first-child { margin-top: 0; }
 .woy-click strong:hover { color: var(--color-ok); border-bottom-color: var(--color-ok); }
 .woy-click li.woy-active > strong,
 .woy-click li.woy-active > p > strong { color: var(--color-ok); border-bottom-color: var(--color-ok); }
+/* Hand-zone bullets we've already cloned into the "Needs your approval"
+ * chip subsection above. The chip IS the UI for the row; keeping the
+ * raw bullet visible duplicates every item on the Overview (bug fix
+ * 2026-11-18). The WaitingTable DOM pass adds / removes this class on
+ * each render so the hide tracks approvalSet membership. */
+.woy-click li.woy-row-cloned { display: none; }
 .woy-needs-approval {
   margin: .25rem 0 .55rem 0;
   padding: .35rem .5rem .4rem .5rem;
@@ -2950,10 +2956,15 @@ function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs}) {
   useLayoutEffect(() => {
     const zone = zoneRef.current;
     if (!zone) return;
-    // 1) Remove any prior subsection + chips (idempotent).
+    // 1) Remove any prior subsection + chips (idempotent). Also
+    // un-hide any <li>s we previously cloned into chips (bug fix
+    // 2026-11-18: before this cleanup existed, the source bullets
+    // stayed display:none forever even if the slug fell out of the
+    // approval set — e.g. after an Accept — leaving an invisible gap).
     const prior = zone.querySelector(":scope > .woy-needs-approval");
     if (prior && prior.parentNode) prior.parentNode.removeChild(prior);
     zone.querySelectorAll(".woy-row-actions").forEach(n => n.parentNode && n.parentNode.removeChild(n));
+    zone.querySelectorAll("li.woy-row-cloned").forEach(li => li.classList.remove("woy-row-cloned"));
     if (!approvalSet.size) return;
     const subsection = document.createElement("div");
     subsection.className = "woy-needs-approval";
@@ -3005,6 +3016,11 @@ function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs}) {
       found = true;
       // Append the chip row to the subsection (one per source li).
       ul.appendChild(makeChipRow(slug, title));
+      // Hide the source bullet — the chip subsection above IS the UI
+      // for this row now (bug fix 2026-11-18: previously the markdown
+      // bullet rendered a second time below the chip list, giving two
+      // copies of every kind=woy task on the Overview).
+      li.classList.add("woy-row-cloned");
     });
     if (found) {
       zone.insertBefore(subsection, zone.firstChild);
