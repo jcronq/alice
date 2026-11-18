@@ -20,7 +20,14 @@ Value                   Env var                      ``forge`` key
 all watched repos       ``ALICE_FORGE_REPOS`` (csv)  ``repos`` (list)
 primary repo            ``ALICE_FORGE_REPO``         ``primary`` (str)
 bug-fix / mud repo      ``ALICE_BUG_FIX_REPO``       ``bug_fix_repo``
+trusted GitHub logins   ``ALICE_TRUSTED_AUTHORS``    ``trusted_authors``
+bug-fix reporters       ``ALICE_BUG_FIX_TRUSTED_     ``bug_fix_trusted_
+                        REPORTERS`` (optional)       reporters`` (optional)
 ======================  ===========================  ==================
+
+``trusted_authors`` is the set of GitHub logins whose issues/comments the
+state machine will act on; there is no default. ``bug_fix_trusted_reporters``
+is optional and falls back to ``trusted_authors``.
 
 If only the repo list is set, the primary is its first entry.
 Example (``alice.config.json``)::
@@ -68,6 +75,22 @@ def _valid(slugs: Any) -> tuple[str, ...]:
             continue
         out.append(s)
     return tuple(out)
+
+
+_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\[bot\])?$")
+
+
+def _valid_logins(logins: Any) -> frozenset[str]:
+    if isinstance(logins, str):
+        logins = logins.split(",")
+    if not isinstance(logins, (list, tuple)):
+        return frozenset()
+    out = set()
+    for raw in logins:
+        login = str(raw).strip().lstrip("@")
+        if _LOGIN_RE.match(login):
+            out.add(login)
+    return frozenset(out)
 
 
 def _env(name: str) -> str:
@@ -140,3 +163,25 @@ def bug_fix_repo(mind: Optional[os.PathLike] = None) -> str:
     if cfg:
         return cfg[0]
     raise _missing("Bug-fix repo", "ALICE_BUG_FIX_REPO", "bug_fix_repo")
+
+
+def trusted_authors(mind: Optional[os.PathLike] = None) -> frozenset[str]:
+    """GitHub logins whose issues/comments Alice's state machine acts on."""
+    env = _valid_logins(_env("ALICE_TRUSTED_AUTHORS"))
+    if env:
+        return env
+    cfg = _valid_logins(_forge_block(mind).get("trusted_authors"))
+    if cfg:
+        return cfg
+    raise _missing("Trusted authors", "ALICE_TRUSTED_AUTHORS", "trusted_authors")
+
+
+def bug_fix_trusted_reporters(mind: Optional[os.PathLike] = None) -> tuple[str, ...]:
+    """Bug-fix dispatcher reporters; falls back to :func:`trusted_authors`."""
+    env = _valid_logins(_env("ALICE_BUG_FIX_TRUSTED_REPORTERS"))
+    if env:
+        return tuple(sorted(env))
+    cfg = _valid_logins(_forge_block(mind).get("bug_fix_trusted_reporters"))
+    if cfg:
+        return tuple(sorted(cfg))
+    return tuple(sorted(trusted_authors(mind)))

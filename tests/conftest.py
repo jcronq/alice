@@ -12,6 +12,8 @@ import pytest
 os.environ.setdefault("ALICE_FORGE_REPOS", "jcronq/cozyhem-engine,jcronq/alice")
 os.environ.setdefault("ALICE_FORGE_REPO", "jcronq/alice")
 os.environ.setdefault("ALICE_BUG_FIX_REPO", "jcronq/modern-mud")
+os.environ.setdefault("ALICE_TRUSTED_AUTHORS", "jcronq")
+os.environ.setdefault("ALICE_BUG_FIX_TRUSTED_REPORTERS", "cronqj")
 
 from alice_speaking.infra.config import Config, SPEAKING_DEFAULTS
 from alice_speaking.domain.principals import (
