@@ -15,10 +15,12 @@ from alice_mam.deliver import (
     CalibreAddError,
     KindleSendError,
     _host_path_to_container,
+    _lister_over_ssh,
     _name_matches_hint,
     _parse_book_id,
     calibre_add,
     extract_epub,
+    extract_epub_via_ssh,
     send_to_kindle,
     wait_for_download,
 )
@@ -116,6 +118,52 @@ def test_wait_for_download_eventually_matches(tmp_path):
         now=now,
     )
     assert out.name == "Twice_Dead_King_Ruin"
+
+
+def test_wait_for_download_matches_single_file(tmp_path):
+    """MAM epub-only torrents often land as a single .epub file."""
+    (tmp_path / "Nate Crowley - The Twice-dead King 01 - Ruin.epub").write_bytes(b"EPUB")
+    out = wait_for_download(
+        "Twice Dead King Ruin",
+        downloads_dir=tmp_path,
+        timeout_minutes=1,
+        poll_interval_seconds=1,
+        sleep=lambda _s: None,
+    )
+    assert out.is_file()
+    assert out.name.endswith(".epub")
+
+
+def test_wait_for_download_prefers_dir_over_file(tmp_path):
+    """When both a matching dir AND a matching file exist, dir wins."""
+    (tmp_path / "Ruin_scan.epub").write_bytes(b"BAD")
+    (tmp_path / "Twice_Dead_King_Ruin").mkdir()
+    (tmp_path / "Twice_Dead_King_Ruin" / "book.epub").write_bytes(b"GOOD")
+    out = wait_for_download(
+        "Twice Dead King Ruin",
+        downloads_dir=tmp_path,
+        timeout_minutes=1,
+        poll_interval_seconds=1,
+        sleep=lambda _s: None,
+    )
+    assert out.is_dir()
+
+
+def test_extract_epub_accepts_single_file(tmp_path):
+    """When wait_for_download returned a .epub file directly."""
+    src = tmp_path / "book.epub"
+    src.write_bytes(b"EPUB")
+    dest = tmp_path / "flat"
+    out = extract_epub(src, dest=dest)
+    assert out == dest / "book.epub"
+    assert out.read_bytes() == b"EPUB"
+
+
+def test_extract_epub_rejects_non_epub_file(tmp_path):
+    src = tmp_path / "cover.jpg"
+    src.write_bytes(b"JPG")
+    with pytest.raises(FileNotFoundError):
+        extract_epub(src, dest=tmp_path / "flat")
 
 
 def test_name_matches_hint_token_overlap():
@@ -302,6 +350,65 @@ def test_send_to_kindle_rejects_bad_book_id():
         send_to_kindle(0)
     with pytest.raises(ValueError):
         send_to_kindle(-1)
+
+
+def test_lister_over_ssh_parses_find_output():
+    """`find -printf '%y|%f\\n'` lines turn into (name, is_dir) tuples."""
+    def runner(cmd, **kwargs):
+        return _FakeRunResult(
+            stdout="d|Twice Dead King Ruin\nf|cover.jpg\nd|Other Book\n"
+        )
+
+    lister = _lister_over_ssh("media", runner=runner)
+    rows = lister(Path("/mnt/plex/downloads/seedbox"))
+    assert ("Twice Dead King Ruin", True) in rows
+    assert ("cover.jpg", False) in rows
+    assert ("Other Book", True) in rows
+
+
+def test_wait_for_download_with_remote_lister():
+    calls: list = []
+    def runner(cmd, **kwargs):
+        calls.append(cmd)
+        return _FakeRunResult(stdout="f|Nate_Crowley_Twice_Dead_King_Ruin.epub\n")
+
+    lister = _lister_over_ssh("media", runner=runner)
+    out = wait_for_download(
+        "Twice Dead King Ruin",
+        downloads_dir=Path("/mnt/plex/downloads/seedbox"),
+        timeout_minutes=1,
+        poll_interval_seconds=1,
+        sleep=lambda _s: None,
+        lister=lister,
+    )
+    # Remote match composes the remote absolute path on the alice side.
+    assert str(out).endswith(".epub")
+    assert len(calls) == 1
+    # And we invoked find with -printf through ssh.
+    assert "find" in calls[0][-1]
+
+
+def test_extract_epub_via_ssh_returns_remote_path():
+    def runner(cmd, **kwargs):
+        return _FakeRunResult(stdout="/home/cronqj/media/flatbooks/book.epub\n")
+
+    out = extract_epub_via_ssh(
+        Path("/mnt/plex/downloads/seedbox/some.epub"),
+        ssh_host="cronqj@media",
+        runner=runner,
+    )
+    assert str(out) == "/home/cronqj/media/flatbooks/book.epub"
+
+
+def test_extract_epub_via_ssh_raises_on_empty_output():
+    def runner(cmd, **kwargs):
+        return _FakeRunResult(returncode=2, stderr="no .epub")
+
+    with pytest.raises(FileNotFoundError):
+        extract_epub_via_ssh(
+            Path("/mnt/plex/downloads/seedbox/nope"),
+            runner=runner,
+        )
 
 
 def test_send_to_kindle_tolerates_json_with_leading_noise():

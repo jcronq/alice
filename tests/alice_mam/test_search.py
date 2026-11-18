@@ -296,6 +296,26 @@ def test_normalise_row_drops_rows_without_id():
     assert _normalise_row({"title": "no id"}) is None
 
 
+def test_normalise_row_uses_tid_only_fallback_when_dl_missing():
+    """Live MAM responses often omit ``dl``; a tid-only URL must still work."""
+    cand = _normalise_row({
+        "id": 761464, "title": "x", "filetype": "epub", "lang_code": "eng"
+    })
+    assert cand is not None
+    assert cand.dl_hash == ""
+    assert cand.download_url == "https://www.myanonamouse.net/tor/download.php?tid=761464"
+
+
+def test_parse_int_handles_mam_human_readable_size():
+    """MAM's live Search JSON returns size as e.g. "2.0 MiB"."""
+    from alice_mam.search import _parse_int
+    assert _parse_int("2.0 MiB") == 2 * 1024 * 1024
+    assert _parse_int("550 KB") == 550_000
+    assert _parse_int("1.3 GiB") == int(1.3 * 1024 ** 3)
+    # Pure int-string path still works.
+    assert _parse_int("123456") == 123456
+
+
 def test_parse_authors_handles_json_string():
     assert _parse_authors('{"1":"Alice","2":"Bob"}') == ["Alice", "Bob"]
     assert _parse_authors("") == []

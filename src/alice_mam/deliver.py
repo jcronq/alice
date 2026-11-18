@@ -82,6 +82,49 @@ def _name_matches_hint(name: str, hint: str, *, min_overlap: int = 2) -> bool:
     return len(overlap) >= min(min_overlap, len(hint_tokens))
 
 
+def _lister_local(dir_path: Path) -> list[tuple[str, bool]]:
+    """Return (name, is_dir) for each child of ``dir_path`` — local fs."""
+    if not dir_path.exists():
+        return []
+    return [(c.name, c.is_dir()) for c in dir_path.iterdir()]
+
+
+def _lister_over_ssh(
+    ssh_host: str,
+    runner: Callable[..., Any] = subprocess.run,
+) -> Callable[[Path], list[tuple[str, bool]]]:
+    """Factory: returns a lister that runs ``find`` on a remote host.
+
+    Uses ``find <dir> -maxdepth 1 -mindepth 1 -printf '%y|%f\\n'`` so
+    each line is ``d|<name>`` for dirs, ``f|<name>`` for regular files.
+    """
+    def lister(dir_path: Path) -> list[tuple[str, bool]]:
+        remote = (
+            f"test -d {str(dir_path)!r} && "
+            f"find {str(dir_path)!r} -maxdepth 1 -mindepth 1 "
+            r"-printf '%y|%f\n'"
+        )
+        result = runner(
+            [
+                "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+                ssh_host, remote,
+            ],
+            capture_output=True, text=True, check=False,
+        )
+        out = (getattr(result, "stdout", "") or "").strip()
+        if not out:
+            return []
+        rows: list[tuple[str, bool]] = []
+        for line in out.splitlines():
+            if "|" not in line:
+                continue
+            tag, _, name = line.partition("|")
+            rows.append((name, tag == "d"))
+        return rows
+
+    return lister
+
+
 def wait_for_download(
     torrent_name_hint: str,
     downloads_dir: Path = DEFAULT_SEEDBOX_DIR,
@@ -91,19 +134,28 @@ def wait_for_download(
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.monotonic,
     log: Callable[[str], None] | None = None,
+    lister: Callable[[Path], list[tuple[str, bool]]] | None = None,
 ) -> Path:
-    """Poll ``downloads_dir`` for a subdirectory matching ``torrent_name_hint``.
+    """Poll ``downloads_dir`` for an entry matching ``torrent_name_hint``.
 
-    Returns the matching :class:`Path`. Raises :class:`TimeoutError` if
-    nothing appears within ``timeout_minutes``.
+    Returns the matching :class:`Path` — may be a subdirectory (common
+    for multi-file torrents) or a single file (common for MAM epubs
+    that ship as one ``.epub``).
 
-    The rclone cron on the media server pulls completed downloads with
-    ``--min-age 5m``, so a hit here implies the torrent is both
-    finished on the seedbox AND fully copied locally (no partials).
+    Raises :class:`TimeoutError` if nothing appears within
+    ``timeout_minutes``. The rclone cron on the media server pulls
+    completed downloads with ``--min-age 5m``, so a hit here implies
+    the torrent is both finished on the seedbox AND fully copied
+    locally (no partials).
+
+    ``lister`` is injectable so callers can poll a remote host over
+    SSH when ``downloads_dir`` isn't mounted locally (see
+    :func:`_lister_over_ssh`).
     """
     downloads_dir = Path(downloads_dir)
     deadline = now() + timeout_minutes * 60.0
     say = log or (lambda _msg: None)
+    list_dir = lister or _lister_local
 
     say(
         f"wait_for_download: polling {downloads_dir} for '{torrent_name_hint}' "
@@ -111,13 +163,23 @@ def wait_for_download(
     )
 
     while True:
-        if downloads_dir.exists():
-            for child in sorted(downloads_dir.iterdir()):
-                if not child.is_dir():
-                    continue
-                if _name_matches_hint(child.name, torrent_name_hint):
-                    say(f"wait_for_download: matched {child}")
-                    return child
+        entries = list_dir(downloads_dir)
+        # Prefer directory matches first (richer torrents with
+        # cover.jpg + .epub + .nfo); fall back to loose files.
+        dir_match: Path | None = None
+        file_match: Path | None = None
+        for name, is_dir in sorted(entries):
+            if not _name_matches_hint(name, torrent_name_hint):
+                continue
+            child = downloads_dir / name
+            if is_dir and dir_match is None:
+                dir_match = child
+            elif (not is_dir) and file_match is None:
+                file_match = child
+        match = dir_match or file_match
+        if match is not None:
+            say(f"wait_for_download: matched {match}")
+            return match
 
         if now() >= deadline:
             raise TimeoutError(
@@ -136,11 +198,13 @@ def extract_epub(
     *,
     copyfile: Callable[[str, str], str] = shutil.copy2,
 ) -> Path:
-    """Find the first ``*.epub`` under ``download_dir`` and copy to ``dest``.
+    """Copy the first ``*.epub`` under ``download_dir`` to ``dest``.
 
-    Walks the directory recursively; the first match (deterministic
-    sort order) wins. Returns the Path of the copied file in ``dest``.
+    ``download_dir`` may also be a single ``.epub`` file (common for
+    MAM torrents that are one epub per torrent — no containing dir
+    on the seedbox). In that case we copy the file as-is.
 
+    Returns the Path of the copied file in ``dest``.
     Raises :class:`FileNotFoundError` if no ``*.epub`` is present.
     """
     download_dir = Path(download_dir)
@@ -148,7 +212,14 @@ def extract_epub(
     if not download_dir.exists():
         raise FileNotFoundError(f"download_dir does not exist: {download_dir}")
 
-    matches = sorted(download_dir.rglob("*.epub"))
+    if download_dir.is_file():
+        if download_dir.suffix.lower() != ".epub":
+            raise FileNotFoundError(
+                f"download target is not a .epub file: {download_dir}"
+            )
+        matches = [download_dir]
+    else:
+        matches = sorted(download_dir.rglob("*.epub"))
     if not matches:
         raise FileNotFoundError(
             f"No .epub files under {download_dir} — nothing to send to Kindle"
@@ -158,6 +229,62 @@ def extract_epub(
     out_path = dest / src.name
     copyfile(str(src), str(out_path))
     return out_path
+
+
+def extract_epub_via_ssh(
+    download_path: Path,
+    ssh_host: str = DEFAULT_MEDIA_SSH,
+    dest: Path = DEFAULT_FLATBOOKS_DIR,
+    *,
+    runner: Callable[..., Any] = subprocess.run,
+) -> Path:
+    """Find + copy first .epub on a remote host — alice→media variant.
+
+    Returns the remote dest-path (a :class:`Path`) where the .epub
+    now lives. Used when the alice container can't see
+    ``/mnt/plex/downloads/seedbox`` directly but can ssh to a host
+    (media, 10.20.30.52) that can.
+
+    Idempotent via ``cp -n``.
+    """
+    download_path = Path(download_path)
+    dest = Path(dest)
+    # One shell snippet: if the path is a directory, find first .epub
+    # inside it; else treat the path itself as the source. Copy to dest
+    # with cp -n (no-clobber); print final destination path on stdout.
+    script = f'''set -e
+SRC={str(download_path)!r}
+DEST_DIR={str(dest)!r}
+mkdir -p "$DEST_DIR"
+if [ -d "$SRC" ]; then
+    EPUB=$(find "$SRC" -maxdepth 4 -type f -name '*.epub' | sort | head -n1)
+elif [ -f "$SRC" ] && case "$SRC" in *.epub|*.EPUB) true;; *) false;; esac; then
+    EPUB="$SRC"
+else
+    echo "no .epub at $SRC" >&2
+    exit 2
+fi
+if [ -z "$EPUB" ]; then
+    echo "no .epub under $SRC" >&2
+    exit 2
+fi
+BASENAME=$(basename "$EPUB")
+cp -n "$EPUB" "$DEST_DIR/$BASENAME"
+echo "$DEST_DIR/$BASENAME"
+'''
+    cmd = [
+        "ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+        ssh_host, "bash -s",
+    ]
+    result = runner(cmd, input=script, capture_output=True, text=True, check=False)
+    rc = getattr(result, "returncode", 0)
+    stdout = (getattr(result, "stdout", "") or "").strip()
+    stderr = (getattr(result, "stderr", "") or "").strip()
+    if rc != 0 or not stdout:
+        raise FileNotFoundError(
+            f"extract_epub_via_ssh: rc={rc} stderr={stderr[:300]!r}"
+        )
+    return Path(stdout.splitlines()[-1].strip())
 
 
 # ─── Calibre add ───────────────────────────────────────────────────────
@@ -330,7 +457,7 @@ msg = EmailMessage()
 msg["Subject"] = title
 msg["From"] = mail_from or login
 msg["To"] = kindle_email
-msg.set_content(f"Sent from Alice-MAM pipeline: {title}")
+msg.set_content(f"Sent from the MAM delivery pipeline: {title}")
 msg.add_attachment(
     epub_bytes,
     maintype="application",
@@ -460,6 +587,7 @@ def _run_pipeline(
     flatbooks_dir: Path = DEFAULT_FLATBOOKS_DIR,
     timeout_minutes: int = 45,
     poll_interval_seconds: int = 30,
+    via_ssh_host: str | None = None,
 ) -> dict[str, Any]:
     """End-to-end driver, suitable for CLI + future Signal command path.
 
@@ -502,18 +630,32 @@ def _run_pipeline(
     logger(f"       → {dest}")
 
     hint = f"{title} {author}"
-    logger(f"[5/6] wait for download to land under {downloads_dir}")
+    if via_ssh_host:
+        lister = _lister_over_ssh(via_ssh_host)
+        logger(
+            f"[5/6] wait for download to land under {downloads_dir} "
+            f"(polling via ssh {via_ssh_host})"
+        )
+    else:
+        lister = None
+        logger(f"[5/6] wait for download to land under {downloads_dir}")
     download_dir = wait_for_download(
         hint,
         downloads_dir=downloads_dir,
         timeout_minutes=timeout_minutes,
         poll_interval_seconds=poll_interval_seconds,
         log=logger,
+        lister=lister,
     )
     logger(f"       → {download_dir}")
 
     logger("[6/6] extract epub → calibre_add → send_to_kindle")
-    epub = extract_epub(download_dir, dest=flatbooks_dir)
+    if via_ssh_host:
+        epub = extract_epub_via_ssh(
+            download_dir, ssh_host=via_ssh_host, dest=flatbooks_dir
+        )
+    else:
+        epub = extract_epub(download_dir, dest=flatbooks_dir)
     logger(f"       extract: {epub}")
     book_id = calibre_add(epub)
     logger(f"       calibre_add: book_id={book_id}")
@@ -577,6 +719,16 @@ def _build_argparser() -> argparse.ArgumentParser:
         default=30,
         help="Polling cadence for the download-landed check.",
     )
+    p.add_argument(
+        "--via-ssh-host",
+        default=DEFAULT_MEDIA_SSH,
+        help=(
+            "SSH host used to poll ``downloads-dir`` + copy the .epub "
+            "into flatbooks. The daemon container doesn't mount "
+            "/mnt/plex, so by default we drive step 5+ over ssh to "
+            "media. Pass '' to run the local filesystem path instead."
+        ),
+    )
     return p
 
 
@@ -598,6 +750,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             flatbooks_dir=Path(ns.flatbooks_dir),
             timeout_minutes=ns.timeout_minutes,
             poll_interval_seconds=ns.poll_interval_seconds,
+            via_ssh_host=ns.via_ssh_host or None,
         )
     except Exception as exc:
         say(f"ERROR: {type(exc).__name__}: {exc}")
@@ -620,6 +773,7 @@ __all__ = [
     "KindleSendError",
     "calibre_add",
     "extract_epub",
+    "extract_epub_via_ssh",
     "main",
     "send_to_kindle",
     "wait_for_download",
