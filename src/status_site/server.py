@@ -129,6 +129,7 @@ from status_site.sources.common import (
     read_asks as _read_asks,
 )
 from status_site import urgency as _urgency
+from status_site import stage_runs as _stage_runs
 from status_site.chat_reactions import (
     fold as reaction_fold,
     merge_reactions,
@@ -3648,6 +3649,73 @@ def handle_effort_action(cfg: "Config", d: dict) -> dict:
     return {"ok": True, "slug": slug, "level": level}
 
 
+# ---------------------------------------------------------------- stage timeline
+#
+# Slice-timeline. Each Waiting-on-you / In-flight item earns five dots
+# (design → build → review → check → merge) inside its expanded card.
+# Dots light up when a run attaches to a stage; grey when no run has
+# touched it. The attribution layer is in :mod:`status_site.stage_runs`
+# — this endpoint is the authenticated write edge and the read edge
+# that the frontend ``TimelineDots`` hits on open + refresh.
+
+
+def handle_stage_run(cfg: "Config", d: dict) -> dict:
+    """Append one stage-run record for an item.
+
+    Body: ``{key, item_slug, stage, status[, task_id, started_at, ended_at,
+    summary]}``. ``stage`` must be one of :data:`stage_runs.STAGES`;
+    ``status`` one of :data:`stage_runs.STATUSES`. ``started_at`` defaults
+    to now; ``ended_at`` of ``null`` or absent means the run is still
+    in-flight. A follow-up POST with the same ``task_id`` closes the run
+    (last write wins at read time).
+
+    Returns the normalised record so the caller can log exactly what
+    landed on disk. Rejects malformed bodies with 400 / unauthenticated
+    callers with 403 — same gate as :func:`handle_effort_action`.
+    """
+    if not isinstance(d, dict):
+        raise ReplyError(400, "bad json")
+    if not hmac.compare_digest(str(d.get("key", "")).encode(), cfg.key.encode()):
+        raise ReplyError(403, "bad key")
+    item_slug_raw = str(d.get("item_slug", ""))
+    item_slug = _stage_runs.safe_slug(item_slug_raw)
+    if not item_slug:
+        raise ReplyError(400, "bad item_slug")
+    try:
+        stage = _stage_runs.validate_stage(d.get("stage"))
+        status = _stage_runs.validate_status(d.get("status"))
+    except ValueError as e:
+        raise ReplyError(400, str(e)) from None
+    task_id = str(d.get("task_id") or "")
+    started_at = str(d.get("started_at") or "") if d.get("started_at") else ""
+    ended_raw = d.get("ended_at")
+    if ended_raw is None:
+        ended_at: str | None = None
+    elif isinstance(ended_raw, str):
+        ended_at = ended_raw.strip() or None
+    else:
+        raise ReplyError(400, "bad ended_at")
+    summary = str(d.get("summary") or "")
+
+    with cfg.lock:
+        rec = _stage_runs.append_stage_run(
+            cfg.status_dir,
+            item_slug=item_slug,
+            stage=stage,
+            status=status,
+            task_id=task_id,
+            started_at=started_at,
+            ended_at=ended_at,
+            summary=summary,
+        )
+    return {"ok": True, "record": rec.to_json()}
+
+
+def read_item_timeline(status_dir: Path, slug: str) -> dict:
+    """Thin wrapper so the HTTP handler stays small (and testable)."""
+    return _stage_runs.aggregate_timeline(status_dir, slug)
+
+
 def read_bug(status_dir: Path, report_id: int) -> dict | None:
     """One bug's frontmatter projection, or ``None`` if the file is missing.
 
@@ -4097,6 +4165,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(
                 200, read_woy_effort(self.cfg.status_dir), head=head
             )
+        if path.startswith("/api/item-timeline/"):
+            # Slice-timeline: GET /api/item-timeline/<slug> returns the
+            # five-stage rollup for the expanded card's dots. No auth —
+            # stage attribution is non-sensitive, same trust surface as
+            # /api/history. Unknown slugs return the five empty-stage
+            # envelope so the client can render dim/grey dots without
+            # branching on 404 vs 200.
+            raw = unquote(path[len("/api/item-timeline/"):])
+            return self._json(
+                200,
+                read_item_timeline(self.cfg.status_dir, raw),
+                head=head,
+            )
         if path == "/api/threads":
             return self._json(200, read_threads(self.cfg), head=head)
         if path == "/api/waiting-order":
@@ -4325,6 +4406,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/woy-action": handle_woy_action,
             "/api/woy-steer": handle_woy_steer,
             "/api/effort": handle_effort_action,
+            "/api/stage-run": handle_stage_run,
             "/api/presence": handle_presence,
         }
         fn = handlers.get(route)

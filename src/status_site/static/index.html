@@ -565,6 +565,56 @@ details.fx-group:first-child { margin-top: 0; }
 }
 .woy-effort-saving { font-size: .78rem; color: var(--color-fg-muted); }
 .woy-effort-err { font-size: .78rem; color: var(--color-bad); }
+/* Slice-timeline: five-dot per-item stage progress strip inside the
+ * expanded card. Each dot maps to one entry of the server-side
+ * ``STAGES`` tuple (design / build / review / check / merge); the
+ * rollup status returned by /api/item-timeline/<slug> colours the dot
+ * (none=grey, success=ok, running=warn-pulse, failed=bad). Hover /
+ * focus opens a native tooltip (``title`` attr) with the latest run
+ * summary — no custom tooltip widget, so the markup stays accessible
+ * and the SSE-driven re-render costs stay flat. */
+.woy-stage-timeline {
+  display: flex; flex-wrap: wrap; gap: .5rem; align-items: center;
+  margin: .2rem 0 .55rem 0;
+}
+.woy-stage-timeline-label {
+  font-size: .78rem; color: var(--color-fg-muted);
+  letter-spacing: .04em; text-transform: uppercase;
+}
+.woy-stage-dots {
+  display: inline-flex; align-items: center; gap: .4rem;
+  padding: .15rem .55rem;
+  border: 1px solid var(--color-border-line);
+  border-radius: 999px;
+}
+.woy-stage-dot {
+  display: inline-flex; flex-direction: column; align-items: center;
+  gap: .1rem;
+  background: transparent; border: 0; padding: 0; margin: 0;
+  color: var(--color-fg-muted); cursor: default; font: inherit;
+  font-size: .68rem; line-height: 1.1;
+}
+.woy-stage-dot .dot {
+  display: inline-block;
+  width: .7rem; height: .7rem; border-radius: 50%;
+  background: var(--color-border-line);
+  border: 1px solid var(--color-border-line);
+}
+.woy-stage-dot.status-success .dot { background: var(--color-ok); border-color: var(--color-ok); }
+.woy-stage-dot.status-failed .dot { background: var(--color-bad); border-color: var(--color-bad); }
+.woy-stage-dot.status-running .dot {
+  background: var(--color-warn); border-color: var(--color-warn);
+  animation: woy-stage-pulse 1.4s ease-in-out infinite;
+}
+.woy-stage-dot.status-success { color: var(--color-fg); }
+.woy-stage-dot.status-failed { color: var(--color-bad); }
+.woy-stage-dot.status-running { color: var(--color-warn); }
+@keyframes woy-stage-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: .45; }
+}
+.woy-stage-empty { font-size: .78rem; color: var(--color-fg-muted); font-style: italic; }
+.woy-stage-err { font-size: .78rem; color: var(--color-bad); }
 .woy-timeline { list-style: none; margin: 0; padding: 0 0 0 .8rem; border-left: 2px solid var(--color-border-line); }
 .woy-timeline li {
   position: relative; padding: .35rem 0 .35rem .9rem;
@@ -2261,6 +2311,86 @@ function mergeHistoryRows(payload) {
   return rows;
 }
 
+// Slice-timeline: ordered stage names + display labels. The server
+// returns five entries per item in this exact order (see
+// ``stage_runs.STAGES``) so the frontend never has to re-sort; we just
+// walk the array and render dots in place.
+const STAGE_LABELS = [
+  {key: "design", label: "Design"},
+  {key: "build", label: "Build"},
+  {key: "review", label: "Review"},
+  {key: "check", label: "Check"},
+  {key: "merge", label: "Merge"},
+];
+
+// Slice-timeline: five-dot per-item stage progress strip. Reads from
+// /api/item-timeline/<slug> and re-fetches when the ExpandedCard's
+// refresh counter bumps (any action that writes a new run should
+// bump it). Renders five dots regardless of data — unknown stages
+// come back as ``status: "none"`` so the component never flickers
+// between "loading" and "empty".
+function TimelineDots({slug, refreshKey}) {
+  const [state, setState] = useState({loading: true});
+  useEffect(() => {
+    let cancelled = false;
+    setState(s => ({...s, loading: true}));
+    (async () => {
+      try {
+        const r = await fetch("/api/item-timeline/" + encodeURIComponent(slug));
+        const body = await r.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!r.ok) {
+          setState({error: body.error || ("HTTP " + r.status)});
+          return;
+        }
+        const stages = Array.isArray(body && body.stages) ? body.stages : [];
+        setState({stages});
+      } catch (e) {
+        if (!cancelled) setState({error: String(e && e.message || e)});
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [slug, refreshKey]);
+  const byKey = {};
+  (state.stages || []).forEach(s => { if (s && s.stage) byKey[s.stage] = s; });
+  const anyRuns = (state.stages || []).some(s => s && s.status && s.status !== "none");
+  const title = stage => {
+    const rec = byKey[stage.key];
+    if (!rec || rec.status === "none") return stage.label + " — no runs yet";
+    const l = rec.latest || {};
+    const parts = [stage.label + " — " + rec.status];
+    if (l.task_id) parts.push("task: " + l.task_id);
+    if (l.started_at) parts.push("started " + l.started_at);
+    if (l.ended_at) parts.push("ended " + l.ended_at);
+    if (l.summary) parts.push(l.summary);
+    if (rec.count && rec.count > 1) parts.push("(" + rec.count + " runs)");
+    return parts.join(" · ");
+  };
+  return h("div", {className: "woy-stage-timeline", role: "group", "aria-label": "Stage timeline"},
+    h("span", {className: "woy-stage-timeline-label"}, "Timeline"),
+    h("div", {className: "woy-stage-dots"},
+      STAGE_LABELS.map(stage => {
+        const rec = byKey[stage.key] || {status: "none"};
+        const status = rec.status || "none";
+        return h("span", {
+          key: stage.key,
+          className: "woy-stage-dot status-" + status,
+          "data-stage": stage.key,
+          "data-status": status,
+          title: title(stage),
+          "aria-label": title(stage),
+        },
+          h("span", {className: "dot"}),
+          h("span", {className: "label"}, stage.label),
+        );
+      })
+    ),
+    !anyRuns && !state.loading && !state.error
+      ? h("span", {className: "woy-stage-empty"}, "No runs yet") : null,
+    state.error ? h("span", {className: "woy-stage-err"}, state.error) : null,
+  );
+}
+
 // Slice-effort: the 4-segment picker in ExpandedCard reads from this
 // table. Order is load-bearing — the keyboard shortcuts 1/2/3/4 map
 // to segments 0/1/2/3 — and the levels must match the server-side
@@ -2547,6 +2677,10 @@ function ExpandedCard({title, slug, externalLink, isPr, onClose, onDismissed}) {
       effortSaving ? h("span", {className: "woy-effort-saving"}, "Saving…") : null,
       effortError ? h("span", {className: "woy-effort-err"}, effortError) : null,
     ),
+    // Slice-timeline: five-dot per-item stage progress. Re-fetches
+    // whenever the card's refresh counter bumps (reply, steer, accept/
+    // reject — anything that could have written a new stage-run).
+    h(TimelineDots, {slug, refreshKey: refresh}),
     hasDetail ? h("a", {className: "woy-detail-link", href: "#" + slug}, "Open detail page →") : null,
     externalLink ? h("a", {className: "woy-external-link", href: externalLink, target: "_blank", rel: "noopener noreferrer"}, "View on GitHub →") : null,
     data.loading ? h("p", {style: MUTED}, "Loading…")
