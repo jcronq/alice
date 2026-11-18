@@ -3725,6 +3725,27 @@ function usePingReviewSlug(slug) {
 // from the reactive shell. All tabs link to ``#<slug>``; parseHash
 // routes chat / bugs / review-<slug> to their A2UI surfaces and
 // everything else falls through to the Overview board.
+//
+// ARIA tablist pattern (overview UX, PR ux/overview-tablist-keys):
+// the <nav> carries ``role="tablist"``; each tab is ``role="tab"``
+// with roving tabindex (the active tab is 0, the rest are -1) so Tab
+// lands on the current tab and Left / Right / Home / End move between
+// them. Pattern drawn from agent-ui-testing/README.md § Keyboard and
+// accessibility ("Tab bar is a tablist; use Left, Right, Home and End
+// to move between tabs"). Pure keyboard-only behaviour — mouse clicks
+// keep working the same as before.
+
+// Pure helper: next tab index for a key press. Exported-style name
+// so the inline reducer-js test harness can slice it out.
+function nextTabIndex(current, key, count) {
+  if (!count) return 0;
+  if (key === "ArrowLeft") return (current - 1 + count) % count;
+  if (key === "ArrowRight") return (current + 1) % count;
+  if (key === "Home") return 0;
+  if (key === "End") return count - 1;
+  return current;
+}
+
 function NavTabs() {
   const [pages, setPages] = useState([]);
   useEffect(() => {
@@ -3746,15 +3767,52 @@ function NavTabs() {
   }, []);
   const route = useHashRoute();
   const current = route.route === "review" ? "review-" + route.slug : route.route;
-  return pages.map(p => {
-    const href = "#" + p.slug;
-    const active = p.slug === current;
+  // Overview is always first; the hardcoded header <a> that used to
+  // render it is gone so the whole tab row lives inside one tablist.
+  const tabs = [{slug: "overview", title: "Overview", href: "#"}]
+    .concat(pages.map(p => ({slug: p.slug, title: p.title, href: "#" + p.slug})));
+  const activeIdx = Math.max(0, tabs.findIndex(t => t.slug === current));
+  const navRef = useRef(null);
+  function onKey(e) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const k = e.key;
+    if (k !== "ArrowLeft" && k !== "ArrowRight" && k !== "Home" && k !== "End") return;
+    e.preventDefault();
+    const next = nextTabIndex(activeIdx, k, tabs.length);
+    const target = tabs[next];
+    if (!target) return;
+    // Setting location.hash triggers the hashchange listener in
+    // useHashRoute, which re-renders this component with the new
+    // active index. "overview" is the parseHash default, so empty-
+    // hash-equivalent "#overview" works and is explicit.
+    location.hash = target.slug === "overview" ? "overview" : target.slug;
+    // Move focus to the newly-selected tab after the re-render so
+    // the roving tabindex lands where the user expects.
+    requestAnimationFrame(() => {
+      if (!navRef.current) return;
+      const el = navRef.current.querySelectorAll('[role="tab"]')[next];
+      if (el && typeof el.focus === "function") el.focus();
+    });
+  }
+  return h("nav", {
+    className: "nav-tabs",
+    "aria-label": "Primary",
+    role: "tablist",
+    ref: navRef,
+    onKeyDown: onKey,
+  }, tabs.map((t, i) => {
+    const active = i === activeIdx;
     return h("a", {
-      key: p.slug, href, title: p.title,
+      key: t.slug,
+      href: t.href,
+      title: t.title,
+      role: "tab",
+      "aria-selected": active ? "true" : "false",
+      tabIndex: active ? 0 : -1,
       className: active ? "on" : null,
       "aria-current": active ? "page" : null,
-    }, p.title);
-  });
+    }, t.title);
+  }));
 }
 
 // Apply persisted width preference once on load so the first paint is
@@ -3979,10 +4037,7 @@ function App() {
   return h(React.Fragment, null,
     h("header", null,
       h("b", null, "Alice"),
-      h("nav", {className: "nav-tabs", "aria-label": "Primary"},
-        h("a", {href: "#", title: "Overview"}, "Overview"),
-        h(NavTabs),
-      ),
+      h(NavTabs),
       h("span", {className: "spacer"}),
       h("span", {className: statusClass}, statusLabel),
       h(ConfigGear),
