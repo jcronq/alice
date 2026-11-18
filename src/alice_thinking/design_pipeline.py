@@ -788,12 +788,22 @@ def commit_approved_draft(
     draft: str,
     slug_hint: str,
     now: Optional[_dt.datetime] = None,
+    alice_summary: str = "",
 ) -> pathlib.Path:
     """Write the approved draft to ``cortex-memory/research/<date>-<slug>.md``.
 
     The slug is sanitized (lowercase, alphanumeric + hyphens). The
     function does NOT add frontmatter — the draft is expected to
     carry its own. Returns the path written.
+
+    Side effect — review-TODO emit (slice review-TODO): after the
+    file lands on disk we append a ``vault-write`` record to
+    ``inner/state/review-todos.jsonl`` so the status-site's
+    Waiting-on-you tier can surface a ``Review changes: <slug>``
+    item. Memory-worker writes do NOT pass through here; they go
+    through ``memory_worker/stage_*.py`` which deliberately never
+    imports :mod:`core.review_todos`. ``alice_summary`` propagates
+    into the TODO so Jason sees why to look before clicking.
     """
     now = now or _dt.datetime.now()
     safe = re.sub(r"[^a-z0-9-]+", "-", slug_hint.lower()).strip("-") or "draft"
@@ -804,6 +814,21 @@ def commit_approved_draft(
     if path.exists():
         path = research / f"{now.date().isoformat()}-{safe}-{int(now.timestamp())}.md"
     path.write_text(draft, encoding="utf-8")
+    # Review-TODO hook. Best-effort — the emit path swallows OSError,
+    # but wrap the call too so an import-time regression in
+    # ``core.review_todos`` can't poison the commission commit.
+    try:
+        from core.review_todos import emit_vault_write_todo
+
+        todo_store = mind / "inner" / "state" / "review-todos.jsonl"
+        emit_vault_write_todo(
+            path,
+            safe,
+            alice_summary=alice_summary,
+            path=todo_store,
+        )
+    except Exception:  # noqa: BLE001 - telemetry must never raise
+        pass
     return path
 
 
