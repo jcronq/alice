@@ -147,6 +147,7 @@ packages = [
     "src/alice_pricing",
     "src/alice_resources",
     "src/alice_speaking",
+    "src/alice_mam",
     "src/alice_state_db",
     "src/alice_thinking",
     "src/status_site",
