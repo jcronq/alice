@@ -260,6 +260,10 @@ class Config:
     # agents submit tasks to Alice over HTTP/JSON-RPC; the worker
     # exposes a port that compose maps to the host.
     a2a_enabled: bool = False
+    # Opt-in: treat Signal "Note to Self" messages (sync'd sentMessage whose
+    # destination is our own account) as inbound. Needed when Alice is a
+    # linked device on the owner's own number. See signal_rpc loop guards.
+    signal_note_to_self: bool = False
     a2a_port: int = 7878
     a2a_host: str = "0.0.0.0"
     # Single shared principal for all A2A traffic in v1. Operator points
@@ -478,6 +482,10 @@ def load() -> Config:
 
     a2a_enabled_raw = (from_any("ALICE_A2A_ENABLED", "0") or "0").strip().lower()
     a2a_enabled = a2a_enabled_raw in {"1", "true", "yes", "on"}
+    signal_note_to_self = (
+        (from_any("SIGNAL_NOTE_TO_SELF", "0") or "0").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
     try:
         a2a_port = int(from_any("ALICE_A2A_PORT", "7878") or "7878")
     except ValueError:
@@ -523,6 +531,7 @@ def load() -> Config:
         viewer_chat_principal=viewer_chat_principal,
         viewer_chat_principal_display_name=viewer_chat_principal_display_name,
         a2a_enabled=a2a_enabled,
+        signal_note_to_self=signal_note_to_self,
         a2a_port=a2a_port,
         a2a_host=a2a_host,
         a2a_principal=a2a_principal,

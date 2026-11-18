@@ -230,3 +230,18 @@ def test_load_two_consecutive_loads_do_not_contaminate_defaults(
         infra_config.SPEAKING_DEFAULTS["cue_runner"]["top_n"]
         == SPEAKING_DEFAULTS["cue_runner"]["top_n"]
     )
+
+
+# ---------- SIGNAL_NOTE_TO_SELF ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [(None, False), ("0", False), ("", False), ("1", True), ("true", True), ("ON", True)],
+)
+def test_signal_note_to_self_flag(env_and_mind, monkeypatch, raw, expected) -> None:
+    env_path, _ = env_and_mind
+    monkeypatch.delenv("SIGNAL_NOTE_TO_SELF", raising=False)
+    if raw is not None:
+        env_path.write_text(env_path.read_text() + f"SIGNAL_NOTE_TO_SELF={raw}\n")
+    assert load().signal_note_to_self is expected

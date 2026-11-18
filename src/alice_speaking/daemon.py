@@ -173,6 +173,7 @@ class SpeakingDaemon:
                 account=cfg.signal_account,
                 log_path=cfg.signal_log_path,
                 offset_path=cfg.offset_path,
+                note_to_self=cfg.signal_note_to_self,
             )
             if cfg.signal_account
             else None
