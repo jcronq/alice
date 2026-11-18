@@ -151,10 +151,14 @@ def render_markdown(rows: list[dict]) -> str:
 
 
 def _default_summary_for_kind(kind: str) -> str:
+    # No hardcoded persona name here — the ``test_no_hardcoded_
+    # personae_literals`` AST walker forbids literal "Alice" in
+    # ``src/``. These phrases describe the artifact itself, which
+    # is agent-neutral anyway.
     if kind == "vault-write":
-        return "Alice updated the vault"
+        return "Vault updated"
     if kind == "outbound-draft":
-        return "Alice drafted outbound content"
+        return "Outbound draft ready"
     return ""
 
 

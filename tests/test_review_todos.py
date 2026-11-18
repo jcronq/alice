@@ -234,7 +234,7 @@ def test_source_render_markdown_default_summary_by_kind():
         }
     ]
     md = src.render_markdown(rows)
-    assert "Alice drafted outbound content" in md
+    assert "Outbound draft ready" in md
 
 
 def test_source_render_markdown_skips_record_with_no_headline():
