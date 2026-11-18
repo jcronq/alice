@@ -322,6 +322,83 @@ details.fx-group:first-child { margin-top: 0; }
   background: var(--color-ok);
   border-color: var(--color-ok);
 }
+/* Keyboard shortcuts help modal (PR ux/overview-shortcuts-help). */
+.kb-help-trigger {
+  font-weight: 600;
+  font-size: 1rem;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.kb-help-backdrop {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(0, 0, 0, .35);
+  display: flex; align-items: center; justify-content: center;
+  padding: 1rem;
+}
+.kb-help {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  border: 1px solid var(--color-border-line);
+  border-radius: 12px;
+  padding: 1.2rem 1.4rem;
+  max-width: 32rem;
+  width: 100%;
+  max-height: 85vh;
+  overflow-y: auto;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, .28);
+}
+.kb-help h2 { margin: 0 0 .8rem; font-size: 1.2rem; }
+.kb-help .kb-group { margin-top: 1rem; }
+.kb-help .kb-group:first-of-type { margin-top: 0; }
+.kb-help .kb-group h3 {
+  font-size: .78rem; font-weight: 600;
+  color: var(--color-fg-muted);
+  text-transform: uppercase; letter-spacing: .04em;
+  margin: 0 0 .4rem;
+  padding-bottom: .2rem;
+  border-bottom: 1px solid var(--color-border-line);
+}
+.kb-help ul { list-style: none; padding: 0; margin: 0; }
+.kb-help li {
+  display: flex; align-items: baseline; gap: .8rem;
+  padding: .3rem 0;
+}
+.kb-help .kb-keys {
+  min-width: 8rem;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: .85rem;
+}
+.kb-help .kb-then { color: var(--color-fg-muted); margin: 0 .2rem; }
+.kb-help kbd {
+  background: var(--color-panel);
+  border: 1px solid var(--color-border-line);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 0 .4rem;
+  font-family: inherit;
+  font-size: .85rem;
+}
+.kb-help .kb-label { flex: 1; color: var(--color-fg); }
+.kb-help-foot {
+  margin: 1rem 0 0;
+  font-size: .78rem;
+  color: var(--color-fg-muted);
+}
+.kb-help-close {
+  margin-top: .9rem;
+  background: var(--color-ok);
+  color: var(--color-bg);
+  border: 1px solid var(--color-ok);
+  border-radius: 999px;
+  padding: .3rem 1rem;
+  font-size: .9rem;
+  cursor: pointer;
+}
+.kb-help-close:hover { opacity: .9; }
 .chat-image { margin: .4rem 0; max-width: 100%; }
 .chat-image img {
   max-width: 100%;
@@ -3834,6 +3911,161 @@ function ConfigGear() {
   );
 }
 
+// ── 10a. keyboard shortcuts (PR ux/overview-shortcuts-help) ──────
+// Minimal power-user keyboard surface inspired by the agent-ui-testing
+// reference (DESIGN.md:122-128): ``?`` opens a modal listing every
+// shortcut (Esc closes, focus returns to prior focus), ``g`` then
+// ``o`` / ``c`` / ``b`` within 1.5s navigates to Overview / Chat /
+// Bugs. Nothing fires while focus is in an input or textarea, nothing
+// fires with Ctrl / Meta / Alt (so browser shortcuts stay untouched),
+// nothing fires while the help modal is open except its own Esc.
+
+// Pure helper: given a key event (destructured for test-friendliness)
+// and the current shortcut state, return the next action. Actions:
+//   {type: "help"}            → open help modal
+//   {type: "close"}           → close help modal (Esc while open)
+//   {type: "nav", slug: "…"}  → navigate to a route slug
+//   {type: "chord", key: "g"} → start a chord
+//   null                      → no action
+function interpretShortcut(ev, state) {
+  if (ev.ctrlKey || ev.metaKey || ev.altKey) return null;
+  const tag = (ev.targetTagName || "").toLowerCase();
+  const inField = tag === "input" || tag === "textarea" || tag === "select" || ev.isContentEditable;
+  // Esc on an open modal closes it even when focus is in a field
+  // (modal traps focus on open; this is the escape hatch).
+  if (ev.key === "Escape" && state.helpOpen) return {type: "close"};
+  if (inField) return null;
+  // Help modal: `?` (Shift+/). When open, only Esc closes.
+  if (state.helpOpen) return null;
+  if (ev.key === "?" || (ev.key === "/" && ev.shiftKey)) return {type: "help"};
+  // Chord: `g` then letter within 1.5s (handled by the component,
+  // which times the chord out — this helper just names the second
+  // keystroke mapping).
+  if (state.chord === "g") {
+    if (ev.key === "o") return {type: "nav", slug: "overview"};
+    if (ev.key === "c") return {type: "nav", slug: "chat"};
+    if (ev.key === "b") return {type: "nav", slug: "bugs"};
+    // Any other key cancels the chord without firing anything.
+    return {type: "chord", key: null};
+  }
+  if (ev.key === "g") return {type: "chord", key: "g"};
+  return null;
+}
+
+// List of shortcut rows rendered in the help modal. Keep in sync with
+// ``interpretShortcut`` — any user-visible key here must have a
+// matching handler, and vice versa.
+const SHORTCUT_ROWS = [
+  {group: "Navigation", keys: ["g", "o"], label: "Go to Overview"},
+  {group: "Navigation", keys: ["g", "c"], label: "Go to Chat"},
+  {group: "Navigation", keys: ["g", "b"], label: "Go to Bugs"},
+  {group: "Help", keys: ["?"], label: "Show this help"},
+  {group: "Help", keys: ["Esc"], label: "Close help"},
+];
+
+function KeyboardShortcuts() {
+  const [helpOpen, setHelpOpen] = useState(false);
+  // ``chord`` is the first key of a pending chord ("g") or null.
+  const chordRef = useRef(null);
+  const chordTimerRef = useRef(null);
+  // Remember who had focus before the modal opened so Esc can restore.
+  const priorFocusRef = useRef(null);
+  function clearChord() {
+    chordRef.current = null;
+    if (chordTimerRef.current) {
+      clearTimeout(chordTimerRef.current);
+      chordTimerRef.current = null;
+    }
+  }
+  function startChord(k) {
+    chordRef.current = k;
+    if (chordTimerRef.current) clearTimeout(chordTimerRef.current);
+    chordTimerRef.current = setTimeout(clearChord, 1500);
+  }
+  useEffect(() => {
+    function onKey(e) {
+      const action = interpretShortcut({
+        key: e.key, shiftKey: e.shiftKey, ctrlKey: e.ctrlKey,
+        metaKey: e.metaKey, altKey: e.altKey,
+        targetTagName: e.target && e.target.tagName,
+        isContentEditable: e.target && e.target.isContentEditable,
+      }, {helpOpen, chord: chordRef.current});
+      if (!action) return;
+      if (action.type === "help") {
+        e.preventDefault();
+        priorFocusRef.current = document.activeElement;
+        setHelpOpen(true);
+        clearChord();
+        return;
+      }
+      if (action.type === "close") {
+        e.preventDefault();
+        setHelpOpen(false);
+        // Restore focus to wherever it was before the modal.
+        const el = priorFocusRef.current;
+        priorFocusRef.current = null;
+        if (el && typeof el.focus === "function") {
+          requestAnimationFrame(() => el.focus());
+        }
+        return;
+      }
+      if (action.type === "nav") {
+        e.preventDefault();
+        location.hash = action.slug;
+        clearChord();
+        return;
+      }
+      if (action.type === "chord") {
+        e.preventDefault();
+        if (action.key) startChord(action.key);
+        else clearChord();
+        return;
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      if (chordTimerRef.current) clearTimeout(chordTimerRef.current);
+    };
+  }, [helpOpen]);
+  if (!helpOpen) return null;
+  // Group rows by their ``group`` field for a clean two-column list.
+  const groups = {};
+  for (const row of SHORTCUT_ROWS) {
+    (groups[row.group] = groups[row.group] || []).push(row);
+  }
+  return h("div", {
+    className: "kb-help-backdrop",
+    role: "dialog",
+    "aria-modal": "true",
+    "aria-labelledby": "kb-help-title",
+    onClick: (e) => { if (e.target === e.currentTarget) setHelpOpen(false); },
+  },
+    h("div", {className: "kb-help", role: "document"},
+      h("h2", {id: "kb-help-title"}, "Keyboard shortcuts"),
+      Object.keys(groups).map(g => h("div", {key: g, className: "kb-group"},
+        h("h3", null, g),
+        h("ul", null, groups[g].map((r, i) => h("li", {key: i},
+          h("span", {className: "kb-keys"},
+            r.keys.map((k, j) => h(React.Fragment, {key: j},
+              j ? h("span", {className: "kb-then"}, " then ") : null,
+              h("kbd", null, k),
+            )),
+          ),
+          h("span", {className: "kb-label"}, r.label),
+        ))),
+      )),
+      h("p", {className: "kb-help-foot"},
+        "Shortcuts pause while focus is in a text field or while this dialog is open."),
+      h("button", {
+        type: "button",
+        className: "kb-help-close",
+        onClick: () => setHelpOpen(false),
+      }, "Close"),
+    ),
+  );
+}
+
 // ── 10b. /history/<id> page (issue #832) ─────────────────────────
 // Full item-history page: real URL (not hash-based) so "see all →"
 // from the drawer is a shareable, reload-safe deep link. The server
@@ -3985,6 +4217,19 @@ function App() {
       ),
       h("span", {className: "spacer"}),
       h("span", {className: statusClass}, statusLabel),
+      h("button", {
+        type: "button",
+        className: "hdr kb-help-trigger",
+        title: "Keyboard shortcuts — ?",
+        "aria-label": "Keyboard shortcuts",
+        onClick: (e) => {
+          // Reuse the same path as the ? key: dispatch a synthesised
+          // keydown on window so the KeyboardShortcuts component owns
+          // the open logic in one place.
+          e.preventDefault();
+          window.dispatchEvent(new KeyboardEvent("keydown", {key: "?", shiftKey: true}));
+        },
+      }, "?"),
       h(ConfigGear),
     ),
     h("main", null,
@@ -3996,6 +4241,7 @@ function App() {
       // sidebar below.
       schedulesPanel,
     ),
+    h(KeyboardShortcuts),
   );
 }
 
