@@ -187,7 +187,7 @@ def test_chip_set_default_when_missing_from_yaml(store, _now_epoch, tmp_path):
     # Hand-edit the file to drop chip_set (simulate a pre-field task).
     tyaml = store.root / "task-0001" / "task.yaml"
     text = tyaml.read_text()
-    text = "\n".join(l for l in text.splitlines() if not l.startswith("chip_set:"))
+    text = "\n".join(line for line in text.splitlines() if not line.startswith("chip_set:"))
     tyaml.write_text(text)
     rows = wt.scan_woy_tasks(store.root, now=_now_epoch)
     assert rows[0]["chip_set"] == "todo"
