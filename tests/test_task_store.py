@@ -351,11 +351,66 @@ def test_create_without_kind_leaves_fields_none(store: TaskStore) -> None:
     assert record.kind is None
     assert record.verb is None
     assert record.external is None
+    assert record.chip_set is None
     # task.yaml does NOT carry the new fields.
     yaml_path = store.root / record.id / "task.yaml"
     text = yaml_path.read_text()
-    for key in ("kind:", "verb:", "target:", "context:", "external:"):
+    for key in ("kind:", "verb:", "target:", "context:", "external:", "chip_set:"):
         assert key not in text, f"unexpected {key!r} in {text!r}"
+
+
+# ---------------------------------------------------------------------------
+# chip_set on kind=woy — Done/Snooze is the default; Accept/Reject opt-in.
+
+
+def test_chip_set_defaults_to_todo_for_kind_woy(store: TaskStore) -> None:
+    """A fresh kind=woy task without an explicit ``--chip-set`` lands
+    with ``chip_set=todo`` so the renderer picks Done/Snooze chips."""
+    record = store.create(
+        title="x", kind="woy", verb="Pull", target="dead drive", context="",
+    )
+    assert record.chip_set == "todo"
+    reloaded = store.load(record.id)
+    assert reloaded.chip_set == "todo"
+    # chip_set serialises to task.yaml so hand-grep debugging still
+    # shows the stored value.
+    text = (store.root / record.id / "task.yaml").read_text()
+    assert "chip_set: todo" in text
+
+
+def test_chip_set_approval_opt_in_persists(store: TaskStore) -> None:
+    """``chip_set=approval`` opt-in flows through to task.yaml so the
+    renderer swaps to Accept/Reject on reload."""
+    record = store.create(
+        title="x", kind="woy", verb="Approve", target="draft",
+        context="Approve this reply to Mike.",
+        chip_set="approval",
+    )
+    assert record.chip_set == "approval"
+    reloaded = store.load(record.id)
+    assert reloaded.chip_set == "approval"
+    text = (store.root / record.id / "task.yaml").read_text()
+    assert "chip_set: approval" in text
+
+
+def test_chip_set_unknown_value_rejected(store: TaskStore) -> None:
+    """Unknown chip_set at the write path raises — stops typos from
+    propagating into the renderer where the fallback is silent."""
+    with pytest.raises(TaskStoreError):
+        store.create(
+            title="x", kind="woy", verb="Call", target="T",
+            context="y", chip_set="haunted",
+        )
+
+
+def test_chip_set_dropped_for_non_woy_task(store: TaskStore) -> None:
+    """Setting ``chip_set`` on a non-woy task is a silent no-op — the
+    chip renderer only looks at kind=woy rows, so persisting the field
+    on other kinds would just be dead weight."""
+    record = store.create(title="plain", chip_set="approval")
+    assert record.chip_set is None
+    text = (store.root / record.id / "task.yaml").read_text()
+    assert "chip_set:" not in text
 
 
 def test_woy_close_done_terminal(store: TaskStore) -> None:

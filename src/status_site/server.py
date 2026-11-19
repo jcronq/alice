@@ -2210,21 +2210,36 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
             _waiting_on_you.SOURCE_NAME
         )
         # ``needs_approval_slugs`` lists the hand-zone bold-title
-        # slugs the server considers one-click-actionable — today
-        # that's "contains a github.com PR URL" (see ``_detect_pr``).
-        # The client renders those under a "Needs your approval"
-        # subheader with inline Accept/Reject buttons. kind=woy task
-        # rows join that list so their chips light up too.
+        # slugs the server considers one-click-actionable AND wants
+        # the Accept/Reject chip pair on — today that's "contains a
+        # github.com PR URL" (see ``_detect_pr``) plus any kind=woy
+        # task that opts in via ``chip_set: approval``.
+        #
+        # ``todo_chip_slugs`` is the default kind=woy codepath —
+        # Done/Snooze chips for items Jason will either do or defer.
+        # Separating the two lets the renderer attach the right
+        # verb pair per row without the UI committing to approval
+        # vocabulary for simple TODOs ("Reject: Pull dead drive sdb"
+        # is nonsensical).
         needs_approval = needs_approval_slugs(hand_zone_md)
+        todo_chip_slugs: list[str] = []
         for r in woy_task_rows:
             slug = r.get("slug")
-            if slug and slug not in needs_approval:
-                needs_approval.append(slug)
+            if not slug:
+                continue
+            chip_set = str(r.get("chip_set") or _woy_tasks.DEFAULT_CHIP_SET).lower()
+            if chip_set == "approval":
+                if slug not in needs_approval:
+                    needs_approval.append(slug)
+            else:
+                if slug not in todo_chip_slugs and slug not in needs_approval:
+                    todo_chip_slugs.append(slug)
         return {
             "markdown": md,
             "hand_zone_md": hand_zone_md,
             "rows": rows,
             "needs_approval_slugs": needs_approval,
+            "todo_chip_slugs": todo_chip_slugs,
             "review_todos": review_todo_rows,
             "woy_tasks": _woy_tasks.typed_rows(woy_task_rows),
         }
@@ -2401,12 +2416,23 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
                 f"{your_todo_md}\n\n{review_md}" if your_todo_md else review_md
             )
         needs_approval = needs_approval_slugs(your_todo_md)
-        # kind=woy task slugs join ``needs_approval`` so the Accept/
-        # Reject chip pair auto-attaches.
+        # kind=woy task slugs split into two buckets by ``chip_set``:
+        # ``approval`` → Accept / Reject (the sign-off subcase);
+        # ``todo`` (default) → Done / Snooze (simple action items).
+        # Hand-written PR bullets stay in ``needs_approval`` via the
+        # ``_detect_pr`` scan above.
+        todo_chip_slugs: list[str] = []
         for r in woy_task_rows:
             slug = r.get("slug")
-            if slug and slug not in needs_approval:
-                needs_approval.append(slug)
+            if not slug:
+                continue
+            chip_set = str(r.get("chip_set") or _woy_tasks.DEFAULT_CHIP_SET).lower()
+            if chip_set == "approval":
+                if slug not in needs_approval:
+                    needs_approval.append(slug)
+            else:
+                if slug not in todo_chip_slugs and slug not in needs_approval:
+                    todo_chip_slugs.append(slug)
         # Attention-reacts (👀 ⚠️ 👎 ❓) wait on #683; the key is the
         # contract so the widget lights up as soon as it is populated.
         attention_reacts: list[dict] = []
@@ -2428,6 +2454,7 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
             "rows": ask_rows,
             "your_todo_md": your_todo_md,
             "needs_approval_slugs": needs_approval,
+            "todo_chip_slugs": todo_chip_slugs,
             "external_todos_md": external_todos_md,
             "review_todos": review_todo_rows,
             "woy_tasks": _woy_tasks.typed_rows(woy_task_rows),
@@ -3765,10 +3792,16 @@ def _maybe_close_woy_task(
 def handle_woy_task_action(cfg: "Config", d: dict) -> dict:
     """Execute a ``task-close`` / ``task-snooze`` / ``task-reject`` descriptor.
 
-    Body: ``{key, task_id, action[, until]}``. ``action`` must be one
-    of :data:`WOY_TASK_ACTIONS`; ``task-snooze`` honours an optional
-    ``until`` ISO-8601 override, otherwise defaults to tomorrow 09:00
-    local.
+    Body: ``{key, action, (task_id|slug), [until]}``. ``action`` must
+    be one of :data:`WOY_TASK_ACTIONS`; ``task-snooze`` honours an
+    optional ``until`` ISO-8601 override, otherwise defaults to
+    tomorrow 09:00 local.
+
+    Either ``task_id`` (``task-NNNN`` shape) or ``slug`` (the WoY row
+    slug, matching :func:`status_site.history.title_slug` on
+    ``"{verb} {target}"``) may be supplied; ``slug`` is the shape the
+    Overview chip DOM carries. Supplying both is allowed; ``task_id``
+    wins (chip renderer may embed both for robustness).
 
     Authenticated against ``cfg.key`` — the shared reply key the Chat
     tab and the ``/api/woy-action`` endpoint already use. Writes the
@@ -3783,8 +3816,15 @@ def handle_woy_task_action(cfg: "Config", d: dict) -> dict:
     if action not in WOY_TASK_ACTIONS:
         raise ReplyError(400, "bad action")
     task_id_raw = str(d.get("task_id") or "").strip()
+    slug_raw = str(d.get("slug") or "").strip()
+    if not task_id_raw and slug_raw:
+        # Slug → task_id lookup — chip renderer POSTs slug-only.
+        resolved = _resolve_woy_slug_to_task_id(safe_slug(slug_raw))
+        if not resolved:
+            raise ReplyError(404, "slug did not resolve to a kind=woy task")
+        task_id_raw = resolved
     if not task_id_raw:
-        raise ReplyError(400, "missing task_id")
+        raise ReplyError(400, "missing task_id or slug")
     # Shape guard: `task-NNNN` style ids only.
     if not re.match(r"^task-\d{4,}$", task_id_raw):
         raise ReplyError(400, "bad task_id")

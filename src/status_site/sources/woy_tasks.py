@@ -29,8 +29,9 @@ A row carries::
 The renderer also emits a hand-zone-shaped markdown blob via
 :func:`render_markdown` so the existing ``WaitingTable`` widget renders
 the items alongside any surviving Jason-authored lines, and the server
-feeds the slugs into ``needs_approval_slugs`` so the Accept / Reject
-chips already attach to them.
+splits the slugs into ``needs_approval_slugs`` (chip_set=approval →
+Accept / Reject) vs. ``todo_chip_slugs`` (chip_set=todo, the default →
+Done / Snooze) so the matching chip pair attaches to each row.
 
 Stdlib-only by convention (``status_site.sources.tasks`` sets this
 precedent). YAML parsing reuses :func:`status_site.sources.tasks._parse_task_yaml`.
@@ -69,19 +70,67 @@ def _parse_iso(value: object) -> Optional[float]:
     return dt.timestamp()
 
 
-def _default_accept_descriptors(task_id: str) -> list[dict]:
-    """Return the canonical trio of Accept / Snooze / Reject descriptors.
+#: Default chip set for ``kind=woy`` tasks when none was set on the
+#: task.yaml. The default is ``"todo"`` (Done / Snooze) because the
+#: overwhelming majority of WoY items are simple action-TODOs Jason
+#: will either do or defer — "reject" is nonsensical for "Pull dead
+#: drive sdb from NAS". ``"approval"`` opts a row into Accept / Reject
+#: for the design-review subcase.
+DEFAULT_CHIP_SET = "todo"
+
+#: Valid ``chip_set`` values. A task.yaml carrying an unknown value
+#: falls back to :data:`DEFAULT_CHIP_SET` (the renderer is forgiving
+#: because the YAML is user-editable); the store-level validation in
+#: :func:`alice_forge.task_store.TaskStore.create` is where the
+#: write path refuses unknown input.
+VALID_CHIP_SETS: frozenset[str] = frozenset({"todo", "approval"})
+
+
+def _normalize_chip_set(value: object) -> str:
+    """Coerce a raw chip_set scalar to one of :data:`VALID_CHIP_SETS`.
+
+    Unknown / missing values fall back to :data:`DEFAULT_CHIP_SET`.
+    The renderer never raises on a stale YAML; the write path owns
+    validation.
+    """
+    if value is None:
+        return DEFAULT_CHIP_SET
+    s = str(value).strip().lower()
+    return s if s in VALID_CHIP_SETS else DEFAULT_CHIP_SET
+
+
+def _descriptors_for_chip_set(task_id: str, chip_set: str) -> list[dict]:
+    """Return the ``accept_descriptors`` trio for one ``chip_set``.
 
     The shape matches ``rows[].accept_descriptors`` promised in the
     design: ``{key, label, action, variant}``. Downstream code (the
     shell chip renderer and the ``/api/woy/action`` handler) keys off
     the ``action`` field.
+
+    * ``"todo"`` (default) → **Done** + **Snooze**. No reject chip —
+      cancelling a WoY task is a rare one-off, reachable via
+      ``task reject task-NNNN`` on the CLI.
+    * ``"approval"`` → **Accept** + **Reject**. Used for the
+      design-review subcase where Alice drafted something and needs
+      explicit sign-off before the outcome ships.
     """
+    if chip_set == "approval":
+        return [
+            {"key": "accept", "label": "Accept", "action": "task-close", "variant": "primary"},
+            {"key": "reject", "label": "Reject", "action": "task-reject", "variant": "danger"},
+        ]
+    # Default + unknown → todo semantics.
     return [
         {"key": "done", "label": "Done", "action": "task-close", "variant": "primary"},
         {"key": "snooze", "label": "Snooze", "action": "task-snooze", "variant": "secondary"},
-        {"key": "reject", "label": "Reject", "action": "task-reject", "variant": "danger"},
     ]
+
+
+# Back-compat alias retained for any importer that still calls the
+# legacy name. The new call site uses :func:`_descriptors_for_chip_set`
+# with an explicit ``chip_set`` so tests can lock the renaming in.
+def _default_accept_descriptors(task_id: str) -> list[dict]:
+    return _descriptors_for_chip_set(task_id, DEFAULT_CHIP_SET)
 
 
 def _is_snoozed(snooze_until: Optional[str], now_epoch: float) -> bool:
@@ -231,6 +280,7 @@ def scan_woy_tasks(
         else:
             external = str(external_raw).strip().lower() in {"1", "true", "yes", "y"}
         task_id = str(scalars.get("id") or d.name).strip()
+        chip_set = _normalize_chip_set(scalars.get("chip_set"))
         row = {
             "task_id": task_id,
             "verb": verb or "",
@@ -239,7 +289,8 @@ def scan_woy_tasks(
             "body": context or "",
             "title": title_text,
             "slug": slug,
-            "accept_descriptors": _default_accept_descriptors(task_id),
+            "chip_set": chip_set,
+            "accept_descriptors": _descriptors_for_chip_set(task_id, chip_set),
             "external": external,
             "status": status,
             "snooze_until": snooze_until,
@@ -320,6 +371,7 @@ def typed_rows(rows: Iterable[dict]) -> list[dict]:
                 "body": r.get("body", r.get("context", "")),
                 "title": r.get("title", ""),
                 "slug": r.get("slug", ""),
+                "chip_set": r.get("chip_set", DEFAULT_CHIP_SET),
                 "accept_descriptors": list(r.get("accept_descriptors") or []),
                 "external": bool(r.get("external")),
                 "status": r.get("status", ""),

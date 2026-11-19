@@ -63,9 +63,14 @@ def test_scan_emits_structured_rows(store, _now_epoch):
     assert r["slug"] == "call-randy-sosa-at-nam"
     assert r["external"] is True
     assert r["status"] == "draft"
-    # accept_descriptors carries the trio with the right actions.
+    # Default chip_set is "todo" (Done / Snooze) — the vast majority
+    # of WoY items are action TODOs; Accept/Reject is opt-in for the
+    # design-review subcase.
+    assert r["chip_set"] == "todo"
     actions = [d["action"] for d in r["accept_descriptors"]]
-    assert actions == ["task-close", "task-snooze", "task-reject"]
+    assert actions == ["task-close", "task-snooze"]
+    labels = [d["label"] for d in r["accept_descriptors"]]
+    assert labels == ["Done", "Snooze"]
 
 
 def test_scan_excludes_non_woy_tasks(store, _now_epoch):
@@ -154,5 +159,60 @@ def test_typed_rows_strips_volatile_fields(store, _now_epoch):
     # section.update doesn't fire every tick as time drifts.
     assert "age_seconds" not in typed[0]
     assert "accept_descriptors" in typed[0]
+    assert typed[0]["chip_set"] == "todo"
     # ``created_epoch`` is stable across ticks → dict-equality holds.
     assert isinstance(typed[0]["created_epoch"], float)
+
+
+# ------------------------------------------------------------------ chip_set
+
+
+def test_approval_chip_set_emits_accept_reject(store, _now_epoch):
+    """Opt-in ``chip_set=approval`` swaps the renderer into the
+    design-review Accept / Reject descriptor pair."""
+    _seed_woy(store, chip_set="approval")
+    rows = wt.scan_woy_tasks(store.root, now=_now_epoch)
+    r = rows[0]
+    assert r["chip_set"] == "approval"
+    actions = [d["action"] for d in r["accept_descriptors"]]
+    assert actions == ["task-close", "task-reject"]
+    labels = [d["label"] for d in r["accept_descriptors"]]
+    assert labels == ["Accept", "Reject"]
+
+
+def test_chip_set_default_when_missing_from_yaml(store, _now_epoch, tmp_path):
+    """A task.yaml without ``chip_set`` defaults to ``todo`` in the
+    renderer — no migration needed for pre-chip-set WoY tasks."""
+    _seed_woy(store)
+    # Hand-edit the file to drop chip_set (simulate a pre-field task).
+    tyaml = store.root / "task-0001" / "task.yaml"
+    text = tyaml.read_text()
+    text = "\n".join(l for l in text.splitlines() if not l.startswith("chip_set:"))
+    tyaml.write_text(text)
+    rows = wt.scan_woy_tasks(store.root, now=_now_epoch)
+    assert rows[0]["chip_set"] == "todo"
+    actions = [d["action"] for d in rows[0]["accept_descriptors"]]
+    assert actions == ["task-close", "task-snooze"]
+
+
+def test_chip_set_unknown_value_in_yaml_falls_back_to_default(
+    store, _now_epoch
+):
+    """A hand-edited stale value shouldn't crash the renderer — the
+    store-level write path owns validation."""
+    _seed_woy(store)
+    tyaml = store.root / "task-0001" / "task.yaml"
+    text = tyaml.read_text().replace("chip_set: todo", "chip_set: haunted")
+    tyaml.write_text(text)
+    rows = wt.scan_woy_tasks(store.root, now=_now_epoch)
+    assert rows[0]["chip_set"] == "todo"
+
+
+def test_descriptors_for_chip_set_direct():
+    todo = wt._descriptors_for_chip_set("task-0001", "todo")
+    assert [d["action"] for d in todo] == ["task-close", "task-snooze"]
+    approval = wt._descriptors_for_chip_set("task-0001", "approval")
+    assert [d["action"] for d in approval] == ["task-close", "task-reject"]
+    # Unknown → defaults to todo (renderer is forgiving).
+    unknown = wt._descriptors_for_chip_set("task-0001", "???")
+    assert [d["action"] for d in unknown] == ["task-close", "task-snooze"]
