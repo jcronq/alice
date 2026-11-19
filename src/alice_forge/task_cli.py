@@ -153,9 +153,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Which chip pair the WoY renderer attaches to this row. "
             "``todo`` (Done / Snooze — the default for --kind woy) "
             "for simple action items; ``approval`` (Accept / Reject) "
-            "for the design-review subcase where Alice drafted "
-            "something and needs explicit sign-off. Dropped for "
-            "non-woy tasks."
+            "for the design-review subcase where a draft needs "
+            "explicit sign-off. Dropped for non-woy tasks."
         ),
     )
 
