@@ -145,6 +145,18 @@ def _build_parser() -> argparse.ArgumentParser:
             "--kind woy). Use --no-external to flip."
         ),
     )
+    pc.add_argument(
+        "--chip-set",
+        default=None,
+        choices=["todo", "approval"],
+        help=(
+            "Which chip pair the WoY renderer attaches to this row. "
+            "``todo`` (Done / Snooze — the default for --kind woy) "
+            "for simple action items; ``approval`` (Accept / Reject) "
+            "for the design-review subcase where a draft needs "
+            "explicit sign-off. Dropped for non-woy tasks."
+        ),
+    )
 
     # ---- update
     pu = sub.add_parser("update", help="Transition a task to a new status.")
@@ -675,6 +687,7 @@ def _cmd_create(store: TaskStore, args: argparse.Namespace) -> int:
         target=getattr(args, "target", None),
         context=getattr(args, "context", None),
         external=getattr(args, "external", None),
+        chip_set=getattr(args, "chip_set", None),
     )
     _print_record(record, as_json=args.json)
     return 0

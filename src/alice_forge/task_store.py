@@ -157,6 +157,7 @@ class TaskRecord:
     context: Optional[str] = None
     external: Optional[bool] = None
     snooze_until: Optional[str] = None
+    chip_set: Optional[str] = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_yaml_dict(self) -> dict[str, Any]:
@@ -192,6 +193,8 @@ class TaskRecord:
             out["external"] = self.external
         if self.snooze_until is not None:
             out["snooze_until"] = self.snooze_until
+        if self.chip_set is not None:
+            out["chip_set"] = self.chip_set
         for k, v in self.extra.items():
             out.setdefault(k, v)
         return out
@@ -478,6 +481,7 @@ class TaskStore:
         target: Optional[str] = None,
         context: Optional[str] = None,
         external: Optional[bool] = None,
+        chip_set: Optional[str] = None,
     ) -> TaskRecord:
         """Allocate a new ``task-NNNN/`` with status=draft.
 
@@ -491,6 +495,14 @@ class TaskStore:
         slices can add their own without re-touching the store. The
         other four scalars (``verb``, ``target``, ``context``,
         ``external``) flow through to ``task.yaml`` when set.
+
+        ``chip_set`` keys which chip pair the WoY renderer attaches
+        to a ``kind=woy`` row: ``"todo"`` (Done / Snooze, the default)
+        for action items Jason will either do or defer, ``"approval"``
+        (Accept / Reject) for the design-review subcase where Alice
+        drafted something and needs explicit sign-off. Unknown values
+        raise :class:`TaskStoreError`. Silently dropped for non-woy
+        tasks — chips only attach to the WoY tier today.
         """
         if actor not in {"speaking", "thinking", "jason", "alice"}:
             raise TaskStoreError(f"invalid actor: {actor!r}")
@@ -499,6 +511,17 @@ class TaskStore:
         # ``kind=woy`` items are user-side actions by default.
         if kind == "woy" and external is None:
             external = True
+        # Validate + default ``chip_set``. Only kind=woy carries chips
+        # in the renderer today; silently drop the field on non-woy
+        # tasks so authors can't attach meaningless action vocabulary.
+        if chip_set is not None and chip_set not in {"todo", "approval"}:
+            raise TaskStoreError(
+                f"invalid chip_set: {chip_set!r} (expected 'todo' or 'approval')"
+            )
+        if kind == "woy" and chip_set is None:
+            chip_set = "todo"
+        if kind != "woy":
+            chip_set = None
 
         with self._locked():
             task_id = self._next_id()
@@ -517,6 +540,7 @@ class TaskStore:
                 target=target,
                 context=context,
                 external=external,
+                chip_set=chip_set,
             )
             task_dir = self._task_dir(task_id)
             task_dir.mkdir(parents=True, exist_ok=False)
@@ -979,6 +1003,7 @@ def _record_from_dict(data: Mapping[str, Any]) -> TaskRecord:
         "context",
         "external",
         "snooze_until",
+        "chip_set",
     }
     extra = {k: v for k, v in data.items() if k not in known}
 
@@ -1012,6 +1037,7 @@ def _record_from_dict(data: Mapping[str, Any]) -> TaskRecord:
         context=_opt_str("context"),
         external=external_val,
         snooze_until=_opt_str("snooze_until"),
+        chip_set=_opt_str("chip_set"),
         extra=extra,
     )
 

@@ -2812,9 +2812,26 @@ function ExpandedCard({title, slug, externalLink, isPr, onClose, onDismissed}) {
   );
 }
 
-function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs}) {
+function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs, todoChipSlugs}) {
   const safe = rows || [];
   const approvalSet = React.useMemo(() => new Set(needsApprovalSlugs || []), [needsApprovalSlugs]);
+  // ``todoChipSlugs`` is the default kind=woy codepath — Done/Snooze
+  // chips for plain action items. ``approvalSet`` wins if a slug is
+  // somehow in both (hand-written PR bullets get Accept/Reject).
+  const todoSet = React.useMemo(() => {
+    const s = new Set();
+    for (const slug of (todoChipSlugs || [])) {
+      if (!approvalSet.has(slug)) s.add(slug);
+    }
+    return s;
+  }, [todoChipSlugs, approvalSet]);
+  // Union: any slug that gets ANY chip pair. Used to drive the
+  // post-render DOM pass + source-bullet hiding.
+  const chipSet = React.useMemo(() => {
+    const s = new Set(approvalSet);
+    for (const slug of todoSet) s.add(slug);
+    return s;
+  }, [approvalSet, todoSet]);
   const zoneRef = useRef(null);
   const [active, setActive] = useState(null); // {slug, title, externalLink, isPr, anchorNode} | null
   // Per-slug {verb, at} for rows Jason has just Accepted/Rejected from
@@ -2886,6 +2903,19 @@ function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs}) {
       runRowAction(slug, verb, btn);
       return;
     }
+    // Todo-variant chip click: Done / Snooze. These POST to the
+    // dedicated ``/api/woy/action`` endpoint and reconcile by slug.
+    const todoBtn = e.target.closest && e.target.closest("button[data-woy-todo-action]");
+    if (todoBtn) {
+      const verb = todoBtn.getAttribute("data-woy-todo-action");
+      const slug = todoBtn.getAttribute("data-woy-slug");
+      if (!verb || !slug) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (rowDone[slug]) return;
+      runTodoAction(slug, verb, todoBtn);
+      return;
+    }
     const label = e.target.closest && e.target.closest(".woy-approval-label");
     if (label) {
       const chipLi = label.closest && label.closest("li[data-woy-slug]");
@@ -2923,6 +2953,10 @@ function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs}) {
     if (active) closeExpand();
     openSlug(li, title, slug, externalLink);
   };
+  // Chip-click handler for approval-style rows (Accept/Reject).
+  // Hits the legacy ``/api/woy-action`` endpoint; server-side
+  // reconciles slug → task_id for kind=woy and no-ops for PR rows
+  // where Accept means "merge the PR".
   const runRowAction = async (slug, verb, btn) => {
     if (!KEY) return;
     if (btn) { btn.disabled = true; btn.textContent = verb === "accept" ? "Accepting…" : "Rejecting…"; }
@@ -2942,10 +2976,39 @@ function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs}) {
       if (btn) { btn.disabled = false; btn.textContent = verb === "accept" ? "Accept" : "Reject"; }
     }
   };
-  // Post-render DOM pass: for each hand-zone <li> whose slug is in
-  // ``needs_approval_slugs``, append an inline Accept/Reject chip
-  // pair (next to the title) AND prepend a lightweight
-  // "Needs your approval" chip-list that mirrors the titles.
+  // Chip-click handler for todo-style rows (Done/Snooze). Hits the
+  // dedicated ``/api/woy/action`` endpoint which takes a slug and
+  // reconciles it to the backing kind=woy task before closing or
+  // snoozing. Both verbs map to a ``rowDone`` key so the pill flips
+  // to "Done Ns ago" / "Snoozed Ns ago" before the next Tracker tick
+  // removes the row.
+  const runTodoAction = async (slug, verb, btn) => {
+    if (!KEY) return;
+    const action = verb === "done" ? "task-close" : "task-snooze";
+    const pendingText = verb === "done" ? "Marking done…" : "Snoozing…";
+    const labelText = verb === "done" ? "Done" : "Snooze";
+    if (btn) { btn.disabled = true; btn.textContent = pendingText; }
+    try {
+      const r = await fetch("/api/woy/action", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({key: KEY, slug, action}),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || !body.ok) {
+        if (btn) { btn.disabled = false; btn.textContent = labelText; }
+        return;
+      }
+      setRowDone(prev => ({...prev, [slug]: {verb, at: Date.now()}}));
+    } catch (e) {
+      if (btn) { btn.disabled = false; btn.textContent = labelText; }
+    }
+  };
+  // Post-render DOM pass: for each hand-zone <li> whose slug has a
+  // chip pair attached (``approvalSet`` → Accept/Reject,
+  // ``todoSet`` → Done/Snooze), prepend a lightweight chip-list
+  // that mirrors the titles. The matching source bullet gets a
+  // ``woy-row-cloned`` class so CSS hides it (the chip IS the UI).
   //
   // Historical note: Slice-2 draft #1 physically MOVED the matching
   // <li>s into the subsection. That broke on every ``nowMs`` tick —
@@ -2953,6 +3016,12 @@ function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs}) {
   // DOM when ``handZoneMd`` is unchanged, so the destroyed nodes
   // were never replaced. We now leave the original <li>s in place
   // and build the subsection by cloning titles into a sibling list.
+  //
+  // 2026-11-18 (fix/woy-todo-semantics): two chip variants now share
+  // the subsection — "YOUR TODO" (Done/Snooze) for kind=woy action
+  // items, "NEEDS YOUR APPROVAL" (Accept/Reject) for the
+  // design-review opt-in. CSS class stays ``.woy-needs-approval`` so
+  // styling is shared.
   useLayoutEffect(() => {
     const zone = zoneRef.current;
     if (!zone) return;
@@ -2960,23 +3029,36 @@ function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs}) {
     // un-hide any <li>s we previously cloned into chips (bug fix
     // 2026-11-18: before this cleanup existed, the source bullets
     // stayed display:none forever even if the slug fell out of the
-    // approval set — e.g. after an Accept — leaving an invisible gap).
+    // chip set — e.g. after an Accept — leaving an invisible gap).
     const prior = zone.querySelector(":scope > .woy-needs-approval");
     if (prior && prior.parentNode) prior.parentNode.removeChild(prior);
     zone.querySelectorAll(".woy-row-actions").forEach(n => n.parentNode && n.parentNode.removeChild(n));
     zone.querySelectorAll("li.woy-row-cloned").forEach(li => li.classList.remove("woy-row-cloned"));
-    if (!approvalSet.size) return;
+    if (!chipSet.size) return;
+    // Build two chip rows: one for todo items (Done/Snooze), one
+    // for approval items (Accept/Reject). We keep them in a single
+    // ``.woy-needs-approval`` wrapper so the border/padding is
+    // consistent; each sub-group gets its own header.
     const subsection = document.createElement("div");
     subsection.className = "woy-needs-approval";
-    const head = document.createElement("h4");
-    head.className = "woy-needs-approval-head";
-    head.textContent = "Needs your approval";
-    subsection.appendChild(head);
-    const ul = document.createElement("ul");
-    subsection.appendChild(ul);
-    const makeChipRow = (slug, titleText) => {
+    const addGroup = (headText, variant) => {
+      const head = document.createElement("h4");
+      head.className = "woy-needs-approval-head";
+      head.textContent = headText;
+      subsection.appendChild(head);
+      const ul = document.createElement("ul");
+      ul.setAttribute("data-chip-set", variant);
+      subsection.appendChild(ul);
+      return ul;
+    };
+    // Render order: todo group first (default), approval second.
+    // Jason's eye lands on action-items; approval sign-offs are
+    // the exception.
+    let todoUl = null, approvalUl = null;
+    const makeApprovalChipRow = (slug, titleText) => {
       const li = document.createElement("li");
       li.setAttribute("data-woy-slug", slug);
+      li.setAttribute("data-chip-set", "approval");
       const label = document.createElement("span");
       label.className = "woy-approval-label";
       label.textContent = titleText;
@@ -3006,26 +3088,75 @@ function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs}) {
       li.appendChild(span);
       return li;
     };
-    let found = false;
+    const makeTodoChipRow = (slug, titleText) => {
+      const li = document.createElement("li");
+      li.setAttribute("data-woy-slug", slug);
+      li.setAttribute("data-chip-set", "todo");
+      const label = document.createElement("span");
+      label.className = "woy-approval-label";
+      label.textContent = titleText;
+      li.appendChild(label);
+      const span = document.createElement("span");
+      span.className = "woy-row-actions";
+      const done = rowDone[slug];
+      const bDone = document.createElement("button");
+      bDone.type = "button";
+      bDone.setAttribute("data-woy-todo-action", "done");
+      bDone.setAttribute("data-woy-slug", slug);
+      bDone.textContent = done && done.verb === "done"
+        ? "Done " + ageString(new Date(done.at).toISOString(), nowMs || Date.now())
+        : "Done";
+      if (done) bDone.disabled = true;
+      const bSnooze = document.createElement("button");
+      bSnooze.type = "button";
+      bSnooze.setAttribute("data-woy-todo-action", "snooze");
+      bSnooze.setAttribute("data-woy-slug", slug);
+      bSnooze.textContent = done && done.verb === "snooze"
+        ? "Snoozed " + ageString(new Date(done.at).toISOString(), nowMs || Date.now())
+        : "Snooze";
+      if (done) bSnooze.disabled = true;
+      span.appendChild(bDone);
+      span.appendChild(bSnooze);
+      li.appendChild(span);
+      return li;
+    };
+    // Collect bullets per slug first; two passes keep the two groups
+    // in the right display order (todo above approval).
+    const perSlug = new Map();
     zone.querySelectorAll("li").forEach(li => {
       const strong = li.querySelector(":scope > strong, :scope > p > strong");
       if (!strong) return;
       const title = (strong.textContent || "").trim();
       const slug = titleSlug(title);
-      if (!slug || !approvalSet.has(slug)) return;
-      found = true;
-      // Append the chip row to the subsection (one per source li).
-      ul.appendChild(makeChipRow(slug, title));
+      if (!slug || !chipSet.has(slug)) return;
+      // approvalSet wins over todoSet if both carry the slug.
+      const variant = approvalSet.has(slug) ? "approval" : "todo";
+      if (!perSlug.has(slug)) perSlug.set(slug, {title, variant, li});
       // Hide the source bullet — the chip subsection above IS the UI
       // for this row now (bug fix 2026-11-18: previously the markdown
       // bullet rendered a second time below the chip list, giving two
       // copies of every kind=woy task on the Overview).
       li.classList.add("woy-row-cloned");
     });
+    let found = false;
+    // Todo group first.
+    for (const [slug, {title, variant}] of perSlug) {
+      if (variant !== "todo") continue;
+      if (!todoUl) todoUl = addGroup("Your TODO", "todo");
+      todoUl.appendChild(makeTodoChipRow(slug, title));
+      found = true;
+    }
+    // Then approval group.
+    for (const [slug, {title, variant}] of perSlug) {
+      if (variant !== "approval") continue;
+      if (!approvalUl) approvalUl = addGroup("Needs your approval", "approval");
+      approvalUl.appendChild(makeApprovalChipRow(slug, title));
+      found = true;
+    }
     if (found) {
       zone.insertBefore(subsection, zone.firstChild);
     }
-  }, [handZoneMd, approvalSet, rowDone, nowMs]);
+  }, [handZoneMd, approvalSet, todoSet, chipSet, rowDone, nowMs]);
   // When a slug disappears from the server payload, clear its rowDone
   // state too so a future render-under-the-same-slug starts fresh.
   useEffect(() => {
@@ -3059,6 +3190,12 @@ function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs}) {
       anchorRef.current = null;
     };
   }, []);
+  // Empty-state fallback fires ONLY when both the structured
+  // ``rows`` list and the hand-zone markdown are empty. Previously
+  // this fired whenever ``rows`` was empty, so a populated
+  // kind=woy / review-TODO hand-zone would render WITH a bogus
+  // "(nothing waiting on you)" line below it. Bug fix 2026-11-18
+  // (fix/woy-todo-semantics): aggregate the predicate.
   const table = safe.length
     ? h(FxTable, {
         columns: [
@@ -3069,8 +3206,10 @@ function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs}) {
         rows: safe,
         rowClass: r => (r.urgency === "NOW" || r.urgency === "UNSET") ? "fx-now" : "",
       })
-    : h("p", {style: {color: "var(--color-fg-muted)", margin: 0}},
-        "(nothing waiting on you)");
+    : (handZoneMd
+        ? null
+        : h("p", {style: {color: "var(--color-fg-muted)", margin: 0}, "data-testid": "waiting-table-empty"},
+            "(nothing waiting on you)"));
   return h(React.Fragment, null,
     handZoneMd ? h("div", {
       className: "woy-click",
@@ -3208,6 +3347,7 @@ function YourTodoBoard({data, nowMs}) {
         rows: d.rows,
         handZoneMd: d.your_todo_md,
         needsApprovalSlugs: d.needs_approval_slugs || [],
+        todoChipSlugs: d.todo_chip_slugs || [],
         nowMs,
       })));
   }
