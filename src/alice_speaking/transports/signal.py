@@ -276,9 +276,15 @@ class SignalTransport:
             # wins over the mid-turn divert below: a forwarded sender
             # is explicitly NOT Alice's conversation to hold, so
             # stitching their follow-up into her local turn would be
-            # wrong. On POST failure we log + fall through to the
-            # standard local path so the operator still has a trail
-            # — silent drops are worse than a visible local reply.
+            # wrong.
+            #
+            # On POST failure we send the sender a short "unreachable"
+            # notice over Signal and drop the message. We do NOT fall
+            # through to the local inbox: cross-tenant leakage (one
+            # user's message handled by a different household's Alice)
+            # breaks the isolation the forward is designed to enforce.
+            # Silent drops would be worse; a visible unreachable
+            # message gives the sender a retry path.
             # See :mod:`alice_speaking.signal_dispatch`.
             dispatch_cfg = getattr(getattr(ctx, "cfg", None), "signal_dispatch", None)
             rule = dispatch_cfg.lookup(env.source) if dispatch_cfg else None
@@ -300,18 +306,34 @@ class SignalTransport:
                         rule.target,
                         rule.label,
                     )
-                    continue
                 except Exception as exc:  # noqa: BLE001
                     log.warning(
                         "signal forward failed "
                         "(sender=%s target=%s label=%s): %s; "
-                        "falling back to local handling",
+                        "sending unreachable notice + dropping",
                         env.source,
                         rule.target,
                         rule.label,
                         exc,
                     )
-                    # Intentional fall-through to local inbox below.
+                    # Best-effort apology back to the sender. Swallow
+                    # any secondary Signal failure — if the outbox is
+                    # also down, there's nothing useful to do but
+                    # leave the log entry above as the trail.
+                    try:
+                        await self._signal.send(
+                            env.source,
+                            "Your Alice isn't reachable right now. "
+                            "Try again in a few minutes.",
+                        )
+                    except Exception as notify_exc:  # noqa: BLE001
+                        log.warning(
+                            "signal forward-failure notice also failed "
+                            "(sender=%s): %s",
+                            env.source,
+                            notify_exc,
+                        )
+                continue
             event = SignalEvent(envelope=env, sender_name=sender_name)
             # Mid-turn context injection: if Alice is currently in a
             # turn for THIS same Signal channel, divert the message

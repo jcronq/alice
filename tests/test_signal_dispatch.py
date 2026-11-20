@@ -1,7 +1,7 @@
 """Tests for Signal sender-based dispatch.
 
 Covers the config loader, the ``_produce`` fork in ``SignalTransport``,
-and the fallback-on-failure path. Also smoke-checks the A2A receiver
+and the forward-failure unreachable-notice path. Also smoke-checks the A2A receiver
 shim that plumbs forwarded Signal metadata into the kernel prompt.
 """
 
@@ -385,23 +385,31 @@ async def test_forward_to_a2a_propagates_poster_errors():
 #
 # These exercise the integration: a producer loop iteration consults
 # ``ctx.cfg.signal_dispatch``, forwards matching senders, and never
-# puts the event on the local inbox. On HTTP failure the fallback
-# path lands the event on the local inbox exactly like an unforwarded
-# sender, so operators keep visibility.
+# puts the event on the local inbox. On HTTP failure the sender
+# receives a short "unreachable" Signal notice and the message is
+# dropped — cross-tenant fallback would break the isolation the
+# forward is designed to enforce.
 
 
 class _FakeSignalClient:
     """Minimal signal-client stand-in that yields a fixed list of envelopes
-    then blocks forever (simulating a live stream)."""
+    then blocks forever (simulating a live stream). Also captures any
+    outbound send() calls so tests can assert on the forward-failure
+    unreachable-notice path.
+    """
 
     def __init__(self, envelopes: list[SignalEnvelope]) -> None:
         self._envelopes = envelopes
         self._gate = asyncio.Event()
+        self.sends: list[tuple[str, str]] = []
 
     async def receive(self):
         for env in self._envelopes:
             yield env
         await self._gate.wait()
+
+    async def send(self, recipient: str, text: str, attachments=None) -> None:
+        self.sends.append((recipient, text))
 
 
 class _AllowAllAddressBook:
@@ -532,9 +540,15 @@ async def test_non_forwarded_sender_lands_on_local_inbox(
 
 
 @pytest.mark.asyncio
-async def test_forward_failure_falls_back_to_local_inbox(
+async def test_forward_failure_sends_unreachable_and_drops(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ):
+    """Forward failure must NOT fall through to the local inbox —
+    cross-tenant leakage (one user's message handled by another
+    household's Alice) breaks the isolation the forward is designed
+    to enforce. On failure the sender gets a short Signal notice and
+    the message is dropped. Jason's call 2026-11-20.
+    """
     envelopes = [
         SignalEnvelope(timestamp=12, source="+14357091396", body="still here"),
     ]
@@ -547,13 +561,16 @@ async def test_forward_failure_falls_back_to_local_inbox(
         monkeypatch=monkeypatch,
         raise_from_poster=RuntimeError("peer down"),
     )
-    # Poster was called once (the attempt), THEN the event fell back.
+    # Forward POST was attempted once.
     assert len(captured) == 1
-    assert transport._inbox.qsize() == 1
-    queued = transport._inbox.get_nowait()
-    assert queued.envelope.source == "+14357091396"
-    # A log line records the failure so the operator can see the retry
-    # happened via local handling.
+    # Inbox is empty — the message did NOT fall through to local Alice.
+    assert transport._inbox.qsize() == 0
+    # An unreachable notice was sent back to the original sender.
+    assert len(transport._signal.sends) == 1
+    recipient, text = transport._signal.sends[0]
+    assert recipient == "+14357091396"
+    assert "reachable" in text.lower() or "unreachable" in text.lower()
+    # A log line records the failure so operators can trace it.
     msgs = "\n".join(rec.message for rec in caplog.records)
     assert "signal forward failed" in msgs
 

@@ -144,15 +144,21 @@ shared account; the sender sees it as an ordinary reply.
 
 ## Failure handling
 
-The forward POST is single-attempt (3s connect / 10s read). On any
-exception (connection refused, 5xx, timeout, etc.) we log a WARNING
-and fall through to the standard local path so the envelope lands
-on Alice's inbox and she can reply herself. Silent drops would
-strand the sender; a visible local reply is the correct degraded
-mode. The operator sees the failure in `speaking.log`:
+The forward POST is single-attempt (3s connect / 5s read — the
+receiver's A2A server returns as soon as it accepts the task via
+`configuration.blocking=False`, so a long-running kernel turn no
+longer trips the timeout). On any exception (connection refused,
+5xx, timeout, etc.) we log a WARNING, send the ORIGINAL SENDER a
+short "your Alice isn't reachable right now" notice over the shared
+signal-cli, and DROP the message. We do NOT fall through to the
+local inbox — cross-tenant leakage (one household's message
+processed by another household's Alice) would break the isolation
+the forward exists to enforce. Silent drops would strand the sender
+without a trail; the unreachable notice gives them a visible retry
+path. The operator sees the failure in `speaking.log`:
 
 ```
-signal forward failed (sender=+14357091396 target=http://10.200.0.2:7878 label=grandparents-home): ConnectError('Connection refused'); falling back to local handling
+signal forward failed (sender=+14357091396 target=http://10.200.0.2:7878 label=grandparents-home): ConnectError('Connection refused'); sending unreachable notice + dropping
 ```
 
 ## What's deliberately out of scope
@@ -160,6 +166,6 @@ signal forward failed (sender=+14357091396 target=http://10.200.0.2:7878 label=g
 - Multi-target routing (one sender → many peers). One rule, one target.
 - Bidirectional A2A (Alice initiating to a peer Alice). Phase 1 is
   inbound-only on the receiver and inbound-only on the forwarder.
-- Retry / queue for failed forwards. Fallback to local is the fallback.
+- Retry / queue for failed forwards. Sender's retry is the recovery path.
 - Per-sender principal mapping on the receiver. Still a single
   `ALICE_A2A_PRINCIPAL` in Phase 1.

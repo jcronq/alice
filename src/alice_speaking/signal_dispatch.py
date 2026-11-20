@@ -29,8 +29,11 @@ sender identity through to its reply-routing logic.
 
 The transport fork lives in ``transports/signal.py::_produce`` —
 forwarded senders never land on the local inbox. A failed POST is
-logged and the envelope falls through to the local inbox as a
-best-effort fallback so the operator still has a trail.
+logged, the original sender receives a short "unreachable" notice
+over the shared signal-cli, and the envelope is dropped. The local
+inbox is never a fallback for forwarded senders: tenant isolation
+requires that cross-household messages never cross over, even on
+error.
 """
 
 from __future__ import annotations
@@ -208,8 +211,10 @@ def build_forward_payload(
     ``SendMessageConfiguration.return_immediately=True``. Without
     this flag the peer blocks until its kernel turn reaches a
     terminal state (typically 15-60s), the forwarder times out, and
-    the fallback path drops the envelope onto the local inbox —
-    producing a second reply to the same inbound message.
+    the failure path (correctly) drops the envelope — but the sender
+    sees that as a spurious "unreachable" notice even though the peer
+    was actually processing fine. `blocking=False` keeps the forward
+    path accurate.
     """
     metadata = {
         "signal_sender": sender,
@@ -299,9 +304,12 @@ async def forward_to_a2a(
     """POST a Signal envelope to a peer Alice over A2A.
 
     Raises any transport-level exception (``httpx.HTTPError``,
-    ``httpx.HTTPStatusError``, etc.) so the caller can decide to fall
-    back to local handling. Does not retry — one attempt, then the
-    caller's fallback policy takes over.
+    ``httpx.HTTPStatusError``, etc.) so the caller can log it and send
+    the original sender an "unreachable" notice. Does not retry — one
+    attempt, then the caller decides how to signal the failure back.
+    The caller MUST NOT fall back to local handling for forwarded
+    senders — tenant isolation requires that cross-household messages
+    stay cross-household.
 
     ``attachments`` — iterable of Signal :class:`Attachment` objects
     (or anything duck-typed with ``path`` / ``content_type`` /
