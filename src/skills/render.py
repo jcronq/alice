@@ -60,7 +60,11 @@ def render_to_disk(
 
     ``mind_dir`` is the mind directory; if its ``CLAUDE.md`` exists
     it gets copied into ``<target_dir>/CLAUDE.md`` so the SDK's
-    auto-loader still finds it after the cwd swap.
+    auto-loader still finds it after the cwd swap. The sibling
+    persona files (``IDENTITY.md``, ``SOUL.md``, ``USER.md``) are
+    copied the same way when present — operators customize those
+    and Alice needs to be able to ``Read ./IDENTITY.md`` without
+    knowing the full mind path.
 
     Returns the list of rendered skills (the ones that actually
     landed on disk).
@@ -97,9 +101,15 @@ def render_to_disk(
                 shutil.copytree(sub_src, skill_target / sub)
 
     if mind_dir is not None:
-        claude_md = pathlib.Path(mind_dir) / "CLAUDE.md"
-        if claude_md.is_file():
-            shutil.copy2(claude_md, tmp / "CLAUDE.md")
+        mind_dir_path = pathlib.Path(mind_dir)
+        # CLAUDE.md is the SDK auto-loader entry; the persona trio
+        # (IDENTITY / SOUL / USER) is what operators actually edit
+        # when they want to override the scaffold's default voice.
+        # Copy all four when present; silently skip missing ones.
+        for name in ("CLAUDE.md", "IDENTITY.md", "SOUL.md", "USER.md"):
+            src = mind_dir_path / name
+            if src.is_file():
+                shutil.copy2(src, tmp / name)
 
     if target_dir.exists():
         shutil.rmtree(target_dir)
