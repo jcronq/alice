@@ -94,7 +94,13 @@ def _valid_logins(logins: Any) -> frozenset[str]:
 
 
 def _env(name: str) -> str:
-    """``os.environ[name]``, else ``name`` from ``alice.env``, else ``""``."""
+    """``os.environ[name]``, else ``name`` from ``alice.env``, else ``""``.
+
+    When reading from the file, honors shell-style inline ``#`` comments
+    (``FOO=bar  # note`` -> ``bar``) but preserves ``#`` inside quoted
+    values. Also uses the opening quote to locate the matching close
+    quote, so trailing junk after a quoted value is discarded.
+    """
     val = os.environ.get(name, "")
     if val:
         return val
@@ -111,8 +117,16 @@ def _env(name: str) -> str:
         if line.startswith("export "):
             line = line[len("export "):].lstrip()
         key, sep, value = line.partition("=")
-        if sep and key.strip() == name:
-            return value.strip().strip('"').strip("'")
+        if not sep or key.strip() != name:
+            continue
+        value = value.lstrip()
+        if value.startswith(('"', "'")):
+            quote = value[0]
+            close = value.find(quote, 1)
+            if close != -1:
+                return value[1:close]
+            return value[1:]
+        return value.split("#", 1)[0].rstrip()
     return ""
 
 
