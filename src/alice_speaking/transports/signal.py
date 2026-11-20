@@ -37,7 +37,7 @@ import datetime
 import pathlib
 import logging
 from dataclasses import dataclass
-from typing import AsyncIterator, Optional
+from typing import Any, AsyncIterator, Optional
 
 from ..infra.signal_rpc import SignalEnvelope
 from ..signal_dispatch import forward_to_a2a
