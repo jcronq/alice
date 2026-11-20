@@ -19,6 +19,12 @@ import pathlib
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..signal_dispatch import (
+    SignalDispatchConfig,
+    SignalDispatchConfigError,
+    from_mapping as _signal_dispatch_from_mapping,
+)
+
 
 DEFAULT_ALICE_ENV = pathlib.Path.home() / ".config" / "alice" / "alice.env"
 DEFAULT_MIND_DIR = pathlib.Path.home() / "alice-mind"
@@ -279,6 +285,18 @@ class Config:
     # Behavior (from alice.config.json, falls back to SPEAKING_DEFAULTS)
     speaking: dict[str, Any] = field(default_factory=lambda: dict(SPEAKING_DEFAULTS))
 
+    # Signal sender-based dispatch — forward specific inbound Signal
+    # senders to a peer Alice over A2A JSON-RPC instead of handling
+    # them locally. Parsed from the top-level ``signal.dispatch`` block
+    # in ``alice.config.json``. Default = no forwards (feature off,
+    # preserves existing behaviour). Hot-reloaded via the same path as
+    # the speaking dict — on reload the daemon rebuilds Config and
+    # every ``_produce`` iteration re-reads ``ctx.cfg.signal_dispatch``.
+    # See :mod:`alice_speaking.signal_dispatch`.
+    signal_dispatch: SignalDispatchConfig = field(
+        default_factory=SignalDispatchConfig
+    )
+
 
 def _load_env_file(path: pathlib.Path) -> dict[str, str]:
     if not path.is_file():
@@ -371,6 +389,7 @@ def load() -> Config:
     )
 
     speaking = dict(SPEAKING_DEFAULTS)
+    signal_dispatch = SignalDispatchConfig()
     config_json = mind_dir / "config" / "alice.config.json"
     if config_json.is_file():
         try:
@@ -383,6 +402,23 @@ def load() -> Config:
             speaking = _deep_merge(speaking, parsed.get("speaking") or {})
         except json.JSONDecodeError as exc:
             raise ValueError(f"{config_json} is not valid JSON: {exc}") from exc
+        # Signal sender-based dispatch. Lives under ``signal.dispatch``
+        # — a top-level key alongside ``speaking`` rather than nested
+        # inside it because signal is a transport concern, not a
+        # kernel-behaviour knob. Missing block → empty forwards (feature
+        # off). See :mod:`alice_speaking.signal_dispatch`.
+        signal_block = parsed.get("signal") if isinstance(parsed, dict) else None
+        if isinstance(signal_block, dict):
+            dispatch_block = signal_block.get("dispatch")
+            if dispatch_block is not None and not isinstance(dispatch_block, dict):
+                raise ValueError(
+                    f"{config_json}: 'signal.dispatch' must be a mapping "
+                    f"(got {type(dispatch_block).__name__})"
+                )
+            try:
+                signal_dispatch = _signal_dispatch_from_mapping(dispatch_block)
+            except SignalDispatchConfigError as exc:
+                raise ValueError(f"{config_json}: {exc}") from exc
 
     cli_enabled_raw = (from_any("ALICE_CLI_ENABLED", "1") or "1").strip().lower()
     cli_enabled = cli_enabled_raw not in {"0", "false", "no", "off", ""}
@@ -514,6 +550,7 @@ def load() -> Config:
         principals_path=principals_path,
         allowed_senders_fallback=allowed,
         speaking=speaking,
+        signal_dispatch=signal_dispatch,
         cli_enabled=cli_enabled,
         cli_socket_path=cli_socket_path,
         discord_bot_token=discord_bot_token,

@@ -913,6 +913,7 @@ async def handle_a2a(ctx: DaemonContext, event: "A2AEvent") -> None:
             principal_name=msg.principal.display_name,
             stamp=stamp,
             text=msg.text,
+            metadata=msg.metadata,
         )
         await ctx._run_turn(
             prompt,
