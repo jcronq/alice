@@ -225,7 +225,7 @@ elif [ -n "$api_base_in_env" ] || [ -n "$api_key_in_env" ]; then
 else
     cat <<EOF
 
-    Alice's worker can authenticate to Claude two ways:
+    Alice's worker can authenticate to Claude three ways:
 
       [1] Claude subscription (default).
           A browser opens; sign in once; we capture a long-lived OAuth
@@ -239,14 +239,22 @@ else
           LiteLLM proxy that maps to any backend. Billing follows
           whichever service the key/proxy points at.
 
+      [3] pi (ChatGPT / Codex subscription, no Anthropic auth).
+          Alice routes LLM calls through pi-coding-agent which forwards
+          to codex using your ChatGPT subscription. You must have run
+          'codex login --device-auth' on this host separately — the
+          auth lives in ~/.codex/auth.json. Nothing is written to
+          alice.env; config/model.yml selects the pi-mono harness.
+
 EOF
     auth_mode=""
     while [ -z "$auth_mode" ]; do
-        choice="$(ask "Choose [1] subscription or [2] api" "1")"
+        choice="$(ask "Choose [1] subscription, [2] api, or [3] pi" "1")"
         case "$choice" in
             1|sub|subscription) auth_mode="subscription" ;;
             2|api|key)          auth_mode="api" ;;
-            *)                  warn "Pick 1 or 2." ;;
+            3|pi|codex)         auth_mode="pi" ;;
+            *)                  warn "Pick 1, 2, or 3." ;;
         esac
     done
 
@@ -265,7 +273,7 @@ EOF
         write_var_to_env "CLAUDE_CODE_OAUTH_TOKEN" "$token"
         ok "Token written to $ENV_FILE"
         unset token
-    else
+    elif [ "$auth_mode" = "api" ]; then
         info "API mode. ANTHROPIC_BASE_URL is optional — leave blank to talk to"
         info "api.anthropic.com directly; set it to your LiteLLM (or other"
         info "Anthropic-compatible) proxy URL to route through there."
@@ -284,6 +292,23 @@ EOF
         ok "API auth written to $ENV_FILE"
         [ -n "$api_base" ] && info "Endpoint: $api_base" || info "Endpoint: (default Anthropic API)"
         unset api_base api_key api_auth
+    elif [ "$auth_mode" = "pi" ]; then
+        # pi-mono: pi-coding-agent routes LLM calls to codex using the
+        # user's ChatGPT subscription. Codex owns the auth (minted via
+        # `codex login --device-auth` on this host); nothing goes into
+        # alice.env. We just confirm the codex creds are in place and
+        # point the user at config/model.yml for the harness selection.
+        if [ -f "$HOME/.codex/auth.json" ]; then
+            ok "Codex auth found at ~/.codex/auth.json"
+        else
+            warn "~/.codex/auth.json not found."
+            info "Run 'codex login --device-auth' before starting Alice, or"
+            info "the pi harness will fail on first turn. See:"
+            info "    https://github.com/openai/codex#authentication"
+        fi
+        info "No Anthropic auth written — pi-mono uses your ChatGPT subscription."
+        info "Edit your mind's config/model.yml to set harness: pi-mono on the"
+        info "hemispheres you want running through pi (see model.yml.example)."
     fi
 
     # The worker daemon caches the resolved auth into os.environ at
