@@ -432,16 +432,25 @@ class _StubDedup:
 
 
 class _FakeCfg:
-    def __init__(self, dispatch: SignalDispatchConfig) -> None:
+    def __init__(
+        self,
+        dispatch: SignalDispatchConfig,
+        mind_dir: "pathlib.Path | None" = None,
+    ) -> None:
         self.signal_dispatch = dispatch
         self.speaking: dict = {}
+        self.mind_dir = mind_dir
 
 
 class _StubCtx:
-    def __init__(self, dispatch: SignalDispatchConfig) -> None:
+    def __init__(
+        self,
+        dispatch: SignalDispatchConfig,
+        mind_dir: "pathlib.Path | None" = None,
+    ) -> None:
         self.address_book = _AllowAllAddressBook()
         self.dedup = _StubDedup()
-        self.cfg = _FakeCfg(dispatch)
+        self.cfg = _FakeCfg(dispatch, mind_dir=mind_dir)
 
 
 async def _run_producer_once(
@@ -451,6 +460,7 @@ async def _run_producer_once(
     monkeypatch: pytest.MonkeyPatch,
     poster=None,
     raise_from_poster: Exception | None = None,
+    mind_dir: "pathlib.Path | None" = None,
 ) -> tuple[SignalTransport, list[tuple[str, dict]]]:
     """Run :meth:`SignalTransport._produce` long enough to consume
     every envelope in ``envelopes``, then cancel. Returns the transport
@@ -471,7 +481,7 @@ async def _run_producer_once(
 
     client = _FakeSignalClient(envelopes)
     transport = SignalTransport(signal_client=client)
-    ctx = _StubCtx(dispatch)
+    ctx = _StubCtx(dispatch, mind_dir=mind_dir)
 
     produce_task = asyncio.create_task(transport._produce(ctx))
     # Give the producer time to drain the finite envelope list. The
@@ -541,16 +551,25 @@ async def test_non_forwarded_sender_lands_on_local_inbox(
 
 @pytest.mark.asyncio
 async def test_forward_failure_sends_unreachable_and_drops(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: pathlib.Path,
 ):
     """Forward failure must NOT fall through to the local inbox —
     cross-tenant leakage (one user's message handled by another
     household's Alice) breaks the isolation the forward is designed
-    to enforce. On failure the sender gets a short Signal notice and
-    the message is dropped. Jason's call 2026-11-20.
+    to enforce. On failure: the sender gets a short Signal notice,
+    the message is dropped, AND a metadata-only surface lands in
+    aimax's inner/surface/ so Alice can investigate the broken pipe
+    without ever seeing the sender's message body. Jason's calls
+    2026-11-20.
     """
     envelopes = [
-        SignalEnvelope(timestamp=12, source="+14357091396", body="still here"),
+        SignalEnvelope(
+            timestamp=12,
+            source="+14357091396",
+            body="SECRET-BODY-CONTENT",
+        ),
     ]
     import logging
 
@@ -560,6 +579,7 @@ async def test_forward_failure_sends_unreachable_and_drops(
         _DISPATCH,
         monkeypatch=monkeypatch,
         raise_from_poster=RuntimeError("peer down"),
+        mind_dir=tmp_path,
     )
     # Forward POST was attempted once.
     assert len(captured) == 1
@@ -573,6 +593,19 @@ async def test_forward_failure_sends_unreachable_and_drops(
     # A log line records the failure so operators can trace it.
     msgs = "\n".join(rec.message for rec in caplog.records)
     assert "signal forward failed" in msgs
+    # Metadata-only surface landed in inner/surface/ for Alice's wake.
+    surfaces = sorted((tmp_path / "inner" / "surface").glob("*.md"))
+    assert len(surfaces) == 1, f"expected one surface file, got {surfaces}"
+    surface_text = surfaces[0].read_text()
+    assert "type: signal-forward-failure" in surface_text
+    assert "+14357091396" in surface_text  # sender number is metadata
+    assert "grandparents-home" in surface_text  # label is metadata
+    assert "http://10.200.0.2:7878" in surface_text  # target is metadata
+    assert "RuntimeError" in surface_text  # error class is metadata
+    # CRITICAL: the surface must NOT contain the message body.
+    # Tenant isolation requires aimax Alice to never see a forwarded
+    # sender's content, even in a failure trail.
+    assert "SECRET-BODY-CONTENT" not in surface_text
 
 
 @pytest.mark.asyncio

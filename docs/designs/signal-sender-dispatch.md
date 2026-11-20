@@ -158,8 +158,19 @@ without a trail; the unreachable notice gives them a visible retry
 path. The operator sees the failure in `speaking.log`:
 
 ```
-signal forward failed (sender=+14357091396 target=http://10.200.0.2:7878 label=grandparents-home): ConnectError('Connection refused'); sending unreachable notice + dropping
+signal forward failed (sender=+14357091396 target=http://10.200.0.2:7878 label=grandparents-home): ConnectError('Connection refused'); sending unreachable notice + surface drop + dropping
 ```
+
+Alongside the log line, a metadata-only surface is dropped into
+`<mind>/inner/surface/` (type: `signal-forward-failure`). The
+surface carries the sender number, target URL, dispatch label,
+and error class — enough for the local instance to investigate
+the broken pipe at her next wake. The sender's message body is
+intentionally NOT in the surface: tenant isolation means the
+local instance never sees a forwarded sender's content, even
+on failure. Investigation candidates: WireGuard tunnel handshake
+(`sudo wg show`), peer container state, A2A port exposure, and
+`signal.dispatch.forwards` config drift.
 
 ## What's deliberately out of scope
 

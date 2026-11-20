@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime
+import pathlib
 import logging
 from dataclasses import dataclass
 from typing import AsyncIterator, Optional
@@ -60,6 +61,82 @@ def _format_envelope_time(timestamp_ms: int) -> str:
     except (OSError, ValueError, OverflowError):
         return str(timestamp_ms)
     return dt.strftime("%-I:%M:%S %p %Z")
+
+
+def _write_forward_failure_surface(
+    *,
+    ctx: Any,
+    sender: str,
+    target: str,
+    label: str,
+    exc: BaseException,
+    timestamp_ms: int,
+) -> None:
+    """Drop a metadata-only surface into ``mind/inner/surface/`` so
+    aimax Alice can investigate a broken forward pipe at her next
+    wake. Body content from the originating envelope is intentionally
+    excluded — the local Alice must never see a forwarded sender's
+    message body, even on failure (tenant isolation, per Jason's
+    2026-11-20 amendment).
+
+    Best-effort: swallows all exceptions so a filesystem hiccup can't
+    stop the Signal pipeline. Operator still has the ``log.warning``
+    trail from the caller.
+    """
+    try:
+        mind_dir = getattr(getattr(ctx, "cfg", None), "mind_dir", None)
+        if mind_dir is None:
+            log.warning(
+                "signal forward-failure surface skipped: ctx.cfg.mind_dir is None"
+            )
+            return
+        surface_dir = pathlib.Path(mind_dir) / "inner" / "surface"
+        surface_dir.mkdir(parents=True, exist_ok=True)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        stamp = now.strftime("%Y-%m-%dT%H-%M-%S")
+        safe_label = "".join(c if c.isalnum() or c in "-_" else "-" for c in label)
+        fname = f"{stamp}-signal-forward-failure-{safe_label}.md"
+        path = surface_dir / fname
+        body = (
+            f"---\n"
+            f"type: signal-forward-failure\n"
+            f"source: signal_dispatch\n"
+            f"created: {now.date().isoformat()}\n"
+            f"reply_expected: false\n"
+            f"sender: \"{sender}\"\n"
+            f"target: {target}\n"
+            f"label: {label}\n"
+            f"error_class: {type(exc).__name__}\n"
+            f"signal_timestamp: {timestamp_ms}\n"
+            f"---\n"
+            f"\n"
+            f"# Signal forward failure\n"
+            f"\n"
+            f"Forward to `{label}` ({target}) failed with "
+            f"`{type(exc).__name__}: {exc}`.\n"
+            f"\n"
+            f"The original sender (`{sender}`) was notified over "
+            f"Signal that their assistant is unreachable; their "
+            f"message was dropped. The body content is NOT included "
+            f"in this surface — tenant isolation means the local "
+            f"instance never sees a forwarded sender's message "
+            f"body, even on failure.\n"
+            f"\n"
+            f"Investigate the pipe: WG tunnel handshake (`sudo wg "
+            f"show`), peer container state, A2A port exposure on the "
+            f"target, and `signal.dispatch.forwards` in "
+            f"`alice.config.json`.\n"
+        )
+        path.write_text(body)
+        log.info(
+            "signal forward-failure surface: %s",
+            path,
+        )
+    except Exception as write_exc:  # noqa: BLE001
+        log.warning(
+            "signal forward-failure surface write failed: %s",
+            write_exc,
+        )
 
 
 @dataclass
@@ -310,11 +387,28 @@ class SignalTransport:
                     log.warning(
                         "signal forward failed "
                         "(sender=%s target=%s label=%s): %s; "
-                        "sending unreachable notice + dropping",
+                        "sending unreachable notice + surface drop + dropping",
                         env.source,
                         rule.target,
                         rule.label,
                         exc,
+                    )
+                    # Drop a metadata-only surface into aimax's
+                    # inner/surface/ so Alice can investigate the
+                    # broken pipe at her next wake. CRITICAL: body
+                    # content is intentionally NOT included —
+                    # tenant isolation requires that aimax Alice
+                    # never see the sender's message, even in a
+                    # failure trail. Only metadata needed to debug
+                    # the pipe (sender number, target URL, label,
+                    # error class).
+                    _write_forward_failure_surface(
+                        ctx=ctx,
+                        sender=env.source,
+                        target=rule.target,
+                        label=rule.label,
+                        exc=exc,
+                        timestamp_ms=env.timestamp,
                     )
                     # Best-effort apology back to the sender. Swallow
                     # any secondary Signal failure — if the outbox is
