@@ -35,10 +35,13 @@ best-effort fallback so the operator still has a trail.
 
 from __future__ import annotations
 
+import base64
 import logging
+import mimetypes
+import pathlib
 import uuid
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional, Sequence
 
 import httpx
 
@@ -144,6 +147,40 @@ def from_mapping(data: Mapping[str, Any] | None) -> SignalDispatchConfig:
     return SignalDispatchConfig(forwards=tuple(rules))
 
 
+def _attachment_to_file_part(attachment: Any) -> dict[str, Any]:
+    """Encode one Signal :class:`Attachment` as an A2A ``FilePart``.
+
+    Accepts anything duck-typed with ``path`` (a filesystem path),
+    ``content_type`` (MIME string, optional), and ``filename``
+    (optional sender-supplied name). Reads the file bytes off disk
+    and base64-encodes them inline — simplest cross-host transport,
+    no shared filesystem assumption with the peer.
+
+    The shape mirrors the v0.3 ``FilePart`` / ``FileWithBytes`` the
+    a2a-sdk accepts via its JSON-RPC ``message/send`` compat adapter:
+    ``{"kind": "file", "file": {"bytes": "<b64>", "mime_type": ...,
+    "name": ...}}``.
+    """
+    path = pathlib.Path(getattr(attachment, "path"))
+    raw = path.read_bytes()
+    encoded = base64.b64encode(raw).decode("ascii")
+    mime = getattr(attachment, "content_type", None) or ""
+    if not mime:
+        guessed, _ = mimetypes.guess_type(path.name)
+        mime = guessed or "application/octet-stream"
+    name = getattr(attachment, "filename", None) or path.name
+    file_payload: dict[str, Any] = {
+        "bytes": encoded,
+        "mime_type": mime,
+    }
+    if name:
+        file_payload["name"] = name
+    return {
+        "kind": "file",
+        "file": file_payload,
+    }
+
+
 def build_forward_payload(
     *,
     body: str,
@@ -151,17 +188,28 @@ def build_forward_payload(
     sender_name: str,
     timestamp_ms: int,
     label: str,
+    attachments: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     """Build a Google A2A ``message/send`` JSON-RPC envelope.
 
     Schema follows a2a-sdk ``SendMessageRequest`` /
     ``MessageSendParams``: one top-level ``message`` with a ``user``
-    role and a single text part. We carry the Signal sender identity
-    twice — on the inner ``Message.metadata`` (so the SDK preserves
-    it on the Task) and on ``params.metadata`` (so a receiver
-    inspecting the raw JSON-RPC envelope sees it without opening the
-    Message). Both copies are identical; the receiver can read
-    whichever is more convenient.
+    role and one text part plus one ``FilePart`` per attachment. We
+    carry the Signal sender identity twice — on the inner
+    ``Message.metadata`` (so the SDK preserves it on the Task) and
+    on ``params.metadata`` (so a receiver inspecting the raw JSON-RPC
+    envelope sees it without opening the Message). Both copies are
+    identical; the receiver can read whichever is more convenient.
+
+    Fire-and-forget: ``configuration.blocking=False`` tells the peer
+    to return as soon as it accepts the task. A2A's v0.3 JSON-RPC
+    adapter (the ``message/send`` method) uses the ``blocking``
+    field name; proto-side this maps to
+    ``SendMessageConfiguration.return_immediately=True``. Without
+    this flag the peer blocks until its kernel turn reaches a
+    terminal state (typically 15-60s), the forwarder times out, and
+    the fallback path drops the envelope onto the local inbox —
+    producing a second reply to the same inbound message.
     """
     metadata = {
         "signal_sender": sender,
@@ -169,6 +217,23 @@ def build_forward_payload(
         "signal_timestamp": int(timestamp_ms),
         "dispatch_label": label,
     }
+    parts: list[dict[str, Any]] = [
+        {"kind": "text", "text": body or ""},
+    ]
+    for att in attachments or ():
+        try:
+            parts.append(_attachment_to_file_part(att))
+        except Exception as exc:  # noqa: BLE001
+            # Don't let one unreadable attachment sink the whole
+            # forward — keep the other parts and log so operators
+            # see what dropped. Silent regression was Finding 2;
+            # a visible drop is still better than hanging the turn.
+            log.warning(
+                "signal forward: skipping unreadable attachment "
+                "(path=%s): %s",
+                getattr(att, "path", "<unknown>"),
+                exc,
+            )
     return {
         "jsonrpc": "2.0",
         "id": uuid.uuid4().hex,
@@ -178,9 +243,10 @@ def build_forward_payload(
                 "kind": "message",
                 "role": "user",
                 "message_id": uuid.uuid4().hex,
-                "parts": [{"kind": "text", "text": body or ""}],
+                "parts": parts,
                 "metadata": metadata,
             },
+            "configuration": {"blocking": False},
             "metadata": metadata,
         },
     }
@@ -198,13 +264,18 @@ HttpPost = Callable[[str, dict[str, Any]], Awaitable[Any]]
 
 
 async def _default_http_post(url: str, payload: dict[str, Any]) -> Any:
-    """Baseline POST — 3s connect / 10s read.
+    """Baseline POST — 3s connect / 5s read.
 
     A2A JSON-RPC lives at the root of the target URL (``/``). Caller
     passes the base URL; we normalise trailing-slash handling here so
     both ``http://host:7878`` and ``http://host:7878/`` work.
+
+    The 5s read budget is comfortable for the fire-and-forget
+    ``blocking=False`` path (peer returns in milliseconds once it
+    accepts the task). A longer window would let a mis-configured
+    blocking peer stall the Signal consumer.
     """
-    timeout = httpx.Timeout(connect=3, read=10, write=10, pool=10)
+    timeout = httpx.Timeout(connect=3, read=5, write=5, pool=5)
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(
             url.rstrip("/") + "/",
@@ -222,6 +293,7 @@ async def forward_to_a2a(
     sender: str,
     sender_name: str,
     timestamp_ms: int,
+    attachments: Sequence[Any] | None = None,
     http_post: HttpPost | None = None,
 ) -> None:
     """POST a Signal envelope to a peer Alice over A2A.
@@ -230,6 +302,12 @@ async def forward_to_a2a(
     ``httpx.HTTPStatusError``, etc.) so the caller can decide to fall
     back to local handling. Does not retry — one attempt, then the
     caller's fallback policy takes over.
+
+    ``attachments`` — iterable of Signal :class:`Attachment` objects
+    (or anything duck-typed with ``path`` / ``content_type`` /
+    ``filename``). Each becomes a ``FilePart`` on the A2A message
+    alongside the text body. ``None`` or an empty iterable sends
+    text-only.
     """
     payload = build_forward_payload(
         body=body,
@@ -237,6 +315,7 @@ async def forward_to_a2a(
         sender_name=sender_name,
         timestamp_ms=timestamp_ms,
         label=rule.label,
+        attachments=attachments,
     )
     poster = http_post or _default_http_post
     await poster(rule.target, payload)

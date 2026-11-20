@@ -244,6 +244,11 @@ def test_build_forward_payload_structure():
     assert message["role"] == "user"
     assert message["kind"] == "message"
     assert message["parts"] == [{"kind": "text", "text": "hi alice"}]
+    # Fire-and-forget: the receiver must not block the forwarder on
+    # the kernel turn or the httpx read-timeout triggers the
+    # fallback-to-local path and produces a duplicate reply. See
+    # Finding 1.
+    assert params["configuration"] == {"blocking": False}
     # Metadata lives on both the message and the envelope so either
     # inspection point sees it.
     for meta in (message["metadata"], params["metadata"]):
@@ -251,6 +256,65 @@ def test_build_forward_payload_structure():
         assert meta["signal_sender_name"] == "Carolyn Cronquist"
         assert meta["signal_timestamp"] == 1_700_000_000_000
         assert meta["dispatch_label"] == "grandparents-home"
+
+
+def test_forward_payload_is_fire_and_forget():
+    """Regression guard for Finding 1 — the A2A ``message/send`` v0.3
+    JSON-RPC adapter maps ``configuration.blocking`` to the proto
+    ``SendMessageConfiguration.return_immediately`` flag. Without
+    this, the peer waits for its full kernel turn (15-60s), the
+    forwarder's httpx read timeout trips, the fallback path lands
+    the envelope on the local inbox, and the receiver (which ran to
+    completion anyway) and local Alice both reply — two messages
+    for one inbound.
+    """
+    payload = build_forward_payload(
+        body="x",
+        sender="+1",
+        sender_name="",
+        timestamp_ms=0,
+        label="l",
+    )
+    assert payload["params"]["configuration"]["blocking"] is False
+
+
+def test_forward_payload_includes_attachments(tmp_path: pathlib.Path):
+    """Regression guard for Finding 2 — the forward path used to drop
+    every attachment on the floor while the local inbox path kept
+    them. Photos and voice notes must ride along as A2A
+    ``FilePart``s so the receiver sees the same content the local
+    path would have.
+    """
+    import base64
+
+    from alice_speaking.infra.signal_rpc import Attachment
+
+    blob = b"\x89PNG\r\n\x1a\nfake-png-bytes"
+    attachment_file = tmp_path / "pic.png"
+    attachment_file.write_bytes(blob)
+    attachment = Attachment(
+        id="abc",
+        path=attachment_file,
+        content_type="image/png",
+        filename="original.png",
+    )
+
+    payload = build_forward_payload(
+        body="look at this",
+        sender="+1",
+        sender_name="Carolyn",
+        timestamp_ms=1,
+        label="l",
+        attachments=[attachment],
+    )
+    parts = payload["params"]["message"]["parts"]
+    assert len(parts) == 2
+    assert parts[0] == {"kind": "text", "text": "look at this"}
+    file_part = parts[1]
+    assert file_part["kind"] == "file"
+    assert file_part["file"]["mime_type"] == "image/png"
+    assert file_part["file"]["name"] == "original.png"
+    assert base64.b64decode(file_part["file"]["bytes"]) == blob
 
 
 def test_build_forward_payload_empty_body_renders_empty_text():
@@ -292,6 +356,9 @@ async def test_forward_to_a2a_calls_injected_poster():
     url, payload = calls[0]
     assert url == "http://10.200.0.2:7878"
     assert payload["method"] == "message/send"
+    # The forward MUST remain fire-and-forget end-to-end, not just
+    # when callers go through build_forward_payload directly.
+    assert payload["params"]["configuration"] == {"blocking": False}
 
 
 @pytest.mark.asyncio
@@ -547,3 +614,151 @@ def test_a2a_build_prompt_default_branch_unchanged():
     )
     assert "recipient='self'" in prompt
     assert "Signal" not in prompt.split("---")[0]  # pre-divider stays clean
+
+
+# ---------------------------------------------------------------------------
+# Attachments flow end-to-end through _produce (Finding 2 regression)
+
+
+@pytest.mark.asyncio
+async def test_produce_forwards_attachments_to_a2a(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+):
+    """An inbound envelope carrying a photo must surface as a
+    ``FilePart`` on the outbound A2A payload, not silently drop."""
+    import base64
+
+    from alice_speaking.infra.signal_rpc import Attachment
+
+    blob = b"photo-bytes"
+    attachment_file = tmp_path / "pic.jpg"
+    attachment_file.write_bytes(blob)
+    attachment = Attachment(
+        id="z",
+        path=attachment_file,
+        content_type="image/jpeg",
+        filename="selfie.jpg",
+    )
+    envelopes = [
+        SignalEnvelope(
+            timestamp=20,
+            source="+14357091396",
+            body="see this",
+            attachments=[attachment],
+        )
+    ]
+    transport, captured = await _run_producer_once(
+        envelopes, _DISPATCH, monkeypatch=monkeypatch
+    )
+    assert transport._inbox.empty(), "forwarded envelope must skip local inbox"
+    assert len(captured) == 1
+    _, payload = captured[0]
+    parts = payload["params"]["message"]["parts"]
+    kinds = [p["kind"] for p in parts]
+    assert kinds == ["text", "file"]
+    file_part = parts[1]
+    assert file_part["file"]["mime_type"] == "image/jpeg"
+    assert base64.b64decode(file_part["file"]["bytes"]) == blob
+
+
+# ---------------------------------------------------------------------------
+# Hot-reload — signal.dispatch picks up alice.config.json edits without
+# a daemon restart (Finding 3 regression). We drive
+# ``SpeakingDaemon._maybe_reload_config`` directly rather than wiring a
+# full daemon; it's a pure method on the daemon class that reads from
+# ``self._config_path`` + ``config_module.load`` and mutates
+# ``self.cfg``, which is all we need to exercise.
+
+
+def test_signal_dispatch_hot_reload_picks_up_new_forwards(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+    from alice_speaking import daemon as daemon_module
+
+    mind_dir = tmp_path / "mind"
+    (mind_dir / "config").mkdir(parents=True)
+    env_path = tmp_path / "alice.env"
+    env_path.write_text(
+        f"WORK_DIR={mind_dir}\n"
+        f"ALICE_MIND_DIR={mind_dir}\n"
+        f"STATE_DIR={tmp_path / 'state'}\n"
+    )
+    config_json = mind_dir / "config" / "alice.config.json"
+    config_json.write_text("{}")
+    monkeypatch.setenv("ALICE_CONFIG", str(env_path))
+    for var in (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "SIGNAL_ACCOUNT",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    initial_cfg = daemon_module.config_module.load()
+    assert initial_cfg.signal_dispatch.forwards == ()
+
+    # Build a minimal stand-in holding just the attributes
+    # ``_maybe_reload_config`` touches. Avoids spinning up a full
+    # :class:`SpeakingDaemon` (which needs transports, LLM clients,
+    # etc.) just to exercise the reload path.
+    class _Events:
+        def __init__(self) -> None:
+            self.emitted: list[tuple[str, dict]] = []
+
+        def emit(self, name: str, **kwargs):
+            self.emitted.append((name, kwargs))
+
+    class _Shim:
+        _config_path = config_json
+        _config_mtime: float = 0.0
+
+        def __init__(self) -> None:
+            self.cfg = initial_cfg
+            self.events = _Events()
+
+    shim = _Shim()
+    daemon_module.SpeakingDaemon._maybe_reload_config(shim)  # type: ignore[arg-type]
+    # Initial read pins the mtime.
+    assert shim.cfg.signal_dispatch.forwards == ()
+
+    # Now drop a forward entry into alice.config.json and bump mtime.
+    config_json.write_text(
+        json.dumps(
+            {
+                "signal": {
+                    "dispatch": {
+                        "forwards": [
+                            {
+                                "senders": ["+14357091396"],
+                                "target": "http://10.200.0.2:7878",
+                                "label": "grandparents-home",
+                            }
+                        ]
+                    }
+                }
+            }
+        )
+    )
+    import os
+
+    future = shim._config_mtime + 10.0
+    os.utime(config_json, (future, future))
+
+    daemon_module.SpeakingDaemon._maybe_reload_config(shim)  # type: ignore[arg-type]
+
+    # Hot-reload must have swapped signal_dispatch — the sender now
+    # resolves via the new ruleset without a container restart.
+    assert len(shim.cfg.signal_dispatch.forwards) == 1
+    rule = shim.cfg.signal_dispatch.lookup("+14357091396")
+    assert rule is not None
+    assert rule.target == "http://10.200.0.2:7878"
+    assert rule.label == "grandparents-home"
+    # Change was surfaced on the reload event for observability.
+    # The first _maybe_reload_config call pinned mtime with the same
+    # cfg we loaded manually (empty forwards both sides, no diff); the
+    # second — after the mtime bump — is the one that should carry
+    # signal_dispatch in its changes list.
+    reload_events = [kw for name, kw in shim.events.emitted if name == "config_reload"]
+    assert reload_events, "at least one config_reload event expected"
+    assert any("signal_dispatch" in kw["changes"] for kw in reload_events)

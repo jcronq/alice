@@ -1214,7 +1214,7 @@ class SpeakingDaemon:
         tool therefore takes effect on her next turn, no daemon restart
         needed. Hot-reloadable: model, quiet_hours,
         working_context_token_budget, context_bootstrap_turns,
-        context_compaction_threshold.
+        context_compaction_threshold, signal.dispatch.forwards.
         """
         if not self._config_path.is_file():
             return
@@ -1238,14 +1238,26 @@ class SpeakingDaemon:
         old_speaking = dict(self.cfg.speaking)
         self.cfg.speaking.clear()
         self.cfg.speaking.update(new_cfg.speaking)
+        # signal_dispatch is a frozen dataclass — can't mutate in
+        # place. Reassigning the attribute on the shared Config
+        # object is fine: every consumer reads it as
+        # ``ctx.cfg.signal_dispatch`` on each inbound envelope
+        # (see :meth:`SignalTransport._produce`), so swapping the
+        # attribute lets the next envelope pick up the new ruleset
+        # without any producer-side cache invalidation.
+        old_dispatch = self.cfg.signal_dispatch
+        self.cfg.signal_dispatch = new_cfg.signal_dispatch
         self._config_mtime = mtime
         changes = {
             k: v for k, v in self.cfg.speaking.items() if old_speaking.get(k) != v
         }
+        changed_keys = list(changes.keys())
+        if old_dispatch != new_cfg.signal_dispatch:
+            changed_keys.append("signal_dispatch")
         log.info(
-            "config reloaded (changes: %s)", list(changes.keys()) or "none observed"
+            "config reloaded (changes: %s)", changed_keys or "none observed"
         )
-        self.events.emit("config_reload", changes=list(changes.keys()))
+        self.events.emit("config_reload", changes=changed_keys)
 
     # ------------------------------------------------------------------
     # Per-event handlers (CLI, Discord, A2A, Signal, Surface, Emergency)

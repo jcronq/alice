@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from typing import AsyncIterator, Optional
 
 from ..infra.signal_rpc import SignalEnvelope
+from ..signal_dispatch import forward_to_a2a
 from .base import (
     SIGNAL_CAPS,
     Capabilities,
@@ -283,17 +284,13 @@ class SignalTransport:
             rule = dispatch_cfg.lookup(env.source) if dispatch_cfg else None
             if rule is not None:
                 try:
-                    # Lazy import — keeps httpx off the Signal transport
-                    # import path for deploys that don't configure any
-                    # forwards (cold-import stays cheap).
-                    from ..signal_dispatch import forward_to_a2a
-
                     await forward_to_a2a(
                         rule=rule,
                         body=env.body or "",
                         sender=env.source,
                         sender_name=sender_name,
                         timestamp_ms=env.timestamp,
+                        attachments=env.attachments,
                     )
                     log.info(
                         "signal forward: ts=%d from=%s -> %s (%s); "
