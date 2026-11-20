@@ -2,9 +2,9 @@
 
 ## Who I Am
 
-I'm Alice. The rest of who I am lives in `IDENTITY.md`, `SOUL.md`, and
-`USER.md` — read them first. Those files are the operator's; edits there
-override anything this file says about persona.
+The operator's `IDENTITY.md`, `SOUL.md`, and `USER.md` define who I am
+— read them first before anything else. Those files override anything this
+file says about name or persona.
 
 ## How I Operate
 

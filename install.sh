@@ -98,6 +98,7 @@ step "Setting up Claude authentication"
 oauth_in_env="${CLAUDE_CODE_OAUTH_TOKEN:-}"
 api_base_in_env="${ANTHROPIC_BASE_URL:-}"
 api_key_in_env="${ANTHROPIC_API_KEY:-}"
+pi_mode_in_env="${ALICE_AUTH_MODE:-}"
 
 write_var_to_env() {
     # write_var_to_env KEY VALUE — upsert KEY=VALUE in alice.env (line-replace,
@@ -222,6 +223,8 @@ if [ -n "$oauth_in_env" ]; then
     ok "Subscription auth already configured (CLAUDE_CODE_OAUTH_TOKEN in alice.env)"
 elif [ -n "$api_base_in_env" ] || [ -n "$api_key_in_env" ]; then
     ok "API auth already configured (ANTHROPIC_* in alice.env)"
+elif [ "$pi_mode_in_env" = "pi" ]; then
+    ok "Pi-mono auth already configured (ALICE_AUTH_MODE=pi in alice.env)"
 else
     cat <<EOF
 
@@ -309,13 +312,28 @@ EOF
         info "No Anthropic auth written — pi-mono uses your ChatGPT subscription."
         info "Edit your mind's config/model.yml to set harness: pi-mono on the"
         info "hemispheres you want running through pi (see model.yml.example)."
+        # Marker so re-runs short-circuit instead of re-prompting the
+        # auth menu every time. Nothing in the runtime reads
+        # ALICE_AUTH_MODE today; it is an installer cookie.
+        write_var_to_env "ALICE_AUTH_MODE" "pi"
+        ok "Marked ALICE_AUTH_MODE=pi so reruns stay idempotent."
     fi
+
+    # Only credential-writing branches need to bounce the worker. Pi
+    # mode wrote no secrets, so skipping the restart avoids tearing
+    # down a healthy container (and any in-flight work) for nothing.
+    did_write_credentials=0
+    [ "$auth_mode" = "subscription" ] && did_write_credentials=1
+    [ "$auth_mode" = "api" ] && did_write_credentials=1
 
     # The worker daemon caches the resolved auth into os.environ at
     # startup (daemon.run() → ensure_auth_env). If the container is
     # already running with a stale value, restart it so the fresh
-    # config takes effect.
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx alice-worker-blue; then
+    # config takes effect. Only runs when credentials actually changed —
+    # pi mode wrote no secrets, so skipping the restart avoids bouncing
+    # a healthy container for nothing.
+    if [ "$did_write_credentials" = "1" ] && \
+       docker ps --format '{{.Names}}' 2>/dev/null | grep -qx alice-worker-blue; then
         info "Restarting alice-worker-blue so it picks up the new auth…"
         docker restart alice-worker-blue >/dev/null
     fi

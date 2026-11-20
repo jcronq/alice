@@ -134,9 +134,18 @@ case "$choice" in
             # is a successful prior scaffold, not an error. Interactive
             # runs still ask — the default "n" preserves the original
             # cautious behavior for humans who typed the command twice.
-            if [ "$NON_INTERACTIVE" -eq 1 ]; then
-                echo "mind: $target already exists; skipping scaffold overlay (idempotent --yes)"
+            if [ "$NON_INTERACTIVE" -eq 1 ] && [ -f "$target/CLAUDE.md" ]; then
+                # A pre-existing target that contains the scaffold's
+                # CLAUDE.md marker is a successful prior run. Skip the
+                # overlay to stay idempotent (install.sh re-invokes
+                # --yes every install). An existing-but-empty / partial
+                # directory (e.g. SIGINT between mkdir and cp -a)
+                # falls through and gets overlaid so the repair is
+                # automatic.
+                echo "mind: $target already scaffolded (CLAUDE.md present); skipping overlay (idempotent --yes)"
                 skip_overlay=1
+            elif [ "$NON_INTERACTIVE" -eq 1 ]; then
+                echo "mind: $target exists but has no CLAUDE.md; treating as partial, overlaying scaffold"
             elif ! confirm "$target exists. overlay scaffold into it?" "n"; then
                 exit 1
             fi
