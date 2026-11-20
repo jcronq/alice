@@ -177,6 +177,63 @@ def test_render_copies_claude_md_when_provided(
     assert "Mind-level instructions." in (target / "CLAUDE.md").read_text()
 
 
+def test_render_copies_persona_trio_when_present(
+    mind: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """IDENTITY.md / SOUL.md / USER.md live beside CLAUDE.md in the
+    scaffolded mind. Operators customize those files; the kernel's
+    cwd is the rendered target, so Alice can't ``Read ./IDENTITY.md``
+    unless render copied it over. Regression for the grandparents-home
+    deploy where operator-edited IDENTITY/SOUL/USER were invisible to
+    pi."""
+    (mind / "IDENTITY.md").write_text("# Identity\nWho I am.\n")
+    (mind / "SOUL.md").write_text("# Soul\nHow I speak.\n")
+    (mind / "USER.md").write_text("# User\nWho I work for.\n")
+
+    target = tmp_path / "state" / "speaking"
+    registry = SkillRegistry.from_mind(mind, include_defaults=False)
+    render_to_disk(
+        registry,
+        hemisphere="speaking",
+        target_dir=target,
+        personae=_personae(),
+        mind_dir=mind,
+    )
+    for name, needle in (
+        ("CLAUDE.md", "Mind-level instructions."),
+        ("IDENTITY.md", "Who I am."),
+        ("SOUL.md", "How I speak."),
+        ("USER.md", "Who I work for."),
+    ):
+        path = target / name
+        assert path.is_file(), f"{name} should be copied into target"
+        assert needle in path.read_text()
+
+
+def test_render_skips_persona_trio_when_absent(
+    mind: pathlib.Path, tmp_path: pathlib.Path
+) -> None:
+    """The mind fixture ships CLAUDE.md but no IDENTITY/SOUL/USER. The
+    render must silently skip those — minds pre-dating the persona
+    trio still work."""
+    assert not (mind / "IDENTITY.md").exists()
+    assert not (mind / "SOUL.md").exists()
+    assert not (mind / "USER.md").exists()
+
+    target = tmp_path / "state" / "speaking"
+    registry = SkillRegistry.from_mind(mind, include_defaults=False)
+    render_to_disk(
+        registry,
+        hemisphere="speaking",
+        target_dir=target,
+        personae=_personae(),
+        mind_dir=mind,
+    )
+    assert (target / "CLAUDE.md").is_file()
+    for name in ("IDENTITY.md", "SOUL.md", "USER.md"):
+        assert not (target / name).exists(), f"{name} should be skipped when absent"
+
+
 def test_render_clears_stale_target(mind: pathlib.Path, tmp_path: pathlib.Path) -> None:
     """A second render with different scoping must not leave behind
     skills from the first run."""

@@ -26,10 +26,16 @@ speaking:
   backend: subscription
   model: claude-opus-4-7
 
+# pi-mono inherits the actual OpenAI model from the user's codex
+# install — pi just passes `model:` here through to `codex exec
+# --model <m>`, and codex rejects anything not in your plan's
+# allowlist. ChatGPT Plus accepts `gpt-6.1-sol` (the current Plus
+# default in ~/.codex/config.toml); Pro unlocks `gpt-5.3-codex`.
+# Mirror whatever your ~/.codex/config.toml default is.
 thinking:
   harness: pi-mono
   backend: pi
-  model: gpt-5.3-codex
+  model: gpt-6.1-sol
 
 viewer:
   harness: claude-code
@@ -73,15 +79,17 @@ backends:
 # templates/mind-scaffold/CLAUDE.md (Phase O) for the docker-compose
 # adjustment.
 #
-# # pi-mono for both speaking and thinking:
+# # pi-mono for both speaking and thinking (ChatGPT Plus example —
+# # swap `gpt-6.1-sol` for `gpt-5.3-codex` on a Pro plan, matching
+# # whatever model your ~/.codex/config.toml defaults to):
 # speaking:
 #   harness: pi-mono
 #   backend: pi
-#   model: gpt-5.3-codex
+#   model: gpt-6.1-sol
 # thinking:
 #   harness: pi-mono
 #   backend: pi
-#   model: gpt-5.3-codex
+#   model: gpt-6.1-sol
 #
 # # Compare thinking on the same local model with Hermes Agent:
 # # Requires `hermes` on PATH (or ALICE_HERMES_BIN). Only thinking is
