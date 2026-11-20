@@ -127,24 +127,35 @@ case "$choice" in
         ;;
     3|*)
         target=$(ask "scaffold target path" "$TARGET")
+        skip_overlay=0
         if [ -e "$target" ]; then
-            if ! confirm "$target exists. overlay scaffold into it?" "n"; then
+            # Non-interactive re-runs (install.sh re-invokes --yes on
+            # every install) must be idempotent: a pre-existing target
+            # is a successful prior scaffold, not an error. Interactive
+            # runs still ask — the default "n" preserves the original
+            # cautious behavior for humans who typed the command twice.
+            if [ "$NON_INTERACTIVE" -eq 1 ]; then
+                echo "mind: $target already exists; skipping scaffold overlay (idempotent --yes)"
+                skip_overlay=1
+            elif ! confirm "$target exists. overlay scaffold into it?" "n"; then
                 exit 1
             fi
         fi
-        mkdir -p "$target"
-        # Copy scaffold preserving hidden files (.claude/, .githooks/, etc.)
-        cp -a "$SCAFFOLD_SRC"/. "$target"/
         TARGET="$target"
-        if [ ! -d "$TARGET/.git" ]; then
-            (
-                cd "$TARGET"
-                git init -q -b master
-                git config core.hooksPath .githooks
-                git add -A
-                git commit -q -m "Initial scaffold from alice-init"
-            )
-            echo "initialized git repo at $TARGET (no remote set)"
+        if [ "$skip_overlay" -eq 0 ]; then
+            mkdir -p "$target"
+            # Copy scaffold preserving hidden files (.claude/, .githooks/, etc.)
+            cp -a "$SCAFFOLD_SRC"/. "$target"/
+            if [ ! -d "$TARGET/.git" ]; then
+                (
+                    cd "$TARGET"
+                    git init -q -b master
+                    git config core.hooksPath .githooks
+                    git add -A
+                    git commit -q -m "Initial scaffold from alice-init"
+                )
+                echo "initialized git repo at $TARGET (no remote set)"
+            fi
         fi
         ;;
 esac
