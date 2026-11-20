@@ -111,3 +111,34 @@ def test_trusted_authors_from_alice_env_file(tmp_path, monkeypatch):
     env.write_text("ALICE_TRUSTED_AUTHORS=filed\n")
     monkeypatch.setenv("ALICE_CONFIG", str(env))
     assert fr.trusted_authors(tmp_path) == frozenset({"filed"})
+
+def test_inline_comment_stripped_from_alice_env(tmp_path, monkeypatch):
+    """`FOO=bar  # note` must yield `bar`, not `bar  # note`.
+
+    Regression: `_env` used to return the raw value with inline comments
+    attached, which caused `_valid` to reject the slug and
+    `forge_repos()` to raise `ForgeNotConfigured`, crashing the daemon
+    at import time. Observed on the grandparents-home deployment.
+    """
+    env = tmp_path / "alice.env"
+    env.write_text(
+        "ALICE_FORGE_REPOS=me/a,me/b  # required at import time\n"
+        "ALICE_FORGE_REPO=me/a   # trailing whitespace before #\n"
+        "ALICE_BUG_FIX_REPO=me/mud#no-space\n"
+    )
+    monkeypatch.setenv("ALICE_CONFIG", str(env))
+    assert fr.forge_repos(tmp_path) == ("me/a", "me/b")
+    assert fr.primary_repo(tmp_path) == "me/a"
+    # `#no-space` with no leading whitespace still terminates per shell
+    # convention; the value is "me/mud".
+    assert fr.bug_fix_repo(tmp_path) == "me/mud"
+
+
+def test_inline_hash_inside_quotes_preserved(tmp_path, monkeypatch):
+    """`#` inside a quoted value is part of the value, not a comment."""
+    env = tmp_path / "alice.env"
+    env.write_text(
+        'ALICE_TRUSTED_AUTHORS="alice,bob"  # external note\n'
+    )
+    monkeypatch.setenv("ALICE_CONFIG", str(env))
+    assert fr.trusted_authors(tmp_path) == frozenset({"alice", "bob"})
