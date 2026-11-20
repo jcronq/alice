@@ -323,7 +323,7 @@ class SignalTransport:
                     try:
                         await self._signal.send(
                             env.source,
-                            "Your Alice isn't reachable right now. "
+                            "Can't reach your assistant right now. "
                             "Try again in a few minutes.",
                         )
                     except Exception as notify_exc:  # noqa: BLE001

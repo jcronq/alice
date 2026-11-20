@@ -569,7 +569,7 @@ async def test_forward_failure_sends_unreachable_and_drops(
     assert len(transport._signal.sends) == 1
     recipient, text = transport._signal.sends[0]
     assert recipient == "+14357091396"
-    assert "reachable" in text.lower() or "unreachable" in text.lower()
+    assert "reach" in text.lower()
     # A log line records the failure so operators can trace it.
     msgs = "\n".join(rec.message for rec in caplog.records)
     assert "signal forward failed" in msgs
