@@ -1,3 +1,13 @@
+{% if signal_sender -%}
+[Signal message forwarded via A2A{% if dispatch_label %} ({{ dispatch_label }}){% endif %} | from {{ signal_sender_name or signal_sender }} ({{ signal_sender }}) | {{ stamp }}]
+
+{{ text }}
+
+---
+{{ capability }}
+
+This message was forwarded to you over A2A because another Alice relay is routing {{ signal_sender_name or signal_sender }}'s Signal messages to you. To reply, call the `send_message` tool with `recipient='{{ signal_sender }}'` — your outbound Signal transport will deliver the reply back to them over Signal. Do NOT reply with `recipient='self'`; that would stream the reply back to the relay instead of to the actual sender.
+{%- else -%}
 [A2A task from {{ principal_name }} | {{ stamp }}]
 
 {{ text }}
@@ -6,3 +16,4 @@
 {{ capability }}
 
 To reply, call the `send_message` tool with recipient='self' (the reply streams back over the same A2A task as text artifacts). Returning text alone will NOT reach the caller.
+{%- endif %}

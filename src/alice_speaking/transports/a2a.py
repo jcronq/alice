@@ -326,22 +326,35 @@ class A2ATransport:
         principal_name: str,
         stamp: str,
         text: str,
+        metadata: Optional[dict] = None,
     ) -> str:
         """Compose the prompt for a single A2A task.
 
         Body lives in
         ``prompts/templates/speaking/turn.a2a.md.j2``
         (Plan 04 Phase 5).
+
+        When ``metadata`` carries a ``signal_sender`` key (the
+        sender-based dispatch path — see
+        :mod:`alice_speaking.signal_dispatch`) the template renders a
+        Signal-forwarded framing that steers Alice to reply by calling
+        ``send_message`` with the original Signal recipient, so her
+        reply reaches the sender over Signal instead of streaming back
+        on the A2A task.
         """
         from prompts import load as load_prompt
         from ..domain.render import capability_prompt_fragment
 
+        meta = metadata or {}
         return load_prompt(
             "speaking.turn.a2a",
             principal_name=principal_name,
             stamp=stamp,
             text=text,
             capability=capability_prompt_fragment("a2a", self.caps),
+            signal_sender=meta.get("signal_sender") or "",
+            signal_sender_name=meta.get("signal_sender_name") or "",
+            dispatch_label=meta.get("dispatch_label") or "",
         )
 
     # ------------------------------------------------------------------
@@ -492,6 +505,24 @@ class _AliceExecutor(AgentExecutor):
             )
             return
 
+        # Carry a2a_context_id plus any caller-supplied metadata through
+        # to the daemon. The sender-based dispatch path (see
+        # :mod:`alice_speaking.signal_dispatch`) uses this to plumb the
+        # originating Signal sender number + display name + dispatch
+        # label into the kernel prompt so Alice can reply via Signal to
+        # the actual sender rather than back over the A2A stream.
+        inbound_metadata: dict = {"a2a_context_id": ctx_id}
+        if context.message is not None and context.message.metadata:
+            for key in (
+                "signal_sender",
+                "signal_sender_name",
+                "signal_timestamp",
+                "dispatch_label",
+            ):
+                value = context.message.metadata.get(key)
+                if value is not None:
+                    inbound_metadata[key] = value
+
         outbox = self._t._open_task_outbox(task_id)
         try:
             inbound = InboundMessage(
@@ -499,7 +530,7 @@ class _AliceExecutor(AgentExecutor):
                 origin=ChannelRef(transport="a2a", address=task_id, durable=False),
                 text=text,
                 timestamp=time.time(),
-                metadata={"a2a_context_id": ctx_id},
+                metadata=inbound_metadata,
             )
             await self._t._push_inbound(inbound)
 

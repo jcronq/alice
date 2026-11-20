@@ -269,6 +269,52 @@ class SignalTransport:
                 continue
             ctx.dedup.mark(env.timestamp)
             sender_name = ctx.address_book.display_name_for("signal", env.source)
+            # Sender-based dispatch fork — if a forward rule covers
+            # this sender, POST the envelope to a peer Alice via A2A
+            # JSON-RPC and skip the local inbox entirely. Forwarding
+            # wins over the mid-turn divert below: a forwarded sender
+            # is explicitly NOT Alice's conversation to hold, so
+            # stitching their follow-up into her local turn would be
+            # wrong. On POST failure we log + fall through to the
+            # standard local path so the operator still has a trail
+            # — silent drops are worse than a visible local reply.
+            # See :mod:`alice_speaking.signal_dispatch`.
+            dispatch_cfg = getattr(getattr(ctx, "cfg", None), "signal_dispatch", None)
+            rule = dispatch_cfg.lookup(env.source) if dispatch_cfg else None
+            if rule is not None:
+                try:
+                    # Lazy import — keeps httpx off the Signal transport
+                    # import path for deploys that don't configure any
+                    # forwards (cold-import stays cheap).
+                    from ..signal_dispatch import forward_to_a2a
+
+                    await forward_to_a2a(
+                        rule=rule,
+                        body=env.body or "",
+                        sender=env.source,
+                        sender_name=sender_name,
+                        timestamp_ms=env.timestamp,
+                    )
+                    log.info(
+                        "signal forward: ts=%d from=%s -> %s (%s); "
+                        "local inbox skipped",
+                        env.timestamp,
+                        env.source,
+                        rule.target,
+                        rule.label,
+                    )
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "signal forward failed "
+                        "(sender=%s target=%s label=%s): %s; "
+                        "falling back to local handling",
+                        env.source,
+                        rule.target,
+                        rule.label,
+                        exc,
+                    )
+                    # Intentional fall-through to local inbox below.
             event = SignalEvent(envelope=env, sender_name=sender_name)
             # Mid-turn context injection: if Alice is currently in a
             # turn for THIS same Signal channel, divert the message
