@@ -191,6 +191,11 @@ class SignalTransport:
         # signal-cli, then await _inbox.join() to let _consume_task
         # finish anything already queued.
         self._produce_task: Optional[asyncio.Task] = None
+        # When True, skip the inbound receive loop in _run and
+        # only service outbound sends. Set by the daemon from
+        # Config.signal_outbound_only. Multi-tenant deploys use
+        # this for non-gateway tenants sharing an account.
+        self._outbound_only: bool = False
         self._consume_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
@@ -288,9 +293,10 @@ class SignalTransport:
         return asyncio.create_task(self._run(ctx), name="sig-produce")
 
     async def _run(self, ctx: DaemonContext) -> None:
-        self._produce_task = asyncio.create_task(
-            self._produce(ctx), name="sig-prod-inner"
-        )
+        if not self._outbound_only:
+            self._produce_task = asyncio.create_task(
+                self._produce(ctx), name="sig-prod-inner"
+            )
         self._consume_task = asyncio.create_task(
             self._consume(ctx), name="sig-cons-inner"
         )
@@ -299,13 +305,15 @@ class SignalTransport:
             # drain doesn't propagate cancellation to _consume_task via
             # gather. Drain explicitly stops _produce, lets _consume
             # finish the inbox, then cancels the supervisor.
-            await asyncio.gather(
-                self._produce_task, self._consume_task, return_exceptions=True
-            )
+            tasks = [t for t in (self._produce_task, self._consume_task) if t is not None]
+            await asyncio.gather(*tasks, return_exceptions=True)
         except asyncio.CancelledError:
             for task in (self._produce_task, self._consume_task):
-                task.cancel()
+                if task is not None:
+                    task.cancel()
             for task in (self._produce_task, self._consume_task):
+                if task is None:
+                    continue
                 with contextlib.suppress(BaseException):
                     await task
             raise

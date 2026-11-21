@@ -179,9 +179,10 @@ class SpeakingDaemon:
             if cfg.signal_account
             else None
         )
-        self.signal_transport: Optional[SignalTransport] = (
-            SignalTransport(signal_client=self.signal) if self.signal else None
-        )
+        self.signal_transport: Optional[SignalTransport] = None
+        if self.signal:
+            self.signal_transport = SignalTransport(signal_client=self.signal)
+            self.signal_transport._outbound_only = cfg.signal_outbound_only
         self.dedup = DedupStore(cfg.seen_path)
         self.turns = TurnLog(cfg.turn_log_path)
         self.events = EventLogger(cfg.event_log_path)

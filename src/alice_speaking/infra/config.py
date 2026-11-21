@@ -270,6 +270,11 @@ class Config:
     # destination is our own account) as inbound. Needed when Alice is a
     # linked device on the owner's own number. See signal_rpc loop guards.
     signal_note_to_self: bool = False
+    # Build SignalTransport for outbound only and skip the
+    # receive-loop task. Used on tenants that share a Signal
+    # account with a gateway peer (the gateway polls receive;
+    # this tenant just sends through the same signal-cli RPC).
+    signal_outbound_only: bool = False
     a2a_port: int = 7878
     a2a_host: str = "0.0.0.0"
     # Single shared principal for all A2A traffic in v1. Operator points
@@ -522,6 +527,10 @@ def load() -> Config:
         (from_any("SIGNAL_NOTE_TO_SELF", "0") or "0").strip().lower()
         in {"1", "true", "yes", "on"}
     )
+    signal_outbound_only = (
+        (from_any("SIGNAL_OUTBOUND_ONLY", "0") or "0").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
     try:
         a2a_port = int(from_any("ALICE_A2A_PORT", "7878") or "7878")
     except ValueError:
@@ -569,6 +578,7 @@ def load() -> Config:
         viewer_chat_principal_display_name=viewer_chat_principal_display_name,
         a2a_enabled=a2a_enabled,
         signal_note_to_self=signal_note_to_self,
+        signal_outbound_only=signal_outbound_only,
         a2a_port=a2a_port,
         a2a_host=a2a_host,
         a2a_principal=a2a_principal,
