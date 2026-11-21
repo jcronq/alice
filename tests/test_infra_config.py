@@ -245,3 +245,17 @@ def test_signal_note_to_self_flag(env_and_mind, monkeypatch, raw, expected) -> N
     if raw is not None:
         env_path.write_text(env_path.read_text() + f"SIGNAL_NOTE_TO_SELF={raw}\n")
     assert load().signal_note_to_self is expected
+
+# ---------- SIGNAL_OUTBOUND_ONLY --------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [(None, False), ("0", False), ("", False), ("1", True), ("true", True), ("ON", True)],
+)
+def test_signal_outbound_only_flag(env_and_mind, monkeypatch, raw, expected) -> None:
+    env_path, _ = env_and_mind
+    monkeypatch.delenv("SIGNAL_OUTBOUND_ONLY", raising=False)
+    if raw is not None:
+        env_path.write_text(env_path.read_text() + f"SIGNAL_OUTBOUND_ONLY={raw}\n")
+    assert load().signal_outbound_only is expected
