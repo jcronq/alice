@@ -237,18 +237,17 @@ def test_build_forward_payload_structure():
         label="grandparents-home",
     )
     assert payload["jsonrpc"] == "2.0"
-    assert payload["method"] == "message/send"
+    assert payload["method"] == "SendMessage"
     assert isinstance(payload["id"], str) and payload["id"]
     params = payload["params"]
     message = params["message"]
-    assert message["role"] == "user"
-    assert message["kind"] == "message"
-    assert message["parts"] == [{"kind": "text", "text": "hi alice"}]
+    assert message["role"] == "ROLE_USER"
+    assert "kind" not in message  # v1: discriminator field dropped
+    assert message["parts"] == [{"text": "hi alice"}]
     # Fire-and-forget: the receiver must not block the forwarder on
     # the kernel turn or the httpx read-timeout triggers the
-    # fallback-to-local path and produces a duplicate reply. See
-    # Finding 1.
-    assert params["configuration"] == {"blocking": False}
+    # fallback-to-local path and produces a duplicate reply.
+    assert params["configuration"] == {"return_immediately": True}
     # Metadata lives on both the message and the envelope so either
     # inspection point sees it.
     for meta in (message["metadata"], params["metadata"]):
@@ -275,7 +274,7 @@ def test_forward_payload_is_fire_and_forget():
         timestamp_ms=0,
         label="l",
     )
-    assert payload["params"]["configuration"]["blocking"] is False
+    assert payload["params"]["configuration"]["return_immediately"] is True
 
 
 def test_forward_payload_includes_attachments(tmp_path: pathlib.Path):
@@ -309,12 +308,11 @@ def test_forward_payload_includes_attachments(tmp_path: pathlib.Path):
     )
     parts = payload["params"]["message"]["parts"]
     assert len(parts) == 2
-    assert parts[0] == {"kind": "text", "text": "look at this"}
+    assert parts[0] == {"text": "look at this"}
     file_part = parts[1]
-    assert file_part["kind"] == "file"
-    assert file_part["file"]["mime_type"] == "image/png"
-    assert file_part["file"]["name"] == "original.png"
-    assert base64.b64decode(file_part["file"]["bytes"]) == blob
+    assert file_part["media_type"] == "image/png"
+    assert file_part["filename"] == "original.png"
+    assert base64.b64decode(file_part["raw"]) == blob
 
 
 def test_build_forward_payload_empty_body_renders_empty_text():
@@ -355,10 +353,10 @@ async def test_forward_to_a2a_calls_injected_poster():
     assert len(calls) == 1
     url, payload = calls[0]
     assert url == "http://10.200.0.2:7878"
-    assert payload["method"] == "message/send"
+    assert payload["method"] == "SendMessage"
     # The forward MUST remain fire-and-forget end-to-end, not just
     # when callers go through build_forward_payload directly.
-    assert payload["params"]["configuration"] == {"blocking": False}
+    assert payload["params"]["configuration"] == {"return_immediately": True}
 
 
 @pytest.mark.asyncio
@@ -522,7 +520,7 @@ async def test_forwarded_sender_hits_poster_not_inbox(
     assert len(captured) == 1
     url, payload = captured[0]
     assert url == "http://10.200.0.2:7878"
-    assert payload["method"] == "message/send"
+    assert payload["method"] == "SendMessage"
     assert (
         payload["params"]["message"]["parts"][0]["text"] == "hi alice"
     )
@@ -704,11 +702,11 @@ async def test_produce_forwards_attachments_to_a2a(
     assert len(captured) == 1
     _, payload = captured[0]
     parts = payload["params"]["message"]["parts"]
-    kinds = [p["kind"] for p in parts]
-    assert kinds == ["text", "file"]
+    assert "text" in parts[0]
+    assert "raw" in parts[1]
     file_part = parts[1]
-    assert file_part["file"]["mime_type"] == "image/jpeg"
-    assert base64.b64decode(file_part["file"]["bytes"]) == blob
+    assert file_part["media_type"] == "image/jpeg"
+    assert base64.b64decode(file_part["raw"]) == blob
 
 
 # ---------------------------------------------------------------------------

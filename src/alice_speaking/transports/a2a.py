@@ -520,13 +520,22 @@ class _AliceExecutor(AgentExecutor):
         # the actual sender rather than back over the A2A stream.
         inbound_metadata: dict = {"a2a_context_id": ctx_id}
         if context.message is not None and context.message.metadata:
+            md = context.message.metadata
+            # v0.3-compat path delivers metadata as a protobuf Struct,
+            # v1 path as a dict. Coerce to dict so .get() works.
+            if not isinstance(md, dict):
+                try:
+                    from google.protobuf.json_format import MessageToDict
+                    md = MessageToDict(md, preserving_proto_field_name=True)
+                except Exception:
+                    md = {}
             for key in (
                 "signal_sender",
                 "signal_sender_name",
                 "signal_timestamp",
                 "dispatch_label",
             ):
-                value = context.message.metadata.get(key)
+                value = md.get(key)
                 if value is not None:
                     inbound_metadata[key] = value
 
