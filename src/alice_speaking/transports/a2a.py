@@ -226,7 +226,14 @@ class A2ATransport:
         )
         routes: list = []
         routes.extend(create_agent_card_routes(agent_card))
-        routes.extend(create_jsonrpc_routes(request_handler, "/"))
+        # enable_v0_3_compat=True: signal_dispatch.forward_to_a2a builds
+        # v0.3-style `message/send` payloads. Without this flag the A2A
+        # SDK returns MethodNotFound for every forward and the inbound
+        # never produces a turn. Keep the flag until the forwarder is
+        # migrated to the v1 method name, then revisit.
+        routes.extend(
+            create_jsonrpc_routes(request_handler, "/", enable_v0_3_compat=True)
+        )
         app = Starlette(routes=routes)
 
         config = uvicorn.Config(
