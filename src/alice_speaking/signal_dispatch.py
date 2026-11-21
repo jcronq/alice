@@ -159,29 +159,25 @@ def _attachment_to_file_part(attachment: Any) -> dict[str, Any]:
     and base64-encodes them inline — simplest cross-host transport,
     no shared filesystem assumption with the peer.
 
-    The shape mirrors the v0.3 ``FilePart`` / ``FileWithBytes`` the
-    a2a-sdk accepts via its JSON-RPC ``message/send`` compat adapter:
-    ``{"kind": "file", "file": {"bytes": "<b64>", "mime_type": ...,
-    "name": ...}}``.
+    The shape matches the v1 ``Part`` proto (``raw`` for inline bytes,
+    ``media_type`` for MIME, ``filename`` for the sender-supplied name).
+    The A2A SDK's ParseDict reads this directly off the JSON.
     """
     path = pathlib.Path(getattr(attachment, "path"))
-    raw = path.read_bytes()
-    encoded = base64.b64encode(raw).decode("ascii")
+    raw_bytes = path.read_bytes()
+    encoded = base64.b64encode(raw_bytes).decode("ascii")
     mime = getattr(attachment, "content_type", None) or ""
     if not mime:
         guessed, _ = mimetypes.guess_type(path.name)
         mime = guessed or "application/octet-stream"
     name = getattr(attachment, "filename", None) or path.name
-    file_payload: dict[str, Any] = {
-        "bytes": encoded,
-        "mime_type": mime,
+    part: dict[str, Any] = {
+        "raw": encoded,
+        "media_type": mime,
     }
     if name:
-        file_payload["name"] = name
-    return {
-        "kind": "file",
-        "file": file_payload,
-    }
+        part["filename"] = name
+    return part
 
 
 def build_forward_payload(
@@ -204,17 +200,13 @@ def build_forward_payload(
     envelope sees it without opening the Message). Both copies are
     identical; the receiver can read whichever is more convenient.
 
-    Fire-and-forget: ``configuration.blocking=False`` tells the peer
-    to return as soon as it accepts the task. A2A's v0.3 JSON-RPC
-    adapter (the ``message/send`` method) uses the ``blocking``
-    field name; proto-side this maps to
-    ``SendMessageConfiguration.return_immediately=True``. Without
-    this flag the peer blocks until its kernel turn reaches a
-    terminal state (typically 15-60s), the forwarder times out, and
-    the failure path (correctly) drops the envelope — but the sender
+    Fire-and-forget: ``configuration.return_immediately=True`` tells
+    the peer to return as soon as it accepts the task. Without this
+    flag the peer blocks until its kernel turn reaches a terminal
+    state (typically 15-60s), the forwarder times out, and the
+    failure path (correctly) drops the envelope — but the sender
     sees that as a spurious "unreachable" notice even though the peer
-    was actually processing fine. `blocking=False` keeps the forward
-    path accurate.
+    was actually processing fine. Keeps the forward path accurate.
     """
     metadata = {
         "signal_sender": sender,
@@ -223,7 +215,7 @@ def build_forward_payload(
         "dispatch_label": label,
     }
     parts: list[dict[str, Any]] = [
-        {"kind": "text", "text": body or ""},
+        {"text": body or ""},
     ]
     for att in attachments or ():
         try:
@@ -242,16 +234,15 @@ def build_forward_payload(
     return {
         "jsonrpc": "2.0",
         "id": uuid.uuid4().hex,
-        "method": "message/send",
+        "method": "SendMessage",
         "params": {
             "message": {
-                "kind": "message",
-                "role": "user",
+                "role": "ROLE_USER",
                 "message_id": uuid.uuid4().hex,
                 "parts": parts,
                 "metadata": metadata,
             },
-            "configuration": {"blocking": False},
+            "configuration": {"return_immediately": True},
             "metadata": metadata,
         },
     }

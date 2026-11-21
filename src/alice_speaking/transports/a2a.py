@@ -226,7 +226,14 @@ class A2ATransport:
         )
         routes: list = []
         routes.extend(create_agent_card_routes(agent_card))
-        routes.extend(create_jsonrpc_routes(request_handler, "/"))
+        # enable_v0_3_compat=True: signal_dispatch.forward_to_a2a builds
+        # v0.3-style `message/send` payloads. Without this flag the A2A
+        # SDK returns MethodNotFound for every forward and the inbound
+        # never produces a turn. Keep the flag until the forwarder is
+        # migrated to the v1 method name, then revisit.
+        routes.extend(
+            create_jsonrpc_routes(request_handler, "/", enable_v0_3_compat=True)
+        )
         app = Starlette(routes=routes)
 
         config = uvicorn.Config(
@@ -513,13 +520,22 @@ class _AliceExecutor(AgentExecutor):
         # the actual sender rather than back over the A2A stream.
         inbound_metadata: dict = {"a2a_context_id": ctx_id}
         if context.message is not None and context.message.metadata:
+            md = context.message.metadata
+            # v0.3-compat path delivers metadata as a protobuf Struct,
+            # v1 path as a dict. Coerce to dict so .get() works.
+            if not isinstance(md, dict):
+                try:
+                    from google.protobuf.json_format import MessageToDict
+                    md = MessageToDict(md, preserving_proto_field_name=True)
+                except Exception:
+                    md = {}
             for key in (
                 "signal_sender",
                 "signal_sender_name",
                 "signal_timestamp",
                 "dispatch_label",
             ):
-                value = context.message.metadata.get(key)
+                value = md.get(key)
                 if value is not None:
                     inbound_metadata[key] = value
 
