@@ -39,6 +39,7 @@ What it doesn't touch:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import pathlib
@@ -862,12 +863,41 @@ class PiSendMessageHandler(NullHandler):
         self._send_message = send_message
         self._events = events
 
+    _SEND_TIMEOUT_S = 45.0
+
     async def on_tool_use(self, name: str, input: Any, id: str) -> None:
         if name not in ("send_message", "mcp__alice__send_message"):
             return
         if not isinstance(input, dict):
             input = {}
-        result = await self._send_message(input)
+        try:
+            result = await asyncio.wait_for(
+                self._send_message(input), timeout=self._SEND_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            result = {
+                "isError": True,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"error: send_message timed out after "
+                            f"{self._SEND_TIMEOUT_S:.0f}s "
+                            "(signal-cli unresponsive?)"
+                        ),
+                    }
+                ],
+            }
+        except Exception as exc:  # noqa: BLE001
+            result = {
+                "isError": True,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"error: {type(exc).__name__}: {exc}",
+                    }
+                ],
+            }
         is_error = bool(result.get("isError"))
         self._events.emit(
             "pi_send_message_result",
