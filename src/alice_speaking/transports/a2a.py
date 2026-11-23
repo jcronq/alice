@@ -1,14 +1,23 @@
-"""A2ATransport: Alice as a Google A2A protocol server.
+"""A2ATransport: Alice as a Google A2A protocol peer — both sides.
 
-Lets external A2A-compliant agents submit text tasks to Alice and
-stream her replies back. Built on the official ``a2a-sdk``: we
-implement an :class:`AgentExecutor` that bridges between A2A's
-per-task event-queue model and Alice's serial-consumer / Transport
-abstraction.
+Lets external A2A-compliant agents submit text tasks to Alice (server
+side) *and* lets Alice initiate tasks against peer A2A agents (client
+side). Built on the official ``a2a-sdk``:
 
-Phase 1 (this module) is **inbound only** — Alice as A2A *server*.
-Outbound (Alice as A2A *client*, initiating to peer agents) lands
-in a follow-up.
+- Server: we implement an :class:`AgentExecutor` that bridges between
+  A2A's per-task event-queue model and Alice's serial-consumer /
+  Transport abstraction.
+- Client: a thin :class:`alice_speaking.transports.a2a_client.A2AClient`
+  wraps the SDK's JSON-RPC client. The :meth:`A2ATransport.send`
+  method dispatches to it when the destination address is a URL
+  (how peer principals register in ``principals.yaml``) instead of
+  a server-side task id.
+
+That shape gives Alice **symmetric** peering: a main-alice ↔ grand-alice
+pairing where either side can initiate. Each inbound request carries
+``X-Alice-Peer-Token``; the token→principal map resolves the caller to
+the right principal (``main-alice`` vs. ``grand-alice``) so the turn
+log reads correctly.
 
 Bridge shape
 ------------
@@ -26,15 +35,33 @@ the per-task queue inside ``execute()``, get translated to
 (WORKING → COMPLETED), and streamed to the client via the SDK's
 ``EventQueue``.
 
+Outbound (peer-initiated by us): the outbox router hands a
+``ChannelRef(transport="a2a", address="http://...")`` to
+:meth:`send`. We recognise the URL and delegate to the :class:`A2AClient`,
+which streams the peer's reply back as an :class:`A2AReply`. The
+aggregated reply text rides back with the send-call's return so the
+``send_message`` tool result includes what the peer said — Alice sees
+her own ping and the pong in the same turn.
+
 Auth (v1)
 ---------
 
-All A2A traffic is mapped to a single configurable principal
-(default ``"a2a"``). For production deployments, put oauth2-proxy /
-Caddy / similar in front of the worker port — same recommendation
-as the rest of Alice's HTTP surfaces. Per-caller identity (resolving
-``X-Forwarded-User`` to a principal in the address book) is the
-obvious follow-up but deferred until a real consumer asks for it.
+All A2A traffic is authenticated by a shared-secret HTTP header,
+``X-Alice-Peer-Token`` (:data:`alice_speaking.transports.a2a_client.PEER_TOKEN_HEADER`).
+Config carries two inputs:
+
+- ``identity_token`` — what WE present on outbound.
+- ``peer_tokens`` — map of inbound tokens → principal_id. An inbound
+  request whose token matches one of these entries gets its sender
+  resolved to that principal; unauthenticated or unknown-token
+  requests fall back to the single ``principal_name`` (default
+  ``"a2a"``) same as Phase 1.
+
+For deployments that don't peer (no YAML, no env vars) nothing
+changes — the shared-secret path is opt-in and the server keeps
+accepting unauthenticated callers as the catch-all principal. A
+future upgrade path (oauth2-proxy / mTLS) can replace the token
+without rewriting the executor.
 
 Server lifecycle
 ----------------
@@ -78,6 +105,7 @@ from a2a.types import (
 )
 from starlette.applications import Starlette
 
+from .a2a_client import A2AClient, A2AReply, PEER_TOKEN_HEADER
 from .base import (
     A2A_CAPS,
     Capabilities,
@@ -90,6 +118,20 @@ from .base import (
 
 
 log = logging.getLogger(__name__)
+
+
+def _destination_is_url(address: str) -> bool:
+    """Return True when ``address`` looks like an outbound peer URL.
+
+    Server-side task ids (uuids) never contain ``://`` so the check is
+    unambiguous. Address-book principals that register a peer Alice do
+    so with a full URL (``http://10.200.0.2:7878``); the router hands
+    that address through verbatim in the :class:`ChannelRef`.
+    """
+    if not address:
+        return False
+    lowered = address.lower()
+    return lowered.startswith("http://") or lowered.startswith("https://")
 
 
 # --- Workaround for a2a-sdk issue #1011 ---
@@ -195,6 +237,10 @@ class A2ATransport:
         host: str = "0.0.0.0",
         external_url: Optional[str] = None,
         inbox_size: int = 64,
+        peer_tokens: Optional[dict[str, str]] = None,
+        peer_display_names: Optional[dict[str, str]] = None,
+        identity_token: Optional[str] = None,
+        client_timeout_s: Optional[float] = None,
     ) -> None:
         self._port = port
         self._host = host
@@ -212,6 +258,27 @@ class A2ATransport:
         self._outbox: dict[str, asyncio.Queue[dict]] = {}
         self._uvicorn_server: Optional[uvicorn.Server] = None
         self._server_task: Optional[asyncio.Task] = None
+        # Peer-token → principal-id map. When an inbound request carries
+        # a known token in ``X-Alice-Peer-Token``, :class:`_AliceExecutor`
+        # tags the InboundMessage's principal with the matching id so
+        # downstream handling attributes the turn to the correct peer
+        # (e.g. "main-alice" vs. "grand-alice") instead of the single
+        # catch-all ``principal_name``. Unknown / missing tokens keep
+        # the Phase-1 fallback behaviour.
+        self._peer_tokens: dict[str, str] = dict(peer_tokens or {})
+        # Optional display-name overrides for peer principals. Lets
+        # ``principals.yaml`` carry the authoritative display name; the
+        # transport prefers it over the auto-built
+        # ``{principal_id} (a2a peer)`` label.
+        self._peer_display_names: dict[str, str] = dict(peer_display_names or {})
+        # Outbound A2A client — lazy inner construction so tests that
+        # don't exercise outbound can instantiate the transport without
+        # touching httpx. Shared across every peer URL; the client
+        # itself caches per-URL SDK clients internally.
+        self._client = A2AClient(
+            identity_token=identity_token,
+            default_timeout_s=client_timeout_s,
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -284,6 +351,10 @@ class A2ATransport:
                 await self._server_task
         self._uvicorn_server = None
         self._server_task = None
+        # Drain outbound sockets. Swallow — the daemon's shutdown path
+        # should never raise through transport.stop.
+        with contextlib.suppress(Exception):
+            await self._client.aclose()
 
     # ------------------------------------------------------------------
     # Inbound
@@ -296,15 +367,40 @@ class A2ATransport:
     # Outbound
 
     async def send(self, out: OutboundMessage) -> int:
-        """Push rendered chunks back to the executor for the matching task.
+        """Deliver ``out`` to the right side of A2A.
 
-        ``out.destination.address`` is the A2A task_id. If the task has
-        ended (executor exited and dropped its outbox) we log + drop the
-        send — same shape as CLI's "no live connection" handling.
+        Two modes, chosen by the destination address shape:
+
+        - **Server-mode push** — the address is a server-side task id
+          from an active inbound. We push rendered chunks onto the
+          per-task outbox so the :class:`_AliceExecutor.execute` loop
+          translates them into A2A artifact events on the SSE stream
+          this turn is replying to.
+        - **Client-mode POST** — the address is an ``http(s)://`` URL
+          (how peer principals in ``principals.yaml`` register). We
+          hand the text to :class:`A2AClient` which runs the full
+          JSON-RPC send-and-stream against the peer. The aggregated
+          reply text is logged for operator visibility; the chunk
+          count returned matches the reply-side chunk count so the
+          send-event emitter stays uniform with other transports.
+
+        A dropped delivery (no live task on the server side, or an
+        error / timeout on the client side) returns 0 chunks — same
+        shape as CLI's "no live connection" path, keeping the
+        ``*_send`` event schema stable.
         """
         from ..domain.render import render
 
-        task_id = out.destination.address
+        destination = out.destination.address
+        if _destination_is_url(destination):
+            reply = await self._client.send_text(url=destination, text=out.text)
+            self._log_client_reply(destination, out.text, reply)
+            # Chunk-count: 1 per artifact frame we received back. For the
+            # ``quick ping``-style ping/pong this is usually 1; for
+            # longer peer replies the counter tracks the stream shape.
+            return reply.chunk_count or (0 if reply.error or reply.timed_out else 1)
+
+        task_id = destination
         q = self._outbox.get(task_id)
         if q is None:
             log.warning(
@@ -319,6 +415,92 @@ class A2ATransport:
         for chunk in chunks:
             q.put_nowait({"kind": "chunk", "text": chunk})
         return len(chunks)
+
+    def _log_client_reply(
+        self, url: str, sent: str, reply: A2AReply
+    ) -> None:
+        """Structured log line for one outbound A2A exchange.
+
+        The outbound call is fire-and-wait — the daemon doesn't stream
+        the reply into Alice's turn (that would require inverting the
+        turn-runner's ``send_message`` call chain). Instead the reply
+        text rides in this log line + the send-event, which operators
+        can grep for.
+        """
+        if reply.error:
+            log.warning(
+                "a2a outbound error: url=%s sent_len=%d err=%s",
+                url,
+                len(sent),
+                reply.error,
+            )
+            return
+        if reply.timed_out:
+            log.warning(
+                "a2a outbound timed out: url=%s sent_len=%d partial=%d chars",
+                url,
+                len(sent),
+                len(reply.text),
+            )
+            return
+        log.info(
+            "a2a outbound ok: url=%s sent_len=%d reply_len=%d chunks=%d state=%s",
+            url,
+            len(sent),
+            len(reply.text),
+            reply.chunk_count,
+            reply.state,
+        )
+
+    async def send_and_capture(
+        self, url: str, text: str, timeout_s: Optional[float] = None
+    ) -> A2AReply:
+        """Public hook for callers that want the aggregated peer reply.
+
+        The :meth:`send` path returns a chunk count because the
+        :class:`Transport` protocol constrains it to; callers that want
+        the reply text (e.g. a mutual-ping smoke test, a future tool
+        that lets Alice *see* the peer's reply inline) go through here.
+        """
+        return await self._client.send_text(url=url, text=text, timeout_s=timeout_s)
+
+    def register_peer(
+        self,
+        *,
+        principal_id: str,
+        token: str,
+        display_name: Optional[str] = None,
+    ) -> None:
+        """Teach the server side about a peer's shared-secret token.
+
+        Idempotent — re-registering the same token re-binds it. Called
+        by the daemon at startup once ``a2a-peers.yaml`` + the
+        env-sourced token values are resolved. Kept as a method so
+        tests can wire a test peer without rebuilding the transport.
+        """
+        if not token or not principal_id:
+            raise ValueError("register_peer requires non-empty token + principal_id")
+        self._peer_tokens[token] = principal_id
+        if display_name:
+            self._peer_display_names[principal_id] = display_name
+
+    def _principal_for_token(self, token: Optional[str]) -> tuple[str, str]:
+        """Resolve an inbound ``X-Alice-Peer-Token`` to a principal.
+
+        Falls back to the configured catch-all when the token is
+        missing or unknown; the result is used verbatim on
+        :class:`Principal.native_id` so the address book can map the
+        turn back to a ``principals.yaml`` entry.
+        """
+        if token:
+            principal_id = self._peer_tokens.get(token)
+            if principal_id:
+                display = (
+                    self._peer_display_names.get(principal_id)
+                    or f"{principal_id} (a2a peer)"
+                )
+                return principal_id, display
+        return self._principal_name, self._principal_display_name
 
     async def typing(self, channel: ChannelRef, on: bool) -> None:
         # No-op: A2A status updates fill the same role.
@@ -423,11 +605,19 @@ class A2ATransport:
     async def _push_inbound(self, inbound: InboundMessage) -> None:
         await self._inbox.put(inbound)
 
-    def _make_principal(self) -> Principal:
+    def _make_principal(self, token: Optional[str] = None) -> Principal:
+        """Build the :class:`Principal` for an inbound A2A task.
+
+        When ``token`` matches a registered peer token the principal is
+        pinned to that peer's id + display name so the turn log shows
+        "from main-alice" rather than the single "a2a" catch-all. A
+        missing / unknown token keeps the Phase-1 default behaviour.
+        """
+        principal_id, display = self._principal_for_token(token)
         return Principal(
             transport="a2a",
-            native_id=self._principal_name,
-            display_name=self._principal_display_name,
+            native_id=principal_id,
+            display_name=display,
         )
 
     def _build_agent_card(self) -> AgentCard:
@@ -512,6 +702,21 @@ class _AliceExecutor(AgentExecutor):
             )
             return
 
+        # Peer-token resolution — the Starlette-based context builder
+        # that the SDK ships stashes HTTP headers into
+        # ``call_context.state['headers']`` (keys lowercased). We pull
+        # the Alice peer token out and resolve it to a principal before
+        # building the InboundMessage so the daemon's address-book
+        # ``learn`` path attributes the turn to the right peer.
+        peer_token: Optional[str] = None
+        call_ctx = getattr(context, "call_context", None)
+        if call_ctx is not None:
+            headers = call_ctx.state.get("headers") if call_ctx.state else None
+            if isinstance(headers, dict):
+                peer_token = headers.get(PEER_TOKEN_HEADER) or headers.get(
+                    PEER_TOKEN_HEADER.upper()
+                )
+
         # Carry a2a_context_id plus any caller-supplied metadata through
         # to the daemon. The sender-based dispatch path (see
         # :mod:`alice_speaking.signal_dispatch`) uses this to plumb the
@@ -542,7 +747,7 @@ class _AliceExecutor(AgentExecutor):
         outbox = self._t._open_task_outbox(task_id)
         try:
             inbound = InboundMessage(
-                principal=self._t._make_principal(),
+                principal=self._t._make_principal(peer_token),
                 origin=ChannelRef(transport="a2a", address=task_id, durable=False),
                 text=text,
                 timestamp=time.time(),

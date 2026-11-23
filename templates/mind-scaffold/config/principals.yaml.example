@@ -28,3 +28,15 @@ principals:
       - transport: signal
         address: "+15555550101"
         preferred: true
+
+  # Example A2A peer. The ``a2a`` channel address is the peer's A2A
+  # JSON-RPC URL (what ``A2AClient`` POSTs to). Pair with an entry
+  # under ``a2a-peers.yaml`` so inbound requests from this peer
+  # resolve to the right principal via the shared-secret header.
+  # grand-alice:
+  #   display_name: Grand Alice (grandparents-home)
+  #   allowed: true
+  #   channels:
+  #     - transport: a2a
+  #       address: "http://10.200.0.2:7878"
+  #       preferred: true
