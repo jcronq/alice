@@ -39,9 +39,11 @@ Outbound (peer-initiated by us): the outbox router hands a
 ``ChannelRef(transport="a2a", address="http://...")`` to
 :meth:`send`. We recognise the URL and delegate to the :class:`A2AClient`,
 which streams the peer's reply back as an :class:`A2AReply`. The
-aggregated reply text rides back with the send-call's return so the
-``send_message`` tool result includes what the peer said — Alice sees
-her own ping and the pong in the same turn.
+:meth:`send` return is the usual chunk-count int (same protocol as
+every other transport); the aggregated reply text itself is logged
+via :meth:`_log_client_reply` for operator visibility, and callers
+that need the body (e.g. the mutual-ping smoke) use
+:meth:`send_and_capture` instead.
 
 Auth (v1)
 ---------
@@ -395,10 +397,14 @@ class A2ATransport:
         if _destination_is_url(destination):
             reply = await self._client.send_text(url=destination, text=out.text)
             self._log_client_reply(destination, out.text, reply)
-            # Chunk-count: 1 per artifact frame we received back. For the
-            # ``quick ping``-style ping/pong this is usually 1; for
-            # longer peer replies the counter tracks the stream shape.
-            return reply.chunk_count or (0 if reply.error or reply.timed_out else 1)
+            # Chunk-count: 1 per artifact frame we received back. We
+            # return it verbatim — a successful-but-empty reply from
+            # the peer is a legitimate zero, same shape the per-task
+            # server-outbox path returns when ``render`` yields no
+            # chunks. Fabricating a ghost "1" here would mislead
+            # downstream send-event consumers into thinking content
+            # was delivered when none was.
+            return reply.chunk_count
 
         task_id = destination
         q = self._outbox.get(task_id)
@@ -713,9 +719,11 @@ class _AliceExecutor(AgentExecutor):
         if call_ctx is not None:
             headers = call_ctx.state.get("headers") if call_ctx.state else None
             if isinstance(headers, dict):
-                peer_token = headers.get(PEER_TOKEN_HEADER) or headers.get(
-                    PEER_TOKEN_HEADER.upper()
-                )
+                # Starlette lowercases every incoming header name before
+                # stashing it on call_context.state['headers'], so one
+                # lowercase lookup is enough. Previous code also tried
+                # PEER_TOKEN_HEADER.upper() — dead branch, dropped.
+                peer_token = headers.get(PEER_TOKEN_HEADER)
 
         # Carry a2a_context_id plus any caller-supplied metadata through
         # to the daemon. The sender-based dispatch path (see

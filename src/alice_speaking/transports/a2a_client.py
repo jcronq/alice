@@ -57,7 +57,6 @@ from a2a.client import (
     A2AClientTimeoutError,
     ClientConfig,
     ClientFactory,
-    minimal_agent_card,
 )
 from a2a.helpers import (
     get_artifact_text,
@@ -65,6 +64,9 @@ from a2a.helpers import (
     new_text_message,
 )
 from a2a.types import (
+    AgentCapabilities,
+    AgentCard,
+    AgentInterface,
     Role,
     SendMessageConfiguration,
     SendMessageRequest,
@@ -93,12 +95,19 @@ _DEFAULT_TIMEOUT_S = 60.0
 # Terminal task states — stop streaming once we see one of these. The
 # a2a-sdk emits status updates through the same StreamResponse as
 # artifact chunks, so the client has to inspect every event.
+# AUTH_REQUIRED and INPUT_REQUIRED are server-close states too: the
+# server ends the SSE stream at that point and the client needs to
+# distinguish "completed successfully" from "stopped mid-flight waiting
+# for more input". We treat them as terminal here; the caller inspects
+# ``reply.state`` to branch.
 _TERMINAL_STATES: frozenset[TaskState.ValueType] = frozenset(
     {
         TaskState.TASK_STATE_COMPLETED,
         TaskState.TASK_STATE_CANCELED,
         TaskState.TASK_STATE_FAILED,
         TaskState.TASK_STATE_REJECTED,
+        TaskState.TASK_STATE_AUTH_REQUIRED,
+        TaskState.TASK_STATE_INPUT_REQUIRED,
     }
 )
 
@@ -197,25 +206,30 @@ class A2AClient:
         Safe to call twice. The parent :class:`A2ATransport` invokes
         this from :meth:`A2ATransport.stop` so the daemon's shutdown
         path drains outbound sockets cleanly.
+
+        Note: every cached SDK client shares ``self._httpx`` via the
+        ``ClientConfig(httpx_client=...)`` we pass to
+        :class:`ClientFactory`. :meth:`BaseClient.close` delegates to
+        :meth:`JsonRpcTransport.close`, which calls ``aclose()`` on
+        that same shared httpx. Closing each cached client in turn
+        would close the shared httpx N times and raise on reuse — so
+        we skip the per-client close entirely and close the shared
+        httpx once below.
         """
         async with self._lock:
-            for client in self._client_cache.values():
-                close = getattr(client, "close", None)
-                if close is None:
-                    continue
-                try:
-                    result = close()
-                    if asyncio.iscoroutine(result):
-                        await result
-                except Exception as exc:  # noqa: BLE001
-                    log.debug("a2a client close failed: %s", exc)
+            # Drop cached SDK clients WITHOUT invoking their close() —
+            # see docstring. The only real resource behind them is the
+            # shared httpx we close next.
             self._client_cache.clear()
             if self._httpx is not None:
+                httpx_client = self._httpx
+                # Null first so a concurrent second aclose() is a no-op
+                # even if the aclose() below raises.
+                self._httpx = None
                 try:
-                    await self._httpx.aclose()
+                    await httpx_client.aclose()
                 except Exception as exc:  # noqa: BLE001
                     log.debug("a2a httpx close failed: %s", exc)
-                self._httpx = None
 
     # ------------------------------------------------------------------
     # Public send
@@ -274,11 +288,20 @@ class A2AClient:
                 len(reply.text),
             )
             reply.timed_out = True
+            # The timed-out async iterator has left the SDK client's
+            # httpx stream in a half-cancelled state; reusing it next
+            # call risks a mid-stream read on a dead connection. Drop
+            # the cached entry so the next send_text rebuilds.
+            self._client_cache.pop(url, None)
             return reply
         except A2AClientTimeoutError as exc:
             log.warning("a2a client timeout against %s: %s", url, exc)
             reply.timed_out = True
             reply.error = str(exc)
+            # Same story as the asyncio.TimeoutError branch: evict the
+            # stale cached client before returning so we don't reuse
+            # a half-cancelled stream.
+            self._client_cache.pop(url, None)
             return reply
         except A2AClientError as exc:
             log.warning("a2a client error against %s: %s", url, exc)
@@ -305,13 +328,17 @@ class A2AClient:
 
         The SDK multiplexes task metadata, status updates, and artifact
         chunks onto a single stream, so the client has to branch per
-        payload type. We only care about:
+        payload type. We care about:
 
-        - ``artifact_update``: append text to ``reply.text``.
+        - ``artifact_update``: append text to ``reply.text`` (streaming
+          path — the common case now that the agent card advertises
+          ``capabilities.streaming=True``).
         - ``status_update``: record the state + any message text (the
           latter only kept for the error trail).
-        - ``task``: initial Task payload — ignore; the subsequent
-          status updates carry the terminal state we actually want.
+        - ``task``: completed Task payload — only emitted when the
+          client took the non-streaming branch (either side's card
+          lacks ``capabilities.streaming``). Pull artifact text off
+          the Task directly so the caller still gets the reply body.
         - ``message``: unary (non-streaming) reply — treat the whole
           message text as the reply body.
         """
@@ -338,7 +365,46 @@ class A2AClient:
                 reply.chunk_count += 1
             reply.state = TaskState.TASK_STATE_COMPLETED
             return
-        # task / other non-payload frames — ignore silently.
+        if response.HasField("task"):
+            # Two legitimate shapes land here:
+            #
+            # - **Streaming path**: the server enqueues the initial
+            #   ``Task`` (status = SUBMITTED, no artifacts) as the very
+            #   first SSE event, then follows with ``status_update`` and
+            #   ``artifact_update`` frames. We must NOT treat this as a
+            #   terminal signal; the real text and the terminal state
+            #   arrive on later frames.
+            # - **Non-streaming path**: :meth:`BaseClient.send_message`
+            #   synthesises one ``StreamResponse.task`` from the Task
+            #   that ``JsonRpcTransport.send_message`` returned. That
+            #   Task carries the terminal status + the full artifact
+            #   set; it is the only frame we will ever see.
+            #
+            # Heuristic: pull artifact text + status off the frame
+            # unconditionally — streaming's initial Task has neither
+            # artifacts nor a terminal state, so the writes are no-ops.
+            # The outer stream loop exits on terminal-state or iterator
+            # exhaustion, so non-streaming "one and done" naturally
+            # falls out when the iterator closes.
+            task = response.task
+            for artifact in task.artifacts:
+                text = get_artifact_text(artifact)
+                if text:
+                    reply.text += text
+                    reply.chunk_count += 1
+            if task.HasField("status"):
+                status_state = task.status.state
+                # Only promote to ``reply.state`` on terminal states;
+                # otherwise the streaming path's initial SUBMITTED
+                # would break the outer loop prematurely.
+                if status_state in _TERMINAL_STATES:
+                    reply.state = status_state
+                if task.status.HasField("message"):
+                    msg_text = get_message_text(task.status.message)
+                    if msg_text:
+                        reply.status_messages.append(msg_text)
+            return
+        # Any other frame kinds — ignore silently.
 
     async def _get_or_build_client(self, url: str):
         """Return a cached SDK client for ``url``, building on miss.
@@ -367,10 +433,23 @@ class A2AClient:
         1. Both peers run the same Alice build; the card at the other
            end is predictable and we gain nothing from fetching it.
         2. Card resolution over the WireGuard mesh is a round-trip we'd
-           rather spare on every send. Minimal cards work for JSON-RPC.
+           rather spare on every send. Hand-built cards work for
+           JSON-RPC when we fill in the fields the SDK actually reads.
         3. If a future peer is a non-Alice A2A agent, the operator can
            flip to full card resolution via a follow-up knob without
            reworking this client.
+
+        We do NOT use :func:`a2a.client.minimal_agent_card` here —
+        it hard-codes ``AgentCapabilities(extended_agent_card=True)``
+        with ``streaming`` left at the dataclass default (False), and
+        :meth:`BaseClient.send_message` falls through to the
+        non-streaming branch when either ``config.streaming`` or
+        ``card.capabilities.streaming`` is False. The non-streaming
+        branch yields a single ``StreamResponse.task`` frame; we
+        handle it defensively in :meth:`_ingest_stream_response` but
+        the streaming SSE path is the one we want to exercise end-to-
+        end for a symmetric peer. Advertising ``streaming=True`` here
+        makes the SDK actually use ``send_message_streaming``.
         """
         if self._httpx is None:
             headers: dict[str, str] = {}
@@ -395,8 +474,20 @@ class A2AClient:
             supported_protocol_bindings=[TransportProtocol.JSONRPC],
         )
         factory = ClientFactory(config)
-        card = minimal_agent_card(
-            url=url, transports=[TransportProtocol.JSONRPC]
+        card = AgentCard(
+            name="",
+            description="",
+            version="",
+            default_input_modes=[],
+            default_output_modes=[],
+            capabilities=AgentCapabilities(streaming=True),
+            skills=[],
+            supported_interfaces=[
+                AgentInterface(
+                    protocol_binding=TransportProtocol.JSONRPC,
+                    url=url,
+                ),
+            ],
         )
         return factory.create(card)
 

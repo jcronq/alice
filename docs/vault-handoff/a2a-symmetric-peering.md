@@ -35,8 +35,35 @@ Main Alice (aimax1) and grand-alice (10.200.0.2) hold mirrored config:
 - `ALICE_A2A_PEER_TOKEN_<PEER>` = the other instance's token (same
   value as her `ALICE_A2A_IDENTITY_TOKEN`).
 
-Rolling back = empty the env vars; the transport reverts to Phase-1
-inbound-only automatically.
+The main-alice compose file (`sandbox/docker-compose.yml`) publishes
+`${ALICE_A2A_PORT:-7878}` on the aimax1 host and defaults
+`ALICE_A2A_ENABLED=true` so both sides share the stack without a
+per-instance override. Grand-alice's alice.env already has those keys
+set; main-alice picks the same defaults up on next container start.
+To opt out (solo deploy that doesn't peer) set
+`ALICE_A2A_ENABLED=false` in alice.env.
+
+### WG reach — which URL hits which Alice
+
+The main ↔ grandparents link is a WireGuard tunnel between aimax1
+(WG ip `10.200.0.1`) and the grandparents host (WG ip `10.200.0.2`).
+Container-side bind is `0.0.0.0:7878`; the host port map makes it
+reachable from the peer over the tunnel:
+
+| From         | URL for peer                      |
+|--------------|-----------------------------------|
+| grand-alice  | `http://10.200.0.1:7878/` (main)  |
+| main-alice   | `http://10.200.0.2:7878/` (grand) |
+
+Register that URL in `principals.yaml` under the peer's principal,
+`channel: a2a`. The transport routes URL-shaped destinations through
+the client; task-id-shaped destinations stay on the server-side
+outbox (the existing Phase-1 path).
+
+Rolling back = empty the env vars (or set `ALICE_A2A_ENABLED=false`);
+the transport reverts to Phase-1 inbound-only — or, if disabled,
+doesn't bind at all. The published host port is safe to leave in
+place: without a listener nothing is reachable behind it.
 
 ## Test
 

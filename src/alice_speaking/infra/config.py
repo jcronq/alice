@@ -558,13 +558,13 @@ def load() -> Config:
         from_any("ALICE_A2A_PEERS_FILE", str(mind_dir / "config" / "a2a-peers.yaml"))
         or str(mind_dir / "config" / "a2a-peers.yaml")
     )
-    try:
-        a2a_peers = _load_a2a_peers(a2a_peers_path)
-    except ValueError:
-        # Loader already logged + raised; re-raising would hard-fail
-        # the daemon on a typo. Prefer a loud warning and empty peers
-        # so inbound-only operation keeps working.
-        a2a_peers = A2APeersConfig()
+    # Let the loader's ValueError propagate — the module docstring
+    # promises "startup fails loudly" on malformed YAML, and silently
+    # falling back to empty peers meant a token-env typo would boot
+    # the daemon with every inbound request mapped to the catch-all
+    # principal. If this blocks a deploy, fix the YAML / env var; the
+    # exception message names the file + the offending field.
+    a2a_peers = _load_a2a_peers(a2a_peers_path)
 
     return Config(
         signal_api=signal_api,

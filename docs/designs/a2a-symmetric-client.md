@@ -83,11 +83,18 @@ before pushing the `InboundMessage` onto the inbox.
 
 `A2AClient` is deliberately thin. One module-scope instance per
 `A2ATransport`; one `a2a-sdk` `Client` per peer URL, cached. We call
-`ClientFactory.create` against a `minimal_agent_card` (JSON-RPC only)
-so startup skips the `.well-known/agent-card.json` round-trip — both
-Alices run the same build, the card is predictable, and card
-resolution over the WireGuard mesh is a round-trip we'd rather spare
-on every send.
+`ClientFactory.create` against a hand-built `AgentCard` with
+`capabilities.streaming=True` and a JSON-RPC interface pinned to the
+peer URL, so startup skips the `.well-known/agent-card.json` round-
+trip — both Alices run the same build, the card is predictable, and
+card resolution over the WireGuard mesh is a round-trip we'd rather
+spare on every send. (We can't use `a2a.client.minimal_agent_card`
+directly: it leaves `capabilities.streaming` at False, which drops
+`BaseClient.send_message` into the non-streaming branch that only
+yields a completed `Task` frame. The client defensively handles that
+frame type too, so even a mis-configured peer still produces a
+usable reply, but the streaming SSE path is the one we want to
+exercise end-to-end for a symmetric peer.)
 
 Timeout: 60s default, overrideable via `ALICE_A2A_CLIENT_TIMEOUT` so
 slow-link WG tunnels can relax it without a code change. The stream
@@ -142,17 +149,28 @@ later is a one-line prompt change.
 
 ### Reachability
 
-- `aimax1` → `10.200.0.2`: WireGuard mesh, `ssh aimax1 curl -s
+The aimax1 ↔ grandparents WG tunnel puts aimax1 at `10.200.0.1` and
+the grandparents host at `10.200.0.2` (verified 2026-11-23 via
+`wg show` on aimax1 — `peer allowed ips: 10.200.0.2/32`, with
+aimax1's local tunnel address `10.200.0.1/24`).
+
+| From         | URL for peer                      |
+|--------------|-----------------------------------|
+| grand-alice  | `http://10.200.0.1:7878/` (main)  |
+| main-alice   | `http://10.200.0.2:7878/` (grand) |
+
+- `aimax1` → `10.200.0.2`: `curl -s
   http://10.200.0.2:7878/.well-known/agent-card.json` from aimax1
-  should return the card.
-- `10.200.0.2` → aimax1: the main-alice principal's URL is the WG
-  address of aimax1 (`http://10.200.0.1:7878` if the mesh is laid out
-  that way) — confirm with `grand-alice: curl -s http://<main-wg-ip>:
-  7878/.well-known/agent-card.json`.
+  returns the agent card (confirmed inbound-only on 2026-11-23).
+- `10.200.0.2` → aimax1: confirm with `curl -s
+  http://10.200.0.1:7878/.well-known/agent-card.json` from
+  grand-alice's host.
 
 Both deploys must publish port 7878 to the host interface the peer
-can reach. The existing compose block for main Alice already does;
-the grand-alice sandbox publishes 7878 inside the WG network.
+can reach. `sandbox/docker-compose.yml` publishes `7878:7878` on
+main-alice and defaults `ALICE_A2A_ENABLED=true` so the listener
+comes up by default; grand-alice's compose publishes the same port
+inside her sandbox.
 
 ## Test plan
 

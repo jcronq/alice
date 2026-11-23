@@ -28,8 +28,10 @@ import pytest
 from alice_speaking.infra import a2a_peers as peers_module
 from alice_speaking.transports.a2a import A2ATransport
 from alice_speaking.transports.a2a_client import (
+    A2AClient,
     A2AReply,
     PEER_TOKEN_HEADER,
+    _TERMINAL_STATES,
     resolve_client_timeout,
     resolve_identity_token,
 )
@@ -267,3 +269,164 @@ def test_resolve_client_timeout_env_override(monkeypatch):
     assert resolve_client_timeout() == pytest.approx(60.0)
     monkeypatch.setenv("ALICE_A2A_CLIENT_TIMEOUT", "-1")
     assert resolve_client_timeout() == pytest.approx(60.0)
+
+
+# -- regression guards for code-review findings (PR #920) ---------------------
+
+
+def test_terminal_states_cover_auth_and_input_required():
+    """Server closes the SSE stream on AUTH_REQUIRED / INPUT_REQUIRED too,
+    so the client must recognise them as terminal — otherwise the stream
+    loop hangs waiting for an event that never arrives."""
+    from a2a.types import TaskState
+
+    assert TaskState.TASK_STATE_AUTH_REQUIRED in _TERMINAL_STATES
+    assert TaskState.TASK_STATE_INPUT_REQUIRED in _TERMINAL_STATES
+
+
+def test_url_empty_reply_reports_zero_chunks(monkeypatch):
+    """F3 — a successful-but-empty peer reply must return a real 0,
+    not a fabricated ghost chunk. The OutboxRouter interprets the
+    chunk count verbatim."""
+    t = A2ATransport(port=0)
+
+    async def fake_send_text(*, url, text, timeout_s=None):
+        # Peer answered, no artifacts emitted, no error, no timeout.
+        return A2AReply(state=None, chunk_count=0)
+
+    monkeypatch.setattr(t._client, "send_text", fake_send_text)
+
+    async def go():
+        return await t.send(
+            OutboundMessage(
+                destination=ChannelRef(
+                    transport="a2a",
+                    address="http://peer.example",
+                    durable=True,
+                ),
+                text="ping",
+            )
+        )
+
+    delivered = asyncio.run(go())
+    assert delivered == 0
+
+
+def test_timeout_invalidates_cached_client(monkeypatch):
+    """F4 — an asyncio.TimeoutError leaves the a2a-sdk client's httpx
+    stream half-cancelled. The next send_text must rebuild rather
+    than reuse the stale cached client."""
+
+    class FakeClient:
+        def __init__(self, url):
+            self.url = url
+
+        async def send_message(self, request):  # pragma: no cover - never yields
+            # Hang-forever iterator; the outer asyncio.timeout fires.
+            await asyncio.sleep(10)
+            if False:
+                yield None
+
+    client = A2AClient(default_timeout_s=0.05)
+
+    async def fake_build(url):
+        return FakeClient(url)
+
+    monkeypatch.setattr(client, "_build_client", fake_build)
+
+    async def go():
+        reply = await client.send_text(url="http://peer.test", text="hi")
+        assert reply.timed_out is True
+        # Cache must be empty — the stale client was evicted.
+        assert client._client_cache == {}
+
+    asyncio.run(go())
+
+
+def _build_task_frame(text: str, state):
+    """Helper: build a StreamResponse carrying a completed-Task payload
+    with a single text artifact. Models the non-streaming branch of
+    :meth:`BaseClient.send_message` where the SDK synthesises one
+    ``StreamResponse.task`` frame from the plain-RPC Task reply."""
+    from a2a.helpers import new_text_artifact
+    from a2a.types import StreamResponse, Task, TaskStatus
+
+    response = StreamResponse()
+    task = Task(
+        id="t1",
+        context_id="t1",
+        status=TaskStatus(state=state),
+        artifacts=[new_text_artifact(name="reply", text=text, artifact_id="a1")],
+    )
+    response.task.CopyFrom(task)
+    return response
+
+
+def test_task_frame_handler_aggregates_artifacts():
+    """F1 fallback — if a peer somehow drives the non-streaming branch,
+    ``_ingest_stream_response`` must pull artifact text off the
+    ``task`` frame rather than silently dropping it."""
+    from a2a.types import TaskState
+
+    client = A2AClient()
+    reply = A2AReply()
+    response = _build_task_frame("pong echo", TaskState.TASK_STATE_COMPLETED)
+
+    client._ingest_stream_response(response, reply)
+
+    assert reply.text == "pong echo"
+    assert reply.chunk_count == 1
+    assert reply.state == TaskState.TASK_STATE_COMPLETED
+
+
+def test_task_frame_handler_does_not_break_on_streaming_initial_task():
+    """F1 regression — the streaming path's FIRST SSE frame is always
+    the initial Task (state=SUBMITTED, artifacts empty). Setting a
+    terminal state on that frame would break the client's outer
+    stream loop before the real artifact and status-COMPLETED frames
+    arrive. The handler must leave ``reply.state`` unset in that case."""
+    from a2a.types import StreamResponse, Task, TaskState, TaskStatus
+
+    client = A2AClient()
+    reply = A2AReply()
+    task = Task(
+        id="t",
+        context_id="t",
+        status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED),
+    )
+    response = StreamResponse()
+    response.task.CopyFrom(task)
+
+    client._ingest_stream_response(response, reply)
+
+    assert reply.state is None
+    assert reply.text == ""
+    assert reply.chunk_count == 0
+
+
+def test_aclose_is_idempotent_and_closes_shared_httpx_once():
+    """F5 — a second aclose() must not double-close the shared httpx
+    client the cached SDK clients share, and the broad-except debug
+    log path must not fire."""
+    import httpx
+
+    client = A2AClient()
+    # Install a fake httpx + two fake cached clients that would try
+    # to close the same underlying resource if invoked.
+    close_count = {"httpx": 0}
+
+    class FakeHttpx:
+        async def aclose(self):
+            close_count["httpx"] += 1
+
+    client._httpx = FakeHttpx()
+    client._client_cache = {"a": object(), "b": object()}
+
+    async def go():
+        await client.aclose()
+        await client.aclose()  # second call must be a no-op
+        assert client._client_cache == {}
+        assert client._httpx is None
+
+    asyncio.run(go())
+    assert close_count["httpx"] == 1
