@@ -513,9 +513,9 @@ async def test_pi_kernel_closeout_timeout_still_returns_timeout_result(
 
 
 def test_pi_kernel_argv_drops_tools_without_pi_equivalent() -> None:
-    """WebFetch and WebSearch have no pi built-in; they drop
-    silently. If the operator's allowlist is ALL drops, --tools is
-    omitted so pi falls back to its default tool set."""
+    """WebFetch and WebSearch have no pi built-in; they drop. If the
+    operator's allowlist is ALL drops, --tools is omitted so pi falls
+    back to its default tool set."""
     cap = CapturingEmitter()
     kernel = PiKernel(cap)
     spec = KernelSpec(
@@ -532,3 +532,22 @@ def test_pi_kernel_argv_drops_tools_without_pi_equivalent() -> None:
     argv_mixed = kernel._build_argv("hi", spec_mixed)
     idx = argv_mixed.index("--tools")
     assert argv_mixed[idx + 1] == "bash,read"
+
+
+def test_pi_kernel_emits_pi_tool_dropped_event_per_lost_tool() -> None:
+    """Visibility fix: WebFetch / WebSearch / unmappable MCP tools
+    dropping to pi should fire a ``pi_tool_dropped`` event so the
+    Jason-Max-exhausted fallback trace shows exactly which
+    capabilities were lost. Previously the drops were silent and the
+    missing Web* access only surfaced when the model complained it
+    couldn't fetch a URL."""
+    cap = CapturingEmitter()
+    kernel = PiKernel(cap)
+    spec = KernelSpec(
+        model="gpt-5.3-codex",
+        allowed_tools=["Bash", "WebFetch", "WebSearch", "mcp__alice__some_rpc"],
+    )
+    kernel._build_argv("hi", spec)
+    dropped = [e for e in cap.events if e["event"] == "pi_tool_dropped"]
+    tool_names = sorted(e["tool"] for e in dropped)
+    assert tool_names == ["WebFetch", "WebSearch", "mcp__alice__some_rpc"]

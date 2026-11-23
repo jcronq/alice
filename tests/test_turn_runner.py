@@ -271,3 +271,198 @@ def test_module_level_repo_path_resolves_to_repo_root() -> None:
     assert (
         tr_module.REPO_PATH / "src" / "alice_speaking" / "turn_runner.py"
     ).is_file()
+
+
+# ---------------------------------------------------------------------
+# Pi-mono preamble-every-turn (session-continuity bug fix).
+#
+# Pi has no SDK-session resume (``pi -p ... --no-session`` is one-shot);
+# turn N+1 would see only the latest user message unless TurnRunner
+# rebuilds the turn-log preamble every real turn. These tests cover the
+# three branches of :meth:`TurnRunner._prime_pi_mono_preamble`:
+#
+#   * summary present → ``build_summary_preamble(summary, tail)``
+#   * tail non-empty, no summary → ``build_bootstrap_preamble(tail)``
+#   * tail empty, no summary → preamble cleared (first fresh turn)
+#
+# Plus two run_turn integration branches:
+#
+#   * pi-mono + non-silent turn → rebuild fires
+#   * pi-mono + silent (compaction/bootstrap) turn → rebuild skipped
+#
+
+
+import pathlib
+
+from alice_speaking.domain.turn_log import Turn, TurnLog
+from alice_speaking.turn_runner import TurnRunner
+from alice_speaking.pipeline import compaction as compaction_module
+
+
+class _StubBackend:
+    """Minimal BackendSpec-shaped stub — TurnRunner only reads
+    ``.harness`` for the pi-mono branch."""
+
+    def __init__(self, harness: str) -> None:
+        self.harness = harness
+
+
+class _StubEvents:
+    """Collects ``emit`` calls so tests can assert on emitted events."""
+
+    def __init__(self) -> None:
+        self.emitted: list[dict[str, Any]] = []
+
+    def emit(self, name: str, **fields: Any) -> None:
+        self.emitted.append({"name": name, **fields})
+
+
+def _pi_mono_runner(
+    tmp_path: pathlib.Path,
+    *,
+    harness: str = "pi-mono",
+    preamble_turns: int = 10,
+) -> TurnRunner:
+    """Bare runner shell populated with just the fields
+    :meth:`_prime_pi_mono_preamble` + :meth:`_build_handlers` touch."""
+    runner = TurnRunner.__new__(TurnRunner)
+    runner._cfg = type(
+        "C",
+        (),
+        {"speaking": {"pi_mono_preamble_turns": preamble_turns}},
+    )()
+    runner._turns = TurnLog(tmp_path / "turns.jsonl")
+    runner._summary_path = tmp_path / "context-summary.md"
+    runner._events = _StubEvents()
+    runner._backend = _StubBackend(harness)
+    runner._pending_preamble = None
+    return runner
+
+
+def _write_turn(log: TurnLog, inbound: str, outbound: str) -> None:
+    log.append(
+        Turn(
+            ts=1_700_000_000.0,
+            sender_number="+1",
+            sender_name="jason",
+            inbound=inbound,
+            outbound=outbound,
+        )
+    )
+
+
+def test_prime_pi_mono_preamble_uses_turn_log_tail_when_no_summary(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Non-empty turn_log, no summary → preamble from
+    ``build_bootstrap_preamble(tail)`` + a ``context_bootstrap`` event
+    tagged ``source=pi_mono_turn_log``."""
+    runner = _pi_mono_runner(tmp_path)
+    _write_turn(runner._turns, "hello", "hi there")
+    _write_turn(runner._turns, "what's my name?", "I don't know yet")
+
+    runner._prime_pi_mono_preamble()
+
+    assert runner._pending_preamble is not None
+    assert "hello" in runner._pending_preamble
+    assert "hi there" in runner._pending_preamble
+    assert "Resume naturally" in runner._pending_preamble
+    source_events = [
+        e for e in runner._events.emitted if e["name"] == "context_bootstrap"
+    ]
+    assert len(source_events) == 1
+    assert source_events[0]["source"] == "pi_mono_turn_log"
+    assert source_events[0]["tail_len"] == 2
+
+
+def test_prime_pi_mono_preamble_prefers_summary_when_present(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Summary on disk → ``build_summary_preamble(summary, tail)`` +
+    a ``context_bootstrap`` event tagged ``source=pi_mono_summary``."""
+    runner = _pi_mono_runner(tmp_path)
+    _write_turn(runner._turns, "latest question", "latest reply")
+    runner._summary_path.write_text("COMPACTION SUMMARY TEXT\n")
+
+    runner._prime_pi_mono_preamble()
+
+    assert runner._pending_preamble is not None
+    assert "COMPACTION SUMMARY TEXT" in runner._pending_preamble
+    assert "Context summary" in runner._pending_preamble
+    # Recent-turns tail is also appended by build_summary_preamble.
+    assert "latest question" in runner._pending_preamble
+    source_events = [
+        e for e in runner._events.emitted if e["name"] == "context_bootstrap"
+    ]
+    assert source_events[0]["source"] == "pi_mono_summary"
+
+
+def test_prime_pi_mono_preamble_empty_turn_log_clears_pending(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Empty turn_log + no summary → ``_pending_preamble`` is cleared
+    (so a stale daemon-start bootstrap doesn't survive into turn 2)."""
+    runner = _pi_mono_runner(tmp_path)
+    runner._pending_preamble = "stale preamble from daemon start"
+
+    runner._prime_pi_mono_preamble()
+
+    assert runner._pending_preamble is None
+    # No event emitted for the degenerate empty case.
+    assert [e for e in runner._events.emitted if e["name"] == "context_bootstrap"] == []
+
+
+def test_prime_pi_mono_preamble_respects_configured_tail_length(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``pi_mono_preamble_turns`` caps how many prior turns the preamble
+    pulls — 3 turns written, cap=2 → ``tail_len=2`` in the emitted event
+    and the oldest turn is not quoted in the preamble."""
+    runner = _pi_mono_runner(tmp_path, preamble_turns=2)
+    _write_turn(runner._turns, "OLDEST", "older-reply")
+    _write_turn(runner._turns, "middle", "middle-reply")
+    _write_turn(runner._turns, "newest", "newest-reply")
+
+    runner._prime_pi_mono_preamble()
+
+    assert runner._pending_preamble is not None
+    assert "OLDEST" not in runner._pending_preamble
+    assert "newest" in runner._pending_preamble
+    source_events = [
+        e for e in runner._events.emitted if e["name"] == "context_bootstrap"
+    ]
+    assert source_events[0]["tail_len"] == 2
+
+
+def test_prime_pi_mono_preamble_replaces_existing_pending(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The whole point: a previous turn left no session-level context
+    carry (pi has no resume), so we OVERWRITE whatever preamble was
+    there with the current turn_log rebuild — not append."""
+    runner = _pi_mono_runner(tmp_path)
+    _write_turn(runner._turns, "canonical question", "canonical answer")
+    runner._pending_preamble = "STALE FROM PRIOR TURN — SHOULD BE REPLACED"
+
+    runner._prime_pi_mono_preamble()
+
+    assert runner._pending_preamble is not None
+    assert "STALE FROM PRIOR TURN" not in runner._pending_preamble
+    assert "canonical question" in runner._pending_preamble
+
+
+def test_prime_bootstrap_preamble_early_returns_when_session_id_set(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Sanity check: for non-pi-mono backends, the original
+    :meth:`prime_bootstrap_preamble` still guards on session_id so the
+    Layer 1 (SDK resume) path keeps its current ownership of turn N+1
+    context. The pi-mono branch bypasses this guard; everything else
+    retains it."""
+    runner = _pi_mono_runner(tmp_path, harness="claude-code")
+    _write_turn(runner._turns, "q", "a")
+    runner.session_id = "existing-sdk-session-id"
+
+    runner.prime_bootstrap_preamble()
+
+    assert runner._pending_preamble is None

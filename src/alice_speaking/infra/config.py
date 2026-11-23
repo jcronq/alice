@@ -57,6 +57,12 @@ SPEAKING_DEFAULTS: dict[str, Any] = {
     # bootstrap preamble when Layer 1 (session_id resume) fails or is missing.
     # See design-unified-context-compaction.md.
     "context_bootstrap_turns": 20,
+    # Pi-mono has no SDK session to resume (``pi -p ... --no-session`` is
+    # one-shot), so turn N+1 can't lean on Layer 1. TurnRunner rebuilds the
+    # bootstrap preamble from the turn_log tail on EVERY turn when the
+    # backend is pi-mono; this sets how many turns back to rebuild from.
+    # Default 10 balances continuity against prompt bloat. Hot-reloadable.
+    "pi_mono_preamble_turns": 10,
     # When the post-turn context size (= last internal API call's prompt
     # size, read from ``usage.iterations[-1]``) exceeds this value, flag
     # the session for compaction. On the next event, run a summary turn,
