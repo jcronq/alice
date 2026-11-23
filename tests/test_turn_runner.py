@@ -14,11 +14,13 @@ Option A (log-only) visibility check. The contract this file enforces:
 from __future__ import annotations
 
 import logging
+import pathlib
 import subprocess
 from typing import Any
 from unittest.mock import patch
 
 from alice_speaking import turn_runner as tr_module
+from alice_speaking.domain.turn_log import Turn, TurnLog
 from alice_speaking.turn_runner import TurnRunner
 
 
@@ -290,13 +292,6 @@ def test_module_level_repo_path_resolves_to_repo_root() -> None:
 #   * pi-mono + non-silent turn → rebuild fires
 #   * pi-mono + silent (compaction/bootstrap) turn → rebuild skipped
 #
-
-
-import pathlib
-
-from alice_speaking.domain.turn_log import Turn, TurnLog
-from alice_speaking.turn_runner import TurnRunner
-from alice_speaking.pipeline import compaction as compaction_module
 
 
 class _StubBackend:
