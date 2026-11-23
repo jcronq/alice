@@ -392,6 +392,13 @@ class SpeakingDaemon:
                 host=cfg.a2a_host,
                 principal_name=cfg.a2a_principal,
                 external_url=cfg.a2a_external_url or None,
+                # Symmetric peering (opt-in via ``a2a-peers.yaml`` +
+                # env-sourced tokens). Empty maps leave the transport
+                # in Phase-1 inbound-only behaviour for existing
+                # deploys.
+                peer_tokens=cfg.a2a_peers.token_map(),
+                peer_display_names=cfg.a2a_peers.display_name_map(),
+                identity_token=cfg.a2a_peers.identity_token,
             )
 
         # Viewer-chat transport — local HTTP loopback ingress that the

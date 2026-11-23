@@ -45,6 +45,14 @@ services:
       # exposing the port unconditionally is safe — without a token
       # nothing is listening behind it. Issue #430.
       - "${ALICE_WS_GATEWAY_PORT:-8765}:${ALICE_WS_GATEWAY_PORT:-8765}"
+      # A2A (Google Agent2Agent) ingress — peer-initiated messages
+      # from other Alice instances (grand-alice over WireGuard, etc.)
+      # land here. Publishing is always safe: the listener only binds
+      # when ALICE_A2A_ENABLED=true, and the server requires a shared
+      # X-Alice-Peer-Token for anything beyond catch-all inbound. The
+      # host side of the WG mesh (10.200.0.1 for the aimax1 ↔
+      # grandparents tunnel) reaches this via aimax1's WG interface.
+      - "${ALICE_A2A_PORT:-7878}:${ALICE_A2A_PORT:-7878}"
     environment:
       # signal-cli is in the same container; no inter-service hop.
       SIGNAL_API: "http://localhost:8080"
@@ -76,14 +84,16 @@ services:
       # enough to pick it up. Empty (the default) lets gh fall through to
       # the mounted ~/.config/gh OAuth credentials.
       GH_TOKEN: "${GH_TOKEN:-}"
-      # A2A (Google Agent2Agent protocol) — opt-in via alice.env. The
-      # speaking daemon spins up a uvicorn server on this port inside the
-      # container when ALICE_A2A_ENABLED=true. Not host-published by
-      # default; add a docker-compose.override.yml entry to publish.
-      ALICE_A2A_ENABLED: "${ALICE_A2A_ENABLED:-}"
-      ALICE_A2A_PORT: "${ALICE_A2A_PORT:-}"
-      ALICE_A2A_HOST: "${ALICE_A2A_HOST:-}"
-      ALICE_A2A_PRINCIPAL: "${ALICE_A2A_PRINCIPAL:-}"
+      # A2A (Google Agent2Agent protocol). The speaking daemon spins up
+      # a uvicorn server on this port inside the container. Default is
+      # ON — symmetric peering (main-alice ↔ grand-alice) needs both
+      # sides to accept inbound. Set ALICE_A2A_ENABLED=false in
+      # alice.env for a solo deploy that doesn't peer. The published
+      # host port above lets WG-reachable peers hit this server.
+      ALICE_A2A_ENABLED: "${ALICE_A2A_ENABLED:-true}"
+      ALICE_A2A_PORT: "${ALICE_A2A_PORT:-7878}"
+      ALICE_A2A_HOST: "${ALICE_A2A_HOST:-0.0.0.0}"
+      ALICE_A2A_PRINCIPAL: "${ALICE_A2A_PRINCIPAL:-a2a}"
       ALICE_A2A_EXTERNAL_URL: "${ALICE_A2A_EXTERNAL_URL:-}"
       # WS gateway (issue #430). Opt-in via the bearer token; when
       # ALICE_WS_GATEWAY_TOKEN is empty the speaking daemon skips the

@@ -1,0 +1,45 @@
+# A2A symmetric-peer auth config. Copy to a2a-peers.yaml alongside
+# principals.yaml and populate the env var names.
+#
+# Two sides to the shared-secret model:
+#
+# - identity_token_env: the env var holding YOUR outbound token —
+#   presented to peers when WE POST to them. Default:
+#   ALICE_A2A_IDENTITY_TOKEN.
+#
+# - peers.<id>.token_env: the env var holding the INBOUND token the
+#   given peer will present when SHE pings US. Matching that token on
+#   an inbound request resolves the caller to the named principal, so
+#   the turn log shows "from main-alice" instead of the catch-all "a2a".
+#
+# The address book (principals.yaml) carries the outbound URL for
+# each peer; this file only carries the auth half. Both files must
+# list the same principal id (e.g. ``grand-alice``) for the two to
+# join up at runtime.
+#
+# Minimum deploy on main Alice (aimax1):
+#
+#   # alice.env (or systemd unit, or secrets file sourced into the daemon)
+#   ALICE_A2A_IDENTITY_TOKEN="<main-alice-secret>"
+#   ALICE_A2A_PEER_TOKEN_GRAND_ALICE="<grand-alice-secret>"
+#
+# Mirror on grand-alice with the envs swapped:
+#
+#   ALICE_A2A_IDENTITY_TOKEN="<grand-alice-secret>"
+#   ALICE_A2A_PEER_TOKEN_MAIN_ALICE="<main-alice-secret>"
+#
+# The tokens are per-pair (not per-direction) — grand-alice's secret
+# is the same token she uses whether she's inbound or outbound, and
+# ditto for main-alice. Rotate with a new value on both ends in the
+# same change.
+
+identity_token_env: ALICE_A2A_IDENTITY_TOKEN
+
+peers:
+  grand-alice:
+    display_name: "Grand Alice (grandparents-home instance)"
+    token_env: ALICE_A2A_PEER_TOKEN_GRAND_ALICE
+
+  # main-alice:
+  #   display_name: "Main Alice (aimax1)"
+  #   token_env: ALICE_A2A_PEER_TOKEN_MAIN_ALICE

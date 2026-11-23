@@ -24,6 +24,7 @@ from ..signal_dispatch import (
     SignalDispatchConfigError,
     from_mapping as _signal_dispatch_from_mapping,
 )
+from .a2a_peers import A2APeersConfig, load as _load_a2a_peers
 
 
 DEFAULT_ALICE_ENV = pathlib.Path.home() / ".config" / "alice" / "alice.env"
@@ -292,6 +293,14 @@ class Config:
     # Empty defaults to ``http://<a2a_host>:<a2a_port>/`` — fine for
     # local dev. Set to the public URL when fronted by a reverse proxy.
     a2a_external_url: str = ""
+    # Symmetric A2A peering — path to ``a2a-peers.yaml`` + parsed
+    # result. When no file + no ``ALICE_A2A_IDENTITY_TOKEN`` the
+    # daemon runs the Phase-1 inbound-only shape (catch-all principal,
+    # no outbound auth). See :mod:`alice_speaking.infra.a2a_peers`.
+    a2a_peers_path: pathlib.Path = field(
+        default_factory=lambda: DEFAULT_MIND_DIR / "config" / "a2a-peers.yaml"
+    )
+    a2a_peers: A2APeersConfig = field(default_factory=A2APeersConfig)
 
     # Behavior (from alice.config.json, falls back to SPEAKING_DEFAULTS)
     speaking: dict[str, Any] = field(default_factory=lambda: dict(SPEAKING_DEFAULTS))
@@ -545,6 +554,18 @@ def load() -> Config:
     a2a_principal = (from_any("ALICE_A2A_PRINCIPAL", "a2a") or "a2a").strip()
     a2a_external_url = (from_any("ALICE_A2A_EXTERNAL_URL", "") or "").strip()
 
+    a2a_peers_path = pathlib.Path(
+        from_any("ALICE_A2A_PEERS_FILE", str(mind_dir / "config" / "a2a-peers.yaml"))
+        or str(mind_dir / "config" / "a2a-peers.yaml")
+    )
+    # Let the loader's ValueError propagate — the module docstring
+    # promises "startup fails loudly" on malformed YAML, and silently
+    # falling back to empty peers meant a token-env typo would boot
+    # the daemon with every inbound request mapped to the catch-all
+    # principal. If this blocks a deploy, fix the YAML / env var; the
+    # exception message names the file + the offending field.
+    a2a_peers = _load_a2a_peers(a2a_peers_path)
+
     return Config(
         signal_api=signal_api,
         signal_account=signal_account,
@@ -589,6 +610,8 @@ def load() -> Config:
         a2a_host=a2a_host,
         a2a_principal=a2a_principal,
         a2a_external_url=a2a_external_url,
+        a2a_peers_path=a2a_peers_path,
+        a2a_peers=a2a_peers,
         cozyhem_events_url=cozyhem_events_url,
         ws_gateway_enabled=ws_gateway_enabled,
         ws_gateway_host=ws_gateway_host,
