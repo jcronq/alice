@@ -23,14 +23,34 @@ ephemeral skills dir from Plan 07 P3). Pi auto-discovery falls back
 to ``.claude/skills/`` under cwd as well; we set cwd to the same
 dir to be defensive.
 
-Compaction: Alice owns compaction. ``--no-session`` (and pi's own
-``compaction.enabled: false`` setting) keeps pi from rolling its
-own context.
+Session resume (2026-11-22): PiKernel honors
+:attr:`KernelSpec.resume` via pi's native ``--session <id>`` +
+``--session-dir <dir>`` mechanism. Every turn persists its JSONL
+transcript to :data:`_DEFAULT_SESSION_DIR` (overridable via
+``ALICE_PI_SESSION_DIR``); when ``resume=<session_id>`` is passed
+and a matching file exists, pi replays the transcript before the
+new prompt so the model sees the full conversation. If the file
+is missing (first turn of a new session_id) we emit
+``pi_resume_file_missing`` and fall back to a fresh pi session —
+the transport-level id pi then generates is captured by the
+translator's ``session`` event and flows back to speaking so the
+*next* turn can resume cleanly. Any filesystem failure on the
+session-dir degrades to ephemeral ``--no-session`` with a
+``pi_session_dir_unavailable`` event — never crash the turn over
+missing persistence.
+
+Pi's auto-compaction is not configured here; grand-Alice's expected
+dialogue length (short Signal threads) keeps us well under the
+default threshold. If auto-compaction becomes a problem we can add
+a pi settings file with ``compaction.enabled: false`` or an
+Alice-side cap on transcript length.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
+import pathlib
 from dataclasses import replace as _dc_replace
 from importlib import resources
 from typing import Any, Optional
@@ -95,6 +115,61 @@ interrupted wake and the handoff.
 Then stop. Do not start new work. Do not drain the inbox. Do not groom \
 the vault. This is a graceful handoff — persist state and exit.
 """
+
+
+# Session-dir resolution. Keyed off an env var so tests + alternate
+# deployments can point at tmp paths without recompiling. The default
+# lives under the Alice-mind bind-mount so JSONL transcripts survive
+# container recreate, matching how ``session.json`` + ``cortex-index.db``
+# are stored.
+_SESSION_DIR_ENV = "ALICE_PI_SESSION_DIR"
+_DEFAULT_SESSION_DIR = "/home/alice/alice-mind/inner/state/sessions"
+
+
+def _resolve_session_dir() -> str:
+    """Return the directory where PiKernel stages session JSONL files.
+
+    Env override wins over the bind-mounted default. Both paths resolve
+    at argv-build time so a test fixture's ``monkeypatch.setenv`` takes
+    effect without a module reload (mirrors the ``ALICE_PI_BIN`` pattern
+    in :mod:`kernels.pi.transport`).
+    """
+    override = os.environ.get(_SESSION_DIR_ENV)
+    if override:
+        return override
+    return _DEFAULT_SESSION_DIR
+
+
+def _pi_session_file_exists(session_dir: str, session_id: str) -> bool:
+    """Return True iff a pi session file matching ``session_id`` exists
+    in ``session_dir``.
+
+    Pi stores sessions as ``<ISO-timestamp>_<uuid>.jsonl``. Rather than
+    try to recover the timestamp prefix, we scan the directory for any
+    file whose name ends with ``_<session_id>.jsonl``. Any IO error
+    (missing dir, permission denied, …) resolves to False so the caller
+    treats it as "fresh session" instead of crashing the turn.
+    """
+    if not session_id:
+        return False
+    try:
+        d = pathlib.Path(session_dir)
+        if not d.is_dir():
+            return False
+        suffix = f"_{session_id}.jsonl"
+        for entry in d.iterdir():
+            # is_file + endswith is enough; we don't need to validate
+            # the file contents here — pi re-validates on load and
+            # errors out with "No session found matching ..." which
+            # our exit-code path surfaces cleanly.
+            if entry.is_file() and entry.name.endswith(suffix):
+                return True
+    except OSError:
+        # Treat unreadable session dir as "no resume available"; the
+        # fresh-start path still writes a new session file (if the dir
+        # is writable later) so continuity recovers on the next turn.
+        return False
+    return False
 
 
 def _thinking_to_pi_arg(level: Optional[ThinkingLevel]) -> str:
@@ -338,9 +413,35 @@ class PiKernel:
             "json",
             "-p",
             prompt,
-            "--no-session",  # Alice owns session state; not pi
             "--no-skills",  # disable directory-based discovery
         ]
+        # Session persistence + resume. Pi natively stores one JSONL
+        # per session under ``--session-dir``; ``--session <id>`` loads
+        # a prior one. We pre-check for the file because pi exits 1
+        # when the id doesn't match — the "fresh session" path has to
+        # omit --session entirely so pi can mint a new uuid.
+        session_dir = self._stage_session_dir()
+        if session_dir is None:
+            # Can't persist → keep today's ephemeral behavior. No
+            # resume, no history saved. The daemon still passes
+            # resume= on subsequent turns; without a dir we just
+            # ignore it (and the drop event tells the operator why).
+            argv.append("--no-session")
+        else:
+            argv.extend(["--session-dir", session_dir])
+            resume_id = (spec.resume or "").strip()
+            if resume_id:
+                if _pi_session_file_exists(session_dir, resume_id):
+                    argv.extend(["--session", resume_id])
+                else:
+                    # First turn of a new session_id (or the JSONL
+                    # was purged). Fresh session; translator captures
+                    # the new id for the next turn's resume=.
+                    self._emit(
+                        "pi_resume_file_missing",
+                        session_id=resume_id,
+                        session_dir=session_dir,
+                    )
         # Skill discovery: explicit --skill <rendered_dir> beats
         # pi's auto-discovery from cwd's .claude/skills (which would
         # find the same files, but being explicit avoids surprises
@@ -389,6 +490,28 @@ class PiKernel:
         # :meth:`_warn_unsupported_fields` and
         # :data:`_PI_UNSUPPORTED_SPEC_FIELDS`).
         return argv
+
+    def _stage_session_dir(self) -> Optional[str]:
+        """Ensure the session JSONL directory exists and is writable.
+
+        Returns the resolved dir path on success, or ``None`` on any
+        filesystem failure (permission denied, read-only mount, …).
+        Emits ``pi_session_dir_unavailable`` on failure so operators
+        can grep for continuity drops. Callers fall back to
+        ``--no-session`` when ``None`` is returned — we never crash
+        a turn over missing persistence.
+        """
+        session_dir = _resolve_session_dir()
+        try:
+            pathlib.Path(session_dir).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._emit(
+                "pi_session_dir_unavailable",
+                path=session_dir,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return None
+        return session_dir
 
 
 def _send_message_extension_path() -> str:

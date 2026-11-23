@@ -551,3 +551,148 @@ def test_pi_kernel_emits_pi_tool_dropped_event_per_lost_tool() -> None:
     dropped = [e for e in cap.events if e["event"] == "pi_tool_dropped"]
     tool_names = sorted(e["tool"] for e in dropped)
     assert tool_names == ["WebFetch", "WebSearch", "mcp__alice__some_rpc"]
+
+
+# -------------------------------------------------------------------- #
+# Session resume (added 2026-11-22) — PiKernel honors spec.resume via
+# pi's native --session + --session-dir flags so every turn carries the
+# full conversation forward. See kernels/pi/kernel.py header for the
+# full design note.
+# -------------------------------------------------------------------- #
+
+
+def test_pi_kernel_argv_sets_session_dir_when_resume_absent(
+    monkeypatch, tmp_path
+) -> None:
+    """Even without resume=, PiKernel must point pi at a writable
+    session-dir so this turn's JSONL is persisted — the *next* turn's
+    resume= then has something to reload."""
+    monkeypatch.setenv("ALICE_PI_SESSION_DIR", str(tmp_path / "sessions"))
+    cap = CapturingEmitter()
+    kernel = PiKernel(cap)
+
+    spec = KernelSpec(model="gpt-5.3-codex")
+    argv = kernel._build_argv("hi", spec)
+
+    assert "--no-session" not in argv
+    assert "--session-dir" in argv
+    idx = argv.index("--session-dir")
+    assert argv[idx + 1] == str(tmp_path / "sessions")
+    # Fresh turn: no --session <id>.
+    assert "--session" not in argv
+
+
+def test_pi_kernel_argv_passes_session_id_when_resume_file_exists(
+    monkeypatch, tmp_path
+) -> None:
+    """resume= set AND a matching JSONL exists → pass --session <id>
+    so pi replays the prior turns before the new prompt."""
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    session_id = "01abc123-dead-beef-cafe-0123456789ab"
+    # Pi stores files as <timestamp>_<uuid>.jsonl; drop one with
+    # arbitrary timestamp — we only match on the uuid suffix.
+    (session_dir / f"2026-11-22T00-00-00-000Z_{session_id}.jsonl").write_text("{}\n")
+    monkeypatch.setenv("ALICE_PI_SESSION_DIR", str(session_dir))
+
+    cap = CapturingEmitter()
+    kernel = PiKernel(cap)
+    spec = KernelSpec(model="gpt-5.3-codex", resume=session_id)
+    argv = kernel._build_argv("hi", spec)
+
+    assert "--session-dir" in argv
+    assert "--session" in argv
+    idx = argv.index("--session")
+    assert argv[idx + 1] == session_id
+
+
+def test_pi_kernel_argv_resume_file_missing_emits_event_and_omits_session(
+    monkeypatch, tmp_path
+) -> None:
+    """resume= set but no matching file → fresh pi session (don't
+    pass --session, since pi would exit 1 on missing session) AND
+    emit ``pi_resume_file_missing`` so operators can grep for the
+    continuity gap."""
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setenv("ALICE_PI_SESSION_DIR", str(session_dir))
+
+    cap = CapturingEmitter()
+    kernel = PiKernel(cap, correlation_id="turn-xyz")
+    spec = KernelSpec(model="gpt-5.3-codex", resume="99999999-no-file-here")
+    argv = kernel._build_argv("hi", spec)
+
+    # Dir still passed (so this turn persists for future resume).
+    assert "--session-dir" in argv
+    # But no --session <id> — pi would exit 1 on the missing file.
+    assert "--session" not in argv
+    missing = [e for e in cap.events if e["event"] == "pi_resume_file_missing"]
+    assert len(missing) == 1
+    assert missing[0]["session_id"] == "99999999-no-file-here"
+    assert missing[0]["turn_id"] == "turn-xyz"
+
+
+def test_pi_kernel_argv_session_dir_unavailable_falls_back_to_no_session(
+    monkeypatch, tmp_path
+) -> None:
+    """If the session-dir can't be created (read-only mount, perm
+    denied), PiKernel must degrade to ephemeral ``--no-session``
+    rather than crash the turn — Carolyn's reply still goes out
+    even if persistence breaks."""
+    # Point at a path whose *parent* is a regular file — mkdir can't
+    # create a subdir under it, so the OSError path fires.
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("sentinel")
+    monkeypatch.setenv(
+        "ALICE_PI_SESSION_DIR", str(blocker / "sessions-impossible")
+    )
+
+    cap = CapturingEmitter()
+    kernel = PiKernel(cap)
+    spec = KernelSpec(model="gpt-5.3-codex", resume="any-id")
+    argv = kernel._build_argv("hi", spec)
+
+    assert "--no-session" in argv
+    assert "--session-dir" not in argv
+    assert "--session" not in argv
+    unavailable = [
+        e for e in cap.events if e["event"] == "pi_session_dir_unavailable"
+    ]
+    assert len(unavailable) == 1
+    assert unavailable[0]["path"].endswith("sessions-impossible")
+
+
+def test_pi_kernel_argv_empty_resume_string_is_treated_as_none(
+    monkeypatch, tmp_path
+) -> None:
+    """``resume=""`` (empty string) should NOT be passed as --session —
+    pi would exit 1 trying to match the empty id. Treat it like
+    ``resume=None`` and mint a fresh session."""
+    monkeypatch.setenv("ALICE_PI_SESSION_DIR", str(tmp_path / "sessions"))
+    cap = CapturingEmitter()
+    kernel = PiKernel(cap)
+    spec = KernelSpec(model="gpt-5.3-codex", resume="")
+    argv = kernel._build_argv("hi", spec)
+    assert "--session" not in argv
+    # Empty resume isn't a "missing file" — don't noise the event log.
+    missing = [e for e in cap.events if e["event"] == "pi_resume_file_missing"]
+    assert missing == []
+
+
+def test_pi_session_file_exists_matches_uuid_suffix(tmp_path) -> None:
+    """Pi's JSONL filename shape is ``<timestamp>_<uuid>.jsonl``.
+    The helper must match on the uuid suffix regardless of the
+    timestamp prefix so operator reindex-by-id lookups work."""
+    from kernels.pi.kernel import _pi_session_file_exists
+
+    (tmp_path / "2026-11-22T00-00-00-000Z_match-me.jsonl").write_text("{}\n")
+    (tmp_path / "unrelated.txt").write_text("")
+    (tmp_path / "match-me-prefix-but-no-underscore.jsonl").write_text("{}\n")
+
+    assert _pi_session_file_exists(str(tmp_path), "match-me") is True
+    assert _pi_session_file_exists(str(tmp_path), "match-nothing") is False
+    # Empty id always False — guards against pi exit-1 on the empty
+    # --session match.
+    assert _pi_session_file_exists(str(tmp_path), "") is False
+    # Nonexistent dir resolves to False (not raise).
+    assert _pi_session_file_exists(str(tmp_path / "nope"), "match-me") is False
