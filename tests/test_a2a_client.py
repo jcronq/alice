@@ -21,7 +21,6 @@ The actual client-to-server round-trip over the wire is covered by
 from __future__ import annotations
 
 import asyncio
-import pathlib
 
 import pytest
 
@@ -408,8 +407,6 @@ def test_aclose_is_idempotent_and_closes_shared_httpx_once():
     """F5 — a second aclose() must not double-close the shared httpx
     client the cached SDK clients share, and the broad-except debug
     log path must not fire."""
-    import httpx
-
     client = A2AClient()
     # Install a fake httpx + two fake cached clients that would try
     # to close the same underlying resource if invoked.
