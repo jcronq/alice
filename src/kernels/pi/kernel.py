@@ -161,20 +161,37 @@ def _summarize_dropped_value(value: Any) -> str:
     return type(value).__name__
 
 
-def _translate_tools(allowed: list[str]) -> list[str]:
+def _translate_tools(
+    allowed: list[str],
+    *,
+    on_drop: Optional[Any] = None,
+) -> list[str]:
     """Translate Claude tool names to pi names. Unknown names pass
     through lowercased so custom/extension tools (which the
     operator wrote in their pi-native form) still work. Returns
     [] when every requested tool dropped — caller treats that as
-    "fall back to pi's default tool set"."""
+    "fall back to pi's default tool set".
+
+    ``on_drop`` (optional) is called once per Claude-only tool name
+    that has no pi equivalent (WebFetch, WebSearch, MCP tools). This
+    gives :class:`PiKernel` a hook for emitting a visibility event so
+    the Claude-code → pi-mono fallback (e.g. Jason's Max token
+    exhausted) doesn't silently lose Web* access with no signal."""
     out: list[str] = []
     for name in allowed:
         if name in _PI_TOOL_NAME_MAP:
             mapped = _PI_TOOL_NAME_MAP[name]
             if mapped is not None:
                 out.append(mapped)
+            elif on_drop is not None:
+                on_drop(name)
             continue
         if name.startswith("mcp__"):
+            # MCP-backed tools without a direct name map silently drop
+            # — pi has no MCP client. Report once so the operator can
+            # spot a missing capability in the pi-mode trace.
+            if on_drop is not None:
+                on_drop(name)
             continue
         # Unknown name: lowercased pass-through. Either it's already
         # a pi-native name, or pi will reject it and the operator
@@ -338,7 +355,16 @@ class PiKernel:
         # If translation drops every name (e.g. all-WebFetch list)
         # don't pass --tools at all — that lets pi default to its
         # full built-in set rather than running with zero tools.
-        translated = _translate_tools(spec.allowed_tools or [])
+        # ``on_drop`` surfaces every Claude-only tool that has no pi
+        # equivalent so the fallback trace shows exactly which
+        # capabilities were lost — the Jason-Max-exhausted fallback
+        # path used to drop WebFetch/WebSearch with no event.
+        def _on_tool_drop(name: str) -> None:
+            self._emit("pi_tool_dropped", tool=name)
+
+        translated = _translate_tools(
+            spec.allowed_tools or [], on_drop=_on_tool_drop
+        )
         if "send_message" in translated:
             argv.extend(["--extension", _send_message_extension_path()])
         if translated:

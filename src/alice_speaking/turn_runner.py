@@ -347,6 +347,58 @@ class TurnRunner:
         self._pending_preamble = None
         return composed
 
+    def _prime_pi_mono_preamble(self) -> None:
+        """Rebuild the preamble from the turn_log tail on EVERY pi-mono turn.
+
+        Pi-mono's kernel invokes ``pi -p <prompt> --no-session`` — the
+        subprocess is one-shot by construction, ignores
+        :attr:`KernelSpec.resume`, and leaves no session JSONL for a
+        resume to replay. That makes Layer 1 (SDK session resume)
+        structurally unavailable for this backend: turn 2+ of a pi-mono
+        conversation would see only the latest user prompt with no
+        history unless we rebuild Layer 2 every turn.
+
+        Policy (mirrors :meth:`prime_bootstrap_preamble` but without the
+        ``session_id is None`` early return):
+
+        * If a compaction summary exists, use summary + tail (same as
+          the post-compaction bootstrap path).
+        * Otherwise use the turn_log tail alone.
+        * Empty turn_log → no preamble (first turn of a fresh deploy).
+
+        Tail length is governed by ``speaking.pi_mono_preamble_turns``
+        (default 10, hot-reloadable). Stays out of silent turns —
+        compaction / bootstrap internal turns don't need their own
+        history injected and don't want to stomp on an already-primed
+        bootstrap preamble.
+        """
+        tail_turns = int(self._cfg.speaking.get("pi_mono_preamble_turns", 10))
+        tail = self._turns.tail(tail_turns)
+        summary = compaction_module.read_summary_if_any(self._summary_path)
+        if summary:
+            self._pending_preamble = compaction_module.build_summary_preamble(
+                summary, tail
+            )
+            self._events.emit(
+                "context_bootstrap",
+                source="pi_mono_summary",
+                tail_len=len(tail),
+            )
+            return
+        preamble = compaction_module.build_bootstrap_preamble(tail)
+        if preamble:
+            self._pending_preamble = preamble
+            self._events.emit(
+                "context_bootstrap",
+                source="pi_mono_turn_log",
+                tail_len=len(tail),
+            )
+        else:
+            # No history yet — drop any stale preamble so the first
+            # turn doesn't fire a bootstrap that was primed at daemon
+            # start and never consumed.
+            self._pending_preamble = None
+
     # ------------------------------------------------------------------
     # Cue runner (pre-turn vault retrieval)
 
@@ -650,6 +702,14 @@ class TurnRunner:
         # into the same buffer.
         self._tool_capture.clear()
         self.last_tool_calls = None
+        # Pi-mono has no working SDK resume (see
+        # :meth:`_prime_pi_mono_preamble`). Rebuild the bootstrap
+        # preamble on every real turn so the model sees prior
+        # conversation history. This runs BEFORE the cue runner so the
+        # vault-context block stacks on top of the turn-log tail (same
+        # order as the daemon-start bootstrap path).
+        if not silent and self._backend.harness == "pi-mono":
+            self._prime_pi_mono_preamble()
         if not silent:
             cue_ctx = await self._build_cue_packet(prompt)
             if cue_ctx.text:
