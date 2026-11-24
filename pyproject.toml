@@ -150,6 +150,7 @@ packages = [
     "src/alice_mam",
     "src/alice_state_db",
     "src/alice_thinking",
+    "src/hooks",
     "src/status_site",
     "src/viewer",
     "src/watchers",

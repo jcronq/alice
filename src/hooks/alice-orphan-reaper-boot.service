@@ -1,0 +1,17 @@
+[Unit]
+Description=Alice subagent orphan reaper (boot-time sweep)
+Documentation=https://github.com/jcronq/alice/blob/master/src/hooks/orphan_reaper.py
+After=network-online.target
+# This is the host-reboot net described in the design §2.3 — runs once right
+# after the container / host comes up and reaps every orphan whose session
+# file is gone. The periodic timer takes over from there.
+
+[Service]
+Type=oneshot
+Environment=PYTHONPATH=/home/alice/alice/src
+ExecStart=/usr/bin/python3 -m hooks.orphan_reaper --mode boot
+Nice=5
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,16 @@
+[Unit]
+Description=Alice subagent orphan reaper timer (every 2 h)
+Documentation=https://github.com/jcronq/alice/blob/master/src/hooks/orphan_reaper.py
+
+[Timer]
+# Cadence: every 2 hours. Pairs with the 2-hour reap threshold inside
+# orphan_reaper.py so a worst-case orphan sits on the dashboard at most ~4 h
+# before being reaped.
+OnBootSec=5min
+OnUnitActiveSec=2h
+AccuracySec=1min
+Unit=alice-orphan-reaper.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
