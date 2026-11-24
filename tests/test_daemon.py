@@ -714,7 +714,12 @@ def test_signal_handle_sends_fallback_on_missed_reply(cfg, monkeypatch) -> None:
     assert len(d.signal.sent) == 1
     recipient, text = d.signal.sent[0]
     assert recipient == "+15555550100"
-    assert "didn't have a response" in text
+    # Owner is not a grandparent → generic (operator-facing) phrasing.
+    # The 2026-11-24 guardrail rework swapped the inline "didn't have a
+    # response" apology for principal-aware text defined in
+    # :mod:`alice_speaking.missed_reply`.
+    assert "backend" in text
+    assert "operator" in text
 
 
 def test_signal_handle_no_fallback_when_send_message_fired(cfg, monkeypatch) -> None:
