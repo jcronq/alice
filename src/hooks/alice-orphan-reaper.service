@@ -1,0 +1,18 @@
+[Unit]
+Description=Alice subagent orphan reaper (periodic sweep)
+Documentation=https://github.com/jcronq/alice/blob/master/src/hooks/orphan_reaper.py
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Relies on the bind-mounted alice repo. pythonpath is set so the module
+# resolves as `hooks.orphan_reaper` without requiring `pip install -e .`.
+Environment=PYTHONPATH=/home/alice/alice/src
+ExecStart=/usr/bin/python3 -m hooks.orphan_reaper --mode periodic
+Nice=5
+# Soft-fail: a reap failure must not cascade into alerting. The journal
+# still captures the traceback for post-mortem.
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=default.target
