@@ -1880,10 +1880,11 @@ class OverviewPollers:
         while not self.stop.is_set():
             try:
                 # `collect()` encapsulates the three-input join (SM store,
-                # start log, stop log) and the active/idle sort. Idle
-                # ``building`` tasks stay visible (hide_idle=False) so
-                # Jason can spot stuck-in-state rows per design OQ2.
-                rows = _running_now.collect(tasks_dir=tasks_dir)
+                # start log, stop log) and the active/idle sort. Running
+                # now = *actually running* only — idle building tasks are
+                # backlog, not in-flight (2026-11-24: Jason flagged idle
+                # rows under "Running now" as misleading on first ship).
+                rows = _running_now.collect(tasks_dir=tasks_dir, hide_idle=True)
                 self._set("running_now", rows)
             except Exception as e:  # noqa: BLE001
                 print(f"status_site: running_now poll failed: {e!r}", flush=True)
