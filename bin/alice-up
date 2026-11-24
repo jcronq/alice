@@ -80,7 +80,9 @@ case "$state" in
         # Exists but isn't running (crashed, `alice-down`, or a compose
         # recreate interrupted between rename and start). Start the
         # container we already have — no compose reconciliation, which
-        # could decide to recreate it.
+        # could decide to recreate it. The hot-swap bind sources must be
+        # present for the start to succeed (see alice-hotswap-sync).
+        "$ALICE_ROOT/bin/alice-hotswap-sync"
         docker start "$ALICE_CONTAINER" >/dev/null
         ;;
     paused)
@@ -94,6 +96,9 @@ case "$state" in
         if ! docker image inspect alice:latest >/dev/null 2>&1; then
             docker compose build alice >/dev/null
         fi
+        # Stage the bind-mounted hot-swap binaries BEFORE compose creates
+        # the container; a missing source would be created as a directory.
+        "$ALICE_ROOT/bin/alice-hotswap-sync"
         # --no-recreate is belt-and-braces: we only get here when no
         # container exists, so there is nothing compose could replace.
         docker compose up -d --no-recreate alice >/dev/null

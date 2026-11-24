@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# alice-hotswap-sync — stage the two binaries that docker-compose.yml
+# bind-mounts over the image's copies, so a container recreate can never
+# regress them again.
+#
+#   alice-hotswap-sync            ensure both binaries are staged + current
+#   alice-hotswap-sync --check    report only; exit 1 if anything is stale
+#
+# Why this exists (see sandbox/docker-compose.yml, "hot-swap" mounts):
+# `alice:latest` is still the 2026-06-27 build and the image rebuild has
+# been blocked for months. Two things in that image are broken for
+# today's world and have been patched by hand inside the running
+# container — and silently lost on every recreate (2026-07-13,
+# 2026-10-22, 2026-11-07, 2026-11-23):
+#
+#   * /usr/local/bin/signal-cli 0.14.1 drops every inbound Signal message
+#     (getServerGuid NPE on sealed-sender envelopes; fixed in 0.14.5).
+#   * the claude-agent-sdk's *bundled* Claude Code binary (2.1.191) is
+#     rejected by current models ("version 2.1.280 or newer is required").
+#     The SDK prefers that bundled binary over anything on PATH.
+#
+# This script keeps host copies under $ALICE_HOTSWAP_DIR; compose mounts
+# them read-only over the image paths. The signal-cli version follows
+# `ARG SIGNAL_CLI_VERSION` in sandbox/Dockerfile so the mount and the
+# (eventual) rebuilt image never disagree. The Claude binary is the newest
+# native build the host's own Claude Code install has under
+# ~/.local/share/claude/versions (the host auto-updater prunes old ones,
+# so we copy rather than mount from there).
+#
+# Once the image is rebuilt from the current Dockerfile both mounts become
+# redundant and can be removed together with this script.
+
+set -euo pipefail
+
+ALICE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=./_alice-env.sh
+. "$ALICE_ROOT/bin/_alice-env.sh"
+
+# Minimum Claude Code version the speaking model accepts. Bump when the
+# API starts rejecting older CLIs again.
+CLAUDE_MIN_VERSION="${ALICE_HOTSWAP_CLAUDE_MIN:-2.1.280}"
+CLAUDE_VERSIONS_DIR="${ALICE_HOTSWAP_CLAUDE_VERSIONS_DIR:-$HOME/.local/share/claude/versions}"
+# Optional: a pre-downloaded signal-cli Linux-native tarball to use instead
+# of fetching from GitHub (offline hosts, tests).
+SIGNAL_TARBALL="${ALICE_HOTSWAP_SIGNAL_TARBALL:-}"
+
+CHECK_ONLY=0
+case "${1:-}" in
+    --check) CHECK_ONLY=1 ;;
+    "") ;;
+    -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
+    *) echo "alice-hotswap-sync: unknown argument: $1" >&2; exit 2 ;;
+esac
+
+log() { echo "[alice-hotswap-sync] $*"; }
+die() { echo "alice-hotswap-sync: $*" >&2; exit 1; }
+
+# version_ge A B — true when dotted version A >= B.
+version_ge() {
+    [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]
+}
+
+signal_cli_wanted() {
+    local v
+    v="$(sed -n 's/^ARG SIGNAL_CLI_VERSION=\([0-9][0-9.]*\).*/\1/p' "$ALICE_ROOT/sandbox/Dockerfile" | head -n1)"
+    [ -n "$v" ] || die "could not read ARG SIGNAL_CLI_VERSION from sandbox/Dockerfile"
+    echo "$v"
+}
+
+# Print the version a staged binary reports, or "" if missing/unrunnable.
+staged_version() {
+    local bin="$1"
+    [ -x "$bin" ] || { echo ""; return 0; }
+    "$bin" --version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true
+}
+
+mkdir -p "$ALICE_HOTSWAP_DIR"
+stale=0
+
+# ---- signal-cli --------------------------------------------------------
+want="$(signal_cli_wanted)"
+sc="$ALICE_HOTSWAP_DIR/signal-cli"
+have="$(staged_version "$sc")"
+if [ "$have" = "$want" ]; then
+    log "signal-cli $have staged at $sc (matches Dockerfile)"
+else
+    stale=1
+    if [ "$CHECK_ONLY" = 1 ]; then
+        log "signal-cli: staged '${have:-<none>}', Dockerfile wants $want"
+    else
+        tmp="$(mktemp -d)"
+        trap 'rm -rf "$tmp"' EXIT
+        if [ -n "$SIGNAL_TARBALL" ]; then
+            log "signal-cli: extracting $SIGNAL_TARBALL ..."
+            cp "$SIGNAL_TARBALL" "$tmp/signal-cli.tgz"
+        else
+            url="https://github.com/AsamK/signal-cli/releases/download/v${want}/signal-cli-${want}-Linux-native.tar.gz"
+            log "signal-cli: downloading $url ..."
+            curl -fsSL -o "$tmp/signal-cli.tgz" "$url"
+        fi
+        tar -xzf "$tmp/signal-cli.tgz" -C "$tmp"
+        [ -f "$tmp/signal-cli" ] || die "tarball did not contain a top-level signal-cli binary"
+        chmod 755 "$tmp/signal-cli"
+        got="$(staged_version "$tmp/signal-cli")"
+        [ "$got" = "$want" ] || die "downloaded signal-cli reports '$got', wanted $want"
+        # Atomic replace: the running container (if any) holds the old
+        # inode via its bind mount and is unaffected until recreate.
+        mv -f "$tmp/signal-cli" "$sc.new" && mv -f "$sc.new" "$sc"
+        log "signal-cli $got staged at $sc"
+        stale=0
+    fi
+fi
+
+# ---- Claude Code (SDK bundled binary) -----------------------------------
+cl="$ALICE_HOTSWAP_DIR/claude"
+have="$(staged_version "$cl")"
+if [ -n "$have" ] && version_ge "$have" "$CLAUDE_MIN_VERSION"; then
+    log "claude $have staged at $cl (>= $CLAUDE_MIN_VERSION)"
+else
+    newest=""
+    if [ -d "$CLAUDE_VERSIONS_DIR" ]; then
+        newest="$(ls -1 "$CLAUDE_VERSIONS_DIR" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
+    fi
+    if [ -z "$newest" ]; then
+        stale=1
+        log "claude: staged '${have:-<none>}' is below $CLAUDE_MIN_VERSION and no native build found in $CLAUDE_VERSIONS_DIR"
+        log "        install/update Claude Code on the host (curl -fsSL https://claude.ai/install.sh | bash) and rerun."
+    elif ! version_ge "$newest" "$CLAUDE_MIN_VERSION"; then
+        stale=1
+        log "claude: newest host build $newest is below $CLAUDE_MIN_VERSION; update Claude Code on the host and rerun."
+    elif [ "$CHECK_ONLY" = 1 ]; then
+        stale=1
+        log "claude: staged '${have:-<none>}', host has $newest"
+    else
+        src="$CLAUDE_VERSIONS_DIR/$newest"
+        [ -f "$src" ] || die "$src is not a file (expected the native claude binary)"
+        cp -f "$src" "$cl.new" && chmod 755 "$cl.new" && mv -f "$cl.new" "$cl"
+        got="$(staged_version "$cl")"
+        [ "$got" = "$newest" ] || die "staged claude reports '$got', expected $newest"
+        log "claude $got staged at $cl"
+    fi
+fi
+
+if [ "$stale" != 0 ]; then
+    [ "$CHECK_ONLY" = 1 ] && exit 1
+    die "could not stage every hot-swap binary; refusing to leave $ALICE_HOTSWAP_DIR incomplete (a missing mount source makes docker create a directory in its place and the container fails to start)."
+fi
+exit 0

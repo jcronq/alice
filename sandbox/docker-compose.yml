@@ -210,6 +210,20 @@ services:
       - ${HOME}/.config/alice:/home/alice/.config/alice:ro
       - ${HOME}/.config/gh:/home/alice/.config/gh:ro
       - ${HOME}/.ssh:/home/alice/.ssh:ro
+      # Hot-swap mounts — host files bind-mounted OVER two binaries baked
+      # into the (stale, 2026-06-27) image, staged by bin/alice-hotswap-sync.
+      # Without these, every container recreate silently regressed to
+      # signal-cli 0.14.1 (drops all inbound Signal: getServerGuid NPE) and
+      # Claude Code 2.1.191 (rejected by current models) until someone
+      # re-patched the running container by hand — 2026-07-13, 2026-10-22,
+      # 2026-11-07, 2026-11-23. The SOURCE FILES MUST EXIST before `up`:
+      # docker creates a directory for a missing bind source and the
+      # container then fails to exec the binary. alice-up / alice-deploy
+      # run alice-hotswap-sync first for exactly that reason.
+      # Drop both (and the script) once the image is rebuilt from the
+      # current Dockerfile (signal-cli 0.14.5, current claude-agent-sdk).
+      - ${ALICE_HOTSWAP_DIR:-${HOME}/.local/state/alice/hotswap}/signal-cli:/usr/local/bin/signal-cli:ro
+      - ${ALICE_HOTSWAP_DIR:-${HOME}/.local/state/alice/hotswap}/claude:/opt/alice-venv/lib/python3.13/site-packages/claude_agent_sdk/_bundled/claude:ro
     working_dir: /home/alice/alice-mind
     # Route `aimax1` to the docker bridge gateway so in-container HTTP
     # calls reach cozyhem-engine on the host. Without this, docker's
