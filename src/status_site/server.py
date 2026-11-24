@@ -2490,7 +2490,16 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
             [it for it in scan_surfaces(cfg.surface_dir) if it.get("type") != "status-chat"],
             now,
         )
-        tasks = _pipeline.scan_tasks(_tasks_dir(), now=now)
+        # Only actually-in-flight states belong in the In-flight tier —
+        # scan_tasks returns every non-terminal SM task, which lumped
+        # selected/draft/designed rows (backlog) into "in flight" and
+        # Jason rightly called this misleading (2026-11-24). Restrict
+        # to INFLIGHT_STATES (building, reviewing); the rest belong in
+        # Alice's queue / backlog surfaces.
+        tasks = [
+            r for r in _pipeline.scan_tasks(_tasks_dir(), now=now)
+            if r.get("state") in _pipeline.INFLIGHT_STATES
+        ]
         n = len(running["rows"]) + len(inflight_pipeline) + len(surfaces) + len(tasks)
         # Group the in-flight pipeline rows by src/ component bucket
         # (issue #821). ``pipeline`` stays on the payload for any
