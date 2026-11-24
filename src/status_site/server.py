@@ -2490,16 +2490,16 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
             [it for it in scan_surfaces(cfg.surface_dir) if it.get("type") != "status-chat"],
             now,
         )
-        # Only actually-in-flight states belong in the In-flight tier —
-        # scan_tasks returns every non-terminal SM task, which lumped
-        # selected/draft/designed rows (backlog) into "in flight" and
-        # Jason rightly called this misleading (2026-11-24). Restrict
-        # to INFLIGHT_STATES (building, reviewing); the rest belong in
-        # Alice's queue / backlog surfaces.
-        tasks = [
-            r for r in _pipeline.scan_tasks(_tasks_dir(), now=now)
-            if r.get("state") in _pipeline.INFLIGHT_STATES
-        ]
+        # SM-task-rooted "in flight" rows are now surfaced exclusively via
+        # the Running-now source (actually-running subagents, SM task ⋈
+        # open dispatch events — see PR #923). The old TASKS subsection
+        # here was `scan_tasks` filtered by state, which still showed
+        # every task that had EVER been marked building/reviewing — 53
+        # rows of months-old backlog on the "agent actively working now"
+        # tier. Jason flagged it twice; drop entirely. If stuck-in-building
+        # visibility is ever wanted, build a dedicated Backlog or Stalled
+        # tier — don't re-attach it here (2026-11-24).
+        tasks: list[dict] = []
         n = len(running["rows"]) + len(inflight_pipeline) + len(surfaces) + len(tasks)
         # Group the in-flight pipeline rows by src/ component bucket
         # (issue #821). ``pipeline`` stays on the payload for any
