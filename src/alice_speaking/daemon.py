@@ -1718,9 +1718,6 @@ class SpeakingDaemon:
                 # calls inside a session, not on the daemon's own
                 # kernel invocations.
                 try:
-                    from .internal.steerable_dispatch import (
-                        _append_dispatch_row,
-                    )
                     import fcntl as _fcntl
                     import pathlib as _pathlib
 

@@ -15,9 +15,6 @@ from __future__ import annotations
 
 import json
 import subprocess
-from pathlib import Path
-
-import pytest
 
 from alice_speaking.internal import steerable_dispatch as sd
 

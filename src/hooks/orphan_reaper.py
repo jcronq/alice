@@ -31,7 +31,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable
 
 START_LOG = Path("/state/worker/alice-task-dispatch.jsonl")
 STOP_LOG = Path("/state/worker/alice-subagent-stop.jsonl")
