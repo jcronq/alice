@@ -47,16 +47,95 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
-from status_site.sources.running_now import (
-    Worktree,
-    _issue_from_branch,
-    parse_worktrees,
-    read_ps_output,
-    read_worktree_output,
-    repo_dir_from_env,
-)
+from status_site.sources.running_now import repo_dir_from_env
 
 SubprocessRunner = Callable[[Sequence[str]], subprocess.CompletedProcess]
+
+
+# ──────────────────────────────────────────────────────────────────────────── #
+# Worktree + ps helpers — inlined here as part of the PR #2 cleanup. These
+# used to live in ``status_site.sources.running_now`` back when that module
+# derived rows from ``git worktree list`` + ``ps aux``. PR #2 rewrote
+# ``running_now`` to join SM tasks against the subagent event logs; the
+# worktree / ps helpers survived because this pipeline-liveness probe still
+# cross-checks GitHub-issue rows against live worker signals (a worktree
+# named after the issue number, a ``claude`` / ``worker.py`` process
+# mentioning it, or a spawn-N-* dir under ``/state/worker/sm-*-spawns``).
+# Keeping them local to the one caller means ``running_now`` can shed its
+# shell-exec surface entirely.
+# ──────────────────────────────────────────────────────────────────────────── #
+
+
+@dataclass(frozen=True)
+class Worktree:
+    path: str
+    branch: str  # branch short name, no refs/heads/ prefix
+
+
+_WT_PATH_RE = re.compile(r"^worktree (.+)$", re.M)
+_WT_BRANCH_RE = re.compile(r"^branch (.+)$", re.M)
+_ISSUE_IN_BRANCH_RE = re.compile(r"(?:^|[-/])(\d{2,6})(?:[-/]|$)")
+
+
+def parse_worktrees(porcelain: str) -> list[Worktree]:
+    """Parse ``git worktree list --porcelain`` output.
+
+    Blocks are separated by blank lines. The main repo's block carries
+    ``bare`` or no ``branch`` line (detached-at-fetch) — skipped, since
+    this section is about active feature worktrees.
+    """
+    out: list[Worktree] = []
+    for block in porcelain.split("\n\n"):
+        path_m = _WT_PATH_RE.search(block)
+        branch_m = _WT_BRANCH_RE.search(block)
+        if not path_m or not branch_m:
+            continue
+        branch = branch_m.group(1).strip()
+        if branch.startswith("refs/heads/"):
+            branch = branch[len("refs/heads/"):]
+        out.append(Worktree(path=path_m.group(1).strip(), branch=branch))
+    return out
+
+
+def _issue_from_branch(branch: str) -> str:
+    """Pull the trailing issue number out of ``feat/638-foo``,
+    ``auto-fix/issue-376``, ``fix/620-blah`` and similar. Returns
+    ``""`` when no plausible issue number is embedded.
+    """
+    m = _ISSUE_IN_BRANCH_RE.search(branch)
+    return m.group(1) if m else ""
+
+
+def _default_runner(cmd: Sequence[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(list(cmd), capture_output=True, text=True, timeout=10)
+
+
+def read_worktree_output(
+    repo_dir: Path,
+    runner: SubprocessRunner | None = None,
+) -> str:
+    """Run ``git worktree list --porcelain`` in ``repo_dir``. Empty on failure."""
+    r = runner or _default_runner
+    try:
+        result = r(["git", "-C", str(repo_dir), "worktree", "list", "--porcelain"])
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout or ""
+
+
+def read_ps_output(runner: SubprocessRunner | None = None) -> str:
+    """Run ``ps aux``. Empty string on failure."""
+    r = runner or _default_runner
+    try:
+        result = r(["ps", "aux"])
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout or ""
+
 
 #: Spawn roots the dispatcher / speaking use for subagent spawns. Each
 #: spawn directory is named ``spawn-<issue-number>-<epoch>``; a

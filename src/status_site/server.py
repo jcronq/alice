@@ -1868,23 +1868,22 @@ class OverviewPollers:
 
     # ── background loops ────────────────────────────────────────
     def _loop_running_now(self) -> None:
-        repo_dir = _running_now.repo_dir_from_env()
+        """Poll SM tasks + subagent event logs → Running-now rows.
+
+        Design: ``cortex-memory/designs/2026-11-24-subagent-driven-running-now.md``.
+        The pre-#2 shape (``git worktree list`` + ``ps aux`` + build-log
+        scraping) is gone; the new source joins SM tasks in ``building``
+        state against the start/stop log pair the hook layer writes. See
+        ``status_site/sources/running_now.py`` for the join semantics.
+        """
         tasks_dir = _tasks_dir()
         while not self.stop.is_set():
             try:
-                worktrees = _running_now.parse_worktrees(
-                    _running_now.read_worktree_output(repo_dir)
-                )
-                ps_output = _running_now.read_ps_output()
-                logs = _running_now.read_build_logs()
-                task_records = _running_now.collect_task_records(tasks_dir)
-                rows = _running_now.build_running_tasks(
-                    worktrees, ps_output, logs, task_records
-                )
-                # Newest first by elapsed-start proxy: shortest-elapsed
-                # first is more intuitive ("just started" above
-                # "running for 2h"). Kept stable for the renderer.
-                rows.sort(key=lambda r: r.elapsed)
+                # `collect()` encapsulates the three-input join (SM store,
+                # start log, stop log) and the active/idle sort. Idle
+                # ``building`` tasks stay visible (hide_idle=False) so
+                # Jason can spot stuck-in-state rows per design OQ2.
+                rows = _running_now.collect(tasks_dir=tasks_dir)
                 self._set("running_now", rows)
             except Exception as e:  # noqa: BLE001
                 print(f"status_site: running_now poll failed: {e!r}", flush=True)
@@ -3953,6 +3952,101 @@ def handle_woy_steer(cfg: "Config", d: dict) -> dict:
     return {"ok": True, "slug": slug, "action": "steer"}
 
 
+# Max characters accepted in a /api/steer text payload. Matches
+# WOY_STEER_MAX so Jason gets consistent limits across steering surfaces.
+SUBAGENT_STEER_MAX = 2000
+# Max length of a task_id in /api/steer. The SM schema is ``task-NNNN``
+# but we accept a bit of slack for display suffixes (e.g. ``task-1025-alt``).
+SUBAGENT_STEER_TASK_MAX = 40
+# Matches the shape ``task-NNNN`` (1+ digits). SM v2 tasks mint 4-digit ids
+# today but the schema doesn't enforce a minimum width — ``task-1`` is a
+# legal id early in the counter sequence (and used heavily in tests).
+_STEER_TASK_RE = re.compile(r"^task-\d{1,10}$")
+
+
+def _render_steer_surface(
+    cfg: "Config",
+    *,
+    task_id: str,
+    text: str,
+) -> str:
+    """Build the ``type: status-steer`` surface Speaking consumes.
+
+    Speaking's intake loop picks this up and routes the ``text`` to
+    ``SendMessage(to=task_id, message=text)`` — the Claude Code Remote
+    Control primitive. Status-site stays stdlib-only (it can't call the
+    SDK itself), so the surface-drop is the stable landing pad.
+    """
+    return f"""---
+priority: action
+type: status-steer
+reply_expected: false
+created: {time.strftime("%Y-%m-%d")}
+detail: status-steer-{task_id}
+source: status-site
+task_id: {task_id}
+---
+
+# Jason steered a sub-agent from the status page
+
+Target sub-agent: {task_id}
+Steer message (route via SendMessage(to={task_id}, message=...)):
+
+{text}
+"""
+
+
+def handle_steer(cfg: "Config", d: dict) -> dict:
+    """Route a Jason-authored steer message to a Remote-Control sub-agent.
+
+    Body: ``{key, task_id, text}``.
+
+    Design: ``cortex-memory/designs/2026-11-24-subagent-driven-running-now.md``
+    §7.6. The in-process SDK call to
+    ``SendMessage(to=task_id, message=text)`` lives in Speaking's own
+    harness — the status-site container is stdlib-only alpine and can't
+    reach claude_agent_sdk. We honour that by writing a
+    ``type: status-steer`` surface into SURFACE_DIR so Speaking's intake
+    loop reads it and makes the call inside a turn (where SendMessage is
+    available). The response shape is ``{ok: true, task_id, dropped: <path>}``
+    on success; the UI surfaces ``{ok: false, error}`` on validation /
+    IO failures. Steer surfaces do NOT trigger a reply back to Jason —
+    the running-now row refreshes on the next SSE tick.
+    """
+    if not isinstance(d, dict):
+        raise ReplyError(400, "bad json")
+    if not hmac.compare_digest(str(d.get("key", "")).encode(), cfg.key.encode()):
+        raise ReplyError(403, "bad key")
+    task_id_raw = str(d.get("task_id") or "").strip()[:SUBAGENT_STEER_TASK_MAX]
+    if not _STEER_TASK_RE.match(task_id_raw):
+        raise ReplyError(400, "bad task_id")
+    text = str(d.get("text") or d.get("message") or "").strip()
+    if not text:
+        raise ReplyError(400, "empty text")
+    if len(text) > SUBAGENT_STEER_MAX:
+        raise ReplyError(413, f"text over {SUBAGENT_STEER_MAX} chars")
+
+    doc = _render_steer_surface(cfg, task_id=task_id_raw, text=text)
+    with cfg.lock:
+        cfg.surface_dir.mkdir(parents=True, exist_ok=True)
+        fname = f"{time.strftime('%Y-%m-%dT%H-%M-%S')}-status-steer-{task_id_raw}.md"
+        tmp = cfg.surface_dir / f".tmp-steer-{os.getpid()}-{time.time_ns()}"
+        try:
+            tmp.write_text(doc)
+        except OSError as exc:
+            raise ReplyError(500, f"write failed: {exc}") from exc
+        dest = cfg.surface_dir / fname
+        n = 1
+        while dest.exists():
+            n += 1
+            dest = cfg.surface_dir / fname.replace(".md", f"-{n}.md")
+        try:
+            os.rename(tmp, dest)
+        except OSError as exc:
+            raise ReplyError(500, f"rename failed: {exc}") from exc
+    return {"ok": True, "task_id": task_id_raw, "dropped": dest.name}
+
+
 def handle_review_todo_click(cfg: "Config", d: dict) -> dict:
     """Slice review-TODO: record a click-through as a dismissal.
 
@@ -4787,6 +4881,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/woy-action": handle_woy_action,
             "/api/woy/action": handle_woy_task_action,
             "/api/woy-steer": handle_woy_steer,
+            # /api/steer — Running-now sub-agent steering (design §7.6).
+            "/api/steer": handle_steer,
             "/api/review-todo-click": handle_review_todo_click,
             "/api/effort": handle_effort_action,
             "/api/stage-run": handle_stage_run,

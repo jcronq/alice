@@ -232,3 +232,82 @@ def test_missing_tool_call_id_skipped(tmp_path):
         ],
     )
     assert compute_reap_rows(cfg) == []
+
+
+# ─── Steerable-aware check (design §7.7) ─────────────────────────────
+
+
+def test_steerable_row_with_live_session_name_not_reaped(tmp_path):
+    """§7.7: a steerable row whose session_name is in the live-RC registry
+    is spared even past the orphan threshold."""
+    now = time.time()
+    cfg = _cfg(
+        tmp_path,
+        now=now,
+        live_session_names=lambda: frozenset({"task-1025"}),
+    )
+    _write_jsonl(
+        cfg.start_log,
+        [
+            {
+                "ts": now - 10_000,  # well past threshold
+                "task_id": "task-1025",
+                "tool_call_id": "toolu_live_steer",
+                "session_id": "steerable-sess",
+                "steerable": True,
+                "session_name": "task-1025",
+            }
+        ],
+    )
+    assert compute_reap_rows(cfg) == []
+
+
+def test_steerable_row_without_live_session_name_is_reaped(tmp_path):
+    """Same steerable row, session_name absent from live registry → reaped."""
+    now = time.time()
+    cfg = _cfg(
+        tmp_path,
+        now=now,
+        live_session_names=lambda: frozenset(),
+    )
+    _write_jsonl(
+        cfg.start_log,
+        [
+            {
+                "ts": now - 10_000,
+                "task_id": "task-1025",
+                "tool_call_id": "toolu_dead_steer",
+                "session_id": "steerable-dead",
+                "steerable": True,
+                "session_name": "task-1025",
+            }
+        ],
+    )
+    rows = compute_reap_rows(cfg)
+    assert len(rows) == 1
+    assert rows[0]["reaped_reason"] == "orphan"
+
+
+def test_live_session_probe_failure_falls_back_safely(tmp_path):
+    """Probe raises → treated as empty set, row is reaped (safe direction)."""
+    now = time.time()
+
+    def _broken_probe() -> frozenset[str]:
+        raise RuntimeError("claude agents --json: ENOENT")
+
+    cfg = _cfg(tmp_path, now=now, live_session_names=_broken_probe)
+    _write_jsonl(
+        cfg.start_log,
+        [
+            {
+                "ts": now - 10_000,
+                "task_id": "task-9",
+                "tool_call_id": "toolu_broken_probe",
+                "session_id": "whatever",
+                "steerable": True,
+                "session_name": "task-9",
+            }
+        ],
+    )
+    rows = compute_reap_rows(cfg)
+    assert len(rows) == 1

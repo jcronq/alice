@@ -46,6 +46,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
@@ -488,6 +489,11 @@ def _spawn_claude_detached(
     ``start_new_session=True`` decouples the child from the watcher's
     s6 process group so an s6 restart doesn't SIGHUP the worker.
     stdout/stderr land in ``scratch_dir`` for post-mortem inspection.
+
+    Design cutover (2026-11-24): like the bug-fix dispatcher, this spawn
+    bypasses Claude Code's PreToolUse Agent hook. The dispatch-log write
+    below is the running-now visibility path. Non-fatal on write
+    failure — the worker still runs, just without a Running-now row.
     """
     stdout_path = scratch_dir / "result.json"
     stderr_path = scratch_dir / "stderr.log"
@@ -524,7 +530,39 @@ def _spawn_claude_detached(
             stderr_f.close()
         except OSError:
             pass
+
+    try:
+        _emit_ci_remediation_dispatch_row(proc.pid, scratch_dir)
+    except Exception:  # noqa: BLE001 — never block dispatch on telemetry
+        pass
     return proc.pid
+
+
+def _emit_ci_remediation_dispatch_row(
+    pid: int | None, scratch_dir: pathlib.Path
+) -> None:
+    """Write a dispatch-log row so Running-now sees this spawn (design PR #2)."""
+    try:
+        from alice_speaking.internal.steerable_dispatch import (
+            _append_dispatch_row,
+        )
+    except Exception:  # noqa: BLE001 — helper not importable in this env
+        return
+    _append_dispatch_row(
+        {
+            "ts": time.time(),
+            "tool_call_id": f"ci-remediation-pid{pid}",
+            "task_id": None,
+            "session_id": "",
+            "subagent_type": "ci-remediation",
+            "description": "ci-remediation worker",
+            "title": "ci-remediation worker",
+            "tags": ["ci-remediation"],
+            "pid": pid,
+            "steerable": False,
+            "scratch_dir": str(scratch_dir),
+        }
+    )
 
 
 def _pid_alive(pid: int | None) -> bool:

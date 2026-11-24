@@ -1002,7 +1002,7 @@ def _scan_with_ps(lines, *, worktrees=(), spawn=frozenset()):
 
 
 def test_is_task_live_detects_matching_worktree_branch():
-    from status_site.sources.running_now import Worktree
+    from status_site.sources.pipeline_liveness import Worktree
 
     scan = P_live.LivenessScan(
         ps_output="",
@@ -1015,7 +1015,7 @@ def test_is_task_live_detects_matching_worktree_branch():
 
 
 def test_is_task_live_detects_matching_worktree_path_when_branch_has_no_issue():
-    from status_site.sources.running_now import Worktree
+    from status_site.sources.pipeline_liveness import Worktree
 
     scan = P_live.LivenessScan(
         ps_output="",
@@ -1106,7 +1106,7 @@ def test_partition_by_state_bucket_with_scan_mixes_live_and_stale():
     """Integration: 5 SM rows — 2 with a live signal, 3 without —
     yields 2 in_flight + 3 blocked, each stale row carrying a
     ``blocked_reason`` string. This is the whole point of slice 2b."""
-    from status_site.sources.running_now import Worktree
+    from status_site.sources.pipeline_liveness import Worktree
 
     rows = [
         # Live via worktree branch.
@@ -1141,7 +1141,7 @@ def test_partition_by_state_bucket_with_scan_mixes_live_and_stale():
 def test_partition_by_state_bucket_with_scan_does_not_mutate_input():
     """The caller's row dicts must be left untouched — the scan
     shallow-copies demoted rows before stamping ``blocked_reason``."""
-    from status_site.sources.running_now import Worktree
+    from status_site.sources.pipeline_liveness import Worktree
 
     row = {"state": "building", "number": 999}
     original = dict(row)
@@ -1228,7 +1228,7 @@ def test_render_in_flight_demotes_rows_with_no_live_signal(tmp_path, monkeypatch
     cfg.pollers._set("pipeline", {"issues": rows, "failed": failed})
 
     # Only #858 has a live signal.
-    from status_site.sources.running_now import Worktree
+    from status_site.sources.pipeline_liveness import Worktree
     fake_scan = P_live.LivenessScan(
         ps_output="",
         worktrees=(Worktree(path="/tmp/alice-858-wt", branch="feat/858-x"),),
@@ -1262,7 +1262,7 @@ def test_render_in_flight_demotes_rows_with_no_live_signal(tmp_path, monkeypatch
 
 
 def test_livenessscan_is_observable_true_when_worktree_present():
-    from status_site.sources.running_now import Worktree
+    from status_site.sources.pipeline_liveness import Worktree
 
     scan = P_live.LivenessScan(
         ps_output="",
@@ -1327,7 +1327,7 @@ def test_partition_with_observable_scan_still_demotes_ghosts():
     back in and demotes rows with no matching evidence. Otherwise
     the sandbox-safety fallback would silently keep ghosts alive
     forever once a single worktree exists."""
-    from status_site.sources.running_now import Worktree
+    from status_site.sources.pipeline_liveness import Worktree
 
     rows = [
         {"state": "building", "number": 10},  # no signal → demote

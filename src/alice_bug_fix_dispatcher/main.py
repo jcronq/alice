@@ -64,6 +64,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Mapping
 
@@ -645,6 +646,15 @@ def _spawn_claude_detached(
     the dispatcher's s6 process group so a dispatcher exit doesn't
     SIGHUP the worker. stdout/stderr land in ``scratch_dir`` so the
     worker's structured JSON return is readable on the next tick.
+
+    Design cutover (2026-11-24): PR #1 added SubagentStop + the orphan
+    reaper; PR #2's ``running_now`` rewrite joins SM tasks against the
+    start/stop log pair. This spawn path bypasses Claude Code's
+    PreToolUse Agent hook (it's a bare subprocess, not an in-process
+    ``Agent(...)`` tool call), so the start row has to be written here
+    or the subagent is invisible to Running-now. The write uses the
+    same ``/state/worker/alice-task-dispatch.jsonl`` the hook does,
+    under ``fcntl.flock``.
     """
     stdout_path = scratch_dir / "result.json"
     stderr_path = scratch_dir / "stderr.log"
@@ -682,7 +692,54 @@ def _spawn_claude_detached(
             stderr_f.close()
         except OSError:
             pass
+
+    # Running-now visibility: write a dispatch-log row so the status-site
+    # sees this subagent in flight. Non-fatal — a failed write here just
+    # hides the row until the next tick picks up the actual process.
+    try:
+        _emit_bug_fix_dispatch_row(report_id, proc.pid, scratch_dir)
+    except Exception:  # noqa: BLE001 — never block dispatch on telemetry
+        pass
     return proc.pid
+
+
+# Running-now log writer. Lazy import of the helper so unit tests that
+# don't need the dispatch-log side-effect don't pay the import cost.
+def _emit_bug_fix_dispatch_row(
+    report_id: int,
+    pid: int | None,
+    scratch_dir: pathlib.Path,
+) -> None:
+    try:
+        from alice_speaking.internal.steerable_dispatch import (
+            _append_dispatch_row,
+        )
+    except Exception:  # noqa: BLE001 — helper not importable in this env
+        return
+    _append_dispatch_row(
+        {
+            "ts": time.time(),
+            # No tool_call_id for subprocess spawns — use the pid-scoped
+            # scratch dir as a stable primary key. Readers treat this
+            # verbatim; no join happens without a stop row for the same
+            # id, which the orphan reaper will supply after 2h.
+            "tool_call_id": f"bug-fix-{report_id}-pid{pid}",
+            # No SM task row here: bug fixes keep their own frontmatter
+            # ledger (``bug_path``). The running-now UI tolerates missing
+            # ``task_id`` (the row just doesn't render in Running-now,
+            # which is fine — these fixes already appear in the Bug tier).
+            "task_id": None,
+            "session_id": "",
+            "subagent_type": "bug-fix",
+            "description": f"bug-fix-{report_id}",
+            "title": f"bug-fix-{report_id}",
+            "tags": ["bug-fix-dispatcher"],
+            "pid": pid,
+            # Not steerable (no Remote Control wiring on this detach).
+            "steerable": False,
+            "scratch_dir": str(scratch_dir),
+        }
+    )
 
 
 def _compute_actuals_patch(

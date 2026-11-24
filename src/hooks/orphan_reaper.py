@@ -26,11 +26,12 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 START_LOG = Path("/state/worker/alice-task-dispatch.jsonl")
 STOP_LOG = Path("/state/worker/alice-subagent-stop.jsonl")
@@ -41,6 +42,15 @@ DEFAULT_THRESHOLD_SECONDS = 2 * 60 * 60
 # Design §2.3: a session file touched in the last 10 min is "live"; skip reaping
 # its orphans on the periodic path (the host-reboot path ignores this).
 SESSION_LIVE_WINDOW_SECONDS = 10 * 60
+
+# Design §7.7: steerable rows get an extra check against the local Remote
+# Control session registry (``claude agents --json`` surfaces every live
+# session on this host, including those launched with ``--remote-control``).
+# A steerable row whose ``session_name`` matches a live session is NOT reaped
+# — the session is in flight and the agent may legitimately still be running
+# past the 2h orphan threshold.
+_CLAUDE_AGENTS_BIN = "claude"
+_CLAUDE_AGENTS_TIMEOUT_S = 5.0
 
 
 # --------------------------------------------------------------------------- #
@@ -87,6 +97,57 @@ def _append_rows(rows: Iterable[dict], stop_log: Path) -> int:
 # --------------------------------------------------------------------------- #
 
 
+#: Callable that returns the set of live Remote Control session *names* on
+#: this host. The default implementation runs ``claude agents --json`` and
+#: parses the response; tests inject a fake so the probe is deterministic.
+LiveSessionNameProbe = Callable[[], frozenset[str]]
+
+
+def _default_live_session_names() -> frozenset[str]:
+    """Probe Claude Code for live Remote-Control session names.
+
+    Returns the set of ``name`` fields from ``claude agents --json`` (the
+    documented machine-readable listing of background agents / Remote
+    Control sessions on this host). Any error → empty set, which makes
+    the §7.7 check fall through to the session-file mtime path. This is
+    the *safe* direction: a transient CLI failure must not cause us to
+    skip-reap sessions that are actually dead.
+    """
+    try:
+        proc = subprocess.run(
+            [_CLAUDE_AGENTS_BIN, "agents", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=_CLAUDE_AGENTS_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    if proc.returncode != 0:
+        return frozenset()
+    raw = (proc.stdout or "").strip()
+    if not raw:
+        return frozenset()
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return frozenset()
+    names: set[str] = set()
+    items: Iterable
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        items = payload.get("sessions") or payload.get("agents") or []
+    else:
+        items = ()
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name") or entry.get("session_name")
+        if isinstance(name, str) and name.strip():
+            names.add(name.strip())
+    return frozenset(names)
+
+
 @dataclass(frozen=True)
 class ReaperConfig:
     """Tunables for a single reaper pass.
@@ -106,6 +167,12 @@ class ReaperConfig:
     # session-live check if its session file is missing. This is what the
     # host_reboot mode wants.
     reboot_mode: bool = False
+    # Design §7.7: injected probe for live Remote Control session names.
+    # Tests pass a lambda returning a fixed set; production uses the
+    # module default (``claude agents --json``).
+    live_session_names: LiveSessionNameProbe = field(
+        default=_default_live_session_names
+    )
 
 
 def _session_is_live(cfg: ReaperConfig, session_id: str, now: float) -> bool:
@@ -178,6 +245,22 @@ def compute_reap_rows(cfg: ReaperConfig) -> list[dict]:
         if tcid:
             closed_ids.add(tcid)
 
+    # Design §7.7: cache the live Remote-Control session set once per pass
+    # so we don't fork+exec ``claude agents --json`` on every steerable
+    # row. The probe runs iff at least one start row looks steerable —
+    # avoids the subprocess cost on reap passes that have no steerable
+    # orphans.
+    live_names: frozenset[str] | None = None
+
+    def _live_names() -> frozenset[str]:
+        nonlocal live_names
+        if live_names is None:
+            try:
+                live_names = cfg.live_session_names()
+            except Exception:  # noqa: BLE001 — never block reaping on probe
+                live_names = frozenset()
+        return live_names
+
     reaped: list[dict] = []
     seen: set[str] = set()
     for row in starts:
@@ -193,6 +276,10 @@ def compute_reap_rows(cfg: ReaperConfig) -> list[dict]:
             start_ts = 0.0
         session_id = row.get("session_id") or ""
 
+        # §7.5 fields — missing / absent is False per the design.
+        is_steerable = bool(row.get("steerable", False))
+        session_name = str(row.get("session_name") or "").strip() or None
+
         if cfg.reboot_mode:
             # Boot mode: reap every orphan whose session file is gone. A session
             # file that still exists on disk is from a prior Claude Code run that
@@ -204,6 +291,13 @@ def compute_reap_rows(cfg: ReaperConfig) -> list[dict]:
         else:
             # Periodic mode: age-gate + session-liveness check.
             if (now - start_ts) < cfg.threshold_seconds:
+                continue
+            # §7.7: steerable rows get an extra check against the
+            # Remote-Control registry — a live name there means the
+            # session is still around and the subagent may legitimately
+            # be past the 2h threshold. If the session_name is live,
+            # skip reaping.
+            if is_steerable and session_name and session_name in _live_names():
                 continue
             if _session_is_live(cfg, session_id, now):
                 continue
