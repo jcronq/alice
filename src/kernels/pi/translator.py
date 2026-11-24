@@ -273,21 +273,51 @@ class PiEventTranslator:
         if self._state.start_ms is not None and self._state.last_message_ms is not None:
             self._state.duration_ms = self._state.last_message_ms - self._state.start_ms
 
+        # Backend error on the assistant message. Pi surfaces upstream
+        # provider failures (ChatGPT usage-limit, auth revoked, model
+        # unreachable, …) via ``stopReason=="error"`` + ``errorMessage``
+        # on message_end, NOT via a top-level ``error`` event. If we
+        # don't check this field the translator reports a successful
+        # empty turn, the daemon emits ``missed_reply`` without a visible
+        # reason, and the user sees dead silence. Observed on grand-Alice
+        # 2026-11-23: Doug's three forwarded inbounds ate codex quota
+        # (``You have hit your ChatGPT usage limit``) and produced zero
+        # signal_sends. Set is_error + error_message on state so
+        # :meth:`to_kernel_result` surfaces ``KernelResult.error``; the
+        # turn_runner's error branch (and any downstream guardrail) can
+        # then surface a human-visible fallback.
+        stop_reason = msg.get("stopReason")
+        error_message = msg.get("errorMessage")
+        is_error = bool(stop_reason == "error" and error_message)
+        if is_error:
+            self._state.is_error = True
+            self._state.error_message = str(error_message)
+            # Visible grep target for operators debugging silent-turn
+            # outages. Separate from the ``result`` event so the trace
+            # shows cause and effect side by side.
+            self._emit(
+                "pi_backend_error",
+                stop_reason=stop_reason,
+                message=str(error_message),
+                session_id=self._state.session_id,
+            )
+
         self._emit(
             "result",
             session_id=self._state.session_id,
             num_turns=self._state.num_turns + 1,
             duration_ms=self._state.duration_ms,
             total_cost_usd=None,
-            is_error=False,
+            is_error=is_error,
             usage=self._usage_event_dict(),
+            **({"error": self._state.error_message} if is_error else {}),
         )
         summary = TurnSummary(
             session_id=self._state.session_id,
             usage=usage_info,
             duration_ms=self._state.duration_ms,
             cost_usd=None,
-            is_error=False,
+            is_error=is_error,
             num_turns=self._state.num_turns + 1,
             raw=msg,
         )
@@ -304,6 +334,13 @@ class PiEventTranslator:
     def to_kernel_result(
         self, *, error: Optional[str] = None, is_error: bool = False
     ) -> KernelResult:
+        # Caller-supplied error (e.g. "timeout" from PiKernel.run) wins
+        # over the stream-captured one so the explicit timeout path keeps
+        # its stable identifier. If the caller didn't pass an error, fall
+        # back to whatever _handle_message_end captured (backend error on
+        # a stopReason=="error" message) so KernelResult.error is never
+        # a silent None when is_error is True.
+        final_error = error if error is not None else self._state.error_message
         return KernelResult(
             text="".join(self._state.parts).strip(),
             session_id=self._state.session_id,
@@ -312,5 +349,5 @@ class PiEventTranslator:
             cost_usd=None,
             is_error=is_error or self._state.is_error,
             num_turns=self._state.num_turns,
-            error=error,
+            error=final_error,
         )
