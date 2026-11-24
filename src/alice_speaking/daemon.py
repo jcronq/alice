@@ -1584,6 +1584,44 @@ class SpeakingDaemon:
             instructions, handle, title=description
         )
 
+        # Design §7.4 / PR #2 punchlist item 8 — write a dispatch-log
+        # row at spawn time so the status-site's ``running_now`` source
+        # (which joins SM tasks against the start/stop log pair) sees
+        # this sub-agent in flight. The in-process ``sub_kernel.run``
+        # path bypasses Claude Code's PreToolUse Agent hook (that hook
+        # fires on tool calls inside a session, not on the daemon's own
+        # SDK invocations), so the row is invisible unless we write it
+        # here.
+        #
+        # ``steerable=False`` because this is an in-process sub-kernel —
+        # no Remote Control session for ``SendMessage`` to reach. Jason
+        # steers these via the parent turn directly (he's talking to
+        # Speaking, who owns the waiter). The /api/steer UI affordance
+        # only appears on steerable rows.
+        try:
+            from .internal.steerable_dispatch import _append_dispatch_row
+
+            _append_dispatch_row(
+                {
+                    "ts": time.time(),
+                    # The daemon's bg-handle doubles as the primary key
+                    # here; readers tolerate missing tool_call_id.
+                    "tool_call_id": handle,
+                    "task_id": auto_fix_task_id,
+                    "session_id": "",
+                    "subagent_type": "claude",
+                    "description": description,
+                    "title": description,
+                    "tags": [],
+                    "steerable": False,
+                    "handle": handle,
+                }
+            )
+        except Exception:  # noqa: BLE001 — never block dispatch on telemetry
+            log.exception(
+                "dispatch-log write failed for %s; row omitted", handle
+            )
+
         # Slice-timeline daemon wire-up: emit the started-at stage-run
         # POST so the WoY expanded card's dots advance from grey to
         # running orange. Soft-fail — if the status site is down, we
@@ -1672,6 +1710,56 @@ class SpeakingDaemon:
                 is_error = True
             finally:
                 self._subagent_tasks.pop(handle, None)
+                # Design §1.2 / PR #2 — write a stop-log row so the
+                # status-site's ``running_now`` sees this subagent close
+                # out. Writing it here (not in a hook) because the SDK
+                # sub-kernel path doesn't fire Claude Code's
+                # SubagentStop hook — that hook fires on Agent tool
+                # calls inside a session, not on the daemon's own
+                # kernel invocations.
+                try:
+                    from .internal.steerable_dispatch import (
+                        _append_dispatch_row,
+                    )
+                    import fcntl as _fcntl
+                    import pathlib as _pathlib
+
+                    _stop_log = _pathlib.Path(
+                        "/state/worker/alice-subagent-stop.jsonl"
+                    )
+                    _stop_log.parent.mkdir(parents=True, exist_ok=True)
+                    with _stop_log.open("a", encoding="utf-8") as f:
+                        _fcntl.flock(f.fileno(), _fcntl.LOCK_EX)
+                        try:
+                            import json as _json
+
+                            f.write(
+                                _json.dumps(
+                                    {
+                                        "ts": time.time(),
+                                        "event": "subagent_stop",
+                                        "tool_call_id": handle,
+                                        "task_id": auto_fix_task_id,
+                                        "session_id": "",
+                                        "duration_ms": int(
+                                            (time.monotonic() - started) * 1000
+                                        ),
+                                        "exit_status": (
+                                            "error" if is_error else "ok"
+                                        ),
+                                        "reaped_reason": None,
+                                        "handle": handle,
+                                    }
+                                )
+                                + "\n"
+                            )
+                        finally:
+                            _fcntl.flock(f.fileno(), _fcntl.LOCK_UN)
+                except Exception:  # noqa: BLE001 — never block completion
+                    log.exception(
+                        "stop-log write failed for %s; row omitted", handle
+                    )
+
                 # Push completion event onto the dispatcher queue —
                 # even on cancel, so a drained subagent still surfaces
                 # back as "didn't finish" rather than vanishing.

@@ -605,6 +605,28 @@ details.fx-group:first-child { margin-top: 0; }
   padding: .3rem .8rem; cursor: pointer; font: inherit; font-size: .88rem;
 }
 .woy-steer button:disabled { opacity: .55; cursor: not-allowed; }
+/* Running-now steer box (design brief 2026-11-24 §7.6). Shares the
+ * visual language with .woy-steer but lives inside an fx-table cell,
+ * so the margin collapses and the overall row keeps its fx-row height. */
+.steer-box {
+  display: flex; gap: .4rem; align-items: center;
+}
+.steer-box input {
+  flex: 1; min-width: 0;
+  padding: .3rem .5rem;
+  background: var(--color-bg); color: var(--color-fg);
+  border: 1px solid var(--color-border-line); border-radius: 6px;
+  font: inherit; font-size: .88rem;
+}
+.steer-box button {
+  background: transparent; color: var(--color-fg);
+  border: 1px solid var(--color-border-line); border-radius: 6px;
+  padding: .25rem .6rem; cursor: pointer; font: inherit; font-size: .85rem;
+}
+.steer-box button:disabled { opacity: .55; cursor: not-allowed; }
+/* Idle rows (SM task is ``building`` but no open sub-agent) are rendered
+ * muted — they're evidence of stuck-in-state work, not active fan-out. */
+.running-now-idle td { color: var(--color-fg-muted); font-style: italic; }
 .woy-action-status { font-size: .8rem; color: var(--color-fg-muted); }
 .woy-action-status.err { color: var(--color-bad); }
 /* Slice-effort: 4-segment effort-level picker in the expanded card.
@@ -2318,6 +2340,69 @@ function A2uiSurface({envelopes, surfaceId}) {
 }
 
 // ── 8. section widgets (slice-2) ──────────────────────────────────
+//
+// Running-now is SM-task-driven now (design brief
+// 2026-11-24-subagent-driven-running-now §3). The row shape:
+//
+//   { task_id, title, state ("active"|"idle"), agent_count, elapsed,
+//     issue, repo, pr_url, steerable_endpoint, agents, alive (derived) }
+//
+// Steerable rows (``steerable_endpoint != null``) grow an inline 📡 textbox
+// that POSTs to /api/steer. The handler writes a ``status-steer`` surface
+// Speaking's intake routes via ``SendMessage(to=task_id, ...)``.
+function SteerBox({taskId, endpoint}) {
+  const [text, setText] = React.useState("");
+  const [state, setState] = React.useState({sending: false, ok: null, err: null});
+  const onSubmit = async e => {
+    if (e && e.preventDefault) e.preventDefault();
+    const msg = text.trim();
+    if (!msg || state.sending || !KEY) return;
+    setState({sending: true, ok: null, err: null});
+    try {
+      const r = await fetch("/api/steer", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({key: KEY, task_id: taskId, text: msg}),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || !body.ok) {
+        setState({sending: false, ok: null, err: body.error || ("HTTP " + r.status)});
+        return;
+      }
+      setState({sending: false, ok: "sent", err: null});
+      setText("");
+    } catch (ex) {
+      setState({sending: false, ok: null, err: String(ex && ex.message || ex)});
+    }
+  };
+  return h("form", {
+    onSubmit,
+    className: "steer-box",
+    style: {display: "flex", gap: "0.3rem", alignItems: "center"},
+    "data-testid": "steer-form-" + taskId,
+  },
+    h("span", {title: "Steerable via Remote Control (" + endpoint + ")",
+                "aria-label": "steerable"}, "📡"),
+    h("input", {
+      type: "text",
+      value: text,
+      onChange: e => setText(e.target.value),
+      placeholder: "steer this subagent…",
+      disabled: state.sending || !KEY,
+      maxLength: 2000,
+      style: {flex: 1, minWidth: "8rem"},
+      "data-testid": "steer-input-" + taskId,
+    }),
+    h("button", {
+      type: "submit",
+      disabled: state.sending || !KEY || !text.trim(),
+      style: {padding: "0.2rem 0.6rem"},
+    }, state.sending ? "sending…" : (state.ok === "sent" ? "sent ✓" : "send")),
+    state.err ? h("span", {style: {color: "var(--color-danger, #c00)", fontSize: "0.85em"}},
+                   state.err) : null,
+  );
+}
+
 function RunningNowBoard({rows, nowMs}) {
   const safe = rows || [];
   if (!safe.length) {
@@ -2325,33 +2410,36 @@ function RunningNowBoard({rows, nowMs}) {
       "(nothing building right now)");
   }
   const columns = [
-    {key: "branch", label: "branch", cell: r => h("code", null, r.branch || "")},
+    {key: "task_id", label: "task", cell: r => h("code", null, r.task_id || "")},
+    {key: "title", label: "title", cell: r => r.title || ""},
     {key: "issue", label: "issue", cell: r => {
       const n = r.issue;
       if (!n) return "";
+      const repo = r.repo || "jcronq/alice";
       return h("a", {
-        href: "https://github.com/jcronq/alice/issues/" + n,
+        href: "https://github.com/" + repo + "/issues/" + n,
         target: "_blank", rel: "noopener",
         style: {fontVariantNumeric: "tabular-nums"},
       }, "#" + n);
     }},
-    {key: "alive", label: "alive", cell: r =>
-      h("span", {className: "fx-pill " + (r.alive ? "active" : "done")},
-        r.alive ? "alive" : "dead")
-    },
+    {key: "state", label: "state", cell: r => {
+      const label = r.state === "active"
+        ? (r.agent_count > 1 ? `active × ${r.agent_count}` : "active")
+        : "idle";
+      return h("span", {className: "fx-pill " + (r.state === "active" ? "active" : "done")}, label);
+    }},
     {key: "elapsed", label: "elapsed", numeric: true, cell: r =>
       h("span", {className: "fx-num"}, r.elapsed || "")
     },
-    {key: "pr_url", label: "PR", cell: r =>
-      r.pr_url
-        ? h("a", {href: r.pr_url, target: "_blank", rel: "noopener"}, "draft PR")
-        : h("span", {style: {color: "var(--color-fg-muted)"}}, "no PR yet")
+    {key: "steer", label: "steer", cell: r =>
+      r.steerable_endpoint
+        ? h(SteerBox, {taskId: r.task_id, endpoint: r.steerable_endpoint})
+        : h("span", {style: {color: "var(--color-fg-muted)"}}, "—")
     },
-    {key: "task_status", label: "status", cell: r => r.task_status || ""},
   ];
   return h(FxTable, {
-    columns, rows: safe,
-    rowClass: r => r.alive ? "" : "",
+    columns, rows: safe.map(r => ({...r, __key: r.task_id})),
+    rowClass: r => r.state === "idle" ? "running-now-idle" : "",
   });
 }
 

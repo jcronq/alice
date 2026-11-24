@@ -35,14 +35,17 @@ def test_running_now_footer_empty():
 
 def test_running_now_footer_nonempty():
     rows = [
-        running_now.RunningTask(
-            branch="feat/x",
-            worktree="/tmp/x",
-            alive=True,
-            pr_url="",
+        running_now.RunningRow(
+            task_id="task-x",
+            title="Example",
+            state="active",
+            agent_count=1,
             elapsed="1m",
-            task_status="",
             issue="",
+            repo="",
+            pr_url="",
+            steerable_endpoint=None,
+            agents=[],
         )
     ]
     assert _FOOTER_RE.match(_last_line(running_now.render(rows)))
