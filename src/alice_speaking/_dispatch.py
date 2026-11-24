@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Optional
 
 from core.sdk_compat import _short
 
+from . import missed_reply as missed_reply_module
 from . import signal_outbound
 from . import slash_commands
 from . import stage_run_client as stage_run_client_module
@@ -145,6 +146,124 @@ def _with_outbound_awareness(
             chars=len(block),
         )
     return f"{block}\n\n{prompt}"
+
+
+async def _fire_missed_reply_guardrail(
+    ctx: DaemonContext,
+    *,
+    channel: ChannelRef,
+    source: str,
+    sender_name: str,
+    turn_id: str,
+) -> bool:
+    """Send the missed-reply fallback + drop a fault surface + (grand-alice)
+    A2A-notify main-alice.
+
+    Returns ``True`` when a fallback reply actually went out on Signal
+    (so the caller flips ``terminal_state = "replied"``). Returns
+    ``False`` when the fallback send itself failed — the user still
+    sees dead air but the surface + event trail are durable records for
+    the operator. Never raises.
+
+    The structured event this fires — ``fallback_reply_sent`` — is in
+    addition to the ``missed_reply`` event ``TurnRunner.run_turn``
+    already emitted; both appear in ``speaking.log`` so the audit trail
+    shows both the detection and the response.
+    """
+    # Resolve the Signal sender to an address-book principal. The lookup
+    # may return None — unknown senders exist (temp allowed-senders
+    # fallback, mid-migration principals.yaml); they get the generic
+    # fallback phrasing, same as Jason or Katie would. The display name
+    # already resolved on the inbound (sender_name) wins over the lookup.
+    principal = None
+    try:
+        principal = ctx.address_book.lookup_by_native("signal", source)
+    except Exception:  # noqa: BLE001 — never fail the guardrail on lookup
+        log.exception("missed-reply guardrail: principal lookup raised")
+    principal_id = principal.id if principal is not None else None
+    fallback_text = missed_reply_module.pick_fallback_text(principal_id)
+    instance = missed_reply_module.resolve_instance_name()
+
+    # 1. Fallback send on the originating Signal channel. Bypasses the
+    #    quiet-hours queue — this is a reply to an inbound, same rule
+    #    as the normal send_message path for Signal turns (a missed
+    #    response is more disruptive than a late one).
+    sent_ok = False
+    try:
+        await ctx.signal_transport.send(
+            OutboundMessage(destination=channel, text=fallback_text)
+        )
+        sent_ok = True
+    except Exception as exc:  # noqa: BLE001
+        log.exception("missed-reply fallback send failed for %s", sender_name)
+        # Event records the failure so the trail is complete even when
+        # the user got nothing. Caller leaves terminal_state="abandoned".
+        with contextlib.suppress(Exception):
+            ctx.events.emit(
+                "fallback_reply_send_failed",
+                turn_id=turn_id,
+                recipient=source,
+                original_sender=source,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    # 2. Surface. Durable fault record — Speaking picks it up on the
+    #    next wake and investigates the backend. Written regardless of
+    #    whether the fallback send succeeded, so a transient Signal
+    #    outage doesn't swallow the fault signal.
+    mind_dir = getattr(getattr(ctx, "cfg", None), "mind_dir", None)
+    surface_path = missed_reply_module.write_fault_surface(
+        mind_dir=mind_dir,
+        instance=instance,
+        principal_id=principal_id,
+        principal_display=sender_name,
+        original_sender=source,
+        turn_id=turn_id,
+    )
+
+    # 3. Structured event — audit-trail companion to ``missed_reply``.
+    if sent_ok:
+        with contextlib.suppress(Exception):
+            ctx.events.emit(
+                "fallback_reply_sent",
+                turn_id=turn_id,
+                recipient=source,
+                original_sender=source,
+                reason="missed_reply",
+                instance=instance,
+                principal_id=principal_id,
+                grandparent=(
+                    principal_id is not None
+                    and principal_id.lower()
+                    in missed_reply_module.GRANDPARENT_PRINCIPAL_IDS
+                ),
+                surface_path=(
+                    str(surface_path) if surface_path is not None else None
+                ),
+            )
+
+    # 4. On grand-alice, courtesy-ping main-alice over A2A. The local
+    #    surface is the durable record — this is best-effort and MUST
+    #    NOT block or fail the turn.
+    if missed_reply_module.is_grand_alice(instance):
+        err = await missed_reply_module.notify_main_alice_via_a2a(
+            ctx,
+            principal_display=sender_name,
+            original_sender=source,
+            turn_id=turn_id,
+            surface_path=surface_path,
+        )
+        with contextlib.suppress(Exception):
+            ctx.events.emit(
+                "fallback_reply_a2a_notify",
+                turn_id=turn_id,
+                instance=instance,
+                target="main-alice",
+                ok=err is None,
+                error=err,
+            )
+
+    return sent_ok
 
 
 async def _maybe_dispatch_slash(
@@ -327,24 +446,29 @@ async def handle_signal(ctx: DaemonContext, batch: list["SignalEvent"]) -> None:
         if ctx._turn_did_send:
             terminal_state = "replied"
         else:
-            # Missed-reply fallback: turn finished cleanly but Alice
-            # never called send_message. Send a plain-text apology so
-            # Jason doesn't see dead air. Bootstrap/compaction turns
-            # use silent=True and run through _run_turn directly (not
-            # this handler), so they can't trip this branch. Fallback
-            # send failures are non-critical — log and move on.
+            # Missed-reply guardrail: turn finished cleanly but Alice
+            # never called send_message. Send a principal-aware fallback
+            # so the user doesn't see dead air, drop a fault-detected
+            # surface so Speaking can investigate the backend, and —
+            # when this is grand-alice — A2A-notify main-alice so Jason
+            # sees the fault at the other end of the mesh too.
+            #
+            # Bootstrap / compaction / idle-flush / surface-triggered /
+            # CLI turns use ``silent=True`` or go through dedicated
+            # handlers (not ``handle_signal``) so they never reach this
+            # branch — the guardrail is Signal-inbound-only by
+            # construction.
+            #
             # Design: cortex-memory/research/2026-05-18-missed-reply-fallback-design.md
-            fallback = (
-                "I received your message but didn't have a response — "
-                "could you try rephrasing?"
-            )
-            try:
-                await ctx.signal_transport.send(
-                    OutboundMessage(destination=channel, text=fallback)
-                )
+            # Jason directive 2026-11-24: "there should always be a response"
+            if await _fire_missed_reply_guardrail(
+                ctx,
+                channel=channel,
+                source=source,
+                sender_name=sender_name,
+                turn_id=turn_id,
+            ):
                 terminal_state = "replied"
-            except Exception:
-                log.exception("missed-reply fallback send failed for %s", sender_name)
     except Exception as exc:  # noqa: BLE001
         log.exception("turn failed for %s", sender_name)
         error = f"{type(exc).__name__}: {exc}"
