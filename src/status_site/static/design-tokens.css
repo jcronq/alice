@@ -10,15 +10,62 @@
  * dashboard-style columns stay aligned.
  */
 :root {
-  /* Colours (light) */
-  --color-bg: #f7f6f2;
-  --color-panel: #ffffff;
-  --color-fg: #1d1c1a;
-  --color-fg-muted: #66645e;
-  --color-border-line: #e3e0d6;
-  --color-ok: #2e7a4f;
-  --color-warn: #b06f14;
-  --color-bad: #b23a3a;
+  /* Agent UI palette (phase 1 port, lifted verbatim from
+   * agent-ui-testing/web/src/styles.css:25-91 — see PR
+   * ``feat/agent-ui-port-p1``). Light below; dark via
+   * ``@media (prefers-color-scheme: dark)`` farther down. */
+  --font:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --bg: #fbfaf7;
+  --surface: #ffffff;
+  --surface-2: #f3f1ec;
+  --border: #e5e2db;
+  --border-strong: #d3cfc6;
+  --text: #1f2328;
+  --text-muted: #6b7280;
+  --accent: #2f6f5e;
+  --accent-hover: #255a4c;
+  --accent-text: #fbfaf7;
+  --accent-tint: rgba(47, 111, 94, 0.09);
+  --accent-ring: rgba(47, 111, 94, 0.35);
+  --user-bubble: var(--accent);
+  --user-text: var(--bg);
+  --claude-bubble: var(--bg);
+  --danger-bg: #fdecec;
+  --danger-text: #a12727;
+  --danger-border: #f2c3c3;
+  --warn: #b45309;
+  --warn-bg: #fdf3e3;
+  --warn-text: #92400e;
+  --warn-border: #f1d29a;
+  --success: #2f6f5e;
+  --fg: var(--text);
+  --muted: var(--text-muted);
+  --line: var(--border);
+  --card: var(--surface);
+  --shadow-sm: 0 1px 2px rgba(31, 35, 40, 0.05);
+  --shadow-md: 0 4px 16px rgba(31, 35, 40, 0.08);
+  --radius-sm: 6px;
+  --radius: 8px;
+  --radius-lg: 10px;
+  --bar-h: 56px;
+  --content-max: 860px;
+  color-scheme: light dark;
+
+  /* Legacy aliases — the rest of the status-site stylesheet still
+   * reads ``--color-*``; map them onto the Agent UI tokens so the
+   * palette replaces in one place. New styles should use the
+   * Agent UI names directly. */
+  --color-bg: var(--bg);
+  --color-panel: var(--surface);
+  --color-fg: var(--text);
+  --color-fg-muted: var(--text-muted);
+  --color-border-line: var(--border);
+  --color-ok: var(--accent);
+  --color-warn: var(--warn);
+  --color-bad: var(--danger-text);
   --color-info: #2f6fb0;
 
   /* Chart-adjacent accents (kept because the dashboard references them
@@ -54,15 +101,29 @@
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --color-bg: #1b1a18;
-    --color-panel: #24231f;
-    --color-fg: #ecebe6;
-    --color-fg-muted: #a6a39a;
-    --color-border-line: #38362f;
-    --color-ok: #67bd88;
-    --color-warn: #e0a24a;
-    --color-bad: #e07a7a;
-  --color-info: #6aa5e0;
+    --bg: #15171a;
+    --surface: #1d2024;
+    --surface-2: #23272c;
+    --border: #2c3036;
+    --border-strong: #3b4047;
+    --text: #e6e6e6;
+    --text-muted: #9aa0a6;
+    --accent: #6cc4a8;
+    --accent-hover: #86d2ba;
+    --accent-text: #15171a;
+    --accent-tint: rgba(108, 196, 168, 0.14);
+    --accent-ring: rgba(108, 196, 168, 0.4);
+    --danger-bg: #3a1a1c;
+    --danger-text: #ffb4b4;
+    --danger-border: #6a2d31;
+    --warn: #f0a35e;
+    --warn-bg: #33270f;
+    --warn-text: #f0a35e;
+    --warn-border: #5e4818;
+    --success: #6cc4a8;
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.45);
+    --color-info: #6aa5e0;
     --dash-chart-grid: #312f29;
     --dash-chart-status-warning: #e0a24a;
     --dash-chart-status-critical: #e07a7a;
@@ -73,14 +134,28 @@
 }
 
 :root[data-theme="dark"] {
-  --color-bg: #1b1a18;
-  --color-panel: #24231f;
-  --color-fg: #ecebe6;
-  --color-fg-muted: #a6a39a;
-  --color-border-line: #38362f;
-  --color-ok: #67bd88;
-  --color-warn: #e0a24a;
-  --color-bad: #e07a7a;
+  --bg: #15171a;
+  --surface: #1d2024;
+  --surface-2: #23272c;
+  --border: #2c3036;
+  --border-strong: #3b4047;
+  --text: #e6e6e6;
+  --text-muted: #9aa0a6;
+  --accent: #6cc4a8;
+  --accent-hover: #86d2ba;
+  --accent-text: #15171a;
+  --accent-tint: rgba(108, 196, 168, 0.14);
+  --accent-ring: rgba(108, 196, 168, 0.4);
+  --danger-bg: #3a1a1c;
+  --danger-text: #ffb4b4;
+  --danger-border: #6a2d31;
+  --warn: #f0a35e;
+  --warn-bg: #33270f;
+  --warn-text: #f0a35e;
+  --warn-border: #5e4818;
+  --success: #6cc4a8;
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.45);
   --color-info: #6aa5e0;
   --dash-chart-grid: #312f29;
   --dash-chart-status-warning: #e0a24a;

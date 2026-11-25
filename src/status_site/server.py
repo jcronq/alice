@@ -2453,6 +2453,11 @@ def section_renderers(cfg: "Config") -> dict[str, Callable[[], dict]]:
             "attention_reacts": attention_reacts,
             "rows": ask_rows,
             "your_todo_md": your_todo_md,
+            # Agent UI phase 1 — structured HTML card shape for each
+            # unresolved ASK row. Frontend prefers this when
+            # non-empty; the FxTable fallback remains in place for
+            # anyone still on the markdown path.
+            "your_todo_cards_html": _waiting_on_you.render_cards(ask_rows),
             "needs_approval_slugs": needs_approval,
             "todo_chip_slugs": todo_chip_slugs,
             "external_todos_md": external_todos_md,
