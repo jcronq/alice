@@ -761,6 +761,191 @@ details.fx-group:first-child { margin-top: 0; }
   border: 1px solid var(--color-border-line); border-radius: 3px;
 }
 .woy-external-link:hover { color: var(--color-fg); border-color: var(--color-fg-muted); }
+
+/* ── Agent-UI Phase 2 frontend — expanded TODO card ───────────────
+ * Ported from reference agent-ui-testing/web/src/todos/{todos,effort}.css.
+ * Vars are mapped onto the status-site's design-tokens.css set. Phase 1
+ * owns the shared tokens + header + collapsed card; Phase 2 adds the
+ * expanded body, intent picker, thread bubbles, composer, Resolve /
+ * Dismiss with 5-second undo. Class names match the reference verbatim
+ * so Phase 1's collapsed renderer can mount this body as its sibling.
+ */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+.todos-page { margin-top: .5rem; }
+.todos-page .todos-title { margin: 0 0 .25rem; font-size: 1.5rem; font-weight: 700; }
+.todos-page .todos-hint { margin: 0 0 1rem; color: var(--color-fg-muted); font-size: .85rem; }
+.todos-page ul.todo-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
+
+.todo-card {
+  display: block; padding: 0;
+  background: var(--color-panel);
+  border: 1px solid var(--color-border-line);
+  border-radius: 12px;
+  min-width: 0;
+}
+.todo-card.is-expanded { border-color: var(--color-fg-muted); }
+.todo-card.is-done { background: var(--color-panel); }
+.todo-row {
+  position: relative; display: flex; flex-wrap: wrap; align-items: center;
+  gap: 4px 10px; padding: 12px 14px; min-width: 0;
+}
+.todo-header {
+  position: static; flex: 0 1 auto; max-width: 100%; min-width: 0;
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 0; margin: 0; font: inherit; color: inherit;
+  background: none; border: 0; cursor: pointer; text-align: left;
+}
+.todo-header::after {
+  content: ""; position: absolute; inset: 0; border-radius: 12px;
+}
+.todo-header:focus-visible { outline: none; }
+.todo-header:focus-visible::after {
+  outline: 2px solid var(--color-ok); outline-offset: -2px;
+}
+.todo-header strong { font-weight: 650; overflow-wrap: anywhere; min-width: 0; }
+.todo-meta { color: var(--color-fg-muted); font-size: .8rem; white-space: nowrap; }
+.todo-pill {
+  margin-left: auto; display: inline-block;
+  padding: 1px 10px; border: 1px solid var(--color-border-line);
+  border-radius: 999px; font-size: .78rem; color: var(--color-fg-muted);
+  white-space: nowrap;
+}
+
+.todo-body {
+  margin: 0; width: auto;
+  padding: 12px 14px 14px;
+  border-top: 1px solid var(--color-border-line);
+}
+.todo-body .details { margin: 0 0 10px; line-height: 1.5; color: var(--color-fg); }
+.todo-body .details p:first-child { margin-top: 0; }
+.todo-body .details p:last-child { margin-bottom: 0; }
+
+/* Intent / effort picker — the 4-segment Spike/Prototype/Solid/Autonomous row. */
+.effort { margin: 0 0 12px; }
+.effort-segs { display: flex; gap: 6px; }
+.effort-seg {
+  flex: 1 1 0; min-width: 0; min-height: 36px;
+  display: flex; flex-direction: row; align-items: center; justify-content: center;
+  gap: 6px; padding: 4px 10px; font: inherit; color: var(--color-fg);
+  background: none; border: 1px solid var(--color-border-line);
+  border-radius: var(--dash-radius); cursor: pointer;
+}
+.effort-seg:hover:not(:disabled):not([aria-pressed="true"]) {
+  border-color: var(--color-fg-muted);
+  background: color-mix(in srgb, var(--color-ok) 12%, transparent);
+}
+.effort-seg[aria-pressed="true"] {
+  background: var(--color-ok); border-color: var(--color-ok);
+  color: var(--color-bg); font-weight: 600;
+}
+.effort-seg:disabled { opacity: .6; cursor: default; }
+.effort-seg:focus-visible { outline: 2px solid var(--color-ok); outline-offset: 2px; }
+.effort-seg .effort-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.effort-hint { margin: 8px 0 0; color: var(--color-fg-muted); font-size: .85rem; }
+.effort-hint .effort-unset { color: var(--color-fg-muted); font-style: italic; }
+.effort-clear {
+  margin-left: 6px; background: none; border: 0; padding: 0;
+  color: var(--color-ok); text-decoration: underline; cursor: pointer;
+  font: inherit; font-size: .85rem;
+}
+.effort-clear:disabled { opacity: .55; cursor: not-allowed; }
+@media (max-width: 640px) {
+  .effort-seg { flex-direction: column; gap: 0; padding: 4px 2px; line-height: 1.2; }
+  .effort-seg .effort-name { font-size: 11px; max-width: 100%; }
+}
+
+/* Thread bubbles — user right/accent, Claude left/outlined, system centered/muted. */
+.todo-thread { border: 0; background: none; overflow: visible; }
+.todo-thread:not(:has(.bubble)):not(:has(.on-it)) { display: none; }
+.todo-thread .conversation {
+  padding: 2px; display: flex; flex-direction: column;
+  gap: 6px; max-height: 360px; overflow-y: auto;
+}
+.bubble {
+  max-width: 88%; padding: .45rem .7rem;
+  border-radius: 10px; font-size: .92rem; line-height: 1.4;
+  overflow-wrap: anywhere; white-space: pre-wrap;
+}
+.bubble-user {
+  align-self: flex-end; background: var(--color-ok); color: var(--color-bg);
+  border-bottom-right-radius: 3px;
+}
+.bubble-claude {
+  align-self: flex-start; background: var(--color-bg); color: var(--color-fg);
+  border: 1px solid var(--color-border-line); border-bottom-left-radius: 3px;
+}
+.bubble-system {
+  align-self: center; background: transparent;
+  color: var(--color-fg-muted); font-size: .8rem; font-style: italic;
+  padding: .15rem .5rem;
+}
+.bubble .bubble-text p:first-child { margin-top: 0; }
+.bubble .bubble-text p:last-child { margin-bottom: 0; }
+.bubble-meta { display: block; opacity: .65; font-size: .72rem; margin-top: .2rem; }
+.bubble-user .bubble-meta { opacity: .9; }
+.on-it {
+  margin: 6px 0 0; padding: 0 2px;
+  color: var(--color-fg-muted); font-size: 13px; font-style: italic;
+}
+
+/* Reply composer */
+.composer {
+  display: flex; flex-wrap: wrap; align-items: flex-end;
+  gap: 8px; margin-top: 12px;
+}
+.composer textarea {
+  flex: 1 1 200px; min-width: 0; min-height: 2.5rem; max-height: 12rem;
+  padding: .5rem .6rem; font: inherit; color: var(--color-fg);
+  background: var(--color-bg); border: 1px solid var(--color-border-line);
+  border-radius: 8px; resize: none; overflow-y: auto;
+}
+.composer textarea:focus-visible { outline: 2px solid var(--color-ok); outline-offset: 1px; }
+
+.btn {
+  font: inherit; font-size: .9rem;
+  padding: .35rem .9rem; border-radius: 8px;
+  cursor: pointer;
+  border: 1px solid var(--color-border-line); background: transparent;
+  color: var(--color-fg);
+}
+.btn:disabled { opacity: .55; cursor: not-allowed; }
+.btn-primary {
+  background: var(--color-ok); border-color: var(--color-ok);
+  color: var(--color-bg); font-weight: 600;
+}
+.btn-primary:hover:not(:disabled) { filter: brightness(1.05); }
+.btn-neutral {
+  background: var(--color-panel); border-color: var(--color-fg-muted);
+  color: var(--color-fg);
+}
+.btn-neutral:hover:not(:disabled) { background: var(--color-bg); }
+.btn-ghost {
+  background: transparent; border-color: var(--color-border-line);
+  color: var(--color-fg-muted);
+}
+.btn-ghost:hover:not(:disabled) { color: var(--color-fg); border-color: var(--color-fg-muted); }
+.btn-send { align-self: flex-end; }
+
+.todo-actions { display: flex; gap: 8px; margin-top: 12px; }
+
+/* Settled strip (Resolve / Dismiss → Undo in 5s). */
+.todo-card.is-settled .todo-row { gap: 10px; }
+.todo-settled {
+  flex: 1 1 12rem; display: flex; align-items: center;
+  gap: 10px; margin: 0; color: var(--color-fg-muted);
+}
+.todo-settled-text { font-weight: 500; color: var(--color-fg); }
+.link-button {
+  background: none; border: 0; padding: 0;
+  color: var(--color-ok); text-decoration: underline; cursor: pointer;
+  font: inherit; font-size: inherit;
+}
+.link-button:disabled { opacity: .55; cursor: not-allowed; }
+
+.form-error { margin: 8px 0 0; color: var(--color-bad); font-size: .85rem; }
 </style>
 </head><body>
 <div id="root">Loading Alice…</div>
@@ -775,7 +960,7 @@ details.fx-group:first-child { margin-top: 0; }
 }
 </script>
 <script type="module">
-import React, {useEffect, useLayoutEffect, useReducer, useRef, useState} from "react";
+import React, {useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState} from "react";
 import {createRoot} from "react-dom/client";
 import {createPortal} from "react-dom";
 import {
@@ -4041,6 +4226,7 @@ function parseHash(raw) {
   if (h === "chat" || parseMessageHash(h)) return {route: "chat", slug: null};
   if (h === "bugs") return {route: "bugs", slug: null};
   if (h === "resources") return {route: "resources", slug: null};
+  if (h === "todos") return {route: "todos", slug: null};
   if (h.startsWith("review-")) return {route: "review", slug: h.slice("review-".length)};
   return {route: "overview", slug: null};
 }
@@ -4484,6 +4670,420 @@ function HistoryRoot({itemId}) {
   );
 }
 
+// ── Agent-UI Phase 2 frontend: expanded TODO card ────────────────
+// Reference: agent-ui-testing/web/src/todos/{TodoItem,EffortPicker}.tsx.
+// The server-side routes Phase 2 BACKEND adds:
+//   POST /api/todos/<id>/effort     {effort: 1|2|3|4|null}
+//   POST /api/todos/<id>/messages   {text, messageId, images?}
+//   POST /api/todos/<id>/resolve    {resolution: "resolved"|"dismissed"}
+//   POST /api/todos/<id>/reopen
+// A failed POST rolls the optimistic UI back in-place so a half-landed
+// backend doesn't strand a user with phantom state.
+const EFFORT_SCALE = [
+  {level: 1, name: "Spike",
+   summary: "Spike: Does the idea work. Reviews: none, lead spot-checks; fix rounds: only what breaks the demo; integrate: branch only."},
+  {level: 2, name: "Prototype",
+   summary: "Prototype: Usable demo. Reviews: one Sonnet pass, blockers only; fix rounds: 1; integrate: branch or draft."},
+  {level: 3, name: "Solid",
+   summary: "Solid: Mergeable feature. Reviews: Sonnet lenses per package; fix rounds: up to 3; integrate: merge when green (idle)."},
+  {level: 4, name: "Autonomous",
+   summary: "Autonomous: Build it properly, unattended. Reviews: lenses + Opus final gate; fix rounds: up to 4 + leftovers filed; integrate: merge + docs + lessons."},
+];
+const EFFORT_UNSET_HINT = "Not set. Claude guesses for small asks (and says so) and asks for big ones.";
+
+// Expanded rows survive remounting (section move, tab switch): the
+// open set is module-level so component-local state can seed from it.
+const _todoExpandedIds = new Set();
+
+function _todoPost(path, body) {
+  return fetch(path, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+}
+function _todoBase(id) { return "/api/todos/" + encodeURIComponent(id); }
+function _todoFormatTime(at) {
+  if (!at) return "";
+  const d = new Date(at);
+  return Number.isNaN(d.getTime())
+    ? ""
+    : d.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+}
+function _todoUuid() {
+  // crypto.randomUUID lands cleanly on every browser we ship against,
+  // but keep a fallback for ancient Safari where tests might run.
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return "msg-" + Math.random().toString(36).slice(2) + "-" + Date.now();
+}
+
+// Segmented 4-button intent picker. Arrow keys roam with roving
+// tabindex, 1-4 pick directly, Backspace / Delete clears. Click again
+// on the pressed segment clears it; rollback on POST failure.
+function EffortPicker({level, onSet, busy, error}) {
+  const [roving, setRoving] = useState(level ? level - 1 : 0);
+  const groupRef = useRef(null);
+  useEffect(() => { if (level) setRoving(level - 1); }, [level]);
+  const MOVES = {ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1};
+  function onKeyDown(e) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const move = MOVES[e.key];
+    if (move !== undefined) {
+      e.preventDefault();
+      const next = (roving + move + EFFORT_SCALE.length) % EFFORT_SCALE.length;
+      setRoving(next);
+      const segs = groupRef.current && groupRef.current.querySelectorAll(".effort-seg");
+      if (segs && segs[next]) segs[next].focus();
+    } else if (/^[1-4]$/.test(e.key)) {
+      e.preventDefault();
+      if (!busy) onSet(Number(e.key));
+    } else if (e.key === "Backspace" || e.key === "Delete") {
+      e.preventDefault();
+      if (!busy) onSet(null);
+    }
+  }
+  function pick(next) {
+    if (busy) return;
+    onSet(next === level ? null : next);
+  }
+  return h("div", {className: "effort", "data-effort-picker": "true", onKeyDown},
+    h("div", {ref: groupRef, role: "group", "aria-label": "Effort",
+              className: "effort-segs"},
+      EFFORT_SCALE.map((seg, i) => h("button", {
+        key: seg.level,
+        type: "button",
+        className: "effort-seg",
+        "data-testid": "effort-seg-" + seg.level,
+        "aria-pressed": level === seg.level,
+        "aria-description": seg.summary,
+        title: seg.summary,
+        tabIndex: roving === i ? 0 : -1,
+        disabled: busy,
+        onFocus: () => setRoving(i),
+        onClick: () => pick(seg.level),
+      }, h("span", {className: "effort-name"}, seg.name))),
+    ),
+    h("p", {className: "effort-hint"},
+      level
+        ? EFFORT_SCALE[level - 1].summary
+        : h("span", {className: "effort-unset"}, EFFORT_UNSET_HINT),
+      level
+        ? h("button", {
+            type: "button",
+            className: "effort-clear",
+            disabled: busy,
+            onClick: () => pick(null),
+          }, "Clear")
+        : null,
+    ),
+    error ? h("p", {role: "alert", className: "form-error"}, error) : null,
+  );
+}
+
+function TodoBubble({msg}) {
+  const role = msg.role || "system";
+  const cls = "bubble " + (
+    role === "user" ? "bubble-user"
+    : role === "claude" ? "bubble-claude"
+    : "bubble-system"
+  );
+  const meta = msg.at ? _todoFormatTime(msg.at) : "";
+  return h("div", {className: cls, "data-role": role},
+    role === "claude"
+      ? h("div", {className: "bubble-text",
+                  dangerouslySetInnerHTML: {__html: renderMarkdown(msg.text || "")}})
+      : msg.text ? h("div", {className: "bubble-text"}, msg.text) : null,
+    role !== "system" && meta
+      ? h("small", {className: "bubble-meta"}, meta)
+      : null,
+  );
+}
+
+function TodoCard({item, onItemChange}) {
+  const [expanded, setExpanded] = useState(() => _todoExpandedIds.has(item.id));
+  const [effortBusy, setEffortBusy] = useState(false);
+  const [effortError, setEffortError] = useState(null);
+  const [draft, setDraft] = useState("");
+  const [sendError, setSendError] = useState(null);
+  const [settled, setSettled] = useState(null); // {verb, resolution}
+  const headerRef = useRef(null);
+  const taRef = useRef(null);
+
+  useEffect(() => {
+    if (expanded) _todoExpandedIds.add(item.id);
+    else _todoExpandedIds.delete(item.id);
+  }, [expanded, item.id]);
+
+  // Undo window: 5 seconds after Resolve/Dismiss. When it elapses, the
+  // card archives itself out of the list via onItemChange(..., {__archived: true}).
+  useEffect(() => {
+    if (!settled) return;
+    const t = setTimeout(() => onItemChange(item.id, {__archived: true}), 5000);
+    return () => clearTimeout(t);
+  }, [settled, item.id, onItemChange]);
+
+  // Auto-grow the composer textarea against its content (capped by CSS max-height).
+  useEffect(() => {
+    const ta = taRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = Math.min(ta.scrollHeight, 192) + "px";
+  }, [draft, expanded]);
+
+  function onCardKeyDown(e) {
+    if (e.key === "Escape" && expanded) {
+      e.preventDefault();
+      setExpanded(false);
+      if (headerRef.current) headerRef.current.focus();
+    }
+  }
+
+  async function setEffort(level) {
+    if (effortBusy) return;
+    const prior = item.effort;
+    setEffortBusy(true);
+    setEffortError(null);
+    onItemChange(item.id, {effort: level == null ? undefined : level});
+    try {
+      const r = await _todoPost(_todoBase(item.id) + "/effort", {effort: level});
+      if (!r.ok) throw new Error("HTTP " + r.status);
+    } catch (err) {
+      onItemChange(item.id, {effort: prior});
+      setEffortError("Could not set the effort level.");
+    } finally {
+      setEffortBusy(false);
+    }
+  }
+
+  async function send(e) {
+    if (e && e.preventDefault) e.preventDefault();
+    const text = draft.trim();
+    if (!text) return;
+    const messageId = _todoUuid();
+    const optimistic = {
+      id: messageId, role: "user", text,
+      at: new Date().toISOString(),
+    };
+    const prior = item.messages || [];
+    setDraft("");
+    setSendError(null);
+    onItemChange(item.id, {messages: [...prior, optimistic]});
+    try {
+      const r = await _todoPost(_todoBase(item.id) + "/messages",
+                                {text, messageId});
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      // The thread.message SSE echo would confirm this bubble; in the
+      // demo we leave the optimistic entry in place.
+    } catch (err) {
+      onItemChange(item.id, {messages: prior});
+      setDraft(text);
+      setSendError("Could not send the message.");
+    }
+  }
+
+  function onComposerKeyDown(e) {
+    // Enter sends; Shift+Enter inserts a newline (default textarea
+    // behaviour). Ctrl+Enter / Cmd+Enter also send for parity with
+    // the chat composer.
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      send(e);
+    }
+  }
+
+  function resolve(resolution) {
+    const verb = resolution === "resolved" ? "Resolved" : "Dismissed";
+    setSettled({verb, resolution});
+    // Best-effort POST — the undo path still works regardless, and
+    // the server is idempotent on repeat posts (Phase 2 backend contract).
+    _todoPost(_todoBase(item.id) + "/resolve", {resolution}).catch(() => {});
+  }
+
+  function reopen() {
+    if (!settled) return;
+    setSettled(null);
+    _todoPost(_todoBase(item.id) + "/reopen").catch(() => {});
+  }
+
+  if (settled) {
+    return h("li", {
+      className: "todo-card is-settled",
+      "data-todo-id": item.id,
+      "data-testid": "todo-" + item.id,
+    },
+      h("div", {className: "todo-row"},
+        h("strong", {className: "todo-title"}, item.title),
+        h("p", {className: "todo-settled", "data-testid": "settled-" + item.id},
+          h("span", {className: "todo-settled-text"}, settled.verb),
+          " — ",
+          h("button", {
+            type: "button",
+            className: "link-button",
+            "aria-label": "Undo: " + item.title,
+            "data-testid": "undo-" + item.id,
+            onClick: reopen,
+          }, "Undo (5s)"),
+        ),
+      ),
+    );
+  }
+
+  const messages = item.messages || [];
+  const working = item.agentStatus === "working";
+  const effort = item.effort;
+
+  return h("li", {
+    className: "todo-card" + (expanded ? " is-expanded" : ""),
+    "data-todo-id": item.id,
+    "data-testid": "todo-" + item.id,
+    onKeyDown: onCardKeyDown,
+  },
+    h("div", {className: "todo-row"},
+      h("button", {
+        ref: headerRef,
+        type: "button",
+        className: "todo-header",
+        "data-todo-header": "true",
+        "data-testid": "header-" + item.id,
+        "aria-expanded": expanded,
+        onClick: () => setExpanded(v => !v),
+      },
+        h("strong", null, item.title),
+      ),
+      h("span", {className: "todo-meta"}, item.when || ""),
+      h("span", {className: "todo-pill", "aria-hidden": "true"},
+        expanded ? "Hide" : "Reply"),
+    ),
+    expanded ? h("div", {className: "todo-body", "data-testid": "body-" + item.id},
+      item.detailsExcerpt
+        ? h("div", {
+            className: "details",
+            dangerouslySetInnerHTML: {__html: renderMarkdown(item.detailsExcerpt)},
+          })
+        : null,
+      h(EffortPicker, {
+        level: effort, onSet: setEffort,
+        busy: effortBusy, error: effortError,
+      }),
+      h("div", {className: "todo-thread"},
+        h("div", {
+          className: "conversation",
+          "data-testid": "conversation-" + item.id,
+        },
+          messages.map(m => h(TodoBubble, {key: m.id, msg: m})),
+        ),
+        working
+          ? h("p", {
+              className: "on-it", role: "status",
+              "data-testid": "on-it-" + item.id,
+            }, "Claude is on it…")
+          : null,
+      ),
+      h("form", {className: "composer", onSubmit: send},
+        h("textarea", {
+          ref: taRef,
+          "aria-label": "Reply to " + item.title,
+          "data-testid": "composer-" + item.id,
+          placeholder: "Reply to Claude",
+          value: draft,
+          rows: 1,
+          onChange: e => setDraft(e.target.value),
+          onKeyDown: onComposerKeyDown,
+        }),
+        h("button", {
+          type: "submit",
+          className: "btn btn-primary btn-send",
+          "data-testid": "send-" + item.id,
+          disabled: draft.trim() === "",
+        }, "Send"),
+      ),
+      sendError ? h("p", {role: "alert", className: "form-error"}, sendError) : null,
+      h("div", {className: "todo-actions"},
+        h("button", {
+          type: "button",
+          className: "btn btn-neutral",
+          "data-testid": "resolve-" + item.id,
+          "aria-label": "Resolve " + item.title,
+          onClick: () => resolve("resolved"),
+        }, "Resolve"),
+        h("button", {
+          type: "button",
+          className: "btn btn-ghost",
+          "data-testid": "dismiss-" + item.id,
+          "aria-label": "Dismiss " + item.title,
+          onClick: () => resolve("dismissed"),
+        }, "Dismiss"),
+      ),
+    ) : null,
+  );
+}
+
+// Demo mount: self-contained TodoCard list seeded with sample items so
+// the Phase 2 frontend can be reviewed, screenshotted, and smoke-tested
+// without Phase 1's collapsed-card renderer or the Phase 2 backend
+// routes landing first. Once both land, this page can either be
+// retired in favour of the live WoY list or kept as a visual gallery.
+function TodosPage() {
+  const nowIso = (deltaMs) => new Date(Date.now() + deltaMs).toISOString();
+  const [items, setItems] = useState(() => [
+    {
+      id: "demo-1",
+      title: "Review Phase 1 token diff",
+      detailsExcerpt: "Phase 1 ports the Agent-UI tokens into `design-tokens.css`. Scan the diff and flag anything that **shifts** an existing token's meaning rather than adding a new one.",
+      effort: undefined,
+      agentStatus: "idle",
+      when: "3m ago",
+      messages: [
+        {id: "seed-1a", role: "claude",
+         text: "Skim done — no load-bearing token shifts. Want me to run a visual diff against the chat page?",
+         at: nowIso(-180000)},
+      ],
+    },
+    {
+      id: "demo-2",
+      title: "Phase 2 backend route schema",
+      detailsExcerpt: "Wire `POST /api/todos/<id>/{effort,messages,resolve,reopen}` into the SSE stream. Sibling PR owns the schema.",
+      effort: 3,
+      agentStatus: "working",
+      when: "just now",
+      messages: [
+        {id: "seed-2a", role: "user",
+         text: "Draft the resolve path first — undo matters more than reopen.",
+         at: nowIso(-60000)},
+        {id: "seed-2b", role: "claude",
+         text: "On it. Posting the diff in a sec.",
+         at: nowIso(-30000)},
+      ],
+    },
+    {
+      id: "demo-3",
+      title: "Smoke-test undo strip",
+      detailsExcerpt: "Make sure the 5-second undo actually restores the card. Click **Resolve**, then click **Undo (5s)** before the timer elapses.",
+      effort: undefined,
+      agentStatus: "idle",
+      when: "1h ago",
+      messages: [],
+    },
+  ]);
+  const onItemChange = useCallback((id, patch) => {
+    setItems(prev => {
+      if (patch && patch.__archived) return prev.filter(x => x.id !== id);
+      return prev.map(x => (x.id === id ? Object.assign({}, x, patch) : x));
+    });
+  }, []);
+  return h("div", {className: "todos-page todos"},
+    h("h2", {className: "todos-title"}, "Todos"),
+    h("p", {className: "todos-hint"},
+      "Click a row to expand. Press 1–4 inside a card to set effort, Backspace to clear. Enter sends a reply; Shift+Enter inserts a newline. Esc collapses."),
+    items.length
+      ? h("ul", {className: "todo-list"},
+          items.map(it => h(TodoCard, {key: it.id, item: it, onItemChange})))
+      : h("p", {className: "todos-hint"}, "All clear."),
+  );
+}
+
 function App() {
   const [state, dispatch] = useReducer(reducer, INITIAL);
   useEventStream(dispatch);
@@ -4541,6 +5141,14 @@ function App() {
         nowMs,
       });
     }
+  } else if (route === "todos") {
+    // Agent-UI Phase 2 frontend: self-contained demo mount for the
+    // expanded todo card (intent picker + composer + resolve/dismiss +
+    // undo). Phase 1 ports the collapsed card + tokens; Phase 2
+    // backend adds the matching POST routes. Until both land, this
+    // page runs on seeded sample data and the API handlers fire best
+    // effort — failure rolls back optimistic state in-place.
+    content = h(TodosPage);
   } else {
     const key = route === "review" ? "page:review" : ("page:" + route);
     const payload = state.sections[key];
