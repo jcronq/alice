@@ -155,6 +155,41 @@ graceful_stop() {
     compose stop "$CONTAINER"
 }
 
+verify_hotswaps() {
+    # The two bind-mounted binaries (see alice-hotswap-sync and the
+    # "hot-swap" mounts in docker-compose.yml) must be what the container
+    # actually runs: signal-cli's RPC must report the Dockerfile's
+    # SIGNAL_CLI_VERSION, and the SDK's bundled claude must be the staged
+    # one. This is the check that would have caught every silent
+    # regression to 0.14.1 / 2.1.191 at deploy time instead of hours later.
+    local want_sc have_sc want_cl have_cl i
+    want_sc="$(sed -n 's/^ARG SIGNAL_CLI_VERSION=\([0-9][0-9.]*\).*/\1/p' "$SANDBOX_DIR/Dockerfile" | head -n1)"
+    want_cl="$("$ALICE_HOTSWAP_DIR/claude" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+    have_sc=""
+    for ((i=0; i<SERVICE_PROBE_TIMEOUT*2; i++)); do
+        have_sc="$(curl -s --max-time 3 -X POST http://127.0.0.1:8080/api/v1/rpc \
+            -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","method":"version","id":"deploy"}' 2>/dev/null \
+            | grep -oE '"version":"[0-9.]+"' | grep -oE '[0-9.]+' || true)"
+        [ -n "$have_sc" ] && break
+        sleep 0.5
+    done
+    if [ "$have_sc" != "$want_sc" ]; then
+        log "signal-cli in container reports '${have_sc:-<no answer>}', Dockerfile wants $want_sc"
+        return 1
+    fi
+    log "signal-cli: $have_sc"
+    have_cl="$(docker exec "$CONTAINER" \
+        /opt/alice-venv/lib/python3.13/site-packages/claude_agent_sdk/_bundled/claude --version 2>/dev/null \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+    if [ -z "$want_cl" ] || [ "$have_cl" != "$want_cl" ]; then
+        log "bundled claude in container reports '${have_cl:-<none>}', staged copy is '${want_cl:-<none>}'"
+        return 1
+    fi
+    log "bundled claude: $have_cl"
+    return 0
+}
+
 post_up_verify() {
     local label="$1"
     log "Probing $HEALTH_URL (timeout ${HEALTH_TIMEOUT}s) ..."
@@ -167,6 +202,18 @@ post_up_verify() {
         docker logs --tail 80 "$CONTAINER" 2>&1 || true
         die "$label aborted: one or more s6 services not up"
     fi
+    log "Verifying hot-swap binaries (signal-cli, bundled claude) ..."
+    if [ "$DRY_RUN" != 1 ] && ! verify_hotswaps; then
+        die "$label aborted: container is running the image's stale binaries; run bin/alice-hotswap-sync and redeploy"
+    fi
+}
+
+stage_hotswaps() {
+    # Must run before any `compose up` that may create a container: the
+    # bind sources have to exist (docker would otherwise create directories
+    # in their place). Idempotent and cheap once staged.
+    log "Staging hot-swap binaries ..."
+    run "$ALICE_ROOT/bin/alice-hotswap-sync"
 }
 
 deploy() {
@@ -185,6 +232,7 @@ deploy() {
     log "Building $IMAGE ..."
     compose build alice
 
+    stage_hotswaps
     graceful_stop
 
     log "Bringing up $CONTAINER ..."
@@ -200,6 +248,7 @@ rollback() {
         die "no $PREMIG_IMAGE to roll back to (deploy at least once first)"
     fi
 
+    stage_hotswaps
     graceful_stop
 
     log "Restoring $PREMIG_IMAGE -> $IMAGE ..."

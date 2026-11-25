@@ -241,11 +241,14 @@ def test_section_update_fires_on_asks_write(site):
             + "\n"
         )
         # Wait for the delta. Tick is 0.05s; give it a couple of seconds.
+        # Tighten predicate so we skip any initial-hydration section.update
+        # that races ahead of the asks.jsonl write (3.11 scheduling order).
         ev = _read_frames_until(
             resp,
             lambda e: isinstance(e, dict)
             and e.get("type") == "section.update"
-            and e.get("name") == "waiting_on_you",
+            and e.get("name") == "waiting_on_you"
+            and "ping me loudly" in e.get("data", {}).get("markdown", ""),
             timeout=4.0,
         )
         assert "ping me loudly" in ev["data"]["markdown"]

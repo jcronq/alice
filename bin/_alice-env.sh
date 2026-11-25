@@ -62,6 +62,10 @@ export ALICE_TOOLS="${ALICE_TOOLS:-$ALICE_ROOT/data/alice-tools}"
 # this name. Overridable for ops that want a non-default install
 # (e.g. running two sandboxes side-by-side under different names).
 export ALICE_CONTAINER="${ALICE_CONTAINER:-alice}"
+# Host dir holding the binaries compose bind-mounts over the image's
+# broken copies (signal-cli, the SDK's bundled claude). Populated by
+# bin/alice-hotswap-sync; see the "hot-swap" mounts in docker-compose.yml.
+export ALICE_HOTSWAP_DIR="${ALICE_HOTSWAP_DIR:-$HOME/.local/state/alice/hotswap}"
 
 # Source alice.env so any secrets the user keeps there (CLAUDE_*,
 # ANTHROPIC_*, GH_TOKEN, etc.) are visible to compose's variable

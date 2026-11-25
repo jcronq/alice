@@ -58,6 +58,8 @@ Notes:
 ## Other bin wrappers
 
 `bin/alice-up`, `bin/alice-down`, `bin/alice-deploy` (blue/green swap),
+`bin/alice-hotswap-sync` (stage the signal-cli + bundled-claude binaries
+that compose bind-mounts over the stale image; run by alice-up/alice-deploy),
 `bin/alice-shell` (exec into the live worker),
 `bin/alice-speaking-bounce` (rescue tool — reap orphan claude procs and
 `s6-svc -r` the speaking daemon when the CLI socket goes deaf),
