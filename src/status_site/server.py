@@ -142,6 +142,12 @@ from status_site.chat_reactions import (
     valid_emoji,
     ATTENTION_EMOJI,
 )
+# Phase 2 (Agent UI port): richer per-item Todo schema + the Agent UI
+# SSE event vocabulary ride on top of the existing sections stream.
+# Both modules are strictly additive — Phase 1 cards keep consuming
+# ``section.update`` / ``page:<slug>`` unchanged.
+from status_site import todos as _todos
+from status_site import todo_events as _todo_events
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 # The SSE-driven React shell at ``index.html`` is the only UI; it
@@ -4508,6 +4514,320 @@ def handle_waiting_order(cfg: Config, d: dict) -> dict:
     return {"ok": True, "order": clean}
 
 
+# ---------------------------------------------------------------- Phase 2 Todo routes
+#
+# Agent UI port, Phase 2 backend: four POST endpoints the P2 frontend
+# calls to mutate per-item TODO state. Each one maps to a write on
+# ``asks.jsonl`` / per-thread file / ``.woy-effort.jsonl`` and (when
+# the broadcaster is wired) fans a ``todo.upsert`` / ``todo.removed``
+# / ``thread.message`` event to every open SSE connection.
+#
+# Routes live on the dynamic path pattern ``/api/todos/<id>/<action>``
+# so the Phase 2 frontend can address a TODO by its ask id without
+# having to carry it in the body. Idempotency per
+# ``(id, messageId)`` for the ``/messages`` endpoint is the only
+# non-obvious semantic — a dup write is a no-op on disk and emits no
+# event. The other three routes are idempotent by construction (last
+# write wins for effort; resolve on an already-resolved record is a
+# no-op; reopen on an open record ditto).
+
+_TODO_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_TODO_ROUTE_RE = re.compile(
+    r"^/api/todos/(?P<id>[A-Za-z0-9_-]{1,64})/(?P<action>effort|messages|resolve|reopen)$"
+)
+# Messages route cap: match ``MAX_TEXT`` so a Phase 2 reply has the
+# same length budget as a Phase 1 ``/api/reply`` post.
+TODO_MESSAGE_MAX_TEXT = MAX_TEXT
+# Idempotency cap: track the most recent N messageIds per thread so
+# a retried POST doesn't double-append. Small — the frontend only
+# retries on failure, so a dozen keys per thread is plenty.
+TODO_MESSAGE_ID_MAX = 128
+# Legal effort body values. ``null`` clears the slug (matches
+# ``shared/src/effort.ts``'s ``SetEffortBody``).
+TODO_EFFORT_LEVELS = {1, 2, 3, 4}
+# Level → word label so the existing ``.woy-effort.jsonl`` schema
+# (which stores words) stays the single source of truth.
+_EFFORT_LEVEL_TO_WORD = {1: "spike", 2: "prototype", 3: "solid", 4: "autonomous"}
+TODO_RESOLUTIONS = ("resolved", "dismissed")
+
+
+def _write_asks_atomic(path: Path, records: list[dict]) -> None:
+    """Rewrite ``asks.jsonl`` atomically (used by resolve / reopen).
+
+    Mirrors ``cli._write_asks`` — same sort-keys-on-write + atomic
+    rename so a crash mid-write doesn't truncate the file. ``cli.py``
+    keeps its private helper to avoid an import cycle with this module.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        for r in records:
+            f.write(json.dumps(r, sort_keys=True) + "\n")
+    tmp.replace(path)
+
+
+def _read_thread(cfg: Config, tid: str) -> list[dict]:
+    """Return the thread file as a list of messages (empty on missing)."""
+    return read_threads(cfg).get(tid, [])
+
+
+def _publish_todo_event(cfg: Config, ev: dict) -> None:
+    """Fan one Agent UI event to every open SSE subscriber.
+
+    Silently drops when the broadcaster isn't wired (tests that don't
+    spin one up). Never raises — the HTTP response must land even if
+    the fanout fails.
+    """
+    bc = cfg.broadcaster
+    if bc is None:
+        return
+    try:
+        bc.publish_event(ev)
+    except Exception as e:  # noqa: BLE001 — never break a handler for a bad fanout
+        print(f"status_site: todo event publish failed: {e!r}", flush=True)
+
+
+def build_todo_for(cfg: Config, record: dict) -> dict:
+    """Build the Todo dict for one ask record (used by upsert events)."""
+    tid = str(record.get("id") or "")
+    thread = _read_thread(cfg, tid)
+    # The effort ledger keys on the WoY slug, which equals the ask id
+    # for Phase 2 records (the frontend addresses them by id). Fall
+    # back to the title slug when the ledger doesn't know the id (so
+    # Phase 1 records still match).
+    effort_map = read_woy_effort(cfg.status_dir)
+    raw = effort_map.get(tid)
+    if raw is None:
+        title_slug = safe_slug(_todos.title_and_excerpt(str(record.get("text") or ""))[0])
+        if title_slug:
+            raw = effort_map.get(title_slug)
+    effort = _todos.effort_level(raw)
+    effort_by = "user" if effort is not None else None
+    return _todos.build_todo(
+        record, thread=thread, effort=effort, effort_by=effort_by
+    )
+
+
+def build_todo_snapshot_fields(cfg: Config) -> dict:
+    """Produce the Agent UI snapshot fields for one SSE connection.
+
+    Loaded from the ask log + per-thread files + the effort ledger on
+    every snapshot — cheap enough (small log) and keeps the snapshot
+    fresh without a separate poll.
+    """
+    asks = _read_asks(_asks_path(cfg.status_dir))
+    threads = read_threads(cfg)
+    effort_map = read_woy_effort(cfg.status_dir)
+    # Index effort by both id and title-slug so Phase 2 (id-keyed) and
+    # Phase 1 (slug-keyed) records both pick up a level.
+    effort_by_id: dict[str, object] = {}
+    for rec in asks:
+        rid = str(rec.get("id") or "")
+        if rid and rid in effort_map:
+            effort_by_id[rid] = effort_map[rid]
+            continue
+        title_slug = safe_slug(
+            _todos.title_and_excerpt(str(rec.get("text") or ""))[0]
+        )
+        if title_slug and title_slug in effort_map:
+            effort_by_id[rid] = effort_map[title_slug]
+    todos = _todos.build_todos(
+        asks, threads=threads, effort_by_id=effort_by_id
+    )
+    return _todo_events.snapshot_fields(
+        todos,
+        work_statuses=[],
+        agent_status=_todo_events.AGENT_STATUS_IDLE,
+    )
+
+
+def _find_ask(records: list[dict], ask_id: str) -> dict | None:
+    for r in records:
+        if r.get("id") == ask_id:
+            return r
+    return None
+
+
+def handle_todo_effort(
+    cfg: Config, todo_id: str, body: dict
+) -> dict:
+    """``POST /api/todos/<id>/effort`` — set/clear the TODO's effort level.
+
+    Body: ``{key, effort: 1|2|3|4|null}``. Writes the effort ledger
+    (reusing the existing ``.woy-effort.jsonl`` store so both
+    Phase 1 and Phase 2 pick up the same level), and fires a
+    ``todo.upsert`` event with the refreshed Todo. Idempotent — the
+    ledger is append-only and last-write-wins at read time.
+    """
+    if not isinstance(body, dict):
+        raise ReplyError(400, "bad json")
+    if not hmac.compare_digest(str(body.get("key", "")).encode(), cfg.key.encode()):
+        raise ReplyError(403, "bad key")
+    raw = body.get("effort")
+    if raw is None:
+        level_word = ""  # clears the slug
+        level_num: int | None = None
+    elif isinstance(raw, bool):
+        # bool is a subclass of int in Python — reject explicitly so
+        # ``effort: true`` isn't silently coerced to ``spike``.
+        raise ReplyError(400, "bad effort")
+    elif isinstance(raw, int) and raw in TODO_EFFORT_LEVELS:
+        level_num = raw
+        level_word = _EFFORT_LEVEL_TO_WORD[raw]
+    else:
+        raise ReplyError(400, "bad effort")
+
+    asks_file = _asks_path(cfg.status_dir)
+    with cfg.lock:
+        records = _read_asks(asks_file)
+        ask = _find_ask(records, todo_id)
+        if ask is None:
+            raise ReplyError(404, "no such todo")
+        _append_woy_effort(cfg.status_dir, slug=todo_id, level=level_word)
+
+    todo = build_todo_for(cfg, ask)
+    # Overlay the just-written effort — ``build_todo_for`` reads from
+    # the ledger again but a fresh writer may race with its own read
+    # on the next tick. Explicit overlay keeps the response + event
+    # deterministic.
+    if level_num is None:
+        todo.pop("effort", None)
+        todo.pop("effortBy", None)
+    else:
+        todo["effort"] = level_num
+        todo["effortBy"] = "user"
+    _publish_todo_event(cfg, _todo_events.todo_upsert_event(todo))
+    return {"ok": True, "todo": todo}
+
+
+def handle_todo_messages(
+    cfg: Config, todo_id: str, body: dict
+) -> dict:
+    """``POST /api/todos/<id>/messages`` — append a user message to the thread.
+
+    Body: ``{key, text, messageId?, images?}``. Appends to the
+    per-thread file and fires a ``thread.message`` event. Idempotent
+    per ``messageId`` — a duplicate id is a no-op (same recent write
+    count, same response). Images are accepted in the body for schema
+    completeness; the stub doesn't persist them (the real Claude
+    backend lives in a separate slice).
+    """
+    if not isinstance(body, dict):
+        raise ReplyError(400, "bad json")
+    if not hmac.compare_digest(str(body.get("key", "")).encode(), cfg.key.encode()):
+        raise ReplyError(403, "bad key")
+    text = str(body.get("text") or "").strip()[:TODO_MESSAGE_MAX_TEXT]
+    message_id = str(body.get("messageId") or "").strip()[:TODO_MESSAGE_MAX_TEXT]
+    images_raw = body.get("images") or []
+    if images_raw and not isinstance(images_raw, list):
+        raise ReplyError(400, "bad images")
+    if not text:
+        raise ReplyError(400, "empty message")
+
+    with cfg.lock:
+        existing = _read_thread(cfg, todo_id)
+        if message_id:
+            # Idempotent per (id, messageId): a second POST with the
+            # same id is a no-op. Scan the recent tail only.
+            tail = existing[-TODO_MESSAGE_ID_MAX:]
+            for m in tail:
+                if m.get("id") == message_id or m.get("messageId") == message_id:
+                    return {"ok": True, "deduped": True, "messageId": message_id}
+        message = {
+            "from": "jason",
+            "role": "user",
+            "at": now_iso(),
+            "text": text,
+        }
+        if message_id:
+            message["id"] = message_id
+            message["messageId"] = message_id
+        if images_raw:
+            # Record the count only — stub doesn't persist bytes.
+            message["imageCount"] = len(images_raw)
+        append_thread(cfg, todo_id, message)
+
+        asks_file = _asks_path(cfg.status_dir)
+        records = _read_asks(asks_file)
+        ask = _find_ask(records, todo_id)
+
+    # Fan ``thread.message`` + a ``todo.upsert`` so clients that
+    # don't track thread state still see ``messageCount`` tick up.
+    event_msg = _todos.build_last_message(message)
+    _publish_todo_event(
+        cfg, _todo_events.thread_message_event(todo_id, event_msg)
+    )
+    if ask is not None:
+        _publish_todo_event(
+            cfg, _todo_events.todo_upsert_event(build_todo_for(cfg, ask))
+        )
+    return {"ok": True, "messageId": message_id or None, "message": event_msg}
+
+
+def handle_todo_resolve(
+    cfg: Config, todo_id: str, body: dict
+) -> dict:
+    """``POST /api/todos/<id>/resolve`` — mark the Todo done or dismissed.
+
+    Body: ``{key, resolution: "resolved"|"dismissed"}``. Writes
+    ``resolved=True`` + ``resolved_at`` to the ask record and fires
+    ``todo.removed``. Idempotent — re-resolving is a no-op.
+    """
+    if not isinstance(body, dict):
+        raise ReplyError(400, "bad json")
+    if not hmac.compare_digest(str(body.get("key", "")).encode(), cfg.key.encode()):
+        raise ReplyError(403, "bad key")
+    resolution = str(body.get("resolution") or "").strip().lower()
+    if resolution not in TODO_RESOLUTIONS:
+        raise ReplyError(400, "bad resolution")
+
+    asks_file = _asks_path(cfg.status_dir)
+    with cfg.lock:
+        records = _read_asks(asks_file)
+        ask = _find_ask(records, todo_id)
+        if ask is None:
+            raise ReplyError(404, "no such todo")
+        if not ask.get("resolved"):
+            ask["resolved"] = True
+            ask["resolved_at"] = now_iso()
+            ask["resolution"] = resolution
+            _write_asks_atomic(asks_file, records)
+
+    _publish_todo_event(cfg, _todo_events.todo_removed_event(todo_id))
+    return {"ok": True, "id": todo_id, "resolution": resolution}
+
+
+def handle_todo_reopen(
+    cfg: Config, todo_id: str, body: dict
+) -> dict:
+    """``POST /api/todos/<id>/reopen`` — the Undo endpoint.
+
+    Body: ``{key}``. Clears ``resolved`` / ``resolved_at`` on the
+    ask record and fires ``todo.upsert`` with the refreshed Todo.
+    Idempotent — reopening an already-open record is a no-op.
+    """
+    if not isinstance(body, dict):
+        raise ReplyError(400, "bad json")
+    if not hmac.compare_digest(str(body.get("key", "")).encode(), cfg.key.encode()):
+        raise ReplyError(403, "bad key")
+
+    asks_file = _asks_path(cfg.status_dir)
+    with cfg.lock:
+        records = _read_asks(asks_file)
+        ask = _find_ask(records, todo_id)
+        if ask is None:
+            raise ReplyError(404, "no such todo")
+        if ask.get("resolved"):
+            ask["resolved"] = False
+            ask.pop("resolved_at", None)
+            ask.pop("resolution", None)
+            _write_asks_atomic(asks_file, records)
+
+    todo = build_todo_for(cfg, ask)
+    _publish_todo_event(cfg, _todo_events.todo_upsert_event(todo))
+    return {"ok": True, "todo": todo}
+
+
 class Handler(BaseHTTPRequestHandler):
     cfg: Config  # set by make_server
     server_version = "StatusSite/1.0"
@@ -4898,8 +5218,24 @@ class Handler(BaseHTTPRequestHandler):
             "/api/stage-run": handle_stage_run,
             "/api/presence": handle_presence,
         }
+        # Phase 2 Agent UI: ``/api/todos/<id>/<action>`` is dynamic —
+        # match the pattern BEFORE the exact-path dispatch so a
+        # future exact-path handler doesn't accidentally mask it.
+        todo_m = _TODO_ROUTE_RE.match(route)
+        todo_dispatch: tuple[Callable[[Config, str, dict], dict], str] | None = None
+        if todo_m is not None:
+            action = todo_m.group("action")
+            todo_id = todo_m.group("id")
+            action_map = {
+                "effort": handle_todo_effort,
+                "messages": handle_todo_messages,
+                "resolve": handle_todo_resolve,
+                "reopen": handle_todo_reopen,
+            }
+            todo_dispatch = (action_map[action], todo_id)
+
         fn = handlers.get(route)
-        if fn is None:
+        if fn is None and todo_dispatch is None:
             return self._json(404, {"error": "not found"})
         try:
             n = int(self.headers.get("Content-Length", "0"))
@@ -4915,7 +5251,10 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self._json(400, {"error": "bad json"})
         try:
-            return self._json(200, fn(self.cfg, d))
+            if todo_dispatch is not None:
+                todo_fn, todo_id = todo_dispatch
+                return self._json(200, todo_fn(self.cfg, todo_id, d))
+            return self._json(200, fn(self.cfg, d))  # type: ignore[misc]
         except ReplyError as e:
             return self._json(e.code, {"error": e.msg})
 
@@ -4999,6 +5338,11 @@ def main() -> None:
         broadcaster = SectionBroadcaster(
             section_renderers(cfg),
             tick_seconds=cfg.sse_tick_seconds,
+            # Phase 2 Agent UI port — merge ``todos`` / ``workStatuses``
+            # / ``agentStatus`` into every snapshot so a P2 client reads
+            # them off the first frame. Phase 1 clients ignore the extra
+            # keys (``sections`` stays authoritative for them).
+            snapshot_augmentor=lambda: build_todo_snapshot_fields(cfg),
         )
         cfg.broadcaster = broadcaster
         broadcaster.start()

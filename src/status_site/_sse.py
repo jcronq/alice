@@ -97,11 +97,19 @@ class SectionBroadcaster:
         tick_seconds: float = DEFAULT_TICK_SECONDS,
         stop: threading.Event | None = None,
         subscriber_queue_max: int = DEFAULT_SUBSCRIBER_QUEUE_MAX,
+        # Phase 2 Agent UI port: optional callable that returns the
+        # extra snapshot fields (``todos`` / ``workStatuses`` /
+        # ``agentStatus``) the frontend reads alongside ``sections``.
+        # Pure merge — if the callable returns a dict, those keys are
+        # spliced into every ``type: snapshot`` payload. ``None`` means
+        # "Phase 1 only", tests spin up the broadcaster without this.
+        snapshot_augmentor: "Callable[[], dict] | None" = None,
     ):
         self._renderers = dict(renderers)
         self._tick_seconds = tick_seconds
         self.stop = stop or threading.Event()
         self._subscriber_queue_max = subscriber_queue_max
+        self._snapshot_augmentor = snapshot_augmentor
         # Broadcaster-local lock. Deliberately NOT ``cfg.lock``: a
         # renderer closure itself acquires ``cfg.lock`` indirectly (via
         # ``OverviewPollers.get``); nesting the two would deadlock since
@@ -140,6 +148,12 @@ class SectionBroadcaster:
         """Render every section fresh and return a ``type: snapshot``
         payload. Side-effect: the "last rendered" cache is seeded, so
         the very next tick won't re-emit everything as a delta.
+
+        Phase 2 Agent UI: when ``snapshot_augmentor`` is set, its
+        return dict (``todos`` / ``workStatuses`` / ``agentStatus``)
+        is merged into the payload so one SSE connection carries both
+        shapes. Augmentor exceptions never kill the stream — we skip
+        the merge and log a debug repr.
         """
         sections: dict[str, dict] = {}
         rendered_now: dict[str, dict] = {}
@@ -149,7 +163,41 @@ class SectionBroadcaster:
             rendered_now[name] = payload
         with self._lock:
             self._rendered.update(rendered_now)
-        return {"type": "snapshot", "ts": _now_iso(), "sections": sections}
+        snap: dict = {"type": "snapshot", "ts": _now_iso(), "sections": sections}
+        if self._snapshot_augmentor is not None:
+            try:
+                extra = self._snapshot_augmentor()
+            except Exception as e:  # noqa: BLE001 — never kill the snapshot
+                print(
+                    f"status_site: SSE snapshot augmentor failed: {e!r}",
+                    flush=True,
+                )
+            else:
+                if isinstance(extra, dict):
+                    # Don't let an augmentor overwrite the core keys —
+                    # ``sections`` / ``type`` / ``ts`` are the
+                    # broadcaster's contract. Everything else is fair
+                    # game.
+                    for k, v in extra.items():
+                        if k in ("type", "ts", "sections"):
+                            continue
+                        snap[k] = v
+        return snap
+
+    # ── public event publish (Phase 2) ────────────────────────────
+
+    def publish_event(self, ev: dict) -> None:
+        """Push one event to every current subscriber.
+
+        Phase 2 Agent UI uses this for the ``todo.upsert`` /
+        ``todo.removed`` / ``thread.message`` / ``thread.delta`` /
+        ``work.update`` / ``agent.status`` vocabulary; handlers call
+        it after mutating state. Drops to the same ``_publish`` path
+        as the tick — a slow subscriber gets reaped, not awaited.
+        """
+        if not isinstance(ev, dict) or "type" not in ev:
+            return
+        self._publish(ev)
 
     def tick(self) -> list[dict]:
         """Rerender each section; publish + return deltas for changes.
