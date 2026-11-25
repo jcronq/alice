@@ -761,6 +761,156 @@ details.fx-group:first-child { margin-top: 0; }
   border: 1px solid var(--color-border-line); border-radius: 3px;
 }
 .woy-external-link:hover { color: var(--color-fg); border-color: var(--color-fg-muted); }
+
+/* Agent UI two-row app bar + pill tabs (phase 1 port, feat/agent-ui-port-p1).
+ * Lifted from agent-ui-testing/web/src/app/tabs.css; selectors scoped to
+ * ``.app-bar`` so the older ``header`` rules above still apply as
+ * fallback for anything that hasn't opted in yet. */
+header.app-bar {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  padding: 0;
+  display: block;
+}
+.app-bar-inner {
+  display: flex; flex-wrap: wrap; align-items: center;
+  gap: 0 16px;
+  max-width: var(--content-max); margin: 0 auto;
+  padding: .3rem 1rem .5rem;
+}
+.app-bar .brand-block {
+  display: flex; flex: 1; min-width: 0;
+  flex-direction: row; align-items: baseline;
+  gap: 12px; order: 1;
+  margin: 6px 0 0;
+  line-height: 1.2;
+}
+.app-bar .brand-block .brand {
+  flex: none;
+  font-size: 1rem; font-weight: 700; letter-spacing: -0.01em;
+  margin: 0;
+}
+.app-bar .brand-block .freshness {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  color: var(--text-muted); font-size: 13px; white-space: nowrap;
+}
+.app-bar .brand-block .freshness[data-offline] { color: var(--warn-text); }
+.app-bar .app-bar-meta {
+  order: 2; margin-top: 2px;
+  display: flex; flex: none;
+  align-items: center; gap: 8px;
+}
+.app-bar .tabbar {
+  order: 3; flex: 1 1 100%;
+  display: flex; min-width: 0;
+  align-items: center; gap: 8px;
+  padding: 6px 0 2px;
+}
+.app-bar .tablist {
+  display: flex; flex: 1 1 auto; min-width: 0;
+  align-items: center; gap: 6px;
+  overflow-x: auto; scrollbar-width: none;
+}
+.app-bar .tablist::-webkit-scrollbar { display: none; }
+.app-bar .tab-pill {
+  position: relative;
+  display: inline-flex; flex: none;
+  align-items: center; height: 32px;
+  box-sizing: border-box;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.app-bar .tab-pill:hover { background: var(--surface-2); color: var(--text); }
+.app-bar .tab-pill[data-selected="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+.app-bar .tab-pill a.tab-link {
+  display: inline-flex; align-items: center;
+  gap: 6px; height: 100%;
+  padding: 0 14px;
+  border-radius: 999px;
+  color: inherit; font-weight: 500;
+  text-decoration: none;
+}
+.app-bar .archive-link {
+  flex: none; padding: 6px 4px;
+  color: var(--text-muted); font-size: 13px;
+  text-decoration: none; white-space: nowrap;
+}
+.app-bar .archive-link:hover { color: var(--text); text-decoration: underline; }
+
+/* TODO cards (phase 1 collapsed shape, from todos.css). ------------------ */
+ul.todo-list {
+  list-style: none;
+  padding: 0; margin: 0;
+  display: flex; flex-direction: column;
+  gap: 8px;
+}
+.todo-card {
+  display: block; padding: 0;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  min-width: 0;
+}
+.todo-row {
+  position: relative;
+  display: flex; flex-wrap: wrap; align-items: center;
+  gap: 4px 10px;
+  padding: 12px 14px;
+  min-width: 0;
+}
+.todo-header {
+  position: static;
+  flex: 0 1 auto; max-width: 100%; min-width: 0;
+  display: inline-flex; flex-direction: row;
+  align-items: center; gap: 8px;
+  padding: 0; border: 0;
+  background: none;
+  font: inherit; color: inherit;
+  cursor: pointer;
+}
+.todo-header strong {
+  font-weight: 650;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.todo-gist {
+  flex: 1 1 8rem; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+.todo-meta {
+  color: var(--text-muted);
+  font-size: 0.8rem; white-space: nowrap;
+}
+.pill-btn {
+  display: inline-flex; align-items: center;
+  padding: 2px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 0.8rem; font-weight: 500;
+  white-space: nowrap; cursor: pointer;
+  text-decoration: none;
+}
+.pill-btn:hover { background: var(--surface-2); color: var(--text); }
+.todo-pill { margin-left: auto; }
+@media (max-width: 640px) {
+  .todo-row { padding: 12px; }
+  .todo-meta { order: 2; margin-left: auto; }
+  .todo-gist { order: 3; flex-basis: 100%; }
+  .todo-pill { order: 5; }
+}
 </style>
 </head><body>
 <div id="root">Loading Alice…</div>
@@ -2900,7 +3050,7 @@ function ExpandedCard({title, slug, externalLink, isPr, onClose, onDismissed}) {
   );
 }
 
-function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs, todoChipSlugs}) {
+function WaitingTable({rows, handZoneMd, cardsHtml, nowMs, needsApprovalSlugs, todoChipSlugs}) {
   const safe = rows || [];
   const approvalSet = React.useMemo(() => new Set(needsApprovalSlugs || []), [needsApprovalSlugs]);
   // ``todoChipSlugs`` is the default kind=woy codepath — Done/Snooze
@@ -3284,20 +3434,35 @@ function WaitingTable({rows, handZoneMd, nowMs, needsApprovalSlugs, todoChipSlug
   // kind=woy / review-TODO hand-zone would render WITH a bogus
   // "(nothing waiting on you)" line below it. Bug fix 2026-11-18
   // (fix/woy-todo-semantics): aggregate the predicate.
-  const table = safe.length
-    ? h(FxTable, {
-        columns: [
-          {key: "urgency", label: "urgency", cell: r => h(UrgencyPill, {rank: r.urgency})},
-          {key: "text", label: "ask", cell: r => r.text || ""},
-          {key: "created", label: "age", cell: r => ageString(r.created, nowMs)},
-        ],
-        rows: safe,
-        rowClass: r => (r.urgency === "NOW" || r.urgency === "UNSET") ? "fx-now" : "",
-      })
-    : (handZoneMd
-        ? null
-        : h("p", {style: {color: "var(--color-fg-muted)", margin: 0}, "data-testid": "waiting-table-empty"},
-            "(nothing waiting on you)"));
+  // Agent UI phase 1: if the server supplied a structured HTML card
+  // list (``your_todo_cards_html``), render it in place of the old
+  // urgency-column FxTable. The markdown hand-zone block still
+  // renders above it unchanged — phase-2 work (expanded cards,
+  // intent picker, reply composer, Resolve/Dismiss) will fold the
+  // hand-zone bullets into cards too.
+  let table;
+  if (cardsHtml) {
+    table = h("div", {
+      className: "woy-cards-wrap",
+      "data-woy-cards": "1",
+      dangerouslySetInnerHTML: {__html: cardsHtml},
+    });
+  } else if (safe.length) {
+    table = h(FxTable, {
+      columns: [
+        {key: "urgency", label: "urgency", cell: r => h(UrgencyPill, {rank: r.urgency})},
+        {key: "text", label: "ask", cell: r => r.text || ""},
+        {key: "created", label: "age", cell: r => ageString(r.created, nowMs)},
+      ],
+      rows: safe,
+      rowClass: r => (r.urgency === "NOW" || r.urgency === "UNSET") ? "fx-now" : "",
+    });
+  } else if (!handZoneMd) {
+    table = h("p", {style: {color: "var(--color-fg-muted)", margin: 0}, "data-testid": "waiting-table-empty"},
+      "(nothing waiting on you)");
+  } else {
+    table = null;
+  }
   return h(React.Fragment, null,
     handZoneMd ? h("div", {
       className: "woy-click",
@@ -3434,6 +3599,7 @@ function YourTodoBoard({data, nowMs}) {
       h(WaitingTable, {
         rows: d.rows,
         handZoneMd: d.your_todo_md,
+        cardsHtml: d.your_todo_cards_html || "",
         needsApprovalSlugs: d.needs_approval_slugs || [],
         todoChipSlugs: d.todo_chip_slugs || [],
         nowMs,
@@ -4147,25 +4313,36 @@ function NavTabs() {
       if (el && typeof el.focus === "function") el.focus();
     });
   }
+  // Agent UI two-row pill tabs: each tab is a `<span class="tab-pill">`
+  // wrapping an `<a class="tab-link">`. Active pill filled with accent;
+  // inactive is transparent + bordered. Reference:
+  // agent-ui-testing/web/src/app/TabBar.tsx:423-538.
   return h("nav", {
-    className: "nav-tabs",
+    className: "tabbar",
     "aria-label": "Primary",
-    role: "tablist",
     ref: navRef,
-    onKeyDown: onKey,
-  }, tabs.map((t, i) => {
-    const active = i === activeIdx;
-    return h("a", {
-      key: t.slug,
-      href: t.href,
-      title: t.title,
-      role: "tab",
-      "aria-selected": active ? "true" : "false",
-      tabIndex: active ? 0 : -1,
-      className: active ? "on" : null,
-      "aria-current": active ? "page" : null,
-    }, t.title);
-  }));
+  },
+    h("div", {
+      className: "tablist",
+      role: "tablist",
+      onKeyDown: onKey,
+    }, tabs.map((t, i) => {
+      const active = i === activeIdx;
+      return h("span", {
+        key: t.slug,
+        className: "tab-pill",
+        "data-selected": active ? "true" : "false",
+      }, h("a", {
+        href: t.href,
+        title: t.title,
+        role: "tab",
+        className: "tab-link",
+        "aria-selected": active ? "true" : "false",
+        tabIndex: active ? 0 : -1,
+        "aria-current": active ? "page" : null,
+      }, t.title));
+    })),
+  );
 }
 
 // Apply persisted width preference once on load so the first paint is
@@ -4552,26 +4729,45 @@ function App() {
     });
   }
 
+  // Agent UI two-row header shell (phase 1 port). Row 1 = brand
+  // "status" + freshness caption; row 2 = pill tabs (NavTabs owns
+  // the tablist). sse-status + ? + gear sit in a small right-side
+  // meta block on row 1. The freshness caption uses the newest
+  // ``ts`` across all sections (that's the "most recent SSE frame"
+  // age Jason cares about). Disconnected → "offline · last updated
+  // H:MM AM"; connected → "updated Nm ago".
+  const latestTs = Object.values(state.ts || {}).reduce((m, v) => {
+    const t = parseTs(v); return t > m ? t : m;
+  }, 0);
+  const freshnessText = !state.connected && latestTs
+    ? "offline · last updated " + new Date(latestTs).toLocaleTimeString(undefined, {hour: "numeric", minute: "2-digit"})
+    : (latestTs ? stampText(latestTs, nowMs) : (state.connected ? "live" : "offline"));
   return h(React.Fragment, null,
-    h("header", null,
-      h("b", null, "Alice"),
-      h(NavTabs),
-      h("span", {className: "spacer"}),
-      h("span", {className: statusClass}, statusLabel),
-      h("button", {
-        type: "button",
-        className: "hdr kb-help-trigger",
-        title: "Keyboard shortcuts — ?",
-        "aria-label": "Keyboard shortcuts",
-        onClick: (e) => {
-          // Reuse the same path as the ? key: dispatch a synthesised
-          // keydown on window so the KeyboardShortcuts component owns
-          // the open logic in one place.
-          e.preventDefault();
-          window.dispatchEvent(new KeyboardEvent("keydown", {key: "?", shiftKey: true}));
-        },
-      }, "?"),
-      h(ConfigGear),
+    h("header", {className: "app-bar"},
+      h("div", {className: "app-bar-inner"},
+        h("div", {className: "brand-block"},
+          h("h1", {className: "brand"}, "status"),
+          h("span", {
+            className: "freshness",
+            "data-offline": state.connected ? null : "true",
+          }, freshnessText),
+        ),
+        h("div", {className: "app-bar-meta"},
+          h("span", {className: statusClass}, statusLabel),
+          h("button", {
+            type: "button",
+            className: "hdr kb-help-trigger",
+            title: "Keyboard shortcuts — ?",
+            "aria-label": "Keyboard shortcuts",
+            onClick: (e) => {
+              e.preventDefault();
+              window.dispatchEvent(new KeyboardEvent("keydown", {key: "?", shiftKey: true}));
+            },
+          }, "?"),
+          h(ConfigGear),
+        ),
+        h(NavTabs),
+      ),
     ),
     h("main", null,
       !KEY && h("div", {className: "notice err"},
