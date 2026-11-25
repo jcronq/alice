@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import queue
-import threading
 
 import pytest
 
@@ -35,7 +34,6 @@ from status_site.server import (
     handle_todo_messages,
     handle_todo_reopen,
     handle_todo_resolve,
-    now_iso,
     read_threads,
 )
 from status_site.sources.common import asks_path
